@@ -6049,13 +6049,15 @@ fn percent_decode_lossy(input: &str) -> String {
 /// Public as an **opaque** type (all fields private): the concurrent-dispatch façade holds an
 /// `Arc<ReadState>` (Stage 4) to drive the lock-free read path without naming the engine's internals.
 pub struct ReadState {
-    // The read-path-consulted catalog maps (tables / views / materialized views / functions),
-    // published as ONE immutable `Arc<CatalogSnapshot>` behind an `ArcSwap` (Stage 2 — blocker #1).
-    // DDL edits a *working* copy of these maps on `Engine` under the catalog latch and then publishes
-    // a fresh snapshot here; lock-free readers + the concurrent-DML path load it. A statement pins one
-    // snapshot for its whole duration so a concurrent DDL publish can never split it across two
-    // catalogs (the same single-snapshot-per-statement discipline as the data pin).
-    catalog: ArcSwap<CatalogSnapshot>,
+    // A bounded RING of recent catalog generations ordered by `commit_seq` (PART B: catalog↔data
+    // co-pinning). DDL edits a *working* copy of the catalog maps under the catalog latch and then
+    // pushes a fresh stamped generation here; lock-free readers + the off-latch concurrent-DML preflight
+    // select the generation AS-OF their pinned `committed_seq` via [`ReadState::catalog_as_of`], so a
+    // shape-changing DDL committed concurrently with a reader can never split the reader's (catalog,
+    // data) pair. Behind an `ArcSwap<Arc<CatalogHistory>>` so the push (COW: clone the small Vec of
+    // `Arc` pointers, append, prune) is wait-free for readers. DDL is rare + serialized so the ring is
+    // tiny (pruned below the oldest active read snapshot in the commit critical section).
+    catalog_history: ArcSwap<CatalogHistory>,
     // Versioned, publish-on-commit MVCC data: per-table `SnapshotCell<Arc<TableVersionData>>`
     // (rows + value-index) + a KV partition, `&self`-readable / lock-free (write-half Stage 3).
     mvcc: MvccData,
@@ -6072,27 +6074,150 @@ pub struct ReadState {
 impl ReadState {
     fn new() -> Self {
         Self {
-            catalog: ArcSwap::new(Arc::new(CatalogSnapshot::default())),
+            catalog_history: ArcSwap::new(Arc::new(CatalogHistory::initial())),
             mvcc: MvccData::new(),
             committed_seq: AtomicU64::new(0),
             residency: ResidencyReadState::default(),
             route_telemetry: RouteTelemetry::default(),
         }
     }
+
+    /// The catalog generation visible AS-OF the boundary `s` (the greatest `commit_seq <= s`), as an
+    /// owned `Arc` pinned for the statement (PART B). A reader loads its `committed_seq = s` ONCE, then
+    /// binds + pins data at THAT same `s`, so the catalog it binds against and the data it reads are
+    /// the same generation — a concurrent shape-changing DDL can never split them. Falls back to the
+    /// oldest retained generation if `s` predates the ring (only possible if a generation a reader
+    /// could still need was pruned, which the oldest-active-snapshot prune boundary prevents).
+    fn catalog_as_of(&self, s: Index) -> Arc<CatalogSnapshot> {
+        self.catalog_history.load().as_of(s)
+    }
+
+    /// The most-recently-published catalog generation (greatest `commit_seq`), owned. Used by paths
+    /// that legitimately want "latest" rather than a pinned boundary (e.g. a freshly-built engine's
+    /// constructor-time reads, or admin introspection that is not snapshot-pinned).
+    fn latest_catalog(&self) -> Arc<CatalogSnapshot> {
+        self.catalog_history.load().latest()
+    }
 }
 
-/// The immutable, read-path-consulted slice of the catalog, published as one `Arc` per DDL commit
-/// (Stage 2 — blocker #1). It holds ONLY the maps the lock-free read path + concurrent-DML path
-/// actually consult — tables, views, materialized views, functions — NOT the full catalog (acl /
-/// comments / roles / databases / tablespaces / domains / publications / subscriptions / sequences /
-/// the oid+column-id allocators stay on `Engine` for DDL `&mut self`; the read path never reads them).
-/// The field names mirror the `Engine` working maps so the publish is a straight clone-and-store.
+/// The minimum number of recent catalog generations the ring ALWAYS retains, so a lock-free reader
+/// that pinned a `committed_seq` boundary without registering an active snapshot still finds the
+/// generation as-of that boundary (a single statement cannot straddle this many serialized DDLs). DDL
+/// is rare and the per-generation payload is a clone of the small working catalog maps, so a generous
+/// floor is cheap; pruning by the oldest active snapshot still applies on top (whichever keeps more).
+const MIN_RETAINED_CATALOG_GENERATIONS: usize = 256;
+
+/// A bounded ring of recent catalog generations ordered by ascending `commit_seq` (PART B). The
+/// lock-free read path + off-latch DML preflight select a generation as-of a pinned boundary; the
+/// single serialized DDL publisher pushes a new generation and prunes (below the oldest active read
+/// snapshot, but always keeping the last [`MIN_RETAINED_CATALOG_GENERATIONS`]). Immutable once
+/// published (COW-replaced wholesale via the `ArcSwap`).
+#[derive(Debug, Default)]
+struct CatalogHistory {
+    /// Generations in ascending `commit_seq` order; never empty after `initial()`.
+    generations: Vec<Arc<CatalogSnapshot>>,
+}
+
+impl CatalogHistory {
+    /// The initial history: one empty generation at `commit_seq = 0` whose `public_schema_exists` /
+    /// `public_schema_implicit` match a fresh engine's working state (so a reader/preflight before any
+    /// DDL sees the correct bootstrap catalog, not the all-`false` `Default`).
+    fn initial() -> Self {
+        Self {
+            generations: vec![Arc::new(CatalogSnapshot {
+                commit_seq: 0,
+                relational_public_schema_exists: true,
+                relational_public_schema_implicit: true,
+                ..CatalogSnapshot::default()
+            })],
+        }
+    }
+
+    /// The generation with the greatest `commit_seq <= s`, or the oldest retained generation if `s`
+    /// predates the ring. Linear scan from the newest end; the ring is tiny (DDL is rare + serialized).
+    fn as_of(&self, s: Index) -> Arc<CatalogSnapshot> {
+        for generation in self.generations.iter().rev() {
+            if generation.commit_seq <= s {
+                return Arc::clone(generation);
+            }
+        }
+        // `s` predates every retained generation (its generation was pruned). Return the oldest we
+        // still hold — the prune boundary (oldest active read snapshot) guarantees no in-flight reader
+        // pinned at `s` actually needs an older one.
+        Arc::clone(self.generations.first().expect("history is never empty"))
+    }
+
+    fn latest(&self) -> Arc<CatalogSnapshot> {
+        Arc::clone(self.generations.last().expect("history is never empty"))
+    }
+
+    /// A new history with `generation` appended (newest), then generations strictly older than the
+    /// newest one that is still `<= prune_below` dropped — i.e. keep the single generation a reader
+    /// pinned at `prune_below` would select, plus everything newer. `prune_below` is the oldest active
+    /// read snapshot's boundary; a `None`/`0` keeps everything but the redundant prefix.
+    fn pushed(&self, generation: Arc<CatalogSnapshot>, prune_below: Index) -> Self {
+        let mut generations = self.generations.clone();
+        generations.push(generation);
+        // Two prune bounds; take the one that drops the FEWEST (keeps the most history):
+        //   (1) below the oldest active read snapshot — the newest generation still `<= prune_below` is
+        //       the one a reader registered at `prune_below` would select; everything strictly before it
+        //       is unreachable by any registered snapshot (the concurrent-DML write path registers).
+        //   (2) a COUNT floor — ALWAYS retain the last `MIN_RETAINED_CATALOG_GENERATIONS` generations,
+        //       so a LOCK-FREE *read* that pinned a boundary WITHOUT registering an active snapshot
+        //       (reads stay OFF the `active_snapshots` mutex — the whole point of the lock-free path)
+        //       still finds its generation: a single statement cannot straddle that many serialized
+        //       DDLs. DDL is rare, so the ring stays tiny under either bound.
+        let keep_from_snapshot = generations
+            .iter()
+            .rposition(|g| g.commit_seq <= prune_below)
+            .unwrap_or(0);
+        let keep_from_count = generations
+            .len()
+            .saturating_sub(MIN_RETAINED_CATALOG_GENERATIONS);
+        let keep_from = keep_from_snapshot.min(keep_from_count);
+        if keep_from > 0 {
+            generations.drain(0..keep_from);
+        }
+        Self { generations }
+    }
+}
+
+/// The immutable, published slice of the catalog, published as one `Arc` per DDL commit (Stage 2 —
+/// blocker #1; lock-free read path, write-half MVCC). The lock-free read path itself consults only the
+/// first four maps (tables / views / materialized views / functions); the rest are here so the
+/// **off-latch** paths — the concurrent-DML preflight (`preflight_unique_index_constraints` + its
+/// helper tree) and the test-only catalog introspection accessors — can read the catalog WITHOUT
+/// taking the catalog latch (which would serialize DML behind DDL and re-enter the latch). Because the
+/// preflight runs strictly BEFORE any apply and DDL is single-writer, the published snapshot a
+/// preflight reads is byte-identical to the working maps it used to read directly. Only the
+/// oid/column-id allocators and the resident-cache admission accounting are NOT here — those are
+/// touched solely by the under-latch apply path / residency admin. `commit_seq` stamps the commit
+/// `Index` this generation was published at (PART B: catalog↔data co-pinning); the read path selects
+/// the generation as-of its pinned `committed_seq` so a shape-changing DDL can never split a reader's
+/// (catalog, data) pair. The field names mirror the `Engine`/`DdlCatalogState` working maps so the
+/// publish is a straight clone-and-store.
 #[derive(Debug, Clone, Default)]
 struct CatalogSnapshot {
+    /// The commit `Index` this catalog generation was published at (PART B). `0` for the initial
+    /// empty generation. A reader pinned at `committed_seq = s` selects the generation with the
+    /// greatest `commit_seq <= s` (`catalog_as_of`).
+    commit_seq: Index,
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
     relational_functions: BTreeMap<String, RelationalFunction>,
+    relational_sequences: BTreeMap<String, RelationalSequence>,
+    relational_domains: BTreeMap<String, RelationalDomain>,
+    relational_publications: BTreeMap<String, RelationalPublication>,
+    relational_subscriptions: BTreeMap<String, RelationalSubscription>,
+    relational_roles: BTreeMap<String, RelationalRole>,
+    relational_databases: BTreeMap<String, RelationalDatabase>,
+    relational_tablespaces: BTreeMap<String, RelationalTablespace>,
+    relational_public_schema_exists: bool,
+    relational_public_schema_implicit: bool,
+    relational_schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
+    relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
+    relational_comments: BTreeMap<RelationalCommentTarget, String>,
 }
 
 /// The GPU-resident read-route metadata reached by the lock-free read path. The device-memory maps
@@ -6238,13 +6363,47 @@ pub struct Engine {
     /// boundary. Separate from `commit` so a transaction can register its snapshot at prepare-begin
     /// WITHOUT serializing on the commit_mutex (prepare is off-lock).
     active_snapshots: Mutex<ActiveSnapshots>,
-    sm: KvStateMachine,
     /// The lock-free read-path state, shared by value-`Arc` with the concurrent-dispatch façade so
     /// reads and the concurrent-DML path reach `mvcc` / `committed_seq` / resident device-memory /
     /// route telemetry WITHOUT the engine `RwLock` (lock-free read path, write-half MVCC). A holder
     /// of `&mut Engine` (serialized DDL) still only ever gets `&ReadState` through this `Arc`, and
     /// every field is interior-mutable, so a reader and a DDL writer never alias the same byte.
     read_state: Arc<ReadState>,
+    /// The DDL-only catalog working state, bundled behind ONE mutex that IS the **catalog latch**
+    /// (lock-free read path, write-half MVCC). It holds the working catalog/views/matviews/functions
+    /// maps (which lock-free readers consult ONLY via the *published* `read_state.catalog` snapshot,
+    /// never these working copies) plus the DDL-only maps the read path never consults at all
+    /// (sequences / domains / publications / subscriptions / roles / databases / tablespaces / acl /
+    /// comments / the oid+column-id allocators / the resident-cache admission accounting). DDL already
+    /// serializes, so one mutex is correct; lock-free readers never touch it and the concurrent-DML
+    /// commit path never touches it either. Lock order is fixed: `commit` (commit_mutex) FIRST, then
+    /// `catalog_latch`. Code that already holds `&mut self` (construction / serialized DDL / recovery /
+    /// residency admin) reaches it lock-free via `Mutex::get_mut` (`ddl_catalog_mut()`); the `&self`
+    /// DDL apply path locks it (`ddl_catalog()`).
+    catalog_latch: Mutex<DdlCatalogState>,
+    metrics: RuntimeMetrics,
+    /// The pending-mutation group-commit batcher (the legacy KV-SET batching subsystem + FLUSH),
+    /// behind its OWN `Mutex` (NOT the commit_mutex) so the `&self` `execute_text` FLUSH path can drain
+    /// it without `&mut self` (lock-free read path, write-half MVCC). `apply_batch` drains items under
+    /// this lock, RELEASES it, then commits each via `commit_mutation` (which takes the commit_mutex
+    /// separately — so the batcher lock is never held across a commit, no lock-order coupling).
+    batcher: Mutex<DualTriggerBatcher<PendingMutation>>,
+    planner: Planner,
+    router: DeviceRouter<MockGpuRuntime>,
+    // Lazily-probed CUDA runtime, behind a OnceLock so the probe getter is `&self`
+    // (the read path lazily initializes it — P1-M3 step 3c).
+    cached_cuda_probe_runtime: OnceLock<CudaDriverRuntime>,
+}
+
+/// The DDL-only catalog working state, serialized behind the engine's **catalog latch**
+/// (`Engine::catalog_latch`) — see that field's doc. It bundles every `Engine` catalog field that is
+/// mutated by DDL and is NOT interior-mutable: the working catalog maps the read path consults only
+/// through the *published* snapshot (`relational_catalog`/`relational_views`/
+/// `relational_materialized_views`/`relational_functions`), plus the DDL-only maps the read path never
+/// consults at all. DDL serializes (one writer), so holding the latch makes a DDL's working-map
+/// mutation + its published-snapshot publish atomic w.r.t. another DDL; lock-free readers and the
+/// concurrent-DML path never take this latch.
+struct DdlCatalogState {
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
@@ -6266,14 +6425,6 @@ pub struct Engine {
     relational_resident_cache: RelationalResidentCache,
     relational_next_oid: u32,
     relational_next_column_id: u32,
-    txn_manager: TxnManager,
-    metrics: RuntimeMetrics,
-    batcher: DualTriggerBatcher<PendingMutation>,
-    planner: Planner,
-    router: DeviceRouter<MockGpuRuntime>,
-    // Lazily-probed CUDA runtime, behind a OnceLock so the probe getter is `&self`
-    // (the read path lazily initializes it — P1-M3 step 3c).
-    cached_cuda_probe_runtime: OnceLock<CudaDriverRuntime>,
 }
 
 /// The commit-critical mutable substate bundled behind the engine's commit_mutex (write-half MVCC,
@@ -6295,6 +6446,15 @@ struct CommitState {
     wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
     /// The recent-commits conflict ledger (SI write-write, first-committer-wins).
     ledger: RecentCommitsLedger,
+    /// The KV replay/state machine (the `SET`/`DELETE`/`GET` key namespace's applied-record log +
+    /// in-memory store), moved under the commit_mutex (A.2): the serialized commit path applies KV
+    /// records here, and the few `GetKv` reads take a brief `commit_state()` shim. The concurrent DML
+    /// path never touches it (it is relational-only), so it adds no contention to that path.
+    sm: KvStateMachine,
+    /// BEGIN/COMMIT/ROLLBACK transaction bookkeeping, moved under the commit_mutex (A.2): transaction
+    /// control runs on the serialized path; the active-count / oldest-txn watermark reads take a brief
+    /// `commit_state()` shim.
+    txn_manager: TxnManager,
 }
 
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
@@ -6657,7 +6817,8 @@ impl MvccData {
     /// held only to clone the cell's current `Arc` (`load()`), then released — the lock-free read
     /// body runs against the pinned handle with no lock held.
     fn load_table(&self, table: &str) -> Option<SnapshotHandle<Arc<TableVersionData>>> {
-        self.tables_read().get(table).map(|cell| cell.load())
+        let g = self.tables_read();
+        g.get(table).map(|cell| cell.load())
     }
 
     /// A loaded, immutable view of `table`'s rows for the read path — an empty store when the table
@@ -6802,6 +6963,15 @@ impl MvccData {
 /// a not-yet-written table without allocating a new store per read.
 static EMPTY_TABLE_VERSION_DATA: std::sync::LazyLock<Arc<TableVersionData>> =
     std::sync::LazyLock::new(|| Arc::new(TableVersionData::default()));
+
+thread_local! {
+    /// Set (RAII-scoped) while this thread runs an internal relational read from INSIDE the commit
+    /// critical section (materialized-view create/refresh applying a committed entry). The deep read
+    /// executor reads this to skip its leader re-check, which would otherwise re-lock the already-held
+    /// commit_mutex and self-deadlock. False for every client read. See
+    /// [`Engine::skip_leader_check_during_internal_read`].
+    static MVCC_READ_SKIPS_LEADER_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// A loaded, immutable view of one table's rows for the read path: either the pinned published
 /// generation (the common case) or a shared empty payload for a table with no MVCC data yet.
@@ -9648,7 +9818,7 @@ impl Engine {
     }
 
     pub fn recover_from_durable_wal(records: &[WalRecord]) -> Result<Self, EngineError> {
-        let mut engine = Self::new_local();
+        let engine = Self::new_local();
         for record in records {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
@@ -9767,32 +9937,34 @@ impl Engine {
                 wal: WalBuffer::default(),
                 wal_commit_timestamps_micros: BTreeMap::new(),
                 ledger: RecentCommitsLedger::default(),
+                sm: KvStateMachine::default(),
+                txn_manager: TxnManager::default(),
             }),
             active_snapshots: Mutex::new(ActiveSnapshots::default()),
-            sm: KvStateMachine::default(),
             read_state: Arc::new(ReadState::new()),
-            relational_catalog: BTreeMap::new(),
-            relational_views: BTreeMap::new(),
-            relational_materialized_views: BTreeMap::new(),
-            relational_functions: BTreeMap::new(),
-            relational_sequences: BTreeMap::new(),
-            relational_domains: BTreeMap::new(),
-            relational_publications: BTreeMap::new(),
-            relational_subscriptions: BTreeMap::new(),
-            relational_roles: BTreeMap::new(),
-            relational_databases: BTreeMap::new(),
-            relational_tablespaces: BTreeMap::new(),
-            relational_public_schema_exists: true,
-            relational_public_schema_implicit: true,
-            relational_schema_acl: BTreeMap::new(),
-            relational_default_table_acl: BTreeMap::new(),
-            relational_comments: BTreeMap::new(),
-            relational_resident_cache: RelationalResidentCache::default(),
-            relational_next_oid: FIRST_USER_RELATION_OID,
-            relational_next_column_id: FIRST_USER_COLUMN_ID,
-            txn_manager: TxnManager::default(),
+            catalog_latch: Mutex::new(DdlCatalogState {
+                relational_catalog: BTreeMap::new(),
+                relational_views: BTreeMap::new(),
+                relational_materialized_views: BTreeMap::new(),
+                relational_functions: BTreeMap::new(),
+                relational_sequences: BTreeMap::new(),
+                relational_domains: BTreeMap::new(),
+                relational_publications: BTreeMap::new(),
+                relational_subscriptions: BTreeMap::new(),
+                relational_roles: BTreeMap::new(),
+                relational_databases: BTreeMap::new(),
+                relational_tablespaces: BTreeMap::new(),
+                relational_public_schema_exists: true,
+                relational_public_schema_implicit: true,
+                relational_schema_acl: BTreeMap::new(),
+                relational_default_table_acl: BTreeMap::new(),
+                relational_comments: BTreeMap::new(),
+                relational_resident_cache: RelationalResidentCache::default(),
+                relational_next_oid: FIRST_USER_RELATION_OID,
+                relational_next_column_id: FIRST_USER_COLUMN_ID,
+            }),
             metrics: RuntimeMetrics::default(),
-            batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
+            batcher: Mutex::new(DualTriggerBatcher::new(64, Duration::from_millis(1))),
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
             cached_cuda_probe_runtime: OnceLock::new(),
@@ -9820,6 +9992,32 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Lock the **catalog latch**, recovering from poison (same wedge-don't-recover policy as
+    /// [`Engine::commit_state`]: a DDL that panics mid-apply poisons this latch, and the façade then
+    /// refuses to serve rather than expose a torn working catalog). Lock order is fixed: a caller that
+    /// also needs the commit_mutex must take `commit_state()` FIRST, then this. Lock-free readers and
+    /// the concurrent-DML path never call this.
+    fn ddl_catalog(&self) -> std::sync::MutexGuard<'_, DdlCatalogState> {
+        self.catalog_latch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `&mut`-access the DDL catalog state WITHOUT locking — sound because `&mut self` already proves
+    /// exclusive access. Used by construction / serialized DDL-via-`&mut self` / recovery / residency
+    /// admin paths (mirrors [`Engine::commit_state_mut`]).
+    fn ddl_catalog_mut(&mut self) -> &mut DdlCatalogState {
+        self.catalog_latch
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether the catalog latch is currently poisoned (a DDL panicked mid-apply). The façade checks
+    /// this on the DDL branch so a DDL that panicked wedges service rather than serving a torn catalog.
+    pub fn is_catalog_latch_poisoned(&self) -> bool {
+        self.catalog_latch.is_poisoned()
+    }
+
     /// Whether the commit_mutex is currently poisoned (a committer panicked mid-section). The façade
     /// checks this to re-home its poison-on-panic policy onto the commit path (write-half Stage 4).
     pub fn is_commit_path_poisoned(&self) -> bool {
@@ -9842,6 +10040,40 @@ impl Engine {
         self.commit_state().repl.role()
     }
 
+    /// Lock the pending-mutation batcher, recovering from poison. Held only briefly (a field read or a
+    /// drain), never across a `commit_mutation` (see the `batcher` field doc).
+    fn batcher(&self) -> std::sync::MutexGuard<'_, DualTriggerBatcher<PendingMutation>> {
+        self.batcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether the current thread is executing a relational read from INSIDE the commit critical
+    /// section (a materialized-view create/refresh applying a committed entry), where the commit_mutex
+    /// is already held and the deep read executor's leader gate would self-deadlock if it re-locked it.
+    /// Thread-local + RAII-scoped ([`Engine::skip_leader_check_during_internal_read`]); false for every
+    /// client read, so their leader gate is unchanged.
+    fn mvcc_read_skips_leader_check(&self) -> bool {
+        MVCC_READ_SKIPS_LEADER_CHECK.with(|flag| flag.get())
+    }
+
+    /// Run `f` (an internal mid-commit relational read) with the deep read executor's leader re-check
+    /// suppressed on this thread, restoring the prior value on the way out (RAII, panic-safe).
+    fn skip_leader_check_during_internal_read<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MVCC_READ_SKIPS_LEADER_CHECK.with(|flag| flag.set(self.0));
+            }
+        }
+        let _restore = MVCC_READ_SKIPS_LEADER_CHECK.with(|flag| {
+            let prev = flag.get();
+            flag.set(true);
+            Restore(prev)
+        });
+        f(self)
+    }
+
     pub fn with_batching(max_items: usize, max_wait: Duration) -> Self {
         Self::with_batching_and_planner_config(max_items, max_wait, PlannerConfig::default())
     }
@@ -9852,7 +10084,7 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Self {
         let mut s = Self::with_planner_config(planner_cfg);
-        s.batcher = DualTriggerBatcher::new(max_items, max_wait);
+        s.batcher = Mutex::new(DualTriggerBatcher::new(max_items, max_wait));
         s
     }
 
@@ -9947,19 +10179,22 @@ impl Engine {
     }
 
     pub fn set_relational_residency_budget_bytes(&mut self, gpu_id: u16, budget_bytes: u64) {
-        self.relational_resident_cache
+        self.ddl_catalog_mut()
+            .relational_resident_cache
             .budget_bytes_by_gpu
             .insert(gpu_id, budget_bytes);
     }
 
     pub fn clear_relational_residency_budget_bytes(&mut self, gpu_id: u16) {
-        self.relational_resident_cache
+        self.ddl_catalog_mut()
+            .relational_resident_cache
             .budget_bytes_by_gpu
             .remove(&gpu_id);
     }
 
     pub fn relational_residency_budget_bytes(&self, gpu_id: u16) -> Option<u64> {
-        self.relational_resident_cache
+        self.ddl_catalog()
+            .relational_resident_cache
             .budget_bytes_by_gpu
             .get(&gpu_id)
             .copied()
@@ -10005,7 +10240,7 @@ impl Engine {
     }
 
     pub fn commit_mutation(
-        &mut self,
+        &self,
         txn_id: u64,
         payload: Vec<u8>,
     ) -> Result<CommitToken, EngineError> {
@@ -10025,7 +10260,7 @@ impl Engine {
     }
 
     pub fn commit_mutation_at(
-        &mut self,
+        &self,
         txn_id: u64,
         payload: Vec<u8>,
         timestamp_micros: u64,
@@ -10034,13 +10269,15 @@ impl Engine {
             return Err(EngineError::NotLeader);
         }
 
-        // Durable-commit critical section over the bundled commit substate (this method is the
-        // SERIALIZED commit path — DDL / COPY-less single mutations / replay — reached under the
-        // façade's exclusive write lock, so `commit_state_mut()` is a no-lock `get_mut`). The
-        // concurrent DML path uses `commit_dml_concurrent`, which performs the same WAL-before-publish
-        // sequence under the actual commit_mutex.
+        // Durable-commit critical section under the **commit_mutex** (A.4 unification — this method is
+        // now `&self`, the SERIALIZED commit path for DDL / KV / sequence-default INSERT / replay,
+        // reached through `&Engine`; the concurrent autocommit-DML path is `commit_dml_concurrent`,
+        // which runs the SAME WAL-before-publish sequence under this same lock). Lock order is fixed:
+        // `commit_state()` (commit_mutex) FIRST, then `ddl_catalog()` (catalog latch) acquired INSIDE.
+        // `next_commit_timestamp_micros` (which itself locks the commit_mutex) is computed by the
+        // caller BEFORE this, so we never re-enter the non-reentrant commit_mutex.
+        let mut commit = self.commit_state();
         let token = {
-            let commit = self.commit_state_mut();
             let wal_len_before = commit.wal.len();
             commit.wal.append(WalRecord {
                 txn_id,
@@ -10070,40 +10307,47 @@ impl Engine {
             token
         };
 
-        let to_apply: Vec<LogEntry> = {
-            let commit = self.commit_state_mut();
-            commit
-                .repl
-                .drain_committed_from(commit.repl.applied_index())
-                .cloned()
-                .collect()
-        };
+        let to_apply: Vec<LogEntry> = commit
+            .repl
+            .drain_committed_from(commit.repl.applied_index())
+            .cloned()
+            .collect();
 
-        for e in &to_apply {
-            self.sm.apply(e)?;
-            self.apply_mvcc_entry(e)?;
-            self.commit_state_mut().repl.mark_applied(e.index);
+        // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
+        // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
+        // order is fixed: commit_mutex (held in `commit`) FIRST, then this latch.
+        {
+            let mut catalog_guard = self.ddl_catalog();
+            let cat = &mut *catalog_guard;
+            for e in &to_apply {
+                commit.sm.apply(e)?;
+                self.apply_mvcc_entry(e, cat)?;
+                commit.repl.mark_applied(e.index);
+            }
+
+            // Publish ordering (Stage 2 — blocker #1; PART B catalog↔data co-pinning). The apply loop
+            // published this commit's data generation(s) and mutated the working catalog maps (for any
+            // DDL entries). Order the rest so a lock-free reader gets a consistent (catalog, data) pair:
+            //   1. residency tombstones, 2. catalog ring push (stamped at `token.index`), then LAST
+            //   3. `committed_seq` release-store.
+            // The catalog is pushed BEFORE `committed_seq` (the FLIP from the old order) so a reader
+            // that loads `committed_seq = token.index` and selects `catalog_as_of(token.index)` is
+            // guaranteed to find this generation — the catalog is visible no later than `committed_seq`.
+            // That, with the per-boundary self-consistency of the data (MVCC versions stamp old/new
+            // part-counts at the DDL's commit_seq), rules out a reader straddling a shape-changing DDL.
+            self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
+            let prune_below = self.catalog_prune_boundary(token.index);
+            self.publish_catalog_snapshot(cat, token.index, prune_below);
         }
-
-        // Publish ordering (Stage 2 — blocker #1). The apply loop already published this commit's data
-        // generation(s) and mutated the working catalog maps (for any DDL entries). Order the rest so
-        // a lock-free reader gets a consistent (catalog, data) pair:
-        //   1. residency tombstones, then 2. `committed_seq` release-store, then 3. catalog snapshot.
-        // The catalog is published LAST (after `committed_seq`) so a reader that loads the new catalog
-        // (acquire) is guaranteed to also observe `committed_seq >= this commit` — i.e. the data is
-        // ALWAYS at least as new as the catalog the reader bound against (the reader loads the catalog
-        // at bind, before it reads `committed_seq` at the data pin). That rules out the "new column in
-        // schema but pre-backfill data" tear for an ADD COLUMN committed concurrently with a reader.
-        self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
         self.publish_committed_seq(token.index);
-        self.publish_catalog_snapshot();
         self.metrics.inc_commit();
+        drop(commit);
 
         Ok(token)
     }
 
     fn commit_mutation_at_with_current_apply<F>(
-        &mut self,
+        &self,
         txn_id: u64,
         payload: Vec<u8>,
         timestamp_micros: u64,
@@ -10114,14 +10358,16 @@ impl Engine {
         // the directly-applied current entry stamps versions with the SAME commit-seq that
         // `apply_mvcc_entry` derives from `entry.index` on replay — keeping the live COPY hot path
         // byte-identical to a WAL replay of the same record (Stage 0 stamp/boundary unification).
-        F: FnMut(&mut Self, Index) -> Result<(), EngineError>,
+        F: FnMut(&Self, &mut DdlCatalogState, Index) -> Result<(), EngineError>,
     {
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
 
+        // A.4 unification: `&self`, the whole critical section under the commit_mutex (held in
+        // `commit`); the catalog latch is acquired INSIDE (fixed lock order).
+        let mut commit = self.commit_state();
         let token = {
-            let commit = self.commit_state_mut();
             let wal_len_before = commit.wal.len();
             commit.wal.append(WalRecord {
                 txn_id,
@@ -10149,37 +10395,42 @@ impl Engine {
             token
         };
 
-        let to_apply: Vec<LogEntry> = {
-            let commit = self.commit_state_mut();
-            commit
-                .repl
-                .drain_committed_from(commit.repl.applied_index())
-                .cloned()
-                .collect()
-        };
+        let to_apply: Vec<LogEntry> = commit
+            .repl
+            .drain_committed_from(commit.repl.applied_index())
+            .cloned()
+            .collect();
 
-        for e in &to_apply {
-            if e.index == token.index {
-                // The caller applies the current entry directly through Engine state. Avoid
-                // cloning and reparsing the large SQL payload through the generic KV state
-                // machine on the COPY hot path while preserving WAL/replay records. Pass the
-                // commit sequence (`e.index`) so the stamp matches `apply_mvcc_entry`'s replay stamp.
-                apply_current(self, e.index)?;
-            } else {
-                self.sm.apply(e)?;
-                self.apply_mvcc_entry(e)?;
+        // Hold the catalog latch across the apply loop AND the catalog publish (PART B; lock order:
+        // commit_mutex FIRST, then this latch).
+        let residency_invalidation_micros;
+        {
+            let mut catalog_guard = self.ddl_catalog();
+            let cat = &mut *catalog_guard;
+            for e in &to_apply {
+                if e.index == token.index {
+                    // The caller applies the current entry directly through Engine state. Avoid
+                    // cloning and reparsing the large SQL payload through the generic KV state
+                    // machine on the COPY hot path while preserving WAL/replay records. Pass the
+                    // commit sequence (`e.index`) so the stamp matches `apply_mvcc_entry`'s replay
+                    // stamp, plus the held catalog latch for any working-map mutation.
+                    apply_current(self, cat, e.index)?;
+                } else {
+                    commit.sm.apply(e)?;
+                    self.apply_mvcc_entry(e, cat)?;
+                }
+                commit.repl.mark_applied(e.index);
             }
-            self.commit_state_mut().repl.mark_applied(e.index);
-        }
 
-        // Publish ordering (Stage 2 — blocker #1): residency → `committed_seq` → catalog snapshot LAST
-        // (mirrors `commit_mutation_at`; see that method for why the catalog is published after
-        // `committed_seq`). The current-apply closure already published data + mutated the working maps.
-        let residency_invalidation_started = Instant::now();
-        self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
-        let residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
+            // Publish ordering (PART B): residency → catalog ring push → `committed_seq` LAST (mirrors
+            // `commit_mutation_at`). The current-apply closure already published data + mutated the maps.
+            let residency_invalidation_started = Instant::now();
+            self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
+            residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
+            let prune_below = self.catalog_prune_boundary(token.index);
+            self.publish_catalog_snapshot(cat, token.index, prune_below);
+        }
         self.publish_committed_seq(token.index);
-        self.publish_catalog_snapshot();
         self.metrics.inc_commit();
 
         Ok((token, residency_invalidation_micros))
@@ -10189,7 +10440,7 @@ impl Engine {
     /// table. Retained as the **conservative fallback** for commit batches whose
     /// mutated tables cannot be determined precisely ([`Engine::residency_invalidation_scope`]
     /// returns `None`). Equivalent to invalidating each resident table individually.
-    fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
+    fn invalidate_relational_residency(&self, txn_id: TxnId, index: Index) {
         let tables: BTreeSet<String> = self
             .read_state
             .residency
@@ -10211,7 +10462,7 @@ impl Engine {
     /// previous global invalidation; the device-memory/partition removals here are
     /// unconditional, so in degenerate cache states it may clear a stray cross-map
     /// entry the old two-loop form left — strictly-safe extra cleanup, never stale.
-    fn invalidate_relational_residency_table(&mut self, table: &str, txn_id: TxnId, index: Index) {
+    fn invalidate_relational_residency_table(&self, table: &str, txn_id: TxnId, index: Index) {
         // Stage 3 — blocker #2: the snapshot/partition flag maps are now published behind `ArcSwap`,
         // so flag the invalidation copy-on-write under the serialized catalog latch (this never runs
         // on the concurrent commit path — that uses `invalidate_relational_residency_tables_concurrent`
@@ -10316,7 +10567,7 @@ impl Engine {
     /// Invalidate residency for a committed batch: per-table when the mutated tables
     /// can be determined, else a conservative global invalidation.
     fn invalidate_relational_residency_for_commit(
-        &mut self,
+        &self,
         entries: &[LogEntry],
         txn_id: TxnId,
         index: Index,
@@ -10331,7 +10582,7 @@ impl Engine {
         }
     }
 
-    fn invalidate_relational_residency_for_memory_pressure(&mut self, gpu_id: u16) {
+    fn invalidate_relational_residency_for_memory_pressure(&self, gpu_id: u16) {
         // Stage 3 — blocker #2: COW the snapshot/partition flag maps under the catalog latch, then
         // tombstone the device-memory cells of every table that was pressured (the cell `invalidate`
         // is `&self`, done outside the COW closure on the collected tables).
@@ -10381,7 +10632,17 @@ impl Engine {
         }
     }
 
-    fn apply_mvcc_entry(&mut self, entry: &LogEntry) -> Result<(), EngineError> {
+    /// Apply one committed log entry to the engine state (`&self`). The caller holds the **catalog
+    /// latch** and passes `&mut DdlCatalogState` so a DDL entry's working-map mutation can be made
+    /// atomic with the subsequent catalog-snapshot publish (the caller holds the SAME guard across both
+    /// — PART B). Lock order is fixed: the caller already holds the commit_mutex, then the catalog
+    /// latch. The `apply_*` methods (now `&self`) freely call `self.read_state.*` and the `&self`
+    /// `preflight_*` tree (which reads the published catalog snapshot, never this latch — no reentry).
+    fn apply_mvcc_entry(
+        &self,
+        entry: &LogEntry,
+        cat: &mut DdlCatalogState,
+    ) -> Result<(), EngineError> {
         let Ok(text) = std::str::from_utf8(&entry.payload) else {
             return Ok(());
         };
@@ -10450,140 +10711,158 @@ impl Engine {
                     })?;
                 }
             }
-            Command::CreateSchema(create) => self.apply_create_schema(create)?,
-            Command::DropSchema(drop) => self.apply_drop_schema(drop)?,
-            Command::CreateDatabase(create) => self.apply_create_database(create)?,
-            Command::DropDatabase(drop) => self.apply_drop_database(drop)?,
-            Command::RenameDatabase(rename) => self.apply_rename_database(rename)?,
-            Command::CreateTablespace(create) => self.apply_create_tablespace(create)?,
-            Command::DropTablespace(drop) => self.apply_drop_tablespace(drop)?,
-            Command::RenameTablespace(rename) => self.apply_rename_tablespace(rename)?,
-            Command::CreateTable(create) => self.apply_create_table(create)?,
-            Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
-            Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
-            Command::AddCheckConstraint(add) => self.apply_add_check_constraint(add)?,
-            Command::AddForeignKey(add) => self.apply_add_foreign_key(add, commit_seq)?,
-            Command::AddColumn(add) => self.apply_add_column(add, commit_seq)?,
-            Command::RenameTable(rename) => self.apply_rename_table(rename, commit_seq)?,
-            Command::RenameColumn(rename) => self.apply_rename_column(rename)?,
-            Command::RenameConstraint(rename) => self.apply_rename_constraint(rename)?,
-            Command::DropColumn(drop) => self.apply_drop_column(drop, commit_seq)?,
-            Command::DropConstraint(drop) => self.apply_drop_constraint(drop)?,
-            Command::CreateIndex(create) => self.apply_create_index(create)?,
-            Command::RenameIndex(rename) => self.apply_rename_index(rename)?,
-            Command::CreateView(create) => self.apply_create_view(create)?,
-            Command::RenameView(rename) => self.apply_rename_view(rename)?,
+            Command::CreateSchema(create) => self.apply_create_schema(cat, create)?,
+            Command::DropSchema(drop) => self.apply_drop_schema(cat, drop)?,
+            Command::CreateDatabase(create) => self.apply_create_database(cat, create)?,
+            Command::DropDatabase(drop) => self.apply_drop_database(cat, drop)?,
+            Command::RenameDatabase(rename) => self.apply_rename_database(cat, rename)?,
+            Command::CreateTablespace(create) => self.apply_create_tablespace(cat, create)?,
+            Command::DropTablespace(drop) => self.apply_drop_tablespace(cat, drop)?,
+            Command::RenameTablespace(rename) => self.apply_rename_tablespace(cat, rename)?,
+            Command::CreateTable(create) => self.apply_create_table(cat, create)?,
+            Command::AddPrimaryKey(add) => self.apply_add_primary_key(cat, add)?,
+            Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(cat, add)?,
+            Command::AddCheckConstraint(add) => self.apply_add_check_constraint(cat, add)?,
+            Command::AddForeignKey(add) => self.apply_add_foreign_key(cat, add, commit_seq)?,
+            Command::AddColumn(add) => self.apply_add_column(cat, add, commit_seq)?,
+            Command::RenameTable(rename) => self.apply_rename_table(cat, rename, commit_seq)?,
+            Command::RenameColumn(rename) => self.apply_rename_column(cat, rename)?,
+            Command::RenameConstraint(rename) => self.apply_rename_constraint(cat, rename)?,
+            Command::DropColumn(drop) => self.apply_drop_column(cat, drop, commit_seq)?,
+            Command::DropConstraint(drop) => self.apply_drop_constraint(cat, drop)?,
+            Command::CreateIndex(create) => self.apply_create_index(cat, create)?,
+            Command::RenameIndex(rename) => self.apply_rename_index(cat, rename)?,
+            Command::CreateView(create) => self.apply_create_view(cat, create)?,
+            Command::RenameView(rename) => self.apply_rename_view(cat, rename)?,
             Command::CreateMaterializedView(create) => {
-                self.apply_create_materialized_view(create)?
+                self.apply_create_materialized_view(cat, create)?
             }
             Command::RefreshMaterializedView(refresh) => {
-                self.apply_refresh_materialized_view(refresh)?
+                self.apply_refresh_materialized_view(cat, refresh)?
             }
             Command::RenameMaterializedView(rename) => {
-                self.apply_rename_materialized_view(rename)?
+                self.apply_rename_materialized_view(cat, rename)?
             }
-            Command::CreateFunction(create) => self.apply_create_function(create)?,
-            Command::RenameFunction(rename) => self.apply_rename_function(rename)?,
-            Command::DropFunction(drop) => self.apply_drop_function(drop)?,
+            Command::CreateFunction(create) => self.apply_create_function(cat, create)?,
+            Command::RenameFunction(rename) => self.apply_rename_function(cat, rename)?,
+            Command::DropFunction(drop) => self.apply_drop_function(cat, drop)?,
             Command::SelectFunction(_) => {}
-            Command::CreateSequence(create) => self.apply_create_sequence(create)?,
-            Command::CreateDomain(create) => self.apply_create_domain(create)?,
+            Command::CreateSequence(create) => self.apply_create_sequence(cat, create)?,
+            Command::CreateDomain(create) => self.apply_create_domain(cat, create)?,
             Command::SequenceNextVal(nextval) => {
-                self.apply_sequence_nextval(nextval)?;
+                self.apply_sequence_nextval(cat, nextval)?;
             }
             Command::SequenceSetVal(setval) => {
-                self.apply_sequence_setval(setval)?;
+                self.apply_sequence_setval(cat, setval)?;
             }
-            Command::RenameSequence(rename) => self.apply_rename_sequence(rename)?,
-            Command::DropTable(drop) => self.apply_drop_table(drop, commit_seq)?,
-            Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, commit_seq)?,
-            Command::DropIndex(drop) => self.apply_drop_index(drop)?,
-            Command::DropView(drop) => self.apply_drop_view(drop)?,
-            Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop)?,
-            Command::DropSequence(drop) => self.apply_drop_sequence(drop)?,
-            Command::DropDomain(drop) => self.apply_drop_domain(drop)?,
-            Command::CreatePublication(create) => self.apply_create_publication(create)?,
-            Command::DropPublication(drop) => self.apply_drop_publication(drop)?,
-            Command::CreateSubscription(create) => self.apply_create_subscription(create)?,
-            Command::DropSubscription(drop) => self.apply_drop_subscription(drop)?,
-            Command::CreateRole(create) => self.apply_create_role(create)?,
-            Command::DropRole(drop) => self.apply_drop_role(drop)?,
-            Command::RenameRole(rename) => self.apply_rename_role(rename)?,
+            Command::RenameSequence(rename) => self.apply_rename_sequence(cat, rename)?,
+            Command::DropTable(drop) => self.apply_drop_table(cat, drop, commit_seq)?,
+            Command::TruncateTable(truncate) => {
+                self.apply_truncate_table(cat, truncate, commit_seq)?
+            }
+            Command::DropIndex(drop) => self.apply_drop_index(cat, drop)?,
+            Command::DropView(drop) => self.apply_drop_view(cat, drop)?,
+            Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(cat, drop)?,
+            Command::DropSequence(drop) => self.apply_drop_sequence(cat, drop)?,
+            Command::DropDomain(drop) => self.apply_drop_domain(cat, drop)?,
+            Command::CreatePublication(create) => self.apply_create_publication(cat, create)?,
+            Command::DropPublication(drop) => self.apply_drop_publication(cat, drop)?,
+            Command::CreateSubscription(create) => self.apply_create_subscription(cat, create)?,
+            Command::DropSubscription(drop) => self.apply_drop_subscription(cat, drop)?,
+            Command::CreateRole(create) => self.apply_create_role(cat, create)?,
+            Command::DropRole(drop) => self.apply_drop_role(cat, drop)?,
+            Command::RenameRole(rename) => self.apply_rename_role(cat, rename)?,
             Command::GrantTable(grant) => self.apply_grant_acl(
+                cat,
                 &grant.relation,
                 grant.kind,
                 &grant.grantee,
                 &grant.privileges,
             )?,
             Command::RevokeTable(revoke) => self.apply_revoke_acl(
+                cat,
                 &revoke.relation,
                 revoke.kind,
                 &revoke.grantee,
                 &revoke.privileges,
             )?,
             Command::GrantSchema(grant) => {
-                self.apply_grant_schema_acl(&grant.schema, &grant.grantee, &grant.privileges)?
+                self.apply_grant_schema_acl(cat, &grant.schema, &grant.grantee, &grant.privileges)?
             }
-            Command::RevokeSchema(revoke) => {
-                self.apply_revoke_schema_acl(&revoke.schema, &revoke.grantee, &revoke.privileges)?
-            }
-            Command::GrantDatabase(grant) => {
-                self.apply_grant_database_acl(&grant.database, &grant.grantee, &grant.privileges)?
-            }
+            Command::RevokeSchema(revoke) => self.apply_revoke_schema_acl(
+                cat,
+                &revoke.schema,
+                &revoke.grantee,
+                &revoke.privileges,
+            )?,
+            Command::GrantDatabase(grant) => self.apply_grant_database_acl(
+                cat,
+                &grant.database,
+                &grant.grantee,
+                &grant.privileges,
+            )?,
             Command::RevokeDatabase(revoke) => self.apply_revoke_database_acl(
+                cat,
                 &revoke.database,
                 &revoke.grantee,
                 &revoke.privileges,
             )?,
             Command::GrantTablespace(grant) => self.apply_grant_tablespace_acl(
+                cat,
                 &grant.tablespace,
                 &grant.grantee,
                 &grant.privileges,
             )?,
             Command::RevokeTablespace(revoke) => self.apply_revoke_tablespace_acl(
+                cat,
                 &revoke.tablespace,
                 &revoke.grantee,
                 &revoke.privileges,
             )?,
-            Command::GrantFunction(grant) => {
-                self.apply_grant_function_acl(&grant.function, &grant.grantee, &grant.privileges)?
-            }
+            Command::GrantFunction(grant) => self.apply_grant_function_acl(
+                cat,
+                &grant.function,
+                &grant.grantee,
+                &grant.privileges,
+            )?,
             Command::RevokeFunction(revoke) => self.apply_revoke_function_acl(
+                cat,
                 &revoke.function,
                 &revoke.grantee,
                 &revoke.privileges,
             )?,
             Command::GrantDefaultTablePrivileges(grant) => {
-                self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)?
+                self.apply_grant_default_table_privileges(cat, &grant.grantee, &grant.privileges)?
             }
-            Command::RevokeDefaultTablePrivileges(revoke) => {
-                self.apply_revoke_default_table_privileges(&revoke.grantee, &revoke.privileges)?
-            }
-            Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
-            Command::CommentOn(comment) => self.apply_comment_on(comment)?,
-            Command::Insert(insert) => self.apply_insert(insert, commit_seq)?,
-            Command::Delete(delete) => self.apply_delete(delete, commit_seq)?,
-            Command::Update(update) => self.apply_update(update, commit_seq)?,
+            Command::RevokeDefaultTablePrivileges(revoke) => self
+                .apply_revoke_default_table_privileges(cat, &revoke.grantee, &revoke.privileges)?,
+            Command::AlterColumnDefault(alter) => self.apply_alter_column_default(cat, alter)?,
+            Command::CommentOn(comment) => self.apply_comment_on(cat, comment)?,
+            Command::Insert(insert) => self.apply_insert(cat, insert, commit_seq)?,
+            Command::Delete(delete) => self.apply_delete(cat, delete, commit_seq)?,
+            Command::Update(update) => self.apply_update(cat, update, commit_seq)?,
             _ => {}
         }
 
         Ok(())
     }
 
-    fn apply_create_view(&mut self, create: CreateView) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&create.name)
-            || self
-                .relational_materialized_views
-                .contains_key(&create.name)
-            || self.relational_sequences.contains_key(&create.name)
-            || (!create.or_replace && self.relational_views.contains_key(&create.name))
+    fn apply_create_view(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateView,
+    ) -> Result<(), EngineError> {
+        if cat.relational_catalog.contains_key(&create.name)
+            || cat.relational_materialized_views.contains_key(&create.name)
+            || cat.relational_sequences.contains_key(&create.name)
+            || (!create.or_replace && cat.relational_views.contains_key(&create.name))
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
         }
-        if self
+        if cat
             .relational_materialized_views
             .contains_key(&create.query.table)
         {
@@ -10596,29 +10875,28 @@ impl Engine {
                 "cannot replace view because another view depends on it".to_string(),
             ));
         }
-        if self.relational_views.contains_key(&create.query.table) {
+        if cat.relational_views.contains_key(&create.query.table) {
             if self.relational_view_depends_on(&create.query.table, &create.name) {
                 return Err(EngineError::ApplyFailed(
                     "view dependency cycle is unsupported".to_string(),
                 ));
             }
-        } else if !self.relational_catalog.contains_key(&create.query.table) {
+        } else if !cat.relational_catalog.contains_key(&create.query.table) {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" does not exist",
                 create.query.table
             )));
         }
-        let (oid, acl) = if let Some(existing) = self.relational_views.get(&create.name) {
+        let (oid, acl) = if let Some(existing) = cat.relational_views.get(&create.name) {
             (existing.oid, existing.acl.clone())
         } else {
-            let oid = self.relational_next_oid;
-            self.relational_next_oid =
-                self.relational_next_oid.checked_add(1).ok_or_else(|| {
-                    EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
-                })?;
+            let oid = cat.relational_next_oid;
+            cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
+                EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
+            })?;
             (oid, BTreeMap::new())
         };
-        self.relational_views.insert(
+        cat.relational_views.insert(
             create.name.clone(),
             RelationalView {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -10643,40 +10921,47 @@ impl Engine {
         target: &str,
         seen: &mut BTreeSet<String>,
     ) -> bool {
+        let cat = self.catalog_snapshot();
         if view == target {
             return true;
         }
         if !seen.insert(view.to_string()) {
             return false;
         }
-        let Some(view) = self.relational_views.get(view) else {
+        let Some(view) = cat.relational_views.get(view) else {
             return false;
         };
         self.relational_view_depends_on_inner(&view.query.table, target, seen)
     }
 
     fn relational_view_has_dependents(&self, view: &str) -> bool {
-        self.relational_views.iter().any(|(candidate, _)| {
+        let cat = self.catalog_snapshot();
+        cat.relational_views.iter().any(|(candidate, _)| {
             candidate != view && self.relational_view_depends_on(candidate, view)
         })
     }
 
     fn apply_create_materialized_view(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         create: CreateMaterializedView,
     ) -> Result<(), EngineError> {
         self.preflight_create_materialized_view(&create)?;
+        // This SELECT runs INSIDE the commit critical section (the commit_mutex is held); suppress the
+        // deep read executor's leader re-check on this thread so it does not self-deadlock re-locking it.
         let result = self
-            .execute_relational_select(&create.query)
+            .skip_leader_check_during_internal_read(|engine| {
+                engine.execute_relational_select(&create.query)
+            })
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed(
                 "relational materialized view OID allocation exhausted".to_string(),
             )
         })?;
         let mut columns = Vec::with_capacity(result.columns.len());
-        let mut next_column_id = self.relational_next_column_id;
+        let mut next_column_id = cat.relational_next_column_id;
         for (idx, column) in result.columns.into_iter().enumerate() {
             let attnum = i16::try_from(idx + 1).map_err(|_| {
                 EngineError::ApplyFailed(
@@ -10701,13 +10986,13 @@ impl Engine {
                 type_size: column.type_size,
             });
         }
-        self.relational_next_column_id = next_column_id;
+        cat.relational_next_column_id = next_column_id;
         let rows = if create.with_data {
             result.rows
         } else {
             Vec::new()
         };
-        self.relational_materialized_views.insert(
+        cat.relational_materialized_views.insert(
             create.name.clone(),
             RelationalMaterializedView {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -10724,11 +11009,12 @@ impl Engine {
     }
 
     fn apply_refresh_materialized_view(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         refresh: RefreshMaterializedView,
     ) -> Result<(), EngineError> {
         self.preflight_refresh_materialized_view(&refresh)?;
-        let existing = self
+        let existing = cat
             .relational_materialized_views
             .get(&refresh.name)
             .ok_or_else(|| {
@@ -10739,8 +11025,11 @@ impl Engine {
             })?;
         let query = existing.query.clone();
         let columns = existing.columns.clone();
+        // Mid-commit read (commit_mutex held): suppress the read executor's leader re-check.
         let result = self
-            .execute_relational_select(&query)
+            .skip_leader_check_during_internal_read(|engine| {
+                engine.execute_relational_select(&query)
+            })
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         if result.columns.len() != columns.len()
             || result
@@ -10753,7 +11042,7 @@ impl Engine {
                 "materialized view refresh changed the result shape".to_string(),
             ));
         }
-        let view = self
+        let view = cat
             .relational_materialized_views
             .get_mut(&refresh.name)
             .expect("materialized view existence preflighted");
@@ -10762,20 +11051,21 @@ impl Engine {
     }
 
     fn apply_create_function(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         create: gpu_db_protocol::CreateFunction,
     ) -> Result<(), EngineError> {
-        if self.relational_functions.contains_key(&create.name) {
+        if cat.relational_functions.contains_key(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
                 "function \"{}\" already exists",
                 create.name
             )));
         }
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational function OID allocation exhausted".to_string())
         })?;
-        self.relational_functions.insert(
+        cat.relational_functions.insert(
             create.name.clone(),
             RelationalFunction {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -10790,47 +11080,52 @@ impl Engine {
     }
 
     fn apply_drop_function(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         drop: gpu_db_protocol::DropFunction,
     ) -> Result<(), EngineError> {
-        if !drop.if_exists && !self.relational_functions.contains_key(&drop.name) {
+        if !drop.if_exists && !cat.relational_functions.contains_key(&drop.name) {
             return Err(EngineError::ApplyFailed(format!(
                 "function \"{}\" does not exist",
                 drop.name
             )));
         }
-        self.relational_functions.remove(&drop.name);
-        self.relational_comments
+        cat.relational_functions.remove(&drop.name);
+        cat.relational_comments
             .remove(&RelationalCommentTarget::Function {
                 function: drop.name,
             });
         Ok(())
     }
 
-    fn apply_rename_function(&mut self, rename: RenameFunction) -> Result<(), EngineError> {
-        if !self.relational_functions.contains_key(&rename.old_name) {
+    fn apply_rename_function(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameFunction,
+    ) -> Result<(), EngineError> {
+        if !cat.relational_functions.contains_key(&rename.old_name) {
             return Err(EngineError::ApplyFailed(format!(
                 "function \"{}\" does not exist",
                 rename.old_name
             )));
         }
-        if self.relational_functions.contains_key(&rename.new_name) {
+        if cat.relational_functions.contains_key(&rename.new_name) {
             return Err(EngineError::ApplyFailed(format!(
                 "function \"{}\" already exists",
                 rename.new_name
             )));
         }
-        let Some(mut function) = self.relational_functions.remove(&rename.old_name) else {
+        let Some(mut function) = cat.relational_functions.remove(&rename.old_name) else {
             return Ok(());
         };
         function.name = rename.new_name.clone();
-        self.relational_functions
+        cat.relational_functions
             .insert(rename.new_name.clone(), function);
         let old_target = RelationalCommentTarget::Function {
             function: rename.old_name,
         };
-        if let Some(comment) = self.relational_comments.remove(&old_target) {
-            self.relational_comments.insert(
+        if let Some(comment) = cat.relational_comments.remove(&old_target) {
+            cat.relational_comments.insert(
                 RelationalCommentTarget::Function {
                     function: rename.new_name,
                 },
@@ -10840,24 +11135,26 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_create_sequence(&mut self, create: CreateSequence) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&create.name)
-            || self.relational_views.contains_key(&create.name)
-            || self
-                .relational_materialized_views
-                .contains_key(&create.name)
-            || self.relational_sequences.contains_key(&create.name)
+    fn apply_create_sequence(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateSequence,
+    ) -> Result<(), EngineError> {
+        if cat.relational_catalog.contains_key(&create.name)
+            || cat.relational_views.contains_key(&create.name)
+            || cat.relational_materialized_views.contains_key(&create.name)
+            || cat.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
         }
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational sequence OID allocation exhausted".to_string())
         })?;
-        self.relational_sequences.insert(
+        cat.relational_sequences.insert(
             create.name.clone(),
             RelationalSequence {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -10871,20 +11168,26 @@ impl Engine {
         Ok(())
     }
 
-    fn create_implicit_sequence(&mut self, name: &str) -> Result<(), EngineError> {
-        self.apply_create_sequence(CreateSequence {
-            name: name.to_string(),
-        })
+    fn create_implicit_sequence(
+        &self,
+        cat: &mut DdlCatalogState,
+        name: &str,
+    ) -> Result<(), EngineError> {
+        self.apply_create_sequence(
+            cat,
+            CreateSequence {
+                name: name.to_string(),
+            },
+        )
     }
 
     fn preflight_create_domain(&self, create: &CreateDomain) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&create.name)
-            || self.relational_views.contains_key(&create.name)
-            || self
-                .relational_materialized_views
-                .contains_key(&create.name)
-            || self.relational_sequences.contains_key(&create.name)
-            || self.relational_domains.contains_key(&create.name)
+        let cat = self.catalog_snapshot();
+        if cat.relational_catalog.contains_key(&create.name)
+            || cat.relational_views.contains_key(&create.name)
+            || cat.relational_materialized_views.contains_key(&create.name)
+            || cat.relational_sequences.contains_key(&create.name)
+            || cat.relational_domains.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "type \"{}\" already exists",
@@ -10894,13 +11197,17 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_create_domain(&mut self, create: CreateDomain) -> Result<(), EngineError> {
+    fn apply_create_domain(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateDomain,
+    ) -> Result<(), EngineError> {
         self.preflight_create_domain(&create)?;
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational domain OID allocation exhausted".to_string())
         })?;
-        self.relational_domains.insert(
+        cat.relational_domains.insert(
             create.name.clone(),
             RelationalDomain {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -10913,6 +11220,7 @@ impl Engine {
     }
 
     fn preflight_drop_domain(&self, drop: &DropDomain) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.domains {
             if !seen.insert(name) {
@@ -10921,13 +11229,13 @@ impl Engine {
                     name
                 )));
             }
-            if !drop.if_exists && !self.relational_domains.contains_key(name) {
+            if !drop.if_exists && !cat.relational_domains.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "domain \"{}\" does not exist",
                     name
                 )));
             }
-            if self.relational_catalog.values().any(|table| {
+            if cat.relational_catalog.values().any(|table| {
                 table
                     .columns
                     .iter()
@@ -10942,11 +11250,15 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_domain(&mut self, drop: DropDomain) -> Result<(), EngineError> {
+    fn apply_drop_domain(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropDomain,
+    ) -> Result<(), EngineError> {
         self.preflight_drop_domain(&drop)?;
         for name in &drop.domains {
-            self.relational_domains.remove(name);
-            self.relational_comments
+            cat.relational_domains.remove(name);
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Domain {
                     domain: name.clone(),
                 });
@@ -10958,8 +11270,9 @@ impl Engine {
         &self,
         column: &mut ColumnDef,
     ) -> Result<(u32, i16), EngineError> {
+        let cat = self.catalog_snapshot();
         if let Some(domain_name) = column.domain.as_ref() {
-            let domain = self.relational_domains.get(domain_name).ok_or_else(|| {
+            let domain = cat.relational_domains.get(domain_name).ok_or_else(|| {
                 EngineError::ApplyFailed(format!("type \"{}\" does not exist", domain_name))
             })?;
             column.ty = domain.base_type;
@@ -10970,10 +11283,11 @@ impl Engine {
     }
 
     fn preflight_implicit_sequence_name(&self, name: &str) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(name)
-            || self.relational_views.contains_key(name)
-            || self.relational_materialized_views.contains_key(name)
-            || self.relational_sequences.contains_key(name)
+        let cat = self.catalog_snapshot();
+        if cat.relational_catalog.contains_key(name)
+            || cat.relational_views.contains_key(name)
+            || cat.relational_materialized_views.contains_key(name)
+            || cat.relational_sequences.contains_key(name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{name}\" already exists"
@@ -10996,9 +11310,13 @@ impl Engine {
         }
     }
 
-    fn apply_sequence_nextval(&mut self, nextval: SequenceNextVal) -> Result<i64, EngineError> {
+    fn apply_sequence_nextval(
+        &self,
+        cat: &mut DdlCatalogState,
+        nextval: SequenceNextVal,
+    ) -> Result<i64, EngineError> {
         self.preflight_sequence_target(&nextval.name)?;
-        let sequence = self
+        let sequence = cat
             .relational_sequences
             .get_mut(&nextval.name)
             .expect("sequence target preflighted");
@@ -11016,15 +11334,19 @@ impl Engine {
     }
 
     fn evaluate_column_default(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         default: &ColumnDefault,
     ) -> Result<SqlValue, EngineError> {
         match default {
             ColumnDefault::Literal(value) => Ok(value.clone()),
             ColumnDefault::SequenceNextVal { sequence, .. } => {
-                let value = self.apply_sequence_nextval(SequenceNextVal {
-                    name: sequence.clone(),
-                })?;
+                let value = self.apply_sequence_nextval(
+                    cat,
+                    SequenceNextVal {
+                        name: sequence.clone(),
+                    },
+                )?;
                 i32::try_from(value).map(SqlValue::Int4).map_err(|_| {
                     EngineError::ApplyFailed(
                         "sequence value is out of range for int4 default".to_string(),
@@ -11050,7 +11372,8 @@ impl Engine {
             ColumnDefault::SequenceNextVal { sequence, .. } => {
                 self.preflight_sequence_target(sequence)?;
                 let entry = seq_state.entry(sequence.clone()).or_insert_with(|| {
-                    let seq = self
+                    let catalog = self.catalog_snapshot();
+                    let seq = catalog
                         .relational_sequences
                         .get(sequence)
                         .expect("sequence target preflighted");
@@ -11074,9 +11397,13 @@ impl Engine {
         }
     }
 
-    fn apply_sequence_setval(&mut self, setval: SequenceSetVal) -> Result<i64, EngineError> {
+    fn apply_sequence_setval(
+        &self,
+        cat: &mut DdlCatalogState,
+        setval: SequenceSetVal,
+    ) -> Result<i64, EngineError> {
         self.preflight_sequence_target(&setval.name)?;
-        let sequence = self
+        let sequence = cat
             .relational_sequences
             .get_mut(&setval.name)
             .expect("sequence target preflighted");
@@ -11085,28 +11412,36 @@ impl Engine {
         Ok(setval.value)
     }
 
-    fn apply_create_schema(&mut self, create: CreateSchema) -> Result<(), EngineError> {
+    fn apply_create_schema(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateSchema,
+    ) -> Result<(), EngineError> {
         if create.name != PUBLIC_SCHEMA_NAME {
             return Err(EngineError::ApplyFailed(format!(
                 "schema \"{}\" is not supported",
                 create.name
             )));
         }
-        if self.relational_public_schema_exists
+        if cat.relational_public_schema_exists
             && !create.if_not_exists
-            && !self.relational_public_schema_implicit
+            && !cat.relational_public_schema_implicit
         {
             return Err(EngineError::ApplyFailed(format!(
                 "schema \"{}\" already exists",
                 create.name
             )));
         }
-        self.relational_public_schema_exists = true;
-        self.relational_public_schema_implicit = false;
+        cat.relational_public_schema_exists = true;
+        cat.relational_public_schema_implicit = false;
         Ok(())
     }
 
-    fn apply_drop_schema(&mut self, drop: DropSchema) -> Result<(), EngineError> {
+    fn apply_drop_schema(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropSchema,
+    ) -> Result<(), EngineError> {
         if drop.name != PUBLIC_SCHEMA_NAME {
             if drop.if_exists {
                 return Ok(());
@@ -11116,7 +11451,7 @@ impl Engine {
                 drop.name
             )));
         }
-        if !self.relational_public_schema_exists {
+        if !cat.relational_public_schema_exists {
             if drop.if_exists {
                 return Ok(());
             }
@@ -11125,49 +11460,55 @@ impl Engine {
                 drop.name
             )));
         }
-        if !self.relational_catalog.is_empty()
-            || !self.relational_views.is_empty()
-            || !self.relational_materialized_views.is_empty()
-            || !self.relational_functions.is_empty()
-            || !self.relational_sequences.is_empty()
-            || !self.relational_domains.is_empty()
-            || !self.relational_publications.is_empty()
-            || !self.relational_subscriptions.is_empty()
+        if !cat.relational_catalog.is_empty()
+            || !cat.relational_views.is_empty()
+            || !cat.relational_materialized_views.is_empty()
+            || !cat.relational_functions.is_empty()
+            || !cat.relational_sequences.is_empty()
+            || !cat.relational_domains.is_empty()
+            || !cat.relational_publications.is_empty()
+            || !cat.relational_subscriptions.is_empty()
         {
             return Err(EngineError::ApplyFailed(format!(
                 "cannot drop non-empty schema \"{}\"",
                 drop.name
             )));
         }
-        self.relational_public_schema_exists = false;
-        self.relational_public_schema_implicit = false;
-        self.relational_schema_acl.clear();
-        self.relational_comments
+        cat.relational_public_schema_exists = false;
+        cat.relational_public_schema_implicit = false;
+        cat.relational_schema_acl.clear();
+        cat.relational_comments
             .remove(&RelationalCommentTarget::Schema { schema: drop.name });
         Ok(())
     }
 
     fn database_exists(&self, database: &str) -> bool {
-        database == "postgres" || self.relational_databases.contains_key(database)
+        let cat = self.catalog_snapshot();
+        database == "postgres" || cat.relational_databases.contains_key(database)
     }
 
     fn tablespace_exists(&self, tablespace: &str) -> bool {
+        let cat = self.catalog_snapshot();
         matches!(tablespace, "pg_default" | "pg_global")
-            || self.relational_tablespaces.contains_key(tablespace)
+            || cat.relational_tablespaces.contains_key(tablespace)
     }
 
-    fn apply_create_database(&mut self, create: CreateDatabase) -> Result<(), EngineError> {
+    fn apply_create_database(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateDatabase,
+    ) -> Result<(), EngineError> {
         if self.database_exists(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
                 "database \"{}\" already exists",
                 create.name
             )));
         }
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational database OID allocation exhausted".to_string())
         })?;
-        self.relational_databases.insert(
+        cat.relational_databases.insert(
             create.name.clone(),
             RelationalDatabase {
                 name: create.name,
@@ -11178,7 +11519,11 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_database(&mut self, drop: DropDatabase) -> Result<(), EngineError> {
+    fn apply_drop_database(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropDatabase,
+    ) -> Result<(), EngineError> {
         let mut seen = BTreeSet::new();
         for database in &drop.names {
             if !seen.insert(database.clone()) {
@@ -11192,7 +11537,7 @@ impl Engine {
                     "cannot drop bootstrap database \"postgres\"".to_string(),
                 ));
             }
-            if !drop.if_exists && !self.relational_databases.contains_key(database) {
+            if !drop.if_exists && !cat.relational_databases.contains_key(database) {
                 return Err(EngineError::ApplyFailed(format!(
                     "database \"{}\" does not exist",
                     database
@@ -11200,8 +11545,8 @@ impl Engine {
             }
         }
         for database in &drop.names {
-            self.relational_databases.remove(database);
-            self.relational_comments
+            cat.relational_databases.remove(database);
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Database {
                     database: database.clone(),
                 });
@@ -11209,13 +11554,17 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_rename_database(&mut self, rename: RenameDatabase) -> Result<(), EngineError> {
+    fn apply_rename_database(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameDatabase,
+    ) -> Result<(), EngineError> {
         if rename.old_name == "postgres" {
             return Err(EngineError::ApplyFailed(
                 "cannot rename bootstrap database \"postgres\"".to_string(),
             ));
         }
-        if !self.relational_databases.contains_key(&rename.old_name) {
+        if !cat.relational_databases.contains_key(&rename.old_name) {
             return Err(EngineError::ApplyFailed(format!(
                 "database \"{}\" does not exist",
                 rename.old_name
@@ -11227,37 +11576,41 @@ impl Engine {
                 rename.new_name
             )));
         }
-        let mut database = self
+        let mut database = cat
             .relational_databases
             .remove(&rename.old_name)
             .expect("database existence checked");
         database.name = rename.new_name.clone();
-        self.relational_databases
+        cat.relational_databases
             .insert(rename.new_name.clone(), database);
         let old_target = RelationalCommentTarget::Database {
             database: rename.old_name,
         };
-        if let Some(comment) = self.relational_comments.remove(&old_target) {
+        if let Some(comment) = cat.relational_comments.remove(&old_target) {
             let new_target = RelationalCommentTarget::Database {
                 database: rename.new_name,
             };
-            self.relational_comments.insert(new_target, comment);
+            cat.relational_comments.insert(new_target, comment);
         }
         Ok(())
     }
 
-    fn apply_create_tablespace(&mut self, create: CreateTablespace) -> Result<(), EngineError> {
+    fn apply_create_tablespace(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateTablespace,
+    ) -> Result<(), EngineError> {
         if self.tablespace_exists(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
                 "tablespace \"{}\" already exists",
                 create.name
             )));
         }
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational tablespace OID allocation exhausted".to_string())
         })?;
-        self.relational_tablespaces.insert(
+        cat.relational_tablespaces.insert(
             create.name.clone(),
             RelationalTablespace {
                 name: create.name,
@@ -11269,7 +11622,11 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_tablespace(&mut self, drop: DropTablespace) -> Result<(), EngineError> {
+    fn apply_drop_tablespace(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropTablespace,
+    ) -> Result<(), EngineError> {
         let mut seen = BTreeSet::new();
         for tablespace in &drop.names {
             if !seen.insert(tablespace.clone()) {
@@ -11284,7 +11641,7 @@ impl Engine {
                     tablespace
                 )));
             }
-            if !drop.if_exists && !self.relational_tablespaces.contains_key(tablespace) {
+            if !drop.if_exists && !cat.relational_tablespaces.contains_key(tablespace) {
                 return Err(EngineError::ApplyFailed(format!(
                     "tablespace \"{}\" does not exist",
                     tablespace
@@ -11292,8 +11649,8 @@ impl Engine {
             }
         }
         for tablespace in &drop.names {
-            self.relational_tablespaces.remove(tablespace);
-            self.relational_comments
+            cat.relational_tablespaces.remove(tablespace);
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Tablespace {
                     tablespace: tablespace.clone(),
                 });
@@ -11301,14 +11658,18 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_rename_tablespace(&mut self, rename: RenameTablespace) -> Result<(), EngineError> {
+    fn apply_rename_tablespace(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameTablespace,
+    ) -> Result<(), EngineError> {
         if matches!(rename.old_name.as_str(), "pg_default" | "pg_global") {
             return Err(EngineError::ApplyFailed(format!(
                 "cannot rename bootstrap tablespace \"{}\"",
                 rename.old_name
             )));
         }
-        if !self.relational_tablespaces.contains_key(&rename.old_name) {
+        if !cat.relational_tablespaces.contains_key(&rename.old_name) {
             return Err(EngineError::ApplyFailed(format!(
                 "tablespace \"{}\" does not exist",
                 rename.old_name
@@ -11320,39 +11681,43 @@ impl Engine {
                 rename.new_name
             )));
         }
-        let mut tablespace = self
+        let mut tablespace = cat
             .relational_tablespaces
             .remove(&rename.old_name)
             .expect("tablespace existence checked");
         tablespace.name = rename.new_name.clone();
-        self.relational_tablespaces
+        cat.relational_tablespaces
             .insert(rename.new_name.clone(), tablespace);
         let old_target = RelationalCommentTarget::Tablespace {
             tablespace: rename.old_name,
         };
-        if let Some(comment) = self.relational_comments.remove(&old_target) {
+        if let Some(comment) = cat.relational_comments.remove(&old_target) {
             let new_target = RelationalCommentTarget::Tablespace {
                 tablespace: rename.new_name,
             };
-            self.relational_comments.insert(new_target, comment);
+            cat.relational_comments.insert(new_target, comment);
         }
         Ok(())
     }
 
-    fn apply_create_table(&mut self, create: CreateTable) -> Result<(), EngineError> {
-        if !self.relational_public_schema_exists {
+    fn apply_create_table(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateTable,
+    ) -> Result<(), EngineError> {
+        if !cat.relational_public_schema_exists {
             return Err(EngineError::ApplyFailed(format!(
                 "schema \"{}\" does not exist",
                 PUBLIC_SCHEMA_NAME
             )));
         }
-        if self.relational_catalog.contains_key(&create.table)
-            || self.relational_views.contains_key(&create.table)
-            || self
+        if cat.relational_catalog.contains_key(&create.table)
+            || cat.relational_views.contains_key(&create.table)
+            || cat
                 .relational_materialized_views
                 .contains_key(&create.table)
-            || self.relational_sequences.contains_key(&create.table)
-            || self.relational_domains.contains_key(&create.table)
+            || cat.relational_sequences.contains_key(&create.table)
+            || cat.relational_domains.contains_key(&create.table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -11368,8 +11733,8 @@ impl Engine {
                 )));
             }
         }
-        let oid = self.relational_next_oid;
-        let next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        let next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational table OID allocation exhausted".to_string())
         })?;
         let implicit_sequences = create
@@ -11387,7 +11752,7 @@ impl Engine {
             self.preflight_implicit_sequence_name(sequence)?;
         }
         let mut columns = Vec::with_capacity(create.columns.len());
-        let mut next_column_id = self.relational_next_column_id;
+        let mut next_column_id = cat.relational_next_column_id;
         for (idx, mut column) in create.columns.into_iter().enumerate() {
             let (type_oid, type_size) = self.resolve_column_domain_type(&mut column)?;
             if let Some(default) = column.default.as_ref() {
@@ -11476,12 +11841,12 @@ impl Engine {
                 value: check.filter.value,
             });
         }
-        self.relational_next_oid = next_oid;
+        cat.relational_next_oid = next_oid;
         for sequence in &implicit_sequences {
-            self.create_implicit_sequence(sequence)?;
+            self.create_implicit_sequence(cat, sequence)?;
         }
-        let next_oid = self.relational_next_oid.max(next_oid);
-        self.relational_catalog.insert(
+        let next_oid = cat.relational_next_oid.max(next_oid);
+        cat.relational_catalog.insert(
             name.clone(),
             RelationalTable {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
@@ -11491,33 +11856,34 @@ impl Engine {
                 indexes,
                 check_constraints: checks,
                 foreign_keys: Vec::new(),
-                acl: self.relational_default_table_acl.clone(),
+                acl: cat.relational_default_table_acl.clone(),
             },
         );
-        self.relational_next_oid = next_oid;
-        self.relational_next_column_id = next_column_id;
+        cat.relational_next_oid = next_oid;
+        cat.relational_next_column_id = next_column_id;
         Ok(())
     }
 
     fn apply_add_primary_key(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         add: gpu_db_protocol::AddPrimaryKey,
     ) -> Result<(), EngineError> {
-        if self
+        if cat
             .relational_catalog
             .values()
             .any(|table| table.indexes.iter().any(|index| index.name == add.name))
-            || self.relational_catalog.contains_key(&add.name)
-            || self.relational_views.contains_key(&add.name)
-            || self.relational_materialized_views.contains_key(&add.name)
-            || self.relational_sequences.contains_key(&add.name)
+            || cat.relational_catalog.contains_key(&add.name)
+            || cat.relational_views.contains_key(&add.name)
+            || cat.relational_materialized_views.contains_key(&add.name)
+            || cat.relational_sequences.contains_key(&add.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 add.name
             )));
         }
-        if self
+        if cat
             .relational_catalog
             .get(&add.table)
             .is_some_and(|table| table.indexes.iter().any(|index| index.primary_key))
@@ -11533,36 +11899,39 @@ impl Engine {
             column: add.column,
             unique: true,
         };
-        self.apply_create_index_with_constraint_flags(create, true, false)
+        self.apply_create_index_with_constraint_flags(cat, create, true, false)
     }
 
-    fn apply_create_index(&mut self, create: CreateIndex) -> Result<(), EngineError> {
-        self.apply_create_index_with_constraint_flags(create, false, false)
+    fn apply_create_index(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateIndex,
+    ) -> Result<(), EngineError> {
+        self.apply_create_index_with_constraint_flags(cat, create, false, false)
     }
 
     fn apply_create_index_with_constraint_flags(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         create: CreateIndex,
         primary_key: bool,
         unique_constraint: bool,
     ) -> Result<(), EngineError> {
-        if self
+        if cat
             .relational_catalog
             .values()
             .any(|table| table.indexes.iter().any(|index| index.name == create.name))
-            || self.relational_catalog.contains_key(&create.name)
-            || self.relational_views.contains_key(&create.name)
-            || self
-                .relational_materialized_views
-                .contains_key(&create.name)
-            || self.relational_sequences.contains_key(&create.name)
+            || cat.relational_catalog.contains_key(&create.name)
+            || cat.relational_views.contains_key(&create.name)
+            || cat.relational_materialized_views.contains_key(&create.name)
+            || cat.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
         }
-        let table = self
+        let table = cat
             .relational_catalog
             .get(&create.table)
             .ok_or_else(|| {
@@ -11586,7 +11955,7 @@ impl Engine {
             let rows = self.visible_relational_rows(&table, visibility)?;
             Self::validate_unique_values(&rows, column_idx, &create.name)?;
         }
-        self.relational_catalog
+        cat.relational_catalog
             .get_mut(&create.table)
             .expect("table existence validated")
             .indexes
@@ -11601,19 +11970,27 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_add_unique_constraint(&mut self, add: AddUniqueConstraint) -> Result<(), EngineError> {
+    fn apply_add_unique_constraint(
+        &self,
+        cat: &mut DdlCatalogState,
+        add: AddUniqueConstraint,
+    ) -> Result<(), EngineError> {
         let create = CreateIndex {
             name: add.name,
             table: add.table,
             column: add.column,
             unique: true,
         };
-        self.apply_create_index_with_constraint_flags(create, false, true)
+        self.apply_create_index_with_constraint_flags(cat, create, false, true)
     }
 
-    fn apply_add_check_constraint(&mut self, add: AddCheckConstraint) -> Result<(), EngineError> {
+    fn apply_add_check_constraint(
+        &self,
+        cat: &mut DdlCatalogState,
+        add: AddCheckConstraint,
+    ) -> Result<(), EngineError> {
         self.preflight_add_check_constraint(&add)?;
-        let table = self
+        let table = cat
             .relational_catalog
             .get_mut(&add.table)
             .expect("table existence preflighted");
@@ -11627,12 +12004,13 @@ impl Engine {
     }
 
     fn apply_add_foreign_key(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         add: AddForeignKey,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         self.preflight_add_foreign_key(&add, txn_id)?;
-        let table = self
+        let table = cat
             .relational_catalog
             .get_mut(&add.table)
             .expect("table existence preflighted");
@@ -11645,8 +12023,12 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_constraint(&mut self, drop: DropConstraint) -> Result<(), EngineError> {
-        let Some(table) = self.relational_catalog.get_mut(&drop.table) else {
+    fn apply_drop_constraint(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropConstraint,
+    ) -> Result<(), EngineError> {
+        let Some(table) = cat.relational_catalog.get_mut(&drop.table) else {
             if drop.table_if_exists {
                 return Ok(());
             }
@@ -11679,11 +12061,11 @@ impl Engine {
                 drop.name
             )));
         }
-        self.relational_comments
+        cat.relational_comments
             .remove(&RelationalCommentTarget::Index {
                 index: drop.name.clone(),
             });
-        self.relational_comments
+        cat.relational_comments
             .remove(&RelationalCommentTarget::Constraint {
                 table: drop.table,
                 constraint: drop.name,
@@ -11691,19 +12073,23 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_rename_constraint(&mut self, rename: RenameConstraint) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&rename.table)
-            || self
+    fn apply_rename_constraint(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameConstraint,
+    ) -> Result<(), EngineError> {
+        if cat.relational_views.contains_key(&rename.table)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.table)
-            || self.relational_sequences.contains_key(&rename.table)
+            || cat.relational_sequences.contains_key(&rename.table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 rename.table
             )));
         }
-        if !self.relational_catalog.contains_key(&rename.table) {
+        if !cat.relational_catalog.contains_key(&rename.table) {
             if rename.table_if_exists {
                 return Ok(());
             }
@@ -11712,24 +12098,24 @@ impl Engine {
                 rename.table
             )));
         }
-        if self.relational_catalog.values().any(|candidate| {
+        if cat.relational_catalog.values().any(|candidate| {
             candidate
                 .indexes
                 .iter()
                 .any(|index| index.name == rename.new_name)
-        }) || self.relational_catalog.contains_key(&rename.new_name)
-            || self.relational_views.contains_key(&rename.new_name)
-            || self
+        }) || cat.relational_catalog.contains_key(&rename.new_name)
+            || cat.relational_views.contains_key(&rename.new_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.new_name)
-            || self.relational_sequences.contains_key(&rename.new_name)
+            || cat.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
             )));
         }
-        let table = self
+        let table = cat
             .relational_catalog
             .get_mut(&rename.table)
             .expect("table existence validated");
@@ -11759,8 +12145,8 @@ impl Engine {
         let old_index_target = RelationalCommentTarget::Index {
             index: rename.old_name.clone(),
         };
-        if let Some(comment) = self.relational_comments.remove(&old_index_target) {
-            self.relational_comments.insert(
+        if let Some(comment) = cat.relational_comments.remove(&old_index_target) {
+            cat.relational_comments.insert(
                 RelationalCommentTarget::Index {
                     index: rename.new_name.clone(),
                 },
@@ -11771,8 +12157,8 @@ impl Engine {
             table: rename.table.clone(),
             constraint: rename.old_name,
         };
-        if let Some(comment) = self.relational_comments.remove(&old_constraint_target) {
-            self.relational_comments.insert(
+        if let Some(comment) = cat.relational_comments.remove(&old_constraint_target) {
+            cat.relational_comments.insert(
                 RelationalCommentTarget::Constraint {
                     table: rename.table,
                     constraint: rename.new_name,
@@ -11929,10 +12315,11 @@ impl Engine {
     }
 
     fn preflight_add_check_constraint(&self, add: &AddCheckConstraint) -> Result<(), EngineError> {
-        let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+        let cat = self.catalog_snapshot();
+        let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
         })?;
-        if self.relational_catalog.values().any(|candidate| {
+        if cat.relational_catalog.values().any(|candidate| {
             candidate.indexes.iter().any(|index| index.name == add.name)
                 || candidate
                     .check_constraints
@@ -11942,10 +12329,10 @@ impl Engine {
                     .foreign_keys
                     .iter()
                     .any(|constraint| constraint.name == add.name)
-        }) || self.relational_catalog.contains_key(&add.name)
-            || self.relational_views.contains_key(&add.name)
-            || self.relational_materialized_views.contains_key(&add.name)
-            || self.relational_sequences.contains_key(&add.name)
+        }) || cat.relational_catalog.contains_key(&add.name)
+            || cat.relational_views.contains_key(&add.name)
+            || cat.relational_materialized_views.contains_key(&add.name)
+            || cat.relational_sequences.contains_key(&add.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "constraint \"{}\" already exists",
@@ -11982,15 +12369,16 @@ impl Engine {
         add: &AddForeignKey,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         if add.table == add.referenced_table {
             return Err(EngineError::ApplyFailed(
                 "self-referential foreign keys are not supported".to_string(),
             ));
         }
-        let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+        let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
         })?;
-        let referenced_table = self
+        let referenced_table = cat
             .relational_catalog
             .get(&add.referenced_table)
             .ok_or_else(|| {
@@ -11999,7 +12387,7 @@ impl Engine {
                     add.referenced_table
                 ))
             })?;
-        if self.relational_catalog.values().any(|candidate| {
+        if cat.relational_catalog.values().any(|candidate| {
             candidate.indexes.iter().any(|index| index.name == add.name)
                 || candidate
                     .check_constraints
@@ -12009,10 +12397,10 @@ impl Engine {
                     .foreign_keys
                     .iter()
                     .any(|constraint| constraint.name == add.name)
-        }) || self.relational_catalog.contains_key(&add.name)
-            || self.relational_views.contains_key(&add.name)
-            || self.relational_materialized_views.contains_key(&add.name)
-            || self.relational_sequences.contains_key(&add.name)
+        }) || cat.relational_catalog.contains_key(&add.name)
+            || cat.relational_views.contains_key(&add.name)
+            || cat.relational_materialized_views.contains_key(&add.name)
+            || cat.relational_sequences.contains_key(&add.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "constraint \"{}\" already exists",
@@ -12058,10 +12446,14 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_index(&mut self, drop: DropIndex) -> Result<(), EngineError> {
+    fn apply_drop_index(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropIndex,
+    ) -> Result<(), EngineError> {
         if !drop.if_exists {
             for name in &drop.names {
-                if !self
+                if !cat
                     .relational_catalog
                     .values()
                     .any(|table| table.indexes.iter().any(|index| index.name == *name))
@@ -12075,7 +12467,7 @@ impl Engine {
         }
         let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
         let mut dropped_constraints = Vec::new();
-        for table in self.relational_catalog.values_mut() {
+        for table in cat.relational_catalog.values_mut() {
             dropped_constraints.extend(
                 table
                     .indexes
@@ -12091,24 +12483,25 @@ impl Engine {
                 .retain(|index| !drop_names.contains(&index.name));
         }
         for name in &drop.names {
-            self.relational_comments
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Index {
                     index: name.clone(),
                 });
         }
         for (table, constraint) in dropped_constraints {
-            self.relational_comments
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Constraint { table, constraint });
         }
         Ok(())
     }
 
     fn preflight_drop_index(&self, drop: &DropIndex) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         if drop.if_exists {
             return Ok(());
         }
         for name in &drop.names {
-            if !self
+            if !cat
                 .relational_catalog
                 .values()
                 .any(|table| table.indexes.iter().any(|index| index.name == *name))
@@ -12120,7 +12513,7 @@ impl Engine {
             }
         }
         let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
-        if self.relational_catalog.values().any(|table| {
+        if cat.relational_catalog.values().any(|table| {
             table.foreign_keys.iter().any(|constraint| {
                 drop_names.contains(&table.name)
                     || drop_names.contains(&constraint.referenced_table)
@@ -12133,8 +12526,12 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_rename_index(&mut self, rename: RenameIndex) -> Result<(), EngineError> {
-        if self.relational_catalog.values().any(|table| {
+    fn apply_rename_index(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameIndex,
+    ) -> Result<(), EngineError> {
+        if cat.relational_catalog.values().any(|table| {
             table
                 .indexes
                 .iter()
@@ -12146,7 +12543,7 @@ impl Engine {
             )));
         }
 
-        for table in self.relational_catalog.values_mut() {
+        for table in cat.relational_catalog.values_mut() {
             let Some(index) = table
                 .indexes
                 .iter_mut()
@@ -12164,8 +12561,8 @@ impl Engine {
             let old_target = RelationalCommentTarget::Index {
                 index: rename.old_name,
             };
-            if let Some(comment) = self.relational_comments.remove(&old_target) {
-                self.relational_comments.insert(
+            if let Some(comment) = cat.relational_comments.remove(&old_target) {
+                cat.relational_comments.insert(
                     RelationalCommentTarget::Index {
                         index: rename.new_name,
                     },
@@ -12182,22 +12579,23 @@ impl Engine {
     }
 
     fn apply_rename_table(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         rename: RenameTable,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&rename.old_name)
-            || self
+        if cat.relational_views.contains_key(&rename.old_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.old_name)
-            || self.relational_sequences.contains_key(&rename.old_name)
+            || cat.relational_sequences.contains_key(&rename.old_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 rename.old_name
             )));
         }
-        if !self.relational_catalog.contains_key(&rename.old_name) {
+        if !cat.relational_catalog.contains_key(&rename.old_name) {
             if rename.if_exists {
                 return Ok(());
             }
@@ -12206,19 +12604,19 @@ impl Engine {
                 rename.old_name
             )));
         }
-        if self.relational_catalog.contains_key(&rename.new_name)
-            || self.relational_views.contains_key(&rename.new_name)
-            || self
+        if cat.relational_catalog.contains_key(&rename.new_name)
+            || cat.relational_views.contains_key(&rename.new_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.new_name)
-            || self.relational_sequences.contains_key(&rename.new_name)
+            || cat.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
             )));
         }
-        if self
+        if cat
             .relational_views
             .values()
             .any(|view| view.query.table == rename.old_name)
@@ -12228,7 +12626,7 @@ impl Engine {
                 rename.old_name
             )));
         }
-        let Some(mut table) = self.relational_catalog.remove(&rename.old_name) else {
+        let Some(mut table) = cat.relational_catalog.remove(&rename.old_name) else {
             return Ok(());
         };
 
@@ -12323,9 +12721,9 @@ impl Engine {
                 Ok::<(), EngineError>(())
             })?;
 
-        self.relational_catalog
+        cat.relational_catalog
             .insert(rename.new_name.clone(), table.clone());
-        for candidate in self.relational_catalog.values_mut() {
+        for candidate in cat.relational_catalog.values_mut() {
             for foreign_key in &mut candidate.foreign_keys {
                 if foreign_key.referenced_table == rename.old_name {
                     foreign_key.referenced_table = rename.new_name.clone();
@@ -12334,7 +12732,7 @@ impl Engine {
         }
 
         let mut retargeted_comments = Vec::new();
-        self.relational_comments
+        cat.relational_comments
             .retain(|target, comment| match target {
                 RelationalCommentTarget::Table { table } if table == &rename.old_name => {
                     retargeted_comments.push((
@@ -12370,7 +12768,7 @@ impl Engine {
                 _ => true,
             });
         for (target, comment) in retargeted_comments {
-            self.relational_comments.insert(target, comment);
+            cat.relational_comments.insert(target, comment);
         }
         self.read_state
             .residency
@@ -12382,11 +12780,16 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_table(&mut self, drop: DropTable, txn_id: TxnId) -> Result<(), EngineError> {
+    fn apply_drop_table(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropTable,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
         self.preflight_drop_table(&drop)?;
 
         for name in &drop.names {
-            let Some(table) = self.relational_catalog.remove(name) else {
+            let Some(table) = cat.relational_catalog.remove(name) else {
                 continue;
             };
             let prefix = relational_key_prefix(&table.name);
@@ -12426,7 +12829,7 @@ impl Engine {
                 .iter()
                 .map(|index| index.name.clone())
                 .collect::<BTreeSet<_>>();
-            self.relational_comments.retain(|target, _| match target {
+            cat.relational_comments.retain(|target, _| match target {
                 RelationalCommentTarget::Table { table }
                 | RelationalCommentTarget::Column { table, .. }
                 | RelationalCommentTarget::Constraint { table, .. } => table != name,
@@ -12453,6 +12856,7 @@ impl Engine {
     }
 
     fn preflight_drop_table(&self, drop: &DropTable) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
             if !seen.insert(name) {
@@ -12461,19 +12865,19 @@ impl Engine {
                     name
                 )));
             }
-            if self.relational_views.contains_key(name) {
+            if cat.relational_views.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a table",
                     name
                 )));
             }
-            if self.relational_sequences.contains_key(name) {
+            if cat.relational_sequences.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a table",
                     name
                 )));
             }
-            if !drop.if_exists && !self.relational_catalog.contains_key(name) {
+            if !drop.if_exists && !cat.relational_catalog.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" does not exist",
                     name
@@ -12484,29 +12888,30 @@ impl Engine {
     }
 
     fn apply_truncate_table(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         truncate: TruncateTable,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&truncate.name)
-            || self
+        if cat.relational_views.contains_key(&truncate.name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&truncate.name)
-            || self.relational_sequences.contains_key(&truncate.name)
+            || cat.relational_sequences.contains_key(&truncate.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 truncate.name
             )));
         }
-        let table = self
+        let table = cat
             .relational_catalog
             .get(&truncate.name)
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", truncate.name))
             })?
             .clone();
-        if self.relational_catalog.values().any(|candidate| {
+        if cat.relational_catalog.values().any(|candidate| {
             candidate
                 .foreign_keys
                 .iter()
@@ -12533,7 +12938,7 @@ impl Engine {
             BTreeSet::new()
         };
         for sequence in &restart_sequences {
-            if !self.relational_sequences.contains_key(sequence) {
+            if !cat.relational_sequences.contains_key(sequence) {
                 return Err(EngineError::ApplyFailed(format!(
                     "sequence \"{sequence}\" does not exist"
                 )));
@@ -12574,7 +12979,7 @@ impl Engine {
         }
         if truncate.restart_identity {
             for sequence in restart_sequences {
-                let sequence_state = self
+                let sequence_state = cat
                     .relational_sequences
                     .get_mut(&sequence)
                     .expect("restart identity sequence preflighted");
@@ -12585,28 +12990,33 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_view(&mut self, drop: DropView) -> Result<(), EngineError> {
+    fn apply_drop_view(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropView,
+    ) -> Result<(), EngineError> {
         self.preflight_drop_view(&drop)?;
         for name in &drop.names {
-            if self.relational_views.remove(name).is_none() {
+            if cat.relational_views.remove(name).is_none() {
                 continue;
             }
-            self.relational_comments
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::View { view: name.clone() });
         }
         Ok(())
     }
 
     fn apply_drop_materialized_view(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         drop: DropMaterializedView,
     ) -> Result<(), EngineError> {
         self.preflight_drop_materialized_view(&drop)?;
         for name in &drop.names {
-            if self.relational_materialized_views.remove(name).is_none() {
+            if cat.relational_materialized_views.remove(name).is_none() {
                 continue;
             }
-            self.relational_comments
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::MaterializedView {
                     materialized_view: name.clone(),
                 });
@@ -12614,13 +13024,17 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_sequence(&mut self, drop: DropSequence) -> Result<(), EngineError> {
+    fn apply_drop_sequence(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropSequence,
+    ) -> Result<(), EngineError> {
         self.preflight_drop_sequence(&drop)?;
         for name in &drop.names {
-            if self.relational_sequences.remove(name).is_none() {
+            if cat.relational_sequences.remove(name).is_none() {
                 continue;
             }
-            self.relational_comments
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Sequence {
                     sequence: name.clone(),
                 });
@@ -12629,7 +13043,8 @@ impl Engine {
     }
 
     fn preflight_create_publication(&self, create: &CreatePublication) -> Result<(), EngineError> {
-        if self.relational_publications.contains_key(&create.name) {
+        let cat = self.catalog_snapshot();
+        if cat.relational_publications.contains_key(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
                 "publication \"{}\" already exists",
                 create.name
@@ -12650,17 +13065,21 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_create_publication(&mut self, create: CreatePublication) -> Result<(), EngineError> {
+    fn apply_create_publication(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreatePublication,
+    ) -> Result<(), EngineError> {
         self.preflight_create_publication(&create)?;
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational publication OID allocation exhausted".to_string())
         })?;
         let (all_tables, tables) = match create.target {
             PublicationTarget::AllTables => (true, Vec::new()),
             PublicationTarget::Tables(tables) => (false, tables),
         };
-        self.relational_publications.insert(
+        cat.relational_publications.insert(
             create.name.clone(),
             RelationalPublication {
                 name: create.name,
@@ -12673,21 +13092,26 @@ impl Engine {
     }
 
     fn role_exists(&self, role: &str) -> bool {
-        role == "postgres" || self.relational_roles.contains_key(role)
+        let cat = self.catalog_snapshot();
+        role == "postgres" || cat.relational_roles.contains_key(role)
     }
 
-    fn apply_create_role(&mut self, create: CreateRole) -> Result<(), EngineError> {
-        if create.name == "postgres" || self.relational_roles.contains_key(&create.name) {
+    fn apply_create_role(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateRole,
+    ) -> Result<(), EngineError> {
+        if create.name == "postgres" || cat.relational_roles.contains_key(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
                 "role \"{}\" already exists",
                 create.name
             )));
         }
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational OID counter overflow".to_string())
         })?;
-        self.relational_roles.insert(
+        cat.relational_roles.insert(
             create.name.clone(),
             RelationalRole {
                 name: create.name,
@@ -12699,43 +13123,48 @@ impl Engine {
     }
 
     fn role_has_dependencies(&self, role: &str) -> bool {
-        self.relational_comments
+        let cat = self.catalog_snapshot();
+        cat.relational_comments
             .contains_key(&RelationalCommentTarget::Role {
                 role: role.to_string(),
             })
-            || self
+            || cat
                 .relational_catalog
                 .values()
                 .any(|table| table.acl.contains_key(role))
-            || self
+            || cat
                 .relational_views
                 .values()
                 .any(|view| view.acl.contains_key(role))
-            || self
+            || cat
                 .relational_materialized_views
                 .values()
                 .any(|view| view.acl.contains_key(role))
-            || self
+            || cat
                 .relational_sequences
                 .values()
                 .any(|sequence| sequence.acl.contains_key(role))
-            || self
+            || cat
                 .relational_databases
                 .values()
                 .any(|database| database.acl.contains_key(role))
-            || self
+            || cat
                 .relational_tablespaces
                 .values()
                 .any(|tablespace| tablespace.acl.contains_key(role))
-            || self
+            || cat
                 .relational_functions
                 .values()
                 .any(|function| function.acl.contains_key(role))
-            || self.relational_schema_acl.contains_key(role)
-            || self.relational_default_table_acl.contains_key(role)
+            || cat.relational_schema_acl.contains_key(role)
+            || cat.relational_default_table_acl.contains_key(role)
     }
 
-    fn apply_drop_role(&mut self, drop: DropRole) -> Result<(), EngineError> {
+    fn apply_drop_role(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropRole,
+    ) -> Result<(), EngineError> {
         let mut seen = BTreeSet::new();
         for role in &drop.names {
             if !seen.insert(role.clone()) {
@@ -12749,13 +13178,13 @@ impl Engine {
                     "cannot drop bootstrap role \"postgres\"".to_string(),
                 ));
             }
-            if !drop.if_exists && !self.relational_roles.contains_key(role) {
+            if !drop.if_exists && !cat.relational_roles.contains_key(role) {
                 return Err(EngineError::ApplyFailed(format!(
                     "role \"{}\" does not exist",
                     role
                 )));
             }
-            if self.relational_roles.contains_key(role) && self.role_has_dependencies(role) {
+            if cat.relational_roles.contains_key(role) && self.role_has_dependencies(role) {
                 return Err(EngineError::ApplyFailed(format!(
                     "role \"{}\" cannot be dropped because dependent metadata exists",
                     role
@@ -12763,18 +13192,22 @@ impl Engine {
             }
         }
         for role in drop.names {
-            self.relational_roles.remove(&role);
+            cat.relational_roles.remove(&role);
         }
         Ok(())
     }
 
-    fn apply_rename_role(&mut self, rename: RenameRole) -> Result<(), EngineError> {
+    fn apply_rename_role(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameRole,
+    ) -> Result<(), EngineError> {
         if rename.old_name == "postgres" {
             return Err(EngineError::ApplyFailed(
                 "cannot rename bootstrap role \"postgres\"".to_string(),
             ));
         }
-        if !self.relational_roles.contains_key(&rename.old_name) {
+        if !cat.relational_roles.contains_key(&rename.old_name) {
             return Err(EngineError::ApplyFailed(format!(
                 "role \"{}\" does not exist",
                 rename.old_name
@@ -12786,68 +13219,69 @@ impl Engine {
                 rename.new_name
             )));
         }
-        let mut role = self
+        let mut role = cat
             .relational_roles
             .remove(&rename.old_name)
             .expect("role existence checked");
         role.name = rename.new_name.clone();
-        self.relational_roles.insert(rename.new_name.clone(), role);
+        cat.relational_roles.insert(rename.new_name.clone(), role);
         let old_target = RelationalCommentTarget::Role {
             role: rename.old_name.clone(),
         };
-        if let Some(comment) = self.relational_comments.remove(&old_target) {
+        if let Some(comment) = cat.relational_comments.remove(&old_target) {
             let new_target = RelationalCommentTarget::Role {
                 role: rename.new_name.clone(),
             };
-            self.relational_comments.insert(new_target, comment);
+            cat.relational_comments.insert(new_target, comment);
         }
-        for table in self.relational_catalog.values_mut() {
+        for table in cat.relational_catalog.values_mut() {
             if let Some(privileges) = table.acl.remove(&rename.old_name) {
                 table.acl.insert(rename.new_name.clone(), privileges);
             }
         }
-        for view in self.relational_views.values_mut() {
+        for view in cat.relational_views.values_mut() {
             if let Some(privileges) = view.acl.remove(&rename.old_name) {
                 view.acl.insert(rename.new_name.clone(), privileges);
             }
         }
-        for view in self.relational_materialized_views.values_mut() {
+        for view in cat.relational_materialized_views.values_mut() {
             if let Some(privileges) = view.acl.remove(&rename.old_name) {
                 view.acl.insert(rename.new_name.clone(), privileges);
             }
         }
-        for sequence in self.relational_sequences.values_mut() {
+        for sequence in cat.relational_sequences.values_mut() {
             if let Some(privileges) = sequence.acl.remove(&rename.old_name) {
                 sequence.acl.insert(rename.new_name.clone(), privileges);
             }
         }
-        for database in self.relational_databases.values_mut() {
+        for database in cat.relational_databases.values_mut() {
             if let Some(privileges) = database.acl.remove(&rename.old_name) {
                 database.acl.insert(rename.new_name.clone(), privileges);
             }
         }
-        for tablespace in self.relational_tablespaces.values_mut() {
+        for tablespace in cat.relational_tablespaces.values_mut() {
             if let Some(privileges) = tablespace.acl.remove(&rename.old_name) {
                 tablespace.acl.insert(rename.new_name.clone(), privileges);
             }
         }
-        for function in self.relational_functions.values_mut() {
+        for function in cat.relational_functions.values_mut() {
             if let Some(privileges) = function.acl.remove(&rename.old_name) {
                 function.acl.insert(rename.new_name.clone(), privileges);
             }
         }
-        if let Some(privileges) = self.relational_schema_acl.remove(&rename.old_name) {
-            self.relational_schema_acl
+        if let Some(privileges) = cat.relational_schema_acl.remove(&rename.old_name) {
+            cat.relational_schema_acl
                 .insert(rename.new_name.clone(), privileges);
         }
-        if let Some(privileges) = self.relational_default_table_acl.remove(&rename.old_name) {
-            self.relational_default_table_acl
+        if let Some(privileges) = cat.relational_default_table_acl.remove(&rename.old_name) {
+            cat.relational_default_table_acl
                 .insert(rename.new_name, privileges);
         }
         Ok(())
     }
 
     fn preflight_drop_publication(&self, drop: &DropPublication) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
             if !seen.insert(name) {
@@ -12856,7 +13290,7 @@ impl Engine {
                     name
                 )));
             }
-            if !drop.if_exists && !self.relational_publications.contains_key(name) {
+            if !drop.if_exists && !cat.relational_publications.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "publication \"{}\" does not exist",
                     name
@@ -12866,11 +13300,15 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_publication(&mut self, drop: DropPublication) -> Result<(), EngineError> {
+    fn apply_drop_publication(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropPublication,
+    ) -> Result<(), EngineError> {
         self.preflight_drop_publication(&drop)?;
         for name in &drop.names {
-            self.relational_publications.remove(name);
-            self.relational_comments
+            cat.relational_publications.remove(name);
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Publication {
                     publication: name.clone(),
                 });
@@ -12882,7 +13320,8 @@ impl Engine {
         &self,
         create: &CreateSubscription,
     ) -> Result<(), EngineError> {
-        if self.relational_subscriptions.contains_key(&create.name) {
+        let cat = self.catalog_snapshot();
+        if cat.relational_subscriptions.contains_key(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
                 "subscription \"{}\" already exists",
                 create.name
@@ -12896,7 +13335,7 @@ impl Engine {
                     publication
                 )));
             }
-            if !self.relational_publications.contains_key(publication) {
+            if !cat.relational_publications.contains_key(publication) {
                 return Err(EngineError::ApplyFailed(format!(
                     "publication \"{}\" does not exist",
                     publication
@@ -12906,13 +13345,17 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_create_subscription(&mut self, create: CreateSubscription) -> Result<(), EngineError> {
+    fn apply_create_subscription(
+        &self,
+        cat: &mut DdlCatalogState,
+        create: CreateSubscription,
+    ) -> Result<(), EngineError> {
         self.preflight_create_subscription(&create)?;
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+        let oid = cat.relational_next_oid;
+        cat.relational_next_oid = cat.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational subscription OID allocation exhausted".to_string())
         })?;
-        self.relational_subscriptions.insert(
+        cat.relational_subscriptions.insert(
             create.name.clone(),
             RelationalSubscription {
                 name: create.name,
@@ -12926,6 +13369,7 @@ impl Engine {
     }
 
     fn preflight_drop_subscription(&self, drop: &DropSubscription) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
             if !seen.insert(name) {
@@ -12934,7 +13378,7 @@ impl Engine {
                     name
                 )));
             }
-            if !drop.if_exists && !self.relational_subscriptions.contains_key(name) {
+            if !drop.if_exists && !cat.relational_subscriptions.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "subscription \"{}\" does not exist",
                     name
@@ -12944,11 +13388,15 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_drop_subscription(&mut self, drop: DropSubscription) -> Result<(), EngineError> {
+    fn apply_drop_subscription(
+        &self,
+        cat: &mut DdlCatalogState,
+        drop: DropSubscription,
+    ) -> Result<(), EngineError> {
         self.preflight_drop_subscription(&drop)?;
         for name in &drop.names {
-            self.relational_subscriptions.remove(name);
-            self.relational_comments
+            cat.relational_subscriptions.remove(name);
+            cat.relational_comments
                 .remove(&RelationalCommentTarget::Subscription {
                     subscription: name.clone(),
                 });
@@ -12956,10 +13404,14 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_rename_sequence(&mut self, rename: RenameSequence) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&rename.old_name)
-            || self.relational_views.contains_key(&rename.old_name)
-            || self
+    fn apply_rename_sequence(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameSequence,
+    ) -> Result<(), EngineError> {
+        if cat.relational_catalog.contains_key(&rename.old_name)
+            || cat.relational_views.contains_key(&rename.old_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.old_name)
         {
@@ -12968,36 +13420,36 @@ impl Engine {
                 rename.old_name
             )));
         }
-        if !self.relational_sequences.contains_key(&rename.old_name) {
+        if !cat.relational_sequences.contains_key(&rename.old_name) {
             return Err(EngineError::ApplyFailed(format!(
                 "sequence \"{}\" does not exist",
                 rename.old_name
             )));
         }
-        if self.relational_catalog.contains_key(&rename.new_name)
-            || self.relational_views.contains_key(&rename.new_name)
-            || self
+        if cat.relational_catalog.contains_key(&rename.new_name)
+            || cat.relational_views.contains_key(&rename.new_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.new_name)
-            || self.relational_sequences.contains_key(&rename.new_name)
+            || cat.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
             )));
         }
-        let Some(mut sequence) = self.relational_sequences.remove(&rename.old_name) else {
+        let Some(mut sequence) = cat.relational_sequences.remove(&rename.old_name) else {
             return Ok(());
         };
         sequence.name = rename.new_name.clone();
-        self.relational_sequences
+        cat.relational_sequences
             .insert(rename.new_name.clone(), sequence);
 
         let old_target = RelationalCommentTarget::Sequence {
             sequence: rename.old_name,
         };
-        if let Some(comment) = self.relational_comments.remove(&old_target) {
-            self.relational_comments.insert(
+        if let Some(comment) = cat.relational_comments.remove(&old_target) {
+            cat.relational_comments.insert(
                 RelationalCommentTarget::Sequence {
                     sequence: rename.new_name,
                 },
@@ -13008,45 +13460,46 @@ impl Engine {
     }
 
     fn apply_rename_materialized_view(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         rename: RenameMaterializedView,
     ) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&rename.old_name)
-            || self.relational_views.contains_key(&rename.old_name)
-            || self.relational_sequences.contains_key(&rename.old_name)
+        if cat.relational_catalog.contains_key(&rename.old_name)
+            || cat.relational_views.contains_key(&rename.old_name)
+            || cat.relational_sequences.contains_key(&rename.old_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a materialized view",
                 rename.old_name
             )));
         }
-        if self.relational_catalog.contains_key(&rename.new_name)
-            || self.relational_views.contains_key(&rename.new_name)
-            || self
+        if cat.relational_catalog.contains_key(&rename.new_name)
+            || cat.relational_views.contains_key(&rename.new_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.new_name)
-            || self.relational_sequences.contains_key(&rename.new_name)
+            || cat.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
             )));
         }
-        let Some(mut view) = self.relational_materialized_views.remove(&rename.old_name) else {
+        let Some(mut view) = cat.relational_materialized_views.remove(&rename.old_name) else {
             return Err(EngineError::ApplyFailed(format!(
                 "materialized view \"{}\" does not exist",
                 rename.old_name
             )));
         };
         view.name = rename.new_name.clone();
-        self.relational_materialized_views
+        cat.relational_materialized_views
             .insert(rename.new_name.clone(), view);
 
         let old_target = RelationalCommentTarget::MaterializedView {
             materialized_view: rename.old_name,
         };
-        if let Some(comment) = self.relational_comments.remove(&old_target) {
-            self.relational_comments.insert(
+        if let Some(comment) = cat.relational_comments.remove(&old_target) {
+            cat.relational_comments.insert(
                 RelationalCommentTarget::MaterializedView {
                     materialized_view: rename.new_name,
                 },
@@ -13057,12 +13510,11 @@ impl Engine {
     }
 
     fn preflight_create_sequence(&self, create: &CreateSequence) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&create.name)
-            || self.relational_views.contains_key(&create.name)
-            || self
-                .relational_materialized_views
-                .contains_key(&create.name)
-            || self.relational_sequences.contains_key(&create.name)
+        let cat = self.catalog_snapshot();
+        if cat.relational_catalog.contains_key(&create.name)
+            || cat.relational_views.contains_key(&create.name)
+            || cat.relational_materialized_views.contains_key(&create.name)
+            || cat.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -13073,15 +13525,16 @@ impl Engine {
     }
 
     fn preflight_sequence_target(&self, name: &str) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(name)
-            || self.relational_views.contains_key(name)
-            || self.relational_materialized_views.contains_key(name)
+        let cat = self.catalog_snapshot();
+        if cat.relational_catalog.contains_key(name)
+            || cat.relational_views.contains_key(name)
+            || cat.relational_materialized_views.contains_key(name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{name}\" is not a sequence"
             )));
         }
-        if !self.relational_sequences.contains_key(name) {
+        if !cat.relational_sequences.contains_key(name) {
             return Err(EngineError::ApplyFailed(format!(
                 "sequence \"{name}\" does not exist"
             )));
@@ -13090,15 +13543,16 @@ impl Engine {
     }
 
     fn preflight_table_acl_target(&self, table: &str) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(table)
-            || self.relational_materialized_views.contains_key(table)
-            || self.relational_sequences.contains_key(table)
+        let cat = self.catalog_snapshot();
+        if cat.relational_views.contains_key(table)
+            || cat.relational_materialized_views.contains_key(table)
+            || cat.relational_sequences.contains_key(table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{table}\" is not a table"
             )));
         }
-        if !self.relational_catalog.contains_key(table) {
+        if !cat.relational_catalog.contains_key(table) {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{table}\" does not exist"
             )));
@@ -13139,30 +13593,31 @@ impl Engine {
     }
 
     fn acl_relation_kind(&self, relation: &str) -> Option<AclRelationKind> {
-        if self.relational_catalog.contains_key(relation) {
+        let cat = self.catalog_snapshot();
+        if cat.relational_catalog.contains_key(relation) {
             Some(AclRelationKind::Table)
-        } else if self.relational_views.contains_key(relation) {
+        } else if cat.relational_views.contains_key(relation) {
             Some(AclRelationKind::View)
-        } else if self.relational_materialized_views.contains_key(relation) {
+        } else if cat.relational_materialized_views.contains_key(relation) {
             Some(AclRelationKind::MaterializedView)
-        } else if self.relational_sequences.contains_key(relation) {
+        } else if cat.relational_sequences.contains_key(relation) {
             Some(AclRelationKind::Sequence)
         } else {
             None
         }
     }
 
-    fn relational_acl_mut(
-        &mut self,
+    fn relational_acl_mut<'a>(
+        cat: &'a mut DdlCatalogState,
         relation: &str,
-    ) -> Option<&mut BTreeMap<String, BTreeSet<TablePrivilege>>> {
-        if let Some(table) = self.relational_catalog.get_mut(relation) {
+    ) -> Option<&'a mut BTreeMap<String, BTreeSet<TablePrivilege>>> {
+        if let Some(table) = cat.relational_catalog.get_mut(relation) {
             Some(&mut table.acl)
-        } else if let Some(view) = self.relational_views.get_mut(relation) {
+        } else if let Some(view) = cat.relational_views.get_mut(relation) {
             Some(&mut view.acl)
-        } else if let Some(view) = self.relational_materialized_views.get_mut(relation) {
+        } else if let Some(view) = cat.relational_materialized_views.get_mut(relation) {
             Some(&mut view.acl)
-        } else if let Some(sequence) = self.relational_sequences.get_mut(relation) {
+        } else if let Some(sequence) = cat.relational_sequences.get_mut(relation) {
             Some(&mut sequence.acl)
         } else {
             None
@@ -13170,7 +13625,8 @@ impl Engine {
     }
 
     fn apply_grant_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         relation: &str,
         kind: AclRelationKind,
         grantee: &str,
@@ -13178,8 +13634,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.preflight_acl_target(relation, kind)?;
         self.preflight_acl_grantee(grantee)?;
-        let acl = self
-            .relational_acl_mut(relation)
+        let acl = Self::relational_acl_mut(cat, relation)
             .expect("relation ACL target preflighted")
             .entry(grantee.to_string())
             .or_default();
@@ -13190,7 +13645,8 @@ impl Engine {
     }
 
     fn apply_revoke_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         relation: &str,
         kind: AclRelationKind,
         grantee: &str,
@@ -13198,9 +13654,8 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.preflight_acl_target(relation, kind)?;
         self.preflight_acl_grantee(grantee)?;
-        let relation_acl = self
-            .relational_acl_mut(relation)
-            .expect("relation ACL target preflighted");
+        let relation_acl =
+            Self::relational_acl_mut(cat, relation).expect("relation ACL target preflighted");
         if let Some(acl) = relation_acl.get_mut(grantee) {
             for privilege in privileges {
                 acl.remove(privilege);
@@ -13213,7 +13668,8 @@ impl Engine {
     }
 
     fn preflight_function_acl_target(&self, function: &str) -> Result<(), EngineError> {
-        if self.relational_functions.contains_key(function) {
+        let cat = self.catalog_snapshot();
+        if cat.relational_functions.contains_key(function) {
             Ok(())
         } else {
             Err(EngineError::ApplyFailed(format!(
@@ -13223,14 +13679,15 @@ impl Engine {
     }
 
     fn apply_grant_function_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         function: &str,
         grantee: &str,
         privileges: &[FunctionPrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_function_acl_target(function)?;
         self.preflight_acl_grantee(grantee)?;
-        let acl = self
+        let acl = cat
             .relational_functions
             .get_mut(function)
             .expect("function ACL target preflighted")
@@ -13244,14 +13701,15 @@ impl Engine {
     }
 
     fn apply_revoke_function_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         function: &str,
         grantee: &str,
         privileges: &[FunctionPrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_function_acl_target(function)?;
         self.preflight_acl_grantee(grantee)?;
-        let function = self
+        let function = cat
             .relational_functions
             .get_mut(function)
             .expect("function ACL target preflighted");
@@ -13267,7 +13725,8 @@ impl Engine {
     }
 
     fn preflight_schema_acl_target(&self, schema: &str) -> Result<(), EngineError> {
-        if schema != PUBLIC_SCHEMA_NAME || !self.relational_public_schema_exists {
+        let cat = self.catalog_snapshot();
+        if schema != PUBLIC_SCHEMA_NAME || !cat.relational_public_schema_exists {
             return Err(EngineError::ApplyFailed(
                 "schema does not exist".to_string(),
             ));
@@ -13276,14 +13735,15 @@ impl Engine {
     }
 
     fn apply_grant_schema_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         schema: &str,
         grantee: &str,
         privileges: &[SchemaPrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_schema_acl_target(schema)?;
         self.preflight_acl_grantee(grantee)?;
-        let acl = self
+        let acl = cat
             .relational_schema_acl
             .entry(grantee.to_string())
             .or_default();
@@ -13294,31 +13754,33 @@ impl Engine {
     }
 
     fn apply_revoke_schema_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         schema: &str,
         grantee: &str,
         privileges: &[SchemaPrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_schema_acl_target(schema)?;
         self.preflight_acl_grantee(grantee)?;
-        if let Some(acl) = self.relational_schema_acl.get_mut(grantee) {
+        if let Some(acl) = cat.relational_schema_acl.get_mut(grantee) {
             for privilege in privileges {
                 acl.remove(privilege);
             }
             if acl.is_empty() {
-                self.relational_schema_acl.remove(grantee);
+                cat.relational_schema_acl.remove(grantee);
             }
         }
         Ok(())
     }
 
     fn apply_grant_default_table_privileges(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         grantee: &str,
         privileges: &[TablePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_acl_grantee(grantee)?;
-        let acl = self
+        let acl = cat
             .relational_default_table_acl
             .entry(grantee.to_string())
             .or_default();
@@ -13329,24 +13791,26 @@ impl Engine {
     }
 
     fn apply_revoke_default_table_privileges(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         grantee: &str,
         privileges: &[TablePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_acl_grantee(grantee)?;
-        if let Some(acl) = self.relational_default_table_acl.get_mut(grantee) {
+        if let Some(acl) = cat.relational_default_table_acl.get_mut(grantee) {
             for privilege in privileges {
                 acl.remove(privilege);
             }
             if acl.is_empty() {
-                self.relational_default_table_acl.remove(grantee);
+                cat.relational_default_table_acl.remove(grantee);
             }
         }
         Ok(())
     }
 
     fn preflight_database_acl_target(&self, database: &str) -> Result<(), EngineError> {
-        if self.relational_databases.contains_key(database) {
+        let cat = self.catalog_snapshot();
+        if cat.relational_databases.contains_key(database) {
             Ok(())
         } else {
             Err(EngineError::ApplyFailed(format!(
@@ -13356,14 +13820,15 @@ impl Engine {
     }
 
     fn apply_grant_database_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         database: &str,
         grantee: &str,
         privileges: &[DatabasePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_database_acl_target(database)?;
         self.preflight_acl_grantee(grantee)?;
-        let Some(database) = self.relational_databases.get_mut(database) else {
+        let Some(database) = cat.relational_databases.get_mut(database) else {
             return Ok(());
         };
         let acl = database.acl.entry(grantee.to_string()).or_default();
@@ -13374,14 +13839,15 @@ impl Engine {
     }
 
     fn apply_revoke_database_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         database: &str,
         grantee: &str,
         privileges: &[DatabasePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_database_acl_target(database)?;
         self.preflight_acl_grantee(grantee)?;
-        let Some(database) = self.relational_databases.get_mut(database) else {
+        let Some(database) = cat.relational_databases.get_mut(database) else {
             return Ok(());
         };
         if let Some(acl) = database.acl.get_mut(grantee) {
@@ -13396,7 +13862,8 @@ impl Engine {
     }
 
     fn preflight_tablespace_acl_target(&self, tablespace: &str) -> Result<(), EngineError> {
-        if self.relational_tablespaces.contains_key(tablespace) {
+        let cat = self.catalog_snapshot();
+        if cat.relational_tablespaces.contains_key(tablespace) {
             Ok(())
         } else {
             Err(EngineError::ApplyFailed(format!(
@@ -13406,14 +13873,15 @@ impl Engine {
     }
 
     fn apply_grant_tablespace_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         tablespace: &str,
         grantee: &str,
         privileges: &[TablespacePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_tablespace_acl_target(tablespace)?;
         self.preflight_acl_grantee(grantee)?;
-        let Some(tablespace) = self.relational_tablespaces.get_mut(tablespace) else {
+        let Some(tablespace) = cat.relational_tablespaces.get_mut(tablespace) else {
             return Ok(());
         };
         let acl = tablespace.acl.entry(grantee.to_string()).or_default();
@@ -13424,14 +13892,15 @@ impl Engine {
     }
 
     fn apply_revoke_tablespace_acl(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         tablespace: &str,
         grantee: &str,
         privileges: &[TablespacePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_tablespace_acl_target(tablespace)?;
         self.preflight_acl_grantee(grantee)?;
-        let Some(tablespace) = self.relational_tablespaces.get_mut(tablespace) else {
+        let Some(tablespace) = cat.relational_tablespaces.get_mut(tablespace) else {
             return Ok(());
         };
         if let Some(acl) = tablespace.acl.get_mut(grantee) {
@@ -13449,20 +13918,19 @@ impl Engine {
         &self,
         create: &CreateMaterializedView,
     ) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&create.name)
-            || self.relational_views.contains_key(&create.name)
-            || self
-                .relational_materialized_views
-                .contains_key(&create.name)
-            || self.relational_sequences.contains_key(&create.name)
+        let cat = self.catalog_snapshot();
+        if cat.relational_catalog.contains_key(&create.name)
+            || cat.relational_views.contains_key(&create.name)
+            || cat.relational_materialized_views.contains_key(&create.name)
+            || cat.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
             )));
         }
-        if self.relational_views.contains_key(&create.query.table)
-            || self
+        if cat.relational_views.contains_key(&create.query.table)
+            || cat
                 .relational_materialized_views
                 .contains_key(&create.query.table)
         {
@@ -13470,7 +13938,7 @@ impl Engine {
                 "materialized views over views are unsupported".to_string(),
             ));
         }
-        if !self.relational_catalog.contains_key(&create.query.table) {
+        if !cat.relational_catalog.contains_key(&create.query.table) {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" does not exist",
                 create.query.table
@@ -13483,16 +13951,17 @@ impl Engine {
         &self,
         refresh: &RefreshMaterializedView,
     ) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&refresh.name)
-            || self.relational_views.contains_key(&refresh.name)
-            || self.relational_sequences.contains_key(&refresh.name)
+        let cat = self.catalog_snapshot();
+        if cat.relational_catalog.contains_key(&refresh.name)
+            || cat.relational_views.contains_key(&refresh.name)
+            || cat.relational_sequences.contains_key(&refresh.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a materialized view",
                 refresh.name
             )));
         }
-        if !self
+        if !cat
             .relational_materialized_views
             .contains_key(&refresh.name)
         {
@@ -13505,6 +13974,7 @@ impl Engine {
     }
 
     fn preflight_drop_view(&self, drop: &DropView) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
         for name in &drop.names {
@@ -13514,31 +13984,31 @@ impl Engine {
                     name
                 )));
             }
-            if self.relational_catalog.contains_key(name) {
+            if cat.relational_catalog.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a view",
                     name
                 )));
             }
-            if self.relational_sequences.contains_key(name) {
+            if cat.relational_sequences.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a view",
                     name
                 )));
             }
-            if self.relational_materialized_views.contains_key(name) {
+            if cat.relational_materialized_views.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a view",
                     name
                 )));
             }
-            if !drop.if_exists && !self.relational_views.contains_key(name) {
+            if !drop.if_exists && !cat.relational_views.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "view \"{}\" does not exist",
                     name
                 )));
             }
-            if self.relational_views.iter().any(|(candidate, _)| {
+            if cat.relational_views.iter().any(|(candidate, _)| {
                 !drop_names.contains(candidate) && self.relational_view_depends_on(candidate, name)
             }) {
                 return Err(EngineError::ApplyFailed(format!(
@@ -13554,6 +14024,7 @@ impl Engine {
         &self,
         drop: &DropMaterializedView,
     ) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
             if !seen.insert(name) {
@@ -13562,16 +14033,16 @@ impl Engine {
                     name
                 )));
             }
-            if self.relational_catalog.contains_key(name)
-                || self.relational_views.contains_key(name)
-                || self.relational_sequences.contains_key(name)
+            if cat.relational_catalog.contains_key(name)
+                || cat.relational_views.contains_key(name)
+                || cat.relational_sequences.contains_key(name)
             {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a materialized view",
                     name
                 )));
             }
-            if !drop.if_exists && !self.relational_materialized_views.contains_key(name) {
+            if !drop.if_exists && !cat.relational_materialized_views.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "materialized view \"{}\" does not exist",
                     name
@@ -13582,6 +14053,7 @@ impl Engine {
     }
 
     fn preflight_drop_sequence(&self, drop: &DropSequence) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         let mut seen = BTreeSet::new();
         for name in &drop.names {
             if !seen.insert(name) {
@@ -13590,16 +14062,16 @@ impl Engine {
                     name
                 )));
             }
-            if self.relational_catalog.contains_key(name)
-                || self.relational_views.contains_key(name)
-                || self.relational_materialized_views.contains_key(name)
+            if cat.relational_catalog.contains_key(name)
+                || cat.relational_views.contains_key(name)
+                || cat.relational_materialized_views.contains_key(name)
             {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a sequence",
                     name
                 )));
             }
-            if !drop.if_exists && !self.relational_sequences.contains_key(name) {
+            if !drop.if_exists && !cat.relational_sequences.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "sequence \"{}\" does not exist",
                     name
@@ -13609,24 +14081,28 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_rename_view(&mut self, rename: RenameView) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&rename.old_name)
-            || self
+    fn apply_rename_view(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameView,
+    ) -> Result<(), EngineError> {
+        if cat.relational_catalog.contains_key(&rename.old_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.old_name)
-            || self.relational_sequences.contains_key(&rename.old_name)
+            || cat.relational_sequences.contains_key(&rename.old_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a view",
                 rename.old_name
             )));
         }
-        if self.relational_catalog.contains_key(&rename.new_name)
-            || self.relational_views.contains_key(&rename.new_name)
-            || self
+        if cat.relational_catalog.contains_key(&rename.new_name)
+            || cat.relational_views.contains_key(&rename.new_name)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.new_name)
-            || self.relational_sequences.contains_key(&rename.new_name)
+            || cat.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -13639,20 +14115,20 @@ impl Engine {
                 rename.old_name
             )));
         }
-        let Some(mut view) = self.relational_views.remove(&rename.old_name) else {
+        let Some(mut view) = cat.relational_views.remove(&rename.old_name) else {
             return Err(EngineError::ApplyFailed(format!(
                 "view \"{}\" does not exist",
                 rename.old_name
             )));
         };
         view.name = rename.new_name.clone();
-        self.relational_views.insert(rename.new_name.clone(), view);
+        cat.relational_views.insert(rename.new_name.clone(), view);
 
         let old_target = RelationalCommentTarget::View {
             view: rename.old_name,
         };
-        if let Some(comment) = self.relational_comments.remove(&old_target) {
-            self.relational_comments.insert(
+        if let Some(comment) = cat.relational_comments.remove(&old_target) {
+            cat.relational_comments.insert(
                 RelationalCommentTarget::View {
                     view: rename.new_name,
                 },
@@ -13662,7 +14138,11 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_comment_on(&mut self, comment: gpu_db_protocol::CommentOn) -> Result<(), EngineError> {
+    fn apply_comment_on(
+        &self,
+        cat: &mut DdlCatalogState,
+        comment: gpu_db_protocol::CommentOn,
+    ) -> Result<(), EngineError> {
         let target = match comment.target {
             CommentTarget::Database { database } => {
                 if !self.database_exists(&database) {
@@ -13701,7 +14181,7 @@ impl Engine {
                 RelationalCommentTarget::Tablespace { tablespace }
             }
             CommentTarget::Table { table } => {
-                if !self.relational_catalog.contains_key(&table) {
+                if !cat.relational_catalog.contains_key(&table) {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" does not exist",
                         table
@@ -13710,7 +14190,7 @@ impl Engine {
                 RelationalCommentTarget::Table { table }
             }
             CommentTarget::Column { table, column } => {
-                let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
+                let table_ref = cat.relational_catalog.get(&table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
                 })?;
                 let column_ref = table_ref
@@ -13726,7 +14206,7 @@ impl Engine {
                 }
             }
             CommentTarget::Index { index } => {
-                if !self.relational_catalog.values().any(|table| {
+                if !cat.relational_catalog.values().any(|table| {
                     table
                         .indexes
                         .iter()
@@ -13740,10 +14220,10 @@ impl Engine {
                 RelationalCommentTarget::Index { index }
             }
             CommentTarget::View { view } => {
-                if !self.relational_views.contains_key(&view) {
-                    if self.relational_catalog.contains_key(&view)
-                        || self.relational_materialized_views.contains_key(&view)
-                        || self.relational_sequences.contains_key(&view)
+                if !cat.relational_views.contains_key(&view) {
+                    if cat.relational_catalog.contains_key(&view)
+                        || cat.relational_materialized_views.contains_key(&view)
+                        || cat.relational_sequences.contains_key(&view)
                     {
                         return Err(EngineError::ApplyFailed(format!(
                             "relation \"{}\" is not a view",
@@ -13758,13 +14238,13 @@ impl Engine {
                 RelationalCommentTarget::View { view }
             }
             CommentTarget::MaterializedView { materialized_view } => {
-                if !self
+                if !cat
                     .relational_materialized_views
                     .contains_key(&materialized_view)
                 {
-                    if self.relational_catalog.contains_key(&materialized_view)
-                        || self.relational_views.contains_key(&materialized_view)
-                        || self.relational_sequences.contains_key(&materialized_view)
+                    if cat.relational_catalog.contains_key(&materialized_view)
+                        || cat.relational_views.contains_key(&materialized_view)
+                        || cat.relational_sequences.contains_key(&materialized_view)
                     {
                         return Err(EngineError::ApplyFailed(format!(
                             "relation \"{}\" is not a materialized view",
@@ -13779,7 +14259,7 @@ impl Engine {
                 RelationalCommentTarget::MaterializedView { materialized_view }
             }
             CommentTarget::Function { function } => {
-                if !self.relational_functions.contains_key(&function) {
+                if !cat.relational_functions.contains_key(&function) {
                     return Err(EngineError::ApplyFailed(format!(
                         "function \"{}\" does not exist",
                         function
@@ -13797,10 +14277,10 @@ impl Engine {
                 RelationalCommentTarget::Extension { extension }
             }
             CommentTarget::Sequence { sequence } => {
-                if !self.relational_sequences.contains_key(&sequence) {
-                    if self.relational_catalog.contains_key(&sequence)
-                        || self.relational_views.contains_key(&sequence)
-                        || self.relational_materialized_views.contains_key(&sequence)
+                if !cat.relational_sequences.contains_key(&sequence) {
+                    if cat.relational_catalog.contains_key(&sequence)
+                        || cat.relational_views.contains_key(&sequence)
+                        || cat.relational_materialized_views.contains_key(&sequence)
                     {
                         return Err(EngineError::ApplyFailed(format!(
                             "relation \"{}\" is not a sequence",
@@ -13815,7 +14295,7 @@ impl Engine {
                 RelationalCommentTarget::Sequence { sequence }
             }
             CommentTarget::Domain { domain } => {
-                if !self.relational_domains.contains_key(&domain) {
+                if !cat.relational_domains.contains_key(&domain) {
                     return Err(EngineError::ApplyFailed(format!(
                         "domain \"{}\" does not exist",
                         domain
@@ -13824,7 +14304,7 @@ impl Engine {
                 RelationalCommentTarget::Domain { domain }
             }
             CommentTarget::Publication { publication } => {
-                if !self.relational_publications.contains_key(&publication) {
+                if !cat.relational_publications.contains_key(&publication) {
                     return Err(EngineError::ApplyFailed(format!(
                         "publication \"{}\" does not exist",
                         publication
@@ -13833,7 +14313,7 @@ impl Engine {
                 RelationalCommentTarget::Publication { publication }
             }
             CommentTarget::Subscription { subscription } => {
-                if !self.relational_subscriptions.contains_key(&subscription) {
+                if !cat.relational_subscriptions.contains_key(&subscription) {
                     return Err(EngineError::ApplyFailed(format!(
                         "subscription \"{}\" does not exist",
                         subscription
@@ -13842,7 +14322,7 @@ impl Engine {
                 RelationalCommentTarget::Subscription { subscription }
             }
             CommentTarget::Constraint { table, constraint } => {
-                let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
+                let table_ref = cat.relational_catalog.get(&table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
                 })?;
                 if !table_ref.indexes.iter().any(|candidate| {
@@ -13866,19 +14346,20 @@ impl Engine {
             }
         };
         if let Some(value) = comment.comment {
-            self.relational_comments.insert(target, value);
+            cat.relational_comments.insert(target, value);
         } else {
-            self.relational_comments.remove(&target);
+            cat.relational_comments.remove(&target);
         }
         Ok(())
     }
 
     fn apply_alter_column_default(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         alter: gpu_db_protocol::AlterColumnDefault,
     ) -> Result<(), EngineError> {
         if let Some(default) = alter.default.as_ref() {
-            let table = self.relational_catalog.get(&alter.table).ok_or_else(|| {
+            let table = cat.relational_catalog.get(&alter.table).ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", alter.table))
             })?;
             let column = table
@@ -13896,7 +14377,7 @@ impl Engine {
             }
             self.preflight_column_default_target(default)?;
         }
-        let table = self
+        let table = cat
             .relational_catalog
             .get_mut(&alter.table)
             .ok_or_else(|| {
@@ -13918,15 +14399,16 @@ impl Engine {
     }
 
     fn apply_add_column(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         add: gpu_db_protocol::AddColumn,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         let mut column_def = add.column;
         let (type_oid, type_size) = self.resolve_column_domain_type(&mut column_def)?;
-        if self.relational_views.contains_key(&add.table)
-            || self.relational_materialized_views.contains_key(&add.table)
-            || self.relational_sequences.contains_key(&add.table)
+        if cat.relational_views.contains_key(&add.table)
+            || cat.relational_materialized_views.contains_key(&add.table)
+            || cat.relational_sequences.contains_key(&add.table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
@@ -13950,7 +14432,7 @@ impl Engine {
                 column_def.name
             )));
         }
-        let table = self
+        let table = cat
             .relational_catalog
             .get(&add.table)
             .ok_or_else(|| {
@@ -13977,13 +14459,13 @@ impl Engine {
             )?
             .len();
         let default_values = (0..row_count)
-            .map(|_| self.evaluate_column_default(&default))
+            .map(|_| self.evaluate_column_default(cat, &default))
             .collect::<Result<Vec<_>, _>>()?;
         let next_attnum = i16::try_from(table.columns.len() + 1).map_err(|_| {
             EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())
         })?;
-        let column_id = self.relational_next_column_id;
-        let next_column_id = self
+        let column_id = cat.relational_next_column_id;
+        let next_column_id = cat
             .relational_next_column_id
             .checked_add(1)
             .ok_or_else(|| {
@@ -14052,12 +14534,12 @@ impl Engine {
             }
             Ok::<(), EngineError>(())
         })?;
-        let table_ref = self
+        let table_ref = cat
             .relational_catalog
             .get_mut(&add.table)
             .expect("table existence validated");
         table_ref.columns.push(new_column.clone());
-        self.relational_next_column_id = next_column_id;
+        cat.relational_next_column_id = next_column_id;
         self.read_state
             .residency
             .with_snapshots_mut(|snapshots| snapshots.remove(&add.table));
@@ -14065,19 +14547,23 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_rename_column(&mut self, rename: RenameColumn) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&rename.table)
-            || self
+    fn apply_rename_column(
+        &self,
+        cat: &mut DdlCatalogState,
+        rename: RenameColumn,
+    ) -> Result<(), EngineError> {
+        if cat.relational_views.contains_key(&rename.table)
+            || cat
                 .relational_materialized_views
                 .contains_key(&rename.table)
-            || self.relational_sequences.contains_key(&rename.table)
+            || cat.relational_sequences.contains_key(&rename.table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 rename.table
             )));
         }
-        let table = self.relational_catalog.get(&rename.table).ok_or_else(|| {
+        let table = cat.relational_catalog.get(&rename.table).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{}\" does not exist", rename.table))
         })?;
         if !table
@@ -14121,7 +14607,7 @@ impl Engine {
             data.value_index = rebuilt;
         });
 
-        let table_ref = self
+        let table_ref = cat
             .relational_catalog
             .get_mut(&rename.table)
             .expect("table existence validated");
@@ -14151,7 +14637,7 @@ impl Engine {
                 constraint.referenced_column = rename.new_name.clone();
             }
         }
-        for candidate in self.relational_catalog.values_mut() {
+        for candidate in cat.relational_catalog.values_mut() {
             if candidate.name == rename.table {
                 continue;
             }
@@ -14174,22 +14660,23 @@ impl Engine {
     }
 
     fn apply_drop_column(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         drop_column: gpu_db_protocol::DropColumn,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&drop_column.table)
-            || self
+        if cat.relational_views.contains_key(&drop_column.table)
+            || cat
                 .relational_materialized_views
                 .contains_key(&drop_column.table)
-            || self.relational_sequences.contains_key(&drop_column.table)
+            || cat.relational_sequences.contains_key(&drop_column.table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 drop_column.table
             )));
         }
-        let table = self
+        let table = cat
             .relational_catalog
             .get(&drop_column.table)
             .ok_or_else(|| {
@@ -14221,7 +14708,7 @@ impl Engine {
                 .foreign_keys
                 .iter()
                 .any(|constraint| constraint.column == drop_column.column)
-            || self.relational_catalog.values().any(|candidate| {
+            || cat.relational_catalog.values().any(|candidate| {
                 candidate.foreign_keys.iter().any(|constraint| {
                     constraint.referenced_table == drop_column.table
                         && constraint.referenced_column == drop_column.column
@@ -14277,7 +14764,7 @@ impl Engine {
             })?;
 
         let dropped_attnum = table.columns[drop_idx].attnum;
-        let table_ref = self
+        let table_ref = cat
             .relational_catalog
             .get_mut(&drop_column.table)
             .expect("table existence validated");
@@ -14288,7 +14775,7 @@ impl Engine {
             })?;
         }
 
-        let shifted_comments = self
+        let shifted_comments = cat
             .relational_comments
             .iter()
             .filter_map(|(target, comment)| match target {
@@ -14307,14 +14794,14 @@ impl Engine {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        self.relational_comments.retain(|target, _| match target {
+        cat.relational_comments.retain(|target, _| match target {
             RelationalCommentTarget::Column { table, attnum } => {
                 !(table == &drop_column.table && *attnum >= dropped_attnum)
             }
             _ => true,
         });
         for (_, new_target, comment) in shifted_comments {
-            self.relational_comments.insert(new_target, comment);
+            cat.relational_comments.insert(new_target, comment);
         }
         self.read_state
             .residency
@@ -14326,8 +14813,13 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_insert(&mut self, insert: Insert, txn_id: TxnId) -> Result<(), EngineError> {
-        self.apply_insert_with_profile(insert, txn_id, None)
+    fn apply_insert(
+        &self,
+        cat: &mut DdlCatalogState,
+        insert: Insert,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        self.apply_insert_with_profile(cat, insert, txn_id, None)
     }
 
     /// The off-lock read boundary a `prepare_*` runs against (write-half MVCC, Stage 2).
@@ -14719,7 +15211,7 @@ impl Engine {
             Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
         }
         if !table.foreign_keys.is_empty()
-            || self.relational_catalog.values().any(|candidate| {
+            || catalog.relational_catalog.values().any(|candidate| {
                 candidate
                     .foreign_keys
                     .iter()
@@ -14879,7 +15371,8 @@ impl Engine {
     /// pre-Stage-4 `apply_delta` (sequence advance first, then rows + value-index), so the live
     /// serialized apply stays byte-identical to a WAL replay.
     fn apply_delta_serialized(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         mut delta: WriteDelta,
         commit_seq: TxnId,
         profile: Option<&mut RelationalCopyAdmissionProfile>,
@@ -14890,7 +15383,7 @@ impl Engine {
             // final `(last_value, is_called)`.
             let advances = std::mem::take(seq_advances);
             for (sequence, (last_value, is_called)) in advances {
-                if let Some(seq) = self.relational_sequences.get_mut(&sequence) {
+                if let Some(seq) = cat.relational_sequences.get_mut(&sequence) {
                     seq.last_value = last_value;
                     seq.is_called = is_called;
                 }
@@ -14900,7 +15393,8 @@ impl Engine {
     }
 
     fn apply_insert_with_profile(
-        &mut self,
+        &self,
+        cat: &mut DdlCatalogState,
         insert: Insert,
         txn_id: TxnId,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
@@ -14912,25 +15406,35 @@ impl Engine {
         // `next_row_id` and the read visibility match what the in-line apply used.
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_insert(&insert, snapshot, profile.as_deref_mut())?;
-        self.apply_delta_serialized(delta, txn_id, profile)
+        self.apply_delta_serialized(cat, delta, txn_id, profile)
     }
 
-    fn apply_delete(&mut self, delete: Delete, txn_id: TxnId) -> Result<(), EngineError> {
+    fn apply_delete(
+        &self,
+        cat: &mut DdlCatalogState,
+        delete: Delete,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
         // Stage 2 split: PURE prepare (resolve matches + FK preflight + write-set) then a
         // `&mut self` tombstone install. `txn_id` is the commit-seq used as both the read boundary
         // and the version stamp, identical to the old direct apply (still under the commit lock).
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_delete(&delete, snapshot)?;
-        self.apply_delta_serialized(delta, txn_id, None)
+        self.apply_delta_serialized(cat, delta, txn_id, None)
     }
 
-    fn apply_update(&mut self, update: Update, txn_id: TxnId) -> Result<(), EngineError> {
+    fn apply_update(
+        &self,
+        cat: &mut DdlCatalogState,
+        update: Update,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
         // Stage 2 split: PURE prepare (resolve matches + encode new images + preflight +
         // write-set) then a `&mut self` version-rewrite install. `txn_id` is the commit-seq used as
         // both the read boundary and the version stamp, identical to the old direct apply.
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_update(&update, snapshot)?;
-        self.apply_delta_serialized(delta, txn_id, None)
+        self.apply_delta_serialized(cat, delta, txn_id, None)
     }
 
     fn preflight_unique_index_constraints(
@@ -14938,6 +15442,7 @@ impl Engine {
         cmd: &Command,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
+        let cat = self.catalog_snapshot();
         match cmd {
             Command::CreateSchema(create) => {
                 if create.name != PUBLIC_SCHEMA_NAME {
@@ -14946,9 +15451,9 @@ impl Engine {
                         create.name
                     )));
                 }
-                if self.relational_public_schema_exists
+                if cat.relational_public_schema_exists
                     && !create.if_not_exists
-                    && !self.relational_public_schema_implicit
+                    && !cat.relational_public_schema_implicit
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "schema \"{}\" already exists",
@@ -14966,21 +15471,21 @@ impl Engine {
                     }
                     return Ok(());
                 }
-                if !self.relational_public_schema_exists && !drop.if_exists {
+                if !cat.relational_public_schema_exists && !drop.if_exists {
                     return Err(EngineError::ApplyFailed(format!(
                         "schema \"{}\" does not exist",
                         drop.name
                     )));
                 }
-                if self.relational_public_schema_exists
-                    && (!self.relational_catalog.is_empty()
-                        || !self.relational_views.is_empty()
-                        || !self.relational_materialized_views.is_empty()
-                        || !self.relational_functions.is_empty()
-                        || !self.relational_sequences.is_empty()
-                        || !self.relational_domains.is_empty()
-                        || !self.relational_publications.is_empty()
-                        || !self.relational_subscriptions.is_empty())
+                if cat.relational_public_schema_exists
+                    && (!cat.relational_catalog.is_empty()
+                        || !cat.relational_views.is_empty()
+                        || !cat.relational_materialized_views.is_empty()
+                        || !cat.relational_functions.is_empty()
+                        || !cat.relational_sequences.is_empty()
+                        || !cat.relational_domains.is_empty()
+                        || !cat.relational_publications.is_empty()
+                        || !cat.relational_subscriptions.is_empty())
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "cannot drop non-empty schema \"{}\"",
@@ -15009,7 +15514,7 @@ impl Engine {
                             "cannot drop bootstrap database \"postgres\"".to_string(),
                         ));
                     }
-                    if !drop.if_exists && !self.relational_databases.contains_key(database) {
+                    if !drop.if_exists && !cat.relational_databases.contains_key(database) {
                         return Err(EngineError::ApplyFailed(format!(
                             "database \"{}\" does not exist",
                             database
@@ -15023,7 +15528,7 @@ impl Engine {
                         "cannot rename bootstrap database \"postgres\"".to_string(),
                     ));
                 }
-                if !self.relational_databases.contains_key(&rename.old_name) {
+                if !cat.relational_databases.contains_key(&rename.old_name) {
                     return Err(EngineError::ApplyFailed(format!(
                         "database \"{}\" does not exist",
                         rename.old_name
@@ -15058,7 +15563,7 @@ impl Engine {
                             tablespace
                         )));
                     }
-                    if !drop.if_exists && !self.relational_tablespaces.contains_key(tablespace) {
+                    if !drop.if_exists && !cat.relational_tablespaces.contains_key(tablespace) {
                         return Err(EngineError::ApplyFailed(format!(
                             "tablespace \"{}\" does not exist",
                             tablespace
@@ -15073,7 +15578,7 @@ impl Engine {
                         rename.old_name
                     )));
                 }
-                if !self.relational_tablespaces.contains_key(&rename.old_name) {
+                if !cat.relational_tablespaces.contains_key(&rename.old_name) {
                     return Err(EngineError::ApplyFailed(format!(
                         "tablespace \"{}\" does not exist",
                         rename.old_name
@@ -15087,7 +15592,7 @@ impl Engine {
                 }
             }
             Command::CreateTable(create) => {
-                if !self.relational_public_schema_exists {
+                if !cat.relational_public_schema_exists {
                     return Err(EngineError::ApplyFailed(format!(
                         "schema \"{}\" does not exist",
                         PUBLIC_SCHEMA_NAME
@@ -15096,7 +15601,7 @@ impl Engine {
                 let mut implicit_sequences = BTreeSet::new();
                 for column in &create.columns {
                     if let Some(domain_name) = column.domain.as_ref() {
-                        if !self.relational_domains.contains_key(domain_name) {
+                        if !cat.relational_domains.contains_key(domain_name) {
                             return Err(EngineError::ApplyFailed(format!(
                                 "type \"{}\" does not exist",
                                 domain_name
@@ -15120,23 +15625,21 @@ impl Engine {
                 }
             }
             Command::CreateIndex(create) if create.unique => {
-                if self
+                if cat
                     .relational_catalog
                     .values()
                     .any(|table| table.indexes.iter().any(|index| index.name == create.name))
-                    || self.relational_catalog.contains_key(&create.name)
-                    || self.relational_views.contains_key(&create.name)
-                    || self
-                        .relational_materialized_views
-                        .contains_key(&create.name)
-                    || self.relational_sequences.contains_key(&create.name)
+                    || cat.relational_catalog.contains_key(&create.name)
+                    || cat.relational_views.contains_key(&create.name)
+                    || cat.relational_materialized_views.contains_key(&create.name)
+                    || cat.relational_sequences.contains_key(&create.name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         create.name
                     )));
                 }
-                let table = self.relational_catalog.get(&create.table).ok_or_else(|| {
+                let table = cat.relational_catalog.get(&create.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
                         "relation \"{}\" does not exist",
                         create.table
@@ -15161,21 +15664,21 @@ impl Engine {
                 Self::validate_unique_values(&rows, column_idx, &create.name)?;
             }
             Command::AddPrimaryKey(add) => {
-                if self
+                if cat
                     .relational_catalog
                     .values()
                     .any(|table| table.indexes.iter().any(|index| index.name == add.name))
-                    || self.relational_catalog.contains_key(&add.name)
-                    || self.relational_views.contains_key(&add.name)
-                    || self.relational_materialized_views.contains_key(&add.name)
-                    || self.relational_sequences.contains_key(&add.name)
+                    || cat.relational_catalog.contains_key(&add.name)
+                    || cat.relational_views.contains_key(&add.name)
+                    || cat.relational_materialized_views.contains_key(&add.name)
+                    || cat.relational_sequences.contains_key(&add.name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         add.name
                     )));
                 }
-                let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+                let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
                 })?;
                 if table.indexes.iter().any(|index| index.primary_key) {
@@ -15203,21 +15706,21 @@ impl Engine {
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
             Command::AddUniqueConstraint(add) => {
-                if self
+                if cat
                     .relational_catalog
                     .values()
                     .any(|table| table.indexes.iter().any(|index| index.name == add.name))
-                    || self.relational_catalog.contains_key(&add.name)
-                    || self.relational_views.contains_key(&add.name)
-                    || self.relational_materialized_views.contains_key(&add.name)
-                    || self.relational_sequences.contains_key(&add.name)
+                    || cat.relational_catalog.contains_key(&add.name)
+                    || cat.relational_views.contains_key(&add.name)
+                    || cat.relational_materialized_views.contains_key(&add.name)
+                    || cat.relational_sequences.contains_key(&add.name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         add.name
                     )));
                 }
-                let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+                let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
                 })?;
                 let column_idx = table
@@ -15241,9 +15744,9 @@ impl Engine {
             Command::AddCheckConstraint(add) => self.preflight_add_check_constraint(add)?,
             Command::AddForeignKey(add) => self.preflight_add_foreign_key(add, txn_id)?,
             Command::AddColumn(add) => {
-                if self.relational_views.contains_key(&add.table)
-                    || self.relational_materialized_views.contains_key(&add.table)
-                    || self.relational_sequences.contains_key(&add.table)
+                if cat.relational_views.contains_key(&add.table)
+                    || cat.relational_materialized_views.contains_key(&add.table)
+                    || cat.relational_sequences.contains_key(&add.table)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
@@ -15268,7 +15771,7 @@ impl Engine {
                         add.column.name
                     )));
                 }
-                let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+                let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
                 })?;
                 if table
@@ -15284,18 +15787,18 @@ impl Engine {
                 self.preflight_column_default_target(default)?;
             }
             Command::RenameTable(rename) => {
-                if self.relational_views.contains_key(&rename.old_name)
-                    || self
+                if cat.relational_views.contains_key(&rename.old_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.old_name)
-                    || self.relational_sequences.contains_key(&rename.old_name)
+                    || cat.relational_sequences.contains_key(&rename.old_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         rename.old_name
                     )));
                 }
-                if !self.relational_catalog.contains_key(&rename.old_name) {
+                if !cat.relational_catalog.contains_key(&rename.old_name) {
                     if rename.if_exists {
                         return Ok(());
                     }
@@ -15304,19 +15807,19 @@ impl Engine {
                         rename.old_name
                     )));
                 }
-                if self.relational_catalog.contains_key(&rename.new_name)
-                    || self.relational_views.contains_key(&rename.new_name)
-                    || self
+                if cat.relational_catalog.contains_key(&rename.new_name)
+                    || cat.relational_views.contains_key(&rename.new_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.new_name)
-                    || self.relational_sequences.contains_key(&rename.new_name)
+                    || cat.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
                     )));
                 }
-                if self
+                if cat
                     .relational_views
                     .values()
                     .any(|view| view.query.table == rename.old_name)
@@ -15328,18 +15831,18 @@ impl Engine {
                 }
             }
             Command::RenameColumn(rename) => {
-                if self.relational_views.contains_key(&rename.table)
-                    || self
+                if cat.relational_views.contains_key(&rename.table)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.table)
-                    || self.relational_sequences.contains_key(&rename.table)
+                    || cat.relational_sequences.contains_key(&rename.table)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         rename.table
                     )));
                 }
-                let table = self.relational_catalog.get(&rename.table).ok_or_else(|| {
+                let table = cat.relational_catalog.get(&rename.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
                         "relation \"{}\" does not exist",
                         rename.table
@@ -15367,18 +15870,18 @@ impl Engine {
                 }
             }
             Command::RenameConstraint(rename) => {
-                if self.relational_views.contains_key(&rename.table)
-                    || self
+                if cat.relational_views.contains_key(&rename.table)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.table)
-                    || self.relational_sequences.contains_key(&rename.table)
+                    || cat.relational_sequences.contains_key(&rename.table)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         rename.table
                     )));
                 }
-                let Some(table) = self.relational_catalog.get(&rename.table) else {
+                let Some(table) = cat.relational_catalog.get(&rename.table) else {
                     if rename.table_if_exists {
                         return Ok(());
                     }
@@ -15387,7 +15890,7 @@ impl Engine {
                         rename.table
                     )));
                 };
-                if self.relational_catalog.values().any(|candidate| {
+                if cat.relational_catalog.values().any(|candidate| {
                     candidate
                         .indexes
                         .iter()
@@ -15400,12 +15903,12 @@ impl Engine {
                             .foreign_keys
                             .iter()
                             .any(|constraint| constraint.name == rename.new_name)
-                }) || self.relational_catalog.contains_key(&rename.new_name)
-                    || self.relational_views.contains_key(&rename.new_name)
-                    || self
+                }) || cat.relational_catalog.contains_key(&rename.new_name)
+                    || cat.relational_views.contains_key(&rename.new_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.new_name)
-                    || self.relational_sequences.contains_key(&rename.new_name)
+                    || cat.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -15430,24 +15933,24 @@ impl Engine {
                 }
             }
             Command::RenameIndex(rename) => {
-                if self.relational_catalog.values().any(|table| {
+                if cat.relational_catalog.values().any(|table| {
                     table
                         .indexes
                         .iter()
                         .any(|index| index.name == rename.new_name)
-                }) || self.relational_catalog.contains_key(&rename.new_name)
-                    || self.relational_views.contains_key(&rename.new_name)
-                    || self
+                }) || cat.relational_catalog.contains_key(&rename.new_name)
+                    || cat.relational_views.contains_key(&rename.new_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.new_name)
-                    || self.relational_sequences.contains_key(&rename.new_name)
+                    || cat.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
                     )));
                 }
-                let Some(index) = self
+                let Some(index) = cat
                     .relational_catalog
                     .values()
                     .flat_map(|table| table.indexes.iter())
@@ -15466,19 +15969,17 @@ impl Engine {
                 }
             }
             Command::CreateView(create) => {
-                if self.relational_catalog.contains_key(&create.name)
-                    || self
-                        .relational_materialized_views
-                        .contains_key(&create.name)
-                    || self.relational_sequences.contains_key(&create.name)
-                    || (!create.or_replace && self.relational_views.contains_key(&create.name))
+                if cat.relational_catalog.contains_key(&create.name)
+                    || cat.relational_materialized_views.contains_key(&create.name)
+                    || cat.relational_sequences.contains_key(&create.name)
+                    || (!create.or_replace && cat.relational_views.contains_key(&create.name))
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         create.name
                     )));
                 }
-                if self
+                if cat
                     .relational_materialized_views
                     .contains_key(&create.query.table)
                 {
@@ -15491,13 +15992,13 @@ impl Engine {
                         "cannot replace view because another view depends on it".to_string(),
                     ));
                 }
-                if self.relational_views.contains_key(&create.query.table) {
+                if cat.relational_views.contains_key(&create.query.table) {
                     if self.relational_view_depends_on(&create.query.table, &create.name) {
                         return Err(EngineError::ApplyFailed(
                             "view dependency cycle is unsupported".to_string(),
                         ));
                     }
-                } else if !self.relational_catalog.contains_key(&create.query.table) {
+                } else if !cat.relational_catalog.contains_key(&create.query.table) {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" does not exist",
                         create.query.table
@@ -15505,29 +16006,29 @@ impl Engine {
                 }
             }
             Command::RenameView(rename) => {
-                if self.relational_catalog.contains_key(&rename.old_name)
-                    || self
+                if cat.relational_catalog.contains_key(&rename.old_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.old_name)
-                    || self.relational_sequences.contains_key(&rename.old_name)
+                    || cat.relational_sequences.contains_key(&rename.old_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a view",
                         rename.old_name
                     )));
                 }
-                if !self.relational_views.contains_key(&rename.old_name) {
+                if !cat.relational_views.contains_key(&rename.old_name) {
                     return Err(EngineError::ApplyFailed(format!(
                         "view \"{}\" does not exist",
                         rename.old_name
                     )));
                 }
-                if self.relational_catalog.contains_key(&rename.new_name)
-                    || self.relational_views.contains_key(&rename.new_name)
-                    || self
+                if cat.relational_catalog.contains_key(&rename.new_name)
+                    || cat.relational_views.contains_key(&rename.new_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.new_name)
-                    || self.relational_sequences.contains_key(&rename.new_name)
+                    || cat.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -15548,16 +16049,16 @@ impl Engine {
                 self.preflight_refresh_materialized_view(refresh)?
             }
             Command::RenameMaterializedView(rename) => {
-                if self.relational_catalog.contains_key(&rename.old_name)
-                    || self.relational_views.contains_key(&rename.old_name)
-                    || self.relational_sequences.contains_key(&rename.old_name)
+                if cat.relational_catalog.contains_key(&rename.old_name)
+                    || cat.relational_views.contains_key(&rename.old_name)
+                    || cat.relational_sequences.contains_key(&rename.old_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a materialized view",
                         rename.old_name
                     )));
                 }
-                if !self
+                if !cat
                     .relational_materialized_views
                     .contains_key(&rename.old_name)
                 {
@@ -15566,12 +16067,12 @@ impl Engine {
                         rename.old_name
                     )));
                 }
-                if self.relational_catalog.contains_key(&rename.new_name)
-                    || self.relational_views.contains_key(&rename.new_name)
-                    || self
+                if cat.relational_catalog.contains_key(&rename.new_name)
+                    || cat.relational_views.contains_key(&rename.new_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.new_name)
-                    || self.relational_sequences.contains_key(&rename.new_name)
+                    || cat.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -15580,7 +16081,7 @@ impl Engine {
                 }
             }
             Command::CreateFunction(create)
-                if self.relational_functions.contains_key(&create.name) =>
+                if cat.relational_functions.contains_key(&create.name) =>
             {
                 return Err(EngineError::ApplyFailed(format!(
                     "function \"{}\" already exists",
@@ -15588,13 +16089,13 @@ impl Engine {
                 )));
             }
             Command::RenameFunction(rename) => {
-                if !self.relational_functions.contains_key(&rename.old_name) {
+                if !cat.relational_functions.contains_key(&rename.old_name) {
                     return Err(EngineError::ApplyFailed(format!(
                         "function \"{}\" does not exist",
                         rename.old_name
                     )));
                 }
-                if self.relational_functions.contains_key(&rename.new_name) {
+                if cat.relational_functions.contains_key(&rename.new_name) {
                     return Err(EngineError::ApplyFailed(format!(
                         "function \"{}\" already exists",
                         rename.new_name
@@ -15602,7 +16103,7 @@ impl Engine {
                 }
             }
             Command::DropFunction(drop)
-                if !drop.if_exists && !self.relational_functions.contains_key(&drop.name) =>
+                if !drop.if_exists && !cat.relational_functions.contains_key(&drop.name) =>
             {
                 return Err(EngineError::ApplyFailed(format!(
                     "function \"{}\" does not exist",
@@ -15612,7 +16113,7 @@ impl Engine {
             Command::CreateFunction(_) | Command::DropFunction(_) => {}
             Command::CommentOn(comment) => {
                 if let CommentTarget::Function { function } = &comment.target {
-                    if !self.relational_functions.contains_key(function) {
+                    if !cat.relational_functions.contains_key(function) {
                         return Err(EngineError::ApplyFailed(format!(
                             "function \"{}\" does not exist",
                             function
@@ -15625,9 +16126,9 @@ impl Engine {
             Command::SequenceNextVal(nextval) => self.preflight_sequence_target(&nextval.name)?,
             Command::SequenceSetVal(setval) => self.preflight_sequence_target(&setval.name)?,
             Command::RenameSequence(rename) => {
-                if self.relational_catalog.contains_key(&rename.old_name)
-                    || self.relational_views.contains_key(&rename.old_name)
-                    || self
+                if cat.relational_catalog.contains_key(&rename.old_name)
+                    || cat.relational_views.contains_key(&rename.old_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.old_name)
                 {
@@ -15636,18 +16137,18 @@ impl Engine {
                         rename.old_name
                     )));
                 }
-                if !self.relational_sequences.contains_key(&rename.old_name) {
+                if !cat.relational_sequences.contains_key(&rename.old_name) {
                     return Err(EngineError::ApplyFailed(format!(
                         "sequence \"{}\" does not exist",
                         rename.old_name
                     )));
                 }
-                if self.relational_catalog.contains_key(&rename.new_name)
-                    || self.relational_views.contains_key(&rename.new_name)
-                    || self
+                if cat.relational_catalog.contains_key(&rename.new_name)
+                    || cat.relational_views.contains_key(&rename.new_name)
+                    || cat
                         .relational_materialized_views
                         .contains_key(&rename.new_name)
-                    || self.relational_sequences.contains_key(&rename.new_name)
+                    || cat.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -15656,16 +16157,16 @@ impl Engine {
                 }
             }
             Command::DropColumn(drop) => {
-                if self.relational_views.contains_key(&drop.table)
-                    || self.relational_materialized_views.contains_key(&drop.table)
-                    || self.relational_sequences.contains_key(&drop.table)
+                if cat.relational_views.contains_key(&drop.table)
+                    || cat.relational_materialized_views.contains_key(&drop.table)
+                    || cat.relational_sequences.contains_key(&drop.table)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         drop.table
                     )));
                 }
-                let table = self.relational_catalog.get(&drop.table).ok_or_else(|| {
+                let table = cat.relational_catalog.get(&drop.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", drop.table))
                 })?;
                 if !table
@@ -15694,7 +16195,7 @@ impl Engine {
                 }
             }
             Command::DropConstraint(drop) => {
-                let Some(table) = self.relational_catalog.get(&drop.table) else {
+                let Some(table) = cat.relational_catalog.get(&drop.table) else {
                     if drop.table_if_exists {
                         return Ok(());
                     }
@@ -15792,14 +16293,13 @@ impl Engine {
                             "cannot drop bootstrap role \"postgres\"".to_string(),
                         ));
                     }
-                    if !drop.if_exists && !self.relational_roles.contains_key(role) {
+                    if !drop.if_exists && !cat.relational_roles.contains_key(role) {
                         return Err(EngineError::ApplyFailed(format!(
                             "role \"{}\" does not exist",
                             role
                         )));
                     }
-                    if self.relational_roles.contains_key(role) && self.role_has_dependencies(role)
-                    {
+                    if cat.relational_roles.contains_key(role) && self.role_has_dependencies(role) {
                         return Err(EngineError::ApplyFailed(format!(
                             "role \"{}\" cannot be dropped because dependent metadata exists",
                             role
@@ -15813,7 +16313,7 @@ impl Engine {
                         "cannot rename bootstrap role \"postgres\"".to_string(),
                     ));
                 }
-                if !self.relational_roles.contains_key(&rename.old_name) {
+                if !cat.relational_roles.contains_key(&rename.old_name) {
                     return Err(EngineError::ApplyFailed(format!(
                         "role \"{}\" does not exist",
                         rename.old_name
@@ -15864,7 +16364,7 @@ impl Engine {
                     }
                     indexes
                 };
-                let mut simulated_sequences = self.relational_sequences.clone();
+                let mut simulated_sequences = cat.relational_sequences.clone();
                 let mut new_rows = Vec::with_capacity(insert.rows.len());
                 for row in &insert.rows {
                     if row.len() != column_indexes.len() {
@@ -16086,6 +16586,7 @@ impl Engine {
     }
 
     fn command_requires_immediate_unique_index_commit(&self, cmd: &Command) -> bool {
+        let cat = self.catalog_snapshot();
         match cmd {
             Command::AddPrimaryKey(_) => true,
             Command::AddUniqueConstraint(_) => true,
@@ -16094,7 +16595,7 @@ impl Engine {
             Command::DropConstraint(_) => true,
             Command::CreateIndex(create) => create.unique,
             Command::Insert(insert) => {
-                self.relational_catalog
+                cat.relational_catalog
                     .get(&insert.table)
                     .is_some_and(|table| {
                         table.indexes.iter().any(|index| index.unique)
@@ -16103,13 +16604,13 @@ impl Engine {
                     })
             }
             Command::Update(update) => {
-                self.relational_catalog
+                cat.relational_catalog
                     .get(&update.table)
                     .is_some_and(|table| {
                         table.indexes.iter().any(|index| index.unique)
                             || !table.check_constraints.is_empty()
                             || !table.foreign_keys.is_empty()
-                            || self.relational_catalog.values().any(|candidate| {
+                            || cat.relational_catalog.values().any(|candidate| {
                                 candidate
                                     .foreign_keys
                                     .iter()
@@ -16118,10 +16619,10 @@ impl Engine {
                     })
             }
             Command::Delete(delete) => {
-                self.relational_catalog
+                cat.relational_catalog
                     .get(&delete.table)
                     .is_some_and(|table| {
-                        self.relational_catalog.values().any(|candidate| {
+                        cat.relational_catalog.values().any(|candidate| {
                             candidate
                                 .foreign_keys
                                 .iter()
@@ -16220,8 +16721,8 @@ impl Engine {
 
                 match self.route_command(&cmd) {
                     RouteDecision::Gpu(_) => {
-                        let queue_cap = self.batcher.max_items();
-                        let pending = self.batcher.len();
+                        let queue_cap = self.batcher().max_items();
+                        let pending = self.batcher().len();
                         if pending >= queue_cap {
                             self.metrics.inc_fallback(FallbackReason::GpuQueueSaturated);
                             return Err(ExecuteError::Engine(
@@ -16232,7 +16733,7 @@ impl Engine {
                             ));
                         }
 
-                        let maybe_batch = self.batcher.enqueue(
+                        let maybe_batch = self.batcher().enqueue(
                             PendingMutation {
                                 txn_id,
                                 payload: text.as_bytes().to_vec(),
@@ -16243,7 +16744,7 @@ impl Engine {
                             self.metrics.observe_pending_batch_len(batch.items.len());
                             self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
                         } else {
-                            self.metrics.observe_pending_batch_len(self.batcher.len());
+                            self.metrics.observe_pending_batch_len(self.batcher().len());
                         }
                     }
                     RouteDecision::CpuFallback { reason, .. } => {
@@ -16271,20 +16772,20 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Begin => {
-                self.txn_manager.begin_with_id(txn_id)?;
+                self.commit_state_mut().txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Commit { chain } => {
-                self.txn_manager.commit(txn_id)?;
+                self.commit_state_mut().txn_manager.commit(txn_id)?;
                 if chain {
-                    self.txn_manager.begin()?;
+                    self.commit_state_mut().txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Rollback { chain } => {
-                self.txn_manager.rollback(txn_id)?;
+                self.commit_state_mut().txn_manager.rollback(txn_id)?;
                 if chain {
-                    self.txn_manager.begin()?;
+                    self.commit_state_mut().txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -16293,7 +16794,7 @@ impl Engine {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
-                if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
+                if let Some(len) = self.commit_state_mut().sm.kv.get(&key).map(|v| v.len()) {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
@@ -16304,7 +16805,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn tick_batching(&mut self, now: Instant) -> Result<(), EngineError> {
+    pub fn tick_batching(&self, now: Instant) -> Result<(), EngineError> {
         if self.repl_role() != Role::Leader {
             if self.has_pending_batch() {
                 return Err(EngineError::NotLeader);
@@ -16312,25 +16813,27 @@ impl Engine {
             return Ok(());
         }
 
-        if let Some(batch) = self.batcher.maybe_flush_due_to_time(now) {
+        let due = self.batcher().maybe_flush_due_to_time(now);
+        if let Some(batch) = due {
             self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
         }
         Ok(())
     }
 
-    pub fn flush_admin(&mut self) -> Result<(), EngineError> {
+    pub fn flush_admin(&self) -> Result<(), EngineError> {
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
 
-        if let Some(batch) = self.batcher.flush_admin() {
+        let admin = self.batcher().flush_admin();
+        if let Some(batch) = admin {
             self.apply_batch(batch.reason, batch.items.into_iter(), Instant::now())?;
         }
         Ok(())
     }
 
     fn apply_batch<I>(
-        &mut self,
+        &self,
         reason: FlushReason,
         items: I,
         flushed_at: Instant,
@@ -16364,15 +16867,15 @@ impl Engine {
 
             if let Err(err) = self.commit_mutation(txn_id, payload) {
                 let tail: Vec<_> = std::iter::once(p).chain(remaining).collect();
-                self.batcher.requeue_front(tail);
-                self.metrics.observe_pending_batch_len(self.batcher.len());
+                self.batcher().requeue_front(tail);
+                self.metrics.observe_pending_batch_len(self.batcher().len());
                 return Err(err);
             }
 
             self.metrics.observe_batch_wait_ms(wait);
         }
 
-        self.metrics.observe_pending_batch_len(self.batcher.len());
+        self.metrics.observe_pending_batch_len(self.batcher().len());
         self.metrics.inc_batch_flush(metric_reason);
         Ok(())
     }
@@ -16695,13 +17198,13 @@ impl Engine {
         Ok(())
     }
 
-    pub fn execute_text(&mut self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
+    pub fn execute_text(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
         let timestamp_micros = self.next_commit_timestamp_micros();
         self.execute_text_at_timestamp_micros(txn_id, text, timestamp_micros)
     }
 
     pub fn execute_text_at_timestamp_micros(
-        &mut self,
+        &self,
         txn_id: u64,
         text: &str,
         timestamp_micros: u64,
@@ -16811,20 +17314,20 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Begin => {
-                self.txn_manager.begin_with_id(txn_id)?;
+                self.commit_state().txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Commit { chain } => {
-                self.txn_manager.commit(txn_id)?;
+                self.commit_state().txn_manager.commit(txn_id)?;
                 if chain {
-                    self.txn_manager.begin()?;
+                    self.commit_state().txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Rollback { chain } => {
-                self.txn_manager.rollback(txn_id)?;
+                self.commit_state().txn_manager.rollback(txn_id)?;
                 if chain {
-                    self.txn_manager.begin()?;
+                    self.commit_state().txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -16833,7 +17336,7 @@ impl Engine {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
-                if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
+                if let Some(len) = self.commit_state().sm.kv.get(&key).map(|v| v.len()) {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
@@ -16845,7 +17348,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn execute_read_text(&mut self, text: &str) -> Result<Option<&str>, ExecuteError> {
+    pub fn execute_read_text(&mut self, text: &str) -> Result<Option<String>, ExecuteError> {
         let cmd = parse_command(text)?;
 
         match cmd {
@@ -16855,7 +17358,7 @@ impl Engine {
                 }
 
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
-                if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
+                if let Some(len) = self.commit_state_mut().sm.kv.get(&key).map(|v| v.len()) {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
                 Ok(self.get(&key))
@@ -16957,24 +17460,16 @@ impl Engine {
         }
     }
 
-    /// Pin one statement-stable relational read snapshot (prereq #1, write-half Stage 4): read the
-    /// visibility boundary (`committed_seq`) ONCE and pin ONE generation of `table` (its rows +
-    /// value-index together). The whole statement then reads from this one pin, so a concurrent
-    /// committer can never interleave the value-index of one `commit_seq` with the rows of another.
-    fn pin_relational_read(&self, table: &str) -> RelationalReadPin {
+    /// Pin one statement-stable relational read snapshot at the ALREADY-CHOSEN boundary `s` (PART B
+    /// catalog↔data co-pinning). The boundary `s` was loaded ONCE per statement (by
+    /// [`Engine::bind_relational_select_for_execution`], which also selected the catalog as-of `s`), so
+    /// the data this pins and the catalog the statement bound against are the SAME generation — a
+    /// concurrent shape-changing DDL can never split the reader's (catalog, data) pair. Pins ONE
+    /// generation of `table` (its rows + value-index together) at `s`.
+    fn pin_relational_read_at(&self, table: &str, s: Index) -> RelationalReadPin {
         RelationalReadPin {
-            visibility: self.read_visibility(),
+            visibility: StorageVisibility { read_txn_id: s },
             table_rows: self.read_state.mvcc.table_rows(table),
-        }
-    }
-
-    /// The single visibility boundary a read pins at statement start: an acquire-load of
-    /// `committed_seq` (the publish point bumped release-last by the commit critical section). Read
-    /// exactly once per statement (via [`Engine::pin_relational_read`]) so every part of the
-    /// statement filters against one boundary — no non-repeatable read within a statement.
-    fn read_visibility(&self) -> StorageVisibility {
-        StorageVisibility {
-            read_txn_id: self.committed_seq(),
         }
     }
 
@@ -16982,9 +17477,39 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        // Lock-free read path (Stage 2 — blocker #1): one pinned catalog snapshot for the view +
-        // materialized-view lookups (cloning the matched definition out before the guard drops).
-        let catalog = self.catalog_snapshot();
+        self.execute_relational_select_instrumented(select, || {})
+    }
+
+    /// [`Engine::execute_relational_select`] with a hook invoked at the START of the read — AFTER the
+    /// reader would load its pin boundary but conceptually BEFORE it binds the catalog / pins data
+    /// (PART B test seam). The concurrency-correctness suite uses this to rendezvous a reader at a
+    /// barrier so it deterministically STRADDLES a concurrent shape-changing DDL commit: the reader
+    /// parks at the hook, a writer commits an ADD/DROP COLUMN, then the reader proceeds to bind + pin.
+    /// With co-pinning the reader selects the catalog as-of its boundary and pins data at the SAME
+    /// boundary, so its (catalog, data) pair is always consistent; without it the bind and the data
+    /// pin could land on different generations and the decode would mismatch the catalog shape.
+    /// Production passes an empty hook, so this is a zero-overhead extraction, not a separate path.
+    pub fn execute_relational_select_instrumented(
+        &self,
+        select: &Select,
+        on_pinned: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        // PART B test seam. The hook is threaded to the CPU pinned read, where it fires in the window
+        // BETWEEN binding the catalog and pinning the data — exactly the window co-pinning closes. The
+        // test parks a reader there while a writer commits a shape-changing DDL: with co-pinning the
+        // data pin reuses the SAME boundary the bind selected its catalog at, so the (catalog, data)
+        // pair stays consistent; without it the pin re-loads `committed_seq` (now newer) while the
+        // catalog is older, and the decode mismatches the catalog shape. A view/matview is resolved
+        // as-of the boundary too; for a plain table SELECT (the test's case) the read goes straight to
+        // the co-pinned CPU path.
+        //
+        // The read pins ONE `committed_seq` boundary and resolves the catalog as-of it. It does NOT
+        // register an active snapshot (reads stay OFF the `active_snapshots` mutex — true lock-free):
+        // the catalog ring's COUNT floor (`MIN_RETAINED_CATALOG_GENERATIONS`) guarantees this read's
+        // generation is still present even if a flurry of concurrent DDLs commit while the statement
+        // runs, so `catalog_as_of(s)` never falls back to a too-new generation.
+        let s = self.committed_seq();
+        let catalog = self.read_state.catalog_as_of(s);
         if let Some(view) = catalog.relational_views.get(&select.table).cloned() {
             if !select_is_plain_view_scan(select) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -17015,6 +17540,9 @@ impl Engine {
         }
         let resident_route = self.plan_relational_resident_route(select);
         if resident_route.accepted {
+            // The resident route does not use the inter-bind-and-pin window the hook targets; fire the
+            // hook now (so a barrier'd test still rendezvouses) and run the resident route.
+            on_pinned();
             match self.execute_relational_select_with_resident_route(select) {
                 Ok(result) => return Ok(result),
                 // A concurrent committer can tombstone the table's GPU residency (publish(None))
@@ -17031,7 +17559,7 @@ impl Engine {
                 Err(err) => return Err(err),
             }
         }
-        self.execute_relational_select_cpu_pinned(select)
+        self.execute_relational_select_cpu_pinned_instrumented(select, on_pinned)
     }
 
     /// The CPU pinned-read path for a relational SELECT (write-half MVCC, Stage 4): bind, pin ONE
@@ -17044,8 +17572,22 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let pin = self.pin_relational_read(&select.table);
+        self.execute_relational_select_cpu_pinned_instrumented(select, || {})
+    }
+
+    /// [`Engine::execute_relational_select_cpu_pinned`] with the PART B test hook fired in the window
+    /// BETWEEN binding the catalog (which captures the co-pin boundary `copin_s`) and pinning the data
+    /// at that SAME `copin_s`. This is precisely the window co-pinning closes: the pin reuses
+    /// `copin_s`, so a DDL committed while the hook is parked cannot make the data pin a different
+    /// generation than the bound catalog. Production passes an empty hook (zero overhead).
+    fn execute_relational_select_cpu_pinned_instrumented(
+        &self,
+        select: &Select,
+        on_bound_before_pin: impl FnOnce(),
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        on_bound_before_pin();
+        let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
         let result = self.execute_mvcc_query_on_pin(&pin, &query)?;
@@ -17090,8 +17632,8 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let pin = self.pin_relational_read(&select.table);
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
         let result =
@@ -17103,8 +17645,8 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let pin = self.pin_relational_read(&select.table);
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (_query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
         let snapshot = self
@@ -17332,7 +17874,7 @@ impl Engine {
                 decision.query_shape
             ))));
         }
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, _copin_s) = self.bind_relational_select_for_execution(select)?;
         let handle = self
             .relational_retained_snapshot_handle(&table.name)
             .ok_or_else(|| {
@@ -17524,7 +18066,7 @@ impl Engine {
             ) {
                 return Ok(None);
             }
-            let (table, bound) = self.bind_relational_select_for_execution(&job.select)?;
+            let (table, bound, copin_s) = self.bind_relational_select_for_execution(&job.select)?;
             let filter_groups = if !bound.filter_groups.is_empty() {
                 bound.filter_groups.clone()
             } else if !bound.filters.is_empty() {
@@ -17581,7 +18123,7 @@ impl Engine {
             }
             batch_selected_indexes = Some(bound.selected_indexes.clone());
             let (_query, access_path) =
-                self.relational_select_mvcc_query_pinned(&job.select, &table, &bound)?;
+                self.relational_select_mvcc_query_pinned(&job.select, &table, &bound, copin_s)?;
             members.push((bound, access_path, needle));
         }
 
@@ -17822,7 +18364,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -17840,7 +18382,7 @@ impl Engine {
             )));
         }
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -17910,7 +18452,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -17928,7 +18470,7 @@ impl Engine {
             )));
         }
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -18026,7 +18568,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let filter_groups = if !bound.filter_groups.is_empty() {
             bound.filter_groups.clone()
         } else if !bound.filters.is_empty() {
@@ -18070,7 +18612,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -18170,7 +18712,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let filter_groups = if !bound.filter_groups.is_empty() {
             bound.filter_groups.clone()
         } else if !bound.filters.is_empty() {
@@ -18220,7 +18762,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -18392,7 +18934,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let SelectProjection::Sum { column } = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "partitioned resident equality SUM proof currently supports only SELECT SUM(int4_column)"
@@ -18442,7 +18984,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -18606,7 +19148,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let SelectProjection::Avg { column } = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "partitioned resident BETWEEN AVG proof currently supports only SELECT AVG(int4_column)"
@@ -18695,7 +19237,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -18865,7 +19407,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let SelectProjection::Max { column } = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "partitioned resident filtered MAX proof currently supports only SELECT MAX(int4_column)"
@@ -18917,7 +19459,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -19061,7 +19603,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let SelectProjection::Avg { column } = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "partitioned resident filtered AVG proof currently supports only SELECT AVG(int4_column)"
@@ -19113,7 +19655,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -19259,7 +19801,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let SelectProjection::Min { column } = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "partitioned resident filtered MIN proof currently supports only SELECT MIN(int4_column)"
@@ -19311,7 +19853,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let partitions = self
             .read_state
             .residency
@@ -19455,7 +19997,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -19492,7 +20034,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -19553,7 +20095,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -19584,7 +20126,7 @@ impl Engine {
         };
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19656,7 +20198,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -19719,7 +20261,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19781,7 +20323,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -19818,7 +20360,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19879,7 +20421,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -19952,7 +20494,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20021,7 +20563,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
@@ -20060,7 +20602,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20164,7 +20706,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let SelectProjection::Sum { column } = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident device-memory SUM proof currently supports only SELECT SUM(int4_column)"
@@ -20194,7 +20736,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20256,7 +20798,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let (aggregate_column, aggregate_name) = match &select.projection {
             SelectProjection::Sum { column } => (column, "SUM"),
             SelectProjection::Avg { column } => (column, "AVG"),
@@ -20310,7 +20852,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20412,7 +20954,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let (aggregate_column, aggregate_name) = match &select.projection {
             SelectProjection::Sum { column } => (column, "SUM"),
             SelectProjection::Avg { column } => (column, "AVG"),
@@ -20501,7 +21043,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20593,7 +21135,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let aggregate_column = match &select.projection {
             SelectProjection::Avg { column }
             | SelectProjection::Min { column }
@@ -20629,7 +21171,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20733,7 +21275,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let (group_column, value_column) = match &select.projection {
             SelectProjection::GroupedCount { column } => (column, column),
             SelectProjection::GroupedSum {
@@ -20793,7 +21335,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20938,7 +21480,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let (group_column, value_column) = match &select.projection {
             SelectProjection::GroupedCount { column } => (column, column),
             SelectProjection::GroupedSum {
@@ -21012,7 +21554,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -21166,7 +21708,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let filter_groups = if !bound.filter_groups.is_empty() {
             bound.filter_groups.clone()
         } else if !bound.filters.is_empty() {
@@ -21219,7 +21761,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -21297,7 +21839,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let filter_groups = if !bound.filter_groups.is_empty() {
             bound.filter_groups.clone()
         } else if !bound.filters.is_empty() {
@@ -21341,7 +21883,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         // Borrow the stored snapshot (`_ref`) instead of `relational_residency_snapshot`, whose
         // `.clone()` deep-copies `resident_rows: Vec<Vec<SqlValue>>` — an O(rows) host allocation on
         // EVERY per-call lookup. That clone (not the kernel) was this route's per-call wall: ~99% of
@@ -21422,7 +21964,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         let filter_groups = if !bound.filter_groups.is_empty() {
             bound.filter_groups.clone()
         } else if !bound.filters.is_empty() {
@@ -21477,7 +22019,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -21820,7 +22362,7 @@ impl Engine {
                     query_shape, "preplanned retained read job"
                 ))));
             }
-            let (table, bound) = self.bind_relational_select_for_execution(select)?;
+            let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
             let filter_groups = if !bound.filter_groups.is_empty() {
                 bound.filter_groups.clone()
             } else if !bound.filters.is_empty() {
@@ -21892,7 +22434,7 @@ impl Engine {
             }
             batch_selected_indexes = Some(bound.selected_indexes.clone());
             let (_query, access_path) =
-                self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+                self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
             members.push((bound, access_path, needle));
         }
 
@@ -22306,7 +22848,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if !select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
@@ -22346,7 +22888,7 @@ impl Engine {
         };
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -22434,7 +22976,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if !select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
@@ -22492,7 +23034,7 @@ impl Engine {
         };
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -22580,7 +23122,7 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
@@ -22649,7 +23191,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -22736,8 +23278,8 @@ impl Engine {
         select: &Select,
         backend: &B,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let pin = self.pin_relational_read(&select.table);
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
         let result = self.execute_mvcc_query_with_fallback_reason(
@@ -22760,16 +23302,23 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Bind a relational SELECT against the catalog generation visible AS-OF the read's pinned
+    /// boundary `s` (PART B catalog↔data co-pinning). Loads `committed_seq` ONCE → `s`, selects
+    /// `catalog_as_of(s)`, clones the bound table out (a stable owned definition), and RETURNS `s`
+    /// alongside so the caller pins the DATA at the SAME `s` (via [`Engine::pin_relational_read_at`] /
+    /// [`Engine::relational_select_mvcc_query_pinned`]). Because `s` is loaded once here and threaded
+    /// to the data pin, the catalog and data a statement reads are the same generation — a concurrent
+    /// shape-changing DDL (which pushes its catalog gen BEFORE bumping `committed_seq`) can never split
+    /// them. Every resident-route projection/aggregate method binds through here, so this one redirect
+    /// co-pins the whole read path.
     fn bind_relational_select_for_execution(
         &self,
         select: &Select,
-    ) -> Result<(RelationalTable, BoundRelationalSelect), ExecuteError> {
-        // Lock-free read path (Stage 2 — blocker #1): bind against a pinned catalog snapshot, cloning
-        // the table out so the statement holds a stable owned definition (the snapshot guard is not
-        // held past this clone). Every resident-route projection/aggregate method binds through here,
-        // so this one redirect covers the whole read path's table lookup.
+    ) -> Result<(RelationalTable, BoundRelationalSelect, Index), ExecuteError> {
+        let s = self.committed_seq();
         let table = self
-            .catalog_snapshot()
+            .read_state
+            .catalog_as_of(s)
             .relational_catalog
             .get(&select.table)
             .ok_or_else(|| {
@@ -22780,22 +23329,24 @@ impl Engine {
             })?
             .clone();
         let bound = bind_relational_select(&table, select)?;
-        Ok((table, bound))
+        Ok((table, bound, s))
     }
 
-    /// `relational_select_mvcc_query` with the read pin taken internally. For callers that resolve
-    /// the result rows from a SEPARATE residency generation (the GPU resident-route projection/
-    /// aggregate methods) rather than the pinned CPU store — they need only the `MvccReadQuery`
-    /// (key set / access path) and resolve against device memory, so a per-call pin is sufficient
-    /// (the residency↔data snapshot consistency for those is enforced by the residency generation's
-    /// `valid_through_index`/`invalidated_at_index`, not this pin).
+    /// `relational_select_mvcc_query` with the read pin taken internally at the co-pinned boundary `s`
+    /// (PART B). For callers that resolve the result rows from a SEPARATE residency generation (the GPU
+    /// resident-route projection/aggregate methods) rather than the pinned CPU store — they need only
+    /// the `MvccReadQuery` (key set / access path) and resolve against device memory, so a per-call pin
+    /// is sufficient (the residency↔data snapshot consistency for those is enforced by the residency
+    /// generation's `valid_through_index`/`invalidated_at_index`, not this pin). `s` is the boundary
+    /// `bind_relational_select_for_execution` returned, so the pin matches the bound catalog.
     fn relational_select_mvcc_query_pinned(
         &self,
         select: &Select,
         table: &RelationalTable,
         bound: &BoundRelationalSelect,
+        s: Index,
     ) -> Result<(MvccReadQuery, RelationalAccessPath), ExecuteError> {
-        let pin = self.pin_relational_read(&select.table);
+        let pin = self.pin_relational_read_at(&select.table, s);
         self.relational_select_mvcc_query(select, table, bound, &pin)
     }
 
@@ -23521,12 +24072,17 @@ impl Engine {
         })
     }
 
-    pub fn relational_catalog_table(&self, table: &str) -> Option<&RelationalTable> {
-        self.relational_catalog.get(table)
+    // --- Catalog introspection accessors (test/admin only; no production callers reach these). ---
+    // They read the DDL working catalog under the catalog latch and return OWNED clones: a `MutexGuard`
+    // cannot lend a borrow that outlives it, so the historical `Option<&T>` borrows became owned values
+    // (lock-free read path, write-half MVCC). Behavior is otherwise identical.
+    pub fn relational_catalog_table(&self, table: &str) -> Option<RelationalTable> {
+        self.ddl_catalog().relational_catalog.get(table).cloned()
     }
 
     pub fn relational_copy_columns(&self, table: &str) -> Result<Vec<CopyColumn>, EngineError> {
-        let table = self.relational_catalog.get(table).ok_or_else(|| {
+        let cat = self.ddl_catalog();
+        let table = cat.relational_catalog.get(table).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
         })?;
         Ok(table
@@ -23558,18 +24114,18 @@ impl Engine {
         if rows.is_empty() {
             return Ok((0, RelationalCopyAdmissionProfile::default()));
         }
-        let table = self.relational_catalog.get(&copy.table).ok_or_else(|| {
-            ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" does not exist",
-                copy.table
-            )))
-        })?;
         let columns = copy.columns.clone().unwrap_or_else(|| {
-            table
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect()
+            self.catalog_snapshot()
+                .relational_catalog
+                .get(&copy.table)
+                .map(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
         });
         let row_count = rows.len();
         let insert = Insert {
@@ -23597,11 +24153,13 @@ impl Engine {
                 txn_id,
                 sql.into_bytes(),
                 timestamp_micros,
-                |engine, commit_seq| {
+                |engine, cat, commit_seq| {
                     let apply_started = Instant::now();
                     // Stamp with the commit sequence (commit `Index`), NOT the façade txn_id, so the
-                    // live COPY apply produces the same `created_by` a WAL replay would (Stage 0).
+                    // live COPY apply produces the same `created_by` a WAL replay would (Stage 0). The
+                    // held catalog latch (`cat`) carries any working-map mutation (sequence advance).
                     let result = engine.apply_insert_with_profile(
+                        cat,
                         insert.clone(),
                         commit_seq,
                         Some(&mut apply_profile),
@@ -23630,234 +24188,283 @@ impl Engine {
     pub fn relational_table_acl(
         &self,
         table: &str,
-    ) -> Option<&BTreeMap<String, BTreeSet<TablePrivilege>>> {
-        self.relational_catalog.get(table).map(|table| &table.acl)
+    ) -> Option<BTreeMap<String, BTreeSet<TablePrivilege>>> {
+        self.ddl_catalog()
+            .relational_catalog
+            .get(table)
+            .map(|table| table.acl.clone())
     }
 
     pub fn relational_relation_acl(
         &self,
         relation: &str,
-    ) -> Option<&BTreeMap<String, BTreeSet<TablePrivilege>>> {
-        self.relational_catalog
+    ) -> Option<BTreeMap<String, BTreeSet<TablePrivilege>>> {
+        // Acquire the catalog latch ONCE: the `.or_else` chain must not re-call `ddl_catalog()` (the
+        // latch is non-reentrant — a second acquisition while the first guard is alive self-deadlocks).
+        let cat = self.ddl_catalog();
+        cat.relational_catalog
             .get(relation)
-            .map(|table| &table.acl)
-            .or_else(|| self.relational_views.get(relation).map(|view| &view.acl))
+            .map(|table| table.acl.clone())
             .or_else(|| {
-                self.relational_materialized_views
+                cat.relational_views
                     .get(relation)
-                    .map(|view| &view.acl)
+                    .map(|view| view.acl.clone())
             })
             .or_else(|| {
-                self.relational_sequences
+                cat.relational_materialized_views
                     .get(relation)
-                    .map(|sequence| &sequence.acl)
+                    .map(|view| view.acl.clone())
+            })
+            .or_else(|| {
+                cat.relational_sequences
+                    .get(relation)
+                    .map(|sequence| sequence.acl.clone())
             })
     }
 
-    pub fn relational_default_table_acl(&self) -> &BTreeMap<String, BTreeSet<TablePrivilege>> {
-        &self.relational_default_table_acl
+    pub fn relational_default_table_acl(&self) -> BTreeMap<String, BTreeSet<TablePrivilege>> {
+        self.ddl_catalog().relational_default_table_acl.clone()
     }
 
-    pub fn relational_schema_acl(&self) -> &BTreeMap<String, BTreeSet<SchemaPrivilege>> {
-        &self.relational_schema_acl
+    pub fn relational_schema_acl(&self) -> BTreeMap<String, BTreeSet<SchemaPrivilege>> {
+        self.ddl_catalog().relational_schema_acl.clone()
     }
 
     pub fn relational_function_acl(
         &self,
         function: &str,
-    ) -> Option<&BTreeMap<String, BTreeSet<FunctionPrivilege>>> {
-        self.relational_functions
+    ) -> Option<BTreeMap<String, BTreeSet<FunctionPrivilege>>> {
+        self.ddl_catalog()
+            .relational_functions
             .get(function)
-            .map(|function| &function.acl)
+            .map(|function| function.acl.clone())
     }
 
-    pub fn relational_catalog_view(&self, view: &str) -> Option<&RelationalView> {
-        self.relational_views.get(view)
+    pub fn relational_catalog_view(&self, view: &str) -> Option<RelationalView> {
+        self.ddl_catalog().relational_views.get(view).cloned()
     }
 
     pub fn relational_catalog_materialized_view(
         &self,
         materialized_view: &str,
-    ) -> Option<&RelationalMaterializedView> {
-        self.relational_materialized_views.get(materialized_view)
+    ) -> Option<RelationalMaterializedView> {
+        self.ddl_catalog()
+            .relational_materialized_views
+            .get(materialized_view)
+            .cloned()
     }
 
-    pub fn relational_catalog_function(&self, function: &str) -> Option<&RelationalFunction> {
-        self.relational_functions.get(function)
+    pub fn relational_catalog_function(&self, function: &str) -> Option<RelationalFunction> {
+        self.ddl_catalog()
+            .relational_functions
+            .get(function)
+            .cloned()
     }
 
-    pub fn relational_catalog_sequence(&self, sequence: &str) -> Option<&RelationalSequence> {
-        self.relational_sequences.get(sequence)
+    pub fn relational_catalog_sequence(&self, sequence: &str) -> Option<RelationalSequence> {
+        self.ddl_catalog()
+            .relational_sequences
+            .get(sequence)
+            .cloned()
     }
 
-    pub fn relational_catalog_domain(&self, domain: &str) -> Option<&RelationalDomain> {
-        self.relational_domains.get(domain)
+    pub fn relational_catalog_domain(&self, domain: &str) -> Option<RelationalDomain> {
+        self.ddl_catalog().relational_domains.get(domain).cloned()
     }
 
     pub fn relational_catalog_publication(
         &self,
         publication: &str,
-    ) -> Option<&RelationalPublication> {
-        self.relational_publications.get(publication)
+    ) -> Option<RelationalPublication> {
+        self.ddl_catalog()
+            .relational_publications
+            .get(publication)
+            .cloned()
     }
 
     pub fn relational_catalog_subscription(
         &self,
         subscription: &str,
-    ) -> Option<&RelationalSubscription> {
-        self.relational_subscriptions.get(subscription)
+    ) -> Option<RelationalSubscription> {
+        self.ddl_catalog()
+            .relational_subscriptions
+            .get(subscription)
+            .cloned()
     }
 
-    pub fn relational_table_comment(&self, table: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_table_comment(&self, table: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Table {
                 table: table.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_database_comment(&self, database: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_database_comment(&self, database: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Database {
                 database: database.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_role_comment(&self, role: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_role_comment(&self, role: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Role {
                 role: role.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_role(&self, role: &str) -> Option<&RelationalRole> {
-        self.relational_roles.get(role)
+    pub fn relational_role(&self, role: &str) -> Option<RelationalRole> {
+        self.ddl_catalog().relational_roles.get(role).cloned()
     }
 
-    pub fn relational_database(&self, database: &str) -> Option<&RelationalDatabase> {
-        self.relational_databases.get(database)
+    pub fn relational_database(&self, database: &str) -> Option<RelationalDatabase> {
+        self.ddl_catalog()
+            .relational_databases
+            .get(database)
+            .cloned()
     }
 
     pub fn relational_database_acl(
         &self,
         database: &str,
-    ) -> Option<&BTreeMap<String, BTreeSet<DatabasePrivilege>>> {
-        self.relational_databases
+    ) -> Option<BTreeMap<String, BTreeSet<DatabasePrivilege>>> {
+        self.ddl_catalog()
+            .relational_databases
             .get(database)
-            .map(|database| &database.acl)
+            .map(|database| database.acl.clone())
     }
 
-    pub fn relational_tablespace(&self, tablespace: &str) -> Option<&RelationalTablespace> {
-        self.relational_tablespaces.get(tablespace)
+    pub fn relational_tablespace(&self, tablespace: &str) -> Option<RelationalTablespace> {
+        self.ddl_catalog()
+            .relational_tablespaces
+            .get(tablespace)
+            .cloned()
     }
 
     pub fn relational_tablespace_acl(
         &self,
         tablespace: &str,
-    ) -> Option<&BTreeMap<String, BTreeSet<TablespacePrivilege>>> {
-        self.relational_tablespaces
+    ) -> Option<BTreeMap<String, BTreeSet<TablespacePrivilege>>> {
+        self.ddl_catalog()
+            .relational_tablespaces
             .get(tablespace)
-            .map(|tablespace| &tablespace.acl)
+            .map(|tablespace| tablespace.acl.clone())
     }
 
-    pub fn relational_schema_comment(&self, schema: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_schema_comment(&self, schema: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Schema {
                 schema: schema.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_tablespace_comment(&self, tablespace: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_tablespace_comment(&self, tablespace: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Tablespace {
                 tablespace: tablespace.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_column_comment(&self, table: &str, attnum: i16) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_column_comment(&self, table: &str, attnum: i16) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Column {
                 table: table.to_string(),
                 attnum,
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_index_comment(&self, index: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_index_comment(&self, index: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Index {
                 index: index.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_view_comment(&self, view: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_view_comment(&self, view: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::View {
                 view: view.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_sequence_comment(&self, sequence: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_sequence_comment(&self, sequence: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Sequence {
                 sequence: sequence.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_materialized_view_comment(&self, materialized_view: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_materialized_view_comment(&self, materialized_view: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::MaterializedView {
                 materialized_view: materialized_view.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_function_comment(&self, function: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_function_comment(&self, function: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Function {
                 function: function.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_extension_comment(&self, extension: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_extension_comment(&self, extension: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Extension {
                 extension: extension.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_constraint_comment(&self, table: &str, constraint: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_constraint_comment(&self, table: &str, constraint: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Constraint {
                 table: table.to_string(),
                 constraint: constraint.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_publication_comment(&self, publication: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_publication_comment(&self, publication: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Publication {
                 publication: publication.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
-    pub fn relational_subscription_comment(&self, subscription: &str) -> Option<&str> {
-        self.relational_comments
+    pub fn relational_subscription_comment(&self, subscription: &str) -> Option<String> {
+        self.ddl_catalog()
+            .relational_comments
             .get(&RelationalCommentTarget::Subscription {
                 subscription: subscription.to_string(),
             })
-            .map(String::as_str)
+            .cloned()
     }
 
     pub fn populate_relational_residency_snapshot(
@@ -23881,6 +24488,7 @@ impl Engine {
             .get(table)
             .cloned();
         let catalog_table = self
+            .ddl_catalog_mut()
             .relational_catalog
             .get(table)
             .ok_or_else(|| {
@@ -24041,12 +24649,15 @@ impl Engine {
             evicted_tables_on_admission,
             device_memory_proof,
         };
-        self.relational_resident_cache.install_snapshot(
-            catalog_table.name,
-            snapshot.clone(),
-            device_memory,
-            &self.read_state.residency,
-        );
+        let read_state = Arc::clone(&self.read_state);
+        self.ddl_catalog_mut()
+            .relational_resident_cache
+            .install_snapshot(
+                catalog_table.name,
+                snapshot.clone(),
+                device_memory,
+                &read_state.residency,
+            );
         Ok(snapshot)
     }
 
@@ -24060,7 +24671,8 @@ impl Engine {
             let resident_bytes_after_admission = self
                 .relational_resident_bytes_for_gpu_excluding(gpu_id, table)
                 .saturating_add(resident_bytes);
-            self.relational_resident_cache
+            self.ddl_catalog_mut()
+                .relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
                     gpu_id,
@@ -24077,7 +24689,8 @@ impl Engine {
         };
         if resident_bytes > budget_bytes {
             let current_bytes = self.relational_resident_bytes_for_gpu(gpu_id);
-            self.relational_resident_cache
+            self.ddl_catalog_mut()
+                .relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
                     gpu_id,
@@ -24098,7 +24711,8 @@ impl Engine {
         let current_bytes_before = current_bytes;
         let mut evicted_tables = Vec::new();
         if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
-            self.relational_resident_cache
+            self.ddl_catalog_mut()
+                .relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
                     gpu_id,
@@ -24134,16 +24748,16 @@ impl Engine {
             if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
                 break;
             }
-            self.relational_resident_cache.remove_table(
-                &map_key,
-                &self.read_state.residency,
-                &self.read_state.route_telemetry,
-            );
+            let read_state = Arc::clone(&self.read_state);
+            self.ddl_catalog_mut()
+                .relational_resident_cache
+                .remove_table(&map_key, &read_state.residency, &read_state.route_telemetry);
             current_bytes = current_bytes.saturating_sub(bytes);
             evicted_tables.push(map_key);
         }
 
-        self.relational_resident_cache
+        self.ddl_catalog_mut()
+            .relational_resident_cache
             .record_decision(RelationalResidentCacheDecision {
                 table: table.to_string(),
                 gpu_id,
@@ -24194,6 +24808,7 @@ impl Engine {
             )));
         }
         let catalog_table = self
+            .ddl_catalog_mut()
             .relational_catalog
             .get(table)
             .ok_or_else(|| {
@@ -24307,12 +24922,15 @@ impl Engine {
             evicted_tables_on_admission,
             device_memory_proof,
         };
-        self.relational_resident_cache.install_snapshot(
-            catalog_table.name,
-            snapshot.clone(),
-            Some(device_memory),
-            &self.read_state.residency,
-        );
+        let read_state = Arc::clone(&self.read_state);
+        self.ddl_catalog_mut()
+            .relational_resident_cache
+            .install_snapshot(
+                catalog_table.name,
+                snapshot.clone(),
+                Some(device_memory),
+                &read_state.residency,
+            );
         Ok(snapshot)
     }
 
@@ -24335,6 +24953,7 @@ impl Engine {
             )));
         }
         let catalog_table = self
+            .ddl_catalog_mut()
             .relational_catalog
             .get(table)
             .ok_or_else(|| {
@@ -24419,12 +25038,15 @@ impl Engine {
             evicted_tables_on_admission,
             device_memory_proof,
         };
-        self.relational_resident_cache.install_snapshot(
-            catalog_table.name,
-            snapshot.clone(),
-            Some(device_memory),
-            &self.read_state.residency,
-        );
+        let read_state = Arc::clone(&self.read_state);
+        self.ddl_catalog_mut()
+            .relational_resident_cache
+            .install_snapshot(
+                catalog_table.name,
+                snapshot.clone(),
+                Some(device_memory),
+                &read_state.residency,
+            );
         Ok(snapshot)
     }
 
@@ -24440,6 +25062,7 @@ impl Engine {
             )));
         }
         let catalog_table = self
+            .ddl_catalog_mut()
             .relational_catalog
             .get(table)
             .ok_or_else(|| {
@@ -24553,12 +25176,15 @@ impl Engine {
             device_memory.insert(partition.partition_id, retained);
         }
         partitions.sort_by_key(|partition| (partition.row_start, partition.partition_id));
-        self.relational_resident_cache.install_partitions(
-            catalog_table.name,
-            partitions,
-            device_memory,
-            &self.read_state.residency,
-        );
+        let read_state = Arc::clone(&self.read_state);
+        self.ddl_catalog_mut()
+            .relational_resident_cache
+            .install_partitions(
+                catalog_table.name,
+                partitions,
+                device_memory,
+                &read_state.residency,
+            );
         Ok(())
     }
 
@@ -24768,7 +25394,11 @@ impl Engine {
         }
         let budget_bytes = self.relational_residency_budget_bytes(gpu_id);
         let requested_tables = if policy.tables.is_empty() {
-            self.relational_catalog.keys().cloned().collect::<Vec<_>>()
+            self.ddl_catalog_mut()
+                .relational_catalog
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
         } else {
             policy.tables.clone()
         };
@@ -24798,7 +25428,11 @@ impl Engine {
                 });
                 continue;
             }
-            if !self.relational_catalog.contains_key(&table) {
+            if !self
+                .ddl_catalog_mut()
+                .relational_catalog
+                .contains_key(&table)
+            {
                 entries.push(RelationalResidencyWarmupEntry {
                     table: table.clone(),
                     action: RelationalResidencyWarmupAction::Skipped,
@@ -24857,6 +25491,7 @@ impl Engine {
                             RelationalResidencyWarmupAction::Warmed
                         },
                         reason: self
+                            .ddl_catalog_mut()
                             .relational_resident_cache
                             .last_decision(&table)
                             .map(|decision| decision.reason.clone())
@@ -25050,7 +25685,7 @@ impl Engine {
             );
         }
 
-        let (table, bound) = match self.bind_relational_select_for_execution(select) {
+        let (table, bound, _copin_s) = match self.bind_relational_select_for_execution(select) {
             Ok(bound) => bound,
             Err(err) => {
                 return Self::resident_route_reject(
@@ -25482,8 +26117,11 @@ impl Engine {
                     .memory_pressured_gpu_ids
                     .contains(&snapshot.gpu_id);
                 let last_decision = self
+                    .ddl_catalog()
                     .relational_resident_cache
-                    .last_decision(&snapshot.table);
+                    .last_decision(&snapshot.table)
+                    .cloned();
+                let last_decision = last_decision.as_ref();
                 let cache_state =
                     Self::relational_snapshot_cache_state(snapshot, memory_pressure_active);
                 RelationalResidencyTableStatus {
@@ -25539,7 +26177,11 @@ impl Engine {
                 .cloned()
                 .collect(),
             resident_bytes_by_gpu,
-            budget_bytes_by_gpu: self.relational_resident_cache.budget_bytes_by_gpu.clone(),
+            budget_bytes_by_gpu: self
+                .ddl_catalog()
+                .relational_resident_cache
+                .budget_bytes_by_gpu
+                .clone(),
         }
     }
 
@@ -25650,7 +26292,13 @@ impl Engine {
         fallback_reason: Option<FallbackReason>,
         observe_cuda_probe_metrics: bool,
     ) -> Result<MvccReadResult, ExecuteError> {
-        if self.repl_role() != Role::Leader {
+        // The leader gate re-reads `repl_role()` (which locks the commit_mutex). A relational SELECT
+        // executed as part of *applying* a committed materialized-view entry runs INSIDE the commit
+        // critical section (which already holds the commit_mutex) and is on a guaranteed leader, so
+        // re-locking here would self-deadlock the non-reentrant commit_mutex. `mvcc_read_skips_leader_
+        // check()` is set only on that internal apply-path read; every client read leaves it false and
+        // is gated exactly as before.
+        if !self.mvcc_read_skips_leader_check() && self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
 
@@ -25684,7 +26332,8 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &CudaMvccExecutionBackend,
     ) -> Result<MvccReadResult, ExecuteError> {
-        if self.repl_role() != Role::Leader {
+        // Same mid-commit reentrancy guard as `execute_mvcc_query_with_fallback_reason` (see there).
+        if !self.mvcc_read_skips_leader_check() && self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
 
@@ -25818,29 +26467,64 @@ impl Engine {
         self.read_state.committed_seq.load(AtomicOrdering::Acquire)
     }
 
-    /// Pin the currently-published catalog snapshot as an owned `Arc` for the whole statement (Stage 2
-    /// — blocker #1). A statement loads this ONCE and threads `&CatalogSnapshot` through its read /
-    /// concurrent-DML helpers, so a concurrent DDL publish (a fresh `Arc` via
-    /// [`Engine::publish_catalog_snapshot`]) can never split the statement across two catalogs — the
-    /// same single-snapshot-per-statement discipline the data pin already uses.
+    /// Pin the LATEST published catalog generation as an owned `Arc` (Stage 2 — blocker #1). This is
+    /// the un-pinned "newest" view; the co-pinned read path uses [`ReadState::catalog_as_of`] with a
+    /// boundary instead (PART B), but the off-latch DML preflight and a handful of admin reads that are
+    /// not boundary-pinned use this. A statement that does pin loads its boundary once and threads it.
     fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
-        self.read_state.catalog.load_full()
+        self.read_state.latest_catalog()
     }
 
-    /// Publish a fresh immutable catalog snapshot from the current `Engine` working maps (Stage 2 —
-    /// blocker #1). Called by the catalog-latch path (serialized DDL apply) AFTER it has mutated the
-    /// working `relational_catalog`/`relational_views`/`relational_materialized_views`/
-    /// `relational_functions` and BEFORE it release-stores `committed_seq` — so a lock-free reader that
-    /// observes the new `committed_seq` also observes (at least) this catalog (publish ordering:
-    /// working maps → catalog → residency → `committed_seq` LAST). Cheap relative to a DDL commit; DDL
-    /// is the only writer and runs under the exclusive catalog latch, so there is one publisher.
-    fn publish_catalog_snapshot(&self) {
-        self.read_state.catalog.store(Arc::new(CatalogSnapshot {
-            relational_catalog: self.relational_catalog.clone(),
-            relational_views: self.relational_views.clone(),
-            relational_materialized_views: self.relational_materialized_views.clone(),
-            relational_functions: self.relational_functions.clone(),
-        }));
+    /// Build a fresh immutable catalog generation from `cat` (the DDL working maps, held under the
+    /// catalog latch) stamped at `commit_seq`, push it onto the catalog ring (pruning generations the
+    /// oldest active read snapshot can no longer need), and return it (Stage 2 — blocker #1; PART B
+    /// co-pinning). Called by the catalog-latch apply path AFTER it has mutated the working maps and
+    /// BEFORE it release-stores `committed_seq` — the publish ordering is now: data gen → residency
+    /// tombstones → **catalog ring push (this)** → `publish_committed_seq` LAST. Because the ring push
+    /// happens before `committed_seq` is bumped, a reader that loads `committed_seq = commit_seq` and
+    /// selects `catalog_as_of(commit_seq)` is guaranteed to find this generation (catalog visible no
+    /// later than `committed_seq`). DDL is the only publisher and runs under the exclusive latch.
+    fn publish_catalog_snapshot(
+        &self,
+        cat: &DdlCatalogState,
+        commit_seq: Index,
+        prune_below: Index,
+    ) {
+        let generation = Arc::new(CatalogSnapshot {
+            commit_seq,
+            relational_catalog: cat.relational_catalog.clone(),
+            relational_views: cat.relational_views.clone(),
+            relational_materialized_views: cat.relational_materialized_views.clone(),
+            relational_functions: cat.relational_functions.clone(),
+            relational_sequences: cat.relational_sequences.clone(),
+            relational_domains: cat.relational_domains.clone(),
+            relational_publications: cat.relational_publications.clone(),
+            relational_subscriptions: cat.relational_subscriptions.clone(),
+            relational_roles: cat.relational_roles.clone(),
+            relational_databases: cat.relational_databases.clone(),
+            relational_tablespaces: cat.relational_tablespaces.clone(),
+            relational_public_schema_exists: cat.relational_public_schema_exists,
+            relational_public_schema_implicit: cat.relational_public_schema_implicit,
+            relational_schema_acl: cat.relational_schema_acl.clone(),
+            relational_default_table_acl: cat.relational_default_table_acl.clone(),
+            relational_comments: cat.relational_comments.clone(),
+        });
+        let history = self.read_state.catalog_history.load();
+        self.read_state
+            .catalog_history
+            .store(Arc::new(history.pushed(generation, prune_below)));
+    }
+
+    /// The oldest active read snapshot's prune boundary for the catalog ring: generations strictly
+    /// older than the one a reader pinned at this boundary would select can be dropped. `None` (no
+    /// in-flight reader) ⇒ prune everything redundant up to `up_to` (the just-committed seq).
+    fn catalog_prune_boundary(&self, up_to: Index) -> Index {
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .oldest()
+            .map(|oldest| oldest.saturating_sub(1))
+            .unwrap_or(up_to)
     }
 
     /// Release-store the visibility/publish boundary to `at least` `seq` (monotonic). Called LAST in
@@ -25864,7 +26548,7 @@ impl Engine {
     }
 
     pub fn applied_len(&self) -> usize {
-        self.sm.applied.len()
+        self.commit_state().sm.applied.len()
     }
 
     pub fn wal_flushed_count(&self) -> usize {
@@ -26336,8 +27020,11 @@ impl Engine {
             .oldest()
     }
 
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.sm.kv.get(key).map(|s| s.as_str())
+    pub fn get(&self, key: &str) -> Option<String> {
+        // KV now lives under the commit_mutex (A.2): a `MutexGuard` cannot lend a borrow that
+        // outlives it, so this returns an owned `String` (the historical `Option<&str>`). The KV read
+        // path is not perf-critical; the relational read path is the lock-free one.
+        self.commit_state().sm.kv.get(key).map(|s| s.to_string())
     }
 
     pub fn visible_state_fingerprint(&self) -> u64 {
@@ -26353,7 +27040,8 @@ impl Engine {
         }
 
         let mut hash = FNV_OFFSET_BASIS;
-        for (k, v) in &self.sm.kv {
+        let commit = self.commit_state();
+        for (k, v) in &commit.sm.kv {
             hash = hash_bytes(hash, k.as_bytes());
             hash = hash_bytes(hash, &[0xFF]);
             hash = hash_bytes(hash, v.as_bytes());
@@ -26363,13 +27051,13 @@ impl Engine {
     }
 
     pub fn active_txn_count(&self) -> usize {
-        self.txn_manager.active_count()
+        self.commit_state().txn_manager.active_count()
     }
 
     pub fn replication_watermarks(&self) -> ReplicationWatermarks {
         let now = Instant::now();
-        let pending_batch_len = self.batcher.len();
-        let pending_batch_cap = self.batcher.max_items();
+        let pending_batch_len = self.batcher().len();
+        let pending_batch_cap = self.batcher().max_items();
         // Read all the commit-substate watermarks under ONE commit_mutex acquisition (a snapshot of
         // the replicator + WAL counters), then release before the rest of the computation.
         let (
@@ -26381,6 +27069,9 @@ impl Engine {
             snapshot_id,
             wal_checkpoint,
             wal_buffered_count,
+            active_txn_count,
+            oldest_active_txn_id,
+            newest_active_txn_id,
         ) = {
             let commit = self.commit_state();
             (
@@ -26392,9 +27083,11 @@ impl Engine {
                 commit.repl.snapshot_meta().snapshot_id,
                 commit.wal.checkpoint_meta(),
                 commit.wal.len(),
+                commit.txn_manager.active_count(),
+                commit.txn_manager.oldest_active_txn_id(),
+                commit.txn_manager.newest_active_txn_id(),
             )
         };
-        let active_txn_count = self.txn_manager.active_count();
         let pending_batch_remaining_capacity = pending_batch_cap.saturating_sub(pending_batch_len);
         let pending_batch_utilization_permyriad = if pending_batch_cap == 0 {
             0
@@ -26411,8 +27104,6 @@ impl Engine {
         let commit_apply_gap = commit_index.saturating_sub(applied_index);
         let apply_visible_gap = applied_index.saturating_sub(visible_index);
 
-        let oldest_active_txn_id = self.txn_manager.oldest_active_txn_id();
-        let newest_active_txn_id = self.txn_manager.newest_active_txn_id();
         let has_wal_backlog = wal_unflushed_count > 0;
         let has_pending_batch_backlog = pending_batch_len > 0;
         let has_active_txn_backlog = active_txn_count > 0;
@@ -26601,25 +27292,28 @@ impl Engine {
     }
 
     pub fn pending_batch_len(&self) -> usize {
-        self.batcher.len()
+        self.batcher().len()
     }
 
     pub fn has_pending_batch(&self) -> bool {
-        !self.batcher.is_empty()
+        !self.batcher().is_empty()
     }
 
     pub fn pending_batch_oldest_age(&self, now: Instant) -> Option<Duration> {
-        self.batcher
+        self.batcher()
             .first_enqueued_at()
             .map(|head| now.saturating_duration_since(head))
     }
 
     pub fn pending_batch_time_until_deadline(&self, now: Instant) -> Option<Duration> {
-        self.batcher.time_until_flush_deadline(now)
+        self.batcher().time_until_flush_deadline(now)
     }
 
     pub fn batching_config(&self) -> (usize, Duration) {
-        (self.batcher.max_items(), self.batcher.max_wait())
+        // ONE batcher lock: two `self.batcher()` in a tuple would keep the first guard alive while
+        // taking the second — a self-deadlock on the non-reentrant mutex.
+        let batcher = self.batcher();
+        (batcher.max_items(), batcher.max_wait())
     }
 
     fn route_command(&self, cmd: &Command) -> RouteDecision {
@@ -26742,7 +27436,7 @@ mod tests {
         // GPU; this asserts the seam the fallback lands on is correct CPU-only). The two are wired to
         // the same bind + pinned MVCC read, so for a non-resident table they must agree on rows,
         // columns, and access path.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         for id in 1..=5 {
             e.execute_text(
@@ -26959,7 +27653,7 @@ mod tests {
     /// per-table refactor kept the fast-path index-targeted (the whole reason for per-table cells).
     #[test]
     fn stage3_resident_equality_read_still_uses_value_index_fast_path() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         // 200 rows; only 2 carry name='Ada'. A version-chain scan would touch all 200; the
@@ -27075,7 +27769,7 @@ mod tests {
 
     #[test]
     fn wal_before_visibility_holds() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         let t = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         assert!(e.wal_flushed_count() >= 1);
         assert!(e.visible_up_to() >= t.index);
@@ -27084,7 +27778,7 @@ mod tests {
 
     #[test]
     fn commit_indices_monotonic() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         let a = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         let b = e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
         assert!(b.index > a.index);
@@ -27093,25 +27787,25 @@ mod tests {
 
     #[test]
     fn execute_set_updates_state_machine() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
-        assert_eq!(e.get("balance"), Some("100"));
+        assert_eq!(e.get("balance").as_deref(), Some("100"));
         assert_eq!(e.metrics().snapshot().commits_total, 1);
     }
 
     #[test]
     fn execute_set_accepts_session_and_local_scope_aliases() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET SESSION balance=100").unwrap();
         e.execute_text(2, "SET LOCAL balance TO 101").unwrap();
 
-        assert_eq!(e.get("balance"), Some("101"));
+        assert_eq!(e.get("balance").as_deref(), Some("101"));
         assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
 
     #[test]
     fn execute_del_removes_existing_key() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
         e.execute_text(2, "DEL balance").unwrap();
 
@@ -27121,7 +27815,7 @@ mod tests {
 
     #[test]
     fn execute_delete_alias_removes_existing_key() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
         e.execute_text(2, "DELETE balance").unwrap();
 
@@ -27135,7 +27829,7 @@ mod tests {
         e.execute_text(1, "SET balance=100").unwrap();
 
         let value = e.execute_read_text("GET balance").unwrap();
-        assert_eq!(value, Some("100"));
+        assert_eq!(value.as_deref(), Some("100"));
         assert_eq!(e.metrics().snapshot().commits_total, 1);
         assert_eq!(e.metrics().snapshot().fallback_total, 1);
         assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 1);
@@ -27227,7 +27921,7 @@ mod tests {
 
     #[test]
     fn execute_text_get_tracks_d2h_bytes_for_hits_only() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
 
         e.execute_text(2, "GET balance").unwrap();
@@ -27256,8 +27950,8 @@ mod tests {
         let t0 = Instant::now();
         e.enqueue_set_text(1, "SET a=1", t0).unwrap();
         e.enqueue_set_text(2, "SET b=2", t0).unwrap();
-        assert_eq!(e.get("a"), Some("1"));
-        assert_eq!(e.get("b"), Some("2"));
+        assert_eq!(e.get("a").as_deref(), Some("1"));
+        assert_eq!(e.get("b").as_deref(), Some("2"));
         assert_eq!(e.metrics().snapshot().batch_flush_count, 1);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 1);
         assert_eq!(
@@ -27293,7 +27987,7 @@ mod tests {
         assert!(e.has_pending_batch());
         assert_eq!(e.pending_batch_len(), 1);
         e.tick_batching(t0 + Duration::from_millis(3)).unwrap();
-        assert_eq!(e.get("a"), Some("7"));
+        assert_eq!(e.get("a").as_deref(), Some("7"));
         assert!(!e.has_pending_batch());
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().snapshot().batch_flush_count, 1);
@@ -27327,14 +28021,14 @@ mod tests {
         assert_eq!(e.pending_batch_len(), 1);
         e.flush_admin().unwrap();
 
-        assert_eq!(e.get("a"), Some("9"));
+        assert_eq!(e.get("a").as_deref(), Some("9"));
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
     }
 
     #[test]
     fn admin_flush_without_pending_queue_is_noop() {
-        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let e = Engine::with_batching(10, Duration::from_secs(60));
         let t0 = Instant::now();
 
         e.flush_admin().unwrap();
@@ -27432,7 +28126,7 @@ mod tests {
             (6, "SET acct_a=99"),
         ];
 
-        let mut immediate = Engine::new_local();
+        let immediate = Engine::new_local();
         for (txn_id, cmd) in trace {
             immediate.execute_text(txn_id, cmd).unwrap();
         }
@@ -27444,8 +28138,11 @@ mod tests {
         }
         batched.flush_admin().unwrap();
 
-        assert_eq!(immediate.sm.applied, batched.sm.applied);
-        assert_eq!(immediate.sm.kv, batched.sm.kv);
+        assert_eq!(
+            immediate.commit_state().sm.applied,
+            batched.commit_state().sm.applied
+        );
+        assert_eq!(immediate.commit_state().sm.kv, batched.commit_state().sm.kv);
         assert_eq!(immediate.visible_up_to(), batched.visible_up_to());
         assert_eq!(
             immediate.visible_state_fingerprint(),
@@ -27457,7 +28154,7 @@ mod tests {
 
     #[test]
     fn visible_state_fingerprint_changes_with_visible_kv_state() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         let empty = e.visible_state_fingerprint();
 
         e.execute_text(1, "SET a=1").unwrap();
@@ -27476,7 +28173,7 @@ mod tests {
         e.enqueue_set_text(1, "SET a=5", t0).unwrap();
         e.execute_text(2, "FLUSH").unwrap();
 
-        assert_eq!(e.get("a"), Some("5"));
+        assert_eq!(e.get("a").as_deref(), Some("5"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
     }
 
@@ -27491,8 +28188,8 @@ mod tests {
         e.enqueue_set_text(3, "SET b=7", t0).unwrap();
         e.execute_text(4, "FLUSH LOG").unwrap();
 
-        assert_eq!(e.get("a"), Some("5"));
-        assert_eq!(e.get("b"), Some("7"));
+        assert_eq!(e.get("a").as_deref(), Some("5"));
+        assert_eq!(e.get("b").as_deref(), Some("7"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 2);
     }
 
@@ -27514,7 +28211,7 @@ mod tests {
         e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
 
         assert_eq!(e.get("a"), None);
-        assert_eq!(e.get("b"), Some("2"));
+        assert_eq!(e.get("b").as_deref(), Some("2"));
         assert_eq!(e.applied_len(), 1);
     }
 
@@ -27625,7 +28322,7 @@ mod tests {
 
         e.execute_text(1, "SET balance=100").unwrap();
 
-        assert_eq!(e.get("balance"), Some("100"));
+        assert_eq!(e.get("balance").as_deref(), Some("100"));
         assert_eq!(e.metrics().snapshot().commits_total, 1);
         assert_eq!(e.metrics().snapshot().fallback_total, 1);
         assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
@@ -27653,7 +28350,7 @@ mod tests {
 
         e.enqueue_set_text(1, "SET balance=100", t0).unwrap();
 
-        assert_eq!(e.get("balance"), Some("100"));
+        assert_eq!(e.get("balance").as_deref(), Some("100"));
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().snapshot().commits_total, 1);
         assert_eq!(e.metrics().snapshot().fallback_total, 1);
@@ -27671,7 +28368,7 @@ mod tests {
 
         e.enqueue_set_text(1, "SET balance=100", t0).unwrap();
 
-        assert_eq!(e.get("balance"), Some("100"));
+        assert_eq!(e.get("balance").as_deref(), Some("100"));
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().snapshot().commits_total, 1);
         assert_eq!(e.metrics().snapshot().fallback_total, 1);
@@ -27748,8 +28445,8 @@ mod tests {
 
         e.flush_admin().unwrap();
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.get("a"), Some("1"));
-        assert_eq!(e.get("b"), Some("2"));
+        assert_eq!(e.get("a").as_deref(), Some("1"));
+        assert_eq!(e.get("b").as_deref(), Some("2"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
         assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
@@ -27841,14 +28538,14 @@ mod tests {
         e.flush_admin().unwrap();
 
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.get("a"), Some("1"));
+        assert_eq!(e.get("a").as_deref(), Some("1"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
         assert_eq!(e.metrics().snapshot().commits_total, 1);
     }
 
     #[test]
     fn execute_text_non_mutations_count_as_not_gpu_eligible_fallbacks() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(1, "BEGIN").unwrap();
         e.execute_text(1, "COMMIT").unwrap();
@@ -27876,7 +28573,7 @@ mod tests {
 
     #[test]
     fn execute_text_bounds_bootstrap_extension_create() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(1, "CREATE EXTENSION IF NOT EXISTS plpgsql")
             .unwrap();
@@ -27918,20 +28615,20 @@ mod tests {
 
     #[test]
     fn execute_text_accepts_bootstrap_extension_if_exists_cleanup() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(1, "COMMENT ON EXTENSION plpgsql IS 'bootstrap extension'")
             .unwrap();
         e.execute_text(2, "DROP EXTENSION IF EXISTS plpgsql")
             .unwrap();
         assert_eq!(
-            e.relational_extension_comment("plpgsql"),
+            e.relational_extension_comment("plpgsql").as_deref(),
             Some("bootstrap extension")
         );
 
         let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
-            recovered.relational_extension_comment("plpgsql"),
+            recovered.relational_extension_comment("plpgsql").as_deref(),
             Some("bootstrap extension")
         );
 
@@ -27955,18 +28652,18 @@ mod tests {
 
     #[test]
     fn execute_text_records_bootstrap_extension_comment_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(1, "COMMENT ON EXTENSION plpgsql IS 'bootstrap extension'")
             .unwrap();
         assert_eq!(
-            e.relational_extension_comment("plpgsql"),
+            e.relational_extension_comment("plpgsql").as_deref(),
             Some("bootstrap extension")
         );
 
         let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
-            recovered.relational_extension_comment("plpgsql"),
+            recovered.relational_extension_comment("plpgsql").as_deref(),
             Some("bootstrap extension")
         );
 
@@ -27986,7 +28683,7 @@ mod tests {
 
     #[test]
     fn execute_text_replays_bounded_role_metadata_and_acl_grantees() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(1, "CREATE ROLE app_reader WITH LOGIN")
             .unwrap();
@@ -28006,7 +28703,7 @@ mod tests {
         assert!(e.relational_role("app_reader").unwrap().login);
         assert!(e.relational_role("app_writer").unwrap().login);
         assert_eq!(
-            e.relational_role_comment("app_reader"),
+            e.relational_role_comment("app_reader").as_deref(),
             Some("read-only app")
         );
         assert!(e
@@ -28014,14 +28711,17 @@ mod tests {
             .unwrap()
             .acl
             .contains_key("app_reader"));
-        assert!(e.relational_default_table_acl.contains_key("app_writer"));
+        assert!(e
+            .ddl_catalog()
+            .relational_default_table_acl
+            .contains_key("app_writer"));
 
         e.execute_text(7, "ALTER ROLE app_reader RENAME TO app_analyst")
             .unwrap();
         assert!(e.relational_role("app_reader").is_none());
         assert!(e.relational_role("app_analyst").unwrap().login);
         assert_eq!(
-            e.relational_role_comment("app_analyst"),
+            e.relational_role_comment("app_analyst").as_deref(),
             Some("read-only app")
         );
         assert!(e
@@ -28055,6 +28755,7 @@ mod tests {
         assert!(recovered.relational_role("app_analyst").is_none());
         assert!(recovered.relational_role("app_writer").unwrap().login);
         assert!(recovered
+            .ddl_catalog()
             .relational_default_table_acl
             .contains_key("app_writer"));
 
@@ -28065,7 +28766,7 @@ mod tests {
             .to_string()
             .contains("relation \"people\" does not exist"));
 
-        let mut missing_role = Engine::new_local();
+        let missing_role = Engine::new_local();
         missing_role
             .execute_text(1, "CREATE TABLE people (id INT)")
             .unwrap();
@@ -28096,7 +28797,7 @@ mod tests {
 
     #[test]
     fn execute_text_replays_bounded_database_metadata() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(1, "CREATE DATABASE appdb").unwrap();
         e.execute_text(2, "COMMENT ON DATABASE appdb IS 'application database'")
@@ -28119,7 +28820,7 @@ mod tests {
             &BTreeSet::from([DatabasePrivilege::Connect, DatabasePrivilege::Temporary])
         );
         assert_eq!(
-            e.relational_database_comment("appdb"),
+            e.relational_database_comment("appdb").as_deref(),
             Some("application database")
         );
 
@@ -28149,7 +28850,7 @@ mod tests {
             .unwrap()
             .contains_key("app_analyst"));
         assert_eq!(
-            e.relational_database_comment("appdb_renamed"),
+            e.relational_database_comment("appdb_renamed").as_deref(),
             Some("application database")
         );
         assert_eq!(e.relational_database_comment("appdb"), None);
@@ -28178,7 +28879,7 @@ mod tests {
         assert!(recovered.relational_database("appdb_renamed").is_none());
         assert_eq!(recovered.relational_database_comment("appdb_renamed"), None);
 
-        let mut kept = Engine::new_local();
+        let kept = Engine::new_local();
         kept.execute_text(1, "CREATE DATABASE appdb").unwrap();
         let recovered_kept = Engine::recover_from_durable_wal(&kept.durable_wal_records()).unwrap();
         assert!(recovered_kept.relational_database("appdb").is_some());
@@ -28231,7 +28932,7 @@ mod tests {
 
     #[test]
     fn commit_and_rollback_require_active_transaction_context() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         let commit_err = e.execute_text(10, "COMMIT").unwrap_err();
         assert!(matches!(
@@ -28258,7 +28959,7 @@ mod tests {
 
     #[test]
     fn and_chain_forms_reopen_transaction_context() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(21, "BEGIN").unwrap();
         e.execute_text(21, "COMMIT AND CHAIN").unwrap();
@@ -28293,7 +28994,7 @@ mod tests {
 
     #[test]
     fn transaction_control_alias_chain_forms_reopen_transaction_context() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(61, "BEGIN").unwrap();
         e.execute_text(61, "END AND CHAIN").unwrap();
@@ -28322,7 +29023,7 @@ mod tests {
 
     #[test]
     fn start_alias_and_work_aliases_drive_transaction_state_transitions() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(73, "START TRANSACTION READ ONLY").unwrap();
         assert_eq!(e.active_txn_count(), 1);
@@ -28386,7 +29087,7 @@ mod tests {
 
     #[test]
     fn commit_and_chain_propagates_txn_id_exhaustion() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(u64::MAX, "BEGIN").unwrap();
         let err = e.execute_text(u64::MAX, "COMMIT AND CHAIN").unwrap_err();
@@ -28398,7 +29099,7 @@ mod tests {
 
     #[test]
     fn replication_watermarks_track_commit_apply_visibility_and_durability() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         let before = e.replication_watermarks();
         assert_eq!(before.role, Role::Leader);
@@ -28512,7 +29213,7 @@ mod tests {
 
     #[test]
     fn replication_watermarks_include_buffered_wal_records() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
@@ -28658,7 +29359,7 @@ mod tests {
 
     #[test]
     fn replication_watermarks_include_active_transaction_count() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
 
         e.execute_text(42, "BEGIN").unwrap();
 
@@ -29153,7 +29854,7 @@ mod tests {
 
         let next = e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
         assert_eq!(next.index, 8);
-        assert_eq!(e.get("b"), Some("2"));
+        assert_eq!(e.get("b").as_deref(), Some("2"));
     }
 
     #[test]
@@ -30093,7 +30794,7 @@ mod tests {
 
     #[test]
     fn relational_select_grouped_having_filters_engine_aggregate_rows() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
@@ -34243,7 +34944,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_runs_visibility_filtered_scan_through_execution_layer() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=pending").unwrap();
         e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -35031,7 +35732,7 @@ mod tests {
 
     #[test]
     fn cuda_native_full_scan_resolution_feeds_all_versions_to_visibility_kernel() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -35064,7 +35765,7 @@ mod tests {
 
     #[test]
     fn cuda_native_full_scan_fallback_re_resolves_cpu_visible_rows() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -35107,7 +35808,7 @@ mod tests {
 
     #[test]
     fn cuda_native_key_lookup_fallback_re_resolves_cpu_visible_row() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -35144,7 +35845,7 @@ mod tests {
 
     #[test]
     fn cuda_native_key_batch_fallback_preserves_request_order() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:3=closed").unwrap();
@@ -35188,7 +35889,7 @@ mod tests {
 
     #[test]
     fn cuda_native_composition_fallback_re_resolves_cpu_visible_rows() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:3=closed").unwrap();
@@ -35233,7 +35934,7 @@ mod tests {
 
     #[test]
     fn cuda_native_follow_value_chain_fallback_re_resolves_cpu_visible_rows() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET profile:1=team:beta").unwrap();
@@ -35442,7 +36143,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_historical_key_lookup_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -35477,7 +36178,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_key_batch_lookup_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:3=closed").unwrap();
@@ -35535,7 +36236,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_follow_value_chain_source_resolution_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -35584,7 +36285,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_concat_native_sources_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=closed").unwrap();
         e.execute_text(3, "SET acct:3=open").unwrap();
@@ -35639,7 +36340,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_concat_limit_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=closed").unwrap();
         e.execute_text(3, "SET acct:3=open").unwrap();
@@ -35689,7 +36390,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_key_order_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:3=closed").unwrap();
         e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -35734,7 +36435,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_value_order_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:3=closed").unwrap();
         e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -35779,7 +36480,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_fan_in_order_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=closed").unwrap();
         e.execute_text(3, "SET acct:3=pending").unwrap();
@@ -35834,7 +36535,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_ordered_limit_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:3=closed").unwrap();
         e.execute_text(3, "SET acct:2=pending").unwrap();
@@ -35874,7 +36575,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_general_key_range_filter_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:0=cold").unwrap();
         e.execute_text(2, "SET acct:1=open").unwrap();
         e.execute_text(3, "SET acct:7=hold").unwrap();
@@ -35919,7 +36620,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_prefix_equivalent_key_range_filter_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET user:1=active").unwrap();
@@ -35962,7 +36663,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_key_prefix_filter_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET user:1=active").unwrap();
@@ -36002,7 +36703,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_string_value_equals_filter_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:3=open").unwrap();
@@ -36042,7 +36743,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_numeric_value_equals_filter_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=7").unwrap();
         e.execute_text(2, "SET acct:2=8").unwrap();
         e.execute_text(3, "SET acct:3=7").unwrap();
@@ -36082,7 +36783,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_filterless_full_scan_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
 
@@ -36121,7 +36822,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_historical_visibility_mask_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
         e.execute_text(3, "SET acct:1=closed").unwrap();
@@ -36162,7 +36863,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_logical_supported_filters_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:0=cold").unwrap();
         e.execute_text(2, "SET acct:1=open").unwrap();
         e.execute_text(3, "SET acct:2=hold").unwrap();
@@ -36213,7 +36914,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_filters_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -36273,7 +36974,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_source_relative_filters_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -36324,7 +37025,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_source_relative_order_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=member:1").unwrap();
@@ -36385,7 +37086,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_cpu_resolved_key_value_order_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -36433,7 +37134,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_source_relative_projection_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=Alpha Team").unwrap();
@@ -36477,7 +37178,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_concat_cpu_resolved_sources_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -36537,7 +37238,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_distinct_cpu_resolved_sources_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -36701,7 +37402,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_nested_native_composition_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
 
@@ -36751,7 +37452,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
         e.execute_text(2, "SET acct:2=profile:1").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -36811,7 +37512,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_path_filters_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
         e.execute_text(2, "SET acct:2=profile:1").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -36878,7 +37579,7 @@ mod tests {
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_occurrence_path_filters_without_fallback(
     ) {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -36938,7 +37639,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_projection_order_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=member:1").unwrap();
@@ -36996,7 +37697,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_prefix_terminal_value_chain_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -37055,7 +37756,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_labeled_branch_source_resolution_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -38386,7 +39087,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-read-workload.txt")
             .lines()
             .enumerate()
@@ -38445,7 +39146,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-full-scan-workload.txt")
             .lines()
             .enumerate()
@@ -38531,7 +39232,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         for (txn_id, command) in
             include_str!("../../../tests/fixtures/mvcc-source-composition-workload.txt")
                 .lines()
@@ -38626,7 +39327,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=locked").unwrap();
         e.execute_text(3, "SET user:1=active").unwrap();
@@ -38710,7 +39411,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_concat_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -38827,7 +39528,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_concat_distinct_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -38929,7 +39630,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -39016,7 +39717,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_except_distinct_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -39111,7 +39812,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_symmetric_difference_distinct_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -39207,7 +39908,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_intersect_all_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -39296,7 +39997,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_except_all_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -39389,7 +40090,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_prefixes_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -39492,7 +40193,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -39592,7 +40293,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_prefixes_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -39700,7 +40401,7 @@ mod tests {
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_prefixes_source(
     ) {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -39815,7 +40516,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -39920,7 +40621,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_chain_branches_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -40127,7 +40828,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -40278,7 +40979,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_chain_terminal_input_provenance() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -40325,7 +41026,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_branch_fan_in_with_terminal_input_provenance() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=profile:3").unwrap();
@@ -40389,7 +41090,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_multi_frame_provenance_filters_and_projection() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -40446,7 +41147,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_preserves_multi_frame_provenance_identity_under_concat_distinct() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:shared").unwrap();
         e.execute_text(3, "SET team:shared=member:1").unwrap();
@@ -40503,7 +41204,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_provenance_path_summary_projection() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -40556,7 +41257,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_provenance_summary_projection_keeps_non_join_shapes_stable() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET standalone:1=Loose").unwrap();
 
         let query = e
@@ -40584,7 +41285,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_frame_aware_provenance_ordering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
         e.execute_text(2, "SET acct:2=profile:1").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -40645,7 +41346,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_provenance_frame_bundle_controls() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
         e.execute_text(2, "SET acct:2=profile:1").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -41051,7 +41752,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -41250,7 +41951,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_repeated_provenance_bundle_subpath_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -41356,7 +42057,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_relative_provenance_bundle_distance_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -41465,7 +42166,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_provenance_bundle_suffix_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -41576,7 +42277,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_provenance_bundle_prefix_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -41689,7 +42390,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -41830,7 +42531,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_whole_bundle_cardinality_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -41940,7 +42641,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_and_nth_occurrence_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -42282,7 +42983,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_occurrence_range_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -42409,7 +43110,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_occurrence_distance_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -42536,7 +43237,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_occurrence_distance_range_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -42705,7 +43406,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_occurrence_distance_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -42931,7 +43632,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_distance_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -43196,7 +43897,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_occurrence_offset_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -43465,7 +44166,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -43643,7 +44344,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_ordering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -43796,7 +44497,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_mixed_occurrence_offset_pair_projection_and_ordering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
@@ -43970,7 +44671,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
         e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
@@ -44169,7 +44870,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_mixed_occurrence_distance_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -44476,7 +45177,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_distance_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -44750,7 +45451,7 @@ mod tests {
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_distance_filters()
     {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -45025,7 +45726,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_to_ordinal_mixed_occurrence_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -45312,7 +46013,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_ordinal_mixed_occurrence_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -45519,7 +46220,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_bundle_first_last_mixed_occurrence_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha=acct:1").unwrap();
@@ -45763,7 +46464,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_sorts_missing_provenance_frames_deterministically() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET profile:1=team:alpha").unwrap();
         e.execute_text(3, "SET team:alpha:1=Alice").unwrap();
@@ -45827,7 +46528,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_labeled_branch_projection_and_ordering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -45907,7 +46608,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_preserves_labeled_branch_identity_and_first_match_filtering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -46019,7 +46720,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_symmetric_difference_all_source_composition() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -46112,7 +46813,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_refs_join_adjacent_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
         e.execute_text(2, "SET acct:2=profile:1").unwrap();
         e.execute_text(3, "SET profile:1=active").unwrap();
@@ -46194,7 +46895,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_prefixes_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=order:1:").unwrap();
         e.execute_text(2, "SET acct:2=order:2:").unwrap();
         e.execute_text(3, "SET order:1:a=paid").unwrap();
@@ -46284,7 +46985,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_ref_prefixes_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -46387,7 +47088,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_ref_value_key_refs_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -46474,7 +47175,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_follow_value_key_ref_value_key_prefixes_source() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET acct:3=missing-profile").unwrap();
@@ -46610,7 +47311,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_join_side_projection_keeps_non_join_shapes_stable() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=locked").unwrap();
 
@@ -46646,7 +47347,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_join_side_source_filters() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
         e.execute_text(2, "SET acct:2=profile:2").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -46685,7 +47386,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_source_filters_are_empty_for_non_join_shapes() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=locked").unwrap();
 
@@ -46705,7 +47406,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_join_side_source_ordering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:2=profile:2").unwrap();
         e.execute_text(2, "SET acct:1=profile:1").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -46781,7 +47482,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_source_ordering_keeps_non_join_shapes_stable() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:2=locked").unwrap();
         e.execute_text(2, "SET acct:1=open").unwrap();
 
@@ -46817,7 +47518,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_mixed_join_side_projection_controls() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:2=profile:2").unwrap();
         e.execute_text(2, "SET acct:1=profile:1").unwrap();
         e.execute_text(3, "SET profile:1=team:alpha").unwrap();
@@ -46879,7 +47580,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_mixed_join_projection_keeps_non_join_shapes_stable() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
 
         let source_key_target_value = e
@@ -46929,7 +47630,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_composite_filter_shapes() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=locked").unwrap();
         e.execute_text(3, "SET user:1=active").unwrap();
@@ -46994,7 +47695,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_key_range_filter_shapes() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=locked").unwrap();
         e.execute_text(3, "SET acct:3=closed").unwrap();
@@ -47033,7 +47734,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_limit_after_filtering() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=locked").unwrap();
         e.execute_text(3, "SET acct:3=locked").unwrap();
@@ -47068,7 +47769,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_key_ordering_before_limit() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:2=locked").unwrap();
         e.execute_text(2, "SET acct:1=open").unwrap();
         e.execute_text(3, "SET acct:3=closed").unwrap();
@@ -47103,7 +47804,7 @@ mod tests {
 
     #[test]
     fn execute_mvcc_query_supports_value_ordering_before_limit() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:2=locked").unwrap();
         e.execute_text(2, "SET acct:1=open").unwrap();
         e.execute_text(3, "SET acct:4=closed").unwrap();
@@ -47171,7 +47872,7 @@ mod tests {
 
     #[test]
     fn publish_telemetry_emits_snapshot_to_sink() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET a=1").unwrap();
 
         let mut sink = InMemoryTelemetrySink::default();
@@ -47218,7 +47919,7 @@ mod tests {
         assert_eq!(marks.snapshot_id, baseline.snapshot.snapshot_id);
         assert_eq!(e.status_snapshot(), baseline);
         assert_eq!(e.visible_up_to(), committed.index);
-        assert_eq!(e.get("a"), Some("1"));
+        assert_eq!(e.get("a").as_deref(), Some("1"));
     }
 
     #[test]
@@ -47244,7 +47945,7 @@ mod tests {
         assert_eq!(marks, baseline_marks);
         assert_eq!(e.status_snapshot(), baseline);
         assert_eq!(e.visible_up_to(), baseline.snapshot.visible_index);
-        assert_eq!(e.get("a"), Some("1"));
+        assert_eq!(e.get("a").as_deref(), Some("1"));
     }
 
     #[test]
@@ -47273,7 +47974,7 @@ mod tests {
 
     #[test]
     fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -47439,7 +48140,7 @@ mod tests {
         let after_reject = e.execute_relational_select(&select).unwrap();
         assert_eq!(after_reject.rows, result.rows);
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         let recovered_indexed = recovered
@@ -47451,7 +48152,7 @@ mod tests {
 
     #[test]
     fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE default_people (id INT, name TEXT DEFAULT 'unknown'::text, bucket INT DEFAULT 7)",
@@ -47504,7 +48205,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let table = recovered
             .relational_catalog_table("default_people")
             .unwrap();
@@ -47526,7 +48227,7 @@ mod tests {
 
     #[test]
     fn relational_add_column_default_rewrites_rows_and_replays() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -47572,7 +48273,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let table = recovered
             .relational_catalog_table("default_people")
             .unwrap();
@@ -47593,7 +48294,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(duplicate.to_string().contains("already exists"));
-        let mut no_default = Engine::new_local();
+        let no_default = Engine::new_local();
         no_default
             .execute_text(1, "CREATE TABLE default_people (id INT)")
             .unwrap();
@@ -47610,7 +48311,7 @@ mod tests {
 
     #[test]
     fn relational_add_column_sequence_default_rewrites_rows_and_replays() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -47661,7 +48362,7 @@ mod tests {
         assert_eq!(sequence.last_value, 3);
         assert!(sequence.is_called);
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_table = recovered
             .relational_catalog_table("default_people")
             .unwrap();
@@ -47746,7 +48447,7 @@ mod tests {
 
     #[test]
     fn relational_drop_column_rewrites_rows_and_replays() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE drop_column_people (id INT, name TEXT, bucket INT DEFAULT 7)",
@@ -47799,15 +48500,18 @@ mod tests {
             vec![("id", 1), ("bucket", 2)]
         );
         assert_eq!(
-            e.relational_column_comment("drop_column_people", 2),
+            e.relational_column_comment("drop_column_people", 2)
+                .as_deref(),
             Some("keep me")
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         assert_eq!(
-            recovered.relational_column_comment("drop_column_people", 2),
+            recovered
+                .relational_column_comment("drop_column_people", 2)
+                .as_deref(),
             Some("keep me")
         );
 
@@ -47819,7 +48523,7 @@ mod tests {
             .unwrap_err();
         assert!(missing_column.to_string().contains("does not exist"));
 
-        let mut constrained = Engine::new_local();
+        let constrained = Engine::new_local();
         constrained
             .execute_text(
                 1,
@@ -47834,7 +48538,7 @@ mod tests {
 
     #[test]
     fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE rename_table_people (id INT PRIMARY KEY, name TEXT UNIQUE, bucket INT DEFAULT 7)",
@@ -47886,15 +48590,18 @@ mod tests {
             ]
         );
         assert_eq!(
-            e.relational_table_comment("renamed_table_people"),
+            e.relational_table_comment("renamed_table_people")
+                .as_deref(),
             Some("old table")
         );
         assert_eq!(
-            e.relational_column_comment("renamed_table_people", 2),
+            e.relational_column_comment("renamed_table_people", 2)
+                .as_deref(),
             Some("person name")
         );
         assert_eq!(
-            e.relational_constraint_comment("renamed_table_people", "rename_table_people_pkey"),
+            e.relational_constraint_comment("renamed_table_people", "rename_table_people_pkey")
+                .as_deref(),
             Some("primary id")
         );
 
@@ -47928,16 +48635,19 @@ mod tests {
         };
         assert!(e.execute_relational_select(&old_select).is_err());
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         assert_eq!(
-            recovered.relational_table_comment("renamed_table_people"),
+            recovered
+                .relational_table_comment("renamed_table_people")
+                .as_deref(),
             Some("old table")
         );
         assert_eq!(
             recovered
-                .relational_constraint_comment("renamed_table_people", "rename_table_people_pkey"),
+                .relational_constraint_comment("renamed_table_people", "rename_table_people_pkey")
+                .as_deref(),
             Some("primary id")
         );
 
@@ -47949,7 +48659,7 @@ mod tests {
             .unwrap_err();
         assert!(duplicate.to_string().contains("already exists"));
 
-        let mut view_engine = Engine::new_local();
+        let view_engine = Engine::new_local();
         view_engine
             .execute_text(1, "CREATE TABLE rename_table_base (id INT, name TEXT)")
             .unwrap();
@@ -47971,7 +48681,7 @@ mod tests {
 
     #[test]
     fn relational_rename_column_updates_catalog_indexes_and_replays() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE rename_column_people (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown')",
@@ -48030,11 +48740,12 @@ mod tests {
         );
         assert_eq!(table.indexes[0].column, "person_id");
         assert_eq!(
-            e.relational_column_comment("rename_column_people", 2),
+            e.relational_column_comment("rename_column_people", 2)
+                .as_deref(),
             Some("display name")
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         assert_eq!(
@@ -48046,7 +48757,9 @@ mod tests {
             "person_id"
         );
         assert_eq!(
-            recovered.relational_column_comment("rename_column_people", 2),
+            recovered
+                .relational_column_comment("rename_column_people", 2)
+                .as_deref(),
             Some("display name")
         );
 
@@ -48058,7 +48771,7 @@ mod tests {
             .unwrap_err();
         assert!(duplicate.to_string().contains("already exists"));
 
-        let mut view_engine = Engine::new_local();
+        let view_engine = Engine::new_local();
         view_engine
             .execute_text(1, "CREATE TABLE rename_base (id INT, name TEXT)")
             .unwrap();
@@ -48079,7 +48792,7 @@ mod tests {
 
     #[test]
     fn relational_rename_constraint_updates_index_comments_and_replays() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE rename_constraint_people (id INT PRIMARY KEY, name TEXT UNIQUE)",
@@ -48130,11 +48843,13 @@ mod tests {
             e.relational_constraint_comment(
                 "rename_constraint_people",
                 "rename_constraint_people_id_pkey"
-            ),
+            )
+            .as_deref(),
             Some("old primary key")
         );
         assert_eq!(
-            e.relational_index_comment("rename_constraint_people_display_name_key"),
+            e.relational_index_comment("rename_constraint_people_display_name_key")
+                .as_deref(),
             Some("old unique index")
         );
         assert_eq!(
@@ -48164,14 +48879,18 @@ mod tests {
             .indexes;
         assert_eq!(recovered_indexes, &indexes);
         assert_eq!(
-            recovered.relational_constraint_comment(
-                "rename_constraint_people",
-                "rename_constraint_people_id_pkey"
-            ),
+            recovered
+                .relational_constraint_comment(
+                    "rename_constraint_people",
+                    "rename_constraint_people_id_pkey"
+                )
+                .as_deref(),
             Some("old primary key")
         );
         assert_eq!(
-            recovered.relational_index_comment("rename_constraint_people_display_name_key"),
+            recovered
+                .relational_index_comment("rename_constraint_people_display_name_key")
+                .as_deref(),
             Some("old unique index")
         );
 
@@ -48190,7 +48909,7 @@ mod tests {
             .unwrap_err();
         assert!(missing_constraint.to_string().contains("does not exist"));
 
-        let mut view_engine = Engine::new_local();
+        let view_engine = Engine::new_local();
         view_engine
             .execute_text(1, "CREATE TABLE rename_constraint_base (id INT, name TEXT)")
             .unwrap();
@@ -48211,7 +48930,7 @@ mod tests {
 
     #[test]
     fn relational_sql_delete_uses_wal_before_visibility_and_rebuilds_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -48235,7 +48954,7 @@ mod tests {
         );
         assert_eq!(e.durable_wal_records().len(), 3);
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
@@ -48258,7 +48977,7 @@ mod tests {
 
     #[test]
     fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -48290,7 +49009,7 @@ mod tests {
         );
         assert_eq!(e.durable_wal_records().len(), 3);
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
@@ -48323,7 +49042,7 @@ mod tests {
 
     #[test]
     fn relational_sql_views_select_and_replay_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -48356,7 +49075,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_view("active_people")
@@ -48379,7 +49098,7 @@ mod tests {
 
     #[test]
     fn relational_sql_create_or_replace_view_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -48411,7 +49130,7 @@ mod tests {
             "SELECT id, name FROM people WHERE id > 2 ORDER BY id"
         );
         assert_eq!(
-            e.relational_view_comment("active_people"),
+            e.relational_view_comment("active_people").as_deref(),
             Some("active people view")
         );
 
@@ -48424,7 +49143,7 @@ mod tests {
             vec![vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())]]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_view("active_people")
@@ -48433,7 +49152,9 @@ mod tests {
             "SELECT id, name FROM people WHERE id > 2 ORDER BY id"
         );
         assert_eq!(
-            recovered.relational_view_comment("active_people"),
+            recovered
+                .relational_view_comment("active_people")
+                .as_deref(),
             Some("active people view")
         );
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
@@ -48460,7 +49181,7 @@ mod tests {
 
     #[test]
     fn relational_sql_layered_views_select_and_replay_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -48497,7 +49218,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_view("active_people_names")
@@ -48506,7 +49227,9 @@ mod tests {
             "SELECT * FROM active_people"
         );
         assert_eq!(
-            recovered.relational_view_comment("active_people_names"),
+            recovered
+                .relational_view_comment("active_people_names")
+                .as_deref(),
             Some("layered active people")
         );
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
@@ -48559,7 +49282,7 @@ mod tests {
 
     #[test]
     fn relational_sql_rename_view_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -48593,7 +49316,7 @@ mod tests {
             "SELECT id, name FROM people WHERE id > 1 ORDER BY id"
         );
         assert_eq!(
-            e.relational_view_comment("renamed_people"),
+            e.relational_view_comment("renamed_people").as_deref(),
             Some("active people view")
         );
         assert_eq!(e.relational_view_comment("active_people"), None);
@@ -48610,7 +49333,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_catalog_view("active_people").is_none());
         assert_eq!(
             recovered
@@ -48620,7 +49343,9 @@ mod tests {
             oid
         );
         assert_eq!(
-            recovered.relational_view_comment("renamed_people"),
+            recovered
+                .relational_view_comment("renamed_people")
+                .as_deref(),
             Some("active people view")
         );
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
@@ -48646,7 +49371,7 @@ mod tests {
 
     #[test]
     fn relational_sql_drop_view_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -48671,7 +49396,7 @@ mod tests {
         assert!(e.relational_catalog_view("other_people").is_none());
         assert!(e.relational_catalog_table("people").is_some());
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_catalog_view("active_people").is_none());
         assert!(recovered.relational_catalog_view("other_people").is_none());
 
@@ -48696,7 +49421,7 @@ mod tests {
             .to_string()
             .contains("view \"active_people\" does not exist"));
 
-        let mut table_target_engine = Engine::new_local();
+        let table_target_engine = Engine::new_local();
         table_target_engine
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -48705,7 +49430,7 @@ mod tests {
             .unwrap_err();
         assert!(table_target.to_string().contains("not a view"));
 
-        let mut preflight_engine = Engine::new_local();
+        let preflight_engine = Engine::new_local();
         preflight_engine
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -48744,7 +49469,7 @@ mod tests {
 
     #[test]
     fn relational_sql_sequence_catalog_objects_replay_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE SEQUENCE public.people_seq")
@@ -48756,7 +49481,7 @@ mod tests {
         assert_eq!(sequence.name, "people_seq");
         let oid = sequence.oid;
         assert_eq!(
-            e.relational_sequence_comment("people_seq"),
+            e.relational_sequence_comment("people_seq").as_deref(),
             Some("people ids")
         );
         e.execute_text(
@@ -48770,7 +49495,7 @@ mod tests {
         assert_eq!(renamed_sequence.name, "people_id_seq");
         assert_eq!(renamed_sequence.oid, oid);
         assert_eq!(
-            e.relational_sequence_comment("people_id_seq"),
+            e.relational_sequence_comment("people_id_seq").as_deref(),
             Some("people ids")
         );
         assert_eq!(e.relational_sequence_comment("people_seq"), None);
@@ -48787,7 +49512,9 @@ mod tests {
             oid
         );
         assert_eq!(
-            recovered.relational_sequence_comment("people_id_seq"),
+            recovered
+                .relational_sequence_comment("people_id_seq")
+                .as_deref(),
             Some("people ids")
         );
 
@@ -48802,7 +49529,7 @@ mod tests {
             .relational_catalog_sequence("people_id_seq")
             .is_none());
 
-        let mut boundary = Engine::new_local();
+        let boundary = Engine::new_local();
         boundary
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -48823,7 +49550,7 @@ mod tests {
             .to_string()
             .contains("sequence \"missing_seq\" does not exist"));
 
-        let mut rename_boundary = Engine::new_local();
+        let rename_boundary = Engine::new_local();
         rename_boundary
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -48844,7 +49571,7 @@ mod tests {
 
     #[test]
     fn relational_sql_sequence_values_replay_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE SEQUENCE public.people_seq")
             .unwrap();
         let sequence = e.relational_catalog_sequence("people_seq").unwrap();
@@ -48895,7 +49622,7 @@ mod tests {
 
     #[test]
     fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE serial_people (id SERIAL PRIMARY KEY, name TEXT)",
@@ -48967,7 +49694,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_serial = recovered.execute_relational_select(&serial_select).unwrap();
         assert_eq!(recovered_serial.rows, serial_result.rows);
         let recovered_manual = recovered.execute_relational_select(&manual_select).unwrap();
@@ -49012,7 +49739,7 @@ mod tests {
 
     #[test]
     fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -49036,7 +49763,8 @@ mod tests {
         let oid = view.oid;
         assert_eq!(view.rows.len(), 2);
         assert_eq!(
-            e.relational_materialized_view_comment("mv_people"),
+            e.relational_materialized_view_comment("mv_people")
+                .as_deref(),
             Some("people snapshot")
         );
 
@@ -49086,11 +49814,12 @@ mod tests {
             oid
         );
         assert_eq!(
-            e.relational_materialized_view_comment("mv_people_snapshot"),
+            e.relational_materialized_view_comment("mv_people_snapshot")
+                .as_deref(),
             Some("people snapshot")
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let Command::Select(renamed_select) =
             parse_command("SELECT * FROM mv_people_snapshot").unwrap()
         else {
@@ -49101,7 +49830,9 @@ mod tests {
             .unwrap();
         assert_eq!(recovered_result.rows, refreshed_result.rows);
         assert_eq!(
-            recovered.relational_materialized_view_comment("mv_people_snapshot"),
+            recovered
+                .relational_materialized_view_comment("mv_people_snapshot")
+                .as_deref(),
             Some("people snapshot")
         );
 
@@ -49118,7 +49849,7 @@ mod tests {
             None
         );
 
-        let mut boundary = Engine::new_local();
+        let boundary = Engine::new_local();
         boundary
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -49154,7 +49885,7 @@ mod tests {
 
     #[test]
     fn relational_sql_select_gpu_bridge_matches_cpu_results_at_sql_level() {
-        let mut cpu = Engine::new_local();
+        let cpu = Engine::new_local();
         cpu.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         cpu.execute_text(
@@ -50120,7 +50851,7 @@ mod tests {
 
     #[test]
     fn relational_sql_cuda_probe_reuses_cached_runtime_snapshot() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         let _ = e
             .cached_cuda_probe_runtime
             .set(CudaDriverRuntime::unavailable());
@@ -50153,7 +50884,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn relational_sql_select_cuda_driver_reports_gpu_execution() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50188,7 +50919,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_relational_sql_equality_limit_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50217,7 +50948,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_relational_sql_projection_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50243,7 +50974,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_relational_sql_order_by_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50272,7 +51003,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_relational_sql_range_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50301,7 +51032,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_relational_sql_and_predicates_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50328,7 +51059,7 @@ mod tests {
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_relational_sql_or_predicates_without_fallback() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50357,7 +51088,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_assigns_stable_public_schema_and_type_metadata() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
 
@@ -50404,7 +51135,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_create_index_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE INDEX people_name_idx ON people (name)")
@@ -50447,7 +51178,7 @@ mod tests {
             "{duplicate_err}"
         );
 
-        let mut missing = Engine::new_local();
+        let missing = Engine::new_local();
         missing
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -50460,7 +51191,7 @@ mod tests {
 
     #[test]
     fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50528,7 +51259,7 @@ mod tests {
             indexes
         );
 
-        let mut duplicate_existing = Engine::new_local();
+        let duplicate_existing = Engine::new_local();
         duplicate_existing
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -50550,7 +51281,7 @@ mod tests {
 
     #[test]
     fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE people (id INT, name TEXT UNIQUE, CONSTRAINT people_id_key UNIQUE (id))",
@@ -50615,7 +51346,7 @@ mod tests {
             indexes
         );
 
-        let mut alter = Engine::new_local();
+        let alter = Engine::new_local();
         alter
             .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
             .unwrap();
@@ -50640,7 +51371,7 @@ mod tests {
 
     #[test]
     fn relational_check_constraints_enforce_and_replay_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE people (id INT, name TEXT, CONSTRAINT people_id_positive CHECK (id > 0))",
@@ -50724,7 +51455,7 @@ mod tests {
             renamed_checks
         );
 
-        let mut alter = Engine::new_local();
+        let alter = Engine::new_local();
         alter
             .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
             .unwrap();
@@ -50764,7 +51495,7 @@ mod tests {
 
     #[test]
     fn relational_foreign_keys_enforce_and_replay_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50825,7 +51556,7 @@ mod tests {
 
     #[test]
     fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT PRIMARY KEY, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -50877,7 +51608,7 @@ mod tests {
             indexes
         );
 
-        let mut alter = Engine::new_local();
+        let alter = Engine::new_local();
         alter
             .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
             .unwrap();
@@ -50899,7 +51630,7 @@ mod tests {
             .to_string()
             .contains("duplicate key value violates unique index"));
 
-        let mut duplicate_existing = Engine::new_local();
+        let duplicate_existing = Engine::new_local();
         duplicate_existing
             .execute_text(1, "CREATE TABLE dupes (id INT, name TEXT)")
             .unwrap();
@@ -50921,7 +51652,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_drops_index_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE INDEX people_name_idx ON people (name)")
@@ -50952,7 +51683,7 @@ mod tests {
             "{missing_err}"
         );
 
-        let mut multi = Engine::new_local();
+        let multi = Engine::new_local();
         multi
             .execute_text(
                 1,
@@ -50992,7 +51723,7 @@ mod tests {
             "{partial_err}"
         );
         assert_eq!(
-            multi.relational_index_comment("people_name_idx"),
+            multi.relational_index_comment("people_name_idx").as_deref(),
             Some("name lookup")
         );
         multi
@@ -51042,7 +51773,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_renames_index_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -51074,7 +51805,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            e.relational_index_comment("people_lookup_idx"),
+            e.relational_index_comment("people_lookup_idx").as_deref(),
             Some("lookup")
         );
         assert_eq!(e.relational_index_comment("people_name_idx"), None);
@@ -51104,7 +51835,9 @@ mod tests {
             renamed_indexes
         );
         assert_eq!(
-            recovered.relational_index_comment("people_lookup_idx"),
+            recovered
+                .relational_index_comment("people_lookup_idx")
+                .as_deref(),
             Some("lookup")
         );
 
@@ -51128,7 +51861,7 @@ mod tests {
             "{missing_err}"
         );
 
-        let mut constrained = Engine::new_local();
+        let constrained = Engine::new_local();
         constrained
             .execute_text(1, "CREATE TABLE keyed_people (id INT PRIMARY KEY)")
             .unwrap();
@@ -51147,7 +51880,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_drops_constraints_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE people (id INT PRIMARY KEY, name TEXT UNIQUE)",
@@ -51275,7 +52008,7 @@ mod tests {
             None
         );
         assert_eq!(
-            e.relational_role_comment("postgres"),
+            e.relational_role_comment("postgres").as_deref(),
             Some("bootstrap role")
         );
         let missing_select = e
@@ -51292,7 +52025,7 @@ mod tests {
         assert!(recovered.relational_catalog_table("teams").is_some());
         assert_eq!(recovered.relational_table_comment("people"), None);
         assert_eq!(
-            recovered.relational_role_comment("postgres"),
+            recovered.relational_role_comment("postgres").as_deref(),
             Some("bootstrap role")
         );
 
@@ -51306,7 +52039,7 @@ mod tests {
             "{missing_drop}"
         );
 
-        let mut with_view = Engine::new_local();
+        let with_view = Engine::new_local();
         with_view
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -51384,7 +52117,7 @@ mod tests {
         assert!(recovered.relational_catalog_table("batch_teams").is_none());
         assert!(recovered.relational_catalog_table("batch_keep").is_some());
 
-        let mut atomic = Engine::new_local();
+        let atomic = Engine::new_local();
         atomic
             .execute_text(1, "CREATE TABLE atomic_people (id INT, name TEXT)")
             .unwrap();
@@ -51484,17 +52217,21 @@ mod tests {
             .is_empty());
         assert!(e.relational_catalog_table("people").is_some());
         assert!(e.relational_catalog_table("teams").is_some());
-        assert_eq!(e.relational_table_comment("people"), Some("people table"));
         assert_eq!(
-            e.relational_column_comment("people", 2),
+            e.relational_table_comment("people").as_deref(),
+            Some("people table")
+        );
+        assert_eq!(
+            e.relational_column_comment("people", 2).as_deref(),
             Some("display name")
         );
         assert_eq!(
-            e.relational_index_comment("people_name_idx"),
+            e.relational_index_comment("people_name_idx").as_deref(),
             Some("lookup")
         );
         assert_eq!(
-            e.relational_constraint_comment("people", "people_pkey"),
+            e.relational_constraint_comment("people", "people_pkey")
+                .as_deref(),
             Some("identity")
         );
         assert!(e
@@ -51509,18 +52246,20 @@ mod tests {
             vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&empty_people).unwrap();
         assert_eq!(
             recovered_result.rows,
             vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]]
         );
         assert_eq!(
-            recovered.relational_table_comment("people"),
+            recovered.relational_table_comment("people").as_deref(),
             Some("people table")
         );
         assert_eq!(
-            recovered.relational_constraint_comment("people", "people_pkey"),
+            recovered
+                .relational_constraint_comment("people", "people_pkey")
+                .as_deref(),
             Some("identity")
         );
 
@@ -51554,8 +52293,7 @@ mod tests {
             e.execute_relational_select(&restart_select).unwrap().rows,
             vec![vec![SqlValue::Int4(1), SqlValue::Text("Linus".to_string())]]
         );
-        let mut recovered_restart =
-            Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered_restart = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered_restart
                 .execute_relational_select(&restart_select)
@@ -51578,7 +52316,7 @@ mod tests {
             "{missing_truncate}"
         );
 
-        let mut with_view = Engine::new_local();
+        let with_view = Engine::new_local();
         with_view
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -51598,7 +52336,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_relation_acl_metadata_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "GRANT SELECT, INSERT ON TABLE public.people TO PUBLIC")
@@ -51725,7 +52463,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_default_table_acl_metadata_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO PUBLIC",
@@ -51788,7 +52526,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_schema_acl_metadata_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "GRANT USAGE, CREATE ON SCHEMA public TO PUBLIC")
             .unwrap();
         e.execute_text(2, "GRANT ALL PRIVILEGES ON SCHEMA public TO postgres")
@@ -51826,7 +52564,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_function_acl_metadata_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42'",
@@ -51884,7 +52622,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_publications_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE TABLE accounts (id INT, owner TEXT)")
@@ -51947,7 +52685,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_disabled_subscriptions_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE PUBLICATION app_pub FOR TABLE people")
@@ -52008,7 +52746,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_logical_replication_comments_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE PUBLICATION app_pub FOR TABLE people")
@@ -52030,25 +52768,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            e.relational_publication_comment("app_pub"),
+            e.relational_publication_comment("app_pub").as_deref(),
             Some("publication metadata")
         );
         assert_eq!(
-            e.relational_subscription_comment("app_sub"),
+            e.relational_subscription_comment("app_sub").as_deref(),
             Some("subscription metadata")
         );
 
         let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
-            recovered.relational_publication_comment("app_pub"),
+            recovered
+                .relational_publication_comment("app_pub")
+                .as_deref(),
             Some("publication metadata")
         );
         assert_eq!(
-            recovered.relational_subscription_comment("app_sub"),
+            recovered
+                .relational_subscription_comment("app_sub")
+                .as_deref(),
             Some("subscription metadata")
         );
 
-        let mut missing_pub_engine = Engine::new_local();
+        let missing_pub_engine = Engine::new_local();
         missing_pub_engine
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -52060,7 +52802,7 @@ mod tests {
             missing_publication.contains("publication \"missing_pub\" does not exist"),
             "{missing_publication}"
         );
-        let mut missing_sub_engine = Engine::new_local();
+        let missing_sub_engine = Engine::new_local();
         missing_sub_engine
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -52092,7 +52834,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_domains_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE DOMAIN public.account_id AS int4")
             .unwrap();
         e.execute_text(2, "COMMENT ON DOMAIN public.account_id IS 'account ids'")
@@ -52111,7 +52853,8 @@ mod tests {
         assert_eq!(table.columns[0].ty, SqlType::Int4);
         assert_eq!(table.columns[0].type_oid, oid);
         assert_eq!(
-            e.relational_comments
+            e.ddl_catalog()
+                .relational_comments
                 .get(&RelationalCommentTarget::Domain {
                     domain: "account_id".to_string(),
                 })
@@ -52140,11 +52883,11 @@ mod tests {
         e.execute_text(6, "DROP TABLE accounts").unwrap();
         e.execute_text(7, "DROP DOMAIN account_id").unwrap();
         assert!(e.relational_catalog_domain("account_id").is_none());
-        assert!(!e
-            .relational_comments
-            .contains_key(&RelationalCommentTarget::Domain {
+        assert!(!e.ddl_catalog().relational_comments.contains_key(
+            &RelationalCommentTarget::Domain {
                 domain: "account_id".to_string(),
-            }));
+            }
+        ));
         e.execute_text(8, "DROP DOMAIN IF EXISTS missing_domain")
             .unwrap();
 
@@ -52169,7 +52912,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_bounded_functions_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE FUNCTION public.answer() RETURNS int4 LANGUAGE sql AS 'SELECT 42'",
@@ -52184,7 +52927,7 @@ mod tests {
         assert_eq!(function.body, "SELECT 42");
         let oid = function.oid;
         assert_eq!(
-            e.relational_function_comment("answer"),
+            e.relational_function_comment("answer").as_deref(),
             Some("metadata only")
         );
         e.execute_text(
@@ -52198,19 +52941,21 @@ mod tests {
         assert_eq!(renamed_function.return_type, SqlType::Int4);
         assert_eq!(renamed_function.body, "SELECT 42");
         assert_eq!(
-            e.relational_function_comment("ultimate_answer"),
+            e.relational_function_comment("ultimate_answer").as_deref(),
             Some("metadata only")
         );
         assert_eq!(e.relational_function_comment("answer"), None);
 
-        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_function = recovered
             .relational_catalog_function("ultimate_answer")
             .unwrap();
         assert_eq!(recovered_function.oid, oid);
         assert_eq!(recovered_function.return_type, SqlType::Int4);
         assert_eq!(
-            recovered.relational_function_comment("ultimate_answer"),
+            recovered
+                .relational_function_comment("ultimate_answer")
+                .as_deref(),
             Some("metadata only")
         );
         let result = recovered
@@ -52309,7 +53054,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_bounded_public_schema_lifecycle() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "COMMENT ON SCHEMA public IS 'application schema'")
             .unwrap();
         let non_empty = e
@@ -52321,15 +53066,15 @@ mod tests {
             non_empty.contains("cannot drop non-empty schema \"public\""),
             "{non_empty}"
         );
-        assert!(e.relational_public_schema_exists);
+        assert!(e.ddl_catalog().relational_public_schema_exists);
         assert_eq!(
-            e.relational_schema_comment("public"),
+            e.relational_schema_comment("public").as_deref(),
             Some("application schema")
         );
 
         e.execute_text(4, "DROP TABLE people").unwrap();
         e.execute_text(5, "DROP SCHEMA IF EXISTS public").unwrap();
-        assert!(!e.relational_public_schema_exists);
+        assert!(!e.ddl_catalog().relational_public_schema_exists);
         assert_eq!(e.relational_schema_comment("public"), None);
 
         let missing_schema = e
@@ -52356,14 +53101,14 @@ mod tests {
             .unwrap();
 
         let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
-        assert!(recovered.relational_public_schema_exists);
+        assert!(recovered.ddl_catalog().relational_public_schema_exists);
         assert!(recovered.relational_catalog_table("recreated").is_some());
         assert_eq!(recovered.relational_schema_comment("public"), None);
     }
 
     #[test]
     fn relational_catalog_records_bounded_tablespace_metadata() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLESPACE appspace LOCATION '/tmp/gpu-db-appspace'",
@@ -52387,7 +53132,7 @@ mod tests {
             &BTreeSet::from([TablespacePrivilege::Create])
         );
         assert_eq!(
-            e.relational_tablespace_comment("appspace"),
+            e.relational_tablespace_comment("appspace").as_deref(),
             Some("application storage")
         );
 
@@ -52403,7 +53148,7 @@ mod tests {
             .unwrap()
             .contains_key("app_loader"));
         assert_eq!(
-            e.relational_tablespace_comment("appspace_fast"),
+            e.relational_tablespace_comment("appspace_fast").as_deref(),
             Some("application storage")
         );
         assert_eq!(e.relational_tablespace_comment("appspace"), None);
@@ -52417,7 +53162,9 @@ mod tests {
             "/tmp/gpu-db-appspace"
         );
         assert_eq!(
-            recovered.relational_tablespace_comment("appspace_fast"),
+            recovered
+                .relational_tablespace_comment("appspace_fast")
+                .as_deref(),
             Some("application storage")
         );
 
@@ -52482,7 +53229,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_records_comments_and_replays_from_wal() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "COMMENT ON DATABASE postgres IS 'primary database'")
@@ -52524,82 +53271,96 @@ mod tests {
         e.execute_text(14, "COMMENT ON VIEW public.people_lookup IS 'lookup view'")
             .unwrap();
         assert_eq!(
-            e.relational_database_comment("postgres"),
+            e.relational_database_comment("postgres").as_deref(),
             Some("primary database")
         );
         assert_eq!(
-            e.relational_role_comment("postgres"),
+            e.relational_role_comment("postgres").as_deref(),
             Some("bootstrap role")
         );
         assert_eq!(
-            e.relational_schema_comment("public"),
+            e.relational_schema_comment("public").as_deref(),
             Some("application schema")
         );
         assert_eq!(
-            e.relational_tablespace_comment("pg_default"),
+            e.relational_tablespace_comment("pg_default").as_deref(),
             Some("default storage")
         );
         assert_eq!(
-            e.relational_tablespace_comment("pg_global"),
+            e.relational_tablespace_comment("pg_global").as_deref(),
             Some("global storage")
         );
-        assert_eq!(e.relational_table_comment("people"), Some("lookup people"));
         assert_eq!(
-            e.relational_column_comment("people", 2),
+            e.relational_table_comment("people").as_deref(),
+            Some("lookup people")
+        );
+        assert_eq!(
+            e.relational_column_comment("people", 2).as_deref(),
             Some("display name")
         );
         assert_eq!(
-            e.relational_index_comment("people_name_idx"),
+            e.relational_index_comment("people_name_idx").as_deref(),
             Some("name lookup")
         );
         assert_eq!(
-            e.relational_constraint_comment("people", "people_pkey"),
+            e.relational_constraint_comment("people", "people_pkey")
+                .as_deref(),
             Some("row identity")
         );
         assert_eq!(
-            e.relational_view_comment("people_lookup"),
+            e.relational_view_comment("people_lookup").as_deref(),
             Some("lookup view")
         );
 
         let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
-            recovered.relational_database_comment("postgres"),
+            recovered.relational_database_comment("postgres").as_deref(),
             Some("primary database")
         );
         assert_eq!(
-            recovered.relational_role_comment("postgres"),
+            recovered.relational_role_comment("postgres").as_deref(),
             Some("bootstrap role")
         );
         assert_eq!(
-            recovered.relational_schema_comment("public"),
+            recovered.relational_schema_comment("public").as_deref(),
             Some("application schema")
         );
         assert_eq!(
-            recovered.relational_tablespace_comment("pg_default"),
+            recovered
+                .relational_tablespace_comment("pg_default")
+                .as_deref(),
             Some("default storage")
         );
         assert_eq!(
-            recovered.relational_tablespace_comment("pg_global"),
+            recovered
+                .relational_tablespace_comment("pg_global")
+                .as_deref(),
             Some("global storage")
         );
         assert_eq!(
-            recovered.relational_table_comment("people"),
+            recovered.relational_table_comment("people").as_deref(),
             Some("lookup people")
         );
         assert_eq!(
-            recovered.relational_column_comment("people", 2),
+            recovered.relational_column_comment("people", 2).as_deref(),
             Some("display name")
         );
         assert_eq!(
-            recovered.relational_index_comment("people_name_idx"),
+            recovered
+                .relational_index_comment("people_name_idx")
+                .as_deref(),
             Some("name lookup")
         );
         assert_eq!(
-            recovered.relational_constraint_comment("people", "people_pkey"),
+            recovered
+                .relational_constraint_comment("people", "people_pkey")
+                .as_deref(),
             Some("row identity")
         );
         assert_eq!(
-            recovered.relational_view_comment("people_lookup"),
+            recovered
+                .relational_view_comment("people_lookup")
+                .as_deref(),
             Some("lookup view")
         );
 
@@ -52631,7 +53392,7 @@ mod tests {
         e.execute_text(23, "DROP VIEW people_lookup").unwrap();
         assert_eq!(e.relational_view_comment("people_lookup"), None);
 
-        let mut missing = Engine::new_local();
+        let missing = Engine::new_local();
         missing
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -52641,7 +53402,7 @@ mod tests {
             .to_string()
             .contains("column \"missing\" does not exist"));
 
-        let mut missing_index = Engine::new_local();
+        let missing_index = Engine::new_local();
         missing_index
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -52655,7 +53416,7 @@ mod tests {
             .execute_text(3, "COMMENT ON VIEW public.people IS 'bad'")
             .is_err());
 
-        let mut missing_constraint = Engine::new_local();
+        let missing_constraint = Engine::new_local();
         missing_constraint
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -52692,7 +53453,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_select_binding_uses_catalog_descriptors() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         let table = e.relational_catalog_table("people").unwrap();
@@ -52702,7 +53463,7 @@ mod tests {
             panic!("expected SELECT plan");
         };
 
-        let bound = bind_relational_select(table, &select).unwrap();
+        let bound = bind_relational_select(&table, &select).unwrap();
 
         assert_eq!(bound.selected_indexes, vec![1]);
         assert_eq!(bound.selected_columns[0].name, "name");
@@ -52721,7 +53482,7 @@ mod tests {
         else {
             panic!("expected SELECT plan");
         };
-        assert!(bind_relational_select(table, &bad_select)
+        assert!(bind_relational_select(&table, &bad_select)
             .unwrap_err()
             .to_string()
             .contains("column \"missing\" does not exist"));
@@ -52731,7 +53492,7 @@ mod tests {
         else {
             panic!("expected SELECT plan");
         };
-        assert!(bind_relational_select(table, &bad_distinct)
+        assert!(bind_relational_select(&table, &bad_distinct)
             .unwrap_err()
             .to_string()
             .contains("SELECT DISTINCT ORDER BY must reference a selected column"));
@@ -52739,7 +53500,7 @@ mod tests {
 
     #[test]
     fn relational_catalog_replays_from_durable_wal_with_table_data() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -52749,7 +53510,7 @@ mod tests {
         .unwrap();
 
         let durable = e.durable_wal_records().to_vec();
-        let mut recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
         let table = recovered.relational_catalog_table("people").unwrap();
 
         assert_eq!(table.schema, PUBLIC_SCHEMA_NAME);
@@ -52789,7 +53550,7 @@ mod tests {
     #[test]
     fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
         let path = test_wal_path("restart");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -52799,7 +53560,7 @@ mod tests {
         .unwrap();
 
         e.persist_durable_wal_to_file(&path).unwrap();
-        let mut recovered = Engine::recover_from_durable_wal_file(&path).unwrap();
+        let recovered = Engine::recover_from_durable_wal_file(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
         let table = recovered.relational_catalog_table("people").unwrap();
@@ -52852,7 +53613,7 @@ mod tests {
 
         // --- session 1: a durable engine commits two statements, then "crashes" (is dropped). ---
         {
-            let mut e = Engine::with_durable_wal_segment(&path);
+            let e = Engine::with_durable_wal_segment(&path);
             assert!(e.wal_is_durable());
             e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
                 .unwrap();
@@ -52936,7 +53697,7 @@ mod tests {
         // or silently truncating, so there is never torn state.
         let path = test_wal_path("durable-torn");
         {
-            let mut e = Engine::with_durable_wal_segment(&path);
+            let e = Engine::with_durable_wal_segment(&path);
             e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
                 .unwrap();
             e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -52966,7 +53727,7 @@ mod tests {
     fn open_durable_wal_segment_on_missing_path_is_a_fresh_durable_db() {
         let path = test_wal_path("durable-fresh");
         assert!(!path.exists());
-        let mut e = Engine::open_durable_wal_segment(&path).unwrap();
+        let e = Engine::open_durable_wal_segment(&path).unwrap();
         assert!(e.wal_is_durable());
         assert_eq!(e.wal_flushed_count(), 0);
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
@@ -52989,7 +53750,7 @@ mod tests {
         ));
         let control_path = dir.join("CONTROL");
         let segment_path = dir.join("segment-0001.wal");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -53000,7 +53761,7 @@ mod tests {
 
         e.persist_durable_wal_checkpoint(&control_path, &segment_path)
             .unwrap();
-        let mut recovered = Engine::recover_from_durable_wal_checkpoint(&control_path).unwrap();
+        let recovered = Engine::recover_from_durable_wal_checkpoint(&control_path).unwrap();
         let _ = std::fs::remove_dir_all(dir);
 
         assert_eq!(recovered.wal_unflushed_count(), 0);
@@ -53035,7 +53796,7 @@ mod tests {
         ));
         let manifest_path = dir.join("MANIFEST");
         let segment_dir = dir.join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -53048,7 +53809,7 @@ mod tests {
             .unwrap();
         assert_eq!(manifest.segments.len(), 3);
 
-        let mut recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
+        let recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
         let _ = std::fs::remove_dir_all(dir);
 
         assert_eq!(recovered.wal_unflushed_count(), 0);
@@ -53086,7 +53847,7 @@ mod tests {
         let object_dir = dir.join("backup").join("objects");
         let restored_manifest_path = dir.join("restored").join("MANIFEST");
         let restored_segment_dir = dir.join("restored").join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -53116,7 +53877,7 @@ mod tests {
             &restored_segment_dir,
         )
         .unwrap();
-        let mut recovered = Engine::recover_from_durable_wal_archive_to_timestamp_micros(
+        let recovered = Engine::recover_from_durable_wal_archive_to_timestamp_micros(
             &restored_manifest_path,
             3_000,
         )
@@ -53157,7 +53918,7 @@ mod tests {
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
         let ingest_segment = segment_dir.join("segment-0002.wal");
-        let mut base = Engine::new_local();
+        let base = Engine::new_local();
         base.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         base.execute_text_at_timestamp_micros(
@@ -53197,8 +53958,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
-        let mut timestamp_recovered =
+        let recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
+        let timestamp_recovered =
             Engine::recover_from_durable_wal_archive_to_timestamp_micros(&manifest_path, 3_000)
                 .unwrap();
         let _ = std::fs::remove_dir_all(dir);
@@ -53251,7 +54012,7 @@ mod tests {
         ));
         let manifest_path = dir.join("MANIFEST");
         let segment_dir = dir.join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -53263,8 +54024,7 @@ mod tests {
 
         e.persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
             .unwrap();
-        let mut recovered =
-            Engine::recover_from_durable_wal_archive_to_txn(&manifest_path, 3).unwrap();
+        let recovered = Engine::recover_from_durable_wal_archive_to_txn(&manifest_path, 3).unwrap();
         let _ = std::fs::remove_dir_all(dir);
 
         assert_eq!(recovered.wal_unflushed_count(), 0);
@@ -53308,7 +54068,7 @@ mod tests {
         ));
         let manifest_path = dir.join("MANIFEST");
         let segment_dir = dir.join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -53334,7 +54094,7 @@ mod tests {
             .persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
             .unwrap();
         assert_eq!(manifest.record_timestamps.len(), 4);
-        let mut recovered =
+        let recovered =
             Engine::recover_from_durable_wal_archive_to_timestamp_micros(&manifest_path, 3_000)
                 .unwrap();
         let _ = std::fs::remove_dir_all(dir);
@@ -53388,7 +54148,7 @@ mod tests {
         let timeline_path = dir.join("branch").join("TIMELINE");
         let pruned_timeline_path = dir.join("pruned-branch").join("TIMELINE");
         let registry_path = dir.join("TIMELINE_REGISTRY");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -53465,7 +54225,7 @@ mod tests {
         let pruned_selection_err =
             Engine::select_durable_wal_archive_timeline(&registry_path, "timeline-pruned-0003")
                 .unwrap_err();
-        let mut recovered = Engine::recover_from_registered_durable_wal_archive_timeline(
+        let recovered = Engine::recover_from_registered_durable_wal_archive_timeline(
             &registry_path,
             "timeline-branch-0002",
         )
@@ -53551,7 +54311,7 @@ mod tests {
         let base_segment_path = dir.join("base").join("base.wal");
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -53565,7 +54325,7 @@ mod tests {
         e.persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
             .unwrap();
 
-        let mut recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
+        let recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
             &control_path,
             &manifest_path,
             3,
@@ -53615,7 +54375,7 @@ mod tests {
         let base_segment_path = dir.join("base").join("base.wal");
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -53641,7 +54401,7 @@ mod tests {
         e.persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
             .unwrap();
 
-        let mut recovered =
+        let recovered =
             Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(
                 &control_path,
                 &manifest_path,
@@ -53681,7 +54441,7 @@ mod tests {
         let base_segment_path = dir.join("base").join("base.wal");
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
-        let mut base = Engine::new_local();
+        let base = Engine::new_local();
         base.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         base.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -53689,7 +54449,7 @@ mod tests {
         base.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
             .unwrap();
 
-        let mut archive = Engine::new_local();
+        let archive = Engine::new_local();
         archive
             .execute_text(3, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -53715,7 +54475,7 @@ mod tests {
 
     #[test]
     fn engine_written_wal_archive_timestamps_are_monotonic() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET a=1").unwrap();
         e.execute_text(2, "SET b=2").unwrap();
 
@@ -53734,7 +54494,7 @@ mod tests {
         ));
         let manifest_path = dir.join("MANIFEST");
         let segment_dir = dir.join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -53750,7 +54510,7 @@ mod tests {
         assert!(obsolete_tail.exists());
         let plan = Engine::apply_durable_wal_archive_retention_to_txn(&manifest_path, 3).unwrap();
 
-        let mut recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
+        let recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
         assert!(!obsolete_tail.exists());
         assert_eq!(plan.retained_record_count, 3);
         assert_eq!(plan.removed_record_count, 1);
@@ -53794,7 +54554,7 @@ mod tests {
         ));
         let manifest_path = dir.join("MANIFEST");
         let segment_dir = dir.join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -53821,7 +54581,7 @@ mod tests {
         let plan =
             Engine::apply_durable_wal_archive_retention_to_timestamp_micros(&manifest_path, 3_000)
                 .unwrap();
-        let mut recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
+        let recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
         let timestamp_err = match Engine::recover_from_durable_wal_archive_to_timestamp_micros(
             &manifest_path,
             4_000,
@@ -53878,7 +54638,7 @@ mod tests {
         let base_segment_path = dir.join("base").join("base.wal");
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -53909,13 +54669,13 @@ mod tests {
             &manifest_path,
         )
         .unwrap();
-        let mut recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
+        let recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
             &control_path,
             &manifest_path,
             3,
         )
         .unwrap();
-        let mut timestamp_recovered =
+        let timestamp_recovered =
             Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(
                 &control_path,
                 &manifest_path,
@@ -53974,7 +54734,7 @@ mod tests {
         let base_segment_path = dir.join("base").join("base.wal");
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
-        let mut base = Engine::new_local();
+        let base = Engine::new_local();
         base.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         base.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -53982,7 +54742,7 @@ mod tests {
         base.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
             .unwrap();
 
-        let mut archive = Engine::new_local();
+        let archive = Engine::new_local();
         archive
             .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -54022,7 +54782,7 @@ mod tests {
         let base_segment_path = dir.join("base").join("base.wal");
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -54061,13 +54821,13 @@ mod tests {
             3_000,
         )
         .unwrap();
-        let mut recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
+        let recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
             &control_path,
             &manifest_path,
             4,
         )
         .unwrap();
-        let mut timestamp_recovered =
+        let timestamp_recovered =
             Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(
                 &control_path,
                 &manifest_path,
@@ -54116,7 +54876,7 @@ mod tests {
         let prune_segments = dir.join("timeline-prune").join("segments");
         let prune_timeline_path = dir.join("timeline-prune").join("TIMELINE");
         let registry_path = dir.join("TIMELINE_REGISTRY");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -54204,7 +54964,7 @@ mod tests {
             3_000,
         )
         .unwrap();
-        let mut recovered = Engine::recover_from_registered_durable_wal_archive_timeline(
+        let recovered = Engine::recover_from_registered_durable_wal_archive_timeline(
             &registry_path,
             "timeline-keep-0002",
         )
@@ -54281,7 +55041,7 @@ mod tests {
         let branch_segments = dir.join("timeline-branch").join("segments");
         let branch_timeline_path = dir.join("timeline-branch").join("TIMELINE");
         let registry_path = dir.join("TIMELINE_REGISTRY");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -54371,7 +55131,7 @@ mod tests {
         let base_segment_path = dir.join("base").join("base.wal");
         let manifest_path = dir.join("archive").join("MANIFEST");
         let segment_dir = dir.join("archive").join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
         e.execute_text_at_timestamp_micros(
@@ -54425,7 +55185,7 @@ mod tests {
         ));
         let manifest_path = dir.join("MANIFEST");
         let segment_dir = dir.join("segments");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(10, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(20, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -54447,7 +55207,7 @@ mod tests {
     #[test]
     fn checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary() {
         let path = test_wal_path("vacuum");
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:1=closed").unwrap();
 
@@ -54514,7 +55274,7 @@ mod tests {
     fn checkpoint_vacuum_rejects_unsafe_boundaries() {
         // Stage 4 reasons in `commit_seq`/`Index` space (was façade-`txn_id`): the durable boundary is
         // `committed_seq`, and the active-snapshot guard is the oldest active READ SNAPSHOT.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         let no_commit_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
         assert!(
             no_commit_err
@@ -54649,7 +55409,7 @@ mod tests {
     fn concurrent_dml_classification_routes_sequence_inserts_to_serialized_path() {
         // `is_concurrent_dml` gates which statements take the off-lock concurrent path vs the
         // serialized catalog-latch path (write-half MVCC, Stage 4).
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE plain (id INT, v INT)")
             .unwrap();
         e.execute_text(2, "CREATE TABLE serial_t (id SERIAL, v TEXT)")
@@ -54694,7 +55454,7 @@ mod tests {
                 .collect()
         };
 
-        let mut concurrent = Engine::new_local();
+        let concurrent = Engine::new_local();
         concurrent
             .execute_text(1, "CREATE TABLE t (id INT, v INT)")
             .unwrap();
@@ -54708,7 +55468,7 @@ mod tests {
             .execute_dml_concurrent(4, "DELETE FROM t WHERE id = 1")
             .unwrap();
 
-        let mut serialized = Engine::new_local();
+        let serialized = Engine::new_local();
         serialized
             .execute_text(1, "CREATE TABLE t (id INT, v INT)")
             .unwrap();
@@ -54730,7 +55490,7 @@ mod tests {
 
     #[test]
     fn relational_index_access_path_survives_wal_recovery() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(
@@ -54740,7 +55500,7 @@ mod tests {
         .unwrap();
 
         let durable = e.durable_wal_records().to_vec();
-        let mut recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&durable).unwrap();
         let Command::Select(select) =
             parse_command("SELECT id FROM people WHERE name = 'Linus' ORDER BY id").unwrap()
         else {
@@ -54778,7 +55538,7 @@ mod tests {
     /// version comparison below would fail.
     #[test]
     fn stage0_wal_replay_reproduces_byte_identical_version_stamps() {
-        let mut live = Engine::new_local();
+        let live = Engine::new_local();
         // Mix of DDL + DML, including UPDATE and DELETE so both `created_by` and `deleted_by`
         // are exercised. Sparse, non-monotonic-relative-to-commit txn_ids on purpose.
         live.execute_text(100, "CREATE TABLE acct (id INT, bal INT)")
@@ -54864,7 +55624,7 @@ mod tests {
     /// reads thread through `visible_up_to`.
     #[test]
     fn stage0_read_boundary_equals_stamp_sequence() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         // commit 1: CREATE TABLE (no row versions)
         e.execute_text(500, "CREATE TABLE t (id INT)").unwrap();
         // commit 2: INSERT id=1  -> row version stamped created_by = 2
@@ -54970,6 +55730,7 @@ mod tests {
             value_index: e.read_state.mvcc.value_index_snapshot(),
             next_row_id: e.read_state.mvcc.current_row_id(),
             sequences: e
+                .ddl_catalog()
                 .relational_sequences
                 .iter()
                 .map(|(name, seq)| (name.clone(), (seq.last_value, seq.is_called)))
@@ -55022,7 +55783,7 @@ mod tests {
     fn prepare_dml_does_not_mutate_engine_state() {
         // Stage 2 invariant (a): `prepare_*` is PURE — calling it leaves every mutable engine
         // structure (versions, value index, row-id counter, sequences) byte-for-byte unchanged.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
             .unwrap();
         e.execute_text(
@@ -55095,10 +55856,11 @@ mod tests {
         // advance the sequence (pure), but the prepared delta must, and `apply_delta` must install
         // exactly the advancement the old in-line apply produced.
         let seq_name = "s_id_seq"; // SERIAL auto-creates `<table>_<col>_seq`.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE s (id SERIAL, v TEXT)")
             .unwrap();
         let seq_before = e
+            .ddl_catalog()
             .relational_sequences
             .get(seq_name)
             .map(|s| (s.last_value, s.is_called));
@@ -55137,7 +55899,7 @@ mod tests {
 
         // Parity: a fresh engine running the SAME insert through the public path lands on the same
         // sequence state.
-        let mut golden = Engine::new_local();
+        let golden = Engine::new_local();
         golden
             .execute_text(1, "CREATE TABLE s (id SERIAL, v TEXT)")
             .unwrap();
@@ -55150,12 +55912,18 @@ mod tests {
         // advance under `&mut self`; the `&self` `apply_delta` deliberately rejects seq-carrying
         // deltas (write-half Stage 4).
         let commit_seq = snapshot.commit_seq;
-        e.apply_delta_serialized(delta, commit_seq, None).unwrap();
+        {
+            let mut cat = e.ddl_catalog();
+            e.apply_delta_serialized(&mut cat, delta, commit_seq, None)
+                .unwrap();
+        }
         let seq_e = e
+            .ddl_catalog()
             .relational_sequences
             .get(seq_name)
             .map(|s| (s.last_value, s.is_called));
         let seq_g = golden
+            .ddl_catalog()
             .relational_sequences
             .get(seq_name)
             .map(|s| (s.last_value, s.is_called));
@@ -55172,7 +55940,7 @@ mod tests {
         // not the store. (The old apply advanced the sequence before preflighting.) This is the
         // Stage-4 abort-is-side-effect-free property; unobservable on live paths because
         // `execute_text` preflights before committing.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE p (id SERIAL, code INT UNIQUE)")
             .unwrap();
         e.execute_text(2, "INSERT INTO p (code) VALUES (100)")
@@ -55201,7 +55969,7 @@ mod tests {
         // key there would spuriously conflict two concurrent disjoint inserts), even though
         // `apply_delta` DOES install those row keys. Inserts conflict ONLY on the unique-index slots
         // they occupy.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO t (id, label) VALUES (1, 'a')")
@@ -55244,7 +56012,7 @@ mod tests {
     fn insert_write_set_records_unique_slots_but_not_row_keys() {
         // BUG-1 fix, complement: an INSERT into a table WITH a unique index records the unique slot it
         // occupies (the genuine first-committer-wins conflict dimension) but STILL records no row key.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE u (id INT, label TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE UNIQUE INDEX u_id ON u (id)")
@@ -55274,7 +56042,7 @@ mod tests {
     fn write_set_is_exactly_the_keys_apply_touches_for_update() {
         // Stage 2 invariant (b), UPDATE: the write-set's row keys equal exactly the row keys whose
         // chain apply rewrote (old tombstoned + new created at the same key).
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
             .unwrap();
         e.execute_text(
@@ -55313,7 +56081,7 @@ mod tests {
     fn write_set_is_exactly_the_keys_apply_touches_for_delete() {
         // Stage 2 invariant (b), DELETE: the write-set's row keys equal exactly the row keys whose
         // version apply tombstoned.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
             .unwrap();
         e.execute_text(
@@ -55349,7 +56117,7 @@ mod tests {
         // Stage 2 invariant (b), unique slots: a unique-column insert records exactly the
         // `(table, column, value)` slots it claims — the Stage 4 first-committer-wins conflict
         // points — and nothing for non-unique columns.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE u (id INT UNIQUE, label TEXT)")
             .unwrap();
 

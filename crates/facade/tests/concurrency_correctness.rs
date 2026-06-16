@@ -41,8 +41,8 @@ use std::time::Duration;
 
 use gpu_db_engine::{Engine, RelationalResidencyWarmupPolicy};
 use gpu_db_facade::{
-    execute_concurrent_dml_with_prepared_hook, execute_on_shared_engine, DbError, DbValue,
-    ErrorCategory, QueryOutcome, SharedEngine,
+    execute_concurrent_dml_with_prepared_hook, execute_on_shared_engine,
+    execute_select_with_pinned_hook, DbError, DbValue, ErrorCategory, QueryOutcome, SharedEngine,
 };
 
 /// Repetitions for each deterministic concurrency test. Each repetition rebuilds fresh state and
@@ -1012,6 +1012,337 @@ fn ddl_concurrent_with_reads_sees_a_consistent_catalog_and_data_pair() {
                 // still the original prefix — the schema grew but the data is consistent.
                 assert_eq!(scalar_i64(&shared, "SELECT COUNT(*) FROM t"), base);
                 assert_eq!(visible_ids(&shared, "t"), (1..=base).collect::<Vec<_>>());
+            }
+        },
+    );
+}
+
+// ----- PART B: reader overlapping a SHAPE-CHANGING DDL always decodes consistently --------------
+
+/// The destination-milestone catalog↔data co-pinning crux (design PART B). With the engine `RwLock`
+/// removed, a lock-free reader pins its `committed_seq` boundary `s` ONCE and resolves BOTH the
+/// catalog (`catalog_as_of(s)`) and the data (pinned at `s`) at that one generation. A writer that
+/// concurrently OSCILLATES a table's column count — `ALTER TABLE t ADD COLUMN cN` then `DROP COLUMN
+/// cN`, driving the physical row part-count UP and then back DOWN — therefore can never split a
+/// reader across two catalogs: every `SELECT *` returns rows whose value count equals the pinned
+/// catalog's column count, and `SELECT id` is always the contiguous committed prefix, with NEVER a
+/// "stored relational row does not match catalog shape" error. This is the property the per-method
+/// co-pin (`bind_relational_select_for_execution` loading `s` once and threading it to the data pin)
+/// guarantees on the now-lock-free path.
+#[test]
+fn reader_overlapping_shape_changing_ddl_always_decodes_consistently() {
+    with_deadline(
+        TEST_DEADLINE_SECS,
+        "reader_overlapping_shape_changing_ddl_always_decodes_consistently",
+        || {
+            for rep in 0..REPS {
+                let shared = Arc::new(SharedEngine::new());
+                run_ok(&shared, "CREATE TABLE t (id INT)");
+                let base = 16;
+                for id in 1..=base {
+                    run_ok(&shared, &format!("INSERT INTO t (id) VALUES ({id})"));
+                }
+
+                let barrier = Arc::new(Barrier::new(THREADS));
+                // One writer OSCILLATES the part-count: ADD COLUMN cN DEFAULT N (backfills every row at
+                // the commit → part-count UP) then DROP COLUMN cN (rewrites every row → part-count
+                // DOWN). Both physically rewrite the stored rows at the DDL's commit_seq, so at any
+                // visibility boundary the visible rows' part-count matches the schema as-of that
+                // boundary. The barrier is the first thing each worker touches.
+                let writer = {
+                    let shared = Arc::clone(&shared);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        for n in 0..40 {
+                            let _ = run_write(
+                                &shared,
+                                &format!("ALTER TABLE t ADD COLUMN c{n} INT DEFAULT {n}"),
+                            );
+                            let _ = run_write(&shared, &format!("ALTER TABLE t DROP COLUMN c{n}"));
+                        }
+                    })
+                };
+                let readers: Vec<_> = (0..(THREADS - 1))
+                    .map(|_| {
+                        let shared = Arc::clone(&shared);
+                        let barrier = Arc::clone(&barrier);
+                        thread::spawn(move || {
+                            barrier.wait();
+                            for _ in 0..80 {
+                                // `SELECT *` pins one catalog generation; EVERY row must have exactly
+                                // that generation's column count (co-pinned data). A split (catalog of
+                                // one commit_seq, rows of another) would surface as a shape-mismatch
+                                // error or a wrong value count.
+                                match run(&shared, "SELECT * FROM t") {
+                                    Ok(QueryOutcome::Rows { rows, columns }) => {
+                                        assert_eq!(
+                                            rows.len(),
+                                            base as usize,
+                                            "rep {rep}: SELECT * row count drifted under oscillating DDL"
+                                        );
+                                        for row in &rows {
+                                            assert_eq!(
+                                                row.len(),
+                                                columns.len(),
+                                                "rep {rep}: a row's value count disagrees with the \
+                                                 pinned catalog's column count (torn schema/data)"
+                                            );
+                                        }
+                                    }
+                                    Ok(other) => {
+                                        panic!("rep {rep}: SELECT * returned non-rows {other:?}")
+                                    }
+                                    Err(err) => panic!(
+                                        "rep {rep}: SELECT * under oscillating DDL failed: {err:?}"
+                                    ),
+                                }
+                                // `SELECT id` projects only the original column; for every catalog
+                                // generation the reader could pin it must be the contiguous committed
+                                // prefix 1..=base.
+                                let ids = visible_ids(&shared, "t");
+                                assert_eq!(
+                                    ids,
+                                    (1..=base).collect::<Vec<_>>(),
+                                    "rep {rep}: SELECT id under oscillating DDL returned a torn / \
+                                     non-prefix row set"
+                                );
+                            }
+                        })
+                    })
+                    .collect();
+
+                writer.join().unwrap();
+                for r in readers {
+                    r.join().unwrap();
+                }
+                // The oscillation ends with c39 dropped, so `t` is back to a single `id` column with
+                // exactly `base` rows.
+                assert_eq!(scalar_i64(&shared, "SELECT COUNT(*) FROM t"), base);
+                assert_eq!(visible_ids(&shared, "t"), (1..=base).collect::<Vec<_>>());
+            }
+        },
+    );
+}
+
+/// INSTRUMENTED variant of the co-pinning crux: a reader deterministically STRADDLES a shape-changing
+/// DDL commit. The reader parks (via [`execute_select_with_pinned_hook`]) in the window BETWEEN
+/// binding its catalog and pinning its data; while it is parked a writer commits an `ALTER TABLE t ADD
+/// COLUMN` (which rewrites every row, changing the part-count) AND bumps `committed_seq`. With
+/// co-pinning the reader's data pin reuses the boundary its bind selected its catalog at, so it reads
+/// the OLD (consistent) generation and decodes cleanly. WITHOUT co-pinning the data pin would re-load
+/// the now-newer `committed_seq` while the catalog stayed old, and the decode would fail with "stored
+/// relational row does not match catalog shape" — so this test is RED on a no-co-pin build and GREEN
+/// with it. The straddle is forced by a barrier (no timing luck), and the whole thing runs on the
+/// lock-free façade (the DDL commits fully concurrently with the parked reader — impossible under the
+/// old reader-excludes-writer lock).
+#[test]
+fn instrumented_reader_straddling_a_shape_change_decodes_at_its_pinned_generation() {
+    with_deadline(
+        TEST_DEADLINE_SECS,
+        "instrumented_reader_straddling_a_shape_change_decodes_at_its_pinned_generation",
+        || {
+            for rep in 0..REPS {
+                let shared = Arc::new(SharedEngine::new());
+                run_ok(&shared, "CREATE TABLE t (id INT)");
+                let base = 8;
+                for id in 1..=base {
+                    run_ok(&shared, &format!("INSERT INTO t (id) VALUES ({id})"));
+                }
+
+                // Rendezvous: the reader parks at the hook (after catalog bind, before data pin) and
+                // releases `reader_at_hook`; the writer then commits the shape DDL and releases
+                // `ddl_done`; the reader proceeds to pin + decode. Two `Barrier(2)`s give an exact
+                // happens-before so the reader's bind precedes the DDL and the DDL precedes its pin.
+                let reader_at_hook = Arc::new(Barrier::new(2));
+                let ddl_done = Arc::new(Barrier::new(2));
+
+                let writer = {
+                    let shared = Arc::clone(&shared);
+                    let reader_at_hook = Arc::clone(&reader_at_hook);
+                    let ddl_done = Arc::clone(&ddl_done);
+                    thread::spawn(move || {
+                        // Wait until the reader has bound its catalog and is parked before the pin.
+                        reader_at_hook.wait();
+                        // Commit a shape-changing DDL that rewrites every row at this commit_seq.
+                        let _ = run_write(
+                            &shared,
+                            &format!("ALTER TABLE t ADD COLUMN c{rep} INT DEFAULT {rep}"),
+                        );
+                        // Release the reader to pin + decode against its ORIGINAL boundary.
+                        ddl_done.wait();
+                    })
+                };
+
+                let reader = {
+                    let shared = Arc::clone(&shared);
+                    let reader_at_hook = Arc::clone(&reader_at_hook);
+                    let ddl_done = Arc::clone(&ddl_done);
+                    thread::spawn(move || {
+                        let outcome =
+                            execute_select_with_pinned_hook(&shared, "SELECT * FROM t", || {
+                                // We are between bind (catalog selected at boundary `s`) and pin. Let the
+                                // writer commit its shape DDL, then wait for it to finish before pinning —
+                                // forcing the straddle deterministically.
+                                reader_at_hook.wait();
+                                ddl_done.wait();
+                            });
+                        // The read must succeed and be self-consistent at its pinned generation: every
+                        // row's value count equals the bound catalog's column count, and the rows are
+                        // the committed prefix. (At the reader's boundary the column was not yet added,
+                        // so it sees the single `id` column.)
+                        match outcome {
+                            Ok(QueryOutcome::Rows { rows, columns }) => {
+                                assert_eq!(
+                                    rows.len(),
+                                    base as usize,
+                                    "rep {rep}: straddling reader saw a drifted row count"
+                                );
+                                for row in &rows {
+                                    assert_eq!(
+                                        row.len(),
+                                        columns.len(),
+                                        "rep {rep}: straddling reader decoded a row whose value count \
+                                         disagrees with its pinned catalog (catalog↔data split — \
+                                         co-pinning regressed)"
+                                    );
+                                }
+                            }
+                            Ok(other) => panic!("rep {rep}: expected rows, got {other:?}"),
+                            Err(err) => panic!(
+                                "rep {rep}: straddling reader errored (a shape-mismatch here means \
+                                 the catalog and data were pinned at different generations): {err:?}"
+                            ),
+                        }
+                    })
+                };
+
+                writer.join().unwrap();
+                reader.join().unwrap();
+                // The committed end state: the column was added, so `t` now has 2 columns and `base`
+                // rows; `SELECT id` is still the prefix.
+                assert_eq!(scalar_i64(&shared, "SELECT COUNT(*) FROM t"), base);
+                assert_eq!(visible_ids(&shared, "t"), (1..=base).collect::<Vec<_>>());
+            }
+        },
+    );
+}
+
+// ----- DDL vs concurrent-DML on the SAME table is a clean retryable abort (stop-condition #2) -----
+
+/// A DML statement preparing OFF-LOCK while a DDL changes that same table's schema must NEVER reach
+/// the `apply_delta` panic — the under-lock re-resolve has to surface a shape mismatch as a RETRYABLE
+/// [`ErrorCategory::Serialization`] (or commit cleanly against whichever schema won), never a
+/// corruption or engine wedge (design stop-condition #2). Here many writers hammer `INSERT`/`UPDATE`
+/// on `t` while a writer concurrently ADD/DROP COLUMNs it; the test asserts every writer outcome is
+/// one of {committed, retryable serialization, a benign schema-shape error}, and that the engine never
+/// poisons (a subsequent read still succeeds) and the table stays internally consistent.
+#[test]
+fn ddl_racing_dml_on_the_same_table_never_corrupts_or_wedges() {
+    with_deadline(
+        TEST_DEADLINE_SECS,
+        "ddl_racing_dml_on_the_same_table_never_corrupts_or_wedges",
+        || {
+            for rep in 0..REPS {
+                let shared = Arc::new(SharedEngine::new());
+                run_ok(&shared, "CREATE TABLE t (id INT, v INT)");
+                for id in 0..THREADS {
+                    run_ok(&shared, &format!("INSERT INTO t (id, v) VALUES ({id}, 0)"));
+                }
+
+                let barrier = Arc::new(Barrier::new(THREADS + 1));
+                // One DDL writer oscillates a third column on `t` while the DML writers run.
+                let ddl = {
+                    let shared = Arc::clone(&shared);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        for n in 0..20 {
+                            let _ = run_write(
+                                &shared,
+                                &format!("ALTER TABLE t ADD COLUMN w{n} INT DEFAULT {n}"),
+                            );
+                            let _ = run_write(&shared, &format!("ALTER TABLE t DROP COLUMN w{n}"));
+                        }
+                    })
+                };
+                let dml: Vec<_> = (0..THREADS)
+                    .map(|w| {
+                        let shared = Arc::clone(&shared);
+                        let barrier = Arc::clone(&barrier);
+                        thread::spawn(move || {
+                            barrier.wait();
+                            let mut outcomes = Vec::new();
+                            for i in 0..30 {
+                                // INSERT and UPDATE on the same table the DDL is reshaping. Each runs
+                                // its off-lock prepare against whatever schema is published, then the
+                                // engine re-resolves under the commit_mutex; a schema change in the
+                                // gap must abort retryably, never panic.
+                                let id = w;
+                                let r1 = run_write(
+                                    &shared,
+                                    &format!("UPDATE t SET v = {i} WHERE id = {id}"),
+                                );
+                                let r2 = run_write(
+                                    &shared,
+                                    &format!(
+                                        "INSERT INTO t (id, v) VALUES ({}, {i})",
+                                        1000 + w * 100 + i
+                                    ),
+                                );
+                                outcomes.push(r1);
+                                outcomes.push(r2);
+                            }
+                            outcomes
+                        })
+                    })
+                    .collect();
+
+                ddl.join().unwrap();
+                let mut categories = Vec::new();
+                for h in dml {
+                    categories.extend(h.join().unwrap());
+                }
+                // Every DML outcome is acceptable iff it is a commit OR a retryable serialization abort
+                // OR a benign engine-level schema error (a DML whose columns don't match the schema
+                // that won) — but NEVER a panic/corruption/wedge. The crux is the absence of a panic
+                // (which `with_deadline`'s join would surface) and of a torn engine.
+                for outcome in &categories {
+                    match outcome {
+                        Ok(()) => {}
+                        Err(ErrorCategory::Serialization) => {}
+                        Err(ErrorCategory::Engine) => {}
+                        Err(other) => panic!(
+                            "rep {rep}: DDL-vs-DML produced a non-retryable, non-benign outcome \
+                             {other:?} (expected commit / Serialization / a benign Engine schema error)"
+                        ),
+                    }
+                }
+                // The engine must NOT be wedged: a read still succeeds and the table is consistent.
+                let count = scalar_i64(&shared, "SELECT COUNT(*) FROM t");
+                assert!(
+                    count >= THREADS as i64,
+                    "rep {rep}: base rows vanished under DDL-vs-DML (engine corrupted?)"
+                );
+                // `SELECT *` decodes cleanly (no torn schema/data) — the co-pinning + clean-abort
+                // invariants held throughout.
+                match run(&shared, "SELECT * FROM t") {
+                    Ok(QueryOutcome::Rows { rows, columns }) => {
+                        for row in &rows {
+                            assert_eq!(
+                                row.len(),
+                                columns.len(),
+                                "rep {rep}: post-race SELECT * row width disagrees with the catalog"
+                            );
+                        }
+                    }
+                    Ok(other) => {
+                        panic!("rep {rep}: post-race SELECT * returned non-rows {other:?}")
+                    }
+                    Err(err) => {
+                        panic!("rep {rep}: post-race SELECT * failed (engine wedged?): {err:?}")
+                    }
+                }
             }
         },
     );

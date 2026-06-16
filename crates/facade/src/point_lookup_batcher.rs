@@ -14,10 +14,10 @@
 //!
 //! ## Correctness invariants (the audit checks all of these)
 //!
-//! - **One read lock per batch.** The coalescer takes `engine.read()` ONCE and
-//!   runs prepare→submit→complete for the whole drained batch under that single
-//!   acquisition, so no writer interleaves a batch (writes take the write lock,
-//!   which is mutually exclusive — plan §7).
+//! - **One pinned generation per batch.** The coalescer runs prepare→submit→complete for the whole
+//!   drained batch over the shared `&Engine` (no façade lock); the engine's `&self` job APIs pin one
+//!   `committed_seq` generation across submit→complete, so the batch reads a single consistent
+//!   snapshot even as concurrent writers commit (lock-free read path, write-half MVCC).
 //! - **Error fanout is total.** Any error from prepare/submit/complete is sent to
 //!   *every* waiter whose request was in that submit group — never a hung
 //!   connection. A drained batch is split into per-`route_id` groups; a failing
@@ -137,7 +137,8 @@ impl AdaptiveWait {
 /// One batchable point-lookup request: a parsed `SELECT`, its int4 needle, and
 /// the `oneshot` sender the coalescer answers on. `route_id` is filled in by the
 /// coalescer (it needs an `engine.read()` to compute), so requests of different
-/// shapes/tables can share the queue and be grouped at flush time.
+/// shapes/tables can share the queue and be grouped at flush time. (`route_id` is computed on the
+/// shared `&Engine`, no lock.)
 struct PointLookupRequest {
     select: Select,
     needle: i32,
@@ -155,8 +156,8 @@ pub struct PointLookupBatcher {
 
 impl PointLookupBatcher {
     /// Spawn the single coalescer thread bound to `engine`. The coalescer holds an
-    /// `Arc<SharedEngine>` and reaches the engine only through its `RwLock` — the
-    /// façade owns the "run the batch under one read lock" guarantee (plan §1).
+    /// `Arc<SharedEngine>` and reaches the engine through the shared `&Engine` (no façade lock — the
+    /// engine's `&self` job APIs own the "one pinned generation per batch" guarantee).
     pub fn new(engine: Arc<SharedEngine>) -> Self {
         Self::with_triggers(engine, DEFAULT_MAX_ITEMS, DEFAULT_MAX_WAIT)
     }
@@ -397,17 +398,22 @@ fn run_batch(engine: &SharedEngine, batch: Batch<PointLookupRequest>) {
         return;
     }
 
-    // ONE read lock for the entire batch (submit + complete for every group). A
-    // poisoned lock means a writer panicked mid-statement: fail every waiter loud
-    // rather than serve possibly-torn state (mirrors `execute_on_shared_engine`).
-    let guard = match engine.read_engine() {
-        Ok(guard) => guard,
+    // The whole batch (submit + complete for every group) runs over ONE pinned generation on the
+    // shared `&Engine` (no façade lock — the "one read-lock per batch" invariant is now "one pinned
+    // generation per batch", enforced by the engine's `&self` job APIs). A committer that panicked
+    // mid-commit poisons the engine's commit_mutex: fail every waiter loud rather than serve
+    // possibly-torn state (mirrors `execute_on_shared_engine`).
+    let engine_ref: &Engine = match engine.read_engine() {
+        Ok(engine_ref) => engine_ref,
         Err(()) => {
             fail_all(requests, crate::poisoned_engine_error());
             return;
         }
     };
-    let engine_ref: &Engine = &guard;
+    if engine_ref.is_commit_path_poisoned() {
+        fail_all(requests, crate::poisoned_engine_error());
+        return;
+    }
 
     // Prepare a job per request. `prepare_relational_retained_read_job` is `&self`
     // (Stage 0) and computes `route_id`, which encodes shape:schema:table:proj:filter
@@ -446,7 +452,7 @@ fn run_batch(engine: &SharedEngine, batch: Batch<PointLookupRequest>) {
         let group = groups.remove(&route_id).expect("group present");
         run_group(engine_ref, group);
     }
-    // `guard` (the read lock) drops here, after every group completed.
+    // The batch is complete; every group ran over the shared `&Engine` (no lock to release).
 }
 
 /// A request whose retained-read job has been prepared under the read lock.

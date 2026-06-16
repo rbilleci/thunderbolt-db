@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::Arc;
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalColumn};
 use gpu_db_protocol::{parse_command, Command, ParseError, Select, SqlType, SqlValue};
@@ -282,14 +282,16 @@ pub fn execute_on_engine(
     }
 }
 
-/// A `Send + Sync` engine wrapper for concurrent dispatch (plan P1-M4): one engine shared
-/// across a server's worker pool behind an `RwLock`, so read-only statements run
-/// concurrently (read lock) while writes serialize (write lock) — "N concurrent readers,
-/// one serialized writer" without the write-half's interior mutability. The server holds an
-/// `Arc<SharedEngine>` and reaches the engine only through this neutral type, never naming
-/// `Engine` directly (keeps the §5.0 protocol-neutral boundary intact).
+/// A `Send + Sync` engine wrapper for concurrent dispatch (lock-free read path, write-half MVCC —
+/// the destination milestone): one engine shared across a server's worker pool behind a plain
+/// `Arc<Engine>`, with **NO façade lock**. The engine is now fully interior-mutable for the
+/// concurrency-relevant paths (`&self` reads, `&self` concurrent-DML commit under the engine's own
+/// `commit_mutex`, `&self` DDL under the engine's own `catalog_latch`), so reads run truly lock-free
+/// and a writer never blocks a reader. The server holds an `Arc<SharedEngine>` and reaches the engine
+/// only through this neutral type, never naming `Engine` directly (keeps the §5.0 protocol-neutral
+/// boundary intact).
 pub struct SharedEngine {
-    engine: RwLock<Engine>,
+    engine: Arc<Engine>,
     next_txn_id: AtomicU64,
 }
 
@@ -304,18 +306,19 @@ impl SharedEngine {
     /// benchmark).
     pub fn from_engine(engine: Engine) -> Self {
         Self {
-            engine: RwLock::new(engine),
+            engine: Arc::new(engine),
             next_txn_id: AtomicU64::new(1),
         }
     }
 
-    /// Acquire the engine **read** lock, mapping a poisoned lock to `Err(())`. The
-    /// point-lookup batcher uses this to hold ONE read lock across a whole batch's
-    /// submit+complete (the "one read-lock per batch" invariant); on poison the
-    /// caller fails every waiter loud rather than serve possibly-torn state (same
-    /// policy as [`execute_on_shared_engine`]).
-    pub(crate) fn read_engine(&self) -> Result<std::sync::RwLockReadGuard<'_, Engine>, ()> {
-        self.engine.read().map_err(|_| ())
+    /// Borrow the shared engine (no lock — the engine is interior-mutable). The point-lookup batcher
+    /// uses this to drive a whole batch's prepare→submit→complete over ONE pinned generation; the
+    /// "one read-lock per batch" invariant is now "one `committed_seq` pin per batch", enforced inside
+    /// the engine's `&self` job APIs. Mapped to `Result` only to preserve the batcher's existing call
+    /// shape (it can no longer fail here — a panicked committer is surfaced by the per-statement
+    /// `is_commit_path_poisoned()` checks, not by a poisoned façade lock).
+    pub(crate) fn read_engine(&self) -> Result<&Engine, ()> {
+        Ok(&self.engine)
     }
 }
 
@@ -325,26 +328,28 @@ impl Default for SharedEngine {
     }
 }
 
-/// Execute one SQL statement against a shared engine (write-half MVCC, Stage 4 — the concurrency
-/// flip). The engine `RwLock` is now used asymmetrically:
+/// Execute one SQL statement against a shared engine (lock-free read path, write-half MVCC — the
+/// destination milestone). There is NO façade lock; every statement runs on the shared `&Engine`:
 ///
-/// - **Reads** (`SELECT`) take a **read** lock and run lock-free against a pinned snapshot.
-/// - **Concurrent DML** (`INSERT`/`UPDATE`/`DELETE` on a base table without `nextval` defaults) also
-///   takes only a **read** lock and goes through the engine's `execute_dml_concurrent` — off-lock
-///   prepare + a short internal `commit_mutex`. So concurrent writers OVERLAP each other and never
-///   block readers; they serialize only briefly on the commit_mutex inside the engine.
-/// - **DDL and everything else** take the **write** lock, which acts as the **catalog latch**: DDL
-///   serializes against DML and readers for its duration (this milestone's confirmed scope — no
-///   online DDL).
+/// - **Reads** (`SELECT`) run truly lock-free against a single pinned `committed_seq` + the catalog
+///   selected as-of that boundary + the per-table data generation (catalog↔data co-pinned), so a
+///   concurrent writer or DDL never blocks or splits them.
+/// - **Concurrent DML** (`INSERT`/`UPDATE`/`DELETE` on a base table without `nextval` defaults) goes
+///   through the engine's `&self` `execute_dml_concurrent` — off-lock prepare + a short internal
+///   `commit_mutex` critical section. Concurrent writers OVERLAP each other and never block readers.
+/// - **DDL / sequence-default INSERT / KV / everything else** goes through the engine's `&self`
+///   `execute_text`, which serializes under the engine's own **catalog latch** (+ commit_mutex) — DDL
+///   is serialized inside the engine, NOT by a façade write lock, so it no longer excludes readers.
 ///
-/// Transaction-control statements take no lock and produce only the tag. The per-statement txn id is
-/// allocated internally (a durable-identity placeholder, not a transaction handle).
+/// Transaction-control statements run no engine call and produce only the tag. The per-statement txn
+/// id is allocated internally (a durable-identity placeholder, not a transaction handle).
 ///
-/// **Poison-on-panic (re-homed to the commit path).** If a writer panics mid-commit, the engine's
-/// internal commit_mutex is poisoned; a DDL panic poisons the engine `RwLock`. Either way every
-/// subsequent statement fails loud with [`ErrorCategory::Internal`] rather than serve possibly-torn
-/// state — the engine deliberately wedges (the WAL is the durable source of truth; a restart
-/// replays it). A retryable SI serialization conflict is NOT a poison: it maps to
+/// **Poison-on-panic (homed to the engine's own locks).** A writer that panics mid-commit poisons the
+/// engine's `commit_mutex` (checked via [`Engine::is_commit_path_poisoned`]); a DDL that panics
+/// mid-apply poisons the engine's `catalog_latch` (checked via [`Engine::is_catalog_latch_poisoned`]).
+/// Either way every subsequent statement fails loud with [`ErrorCategory::Internal`] rather than serve
+/// possibly-torn state — the engine deliberately wedges (the WAL is the durable source of truth; a
+/// restart replays it). A retryable SI serialization conflict is NOT a poison: it maps to
 /// [`ErrorCategory::Serialization`] (class-40) and the client retries.
 pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
     let command = match parse_command(sql) {
@@ -352,9 +357,9 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
         Err(ParseError::Empty) => return Ok(QueryOutcome::Empty),
         Err(err) => return Err(map_parse_error(err)),
     };
+    let engine: &Engine = &shared.engine;
     match command {
         Command::Select(select) => {
-            let engine = shared.engine.read().map_err(|_| poisoned_engine_error())?;
             // A writer that panicked mid-commit poisons the commit path; refuse to serve a read
             // against possibly-torn published state (re-homed poison policy).
             if engine.is_commit_path_poisoned() {
@@ -386,27 +391,25 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
         other => {
             let tag = command_tag(&other);
             let txn_id = shared.next_txn_id.fetch_add(1, Ordering::Relaxed);
-            // A READ lock (shared with readers and other concurrent writers) probes whether this
-            // statement is concurrent-eligible DML. The probe and the concurrent commit both run
-            // under the read lock, so writers overlap and never block readers.
-            {
-                let engine = shared.engine.read().map_err(|_| poisoned_engine_error())?;
-                if engine.is_commit_path_poisoned() {
-                    return Err(poisoned_engine_error());
-                }
-                if engine.is_concurrent_dml(sql) {
-                    engine
-                        .execute_dml_concurrent(txn_id, sql)
-                        .map_err(map_execute_error)?;
-                    return Ok(QueryOutcome::Command {
-                        tag,
-                        rows_affected: None,
-                    });
-                }
-            }
-            // DDL / sequence-default INSERT / KV / other: the WRITE lock is the catalog latch.
-            let mut engine = shared.engine.write().map_err(|_| poisoned_engine_error())?;
+            // Probe whether this statement is concurrent-eligible DML; if so, the engine's `&self`
+            // concurrent-DML path (off-lock prepare + short commit_mutex) overlaps other writers and
+            // never blocks readers.
             if engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
+            if engine.is_concurrent_dml(sql) {
+                engine
+                    .execute_dml_concurrent(txn_id, sql)
+                    .map_err(map_execute_error)?;
+                return Ok(QueryOutcome::Command {
+                    tag,
+                    rows_affected: None,
+                });
+            }
+            // DDL / sequence-default INSERT / KV / other: the engine's catalog latch is the serializer.
+            // A DDL that panicked mid-apply poisons the catalog latch — refuse rather than serve a torn
+            // catalog (the catalog-latch counterpart of the commit-path poison check).
+            if engine.is_catalog_latch_poisoned() {
                 return Err(poisoned_engine_error());
             }
             engine
@@ -421,11 +424,11 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
 }
 
 /// Test-support: run a concurrent DML statement through the shared engine with a hook invoked
-/// between the off-lock snapshot capture+prepare and the commit critical section (write-half MVCC,
-/// Stage 4). The concurrency-correctness suite uses this to rendezvous two writers at a barrier in
-/// that window, deterministically forcing the SI write-write conflict (both snapshot, then both
-/// commit). Takes only a READ lock (the concurrent-DML path), so the hook runs while the engine is
-/// reader-shared. The supplied `txn_id` is the durable identity (the caller picks a unique one).
+/// between the off-lock snapshot capture+prepare and the commit critical section (write-half MVCC).
+/// The concurrency-correctness suite uses this to rendezvous two writers at a barrier in that window,
+/// deterministically forcing the SI write-write conflict (both snapshot, then both commit). Runs on
+/// the shared `&Engine` with no façade lock (the concurrent-DML path), so the hook runs fully
+/// concurrently. The supplied `txn_id` is the durable identity (the caller picks a unique one).
 #[doc(hidden)]
 pub fn execute_concurrent_dml_with_prepared_hook(
     shared: &SharedEngine,
@@ -433,13 +436,52 @@ pub fn execute_concurrent_dml_with_prepared_hook(
     sql: &str,
     on_prepared: impl FnOnce(),
 ) -> Result<(), DbError> {
-    let engine = shared.engine.read().map_err(|_| poisoned_engine_error())?;
+    let engine: &Engine = &shared.engine;
     if engine.is_commit_path_poisoned() {
         return Err(poisoned_engine_error());
     }
     engine
         .execute_dml_concurrent_instrumented(txn_id, sql, on_prepared)
         .map_err(map_execute_error)
+}
+
+/// Test-support: run a `SELECT` through the shared engine with a hook invoked in the window BETWEEN
+/// the read's catalog bind and its data pin (PART B catalog↔data co-pinning). The
+/// concurrency-correctness suite uses this to park a reader there while a writer commits a
+/// shape-changing DDL, deterministically straddling the co-pinned region: with co-pinning the read's
+/// (catalog, data) pair stays consistent, without it the decode mismatches the catalog shape. Runs on
+/// the shared `&Engine` with no façade lock, so the writer's DDL commits fully concurrently with the
+/// parked reader (the property only the lock-free path can exhibit).
+#[doc(hidden)]
+pub fn execute_select_with_pinned_hook(
+    shared: &SharedEngine,
+    sql: &str,
+    on_pinned: impl FnOnce(),
+) -> Result<QueryOutcome, DbError> {
+    let engine: &Engine = &shared.engine;
+    if engine.is_commit_path_poisoned() {
+        return Err(poisoned_engine_error());
+    }
+    let select = match parse_command(sql) {
+        Ok(Command::Select(select)) => select,
+        Ok(_) => {
+            return Err(DbError {
+                category: ErrorCategory::Unsupported,
+                message: "execute_select_with_pinned_hook requires a SELECT".to_string(),
+            })
+        }
+        Err(err) => return Err(map_parse_error(err)),
+    };
+    let result = engine
+        .execute_relational_select_instrumented(&select, on_pinned)
+        .map_err(map_execute_error)?;
+    let columns = result.columns.iter().map(map_column).collect();
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| row.into_iter().map(map_value).collect())
+        .collect();
+    Ok(QueryOutcome::Rows { columns, rows })
 }
 
 /// Classify-or-fallback entry (Thread-3 Stage 1/Stage 4, strictly additive). If `sql` is a
