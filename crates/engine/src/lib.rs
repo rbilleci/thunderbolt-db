@@ -8883,16 +8883,38 @@ fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
     )
 }
 
-/// Validate `value` against the column type and coerce it into storable form. For a
-/// NUMERIC column this rescales the value to the column's declared `scale` (round-half-up)
-/// and enforces the `precision` budget, raising a PostgreSQL-style `numeric field overflow`
-/// when the rescaled mantissa exceeds `10^precision` or leaves i128 range. Non-numeric
-/// types pass through unchanged after the type check.
+/// Widen an INSERT/UPDATE value to `column_ty` along the lossless integer→numeric tower,
+/// so a bare-int literal populates a `numeric`/`int8` column (`INSERT INTO acct (bal)
+/// VALUES (100)`) the way PostgreSQL's implicit assignment cast does. Only lossless
+/// widenings are applied; a narrowing/rounding assignment cast (numeric→int, int8→int4)
+/// is NOT — those still fail the type check in `coerce_insert_value`, as before. Numeric
+/// widening lands at scale 0; the caller then rescales to the column's declared scale.
+fn widen_value_to_column_type(value: SqlValue, column_ty: SqlType) -> SqlValue {
+    match (value, column_ty) {
+        (SqlValue::Int4(v), SqlType::Int8) => SqlValue::Int8(i64::from(v)),
+        (SqlValue::Int4(v), SqlType::Numeric { .. }) => {
+            SqlValue::Numeric(Decimal128::new(i128::from(v), 0))
+        }
+        (SqlValue::Int8(v), SqlType::Numeric { .. }) => {
+            SqlValue::Numeric(Decimal128::new(i128::from(v), 0))
+        }
+        (other, _) => other,
+    }
+}
+
+/// Validate `value` against the column type and coerce it into storable form. The value is
+/// first widened along the integer→numeric tower (`widen_value_to_column_type`), so a
+/// bare-int literal lands in a `numeric`/`int8` column. For a NUMERIC column this then
+/// rescales the value to the column's declared `scale` (round-half-up) and enforces the
+/// `precision` budget, raising a PostgreSQL-style `numeric field overflow` when the
+/// rescaled mantissa exceeds `10^precision` or leaves i128 range. Other types pass through
+/// unchanged after the type check.
 fn coerce_insert_value(
     value: SqlValue,
     ty: SqlType,
     column_name: &str,
 ) -> Result<SqlValue, EngineError> {
+    let value = widen_value_to_column_type(value, ty);
     if !sql_value_matches_type(&value, ty) {
         return Err(EngineError::ApplyFailed(format!(
             "invalid value for column \"{column_name}\""
@@ -9685,13 +9707,15 @@ fn bind_update_assignments(
                     assignment.column
                 ))));
             }
-            if !sql_value_matches_type(&assignment.value, table.columns[idx].ty) {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "invalid value for column \"{}\"",
-                    assignment.column
-                ))));
-            }
-            Ok((idx, assignment.value.clone()))
+            // Coerce + rescale to the column type (widen int→numeric/int8, rescale a
+            // numeric to the declared scale, enforce precision) — parity with INSERT.
+            let value = coerce_insert_value(
+                assignment.value.clone(),
+                table.columns[idx].ty,
+                &assignment.column,
+            )
+            .map_err(ExecuteError::Engine)?;
+            Ok((idx, value))
         })
         .collect()
 }
@@ -50568,6 +50592,49 @@ mod tests {
             coerce_filter_literal(SqlValue::Text("x".into()), num),
             SqlValue::Text("x".into())
         );
+    }
+
+    #[test]
+    fn insert_and_update_widen_literals_across_the_numeric_tower() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE acct (id INT, bal NUMERIC(10,2), big BIGINT)",
+        )
+        .unwrap();
+        // Bare-int literals populate the numeric and bigint columns (PG implicit cast);
+        // before this fix they errored "invalid value for column".
+        e.execute_text(2, "INSERT INTO acct (id, bal, big) VALUES (1, 100, 5)")
+            .unwrap();
+        let run = |e: &Engine, sql: &str| {
+            let Command::Select(s) = parse_command(sql).unwrap() else {
+                panic!("expected SELECT");
+            };
+            e.execute_relational_select(&s).unwrap().rows
+        };
+        // The numeric is stored at the column scale (100 -> 100.00), the bigint as int8.
+        assert_eq!(
+            run(&e, "SELECT bal, big FROM acct WHERE id = 1"),
+            vec![vec![
+                SqlValue::Numeric(Decimal128::parse("100.00").unwrap()),
+                SqlValue::Int8(5)
+            ]]
+        );
+        // UPDATE coerces + rescales the same way (was a type error + missing rescale before).
+        e.execute_text(3, "UPDATE acct SET bal = 7 WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            run(&e, "SELECT bal FROM acct WHERE id = 1"),
+            vec![vec![SqlValue::Numeric(Decimal128::parse("7.00").unwrap())]]
+        );
+        // Precision overflow on a widened int still errors (numeric(10,2) holds 8 integer digits).
+        assert!(e
+            .execute_text(4, "INSERT INTO acct (id, bal) VALUES (2, 123456789)")
+            .is_err());
+        // A genuinely incompatible type still errors loudly — no silent coercion.
+        assert!(e
+            .execute_text(5, "INSERT INTO acct (id, bal) VALUES (3, 'x')")
+            .is_err());
     }
 
     #[test]
