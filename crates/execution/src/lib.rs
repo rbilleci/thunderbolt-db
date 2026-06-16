@@ -7949,6 +7949,428 @@ done:
         .collect())
 }
 
+// P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
+// operator). Sorts N i64 keys (resident, at `keys_byte_offset`) by (key, original index) and returns
+// the permutation indices, ascending or descending. Two kernels on one pooled stream:
+//   - `..._init`: grid-stride fill keys_work[i] = (i<N) ? key[i] : i64::MAX (pad sorts to the end),
+//     idx_work[i] = i.
+//   - `..._step`: one compare-exchange stage of the bitonic network; the host loops k (subsequence
+//     size) and j (compare distance) over O(log²N) launches.
+// STABLE: equal keys break the tie by ASCENDING original index regardless of direction, matching the
+// engine's stable CPU ORDER BY. Host-looped steps handle any N; the per-step launch overhead is
+// exactly why radix (S3) wins above the crossover and the adaptive dispatch (S4) chooses.
+#[allow(dead_code)] // S2 primitive: wired into the production adaptive sort operator in S4.
+fn launch_cuda_resident_i64_argsort_bitonic(
+    resident: &CudaResidentDeviceMemory,
+    keys_byte_offset: u64,
+    n: u64,
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_bitonic_argsort_init(
+    .param .u64 keys_src_ptr,
+    .param .u64 n,
+    .param .u64 n_pad,
+    .param .u64 keys_work_ptr,
+    .param .u64 idx_work_ptr,
+    .param .u32 descending
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_real;
+    .reg .pred %p_pdesc;
+    .reg .u32 %desc;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u32 %idxv;
+    .reg .u64 %src;
+    .reg .u64 %n;
+    .reg .u64 %npad;
+    .reg .u64 %kw;
+    .reg .u64 %iw;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off8;
+    .reg .u64 %off4;
+    .reg .u64 %addr;
+    .reg .s64 %keyv;
+
+    ld.param.u64 %src, [keys_src_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %npad, [n_pad];
+    ld.param.u64 %kw, [keys_work_ptr];
+    ld.param.u64 %iw, [idx_work_ptr];
+    ld.param.u32 %desc, [descending];
+    setp.eq.u32 %p_pdesc, %desc, 1;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+
+iloop:
+    setp.ge.u64 %p_done, %i, %npad;
+    @%p_done bra idone;
+    mul.lo.u64 %off8, %i, 8;
+    mul.lo.u64 %off4, %i, 4;
+    cvt.u32.u64 %idxv, %i;
+    add.u64 %addr, %iw, %off4;
+    st.global.u32 [%addr], %idxv;
+    setp.lt.u64 %p_real, %i, %n;
+    @!%p_real bra ipad;
+    add.u64 %addr, %src, %off8;
+    ld.global.s64 %keyv, [%addr];
+    bra istore;
+ipad:
+    // Padding sentinel must sink to the UNREAD end so idx[0..n) holds only real rows.
+    // Ascending: pad = i64::MAX (sorts to the high end). Descending: pad = i64::MIN
+    // (sorts to the low end). MIN is computed as MAX+1 (two's-complement wrap) to avoid
+    // the most-negative-literal PTX parse pitfall.
+    mov.s64 %keyv, 9223372036854775807;
+    @%p_pdesc add.s64 %keyv, %keyv, 1;
+istore:
+    add.u64 %addr, %kw, %off8;
+    st.global.s64 [%addr], %keyv;
+    add.u64 %i, %i, %stride;
+    bra iloop;
+idone:
+    ret;
+}
+
+.visible .entry gpu_db_bitonic_argsort_step(
+    .param .u64 keys_work_ptr,
+    .param .u64 idx_work_ptr,
+    .param .u64 n_pad,
+    .param .u64 j,
+    .param .u64 k,
+    .param .u32 descending
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_pair;
+    .reg .pred %p_asc;
+    .reg .pred %p_nasc;
+    .reg .pred %p_desc;
+    .reg .pred %p_ndesc;
+    .reg .pred %p_kgt;
+    .reg .pred %p_klt;
+    .reg .pred %p_keq;
+    .reg .pred %p_igt;
+    .reg .pred %p_ilt;
+    .reg .pred %p_ka;
+    .reg .pred %p_kb;
+    .reg .pred %p_ta;
+    .reg .pred %p_tb;
+    .reg .pred %p_iaft;
+    .reg .pred %p_ibef;
+    .reg .pred %p_s1;
+    .reg .pred %p_s2;
+    .reg .pred %p_swap;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u32 %desc;
+    .reg .u32 %idxi;
+    .reg .u32 %idxl;
+    .reg .u64 %kw;
+    .reg .u64 %iw;
+    .reg .u64 %npad;
+    .reg .u64 %j;
+    .reg .u64 %k;
+    .reg .u64 %i;
+    .reg .u64 %l;
+    .reg .u64 %stride;
+    .reg .u64 %band;
+    .reg .u64 %ai8;
+    .reg .u64 %al8;
+    .reg .u64 %ai4;
+    .reg .u64 %al4;
+    .reg .u64 %addr;
+    .reg .s64 %ki;
+    .reg .s64 %kl;
+
+    ld.param.u64 %kw, [keys_work_ptr];
+    ld.param.u64 %iw, [idx_work_ptr];
+    ld.param.u64 %npad, [n_pad];
+    ld.param.u64 %j, [j];
+    ld.param.u64 %k, [k];
+    ld.param.u32 %desc, [descending];
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+
+    setp.eq.u32 %p_desc, %desc, 1;
+    not.pred %p_ndesc, %p_desc;
+
+sloop:
+    setp.ge.u64 %p_done, %i, %npad;
+    @%p_done bra sdone;
+    xor.b64 %l, %i, %j;
+    setp.gt.u64 %p_pair, %l, %i;
+    @!%p_pair bra snext;
+
+    mul.lo.u64 %ai8, %i, 8;
+    mul.lo.u64 %al8, %l, 8;
+    mul.lo.u64 %ai4, %i, 4;
+    mul.lo.u64 %al4, %l, 4;
+    add.u64 %addr, %kw, %ai8;
+    ld.global.s64 %ki, [%addr];
+    add.u64 %addr, %kw, %al8;
+    ld.global.s64 %kl, [%addr];
+    add.u64 %addr, %iw, %ai4;
+    ld.global.u32 %idxi, [%addr];
+    add.u64 %addr, %iw, %al4;
+    ld.global.u32 %idxl, [%addr];
+
+    setp.gt.s64 %p_kgt, %ki, %kl;
+    setp.lt.s64 %p_klt, %ki, %kl;
+    setp.eq.s64 %p_keq, %ki, %kl;
+    setp.gt.u32 %p_igt, %idxi, %idxl;
+    setp.lt.u32 %p_ilt, %idxi, %idxl;
+    and.pred %p_s1, %p_desc, %p_klt;
+    and.pred %p_s2, %p_ndesc, %p_kgt;
+    or.pred %p_ka, %p_s1, %p_s2;
+    and.pred %p_s1, %p_desc, %p_kgt;
+    and.pred %p_s2, %p_ndesc, %p_klt;
+    or.pred %p_kb, %p_s1, %p_s2;
+    and.pred %p_ta, %p_keq, %p_igt;
+    or.pred %p_iaft, %p_ka, %p_ta;
+    and.pred %p_tb, %p_keq, %p_ilt;
+    or.pred %p_ibef, %p_kb, %p_tb;
+    and.b64 %band, %i, %k;
+    setp.eq.u64 %p_asc, %band, 0;
+    not.pred %p_nasc, %p_asc;
+    and.pred %p_s1, %p_asc, %p_iaft;
+    and.pred %p_s2, %p_nasc, %p_ibef;
+    or.pred %p_swap, %p_s1, %p_s2;
+    @!%p_swap bra snext;
+    add.u64 %addr, %kw, %ai8;
+    st.global.s64 [%addr], %kl;
+    add.u64 %addr, %kw, %al8;
+    st.global.s64 [%addr], %ki;
+    add.u64 %addr, %iw, %ai4;
+    st.global.u32 [%addr], %idxl;
+    add.u64 %addr, %iw, %al4;
+    st.global.u32 [%addr], %idxi;
+
+snext:
+    add.u64 %i, %i, %stride;
+    bra sloop;
+sdone:
+    ret;
+}
+"#;
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    // Argsort indices are materialized as u32 on-device (idx buffer = n_pad*4, `cvt.u32.u64`).
+    // Guard the precondition so >4B rows fail loud instead of silently truncating the index.
+    if n > u64::from(u32::MAX) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    let key_end = n
+        .checked_mul(std::mem::size_of::<i64>() as u64)
+        .and_then(|b| keys_byte_offset.checked_add(b))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if key_end > resident.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(key_end as usize));
+    }
+    let n_pad = n
+        .checked_next_power_of_two()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let n_usize =
+        usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let n_pad_usize = usize::try_from(n_pad)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let init_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_bitonic_argsort_init", &ptx)?;
+    let step_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_bitonic_argsort_step", &ptx)?;
+
+    let primary = resident.primary();
+    let keys_work = primary.lease_device_buffer(
+        n_pad_usize
+            .checked_mul(std::mem::size_of::<i64>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )?;
+    let idx_work = primary.lease_device_buffer(
+        n_pad_usize
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )?;
+
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let stream = lease
+        .pooled
+        .as_ref()
+        .expect("pooled stream just set")
+        .stream;
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        // SAFETY: best-effort drain on an already-failing path before the leases unwind.
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    const BLOCK: u32 = 256;
+    let grid = n_pad.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+
+    let mut src_arg = resident
+        .device_ptr()
+        .checked_add(keys_byte_offset)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut n_arg = n;
+    let mut n_pad_arg = n_pad;
+    let mut kw_arg = keys_work.ptr;
+    let mut iw_arg = idx_work.ptr;
+    let mut desc_arg: u32 = u32::from(descending);
+    let mut init_args = [
+        (&mut src_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut n_pad_arg as *mut u64).cast::<c_void>(),
+        (&mut kw_arg as *mut u64).cast::<c_void>(),
+        (&mut iw_arg as *mut u64).cast::<c_void>(),
+        (&mut desc_arg as *mut u32).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            init_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            init_args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+
+    let mut k = 2_u64;
+    while k <= n_pad {
+        let mut j = k >> 1;
+        while j > 0 {
+            let mut j_arg = j;
+            let mut k_arg = k;
+            let mut step_args = [
+                (&mut kw_arg as *mut u64).cast::<c_void>(),
+                (&mut iw_arg as *mut u64).cast::<c_void>(),
+                (&mut n_pad_arg as *mut u64).cast::<c_void>(),
+                (&mut j_arg as *mut u64).cast::<c_void>(),
+                (&mut k_arg as *mut u64).cast::<c_void>(),
+                (&mut desc_arg as *mut u32).cast::<c_void>(),
+            ];
+            check_cuda(unsafe {
+                cu_launch_kernel(
+                    step_fn,
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    step_args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            })
+            .map_err(drain_err)?;
+            j >>= 1;
+        }
+        k <<= 1;
+    }
+
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    resident.record_kernel_event_elapsed_us(None);
+
+    let mut indices = vec![0_u32; n_usize];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            indices.as_mut_ptr().cast::<c_void>(),
+            idx_work.ptr,
+            n_usize * std::mem::size_of::<u32>(),
+        )
+    })
+    .map_err(drain_err)?;
+    drop(lease);
+    Ok(indices)
+}
+
 fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     resident: &R,
     byte_offset: u64,
@@ -14549,5 +14971,138 @@ mod tests {
             "hash-agg ({largest_hash:.3} ms) did not beat the serial linear-probe kernel \
              ({largest_serial:.3} ms) on the largest table — milestone premise unmet"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_bitonic_argsort_i64_sorts_stably_both_directions() {
+        // P2 §9.5/S2 — bitonic argsort primitive correctness + benchmark (GPU-native property oracle).
+        // No CPU sort oracle: verify the GPU permutation is (a) a permutation of 0..n, (b) sorted in
+        // the requested direction, (c) STABLE (equal keys keep ascending original-index order). Covers
+        // both directions across sizes incl. duplicates, negatives, and non-power-of-2 n (padding).
+        use std::time::Instant;
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let retain_keys = |keys: &[i64]| {
+            let n = keys.len() as u64;
+            // SAFETY: `i64` is POD; native bytes; `keys` outlives the synchronous retain copy.
+            let key_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(keys.as_ptr().cast::<u8>(), keys.len() * 8) };
+            let header = n.to_le_bytes();
+            let off = std::mem::size_of::<u64>() as u64;
+            let allocated = off + key_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: off,
+                            bytes: key_bytes,
+                        },
+                    ],
+                )
+                .expect("retain keys");
+            (resident, off)
+        };
+        let verify = |keys: &[i64], idx: &[u32], descending: bool| {
+            assert_eq!(idx.len(), keys.len());
+            // (a) permutation of 0..n.
+            let mut seen = vec![false; keys.len()];
+            for &x in idx {
+                assert!(
+                    !seen[x as usize],
+                    "index {x} appears twice — not a permutation"
+                );
+                seen[x as usize] = true;
+            }
+            // (b) sorted in the requested direction, and (c) STABLE across each ENTIRE run of
+            // equal keys. Stability is checked NON-ADJACENTLY: within a maximal equal-key run
+            // every original index must exceed the run's FIRST index (not merely the previous
+            // one), so a violation between two equal rows separated by other equal rows can't
+            // slip past. Equal keys are contiguous once (b) holds. Property oracle — no CPU sort.
+            let mut run_start = 0usize;
+            for p in 1..idx.len() {
+                let (prev, cur) = (keys[idx[p - 1] as usize], keys[idx[p] as usize]);
+                if descending {
+                    assert!(prev >= cur, "not descending at {p}: {prev} < {cur}");
+                } else {
+                    assert!(prev <= cur, "not ascending at {p}: {prev} > {cur}");
+                }
+                if cur == prev {
+                    assert!(
+                        idx[p] > idx[run_start],
+                        "not stable on ties: equal-key run [{run_start}..={p}] has idx[{p}]={} <= run-start idx={}",
+                        idx[p],
+                        idx[run_start]
+                    );
+                } else {
+                    run_start = p;
+                }
+            }
+        };
+
+        for &n in &[1_usize, 2, 7, 100, 1_000, 4_096, 5_000] {
+            let keys: Vec<i64> = (0..n)
+                .map(|i| (((i as u64).wrapping_mul(2_654_435_761) % 1_000) as i64) - 500)
+                .collect();
+            for &desc in &[false, true] {
+                let (resident, off) = retain_keys(&keys);
+                let idx = launch_cuda_resident_i64_argsort_bitonic(&resident, off, n as u64, desc)
+                    .expect("argsort");
+                verify(&keys, &idx, desc);
+            }
+        }
+
+        // Extreme-value keys: exercise the padding-sentinel COLLISION path on-device — real
+        // keys equal to the ascending sentinel (i64::MAX) / descending sentinel (i64::MIN),
+        // which the bounded-key loop above never reaches. Includes the all-sentinel worst
+        // cases and duplicate-heavy arrays that stress non-adjacent stability over long runs.
+        let (mn, mx) = (i64::MIN, i64::MAX);
+        let extreme_cases: Vec<Vec<i64>> = vec![
+            vec![mx; 64],                                                 // all == asc sentinel
+            vec![mn; 64],                                                 // all == desc sentinel
+            vec![mn, mx, 0, mx, mn, 7, mx, mn, -1, mx],                   // mixed, non-pow-2
+            (0..300).map(|i| if i % 2 == 0 { mn } else { mx }).collect(), // alternating extremes
+            (0..1_000).map(|i| (i % 3) as i64 - 1).collect(),             // dup-heavy: stability
+        ];
+        for keys in &extreme_cases {
+            for &desc in &[false, true] {
+                let (resident, off) = retain_keys(keys);
+                let idx = launch_cuda_resident_i64_argsort_bitonic(
+                    &resident,
+                    off,
+                    keys.len() as u64,
+                    desc,
+                )
+                .expect("argsort extreme");
+                verify(keys, &idx, desc);
+            }
+        }
+
+        // Benchmark: bitonic latency vs N (informs the S3/S4 radix crossover — host-looped
+        // O(log^2 N) per-step launches, so it grows faster than radix's constant passes).
+        println!("p2_m2_s2_bitonic_argsort: latency vs N");
+        println!("| n | ms |");
+        println!("|---:|---:|");
+        for &n in &[100_usize, 1_000, 10_000, 100_000, 1_000_000] {
+            let keys: Vec<i64> = (0..n)
+                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % n.max(1) as u64) as i64)
+                .collect();
+            let (resident, off) = retain_keys(&keys);
+            let mut ms = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let idx = launch_cuda_resident_i64_argsort_bitonic(&resident, off, n as u64, false)
+                    .unwrap();
+                std::hint::black_box(&idx);
+                ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!("| {n} | {ms:.3} |");
+        }
     }
 }
