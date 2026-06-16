@@ -1229,9 +1229,27 @@ as a radix sort that would sort the wrong key and be discarded.
   prefix) applied on the GPU; the CPU `.sort_by`/filter kept only as a `#[cfg(test)]` parity
   reference or labeled bootstrap fallback. Build it ONCE as a shared operator — it applies
   to grouped aggregates AND projection/DISTINCT ORDER BY.
-- **Trigger:** after the serial-kernel thrust (grouped_stats hash-agg lands first); a
-  companion to §1.4 step 1.3 (plan→kernel compiler) and §9.4 (CPU-execution routes) — all
-  three move the remaining CPU relational work onto the GPU.
+- **Status: ACTIVE — sequenced 2026-06-16** (user pulled it forward so the grouped/ordering
+  path lands GPU-native in one pass, with no later rework). **Adaptive sort (decided):**
+  size-dispatch — **bitonic for small results, radix for large**, estimated crossover ~10k
+  rows but **CALIBRATED by the S2/S3 benchmarks** (bitonic is one kernel and wins below the
+  crossover where radix's ~12-launch overhead dominates; radix's O(n) + constant 4 passes
+  wins above, where bitonic's O(log²n) global stages explode). **Slice sequence** — each:
+  implement → adversarial audit → execution + engine GPU gates → benchmark → commit:
+  - **S1** `grouped_stats` → GPU **hash aggregation** (the group-by: parallel atomic
+    open-addressing table → unordered groups; the last serial-kernel holdout).
+  - **S2** **bitonic** sort primitive (small): single-block + multi-block-merge over
+    (key, payload).
+  - **S3** **LSD radix** sort primitive (large): 4-pass histogram + exclusive scan +
+    stable scatter, adapting compare_project's partition+prefix-sum pattern.
+  - **S4** **adaptive dispatch + HAVING + LIMIT**: size-threshold (calibrated) picks
+    bitonic/radix, + HAVING predicate filter + LIMIT top-K = the full ORDER BY/HAVING/LIMIT
+    operator over the result.
+  - **S5** **engine wiring**: replace the CPU `.sort_by`/HAVING/LIMIT for resident grouped
+    queries (then projection/DISTINCT ORDER BY) with the GPU operator.
+  - **Benchmark deliverable:** adaptive latency across 100/1k/10k/100k/1M, confirming the
+    dispatch picks the faster path and locating the crossover.
+  Companion to §1.4 step 1.3 (plan→kernel compiler) and §9.4 (CPU-execution routes).
 - **Acceptance:** ORDER BY/HAVING/LIMIT for resident grouped + projected queries execute on
   the GPU (no CPU per-result sort/filter on the hot path); CPU↔GPU parity tests green;
   d2h/telemetry assertions updated.
