@@ -169,6 +169,21 @@ remaining program is:
    first, it is an explicit **stepping-stone / parity-reference**, tracked as
    GPU-parity debt with a milestone — never the optimized hot path.
 
+> **Test-oracle hygiene is part of this debt (added 2026-06-16).** The charter
+> permits CPU relational execution only as clause-(a) "reference semantics for
+> CPU↔GPU parity tests," and even that is **tracked GPU-parity debt**. So GPU
+> parity tests must use a **GPU-native oracle** — assert the parallel kernel
+> against an on-device serial reference (or a construction/closed-form expected),
+> never a CPU re-implementation of the operator as the expected value. **Action
+> (runs alongside the kernel-migration slices, not a gate ahead of them):** audit
+> the existing `#[ignore]` GPU tests in `crates/execution` and `crates/engine` and
+> revise any CPU `.filter()/.fold()`-style expected-value oracle to the GPU-native
+> form. Known instance: `gpu_parallel_i32_equal_count_matches_serial_and_wins`
+> still asserts against a CPU-computed `expected` — drop that leg in favor of the
+> on-device serial reference it already has. (The compare-count slice already
+> follows the target pattern: `gpu_parallel_i32_compare_count_matches_serial_and_wins`
+> uses only the on-device serial oracle.)
+
 The authoritative, milestone-level track for this engine spine is
 `docs/roadmap/gpu-native-oltp-roadmap.md`. The phase plan in §5 is sequenced to
 serve this spine: **Phase 2 (real GPU execution engine) is the lead/priority
