@@ -9157,7 +9157,11 @@ const PG_BOOTSTRAP_OWNER_OID: i32 = 10;
 
 /// Build a transient in-memory [`RelationalTable`] describing a catalog relation's fixed
 /// columns. Only `columns` (and a nominal `oid`) are consulted by the bind/finalize path.
-fn catalog_relation_table(name: &str, columns: &[(&str, SqlType)]) -> RelationalTable {
+fn catalog_relation_table(
+    schema: &str,
+    name: &str,
+    columns: &[(&str, SqlType)],
+) -> RelationalTable {
     let columns = columns
         .iter()
         .enumerate()
@@ -9174,7 +9178,7 @@ fn catalog_relation_table(name: &str, columns: &[(&str, SqlType)]) -> Relational
         })
         .collect();
     RelationalTable {
-        schema: "pg_catalog".to_string(),
+        schema: schema.to_string(),
         name: name.to_string(),
         oid: 0,
         columns,
@@ -9185,10 +9189,23 @@ fn catalog_relation_table(name: &str, columns: &[(&str, SqlType)]) -> Relational
     }
 }
 
+/// The `information_schema.columns.data_type` spelling for an engine type (PostgreSQL uses
+/// the SQL-standard names here, e.g. `integer`/`bigint`, not the `pg_type` names).
+fn information_schema_data_type(ty: SqlType) -> &'static str {
+    match ty {
+        SqlType::Int4 => "integer",
+        SqlType::Int8 => "bigint",
+        SqlType::Numeric { .. } => "numeric",
+        SqlType::Bool => "boolean",
+        SqlType::Text => "text",
+    }
+}
+
 /// `pg_catalog.pg_namespace` — one row per schema. The engine models the `public` user
 /// schema (when present) plus the always-exposed `pg_catalog`/`information_schema`.
 fn synthesize_pg_namespace(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<Vec<SqlValue>>) {
     let table = catalog_relation_table(
+        "pg_catalog",
         "pg_namespace",
         &[
             ("oid", SqlType::Int4),
@@ -9223,6 +9240,7 @@ fn synthesize_pg_namespace(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<V
 /// `m`, sequence `S`), synthesized from the catalog's relation maps.
 fn synthesize_pg_class(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<Vec<SqlValue>>) {
     let table = catalog_relation_table(
+        "pg_catalog",
         "pg_class",
         &[
             ("oid", SqlType::Int4),
@@ -9269,6 +9287,158 @@ fn synthesize_pg_class(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<Vec<S
     (table, rows)
 }
 
+/// `pg_catalog.pg_attribute` — one row per user column. `attrelid` links to pg_class.oid;
+/// `atttypid`/`attlen` come from the column's resolved type. Nullability isn't modeled yet
+/// (M3), so `attnotnull` is always false.
+fn synthesize_pg_attribute(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<Vec<SqlValue>>) {
+    let table = catalog_relation_table(
+        "pg_catalog",
+        "pg_attribute",
+        &[
+            ("attrelid", SqlType::Int4),
+            ("attname", SqlType::Text),
+            ("atttypid", SqlType::Int4),
+            ("attnum", SqlType::Int4),
+            ("attlen", SqlType::Int4),
+            ("attnotnull", SqlType::Bool),
+        ],
+    );
+    let attribute_row = |oid: u32, col: &RelationalColumn| {
+        vec![
+            SqlValue::Int4(oid as i32),
+            SqlValue::Text(col.name.clone()),
+            SqlValue::Int4(col.type_oid as i32),
+            SqlValue::Int4(i32::from(col.attnum)),
+            SqlValue::Int4(i32::from(col.type_size)),
+            SqlValue::Bool(false),
+        ]
+    };
+    let mut rows = Vec::new();
+    for t in catalog.relational_catalog.values() {
+        for col in &t.columns {
+            rows.push(attribute_row(t.oid, col));
+        }
+    }
+    for mv in catalog.relational_materialized_views.values() {
+        for col in &mv.columns {
+            rows.push(attribute_row(mv.oid, col));
+        }
+    }
+    (table, rows)
+}
+
+/// `pg_catalog.pg_type` — the engine's fixed base types plus any user domains.
+fn synthesize_pg_type(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<Vec<SqlValue>>) {
+    let table = catalog_relation_table(
+        "pg_catalog",
+        "pg_type",
+        &[
+            ("oid", SqlType::Int4),
+            ("typname", SqlType::Text),
+            ("typlen", SqlType::Int4),
+            ("typtype", SqlType::Text),
+            ("typnamespace", SqlType::Int4),
+        ],
+    );
+    let base = |ty: SqlType| {
+        vec![
+            SqlValue::Int4(ty.postgres_oid() as i32),
+            SqlValue::Text(ty.catalog_name().to_string()),
+            SqlValue::Int4(i32::from(ty.type_size())),
+            SqlValue::Text("b".to_string()),
+            SqlValue::Int4(PG_CATALOG_NAMESPACE_OID),
+        ]
+    };
+    let mut rows = vec![
+        base(SqlType::Int4),
+        base(SqlType::Int8),
+        base(SqlType::Numeric {
+            precision: NUMERIC_DEFAULT_PRECISION,
+            scale: 0,
+        }),
+        base(SqlType::Bool),
+        base(SqlType::Text),
+    ];
+    for domain in catalog.relational_domains.values() {
+        rows.push(vec![
+            SqlValue::Int4(domain.oid as i32),
+            SqlValue::Text(domain.name.clone()),
+            SqlValue::Int4(i32::from(domain.base_type.type_size())),
+            SqlValue::Text("d".to_string()),
+            SqlValue::Int4(PG_PUBLIC_NAMESPACE_OID),
+        ]);
+    }
+    (table, rows)
+}
+
+/// `information_schema.tables` — one row per user table (`BASE TABLE`) and view (`VIEW`) in
+/// `public`. (Materialized views are not part of `information_schema.tables` in PostgreSQL.)
+fn synthesize_information_schema_tables(
+    catalog: &CatalogSnapshot,
+) -> (RelationalTable, Vec<Vec<SqlValue>>) {
+    let table = catalog_relation_table(
+        "information_schema",
+        "tables",
+        &[
+            ("table_catalog", SqlType::Text),
+            ("table_schema", SqlType::Text),
+            ("table_name", SqlType::Text),
+            ("table_type", SqlType::Text),
+        ],
+    );
+    let row = |name: &str, table_type: &str| {
+        vec![
+            SqlValue::Text("postgres".to_string()),
+            SqlValue::Text("public".to_string()),
+            SqlValue::Text(name.to_string()),
+            SqlValue::Text(table_type.to_string()),
+        ]
+    };
+    let mut rows = Vec::new();
+    for t in catalog.relational_catalog.values() {
+        rows.push(row(&t.name, "BASE TABLE"));
+    }
+    for v in catalog.relational_views.values() {
+        rows.push(row(&v.name, "VIEW"));
+    }
+    (table, rows)
+}
+
+/// `information_schema.columns` — one row per user column. `data_type` uses the SQL-standard
+/// spelling; `is_nullable` is always `YES` until the value model gains NULL (M3).
+fn synthesize_information_schema_columns(
+    catalog: &CatalogSnapshot,
+) -> (RelationalTable, Vec<Vec<SqlValue>>) {
+    let table = catalog_relation_table(
+        "information_schema",
+        "columns",
+        &[
+            ("table_catalog", SqlType::Text),
+            ("table_schema", SqlType::Text),
+            ("table_name", SqlType::Text),
+            ("column_name", SqlType::Text),
+            ("ordinal_position", SqlType::Int4),
+            ("data_type", SqlType::Text),
+            ("is_nullable", SqlType::Text),
+        ],
+    );
+    let mut rows = Vec::new();
+    for t in catalog.relational_catalog.values() {
+        for col in &t.columns {
+            rows.push(vec![
+                SqlValue::Text("postgres".to_string()),
+                SqlValue::Text("public".to_string()),
+                SqlValue::Text(t.name.clone()),
+                SqlValue::Text(col.name.clone()),
+                SqlValue::Int4(i32::from(col.attnum)),
+                SqlValue::Text(information_schema_data_type(col.ty).to_string()),
+                SqlValue::Text("YES".to_string()),
+            ]);
+        }
+    }
+    (table, rows)
+}
+
 /// Route a SELECT's FROM relation to a synthesized catalog relation, or `None` if it is
 /// not a catalog relation (then it resolves as a user table). `pg_catalog` relations match
 /// qualified (`pg_catalog.pg_class`) or bare (`pg_class`); `information_schema` is qualified.
@@ -9276,10 +9446,19 @@ fn synthesize_catalog_relation(
     name: &str,
     catalog: &CatalogSnapshot,
 ) -> Option<(RelationalTable, Vec<Vec<SqlValue>>)> {
+    if let Some(relation) = name.strip_prefix("information_schema.") {
+        return match relation {
+            "tables" => Some(synthesize_information_schema_tables(catalog)),
+            "columns" => Some(synthesize_information_schema_columns(catalog)),
+            _ => None,
+        };
+    }
     let relation = name.strip_prefix("pg_catalog.").unwrap_or(name);
     match relation {
         "pg_namespace" => Some(synthesize_pg_namespace(catalog)),
         "pg_class" => Some(synthesize_pg_class(catalog)),
+        "pg_attribute" => Some(synthesize_pg_attribute(catalog)),
+        "pg_type" => Some(synthesize_pg_type(catalog)),
         _ => None,
     }
 }
@@ -50967,6 +51146,90 @@ mod tests {
             panic!("expected SELECT");
         };
         assert!(e.execute_relational_select(&bad).is_err());
+    }
+
+    #[test]
+    fn engine_answers_pg_attribute_pg_type_and_information_schema() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE people (id INT, name TEXT, bal NUMERIC(10,2))",
+        )
+        .unwrap();
+        let run = |e: &Engine, sql: &str| {
+            let Command::Select(s) = parse_command_allowing_catalog(sql).unwrap() else {
+                panic!("expected SELECT");
+            };
+            e.execute_relational_select(&s).unwrap().rows
+        };
+        // pg_attribute: the table's columns with their type OIDs (numeric=1700/int4=23/text=25).
+        assert_eq!(
+            run(
+                &e,
+                "SELECT attname, atttypid FROM pg_attribute ORDER BY attname"
+            ),
+            vec![
+                vec![SqlValue::Text("bal".to_string()), SqlValue::Int4(1700)],
+                vec![SqlValue::Text("id".to_string()), SqlValue::Int4(23)],
+                vec![SqlValue::Text("name".to_string()), SqlValue::Int4(25)],
+            ]
+        );
+        // pg_type: the fixed base types (pg_type spells them int8, not bigint).
+        assert_eq!(
+            run(
+                &e,
+                "SELECT oid, typlen FROM pg_type WHERE typname = 'numeric'"
+            ),
+            vec![vec![SqlValue::Int4(1700), SqlValue::Int4(-1)]]
+        );
+        assert_eq!(
+            run(&e, "SELECT oid FROM pg_type WHERE typname = 'int8'"),
+            vec![vec![SqlValue::Int4(20)]]
+        );
+        // information_schema.tables (qualified; not in the implicit search path).
+        assert_eq!(
+            run(
+                &e,
+                "SELECT table_schema, table_type FROM information_schema.tables WHERE table_name = 'people'"
+            ),
+            vec![vec![
+                SqlValue::Text("public".to_string()),
+                SqlValue::Text("BASE TABLE".to_string())
+            ]]
+        );
+        // information_schema.columns: SQL-standard data_type names, ordered by position.
+        assert_eq!(
+            run(
+                &e,
+                "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = 'people' ORDER BY ordinal_position"
+            ),
+            vec![
+                vec![
+                    SqlValue::Text("id".to_string()),
+                    SqlValue::Text("integer".to_string()),
+                    SqlValue::Text("YES".to_string())
+                ],
+                vec![
+                    SqlValue::Text("name".to_string()),
+                    SqlValue::Text("text".to_string()),
+                    SqlValue::Text("YES".to_string())
+                ],
+                vec![
+                    SqlValue::Text("bal".to_string()),
+                    SqlValue::Text("numeric".to_string()),
+                    SqlValue::Text("YES".to_string())
+                ],
+            ]
+        );
+        // The text -> rows catalog entry resolves the same relations.
+        assert_eq!(
+            e.execute_relational_select_text(
+                "SELECT table_type FROM information_schema.tables WHERE table_name = 'people'"
+            )
+            .unwrap()
+            .rows,
+            vec![vec![SqlValue::Text("BASE TABLE".to_string())]]
+        );
     }
 
     #[test]
