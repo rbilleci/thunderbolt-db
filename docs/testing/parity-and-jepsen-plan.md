@@ -1,6 +1,6 @@
 # Parity and Jepsen Validation Plan
 
-This plan defines how we prove correctness while moving from local deterministic execution to replicated, GPU-accelerated operation.
+This plan defines how we prove correctness while moving from local deterministic execution to replicated, GPU-native operation.
 
 ## Objectives
 

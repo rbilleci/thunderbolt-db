@@ -29,9 +29,9 @@ Overall status: **Aligned (with intentional scope compression)**
 - New docs: invariant explicitly elevated and enforced in commit path docs
 - Status: **Aligned**
 
-### 3) GPU as acceleration, CPU correctness fallback
-- `DESIGN.md`: hybrid CPU/GPU, CPU-only correctness mode
-- New docs: GPU-first guardrails + mandatory safe CPU fallback with parity tracking
+### 3) GPU-native execution (GPU is the relational substrate; CPU is host/control plane)
+- `DESIGN.md`: GPU-native charter — the GPU executes the entire relational data path including the catalog; CPU is the host/control plane only (no "hybrid CPU-GPU" co-execution principle, no permanent CPU fallback for hot relational work)
+- New docs: GPU-native principles (`docs/architecture/00-gpu-native-principles.md`) + GPU-First guardrails; CPU relational execution is parity-reference / bootstrap **debt** with a milestone, not a product pillar
 - Status: **Aligned**
 
 ### 4) Deterministic batching / replay semantics
