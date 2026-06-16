@@ -542,6 +542,14 @@ and a harness that measures it:
   itself is done — optimistic MVCC + short commit-lock + lock-free reads; what remains for write
   *throughput* is this fsync amortization.) Sweep it together with the Phase 7 data-structure
   audit over the WAL buffer + replication log.
+  **PREREQUISITE — S1 (from the latch-free-reads work, commit `602a6efc`):** group commit (and
+  follower apply) make the commit apply-loop process **>1 catalog-mutating entry per batch**, which
+  trips a latent bug — four DDL apply helpers (`database_exists`, `tablespace_exists`,
+  `relational_view_depends_on_inner`/`has_dependents`) read the **published** catalog snapshot while
+  the apply loop mutates the **working** copy (published once *after* the loop), so a later in-batch
+  entry misses an earlier one → **silent catalog corruption**. Today `to_apply` is always ≤1 entry
+  (propose-by-1 + synchronous in-loop apply) so it's unreachable; **before enabling multi-entry apply,
+  fix those helpers to read the working `cat`** (and add a multi-entry-batch regression test).
 - **Crash safety.** Real kill+reopen+replay tests in a `tests/` integration suite;
   wire the offline PITR/archive tooling to continuous object-store archival.
 - **Exit:** a 3-node cluster survives leader kill with zero committed-txn loss and
