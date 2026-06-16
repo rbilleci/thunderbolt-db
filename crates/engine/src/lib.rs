@@ -8936,6 +8936,35 @@ fn coerce_insert_value(
     }
 }
 
+/// Coerce a column DEFAULT to `ty` with the same lossless integer→numeric widening and
+/// scale/precision handling as an INSERT value, so a cross-type default literal
+/// (`bal NUMERIC DEFAULT 0`, `big BIGINT DEFAULT 5`) is accepted and stored at the
+/// column's type and scale. A `nextval(...)` default is still restricted to `int4`
+/// columns (the prior `column_default_matches_type` rule). The single source of truth for
+/// "is this default valid for this column", used both to coerce-and-store (CREATE, ALTER
+/// SET DEFAULT, ADD COLUMN) and to validate in the concurrent-DDL preflight.
+fn coerce_column_default(
+    default: ColumnDefault,
+    ty: SqlType,
+    column_name: &str,
+) -> Result<ColumnDefault, EngineError> {
+    match default {
+        ColumnDefault::Literal(value) => Ok(ColumnDefault::Literal(coerce_insert_value(
+            value,
+            ty,
+            column_name,
+        )?)),
+        ColumnDefault::SequenceNextVal { .. } => {
+            if ty != SqlType::Int4 {
+                return Err(EngineError::ApplyFailed(format!(
+                    "invalid default for column \"{column_name}\""
+                )));
+            }
+            Ok(default)
+        }
+    }
+}
+
 /// Whether `mantissa` needs more than `precision` significant decimal digits (the
 /// PostgreSQL `numeric(p,s)` overflow condition once the value is at the column scale).
 fn numeric_exceeds_precision(mantissa: i128, precision: u8) -> bool {
@@ -8992,13 +9021,6 @@ fn coerce_filter_literal(value: SqlValue, column_ty: SqlType) -> SqlValue {
             None => SqlValue::Numeric(d),
         },
         (other, _) => other,
-    }
-}
-
-fn column_default_matches_type(value: &ColumnDefault, ty: SqlType) -> bool {
-    match value {
-        ColumnDefault::Literal(value) => sql_value_matches_type(value, ty),
-        ColumnDefault::SequenceNextVal { .. } => ty == SqlType::Int4,
     }
 }
 
@@ -11959,8 +11981,12 @@ impl Engine {
         let mut next_column_id = cat.relational_next_column_id;
         for (idx, mut column) in create.columns.into_iter().enumerate() {
             let (type_oid, type_size) = self.resolve_column_domain_type(&mut column)?;
-            if let Some(default) = column.default.as_ref() {
-                self.preflight_column_default_target(default)?;
+            if let Some(default) = column.default.take() {
+                // Coerce a cross-type default literal to the column type (parity with INSERT),
+                // e.g. `bal NUMERIC DEFAULT 0` -> Numeric at the column scale.
+                let default = coerce_column_default(default, column.ty, &column.name)?;
+                self.preflight_column_default_target(&default)?;
+                column.default = Some(default);
             }
             let attnum = i16::try_from(idx + 1).map_err(|_| {
                 EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())
@@ -14562,7 +14588,10 @@ impl Engine {
         cat: &mut DdlCatalogState,
         alter: gpu_db_sql::AlterColumnDefault,
     ) -> Result<(), EngineError> {
-        if let Some(default) = alter.default.as_ref() {
+        // Coerce the new default to the column type (parity with INSERT/CREATE) before the
+        // mutable borrow, so `ALTER ... SET DEFAULT 0` on a numeric column is accepted and
+        // stored at the column scale rather than rejected as a type mismatch.
+        let coerced_default = if let Some(default) = alter.default {
             let table = cat.relational_catalog.get(&alter.table).ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", alter.table))
             })?;
@@ -14573,14 +14602,12 @@ impl Engine {
                 .ok_or_else(|| {
                     EngineError::ApplyFailed(format!("column \"{}\" does not exist", alter.column))
                 })?;
-            if !column_default_matches_type(default, column.ty) {
-                return Err(EngineError::ApplyFailed(format!(
-                    "invalid default for column \"{}\"",
-                    alter.column
-                )));
-            }
-            self.preflight_column_default_target(default)?;
-        }
+            let coerced = coerce_column_default(default, column.ty, &alter.column)?;
+            self.preflight_column_default_target(&coerced)?;
+            Some(coerced)
+        } else {
+            None
+        };
         let table = cat
             .relational_catalog
             .get_mut(&alter.table)
@@ -14594,11 +14621,7 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("column \"{}\" does not exist", alter.column))
             })?;
-        let Some(default) = alter.default else {
-            column.default = None;
-            return Ok(());
-        };
-        column.default = Some(default);
+        column.default = coerced_default;
         Ok(())
     }
 
@@ -14630,12 +14653,11 @@ impl Engine {
                 "ADD COLUMN SERIAL is unsupported in the bootstrap relational subset".to_string(),
             ));
         }
-        if !column_default_matches_type(&default, column_def.ty) {
-            return Err(EngineError::ApplyFailed(format!(
-                "invalid default for column \"{}\"",
-                column_def.name
-            )));
-        }
+        // Coerce a cross-type default literal to the column type (parity with INSERT/CREATE),
+        // storing it back so both the existing-row backfill and `from_def` use the coerced
+        // value; also re-validates a nextval default against the int4 restriction.
+        let default = coerce_column_default(default, column_def.ty, &column_def.name)?;
+        column_def.default = Some(default.clone());
         let table = cat
             .relational_catalog
             .get(&add.table)
@@ -15965,12 +15987,9 @@ impl Engine {
                             .to_string(),
                     ));
                 }
-                if !column_default_matches_type(default, add.column.ty) {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "invalid default for column \"{}\"",
-                        add.column.name
-                    )));
-                }
+                // Validate the default is coercible to the column type (parity with apply);
+                // this concurrent-DDL preflight only checks — apply coerces and stores.
+                coerce_column_default(default.clone(), add.column.ty, &add.column.name)?;
                 let table = cat.relational_catalog.get(&add.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
                 })?;
@@ -50634,6 +50653,52 @@ mod tests {
         // A genuinely incompatible type still errors loudly — no silent coercion.
         assert!(e
             .execute_text(5, "INSERT INTO acct (id, bal) VALUES (3, 'x')")
+            .is_err());
+    }
+
+    #[test]
+    fn column_defaults_coerce_cross_type_literals() {
+        let mut e = Engine::new_local();
+        // Cross-type DEFAULT literals (int -> numeric / int8) are accepted at CREATE and
+        // stored at the column type/scale; before this they errored "invalid default".
+        e.execute_text(
+            1,
+            "CREATE TABLE t (id INT, bal NUMERIC(10,2) DEFAULT 0, big BIGINT DEFAULT 7)",
+        )
+        .unwrap();
+        let run = |e: &Engine, sql: &str| {
+            let Command::Select(s) = parse_command(sql).unwrap() else {
+                panic!("expected SELECT");
+            };
+            e.execute_relational_select(&s).unwrap().rows
+        };
+        // INSERT omitting the defaulted columns materializes the defaults at the column type.
+        e.execute_text(2, "INSERT INTO t (id) VALUES (1)").unwrap();
+        assert_eq!(
+            run(&e, "SELECT bal, big FROM t WHERE id = 1"),
+            vec![vec![
+                SqlValue::Numeric(Decimal128::parse("0.00").unwrap()),
+                SqlValue::Int8(7)
+            ]]
+        );
+        // ALTER ... SET DEFAULT with a cross-type literal is accepted and applied.
+        e.execute_text(3, "ALTER TABLE t ALTER COLUMN bal SET DEFAULT 5")
+            .unwrap();
+        e.execute_text(4, "INSERT INTO t (id) VALUES (2)").unwrap();
+        assert_eq!(
+            run(&e, "SELECT bal FROM t WHERE id = 2"),
+            vec![vec![SqlValue::Numeric(Decimal128::parse("5.00").unwrap())]]
+        );
+        // ADD COLUMN with a cross-type default backfills existing rows at the column type.
+        e.execute_text(5, "ALTER TABLE t ADD COLUMN tax NUMERIC(10,2) DEFAULT 1")
+            .unwrap();
+        assert_eq!(
+            run(&e, "SELECT tax FROM t WHERE id = 1"),
+            vec![vec![SqlValue::Numeric(Decimal128::parse("1.00").unwrap())]]
+        );
+        // A genuinely incompatible default still errors loudly — no silent coercion.
+        assert!(e
+            .execute_text(6, "CREATE TABLE bad (x NUMERIC(10,2) DEFAULT 'oops')")
             .is_err());
     }
 
