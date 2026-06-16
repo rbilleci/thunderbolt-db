@@ -5993,14 +5993,7 @@ fn launch_cuda_resident_i32_sum(
     byte_offset: u64,
     row_count: u64,
 ) -> Result<i64, CudaRuntimeProbeError> {
-    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
-    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
-    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
-    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuModuleGetFunction =
-        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -6014,7 +6007,12 @@ fn launch_cuda_resident_i32_sum(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    // P2-M2 — the i32-sum kernel is already a parallel grid-stride reduction (each thread sums a
+    // strided slice into an s64, then `atom.global.add.u64`s it into one output). This migrates the
+    // LAUNCH off the default/null stream + per-call cuModuleLoadData (re-JIT) + per-call cuMemAlloc
+    // onto a pooled private stream with a cached module + async-memset scratch via
+    // `launch_on_pooled_stream` (event-timed, covering-synced, drained-on-error). Kernel unchanged.
 
     const PTX: &[u8] = br#"
 .version 6.0
@@ -6096,132 +6094,70 @@ done:
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
 
-    let cu_mem_alloc = unsafe {
-        resident
-            .lib()
-            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_mem_free = unsafe {
-        resident
-            .lib()
-            .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memset_d8 = unsafe {
-        resident
-            .lib()
-            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_load_data = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_unload = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleUnload>(b"cuModuleUnload\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_get_function = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_ctx_synchronize = unsafe {
+    let cu_memset_d8_async = unsafe {
         resident
             .lib()
-            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .get::<CuMemsetD8Async>(b"cuMemsetD8Async\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-
-    let mut device_output = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_output, std::mem::size_of::<i64>()) })?;
-    let allocation_guard = CudaDeviceAllocationGuard {
-        ptr: device_output,
-        free: *cu_mem_free,
-    };
-    check_cuda(unsafe { cu_memset_d8(allocation_guard.ptr, 0, std::mem::size_of::<i64>()) })?;
 
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_sum", &ptx)?;
 
-    let mut module = std::ptr::null_mut();
-    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
-    let module_guard = CudaModuleGuard {
-        module,
-        unload: *cu_module_unload,
-    };
-
-    let mut function = std::ptr::null_mut();
-    check_cuda(unsafe {
-        cu_module_get_function(&mut function, module, c"gpu_db_resident_i32_sum".as_ptr())
-    })?;
-
-    let mut resident_arg = resident.device_ptr();
-    let mut offset_arg = byte_offset;
-    let mut rows_arg = row_count;
-    let mut output_arg = allocation_guard.ptr;
-    let mut args = [
-        (&mut resident_arg as *mut u64).cast::<c_void>(),
-        (&mut offset_arg as *mut u64).cast::<c_void>(),
-        (&mut rows_arg as *mut u64).cast::<c_void>(),
-        (&mut output_arg as *mut u64).cast::<c_void>(),
-    ];
     let block_dim = 256_u32;
     let grid_dim = if row_count == 0 {
         1
     } else {
         row_count.div_ceil(u64::from(block_dim)).min(1024) as u32
     };
-    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
-        cu_launch_kernel(
-            function,
-            grid_dim,
-            1,
-            1,
-            block_dim,
-            1,
-            1,
-            0,
-            std::ptr::null_mut(),
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
+
+    let mut output_bytes = [0_u8; std::mem::size_of::<i64>()];
+    launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
+        // Zero the 8-byte scratch on the stream (the kernel atom-adds into it), ordered before the
+        // kernel launch on the same stream.
+        let memset_rc =
+            unsafe { cu_memset_d8_async(output_ptr, 0, std::mem::size_of::<i64>(), stream) };
+        if memset_rc != 0 {
+            return memset_rc;
+        }
+        let mut resident_arg = resident.device_ptr();
+        let mut offset_arg = byte_offset;
+        let mut rows_arg = row_count;
+        let mut output_arg = output_ptr;
+        let mut args = [
+            (&mut resident_arg as *mut u64).cast::<c_void>(),
+            (&mut offset_arg as *mut u64).cast::<c_void>(),
+            (&mut rows_arg as *mut u64).cast::<c_void>(),
+            (&mut output_arg as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                grid_dim,
+                1,
+                1,
+                block_dim,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
     })?;
 
-    let mut output = 0_i64;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut output as *mut i64).cast::<c_void>(),
-            allocation_guard.ptr,
-            std::mem::size_of::<i64>(),
-        )
-    })?;
-    drop(module_guard);
-    drop(allocation_guard);
-    Ok(output)
+    Ok(i64::from_le_bytes(output_bytes))
 }
 
 #[repr(C)]
@@ -13656,5 +13592,57 @@ mod tests {
             "kernel-less project ({largest_kernelless_ms:.3} ms) did not beat the serial (1,1,1) \
              copy kernel ({largest_serial_ms:.3} ms) on the largest table — milestone premise unmet"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_pooled_i32_sum_matches_closed_form_across_sizes() {
+        // P2-M2 — sum pooled-stream launch-migration correctness gate (GPU-native, construction
+        // oracle). The i32-sum kernel is already a parallel grid-stride reduction; this migrated its
+        // launch off the default/null stream + per-call cuModuleLoadData/cuMemAlloc onto a pooled
+        // private stream with a cached module + async-memset scratch. Assert the migrated GPU sum
+        // EQUALS the CLOSED-FORM sum of the synthetic column (value[i] = i % 7 => sum =
+        // 21*(n/7) + r*(r-1)/2 for r = n % 7) across sub-block .. multi-block sizes — no CPU operator
+        // re-implementation, just the known-data constant. This gates the migrated launch wiring
+        // (scratch zeroing, kernel atomic-add into scratch, scratch readback); end-to-end value
+        // correctness through the engine is also covered by the scalar_aggregate probe.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let sizes: [u64; 5] = [1, 257, 4_096, 65_536, 1 << 24];
+        for &n in &sizes {
+            let values: Vec<i32> = (0..n).map(|i| (i % 7) as i32).collect();
+            // SAFETY: `i32` is POD; viewing the Vec as native (little-endian) bytes matches the
+            // resident column layout, and `values` outlives the retain copy.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let allocated = std::mem::size_of::<u64>() as u64 + column_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: std::mem::size_of::<u64>() as u64,
+                            bytes: column_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident column");
+            let offset = std::mem::size_of::<u64>() as u64;
+
+            // Closed form: each full period of 7 sums to 0+1+..+6 = 21; the r = n % 7 remainder
+            // adds 0+1+..+(r-1) = r*(r-1)/2. (value[i] = i % 7.)
+            let q = (n / 7) as i64;
+            let r = (n % 7) as i64;
+            let expected = 21 * q + (r * (r - 1)) / 2;
+            let gpu = resident.sum_i32_from_payload(offset, n).expect("gpu sum");
+            assert_eq!(gpu, expected, "sum mismatch at rows={n}");
+        }
     }
 }
