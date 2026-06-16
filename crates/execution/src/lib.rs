@@ -6161,7 +6161,6 @@ done:
 }
 
 #[repr(C)]
-#[derive(Default)]
 struct CudaI32StatsRaw {
     count: u64,
     sum: i64,
@@ -6176,14 +6175,6 @@ fn launch_cuda_resident_i32_between_stats(
     lower_inclusive: i32,
     upper_inclusive: i32,
 ) -> Result<CudaI32Stats, CudaRuntimeProbeError> {
-    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
-    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
-    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
-    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuModuleGetFunction =
-        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -6197,7 +6188,15 @@ fn launch_cuda_resident_i32_between_stats(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    // P2-M2 — the between-stats kernel is already a parallel grid-stride reduction (each thread
+    // computes count/sum/min/max for the [lower,upper] predicate, then atomic add count/sum +
+    // atomic min/max into one 24-byte output struct). Migrate the LAUNCH off the default/null stream
+    // + per-call cuModuleLoadData (re-JIT) + per-call cuMemAlloc + blocking H2D/D2H onto a pooled
+    // private stream with a cached module and an ASYNC H2D of the init struct
+    // (count=0,sum=0,min=INT_MAX,max=INT_MIN — the min/max sentinels can't be memset like sum's plain
+    // zero) into the pooled scratch BEFORE the kernel, via launch_on_pooled_stream (event-timed,
+    // covering-synced, drained-on-error). Kernel unchanged.
 
     const PTX: &[u8] = br#"
 .version 6.0
@@ -6320,153 +6319,90 @@ ret_done:
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
 
-    let cu_mem_alloc = unsafe {
-        resident
-            .lib()
-            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_mem_free = unsafe {
-        resident
-            .lib()
-            .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_htod = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_load_data = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_unload = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleUnload>(b"cuModuleUnload\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_get_function = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_ctx_synchronize = unsafe {
-        resident
-            .lib()
-            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-
-    let mut device_output = 0_u64;
-    check_cuda(unsafe {
-        cu_mem_alloc(&mut device_output, std::mem::size_of::<CudaI32StatsRaw>())
-    })?;
-    let output_guard = CudaDeviceAllocationGuard {
-        ptr: device_output,
-        free: *cu_mem_free,
-    };
-    let initial = CudaI32StatsRaw {
-        count: 0,
-        sum: 0,
-        min: i32::MAX,
-        max: i32::MIN,
-    };
-    check_cuda(unsafe {
-        cu_memcpy_htod(
-            output_guard.ptr,
-            (&initial as *const CudaI32StatsRaw).cast::<c_void>(),
-            std::mem::size_of::<CudaI32StatsRaw>(),
-        )
-    })?;
+    let htod_async = resident
+        .primary()
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
 
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_between_stats", &ptx)?;
 
-    let mut module = std::ptr::null_mut();
-    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
-    let module_guard = CudaModuleGuard {
-        module,
-        unload: *cu_module_unload,
-    };
-
-    let mut function = std::ptr::null_mut();
-    check_cuda(unsafe {
-        cu_module_get_function(
-            &mut function,
-            module,
-            c"gpu_db_resident_i32_between_stats".as_ptr(),
-        )
-    })?;
-
-    let mut resident_arg = resident.device_ptr();
-    let mut offset_arg = byte_offset;
-    let mut rows_arg = row_count;
-    let mut lower_arg = lower_inclusive;
-    let mut upper_arg = upper_inclusive;
-    let mut output_arg = output_guard.ptr;
-    let mut args = [
-        (&mut resident_arg as *mut u64).cast::<c_void>(),
-        (&mut offset_arg as *mut u64).cast::<c_void>(),
-        (&mut rows_arg as *mut u64).cast::<c_void>(),
-        (&mut lower_arg as *mut i32).cast::<c_void>(),
-        (&mut upper_arg as *mut i32).cast::<c_void>(),
-        (&mut output_arg as *mut u64).cast::<c_void>(),
-    ];
     let block_dim = 256_u32;
     let grid_dim = if row_count == 0 {
         1
     } else {
         row_count.div_ceil(u64::from(block_dim)).min(1024) as u32
     };
-    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
-        cu_launch_kernel(
-            function,
-            grid_dim,
-            1,
-            1,
-            block_dim,
-            1,
-            1,
-            0,
-            std::ptr::null_mut(),
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
+
+    // Init struct H2D'd into the scratch on-stream BEFORE the kernel: count/sum start at 0 (atomic
+    // add), min/max at the INT sentinels (atomic min/max). `initial` outlives the helper's covering
+    // sync, so the async source stays valid until the copy completes.
+    let initial = CudaI32StatsRaw {
+        count: 0,
+        sum: 0,
+        min: i32::MAX,
+        max: i32::MIN,
+    };
+    let mut output_bytes = [0_u8; std::mem::size_of::<CudaI32StatsRaw>()];
+    launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
+        let htod_rc = unsafe {
+            htod_async(
+                output_ptr,
+                (&initial as *const CudaI32StatsRaw).cast::<c_void>(),
+                std::mem::size_of::<CudaI32StatsRaw>(),
+                stream,
+            )
+        };
+        if htod_rc != 0 {
+            return htod_rc;
+        }
+        let mut resident_arg = resident.device_ptr();
+        let mut offset_arg = byte_offset;
+        let mut rows_arg = row_count;
+        let mut lower_arg = lower_inclusive;
+        let mut upper_arg = upper_inclusive;
+        let mut output_arg = output_ptr;
+        let mut args = [
+            (&mut resident_arg as *mut u64).cast::<c_void>(),
+            (&mut offset_arg as *mut u64).cast::<c_void>(),
+            (&mut rows_arg as *mut u64).cast::<c_void>(),
+            (&mut lower_arg as *mut i32).cast::<c_void>(),
+            (&mut upper_arg as *mut i32).cast::<c_void>(),
+            (&mut output_arg as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                grid_dim,
+                1,
+                1,
+                block_dim,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
     })?;
 
-    let mut raw = CudaI32StatsRaw::default();
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut raw as *mut CudaI32StatsRaw).cast::<c_void>(),
-            output_guard.ptr,
-            std::mem::size_of::<CudaI32StatsRaw>(),
-        )
-    })?;
-    drop(module_guard);
-    drop(output_guard);
+    let raw = CudaI32StatsRaw {
+        count: u64::from_le_bytes(output_bytes[0..8].try_into().unwrap()),
+        sum: i64::from_le_bytes(output_bytes[8..16].try_into().unwrap()),
+        min: i32::from_le_bytes(output_bytes[16..20].try_into().unwrap()),
+        max: i32::from_le_bytes(output_bytes[20..24].try_into().unwrap()),
+    };
 
     Ok(CudaI32Stats {
         count: raw.count,
@@ -13644,5 +13580,67 @@ mod tests {
             let gpu = resident.sum_i32_from_payload(offset, n).expect("gpu sum");
             assert_eq!(gpu, expected, "sum mismatch at rows={n}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_pooled_i32_between_stats_matches_expected() {
+        // P2-M2 — between-stats pooled launch-migration correctness gate (GPU-native oracle).
+        // The kernel is unchanged (parallel grid-stride count/sum/min/max for the [lo,hi] predicate,
+        // atomic-reduced into one 24-byte struct); this gates the migrated launch wiring: the ASYNC
+        // H2D of the {count=0, sum=0, min=INT_MAX, max=INT_MIN} init struct into the pooled scratch,
+        // the on-stream ordering before the kernel, and the 24-byte scratch readback. Expected values
+        // are hand-computed constants (no CPU operator re-implementation).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let run = |values: &[i32], lo: i32, hi: i32| -> CudaI32Stats {
+            let n = values.len() as u64;
+            // SAFETY: `i32` is POD; viewing the Vec as native bytes matches the resident column
+            // layout, and `values` outlives the synchronous retain copy.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let allocated = std::mem::size_of::<u64>() as u64 + column_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: std::mem::size_of::<u64>() as u64,
+                            bytes: column_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident column");
+            resident
+                .stats_i32_between_from_payload(std::mem::size_of::<u64>() as u64, n, lo, hi)
+                .expect("between stats")
+        };
+
+        // Small, hand-verified: matching {3,4,5,6}.
+        let s = run(&[1, 2, 3, 4, 5, 6, 7, 8], 3, 6);
+        assert_eq!((s.count, s.sum, s.min, s.max), (4, 18, Some(3), Some(6)));
+
+        // No match -> count 0, min/max None: exercises the kernel's count==0 guard so the init
+        // sentinels are left in the scratch, then mapped to None by the host conversion.
+        let s = run(&[1, 2, 3, 4, 5, 6, 7, 8], 100, 200);
+        assert_eq!((s.count, s.sum, s.min, s.max), (0, 0, None, None));
+
+        // Multi-block (299_999 = 7*42857 rows, value[i] = i % 7), range [2,5] -> {2,3,4,5} matches
+        // every period; exercises the parallel atomic count/sum + min/max reduction across >1000
+        // blocks and the grid-stride wrap.
+        let q = 42_857_i64;
+        let values: Vec<i32> = (0..7 * q).map(|i| (i % 7) as i32).collect();
+        let s = run(&values, 2, 5);
+        assert_eq!(
+            (s.count, s.sum, s.min, s.max),
+            (4 * q as u64, 14 * q, Some(2), Some(5))
+        );
     }
 }
