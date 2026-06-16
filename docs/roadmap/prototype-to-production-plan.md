@@ -633,6 +633,41 @@ sweep so the next such landmine is found by design, not by benchmark surprise.
   complexity, alloc profile, evidence) with no remaining O(n)/O(n²)-per-op surprises on the
   commit, read, or execute hot paths.
 
+### Phase 8 — Type-system review (addendum: PostgreSQL fidelity × GPU optimization)
+**Goal:** a complete, systematic review of the type system once it exists (it is built
+milestone-by-milestone in Phase 3), to (a) certify **PostgreSQL compatibility** across every supported
+type and (b) **optimize each type's representation for the GPU engine**. Phase 3 lands types with local,
+pragmatic decisions — e.g. NUMERIC as an i128 fixed-point decimal with a ~38-digit cap + a *deferred*
+bignum fallback (chosen for scale/perf + GPU-amenability over an arbitrary-precision string), and every
+non-int4/text type riding the CPU path because the GPU-resident routes are int4-shaped. This addendum
+makes the whole type system coherent — no PG-compat gap slips through a per-milestone seam, and no type
+is stuck on a representation that's wrong for a GPU-native engine — rather than a patchwork of one-off
+choices. (Same spirit as Phase 7's data-structure sweep, focused on the type layer.)
+- **PG-compat inventory.** One row per supported type: storage + **text AND binary** wire codecs +
+  OID/typmod + value semantics (compare, arithmetic, casts/coercion, NULL, text collation, timestamp
+  tz/infinity) + the edge cases that diverge from PostgreSQL. Verify against PG's *observable* behavior
+  (the golden scenarios + real-driver **binary** round-trips + `pg_dump` fidelity), not just "a value
+  goes in and comes out." Items to resolve or explicitly track: the i128 NUMERIC >38-digit gap (design
+  the additive bignum/CPU fallback here — a new value variant + a distinct storage tag, no re-encode of
+  i128 values; see the §"larger NUMERIC" reasoning), NUMERIC round-half-up vs PG, float8 NaN/±Inf,
+  varchar(n) length + text collation, timestamp[tz]/date ranges + ±infinity, uuid/bytea/json(b)
+  canonicalization, and `SUM()` accumulator overflow at extreme scale.
+- **GPU-representation optimization.** Classify every type: **GPU-resident-amenable** (fixed-width,
+  alloc-free — int2/4/8, float8, bool, the i128 decimal, uuid (128-bit), date/timestamp (i32/i64)) vs
+  **variable-length / CPU-only** (text/varchar, json(b), arbitrary bytea, the bignum-NUMERIC fallback).
+  Design the GPU-resident column encoding + scan/filter/aggregate route for each amenable type — the
+  GPU-native payoff for typed columns (today only int4/text are resident; Phase 3 leaves the rest on the
+  CPU path by design) — and decide whether/how variable-length types get GPU treatment (dictionary-encoded
+  text, fixed-prefix, offset arrays) vs staying CPU. This is where NUMERIC/int8/etc. graduate from the
+  Phase-3 CPU path to real GPU routes.
+- **Method.** The inventory table + a PG-gap analysis + a per-type representation decision, each with the
+  same per-op-cost-vs-n + alloc-per-op scaling rigor as Phase 7, backed by a before/after benchmark
+  (GPU vs CPU per type; representation A/B) and a compat re-check.
+- **Exit:** a written type-system review (one row per type: PG-compat status + any *documented,
+  intentional* gap; chosen representation; GPU-resident route status) with **no silent PG-compat gaps**,
+  GPU-resident coverage maximized across the fixed-width types, and every deferred item (bignum NUMERIC,
+  per-type GPU routes) either closed or explicitly tracked.
+
 ---
 
 ## 6. Strategic Recommendation: stage the commercial envelope
