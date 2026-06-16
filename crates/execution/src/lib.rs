@@ -6715,7 +6715,726 @@ done:
     Ok(values)
 }
 
+// P2-M2 / S1 — parallel GPU hash aggregation (the GROUP BY operator), replacing the single-thread
+// `(1,1,1)` O(rows × groups) linear-probe scan. Three kernels run ordered on one pooled stream:
+//   (1) `..._hash_init`   — grid-stride fill the open-addressing table: slots=EMPTY(0),
+//       counts/sums=0, mins=INT_MAX, maxs=INT_MIN (the min/max sentinels so atomic min/max work).
+//   (2) `..._hash_aggregate` — one thread per row (grid-stride, optional filter). Each slot is a
+//       u64 `(occupied<<32)|key`; a single `atom.cas.b64(slot, EMPTY, packed)` claims-or-finds the
+//       group with no key-write race, linear-probe on collision; then `atom.add` count/sum +
+//       `atom.min/max` from the pre-initialized neutral values, so claimer and finder race cleanly.
+//   (3) `..._hash_compact` — gather non-empty slots into the output arrays via `atom.add` append
+//       (arbitrary order — correct, since the engine applies ORDER BY; see plan §9.5).
+// Output order is unspecified (a GROUP BY has none without ORDER BY); the serial oracle's
+// insertion order and this hash order are both valid, so the parity test sorts both by group key.
 fn launch_cuda_resident_i32_grouped_stats(
+    resident: &CudaResidentDeviceMemory,
+    group_byte_offset: u64,
+    value_byte_offset: u64,
+    filter: Option<(u64, i32, CudaI32Comparison)>,
+    row_count: u64,
+) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+    type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_grouped_hash_init(
+    .param .u64 slots_ptr,
+    .param .u64 counts_ptr,
+    .param .u64 sums_ptr,
+    .param .u64 mins_ptr,
+    .param .u64 maxs_ptr,
+    .param .u64 table_size
+)
+{
+    .reg .pred %p_done;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u64 %slots;
+    .reg .u64 %counts;
+    .reg .u64 %sums;
+    .reg .u64 %mins;
+    .reg .u64 %maxs;
+    .reg .u64 %size;
+    .reg .u64 %idx;
+    .reg .u64 %stride;
+    .reg .u64 %addr;
+    .reg .u64 %off8;
+    .reg .u64 %off4;
+
+    ld.param.u64 %slots, [slots_ptr];
+    ld.param.u64 %counts, [counts_ptr];
+    ld.param.u64 %sums, [sums_ptr];
+    ld.param.u64 %mins, [mins_ptr];
+    ld.param.u64 %maxs, [maxs_ptr];
+    ld.param.u64 %size, [table_size];
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %idx, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+
+init_loop:
+    setp.ge.u64 %p_done, %idx, %size;
+    @%p_done bra init_done;
+    mul.lo.u64 %off8, %idx, 8;
+    mul.lo.u64 %off4, %idx, 4;
+    add.u64 %addr, %slots, %off8;
+    st.global.u64 [%addr], 0;
+    add.u64 %addr, %counts, %off8;
+    st.global.u64 [%addr], 0;
+    add.u64 %addr, %sums, %off8;
+    st.global.u64 [%addr], 0;
+    add.u64 %addr, %mins, %off4;
+    mov.u32 %tmp32, 2147483647;
+    st.global.u32 [%addr], %tmp32;
+    add.u64 %addr, %maxs, %off4;
+    mov.u32 %tmp32, 2147483648;
+    st.global.u32 [%addr], %tmp32;
+    add.u64 %idx, %idx, %stride;
+    bra init_loop;
+init_done:
+    ret;
+}
+
+.visible .entry gpu_db_resident_i32_grouped_hash_aggregate(
+    .param .u64 resident_ptr,
+    .param .u64 group_byte_offset,
+    .param .u64 value_byte_offset,
+    .param .u64 filter_byte_offset,
+    .param .u64 row_count,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 slots_ptr,
+    .param .u64 counts_ptr,
+    .param .u64 sums_ptr,
+    .param .u64 mins_ptr,
+    .param .u64 maxs_ptr,
+    .param .u32 table_mask
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_check;
+    .reg .pred %p_match;
+    .reg .pred %p_claimed;
+    .reg .pred %p_exists;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u32 %comparison;
+    .reg .u32 %mask;
+    .reg .u32 %slot;
+    .reg .u32 %hash;
+    .reg .u32 %group_u;
+    .reg .u64 %resident;
+    .reg .u64 %group_base;
+    .reg .u64 %value_base;
+    .reg .u64 %filter_base;
+    .reg .u64 %rows;
+    .reg .u64 %slots;
+    .reg .u64 %counts;
+    .reg .u64 %sums;
+    .reg .u64 %mins;
+    .reg .u64 %maxs;
+    .reg .u64 %idx;
+    .reg .u64 %stride;
+    .reg .u64 %addr;
+    .reg .u64 %roff;
+    .reg .u64 %slot64;
+    .reg .u64 %off8;
+    .reg .u64 %off4;
+    .reg .u64 %packed;
+    .reg .u64 %cur;
+    .reg .u64 %zero;
+    .reg .u64 %one;
+    .reg .u64 %hibit;
+    .reg .u64 %valbits;
+    .reg .u64 %ignore64;
+    .reg .s64 %val64;
+    .reg .s32 %needle;
+    .reg .s32 %value;
+    .reg .s32 %filter_value;
+    .reg .s32 %ignore32;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %group_base, [group_byte_offset];
+    ld.param.u64 %value_base, [value_byte_offset];
+    ld.param.u64 %filter_base, [filter_byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %slots, [slots_ptr];
+    ld.param.u64 %counts, [counts_ptr];
+    ld.param.u64 %sums, [sums_ptr];
+    ld.param.u64 %mins, [mins_ptr];
+    ld.param.u64 %maxs, [maxs_ptr];
+    ld.param.u32 %mask, [table_mask];
+
+    add.u64 %group_base, %resident, %group_base;
+    add.u64 %value_base, %resident, %value_base;
+    add.u64 %filter_base, %resident, %filter_base;
+    mov.u64 %zero, 0;
+    mov.u64 %one, 1;
+    mov.u64 %hibit, 4294967296;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %idx, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+
+row_loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra agg_done;
+    mul.lo.u64 %roff, %idx, 4;
+
+    setp.eq.u32 %p_check, %comparison, 0;
+    @%p_check bra do_agg;
+    add.u64 %addr, %filter_base, %roff;
+    ld.global.s32 %filter_value, [%addr];
+    mov.pred %p_match, 0;
+    setp.eq.u32 %p_check, %comparison, 1;
+    @%p_check bra f_lt;
+    setp.eq.u32 %p_check, %comparison, 2;
+    @%p_check bra f_lte;
+    setp.eq.u32 %p_check, %comparison, 3;
+    @%p_check bra f_gt;
+    setp.eq.u32 %p_check, %comparison, 4;
+    @%p_check bra f_gte;
+    bra next_row;
+f_lt:
+    setp.lt.s32 %p_match, %filter_value, %needle;
+    bra f_done;
+f_lte:
+    setp.le.s32 %p_match, %filter_value, %needle;
+    bra f_done;
+f_gt:
+    setp.gt.s32 %p_match, %filter_value, %needle;
+    bra f_done;
+f_gte:
+    setp.ge.s32 %p_match, %filter_value, %needle;
+f_done:
+    @!%p_match bra next_row;
+
+do_agg:
+    add.u64 %addr, %group_base, %roff;
+    ld.global.u32 %group_u, [%addr];
+    add.u64 %addr, %value_base, %roff;
+    ld.global.s32 %value, [%addr];
+
+    cvt.u64.u32 %packed, %group_u;
+    or.b64 %packed, %packed, %hibit;
+
+    mul.lo.u32 %hash, %group_u, 2654435761;
+    shr.u32 %tmp32, %hash, 15;
+    xor.b32 %hash, %hash, %tmp32;
+    and.b32 %slot, %hash, %mask;
+
+probe:
+    cvt.u64.u32 %slot64, %slot;
+    mul.lo.u64 %off8, %slot64, 8;
+    add.u64 %addr, %slots, %off8;
+    atom.global.cas.b64 %cur, [%addr], %zero, %packed;
+    setp.eq.u64 %p_claimed, %cur, %zero;
+    @%p_claimed bra at_slot;
+    setp.eq.u64 %p_exists, %cur, %packed;
+    @%p_exists bra at_slot;
+    add.u32 %slot, %slot, 1;
+    and.b32 %slot, %slot, %mask;
+    bra probe;
+
+at_slot:
+    mul.lo.u64 %off4, %slot64, 4;
+    add.u64 %addr, %counts, %off8;
+    atom.global.add.u64 %ignore64, [%addr], %one;
+    cvt.s64.s32 %val64, %value;
+    cvt.u64.s64 %valbits, %val64;
+    add.u64 %addr, %sums, %off8;
+    atom.global.add.u64 %ignore64, [%addr], %valbits;
+    add.u64 %addr, %mins, %off4;
+    atom.global.min.s32 %ignore32, [%addr], %value;
+    add.u64 %addr, %maxs, %off4;
+    atom.global.max.s32 %ignore32, [%addr], %value;
+
+next_row:
+    add.u64 %idx, %idx, %stride;
+    bra row_loop;
+
+agg_done:
+    ret;
+}
+
+.visible .entry gpu_db_resident_i32_grouped_hash_compact(
+    .param .u64 slots_ptr,
+    .param .u64 counts_ptr,
+    .param .u64 sums_ptr,
+    .param .u64 mins_ptr,
+    .param .u64 maxs_ptr,
+    .param .u64 table_size,
+    .param .u64 out_groups_ptr,
+    .param .u64 out_counts_ptr,
+    .param .u64 out_sums_ptr,
+    .param .u64 out_mins_ptr,
+    .param .u64 out_maxs_ptr,
+    .param .u64 out_count_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_empty;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u32 %key;
+    .reg .u32 %minval;
+    .reg .u32 %maxval;
+    .reg .u64 %slots;
+    .reg .u64 %counts;
+    .reg .u64 %sums;
+    .reg .u64 %mins;
+    .reg .u64 %maxs;
+    .reg .u64 %size;
+    .reg .u64 %og;
+    .reg .u64 %oc;
+    .reg .u64 %os;
+    .reg .u64 %omin;
+    .reg .u64 %omax;
+    .reg .u64 %ocount;
+    .reg .u64 %idx;
+    .reg .u64 %stride;
+    .reg .u64 %addr;
+    .reg .u64 %off8;
+    .reg .u64 %off4;
+    .reg .u64 %slot;
+    .reg .u64 %pos;
+    .reg .u64 %pos8;
+    .reg .u64 %pos4;
+    .reg .u64 %one;
+    .reg .u64 %cval;
+    .reg .u64 %sval;
+
+    ld.param.u64 %slots, [slots_ptr];
+    ld.param.u64 %counts, [counts_ptr];
+    ld.param.u64 %sums, [sums_ptr];
+    ld.param.u64 %mins, [mins_ptr];
+    ld.param.u64 %maxs, [maxs_ptr];
+    ld.param.u64 %size, [table_size];
+    ld.param.u64 %og, [out_groups_ptr];
+    ld.param.u64 %oc, [out_counts_ptr];
+    ld.param.u64 %os, [out_sums_ptr];
+    ld.param.u64 %omin, [out_mins_ptr];
+    ld.param.u64 %omax, [out_maxs_ptr];
+    ld.param.u64 %ocount, [out_count_ptr];
+    mov.u64 %one, 1;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %idx, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+
+compact_loop:
+    setp.ge.u64 %p_done, %idx, %size;
+    @%p_done bra compact_done;
+    mul.lo.u64 %off8, %idx, 8;
+    add.u64 %addr, %slots, %off8;
+    ld.global.u64 %slot, [%addr];
+    setp.eq.u64 %p_empty, %slot, 0;
+    @%p_empty bra compact_next;
+
+    atom.global.add.u64 %pos, [%ocount], %one;
+    mul.lo.u64 %pos8, %pos, 8;
+    mul.lo.u64 %pos4, %pos, 4;
+    cvt.u32.u64 %key, %slot;
+    add.u64 %addr, %og, %pos4;
+    st.global.u32 [%addr], %key;
+    add.u64 %addr, %counts, %off8;
+    ld.global.u64 %cval, [%addr];
+    add.u64 %addr, %oc, %pos8;
+    st.global.u64 [%addr], %cval;
+    add.u64 %addr, %sums, %off8;
+    ld.global.u64 %sval, [%addr];
+    add.u64 %addr, %os, %pos8;
+    st.global.u64 [%addr], %sval;
+    mul.lo.u64 %off4, %idx, 4;
+    add.u64 %addr, %mins, %off4;
+    ld.global.u32 %minval, [%addr];
+    add.u64 %addr, %omin, %pos4;
+    st.global.u32 [%addr], %minval;
+    add.u64 %addr, %maxs, %off4;
+    ld.global.u32 %maxval, [%addr];
+    add.u64 %addr, %omax, %pos4;
+    st.global.u32 [%addr], %maxval;
+
+compact_next:
+    add.u64 %idx, %idx, %stride;
+    bra compact_loop;
+compact_done:
+    ret;
+}
+"#;
+
+    // Bounds: group + value columns (and filter column if present) must lie in the resident alloc.
+    let group_bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| group_byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let value_bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| value_byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if group_bytes > resident.metadata().allocated_bytes
+        || value_bytes > resident.metadata().allocated_bytes
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            group_bytes.max(value_bytes) as usize,
+        ));
+    }
+    let (filter_byte_offset, needle, comparison_code) =
+        if let Some((filter_byte_offset, needle, comparison)) = filter {
+            let filter_bytes = row_count
+                .checked_mul(std::mem::size_of::<i32>() as u64)
+                .and_then(|bytes| filter_byte_offset.checked_add(bytes))
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if filter_bytes > resident.metadata().allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    filter_bytes as usize,
+                ));
+            }
+            (filter_byte_offset, needle, comparison.code())
+        } else {
+            (group_byte_offset, 0, 0)
+        };
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Open-addressing table sized to >= 2x worst-case distinct groups (= row_count) -> load factor
+    // <= 0.5, so linear probing terminates and every group fits. Power-of-two for the `& mask` wrap.
+    let table_size = row_count
+        .checked_mul(2)
+        .and_then(|w| w.checked_next_power_of_two())
+        .map(|s| s.max(256))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let table_mask = u32::try_from(table_size - 1)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let table_size_usize = usize::try_from(table_size)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let row_count_usize = usize::try_from(row_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset_d8_async = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8Async>(b"cuMemsetD8Async\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let init_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_grouped_hash_init", &ptx)?;
+    let aggregate_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_grouped_hash_aggregate", &ptx)?;
+    let compact_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_grouped_hash_compact", &ptx)?;
+
+    // Pooled device buffers (no per-call cuMemAlloc churn): the 5 table columns + the 5 output
+    // columns + the output counter. Sized to the table / worst-case row_count.
+    let table_u64_bytes = table_size_usize
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let table_i32_bytes = table_size_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let out_i32_bytes = row_count_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let out_u64_bytes = row_count_usize
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let primary = resident.primary();
+    let slots = primary.lease_device_buffer(table_u64_bytes)?;
+    let counts = primary.lease_device_buffer(table_u64_bytes)?;
+    let sums = primary.lease_device_buffer(table_u64_bytes)?;
+    let mins = primary.lease_device_buffer(table_i32_bytes)?;
+    let maxs = primary.lease_device_buffer(table_i32_bytes)?;
+    let out_groups = primary.lease_device_buffer(out_i32_bytes)?;
+    let out_counts = primary.lease_device_buffer(out_u64_bytes)?;
+    let out_sums = primary.lease_device_buffer(out_u64_bytes)?;
+    let out_mins = primary.lease_device_buffer(out_i32_bytes)?;
+    let out_maxs = primary.lease_device_buffer(out_i32_bytes)?;
+    let out_count = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
+
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let pooled = lease.pooled.as_ref().expect("pooled stream just set");
+    let stream = pooled.stream;
+    let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        // SAFETY: best-effort drain on an already-failing path before the leases unwind, so no buffer
+        // returns to the pool while a kernel is still reading/writing it (cross-thread UAF guard).
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    const BLOCK: u32 = 256;
+    let init_grid = table_size.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let agg_grid = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+
+    let launch = |function: *mut c_void, grid: u32, args: &mut [*mut c_void]| -> i32 {
+        unsafe {
+            cu_launch_kernel(
+                function,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    };
+
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })
+            .map_err(drain_err)?;
+    }
+    // out_count starts at 0 (the compact kernel atom-appends into it), ordered on the stream.
+    check_cuda(unsafe { cu_memset_d8_async(out_count.ptr, 0, std::mem::size_of::<u64>(), stream) })
+        .map_err(drain_err)?;
+
+    let mut slots_arg = slots.ptr;
+    let mut counts_arg = counts.ptr;
+    let mut sums_arg = sums.ptr;
+    let mut mins_arg = mins.ptr;
+    let mut maxs_arg = maxs.ptr;
+    let mut table_size_arg = table_size;
+    let mut init_args = [
+        (&mut slots_arg as *mut u64).cast::<c_void>(),
+        (&mut counts_arg as *mut u64).cast::<c_void>(),
+        (&mut sums_arg as *mut u64).cast::<c_void>(),
+        (&mut mins_arg as *mut u64).cast::<c_void>(),
+        (&mut maxs_arg as *mut u64).cast::<c_void>(),
+        (&mut table_size_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(launch(init_fn, init_grid, &mut init_args)).map_err(drain_err)?;
+
+    let mut resident_arg = resident.device_ptr();
+    let mut group_offset_arg = group_byte_offset;
+    let mut value_offset_arg = value_byte_offset;
+    let mut filter_offset_arg = filter_byte_offset;
+    let mut rows_arg = row_count;
+    let mut needle_arg = needle;
+    let mut comparison_arg = comparison_code;
+    let mut mask_arg = table_mask;
+    let mut agg_args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut group_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut value_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut filter_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
+        (&mut slots_arg as *mut u64).cast::<c_void>(),
+        (&mut counts_arg as *mut u64).cast::<c_void>(),
+        (&mut sums_arg as *mut u64).cast::<c_void>(),
+        (&mut mins_arg as *mut u64).cast::<c_void>(),
+        (&mut maxs_arg as *mut u64).cast::<c_void>(),
+        (&mut mask_arg as *mut u32).cast::<c_void>(),
+    ];
+    check_cuda(launch(aggregate_fn, agg_grid, &mut agg_args)).map_err(drain_err)?;
+
+    let mut out_groups_arg = out_groups.ptr;
+    let mut out_counts_arg = out_counts.ptr;
+    let mut out_sums_arg = out_sums.ptr;
+    let mut out_mins_arg = out_mins.ptr;
+    let mut out_maxs_arg = out_maxs.ptr;
+    let mut out_count_arg = out_count.ptr;
+    let mut compact_args = [
+        (&mut slots_arg as *mut u64).cast::<c_void>(),
+        (&mut counts_arg as *mut u64).cast::<c_void>(),
+        (&mut sums_arg as *mut u64).cast::<c_void>(),
+        (&mut mins_arg as *mut u64).cast::<c_void>(),
+        (&mut maxs_arg as *mut u64).cast::<c_void>(),
+        (&mut table_size_arg as *mut u64).cast::<c_void>(),
+        (&mut out_groups_arg as *mut u64).cast::<c_void>(),
+        (&mut out_counts_arg as *mut u64).cast::<c_void>(),
+        (&mut out_sums_arg as *mut u64).cast::<c_void>(),
+        (&mut out_mins_arg as *mut u64).cast::<c_void>(),
+        (&mut out_maxs_arg as *mut u64).cast::<c_void>(),
+        (&mut out_count_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(launch(compact_fn, init_grid, &mut compact_args)).map_err(drain_err)?;
+
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })
+            .map_err(drain_err)?;
+    }
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    if timed {
+        let mut elapsed_ms = 0.0_f32;
+        check_cuda(unsafe {
+            (primary.cu_event_elapsed_time)(&mut elapsed_ms, pooled.start_event, pooled.stop_event)
+        })?;
+        resident
+            .record_kernel_event_elapsed_us(Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64));
+    } else {
+        resident.record_kernel_event_elapsed_us(None);
+    }
+
+    let mut output_count = 0_u64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut output_count as *mut u64).cast::<c_void>(),
+            out_count.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+    if output_count > row_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(output_count).unwrap_or(usize::MAX),
+        ));
+    }
+    let output_len = usize::try_from(output_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut groups = vec![0_i32; output_len];
+    let mut counts_host = vec![0_u64; output_len];
+    let mut sums_host = vec![0_i64; output_len];
+    let mut mins_host = vec![0_i32; output_len];
+    let mut maxs_host = vec![0_i32; output_len];
+    if output_len > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                groups.as_mut_ptr().cast::<c_void>(),
+                out_groups.ptr,
+                output_len * std::mem::size_of::<i32>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                counts_host.as_mut_ptr().cast::<c_void>(),
+                out_counts.ptr,
+                output_len * std::mem::size_of::<u64>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                sums_host.as_mut_ptr().cast::<c_void>(),
+                out_sums.ptr,
+                output_len * std::mem::size_of::<i64>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                mins_host.as_mut_ptr().cast::<c_void>(),
+                out_mins.ptr,
+                output_len * std::mem::size_of::<i32>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                maxs_host.as_mut_ptr().cast::<c_void>(),
+                out_maxs.ptr,
+                output_len * std::mem::size_of::<i32>(),
+            )
+        })?;
+    }
+    drop(lease);
+
+    Ok(groups
+        .into_iter()
+        .zip(counts_host)
+        .zip(sums_host)
+        .zip(mins_host)
+        .zip(maxs_host)
+        .map(|((((group, count), sum), min), max)| CudaI32GroupedStats {
+            group,
+            count,
+            sum,
+            min,
+            max,
+        })
+        .collect())
+}
+
+/// Single-thread `(1,1,1)` serial linear-probe grouped aggregation — retained ONLY (under
+/// `#[cfg(test)]`) as the on-GPU parity + benchmark oracle for the P2-M2/S1 parallel hash
+/// aggregation. The production route is the parallel `launch_cuda_resident_i32_grouped_stats`
+/// (atomic open-addressing hash table). This is the previously-shipped serial kernel kept as a
+/// device-side reference (no CPU operator re-implementation). O(rows × groups), single thread.
+#[cfg(test)]
+fn launch_cuda_resident_i32_grouped_stats_serial(
     resident: &CudaResidentDeviceMemory,
     group_byte_offset: u64,
     value_byte_offset: u64,
@@ -10268,11 +10987,16 @@ impl Drop for CudaModuleGuard {
     }
 }
 
+// Only the `#[cfg(test)]` serial-reference kernels use the legacy whole-context event timing now
+// (every production resident route runs on the pooled stream with `launch_on_pooled_stream`'s event
+// timing), so this helper + its event guard are test-only.
+#[cfg(test)]
 struct CudaEventGuard {
     event: *mut c_void,
     destroy: unsafe extern "C" fn(*mut c_void) -> i32,
 }
 
+#[cfg(test)]
 impl Drop for CudaEventGuard {
     fn drop(&mut self) {
         unsafe {
@@ -10281,6 +11005,7 @@ impl Drop for CudaEventGuard {
     }
 }
 
+#[cfg(test)]
 fn launch_with_optional_cuda_event_timing<R, F>(
     resident: &R,
     cu_ctx_synchronize: unsafe extern "C" fn() -> i32,
@@ -13641,6 +14366,188 @@ mod tests {
         assert_eq!(
             (s.count, s.sum, s.min, s.max),
             (4 * q as u64, 14 * q, Some(2), Some(5))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_hash_i32_grouped_stats_matches_serial_and_wins_on_large_tables() {
+        // P2-M2/S1 — grouped_stats parallel hash-aggregation parity + perf gate (GPU-native oracle).
+        // A/Bs the parallel atomic open-addressing hash aggregation against the retained serial
+        // single-thread linear-probe kernel ON THE GPU (no CPU oracle). GROUP BY has no inherent
+        // order, so both outputs are sorted by group key before comparison. Covers unfiltered and
+        // filtered variants across row counts and group cardinalities, plus a serial-vs-hash speedup
+        // table (high cardinality stresses the serial O(rows × groups) probe — the catastrophic
+        // single-thread case the parallel hash agg replaces).
+        use std::time::Instant;
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let retain = |groups: &[i32], values: &[i32]| {
+            let n = groups.len() as u64;
+            // SAFETY: `i32` is POD; native bytes match the resident column layout; the columns
+            // outlive the synchronous retain copy.
+            let group_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(groups.as_ptr().cast::<u8>(), groups.len() * 4)
+            };
+            let value_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let hsize = std::mem::size_of::<u64>() as u64;
+            let group_off = hsize;
+            let value_off = hsize + group_bytes.len() as u64;
+            let allocated = hsize + group_bytes.len() as u64 + value_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: group_off,
+                            bytes: group_bytes,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: value_off,
+                            bytes: value_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident columns");
+            (resident, group_off, value_off)
+        };
+        let sorted = |mut v: Vec<CudaI32GroupedStats>| {
+            v.sort_by_key(|g| g.group);
+            v
+        };
+
+        // Parity: unfiltered + filtered, across sizes/cardinalities. group[i]=i%g, value[i]=i%100.
+        for &(n, g) in &[
+            (1_u64, 1_i64),
+            (10, 3),
+            (1_000, 7),
+            (50_000, 64),
+            (100_000, 256),
+        ] {
+            let groups: Vec<i32> = (0..n).map(|i| (i % g as u64) as i32).collect();
+            let values: Vec<i32> = (0..n).map(|i| (i % 100) as i32).collect();
+            let (resident, go, vo) = retain(&groups, &values);
+            let serial = sorted(
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n)
+                    .expect("serial grouped"),
+            );
+            let hash = sorted(
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n)
+                    .expect("hash-agg grouped"),
+            );
+            assert_eq!(
+                hash, serial,
+                "grouped hash-agg != serial at rows={n} groups={g}"
+            );
+            // Filtered (resident filtered-grouped-aggregate path): keep rows where value >= 50.
+            let filt = Some((vo, 50_i32, CudaI32Comparison::Gte));
+            let serial_f = sorted(
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, filt, n)
+                    .expect("serial filtered grouped"),
+            );
+            let hash_f = sorted(
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, n)
+                    .expect("hash-agg filtered grouped"),
+            );
+            assert_eq!(
+                hash_f, serial_f,
+                "filtered grouped hash-agg != serial at rows={n} groups={g}"
+            );
+        }
+
+        // Edge cases (audit follow-up): negative group keys + negative values exercise the
+        // `(occupied<<32)|key` round-trip through the u64 slot and the two's-complement sum/min/max;
+        // a fully-filtered-out group must be absent from the output (it never claims a slot).
+        {
+            let groups: Vec<i32> = (0..2_000).map(|i| (i % 5) - 2).collect();
+            let values: Vec<i32> = (0..2_000).map(|i| (i % 100) - 50).collect();
+            let (resident, go, vo) = retain(&groups, &values);
+            let serial = sorted(
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, 2_000)
+                    .expect("serial negatives"),
+            );
+            let hash = sorted(
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, 2_000)
+                    .expect("hash-agg negatives"),
+            );
+            assert_eq!(
+                hash, serial,
+                "grouped hash-agg != serial for negative keys/values"
+            );
+            assert!(
+                hash.iter().any(|g| g.group < 0) && hash.iter().any(|g| g.sum < 0),
+                "expected the negative-key + negative-sum paths to be exercised"
+            );
+        }
+        {
+            // group 0's rows are all value=10 (< 50) -> fully removed by `value >= 50`; groups 1..3
+            // (value=90) survive, so group 0 must be absent from both outputs.
+            let groups: Vec<i32> = (0..2_000).map(|i| i % 4).collect();
+            let values: Vec<i32> = groups
+                .iter()
+                .map(|&gr| if gr == 0 { 10 } else { 90 })
+                .collect();
+            let (resident, go, vo) = retain(&groups, &values);
+            let filt = Some((vo, 50_i32, CudaI32Comparison::Gte));
+            let serial = sorted(
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, filt, 2_000)
+                    .expect("serial fully-filtered"),
+            );
+            let hash = sorted(
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, 2_000)
+                    .expect("hash-agg fully-filtered"),
+            );
+            assert_eq!(
+                hash, serial,
+                "filtered grouped hash-agg != serial with a fully-filtered group"
+            );
+            assert!(
+                !hash.iter().any(|g| g.group == 0),
+                "group 0 (all rows filtered out) must be absent from the output"
+            );
+        }
+
+        // Benchmark: best-of-3 latency, serial vs hash-agg.
+        println!("p2_m2_s1_grouped_stats: group[i]=i%groups, value[i]=i%100");
+        println!("| rows | groups | serial ms | hash ms | speedup |");
+        println!("|---:|---:|---:|---:|---:|");
+        let mut largest_serial = 0.0_f64;
+        let mut largest_hash = 0.0_f64;
+        for &(n, g) in &[(4_096_u64, 128_i64), (16_384, 256), (65_536, 512)] {
+            let groups: Vec<i32> = (0..n).map(|i| (i % g as u64) as i32).collect();
+            let values: Vec<i32> = (0..n).map(|i| (i % 100) as i32).collect();
+            let (resident, go, vo) = retain(&groups, &values);
+            let mut serial_ms = f64::MAX;
+            let mut hash_ms = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n).unwrap();
+                serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                let t = Instant::now();
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n).unwrap();
+                hash_ms = hash_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let speedup = if hash_ms > 0.0 {
+                serial_ms / hash_ms
+            } else {
+                0.0
+            };
+            println!("| {n} | {g} | {serial_ms:.3} | {hash_ms:.3} | {speedup:.1}x |");
+            largest_serial = serial_ms;
+            largest_hash = hash_ms;
+        }
+        assert!(
+            largest_hash < largest_serial,
+            "hash-agg ({largest_hash:.3} ms) did not beat the serial linear-probe kernel \
+             ({largest_serial:.3} ms) on the largest table — milestone premise unmet"
         );
     }
 }
