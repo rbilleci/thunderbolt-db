@@ -27,7 +27,7 @@ use std::thread;
 use std::time::Instant;
 
 use gpu_db_engine::Engine;
-use gpu_db_protocol::{parse_command, Command, Select};
+use gpu_db_sql::{parse_command, Command, Select};
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
@@ -158,7 +158,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let warm = engine.execute_relational_select(&select)?;
     assert_eq!(
         warm.rows,
-        vec![vec![gpu_db_protocol::SqlValue::Int4(rows as i32)]]
+        vec![vec![gpu_db_sql::SqlValue::Int4(rows as i32)]]
     );
 
     println!(

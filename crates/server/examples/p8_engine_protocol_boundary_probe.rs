@@ -222,11 +222,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("engine_owned_target=true");
     println!("protocol_parser_reused=true");
-    println!("crate_direction=gpu_db_engine_depends_on_gpu_db_protocol");
+    println!("crate_direction=gpu_db_engine_depends_on_gpu_db_sql_not_protocol");
     println!("create_table_into_engine_wal_mvcc=true");
     println!("select_parser_reused=true");
     println!("select_result_rows={}", result.rows.len());
-    println!("copy_parser_in_protocol_lib={copy_parser_available}");
+    println!("copy_parser_in_sql_lib={copy_parser_available}");
     println!("engine_copy_column_projection_available=true");
     println!("copy_rows_decoded_by_protocol={copied_rows}");
     println!("copy_rows_committed_to_engine_wal_mvcc=true");

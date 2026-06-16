@@ -36,3 +36,8 @@ tokio-postgres = "0.7"
 # For the GPU-retained benchmark example only: it builds + warms an Engine to GPU residency,
 # then serves it through the façade. The library itself never depends on the engine directly.
 gpu_db_engine = { path = "../engine" }
+# The engine+pgwire integration examples (`p8_engine_*`) live here — the server is
+# the layer that legitimately spans both the engine and the wire crate. They reach
+# into the engine's residency/metrics internals directly, so those are dev-deps too.
+gpu_db_execution = { path = "../execution" }
+gpu_db_metrics = { path = "../metrics" }

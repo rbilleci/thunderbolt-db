@@ -1,5 +1,5 @@
 use gpu_db_execution::{DeviceTarget, PlannedOp};
-use gpu_db_protocol::Command;
+use gpu_db_sql::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanKind {
@@ -222,10 +222,10 @@ mod tests {
     #[test]
     fn planner_marks_relational_select_as_gpu_targeted() {
         let planner = Planner::default();
-        let plan = planner.plan_command(&Command::Select(gpu_db_protocol::Select {
+        let plan = planner.plan_command(&Command::Select(gpu_db_sql::Select {
             table: "people".to_string(),
             distinct: false,
-            projection: gpu_db_protocol::SelectProjection::All,
+            projection: gpu_db_sql::SelectProjection::All,
             group_by: None,
             having_groups: Vec::new(),
             filter: None,
@@ -255,10 +255,10 @@ mod tests {
             Command::GetKv {
                 key: "a".to_string(),
             },
-            Command::Select(gpu_db_protocol::Select {
+            Command::Select(gpu_db_sql::Select {
                 table: "t".to_string(),
                 distinct: false,
-                projection: gpu_db_protocol::SelectProjection::All,
+                projection: gpu_db_sql::SelectProjection::All,
                 group_by: None,
                 having_groups: Vec::new(),
                 filter: None,
@@ -268,36 +268,36 @@ mod tests {
                 limit: None,
                 offset: None,
             }),
-            Command::Delete(gpu_db_protocol::Delete {
+            Command::Delete(gpu_db_sql::Delete {
                 table: "t".to_string(),
                 filter: None,
-                filters: vec![gpu_db_protocol::SelectFilter {
+                filters: vec![gpu_db_sql::SelectFilter {
                     column: "id".to_string(),
-                    op: gpu_db_protocol::SelectFilterOp::Eq,
-                    value: gpu_db_protocol::SqlValue::Int4(1),
+                    op: gpu_db_sql::SelectFilterOp::Eq,
+                    value: gpu_db_sql::SqlValue::Int4(1),
                 }],
-                filter_groups: vec![vec![gpu_db_protocol::SelectFilter {
+                filter_groups: vec![vec![gpu_db_sql::SelectFilter {
                     column: "id".to_string(),
-                    op: gpu_db_protocol::SelectFilterOp::Eq,
-                    value: gpu_db_protocol::SqlValue::Int4(1),
+                    op: gpu_db_sql::SelectFilterOp::Eq,
+                    value: gpu_db_sql::SqlValue::Int4(1),
                 }]],
             }),
-            Command::Update(gpu_db_protocol::Update {
+            Command::Update(gpu_db_sql::Update {
                 table: "t".to_string(),
-                assignments: vec![gpu_db_protocol::UpdateAssignment {
+                assignments: vec![gpu_db_sql::UpdateAssignment {
                     column: "name".to_string(),
-                    value: gpu_db_protocol::SqlValue::Text("updated".to_string()),
+                    value: gpu_db_sql::SqlValue::Text("updated".to_string()),
                 }],
                 filter: None,
-                filters: vec![gpu_db_protocol::SelectFilter {
+                filters: vec![gpu_db_sql::SelectFilter {
                     column: "id".to_string(),
-                    op: gpu_db_protocol::SelectFilterOp::Eq,
-                    value: gpu_db_protocol::SqlValue::Int4(1),
+                    op: gpu_db_sql::SelectFilterOp::Eq,
+                    value: gpu_db_sql::SqlValue::Int4(1),
                 }],
-                filter_groups: vec![vec![gpu_db_protocol::SelectFilter {
+                filter_groups: vec![vec![gpu_db_sql::SelectFilter {
                     column: "id".to_string(),
-                    op: gpu_db_protocol::SelectFilterOp::Eq,
-                    value: gpu_db_protocol::SqlValue::Int4(1),
+                    op: gpu_db_sql::SelectFilterOp::Eq,
+                    value: gpu_db_sql::SqlValue::Int4(1),
                 }]],
             }),
             Command::Begin,

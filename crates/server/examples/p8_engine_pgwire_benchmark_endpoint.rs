@@ -2797,7 +2797,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact("max_sessions", max_sessions)?;
     state.fact(
         "crate_direction",
-        "gpu_db_engine_depends_on_gpu_db_protocol",
+        "gpu_db_engine_depends_on_gpu_db_sql_not_protocol",
     )?;
 
     let mut completed = 0;

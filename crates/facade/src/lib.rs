@@ -15,11 +15,12 @@
 //!
 //! ## Known transitional shape
 //!
-//! - The neutral value vocabulary ([`DbValue`], [`LogicalType`]) currently mirrors
-//!   the protocol crate's `SqlValue`/`SqlType` and is converted at the boundary so
-//!   those protocol types do not leak. The next milestone moves the neutral
-//!   vocabulary into `gpu_db_types` and inverts the `engine -> protocol`
-//!   dependency that exists today.
+//! - The neutral value vocabulary ([`DbValue`], [`LogicalType`]) mirrors the
+//!   SQL vocabulary's `SqlValue`/`SqlType` (now in the lower `gpu_db_sql` crate)
+//!   and is converted at the boundary so those engine-facing types do not leak.
+//!   The `engine -> protocol` dependency has been inverted: both the engine and
+//!   this façade depend on `gpu_db_sql`, so the parsed types are identity-equal
+//!   across the boundary (roadmap §9.2).
 //! - `rows_affected` is `None` for DML: the engine's `execute_text` does not yet
 //!   return an affected-row count. Surfacing that is a tracked follow-up.
 //! - Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) updates session state but
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalColumn};
-use gpu_db_protocol::{parse_command, Command, ParseError, Select, SqlType, SqlValue};
+use gpu_db_sql::{parse_command, Command, ParseError, Select, SqlType, SqlValue};
 
 pub mod pg_adapter;
 mod point_lookup_batcher;
@@ -577,7 +578,7 @@ fn select_int4_equality_needle(select: &Select) -> Option<i32> {
     } else {
         select.filter.as_ref()?
     };
-    if filter.op != gpu_db_protocol::SelectFilterOp::Eq {
+    if filter.op != gpu_db_sql::SelectFilterOp::Eq {
         return None;
     }
     match filter.value {

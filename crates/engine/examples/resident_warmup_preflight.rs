@@ -2,7 +2,7 @@ use std::env;
 use std::process;
 
 use gpu_db_engine::{Engine, RelationalResidencyWarmupAction, RelationalResidencyWarmupPolicy};
-use gpu_db_protocol::{parse_command, Command};
+use gpu_db_sql::{parse_command, Command};
 
 #[derive(Debug)]
 struct Config {

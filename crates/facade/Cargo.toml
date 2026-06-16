@@ -5,15 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 # Protocol-neutral façade over the engine (prototype→production plan, P0-M1).
-# Depends on the engine (execution) and, transitionally, on the protocol crate for
-# the SQL value/command vocabulary it converts away from. The eventual goal
-# (next milestone) is to move that neutral vocabulary into `gpu_db_types` and
-# invert the engine→protocol dependency.
+# Depends on the engine (execution) and on the lower `gpu_db_sql` crate for the
+# SQL value/command vocabulary it converts away from. It has no wire dependency:
+# all PostgreSQL-specific mapping lives in `pg_adapter` over neutral façade types
+# (roadmap §9.2 — the engine→protocol dependency is now inverted).
 
 [dependencies]
 thiserror.workspace = true
 gpu_db_engine = { path = "../engine" }
-gpu_db_protocol = { path = "../protocol" }
+gpu_db_sql = { path = "../sql" }
 # Thread-3 batched/async GPU submission (P0-M? staged): the façade owns the
 # point-lookup batcher (coalescer thread + per-batch read lock). It reuses the
 # generic dual-trigger batcher rather than re-deriving M0's ad-hoc backlog loop.

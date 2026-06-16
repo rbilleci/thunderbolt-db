@@ -3,7 +3,7 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalSelectResult, RelationalSqlGpuBridgeReport};
-use gpu_db_protocol::{parse_command, Command, Select};
+use gpu_db_sql::{parse_command, Command, Select};
 
 #[derive(Debug)]
 struct WorkloadReport {

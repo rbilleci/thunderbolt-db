@@ -10,7 +10,7 @@ use gpu_db_engine::{
     ResidentDeviceInt4ColumnStats, ResidentDeviceTextColumnLayout,
 };
 use gpu_db_execution::{CudaDriverRuntime, CudaOwnedDeviceMemoryChunk};
-use gpu_db_protocol::{parse_command, Command, Select};
+use gpu_db_sql::{parse_command, Command, Select};
 
 const VRAM_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 const TARGET_TIERS: &[(&str, u64)] = &[
@@ -833,8 +833,8 @@ fn assert_single_int(
         return Err(format!("{label} returned an empty row").into());
     };
     let actual = match value {
-        gpu_db_protocol::SqlValue::Int4(value) => i64::from(*value),
-        gpu_db_protocol::SqlValue::Int8(value) => *value,
+        gpu_db_sql::SqlValue::Int4(value) => i64::from(*value),
+        gpu_db_sql::SqlValue::Int8(value) => *value,
         other => return Err(format!("{label} returned non-integer value {other:?}").into()),
     };
     if actual != expected {
@@ -854,7 +854,7 @@ fn assert_single_numeric(
     let Some(value) = row.first() else {
         return Err(format!("{label} returned an empty row").into());
     };
-    let gpu_db_protocol::SqlValue::Numeric(actual) = value else {
+    let gpu_db_sql::SqlValue::Numeric(actual) = value else {
         return Err(format!("{label} returned non-numeric value {value:?}").into());
     };
     if actual != expected {
@@ -1188,16 +1188,16 @@ fn expected_result_for_case(
     rows: usize,
 ) -> Result<RelationalSelectResult, Box<dyn Error>> {
     let value = match case.name {
-        "order_line_count_all" => gpu_db_protocol::SqlValue::Int8(rows as i64),
-        "order_line_sum_amount" => gpu_db_protocol::SqlValue::Int8(expected_amount_sum(rows)),
+        "order_line_count_all" => gpu_db_sql::SqlValue::Int8(rows as i64),
+        "order_line_sum_amount" => gpu_db_sql::SqlValue::Int8(expected_amount_sum(rows)),
         "order_line_avg_quantity_between" => {
-            gpu_db_protocol::SqlValue::Numeric(expected_quantity_between_avg(rows))
+            gpu_db_sql::SqlValue::Numeric(expected_quantity_between_avg(rows))
         }
         "order_line_max_amount_filter" => {
             let lower = (rows / 4).max(1) as i32;
             expected_amount_max_filter(rows, lower)
-                .map(|value| gpu_db_protocol::SqlValue::Int4(value as i32))
-                .unwrap_or_else(|| gpu_db_protocol::SqlValue::Text(String::new()))
+                .map(|value| gpu_db_sql::SqlValue::Int4(value as i32))
+                .unwrap_or_else(|| gpu_db_sql::SqlValue::Text(String::new()))
         }
         other => return Err(format!("no formula-backed expected result for {other}").into()),
     };
@@ -1212,8 +1212,8 @@ fn expected_result_for_case(
 }
 
 fn assert_rows_match(
-    actual: &[Vec<gpu_db_protocol::SqlValue>],
-    expected: &[Vec<gpu_db_protocol::SqlValue>],
+    actual: &[Vec<gpu_db_sql::SqlValue>],
+    expected: &[Vec<gpu_db_sql::SqlValue>],
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
     if actual.len() != expected.len() {
@@ -1247,13 +1247,10 @@ fn assert_rows_match(
     Ok(())
 }
 
-fn sql_value_matches(
-    actual: &gpu_db_protocol::SqlValue,
-    expected: &gpu_db_protocol::SqlValue,
-) -> bool {
+fn sql_value_matches(actual: &gpu_db_sql::SqlValue, expected: &gpu_db_sql::SqlValue) -> bool {
     match (actual, expected) {
-        (gpu_db_protocol::SqlValue::Int4(actual), gpu_db_protocol::SqlValue::Int8(expected))
-        | (gpu_db_protocol::SqlValue::Int8(expected), gpu_db_protocol::SqlValue::Int4(actual)) => {
+        (gpu_db_sql::SqlValue::Int4(actual), gpu_db_sql::SqlValue::Int8(expected))
+        | (gpu_db_sql::SqlValue::Int8(expected), gpu_db_sql::SqlValue::Int4(actual)) => {
             i64::from(*actual) == *expected
         }
         _ => actual == expected,

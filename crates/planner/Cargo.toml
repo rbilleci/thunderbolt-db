@@ -6,4 +6,7 @@ license.workspace = true
 
 [dependencies]
 gpu_db_execution = { path = "../execution" }
-gpu_db_protocol = { path = "../protocol" }
+# The planner consumes the neutral SQL command AST only; it has no wire
+# dependency, so it reads the vocabulary from `gpu_db_sql` rather than the
+# pgwire `gpu_db_protocol` crate (roadmap §9.2).
+gpu_db_sql = { path = "../sql" }

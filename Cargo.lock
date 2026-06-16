@@ -525,9 +525,9 @@ dependencies = [
  "gpu_db_metrics",
  "gpu_db_observability",
  "gpu_db_planner",
- "gpu_db_protocol",
  "gpu_db_replication",
  "gpu_db_snapshot",
+ "gpu_db_sql",
  "gpu_db_storage",
  "gpu_db_txn",
  "gpu_db_types",
@@ -553,7 +553,7 @@ version = "0.1.0"
 dependencies = [
  "gpu_db_batching",
  "gpu_db_engine",
- "gpu_db_protocol",
+ "gpu_db_sql",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -580,7 +580,7 @@ name = "gpu_db_planner"
 version = "0.1.0"
 dependencies = [
  "gpu_db_execution",
- "gpu_db_protocol",
+ "gpu_db_sql",
 ]
 
 [[package]]
@@ -590,6 +590,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "gpu_db_sql",
  "hmac 0.12.1",
  "pbkdf2",
  "rand 0.8.6",
@@ -617,7 +618,9 @@ name = "gpu_db_server"
 version = "0.1.0"
 dependencies = [
  "gpu_db_engine",
+ "gpu_db_execution",
  "gpu_db_facade",
+ "gpu_db_metrics",
  "gpu_db_protocol",
  "tikv-jemallocator",
  "tokio",
@@ -629,6 +632,13 @@ name = "gpu_db_snapshot"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+]
+
+[[package]]
+name = "gpu_db_sql"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

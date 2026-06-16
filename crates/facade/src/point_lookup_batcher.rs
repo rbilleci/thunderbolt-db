@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{Batch, DualTriggerBatcher};
 use gpu_db_engine::{Engine, ExecuteError, RelationalSelectResult};
-use gpu_db_protocol::Select;
+use gpu_db_sql::Select;
 use tokio::sync::oneshot;
 
 use crate::{map_column, map_value, DbError, ErrorCategory, QueryOutcome, SharedEngine};
@@ -557,7 +557,7 @@ fn map_execute_error_local(err: ExecuteError) -> DbError {
 mod tests {
     use super::*;
     use crate::execute_on_shared_engine;
-    use gpu_db_protocol::{parse_command, Command};
+    use gpu_db_sql::{parse_command, Command};
     use std::sync::mpsc::TryRecvError;
 
     fn select(sql: &str) -> Select {

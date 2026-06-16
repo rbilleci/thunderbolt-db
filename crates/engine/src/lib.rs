@@ -22,7 +22,9 @@ use gpu_db_observability::{
     RelationalResidentRouteDecisionStatus, ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
-use gpu_db_protocol::{
+use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
+use gpu_db_snapshot::{SnapshotCell, SnapshotHandle};
+use gpu_db_sql::{
     parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
     ColumnDef, ColumnDefault, Command, CommentTarget, CopyColumn, CopyFromStdin, CreateDatabase,
     CreateDomain, CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication,
@@ -36,8 +38,6 @@ use gpu_db_protocol::{
     SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
     TablespacePrivilege, TruncateTable, Update,
 };
-use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
-use gpu_db_snapshot::{SnapshotCell, SnapshotHandle};
 use gpu_db_storage::{
     InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore, TupleVersion,
     Visibility as StorageVisibility,
@@ -11053,7 +11053,7 @@ impl Engine {
     fn apply_create_function(
         &self,
         cat: &mut DdlCatalogState,
-        create: gpu_db_protocol::CreateFunction,
+        create: gpu_db_sql::CreateFunction,
     ) -> Result<(), EngineError> {
         if cat.relational_functions.contains_key(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
@@ -11082,7 +11082,7 @@ impl Engine {
     fn apply_drop_function(
         &self,
         cat: &mut DdlCatalogState,
-        drop: gpu_db_protocol::DropFunction,
+        drop: gpu_db_sql::DropFunction,
     ) -> Result<(), EngineError> {
         if !drop.if_exists && !cat.relational_functions.contains_key(&drop.name) {
             return Err(EngineError::ApplyFailed(format!(
@@ -11867,7 +11867,7 @@ impl Engine {
     fn apply_add_primary_key(
         &self,
         cat: &mut DdlCatalogState,
-        add: gpu_db_protocol::AddPrimaryKey,
+        add: gpu_db_sql::AddPrimaryKey,
     ) -> Result<(), EngineError> {
         if cat
             .relational_catalog
@@ -14141,7 +14141,7 @@ impl Engine {
     fn apply_comment_on(
         &self,
         cat: &mut DdlCatalogState,
-        comment: gpu_db_protocol::CommentOn,
+        comment: gpu_db_sql::CommentOn,
     ) -> Result<(), EngineError> {
         let target = match comment.target {
             CommentTarget::Database { database } => {
@@ -14356,7 +14356,7 @@ impl Engine {
     fn apply_alter_column_default(
         &self,
         cat: &mut DdlCatalogState,
-        alter: gpu_db_protocol::AlterColumnDefault,
+        alter: gpu_db_sql::AlterColumnDefault,
     ) -> Result<(), EngineError> {
         if let Some(default) = alter.default.as_ref() {
             let table = cat.relational_catalog.get(&alter.table).ok_or_else(|| {
@@ -14401,7 +14401,7 @@ impl Engine {
     fn apply_add_column(
         &self,
         cat: &mut DdlCatalogState,
-        add: gpu_db_protocol::AddColumn,
+        add: gpu_db_sql::AddColumn,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         let mut column_def = add.column;
@@ -14662,7 +14662,7 @@ impl Engine {
     fn apply_drop_column(
         &self,
         cat: &mut DdlCatalogState,
-        drop_column: gpu_db_protocol::DropColumn,
+        drop_column: gpu_db_sql::DropColumn,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         if cat.relational_views.contains_key(&drop_column.table)
@@ -48044,7 +48044,7 @@ mod tests {
         )
         .unwrap();
 
-        let copy = gpu_db_protocol::parse_copy_from_stdin(
+        let copy = gpu_db_sql::parse_copy_from_stdin(
             "COPY people (id, name) FROM STDIN WITH (FORMAT csv)",
         )
         .unwrap();
@@ -48052,7 +48052,7 @@ mod tests {
         let rows = ["1,Ada", "2,O'Brien"]
             .into_iter()
             .map(|line| {
-                gpu_db_protocol::parse_copy_row(
+                gpu_db_sql::parse_copy_row(
                     &copy_columns,
                     copy.columns.as_deref().unwrap(),
                     copy.options,
@@ -48070,11 +48070,11 @@ mod tests {
         assert!(profile.commit_total_micros >= profile.current_apply_total_micros);
 
         let default_copy =
-            gpu_db_protocol::parse_copy_from_stdin("COPY people (id) FROM STDIN").unwrap();
+            gpu_db_sql::parse_copy_from_stdin("COPY people (id) FROM STDIN").unwrap();
         let default_rows = ["3"]
             .into_iter()
             .map(|line| {
-                gpu_db_protocol::parse_copy_row(
+                gpu_db_sql::parse_copy_row(
                     &copy_columns,
                     default_copy.columns.as_deref().unwrap(),
                     default_copy.options,

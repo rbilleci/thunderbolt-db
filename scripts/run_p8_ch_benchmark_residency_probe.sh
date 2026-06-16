@@ -2346,7 +2346,7 @@ write_protocol_retained_route_bridge_report() {
 
   {
     echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "crate_direction=gpu_db_engine_depends_on_gpu_db_protocol"
+    echo "crate_direction=gpu_db_engine_depends_on_gpu_db_sql_not_protocol"
     echo "protocol_crate_depends_on_engine=false"
     echo "protocol_server_target=crates/protocol/src/bin/gpu-db-server.rs"
     echo "protocol_state=Session/SharedCatalog private Table rows"

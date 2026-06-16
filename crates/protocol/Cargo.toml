@@ -13,6 +13,11 @@ rustls = "0.23"
 rustls-pemfile = "2"
 sha2 = "0.10"
 thiserror.workspace = true
+# Neutral SQL vocabulary (AST + `SqlType`/`SqlValue` + parser + `ParseError`)
+# lives in the lower `gpu_db_sql` crate so the engine can depend on it without
+# the wire layer. Protocol re-exports it (`pub use gpu_db_sql::*`) to keep its
+# public API byte-compatible (roadmap §9.2).
+gpu_db_sql = { path = "../sql" }
 
 [dev-dependencies]
 bytes = "1"
