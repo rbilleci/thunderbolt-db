@@ -9173,6 +9173,32 @@ wave_done:
     Ok(indices)
 }
 
+/// Benchmark-calibrated bitonic<->radix crossover for the adaptive GPU argsort (S2/S3, measured on
+/// RTX PRO 6000 Blackwell): at ~10k rows the two arms tie (radix 0.99x bitonic); below it bitonic's
+/// single-kernel-per-stage simplicity wins, above it radix's O(n) beats bitonic's O(n log^2 n)
+/// launch count and the gap widens (radix 1.27x @100k -> 3.10x @10M).
+const ADAPTIVE_SORT_CROSSOVER_ROWS: u64 = 10_000;
+
+/// Adaptive GPU argsort over a resident i64 key column — the unified ORDER BY sort primitive (S4).
+/// Dispatches to the bitonic arm (S2) below the crossover and the radix arm (S3) at/above it, so the
+/// faster algorithm runs for the result size. Returns a stable Vec<u32> permutation ordering rows by
+/// key (ascending when `descending=false`, else descending; equal keys keep ascending original index
+/// in both directions). Both arms produce byte-identical permutations, so the choice is invisible to
+/// callers — the operator's result is deterministic regardless of which arm runs.
+#[allow(dead_code)] // wired into the engine grouped/projection ORDER BY path in S5.
+fn launch_cuda_resident_i64_argsort_adaptive(
+    resident: &CudaResidentDeviceMemory,
+    keys_byte_offset: u64,
+    n: u64,
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    if n < ADAPTIVE_SORT_CROSSOVER_ROWS {
+        launch_cuda_resident_i64_argsort_bitonic(resident, keys_byte_offset, n, descending)
+    } else {
+        launch_cuda_resident_i64_argsort_radix(resident, keys_byte_offset, n, descending)
+    }
+}
+
 /// Serial single-thread GPU LSD-radix argsort — the GPU-native parity ORACLE + benchmark
 /// baseline for the parallel `launch_cuda_resident_i64_argsort_radix` (S3). One device thread
 /// runs a textbook stable counting sort: 16 LSD passes of 4 bits each over a signed→unsigned
@@ -16401,6 +16427,61 @@ mod tests {
             };
             let speedup = bitonic_ms / radix_ms;
             println!("| {n} | {bitonic_ms:.3} | {radix_ms:.3} | {serial_str} | {speedup:.2}x |");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_adaptive_argsort_dispatches_and_matches_reference() {
+        // P2 §9.5/S4 — the adaptive dispatch must return a CORRECT stable argsort on both sides of
+        // the bitonic<->radix crossover. Both arms are already proven byte-identical (S3 gate), so
+        // validating adaptive == bitonic across sizes straddling the threshold confirms the dispatch
+        // picks a correct arm each side. GPU-vs-GPU; no CPU oracle.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let retain_keys = |keys: &[i64]| {
+            let n = keys.len() as u64;
+            // SAFETY: `i64` is POD; native bytes; `keys` outlives the synchronous retain copy.
+            let key_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(keys.as_ptr().cast::<u8>(), keys.len() * 8) };
+            let header = n.to_le_bytes();
+            let off = std::mem::size_of::<u64>() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    off + key_bytes.len() as u64,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: off,
+                            bytes: key_bytes,
+                        },
+                    ],
+                )
+                .expect("retain keys");
+            (resident, off)
+        };
+
+        // Sizes straddling ADAPTIVE_SORT_CROSSOVER_ROWS (10_000): below -> bitonic arm, at/above ->
+        // radix arm. Include the exact boundary and ±1.
+        for &n in &[100_usize, 9_999, 10_000, 10_001, 50_000] {
+            let keys: Vec<i64> = (0..n)
+                .map(|i| (((i as u64).wrapping_mul(2_654_435_761) % 4_096) as i64) - 2_048)
+                .collect();
+            let nn = n as u64;
+            for &desc in &[false, true] {
+                let (resident, off) = retain_keys(&keys);
+                let adaptive = launch_cuda_resident_i64_argsort_adaptive(&resident, off, nn, desc)
+                    .expect("adaptive argsort");
+                let reference = launch_cuda_resident_i64_argsort_bitonic(&resident, off, nn, desc)
+                    .expect("bitonic reference");
+                assert_eq!(
+                    adaptive, reference,
+                    "adaptive argsort != bitonic reference for n={n} descending={desc}"
+                );
+            }
         }
     }
 }
