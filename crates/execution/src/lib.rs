@@ -8371,6 +8371,1163 @@ sdone:
     Ok(indices)
 }
 
+/// Parallel GPU LSD-radix argsort over a resident i64 key column — the LARGE-result arm of the
+/// adaptive sort operator (S3). Returns a Vec<u32> permutation of 0..n ordering the rows by key
+/// (ascending when `descending=false`, descending when true), STABLE (equal keys keep ascending
+/// original index) in both directions. O(n), constant 16 LSD passes of 4 bits — beats the bitonic
+/// arm's O(n log^2 n) launch count at large n.
+///
+/// Keys are mapped signed->unsigned-order by XOR with a direction mask (0x8000…0 ascending so i64
+/// order == u64 order; 0x7FFF…F descending = the complement, so one ascending radix yields
+/// descending keys with the SAME ascending-index tie-break). Each pass is three kernels on one
+/// pooled stream: (1) `radix_histogram` — each block counts its contiguous chunk's 4-bit digits
+/// into a bucket-major block_hist[d*G+b] via a shared per-digit histogram; (2) `radix_scan` —
+/// exclusive prefix sum over the whole 16*G matrix, so block_hist[d*G+b] becomes the global output
+/// offset where block b's digit-d run begins; (3) `radix_scatter` — each block STABLY scatters its
+/// chunk to keys_dst/idx_dst at base + per-digit-running + within-block rank, the within-block rank
+/// computed per grid-stride wave by `match.any.sync` warp ranking + a cross-warp per-digit combine,
+/// with a per-digit running offset carried across waves. Ping-pong (keys/idx a<->b) over 16 passes.
+#[allow(dead_code)] // wired into the engine grouped/projection ORDER BY path in S4/S5.
+fn launch_cuda_resident_i64_argsort_radix(
+    resident: &CudaResidentDeviceMemory,
+    keys_byte_offset: u64,
+    n: u64,
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.3
+.target sm_70
+.address_size 64
+
+.visible .entry gpu_db_radix_init(
+    .param .u64 keys_src_ptr,
+    .param .u64 n,
+    .param .u64 mask,
+    .param .u64 keys_a_ptr,
+    .param .u64 idx_a_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %idxv;
+    .reg .u64 %src;
+    .reg .u64 %n;
+    .reg .u64 %mask;
+    .reg .u64 %ka;
+    .reg .u64 %ia;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+
+    ld.param.u64 %src, [keys_src_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %ka, [keys_a_ptr];
+    ld.param.u64 %ia, [idx_a_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+init_l:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra init_d;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %src, %o8;
+    ld.global.u64 %key, [%addr];
+    xor.b64 %key, %key, %mask;
+    add.u64 %addr, %ka, %o8;
+    st.global.u64 [%addr], %key;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %ia, %o4;
+    cvt.u32.u64 %idxv, %i;
+    st.global.u32 [%addr], %idxv;
+    add.u64 %i, %i, %stride;
+    bra init_l;
+init_d:
+    ret;
+}
+
+.visible .entry gpu_db_radix_histogram(
+    .param .u64 keys_ptr,
+    .param .u64 n,
+    .param .u32 shift,
+    .param .u64 chunk,
+    .param .u64 ndiv,
+    .param .u64 block_hist_ptr
+)
+{
+    .shared .align 4 .b32 s_hist[16];
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %shift;
+    .reg .u32 %d;
+    .reg .u32 %c;
+    .reg .u32 %t32;
+    .reg .u64 %keys;
+    .reg .u64 %n;
+    .reg .u64 %chunk;
+    .reg .u64 %G;
+    .reg .u64 %bh;
+    .reg .u64 %bid64;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %row;
+    .reg .u64 %iter;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %dig;
+
+    ld.param.u64 %keys, [keys_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u32 %shift, [shift];
+    ld.param.u64 %chunk, [chunk];
+    ld.param.u64 %G, [ndiv];
+    ld.param.u64 %bh, [block_hist_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra zskip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_hist;
+    add.u64 %addr, %addr, %o4;
+    mov.u32 %t32, 0;
+    st.shared.u32 [%addr], %t32;
+zskip:
+    bar.sync 0;
+
+    cvt.u64.u32 %bid64, %bid;
+    mul.lo.u64 %start, %bid64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p, %end, %n;
+    @%p mov.u64 %end, %n;
+
+    mov.u64 %iter, %start;
+hloop:
+    setp.ge.u64 %p, %iter, %end;
+    @%p bra hdone;
+    cvt.u64.u32 %o8, %lane;
+    add.u64 %row, %iter, %o8;
+    setp.ge.u64 %p, %row, %end;
+    @%p bra hskip;
+    mul.lo.u64 %o8, %row, 8;
+    add.u64 %addr, %keys, %o8;
+    ld.global.u64 %key, [%addr];
+    shr.u64 %dig, %key, %shift;
+    and.b64 %dig, %dig, 15;
+    cvt.u32.u64 %d, %dig;
+    mul.wide.u32 %o4, %d, 4;
+    mov.u64 %addr, s_hist;
+    add.u64 %addr, %addr, %o4;
+    atom.shared.add.u32 %t32, [%addr], 1;
+hskip:
+    cvt.u64.u32 %o8, %bdim;
+    add.u64 %iter, %iter, %o8;
+    bra hloop;
+hdone:
+    bar.sync 0;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra wskip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_hist;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    cvt.u64.u32 %o8, %lane;
+    mul.lo.u64 %o8, %o8, %G;
+    add.u64 %o8, %o8, %bid64;
+    mul.lo.u64 %o8, %o8, 4;
+    add.u64 %addr, %bh, %o8;
+    st.global.u32 [%addr], %c;
+wskip:
+    ret;
+}
+
+// Single-block parallel exclusive prefix sum over block_hist[0..total): each tile of `bdim`
+// elements is inclusive-scanned in shared memory (Hillis-Steele), written back as carry +
+// (inclusive - own), and the running `carry` chains across tiles. Replaces the old single-thread
+// serial scan (a sequential dependent-global-load bottleneck).
+.visible .entry gpu_db_radix_scan(
+    .param .u64 block_hist_ptr,
+    .param .u64 total
+)
+{
+    .shared .align 4 .b32 s[1024];
+    .reg .pred %p;
+    .reg .pred %p_in;
+    .reg .u32 %thr;
+    .reg .u32 %bdim;
+    .reg .u32 %d;
+    .reg .u32 %v;
+    .reg .u32 %orig;
+    .reg .u32 %recv;
+    .reg .u32 %carry;
+    .reg .u32 %tot;
+    .reg .u32 %t32;
+    .reg .u64 %bh;
+    .reg .u64 %total;
+    .reg .u64 %base;
+    .reg .u64 %i;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    ld.param.u64 %bh, [block_hist_ptr];
+    ld.param.u64 %total, [total];
+    mov.u32 %carry, 0;
+    mov.u64 %base, 0;
+tile_loop:
+    setp.ge.u64 %p, %base, %total;
+    @%p bra tile_done;
+    cvt.u64.u32 %o4, %thr;
+    add.u64 %i, %base, %o4;
+    setp.lt.u64 %p_in, %i, %total;
+    mov.u32 %v, 0;
+    @!%p_in bra loaded;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %bh, %o4;
+    ld.global.u32 %v, [%addr];
+loaded:
+    mov.u32 %orig, %v;
+    mul.wide.u32 %o4, %thr, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %v;
+    bar.sync 0;
+    mov.u32 %d, 1;
+hs_loop:
+    setp.ge.u32 %p, %d, %bdim;
+    @%p bra hs_done;
+    mov.u32 %recv, 0;
+    setp.lt.u32 %p, %thr, %d;
+    @%p bra hs_noread;
+    sub.u32 %t32, %thr, %d;
+    mul.wide.u32 %o4, %t32, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %recv, [%addr];
+hs_noread:
+    bar.sync 0;
+    setp.lt.u32 %p, %thr, %d;
+    @%p bra hs_nowrite;
+    mul.wide.u32 %o4, %thr, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %v, [%addr];
+    add.u32 %v, %v, %recv;
+    st.shared.u32 [%addr], %v;
+hs_nowrite:
+    bar.sync 0;
+    shl.b32 %d, %d, 1;
+    bra hs_loop;
+hs_done:
+    sub.u32 %t32, %bdim, 1;
+    mul.wide.u32 %o4, %t32, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %tot, [%addr];
+    @!%p_in bra skip_write;
+    mul.wide.u32 %o4, %thr, 4;
+    mov.u64 %addr, s;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %v, [%addr];
+    sub.u32 %v, %v, %orig;
+    add.u32 %v, %v, %carry;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %bh, %o4;
+    st.global.u32 [%addr], %v;
+skip_write:
+    add.u32 %carry, %carry, %tot;
+    bar.sync 0;
+    cvt.u64.u32 %o4, %bdim;
+    add.u64 %base, %base, %o4;
+    bra tile_loop;
+tile_done:
+    ret;
+}
+
+.visible .entry gpu_db_radix_scatter(
+    .param .u64 keys_src_ptr,
+    .param .u64 idx_src_ptr,
+    .param .u64 n,
+    .param .u32 shift,
+    .param .u64 chunk,
+    .param .u64 ndiv,
+    .param .u64 block_base_ptr,
+    .param .u64 keys_dst_ptr,
+    .param .u64 idx_dst_ptr
+)
+{
+    .shared .align 4 .b32 s_wh[128];
+    .shared .align 4 .b32 s_wb[128];
+    .shared .align 4 .b32 s_run[16];
+    .shared .align 4 .b32 s_tot[16];
+    .reg .pred %p;
+    .reg .pred %p_leader;
+    .reg .pred %p_valid;
+    .reg .pred %p_d16;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %warp;
+    .reg .u32 %nwarps;
+    .reg .u32 %lid;
+    .reg .u32 %lmlt;
+    .reg .u32 %shift;
+    .reg .u32 %d;
+    .reg .u32 %mask;
+    .reg .u32 %tmp;
+    .reg .u32 %wrank;
+    .reg .u32 %wcount;
+    .reg .u32 %run;
+    .reg .u32 %c;
+    .reg .u32 %base;
+    .reg .u32 %t32;
+    .reg .u32 %idxv;
+    .reg .u32 %bid;
+    .reg .u32 %w;
+    .reg .u64 %ks;
+    .reg .u64 %is;
+    .reg .u64 %n;
+    .reg .u64 %chunk;
+    .reg .u64 %G;
+    .reg .u64 %bb;
+    .reg .u64 %kd;
+    .reg .u64 %id;
+    .reg .u64 %bid64;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %iter;
+    .reg .u64 %row;
+    .reg .u64 %stride;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %dig;
+    .reg .u64 %pos;
+    .reg .u64 %digd;
+
+    ld.param.u64 %ks, [keys_src_ptr];
+    ld.param.u64 %is, [idx_src_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u32 %shift, [shift];
+    ld.param.u64 %chunk, [chunk];
+    ld.param.u64 %G, [ndiv];
+    ld.param.u64 %bb, [block_base_ptr];
+    ld.param.u64 %kd, [keys_dst_ptr];
+    ld.param.u64 %id, [idx_dst_ptr];
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %lid, %laneid;
+    mov.u32 %lmlt, %lanemask_lt;
+    shr.u32 %warp, %lane, 5;
+    add.u32 %tmp, %bdim, 31;
+    shr.u32 %nwarps, %tmp, 5;
+    cvt.u64.u32 %bid64, %bid;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra runzskip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_run;
+    add.u64 %addr, %addr, %o4;
+    mov.u32 %t32, 0;
+    st.shared.u32 [%addr], %t32;
+runzskip:
+    bar.sync 0;
+
+    mul.lo.u64 %start, %bid64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p, %end, %n;
+    @%p mov.u64 %end, %n;
+    cvt.u64.u32 %stride, %bdim;
+    mov.u64 %iter, %start;
+
+wave_loop:
+    setp.ge.u64 %p, %iter, %end;
+    @%p bra wave_done;
+    cvt.u64.u32 %o8, %lane;
+    add.u64 %row, %iter, %o8;
+    setp.lt.u64 %p_valid, %row, %end;
+
+    mov.u32 %d, 16;
+    @!%p_valid bra have_digit;
+    mul.lo.u64 %o8, %row, 8;
+    add.u64 %addr, %ks, %o8;
+    ld.global.u64 %key, [%addr];
+    shr.u64 %dig, %key, %shift;
+    and.b64 %dig, %dig, 15;
+    cvt.u32.u64 %d, %dig;
+have_digit:
+
+    setp.ge.u32 %p, %lid, 16;
+    @%p bra whz_skip;
+    mul.lo.u32 %tmp, %warp, 16;
+    add.u32 %tmp, %tmp, %lid;
+    mul.wide.u32 %o4, %tmp, 4;
+    mov.u64 %addr, s_wh;
+    add.u64 %addr, %addr, %o4;
+    mov.u32 %t32, 0;
+    st.shared.u32 [%addr], %t32;
+whz_skip:
+    bar.sync 0;
+
+    match.any.sync.b32 %mask, %d, 0xffffffff;
+    and.b32 %tmp, %mask, %lmlt;
+    popc.b32 %wrank, %tmp;
+    popc.b32 %wcount, %mask;
+    setp.eq.u32 %p_leader, %wrank, 0;
+    setp.lt.u32 %p_d16, %d, 16;
+    and.pred %p_leader, %p_leader, %p_d16;
+    @!%p_leader bra leader_skip;
+    mul.lo.u32 %tmp, %warp, 16;
+    add.u32 %tmp, %tmp, %d;
+    mul.wide.u32 %o4, %tmp, 4;
+    mov.u64 %addr, s_wh;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %wcount;
+leader_skip:
+    bar.sync 0;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra combine_skip;
+    mov.u32 %run, 0;
+    mov.u32 %w, 0;
+ccol_loop:
+    setp.ge.u32 %p, %w, %nwarps;
+    @%p bra ccol_done;
+    mul.lo.u32 %t32, %w, 16;
+    add.u32 %t32, %t32, %lane;
+    mul.wide.u32 %o4, %t32, 4;
+    mov.u64 %addr, s_wh;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    mov.u64 %addr, s_wb;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %run;
+    add.u32 %run, %run, %c;
+    add.u32 %w, %w, 1;
+    bra ccol_loop;
+ccol_done:
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_tot;
+    add.u64 %addr, %addr, %o4;
+    st.shared.u32 [%addr], %run;
+combine_skip:
+    bar.sync 0;
+
+    @!%p_valid bra after_scatter;
+    cvt.u64.u32 %digd, %d;
+    mul.lo.u64 %o8, %digd, %G;
+    add.u64 %o8, %o8, %bid64;
+    mul.lo.u64 %o8, %o8, 4;
+    add.u64 %addr, %bb, %o8;
+    ld.global.u32 %base, [%addr];
+    mul.wide.u32 %o4, %d, 4;
+    mov.u64 %addr, s_run;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %run, [%addr];
+    mul.lo.u32 %tmp, %warp, 16;
+    add.u32 %tmp, %tmp, %d;
+    mul.wide.u32 %o4, %tmp, 4;
+    mov.u64 %addr, s_wb;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    add.u32 %base, %base, %run;
+    add.u32 %base, %base, %c;
+    add.u32 %base, %base, %wrank;
+    cvt.u64.u32 %pos, %base;
+    mul.lo.u64 %o8, %pos, 8;
+    add.u64 %addr, %kd, %o8;
+    st.global.u64 [%addr], %key;
+    mul.lo.u64 %o8, %row, 4;
+    add.u64 %addr, %is, %o8;
+    ld.global.u32 %idxv, [%addr];
+    mul.lo.u64 %o8, %pos, 4;
+    add.u64 %addr, %id, %o8;
+    st.global.u32 [%addr], %idxv;
+after_scatter:
+    bar.sync 0;
+
+    setp.ge.u32 %p, %lane, 16;
+    @%p bra runupd_skip;
+    mul.wide.u32 %o4, %lane, 4;
+    mov.u64 %addr, s_tot;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %c, [%addr];
+    mov.u64 %addr, s_run;
+    add.u64 %addr, %addr, %o4;
+    ld.shared.u32 %run, [%addr];
+    add.u32 %run, %run, %c;
+    st.shared.u32 [%addr], %run;
+runupd_skip:
+    bar.sync 0;
+    add.u64 %iter, %iter, %stride;
+    bra wave_loop;
+wave_done:
+    ret;
+}
+"#;
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if n > u64::from(u32::MAX) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    let key_end = n
+        .checked_mul(std::mem::size_of::<i64>() as u64)
+        .and_then(|b| keys_byte_offset.checked_add(b))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if key_end > resident.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(key_end as usize));
+    }
+    let n_usize =
+        usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    // Contiguous partition: block `b` owns rows [b*chunk, min(b*chunk+chunk, n)). `chunk` is sized
+    // so the block count G stays within the grid-x max (65_535) for any n.
+    const BLOCK: u32 = 256;
+    // The scatter kernel's shared arrays s_wh[128]/s_wb[128] are sized for nwarps = BLOCK/32 = 8
+    // (128 = 16 digits * 8 warps), and the scan kernel's s[1024] + its 1024-thread launch assume
+    // that block. Raising BLOCK without resizing those hard-coded PTX shared arrays would corrupt
+    // shared memory, so pin it at compile time.
+    const _: () = assert!(
+        BLOCK == 256,
+        "radix PTX shared-memory sizes are hard-coded for BLOCK=256"
+    );
+    const CHUNK_ROWS: u64 = 2_048;
+    const MAX_GRID: u64 = 65_535;
+    let chunk = CHUNK_ROWS.max(n.div_ceil(MAX_GRID));
+    let grid_g_u64 = n.div_ceil(chunk);
+    let grid_g = u32::try_from(grid_g_u64)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let hist_len = grid_g_u64
+        .checked_mul(16)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let hist_len_usize = usize::try_from(hist_len)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let init_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_init", &ptx)?;
+    let hist_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_histogram", &ptx)?;
+    let scan_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_scan", &ptx)?;
+    let scatter_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_scatter", &ptx)?;
+
+    let primary = resident.primary();
+    let bytes8 = n_usize
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let bytes4 = n_usize
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let hist_bytes = hist_len_usize
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let keys_a = primary.lease_device_buffer(bytes8)?;
+    let keys_b = primary.lease_device_buffer(bytes8)?;
+    let idx_a = primary.lease_device_buffer(bytes4)?;
+    let idx_b = primary.lease_device_buffer(bytes4)?;
+    let block_hist = primary.lease_device_buffer(hist_bytes)?;
+
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let stream = lease
+        .pooled
+        .as_ref()
+        .expect("pooled stream just set")
+        .stream;
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    let src_keys_base = resident
+        .device_ptr()
+        .checked_add(keys_byte_offset)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mask: u64 = if descending {
+        0x7FFF_FFFF_FFFF_FFFF
+    } else {
+        0x8000_0000_0000_0000
+    };
+
+    // init: transform source keys into keys_a, idx_a = identity.
+    {
+        let mut src_arg = src_keys_base;
+        let mut n_arg = n;
+        let mut mask_arg = mask;
+        let mut ka_arg = keys_a.ptr;
+        let mut ia_arg = idx_a.ptr;
+        let mut init_args = [
+            (&mut src_arg as *mut u64).cast::<c_void>(),
+            (&mut n_arg as *mut u64).cast::<c_void>(),
+            (&mut mask_arg as *mut u64).cast::<c_void>(),
+            (&mut ka_arg as *mut u64).cast::<c_void>(),
+            (&mut ia_arg as *mut u64).cast::<c_void>(),
+        ];
+        let init_grid = n.div_ceil(u64::from(BLOCK)).clamp(1, MAX_GRID) as u32;
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                init_fn,
+                init_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                init_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+    }
+
+    // 16 LSD passes of 4 bits, ping-ponging (keys/idx) a<->b.
+    let mut keys_src = keys_a.ptr;
+    let mut keys_dst = keys_b.ptr;
+    let mut idx_src = idx_a.ptr;
+    let mut idx_dst = idx_b.ptr;
+    for pass in 0u32..16 {
+        let mut shift_arg = pass * 4;
+        let mut n_arg = n;
+        let mut chunk_arg = chunk;
+        let mut g_arg = grid_g_u64;
+        let mut bh_arg = block_hist.ptr;
+        let mut total_arg = hist_len;
+
+        // histogram (reads keys_src)
+        let mut ksrc_arg = keys_src;
+        let mut hist_args = [
+            (&mut ksrc_arg as *mut u64).cast::<c_void>(),
+            (&mut n_arg as *mut u64).cast::<c_void>(),
+            (&mut shift_arg as *mut u32).cast::<c_void>(),
+            (&mut chunk_arg as *mut u64).cast::<c_void>(),
+            (&mut g_arg as *mut u64).cast::<c_void>(),
+            (&mut bh_arg as *mut u64).cast::<c_void>(),
+        ];
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                hist_fn,
+                grid_g,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                hist_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        // scan (single block, exclusive prefix over the 16*G matrix)
+        let mut scan_args = [
+            (&mut bh_arg as *mut u64).cast::<c_void>(),
+            (&mut total_arg as *mut u64).cast::<c_void>(),
+        ];
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                scan_fn,
+                1,
+                1,
+                1,
+                1_024,
+                1,
+                1,
+                0,
+                stream,
+                scan_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        // scatter (reads keys_src/idx_src, writes keys_dst/idx_dst)
+        let mut isrc_arg = idx_src;
+        let mut kdst_arg = keys_dst;
+        let mut idst_arg = idx_dst;
+        let mut scatter_args = [
+            (&mut ksrc_arg as *mut u64).cast::<c_void>(),
+            (&mut isrc_arg as *mut u64).cast::<c_void>(),
+            (&mut n_arg as *mut u64).cast::<c_void>(),
+            (&mut shift_arg as *mut u32).cast::<c_void>(),
+            (&mut chunk_arg as *mut u64).cast::<c_void>(),
+            (&mut g_arg as *mut u64).cast::<c_void>(),
+            (&mut bh_arg as *mut u64).cast::<c_void>(),
+            (&mut kdst_arg as *mut u64).cast::<c_void>(),
+            (&mut idst_arg as *mut u64).cast::<c_void>(),
+        ];
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                scatter_fn,
+                grid_g,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                scatter_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        std::mem::swap(&mut keys_src, &mut keys_dst);
+        std::mem::swap(&mut idx_src, &mut idx_dst);
+    }
+
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    resident.record_kernel_event_elapsed_us(None);
+
+    // After 16 (even) passes the final result is in the buffer `idx_src` now points at.
+    let mut indices = vec![0_u32; n_usize];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            indices.as_mut_ptr().cast::<c_void>(),
+            idx_src,
+            n_usize * std::mem::size_of::<u32>(),
+        )
+    })
+    .map_err(drain_err)?;
+    drop(lease);
+    Ok(indices)
+}
+
+/// Serial single-thread GPU LSD-radix argsort — the GPU-native parity ORACLE + benchmark
+/// baseline for the parallel `launch_cuda_resident_i64_argsort_radix` (S3). One device thread
+/// runs a textbook stable counting sort: 16 LSD passes of 4 bits each over a signed→unsigned
+/// key transform (XOR `mask`: 0x8000…0 ascending so i64 order == u64 order; 0x7FFF…F descending
+/// = the complement, so one ascending radix yields descending keys with the SAME ascending-index
+/// tie-break — stable in both directions). Obviously correct + stable (serial in-order scatter),
+/// so the parallel version is validated against THIS (same algorithm → isolates parallelization
+/// bugs) as well as the independently-verified bitonic arm. Test-only; never on the hot path.
+#[cfg(test)]
+fn launch_cuda_resident_i64_argsort_radix_serial(
+    resident: &CudaResidentDeviceMemory,
+    keys_byte_offset: u64,
+    n: u64,
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_radix_argsort_serial(
+    .param .u64 keys_src_ptr,
+    .param .u64 n,
+    .param .u64 mask,
+    .param .u64 keys_a_ptr,
+    .param .u64 keys_b_ptr,
+    .param .u64 idx_a_ptr,
+    .param .u64 idx_b_ptr,
+    .param .u64 hist_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %thr;
+    .reg .u32 %bid;
+    .reg .u32 %lane32;
+    .reg .u32 %pass;
+    .reg .u32 %shift;
+    .reg .u32 %d;
+    .reg .u32 %cnt;
+    .reg .u32 %run;
+    .reg .u32 %tmp;
+    .reg .u32 %idxv;
+    .reg .u32 %pos;
+    .reg .u64 %src;
+    .reg .u64 %n;
+    .reg .u64 %mask;
+    .reg .u64 %ka;
+    .reg .u64 %kb;
+    .reg .u64 %ia;
+    .reg .u64 %ib;
+    .reg .u64 %hist;
+    .reg .u64 %i;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %dig;
+
+    // Single-thread oracle: only (block 0, thread 0) executes; the rest return.
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bid, %ctaid.x;
+    or.b32 %lane32, %thr, %bid;
+    setp.ne.u32 %p, %lane32, 0;
+    @%p bra done;
+
+    ld.param.u64 %src, [keys_src_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %ka, [keys_a_ptr];
+    ld.param.u64 %kb, [keys_b_ptr];
+    ld.param.u64 %ia, [idx_a_ptr];
+    ld.param.u64 %ib, [idx_b_ptr];
+    ld.param.u64 %hist, [hist_ptr];
+
+    // init: keys_a[i] = key[i] XOR mask ; idx_a[i] = i
+    mov.u64 %i, 0;
+init_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra init_done;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %src, %o8;
+    ld.global.u64 %key, [%addr];
+    xor.b64 %key, %key, %mask;
+    add.u64 %addr, %ka, %o8;
+    st.global.u64 [%addr], %key;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %ia, %o4;
+    cvt.u32.u64 %idxv, %i;
+    st.global.u32 [%addr], %idxv;
+    add.u64 %i, %i, 1;
+    bra init_loop;
+init_done:
+
+    mov.u32 %pass, 0;
+pass_loop:
+    setp.ge.u32 %p, %pass, 16;
+    @%p bra pass_done;
+    mul.lo.u32 %shift, %pass, 4;
+
+    // zero hist[0..16)
+    mov.u32 %d, 0;
+hz_loop:
+    setp.ge.u32 %p, %d, 16;
+    @%p bra hz_done;
+    mul.wide.u32 %o4, %d, 4;
+    add.u64 %addr, %hist, %o4;
+    mov.u32 %tmp, 0;
+    st.global.u32 [%addr], %tmp;
+    add.u32 %d, %d, 1;
+    bra hz_loop;
+hz_done:
+
+    // count: hist[digit(keys_a[i])]++
+    mov.u64 %i, 0;
+count_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra count_done;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %ka, %o8;
+    ld.global.u64 %key, [%addr];
+    shr.u64 %dig, %key, %shift;
+    and.b64 %dig, %dig, 15;
+    cvt.u32.u64 %d, %dig;
+    mul.wide.u32 %o4, %d, 4;
+    add.u64 %addr, %hist, %o4;
+    ld.global.u32 %cnt, [%addr];
+    add.u32 %cnt, %cnt, 1;
+    st.global.u32 [%addr], %cnt;
+    add.u64 %i, %i, 1;
+    bra count_loop;
+count_done:
+
+    // exclusive scan: run=0; for d: t=hist[d]; hist[d]=run; run+=t
+    mov.u32 %run, 0;
+    mov.u32 %d, 0;
+scan_loop:
+    setp.ge.u32 %p, %d, 16;
+    @%p bra scan_done;
+    mul.wide.u32 %o4, %d, 4;
+    add.u64 %addr, %hist, %o4;
+    ld.global.u32 %cnt, [%addr];
+    st.global.u32 [%addr], %run;
+    add.u32 %run, %run, %cnt;
+    add.u32 %d, %d, 1;
+    bra scan_loop;
+scan_done:
+
+    // stable scatter (in input order): pos = hist[d]++ ; keys_b[pos]=key ; idx_b[pos]=idx_a[i]
+    mov.u64 %i, 0;
+scatter_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra scatter_done;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %ka, %o8;
+    ld.global.u64 %key, [%addr];
+    shr.u64 %dig, %key, %shift;
+    and.b64 %dig, %dig, 15;
+    cvt.u32.u64 %d, %dig;
+    mul.wide.u32 %o4, %d, 4;
+    add.u64 %addr, %hist, %o4;
+    ld.global.u32 %pos, [%addr];
+    add.u32 %tmp, %pos, 1;
+    st.global.u32 [%addr], %tmp;
+    // keys_b[pos] = key
+    mul.wide.u32 %o8, %pos, 8;
+    add.u64 %addr, %kb, %o8;
+    st.global.u64 [%addr], %key;
+    // idx_b[pos] = idx_a[i]
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %ia, %o4;
+    ld.global.u32 %idxv, [%addr];
+    mul.wide.u32 %o4, %pos, 4;
+    add.u64 %addr, %ib, %o4;
+    st.global.u32 [%addr], %idxv;
+    add.u64 %i, %i, 1;
+    bra scatter_loop;
+scatter_done:
+
+    // copy b -> a (keys + idx) so the next pass reads from a
+    mov.u64 %i, 0;
+copy_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra copy_done;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %kb, %o8;
+    ld.global.u64 %key, [%addr];
+    add.u64 %addr, %ka, %o8;
+    st.global.u64 [%addr], %key;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %ib, %o4;
+    ld.global.u32 %idxv, [%addr];
+    add.u64 %addr, %ia, %o4;
+    st.global.u32 [%addr], %idxv;
+    add.u64 %i, %i, 1;
+    bra copy_loop;
+copy_done:
+
+    add.u32 %pass, %pass, 1;
+    bra pass_loop;
+pass_done:
+done:
+    ret;
+}
+"#;
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if n > u64::from(u32::MAX) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    let key_end = n
+        .checked_mul(std::mem::size_of::<i64>() as u64)
+        .and_then(|b| keys_byte_offset.checked_add(b))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if key_end > resident.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(key_end as usize));
+    }
+    let n_usize =
+        usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_radix_argsort_serial", &ptx)?;
+
+    let primary = resident.primary();
+    let bytes8 = n_usize
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let bytes4 = n_usize
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let keys_a = primary.lease_device_buffer(bytes8)?;
+    let keys_b = primary.lease_device_buffer(bytes8)?;
+    let idx_a = primary.lease_device_buffer(bytes4)?;
+    let idx_b = primary.lease_device_buffer(bytes4)?;
+    let hist = primary.lease_device_buffer(16 * std::mem::size_of::<u32>())?;
+
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let stream = lease
+        .pooled
+        .as_ref()
+        .expect("pooled stream just set")
+        .stream;
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    let mut src_arg = resident
+        .device_ptr()
+        .checked_add(keys_byte_offset)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut n_arg = n;
+    let mut mask_arg: u64 = if descending {
+        0x7FFF_FFFF_FFFF_FFFF
+    } else {
+        0x8000_0000_0000_0000
+    };
+    let mut ka_arg = keys_a.ptr;
+    let mut kb_arg = keys_b.ptr;
+    let mut ia_arg = idx_a.ptr;
+    let mut ib_arg = idx_b.ptr;
+    let mut hist_arg = hist.ptr;
+    let mut args = [
+        (&mut src_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut mask_arg as *mut u64).cast::<c_void>(),
+        (&mut ka_arg as *mut u64).cast::<c_void>(),
+        (&mut kb_arg as *mut u64).cast::<c_void>(),
+        (&mut ia_arg as *mut u64).cast::<c_void>(),
+        (&mut ib_arg as *mut u64).cast::<c_void>(),
+        (&mut hist_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    resident.record_kernel_event_elapsed_us(None);
+
+    let mut indices = vec![0_u32; n_usize];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            indices.as_mut_ptr().cast::<c_void>(),
+            idx_a.ptr,
+            n_usize * std::mem::size_of::<u32>(),
+        )
+    })
+    .map_err(drain_err)?;
+    drop(lease);
+    Ok(indices)
+}
+
 fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     resident: &R,
     byte_offset: u64,
@@ -15103,6 +16260,147 @@ mod tests {
                 ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
             }
             println!("| {n} | {ms:.3} |");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_radix_argsort_parallel_matches_serial_and_bitonic() {
+        // P2 §9.5/S3 — validate the PARALLEL tiled radix against TWO GPU-native oracles: the serial
+        // single-thread radix (SAME algorithm → isolates parallelization/scan bugs) and the
+        // independently-verified bitonic arm (DIFFERENT algorithm → cross-checks semantics). All
+        // three are stable with the SAME ascending-index tie-break, so for identical inputs the
+        // returned permutations must be BYTE-IDENTICAL in both directions. GPU-vs-GPU; no CPU oracle.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let retain_keys = |keys: &[i64]| {
+            let n = keys.len() as u64;
+            // SAFETY: `i64` is POD; native bytes; `keys` outlives the synchronous retain copy.
+            let key_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(keys.as_ptr().cast::<u8>(), keys.len() * 8) };
+            let header = n.to_le_bytes();
+            let off = std::mem::size_of::<u64>() as u64;
+            let allocated = off + key_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: off,
+                            bytes: key_bytes,
+                        },
+                    ],
+                )
+                .expect("retain keys");
+            (resident, off)
+        };
+
+        let mut cases: Vec<Vec<i64>> = Vec::new();
+        for &n in &[1_usize, 2, 7, 16, 17, 100, 1_000, 4_096, 5_000] {
+            cases.push(
+                (0..n)
+                    .map(|i| (((i as u64).wrapping_mul(2_654_435_761) % 1_000) as i64) - 500)
+                    .collect(),
+            );
+        }
+        let (mn, mx) = (i64::MIN, i64::MAX);
+        cases.push(vec![mx; 64]); // all == asc sentinel
+        cases.push(vec![mn; 64]); // all == desc sentinel
+        cases.push(vec![mn, mx, 0, mx, mn, 7, mx, mn, -1, mx]); // mixed, non-pow-2
+        cases.push((0..300).map(|i| if i % 2 == 0 { mn } else { mx }).collect());
+        cases.push((0..1_000).map(|i| (i % 3) as i64 - 1).collect()); // dup-heavy
+
+        for keys in &cases {
+            let n = keys.len() as u64;
+            for &desc in &[false, true] {
+                let (resident, off) = retain_keys(keys);
+                let parallel = launch_cuda_resident_i64_argsort_radix(&resident, off, n, desc)
+                    .expect("parallel radix");
+                let serial = launch_cuda_resident_i64_argsort_radix_serial(&resident, off, n, desc)
+                    .expect("serial radix");
+                let bitonic = launch_cuda_resident_i64_argsort_bitonic(&resident, off, n, desc)
+                    .expect("bitonic");
+                assert_eq!(
+                    parallel, serial,
+                    "parallel radix != serial radix for n={n} descending={desc}"
+                );
+                assert_eq!(
+                    parallel, bitonic,
+                    "parallel radix != bitonic for n={n} descending={desc}"
+                );
+            }
+        }
+
+        // Large-n parity crossing the multi-tile scan boundary: the scan handles 1024 entries per
+        // tile, so its cross-tile carry chain only engages once 16*G > 1024, i.e. G > 64, i.e.
+        // n > 64*chunk = 131072. These sizes also force many grid-stride waves per block. Validated
+        // against the (fast, parallel) bitonic arm; the single-thread serial oracle is too slow here.
+        for &n in &[131_073_usize, 200_000, 300_000] {
+            let keys: Vec<i64> = (0..n)
+                .map(|i| {
+                    (((i as u64).wrapping_mul(11_400_714_819_323_198_485) >> 33) as i64)
+                        - (n as i64 / 2)
+                })
+                .collect();
+            let nn = n as u64;
+            for &desc in &[false, true] {
+                let (resident, off) = retain_keys(&keys);
+                let parallel = launch_cuda_resident_i64_argsort_radix(&resident, off, nn, desc)
+                    .expect("parallel radix large-n");
+                let bitonic = launch_cuda_resident_i64_argsort_bitonic(&resident, off, nn, desc)
+                    .expect("bitonic large-n");
+                assert_eq!(
+                    parallel, bitonic,
+                    "parallel radix != bitonic for large n={n} descending={desc} (multi-tile scan)"
+                );
+            }
+        }
+
+        // Benchmark: parallel radix vs the bitonic arm (S2) vs the serial radix oracle, across N.
+        // This (a) proves the parallel radix beats its serial oracle, and (b) locates the bitonic
+        // -> radix CROSSOVER that the S4 adaptive dispatch will use. Serial is single-thread, so it
+        // is only timed up to 10k (it would take seconds at 1M).
+        use std::time::Instant;
+        let bench = |f: &dyn Fn() -> Vec<u32>| -> f64 {
+            let mut ms = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let out = f();
+                std::hint::black_box(&out);
+                ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ms
+        };
+        println!("p2_m2_s3_radix_argsort: latency vs N (ascending, best-of-3)");
+        println!("| n | bitonic ms | radix ms | serial ms | radix vs bitonic |");
+        println!("|---:|---:|---:|---:|---:|");
+        for &n in &[100_usize, 1_000, 10_000, 100_000, 1_000_000, 10_000_000] {
+            let keys: Vec<i64> = (0..n)
+                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % n.max(1) as u64) as i64)
+                .collect();
+            let (resident, off) = retain_keys(&keys);
+            let nn = n as u64;
+            let bitonic_ms = bench(&|| {
+                launch_cuda_resident_i64_argsort_bitonic(&resident, off, nn, false).unwrap()
+            });
+            let radix_ms = bench(&|| {
+                launch_cuda_resident_i64_argsort_radix(&resident, off, nn, false).unwrap()
+            });
+            let serial_str = if n <= 10_000 {
+                let serial_ms = bench(&|| {
+                    launch_cuda_resident_i64_argsort_radix_serial(&resident, off, nn, false)
+                        .unwrap()
+                });
+                format!("{serial_ms:.3}")
+            } else {
+                "-".to_string()
+            };
+            let speedup = bitonic_ms / radix_ms;
+            println!("| {n} | {bitonic_ms:.3} | {radix_ms:.3} | {serial_str} | {speedup:.2}x |");
         }
     }
 }
