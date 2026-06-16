@@ -713,6 +713,17 @@ GPU-native target is GPU-resident, never the CPU path.
   forbidden response cache; close the COPY ingest gap vs PostgreSQL. (Write throughput
   here depends on **Phase 4's group-commit / WAL-fsync optimization**; read-under-write
   throughput on the lock-free read path + the **Phase 7** data-structure sweep.)
+- **Pinned-host D2H evaluation (deferred optimization).** Result-materialization
+  D2H copies currently target pageable host memory; for large result transfers
+  (e.g. the kernel-less full-column projection route, §1.4) the device→host bus
+  transfer is the floor (a 64MB projection measured ~42 ms / ~1.5 GB/s pageable on
+  RTX 6000 Blackwell). Pinned host buffers would let the D2H run at bus rate, but
+  the engine-native `Vec` return forces a pinned→`Vec` host memcpy that eats part
+  of the gain, so the net win is unclear. **Evaluate pinned host memory against the
+  full benchmark harness above** (latency AND throughput, across route/result
+  sizes) before adopting — do not adopt blind; this is a **later optimization
+  stage**, not a spine gate. Bounded OLTP projections (20–50 rows) do not need it.
+  Decide: default, opt-in by result size, or skip.
 - **Exit:** published, reproducible curves meeting the `§1.1` targets on the
   execute-from-snapshot path.
 
