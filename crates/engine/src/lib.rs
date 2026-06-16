@@ -25,19 +25,19 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_snapshot::{SnapshotCell, SnapshotHandle};
 use gpu_db_sql::{
-    parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
-    ColumnDef, ColumnDefault, Command, CommentTarget, CopyColumn, CopyFromStdin, CreateDatabase,
-    CreateDomain, CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication,
-    CreateRole, CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace,
-    CreateView, DatabasePrivilege, Decimal128, Delete, DropConstraint, DropDatabase, DropDomain,
-    DropExtension, DropIndex, DropMaterializedView, DropPublication, DropRole, DropSchema,
-    DropSequence, DropSubscription, DropTable, DropTablespace, DropView, FunctionPrivilege, Insert,
-    ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
-    RenameDatabase, RenameFunction, RenameIndex, RenameMaterializedView, RenameRole,
-    RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
-    SelectFilterOp, SelectFunction, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType,
-    SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
-    NUMERIC_DEFAULT_PRECISION,
+    parse_command, parse_command_allowing_catalog, AclRelationKind, AddCheckConstraint,
+    AddForeignKey, AddUniqueConstraint, ColumnDef, ColumnDefault, Command, CommentTarget,
+    CopyColumn, CopyFromStdin, CreateDatabase, CreateDomain, CreateExtension, CreateIndex,
+    CreateMaterializedView, CreatePublication, CreateRole, CreateSchema, CreateSequence,
+    CreateSubscription, CreateTable, CreateTablespace, CreateView, DatabasePrivilege, Decimal128,
+    Delete, DropConstraint, DropDatabase, DropDomain, DropExtension, DropIndex,
+    DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
+    DropTable, DropTablespace, DropView, FunctionPrivilege, Insert, ParseError, PublicationTarget,
+    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
+    RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace,
+    RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectProjection,
+    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege,
+    TruncateTable, Update, NUMERIC_DEFAULT_PRECISION,
 };
 use gpu_db_storage::{
     InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore, TupleVersion,
@@ -9129,6 +9129,161 @@ fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
     }
 }
 
+// ============================================================================
+// Phase-3 M2 — engine-native pg_catalog / information_schema (single-relation).
+//
+// A SELECT against a catalog relation (qualified `pg_catalog.pg_class`, or bare
+// `pg_class` via the implicit pg_catalog search path) is answered by synthesizing the
+// relation's rows from the pinned `CatalogSnapshot` and running them through the SAME
+// bind -> filter -> project -> order/limit pipeline as a user table, so introspection is
+// MVCC-consistent and reuses the relational core. Multi-relation JOIN catalog queries
+// (psql's `\d` family) are NOT handled here — the executor has no joins yet (a later
+// milestone); this is the single-relation data layer.
+//
+// Catalog columns whose PostgreSQL type the engine lacks (`oid`, `name`, `char`) are
+// mapped to the nearest engine type (oid -> int4, name/char -> text) — the VALUES are
+// faithful. NULL-bearing columns are omitted until the value model gains NULL (M3).
+// ============================================================================
+
+/// The OID PostgreSQL assigns the `public` schema — the one namespace every engine
+/// relation lives in (the engine models only the `public` user schema).
+const PG_PUBLIC_NAMESPACE_OID: i32 = 2200;
+/// The `pg_catalog` system-schema OID (fixed in PostgreSQL).
+const PG_CATALOG_NAMESPACE_OID: i32 = 11;
+/// A representative `information_schema` namespace OID (its real OID varies per cluster).
+const PG_INFORMATION_SCHEMA_NAMESPACE_OID: i32 = 13183;
+/// The bootstrap superuser OID used as every relation/namespace owner.
+const PG_BOOTSTRAP_OWNER_OID: i32 = 10;
+
+/// Build a transient in-memory [`RelationalTable`] describing a catalog relation's fixed
+/// columns. Only `columns` (and a nominal `oid`) are consulted by the bind/finalize path.
+fn catalog_relation_table(name: &str, columns: &[(&str, SqlType)]) -> RelationalTable {
+    let columns = columns
+        .iter()
+        .enumerate()
+        .map(|(idx, (col_name, ty))| RelationalColumn {
+            id: 0,
+            table_oid: 0,
+            attnum: (idx + 1) as i16,
+            name: (*col_name).to_string(),
+            ty: *ty,
+            domain: None,
+            default: None,
+            type_oid: ty.postgres_oid(),
+            type_size: ty.type_size(),
+        })
+        .collect();
+    RelationalTable {
+        schema: "pg_catalog".to_string(),
+        name: name.to_string(),
+        oid: 0,
+        columns,
+        indexes: Vec::new(),
+        check_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+        acl: BTreeMap::new(),
+    }
+}
+
+/// `pg_catalog.pg_namespace` — one row per schema. The engine models the `public` user
+/// schema (when present) plus the always-exposed `pg_catalog`/`information_schema`.
+fn synthesize_pg_namespace(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<Vec<SqlValue>>) {
+    let table = catalog_relation_table(
+        "pg_namespace",
+        &[
+            ("oid", SqlType::Int4),
+            ("nspname", SqlType::Text),
+            ("nspowner", SqlType::Int4),
+        ],
+    );
+    let owner = SqlValue::Int4(PG_BOOTSTRAP_OWNER_OID);
+    let mut rows = vec![
+        vec![
+            SqlValue::Int4(PG_CATALOG_NAMESPACE_OID),
+            SqlValue::Text("pg_catalog".to_string()),
+            owner.clone(),
+        ],
+        vec![
+            SqlValue::Int4(PG_INFORMATION_SCHEMA_NAMESPACE_OID),
+            SqlValue::Text("information_schema".to_string()),
+            owner.clone(),
+        ],
+    ];
+    if catalog.relational_public_schema_exists {
+        rows.push(vec![
+            SqlValue::Int4(PG_PUBLIC_NAMESPACE_OID),
+            SqlValue::Text("public".to_string()),
+            owner,
+        ]);
+    }
+    (table, rows)
+}
+
+/// `pg_catalog.pg_class` — one row per relation (table `r`, view `v`, materialized view
+/// `m`, sequence `S`), synthesized from the catalog's relation maps.
+fn synthesize_pg_class(catalog: &CatalogSnapshot) -> (RelationalTable, Vec<Vec<SqlValue>>) {
+    let table = catalog_relation_table(
+        "pg_class",
+        &[
+            ("oid", SqlType::Int4),
+            ("relname", SqlType::Text),
+            ("relnamespace", SqlType::Int4),
+            ("relkind", SqlType::Text),
+            ("relnatts", SqlType::Int4),
+            ("relowner", SqlType::Int4),
+            ("relhasindex", SqlType::Bool),
+        ],
+    );
+    let namespace = SqlValue::Int4(PG_PUBLIC_NAMESPACE_OID);
+    let owner = SqlValue::Int4(PG_BOOTSTRAP_OWNER_OID);
+    let row = |oid: u32, name: &str, kind: &str, natts: usize, has_index: bool| {
+        vec![
+            SqlValue::Int4(oid as i32),
+            SqlValue::Text(name.to_string()),
+            namespace.clone(),
+            SqlValue::Text(kind.to_string()),
+            SqlValue::Int4(natts as i32),
+            owner.clone(),
+            SqlValue::Bool(has_index),
+        ]
+    };
+    let mut rows = Vec::new();
+    for t in catalog.relational_catalog.values() {
+        rows.push(row(
+            t.oid,
+            &t.name,
+            "r",
+            t.columns.len(),
+            !t.indexes.is_empty(),
+        ));
+    }
+    for v in catalog.relational_views.values() {
+        rows.push(row(v.oid, &v.name, "v", 0, false));
+    }
+    for mv in catalog.relational_materialized_views.values() {
+        rows.push(row(mv.oid, &mv.name, "m", mv.columns.len(), false));
+    }
+    for s in catalog.relational_sequences.values() {
+        rows.push(row(s.oid, &s.name, "S", 0, false));
+    }
+    (table, rows)
+}
+
+/// Route a SELECT's FROM relation to a synthesized catalog relation, or `None` if it is
+/// not a catalog relation (then it resolves as a user table). `pg_catalog` relations match
+/// qualified (`pg_catalog.pg_class`) or bare (`pg_class`); `information_schema` is qualified.
+fn synthesize_catalog_relation(
+    name: &str,
+    catalog: &CatalogSnapshot,
+) -> Option<(RelationalTable, Vec<Vec<SqlValue>>)> {
+    let relation = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    match relation {
+        "pg_namespace" => Some(synthesize_pg_namespace(catalog)),
+        "pg_class" => Some(synthesize_pg_class(catalog)),
+        _ => None,
+    }
+}
+
 fn encode_relational_row(values: &[SqlValue]) -> String {
     values
         .iter()
@@ -17698,6 +17853,22 @@ impl Engine {
         self.execute_relational_select_instrumented(select, || {})
     }
 
+    /// Parse and execute a relational SELECT from text, accepting native
+    /// `pg_catalog`/`information_schema` catalog relations (Phase-3 M2). This is the
+    /// text -> rows entry a consolidated server uses for catalog introspection; user SQL
+    /// without a catalog reference parses and runs exactly as via the strict path.
+    pub fn execute_relational_select_text(
+        &self,
+        text: &str,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        match parse_command_allowing_catalog(text)? {
+            Command::Select(select) => self.execute_relational_select(&select),
+            _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "expected a SELECT statement".to_string(),
+            ))),
+        }
+    }
+
     /// [`Engine::execute_relational_select`] with a hook invoked at the START of the read — AFTER the
     /// reader would load its pin boundary but conceptually BEFORE it binds the catalog / pins data
     /// (PART B test seam). The concurrency-correctness suite uses this to rendezvous a reader at a
@@ -17755,6 +17926,37 @@ impl Engine {
                 fallback_reason: Some(FallbackReason::NotGpuEligible),
                 access_path: RelationalAccessPath::FullTableScan,
             });
+        }
+        // Phase-3 M2: a SELECT against a synthesized pg_catalog/information_schema relation
+        // runs through the SAME bind -> filter -> project -> order/limit core as a user
+        // table, over rows projected from this pinned catalog generation (MVCC-consistent).
+        // Resolved AFTER user tables/views so a real relation always shadows a catalog name.
+        if !catalog.relational_catalog.contains_key(&select.table) {
+            if let Some((catalog_table, catalog_rows)) =
+                synthesize_catalog_relation(&select.table, &catalog)
+            {
+                let bound = bind_relational_select(&catalog_table, select)?;
+                let result = MvccReadResult {
+                    planned_target: DeviceTarget::Cpu,
+                    executed_target: DeviceTarget::Cpu,
+                    fallback_reason: Some(FallbackReason::NotGpuEligible),
+                    rows: catalog_rows
+                        .iter()
+                        .map(|row| MvccReadRow {
+                            source_key: None,
+                            key: None,
+                            value: Some(encode_relational_row(row)),
+                        })
+                        .collect(),
+                };
+                return self.finalize_relational_select(
+                    select,
+                    catalog_table,
+                    bound,
+                    RelationalAccessPath::FullTableScan,
+                    result,
+                );
+            }
         }
         let resident_route = self.plan_relational_resident_route(select);
         if resident_route.accepted {
@@ -50700,6 +50902,71 @@ mod tests {
         assert!(e
             .execute_text(6, "CREATE TABLE bad (x NUMERIC(10,2) DEFAULT 'oops')")
             .is_err());
+    }
+
+    #[test]
+    fn engine_answers_single_relation_pg_catalog_queries() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE TABLE orders (id INT)").unwrap();
+        // The catalog-aware parse entry carries pg_catalog/information_schema qualifiers;
+        // the strict parse_command (legacy server) keeps rejecting them.
+        let run = |e: &Engine, sql: &str| {
+            let Command::Select(s) = parse_command_allowing_catalog(sql).unwrap() else {
+                panic!("expected SELECT");
+            };
+            e.execute_relational_select(&s).unwrap().rows
+        };
+        // pg_namespace synthesizes the public schema (queried via the normal WHERE path).
+        assert_eq!(
+            run(
+                &e,
+                "SELECT nspname FROM pg_namespace WHERE nspname = 'public'"
+            ),
+            vec![vec![SqlValue::Text("public".to_string())]]
+        );
+        // pg_class: both tables, resolvable BARE (implicit pg_catalog search path) with
+        // WHERE + ORDER BY routed through the standard relational SELECT machinery.
+        assert_eq!(
+            run(
+                &e,
+                "SELECT relname FROM pg_class WHERE relkind = 'r' ORDER BY relname"
+            ),
+            vec![
+                vec![SqlValue::Text("orders".to_string())],
+                vec![SqlValue::Text("people".to_string())],
+            ]
+        );
+        // ...and QUALIFIED (pg_catalog.pg_class), which the parser now carries to the engine.
+        assert_eq!(
+            run(
+                &e,
+                "SELECT relname FROM pg_catalog.pg_class WHERE relname = 'people'"
+            ),
+            vec![vec![SqlValue::Text("people".to_string())]]
+        );
+        // relnatts/relkind are synthesized from the live catalog (people has 2 columns).
+        assert_eq!(
+            run(&e, "SELECT relnatts FROM pg_class WHERE relname = 'people'"),
+            vec![vec![SqlValue::Int4(2)]]
+        );
+        // Aggregates reuse the same path.
+        assert_eq!(
+            run(&e, "SELECT COUNT(*) FROM pg_class WHERE relkind = 'r'"),
+            vec![vec![SqlValue::Int8(2)]]
+        );
+        // A real user table always shadows a catalog name; an unknown catalog relation errors.
+        assert_eq!(
+            run(&e, "SELECT id FROM people WHERE id = 0"),
+            Vec::<Vec<SqlValue>>::new()
+        );
+        let Command::Select(bad) =
+            parse_command_allowing_catalog("SELECT * FROM pg_catalog.pg_does_not_exist").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        assert!(e.execute_relational_select(&bad).is_err());
     }
 
     #[test]

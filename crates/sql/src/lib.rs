@@ -2267,7 +2267,10 @@ fn strip_set_scope_prefix<'a>(input: &'a str, scope: &str) -> Option<&'a str> {
     Some(after_scope.trim_start())
 }
 
-fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> {
+fn parse_relational_command(
+    input: &str,
+    allow_catalog_schemas: bool,
+) -> Option<Result<Command, ParseError>> {
     let first = input.split_whitespace().next()?;
     if first.eq_ignore_ascii_case("CREATE") {
         let second = input.split_whitespace().nth(1)?;
@@ -2527,7 +2530,7 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if let Ok(function_command) = parse_select_function(input) {
             return Some(Ok(function_command));
         }
-        return Some(parse_select(input).map(Command::Select));
+        return Some(parse_select(input, allow_catalog_schemas).map(Command::Select));
     }
     None
 }
@@ -3683,7 +3686,7 @@ fn parse_create_view(input: &str) -> Result<CreateView, ParseError> {
     {
         return Err(ParseError::InvalidRelationalSql);
     }
-    let query = parse_select(definition)?;
+    let query = parse_select(definition, false)?;
     if query.table == name {
         return Err(ParseError::InvalidRelationalSql);
     }
@@ -3808,7 +3811,7 @@ fn parse_create_materialized_view(input: &str) -> Result<CreateMaterializedView,
     if definition.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
-    let query = parse_select(definition)?;
+    let query = parse_select(definition, false)?;
     if query.table == name {
         return Err(ParseError::InvalidRelationalSql);
     }
@@ -5657,7 +5660,7 @@ fn parse_update_assignment(input: &str) -> Result<UpdateAssignment, ParseError> 
     Ok(UpdateAssignment { column, value })
 }
 
-fn parse_select(input: &str) -> Result<Select, ParseError> {
+fn parse_select(input: &str, allow_catalog_schemas: bool) -> Result<Select, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "SELECT")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
@@ -5696,7 +5699,14 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
         tail = after_only.trim_start();
     }
     let table_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
-    let table = normalize_relation_identifier(&tail[..table_end])?;
+    // Only the engine's catalog-aware entry carries a `pg_catalog.`/`information_schema.`
+    // qualifier through; the strict path keeps rejecting non-public schemas (so the legacy
+    // server's compatibility layer still handles catalog queries unchanged).
+    let table = if allow_catalog_schemas {
+        normalize_select_relation_identifier(&tail[..table_end])?
+    } else {
+        normalize_relation_identifier(&tail[..table_end])?
+    };
     tail = tail[table_end..].trim_start();
 
     let mut filter_groups = Vec::new();
@@ -6244,6 +6254,28 @@ fn normalize_relation_identifier(input: &str) -> Result<String, ParseError> {
         return normalize_identifier(table);
     }
     normalize_identifier(s)
+}
+
+/// The system catalog schemas the engine answers natively (Phase-3 M2). A SELECT may
+/// reference these schema-qualified; the qualifier is PRESERVED in the normalized name so
+/// the engine routes the relation to its catalog synthesizer instead of a user table.
+pub const PG_CATALOG_SCHEMA: &str = "pg_catalog";
+pub const INFORMATION_SCHEMA: &str = "information_schema";
+
+/// Relation-name normalizer for a SELECT's FROM target. Identical to
+/// [`normalize_relation_identifier`] for user relations (`public.t`/`t` → bare `t`), but
+/// PRESERVES a `pg_catalog.`/`information_schema.` qualifier (lowercased, as
+/// `pg_catalog.pg_class`) so catalog relations survive parsing and reach the engine
+/// instead of being rejected. DML keeps the strict (public-only) normalizer.
+fn normalize_select_relation_identifier(input: &str) -> Result<String, ParseError> {
+    let s = input.trim();
+    if let Some((schema, table)) = s.split_once('.') {
+        let schema_norm = normalize_identifier(schema)?;
+        if schema_norm == PG_CATALOG_SCHEMA || schema_norm == INFORMATION_SCHEMA {
+            return Ok(format!("{schema_norm}.{}", normalize_identifier(table)?));
+        }
+    }
+    normalize_relation_identifier(s)
 }
 
 fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
@@ -6822,7 +6854,22 @@ fn is_begin_with_optional_mode(input: &str) -> bool {
     false
 }
 
+/// Parse a single SQL command (the strict, public entry). A SELECT whose FROM target is a
+/// `pg_catalog.`/`information_schema.`-qualified relation is rejected, exactly as before —
+/// the legacy compatibility server relies on this (catalog queries fail to parse and route
+/// to its compatibility layer). The engine uses [`parse_command_allowing_catalog`] instead.
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
+    parse_command_inner(input, false)
+}
+
+/// Like [`parse_command`] but carries a `pg_catalog.`/`information_schema.` qualifier on a
+/// SELECT's FROM target through to the parsed `Select`, for the engine's native catalog
+/// support (Phase-3 M2). Behaves identically to [`parse_command`] for every other command.
+pub fn parse_command_allowing_catalog(input: &str) -> Result<Command, ParseError> {
+    parse_command_inner(input, true)
+}
+
+fn parse_command_inner(input: &str, allow_catalog_schemas: bool) -> Result<Command, ParseError> {
     let mut s = input.trim_end();
     if s.is_empty() {
         return Err(ParseError::Empty);
@@ -6856,7 +6903,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     if let Some(reset) = parse_reset_command(s) {
         return reset;
     }
-    if let Some(relational) = parse_relational_command(s) {
+    if let Some(relational) = parse_relational_command(s, allow_catalog_schemas) {
         return relational;
     }
 
