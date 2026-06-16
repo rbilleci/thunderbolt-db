@@ -1209,6 +1209,33 @@ explicit decision to finish the serial-kernel thrust before this).
   predicate loop); CPU↔GPU parity tests green; any CPU path kept only as a
   `#[cfg(test)]` parity reference or a labeled bootstrap fallback, never the hot path.
 
+### 9.5 GPU sort/order operator (move ORDER BY / HAVING / LIMIT off the CPU)
+
+**Debt:** the engine computes GPU-resident aggregations/projections, then applies the
+query's **ORDER BY, HAVING, and LIMIT on the CPU** as Rust post-processing — e.g. the
+grouped-aggregate path runs the GPU group-by
+(`execute_relational_grouped_aggregate_with_resident_device_memory_probe`,
+`engine/lib.rs:21867`) and then sorts/filters the result rows in Rust (`.sort_by`). Under
+the GPU-native charter, **sorts and ordering are GPU relational operators**; this CPU
+ordering is tracked debt, not the target. Surfaced 2026-06-16 while deciding the
+grouped_stats parallelization: the engine discards the kernel's group order and re-sorts on
+the CPU by the requested column — *usually an aggregate* (`ORDER BY sum DESC`, `count DESC`),
+not the group key. That is precisely why **GROUP BY and ORDER BY are separated**:
+grouped_stats is built as an (unordered, correct) GPU hash aggregation (the group-by
+operator), and the *ordering* is owed here as its own operator — NOT folded into the group-by
+as a radix sort that would sort the wrong key and be discarded.
+- **End state:** a GPU sort / top-K operator that orders the (small) grouped/projected
+  result on-device by the requested column, with HAVING (predicate) and LIMIT (top-K /
+  prefix) applied on the GPU; the CPU `.sort_by`/filter kept only as a `#[cfg(test)]` parity
+  reference or labeled bootstrap fallback. Build it ONCE as a shared operator — it applies
+  to grouped aggregates AND projection/DISTINCT ORDER BY.
+- **Trigger:** after the serial-kernel thrust (grouped_stats hash-agg lands first); a
+  companion to §1.4 step 1.3 (plan→kernel compiler) and §9.4 (CPU-execution routes) — all
+  three move the remaining CPU relational work onto the GPU.
+- **Acceptance:** ORDER BY/HAVING/LIMIT for resident grouped + projected queries execute on
+  the GPU (no CPU per-result sort/filter on the hot path); CPU↔GPU parity tests green;
+  d2h/telemetry assertions updated.
+
 > Status note: these are referenced from the Phase 0 "Structural findings" block
 > and from the P0-M3 / P1-M3-step-1 run reports. Update each subsection's status when
 > picked up; do not let the three-server state, the engine→protocol edge, or the
