@@ -9554,6 +9554,260 @@ done:
     Ok(indices)
 }
 
+/// GPU HAVING filter over a grouped result (S4) — evaluates a DNF predicate (OR of AND-clauses)
+/// per group row on the resident i64 group-value and i64 aggregate columns, returning the surviving
+/// ORIGINAL row indices in ascending order. A filter is `(col, op, val)`: `col` 0 selects the group
+/// value, 1 the aggregate; `op` is 0=Eq 1=Lt 2=Lte 3=Gt 4=Gte (matching the engine's numeric
+/// `select_filter_matches` over i64); `val` is the i64 constant. A clause matches when ALL its
+/// filters hold (vacuous AND, an empty clause, = match); the row survives when ANY clause matches.
+///
+/// CONTRACT for S5 wiring: empty `clauses` => NO survivors (vacuous OR). This deliberately DIFFERS
+/// from SQL's *absent* HAVING (which means ALL rows, per the engine's `grouped_row_matches_having`),
+/// so the caller MUST keep this kernel behind the engine's existing `!having_groups.is_empty()`
+/// guard (or skip the kernel and pass everything through when HAVING is absent).
+///
+/// Single-block fused kernel: each thread evaluates the DNF for its grid-stride rows -> keep flag,
+/// then the block ordered-compacts survivors ascending via a two-level warp-shuffle prefix sum with
+/// a running offset carried across waves (same stable-compaction backbone as compare_scatter_blocks).
+/// The DNF is uploaded as flat device arrays. Sized for the (small-to-moderate) grouped result; a
+/// multi-block variant for very high group cardinality is a tracked follow-up.
+#[allow(dead_code)] // wired into the engine grouped HAVING path in S5.
+fn launch_cuda_resident_having_filter(
+    resident: &CudaResidentDeviceMemory,
+    group_byte_offset: u64,
+    agg_byte_offset: u64,
+    n: u64,
+    clauses: &[Vec<(u32, u32, i64)>],
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = include_bytes!("having.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if n > u64::from(u32::MAX) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    // Both key columns are i64; bound-check their read ranges against the resident allocation.
+    let allocated = resident.metadata().allocated_bytes;
+    for off in [group_byte_offset, agg_byte_offset] {
+        let end = n
+            .checked_mul(std::mem::size_of::<i64>() as u64)
+            .and_then(|b| off.checked_add(b))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if end > allocated {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
+        }
+    }
+    let n_usize =
+        usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    // Encode the DNF as flat arrays: clause_off[c..c+1] bounds clause c's filters in col/op/val.
+    let n_clauses = clauses.len() as u64;
+    let mut clause_off: Vec<u32> = Vec::with_capacity(clauses.len() + 1);
+    let mut filter_col: Vec<u32> = Vec::new();
+    let mut filter_op: Vec<u32> = Vec::new();
+    let mut filter_val: Vec<i64> = Vec::new();
+    let mut acc: u32 = 0;
+    clause_off.push(0);
+    for clause in clauses {
+        for &(col, op, val) in clause {
+            filter_col.push(col);
+            filter_op.push(op);
+            filter_val.push(val);
+        }
+        acc = acc
+            .checked_add(u32::try_from(clause.len()).unwrap_or(u32::MAX))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        clause_off.push(acc);
+    }
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_having_filter", &ptx)?;
+
+    let primary = resident.primary();
+    // Lease + upload a host slice into a device buffer; pads zero-length to a 1-element lease so the
+    // (unread) device pointer is always valid.
+    let upload_u32 = |data: &[u32]| {
+        let buf = primary.lease_device_buffer(data.len().max(1) * std::mem::size_of::<u32>())?;
+        if !data.is_empty() {
+            check_cuda(unsafe {
+                cu_memcpy_htod(
+                    buf.ptr,
+                    data.as_ptr().cast::<c_void>(),
+                    std::mem::size_of_val(data),
+                )
+            })?;
+        }
+        Ok::<_, CudaRuntimeProbeError>(buf)
+    };
+    let clause_off_buf = upload_u32(&clause_off)?;
+    let filter_col_buf = upload_u32(&filter_col)?;
+    let filter_op_buf = upload_u32(&filter_op)?;
+    let filter_val_buf =
+        primary.lease_device_buffer(filter_val.len().max(1) * std::mem::size_of::<i64>())?;
+    if !filter_val.is_empty() {
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                filter_val_buf.ptr,
+                filter_val.as_ptr().cast::<c_void>(),
+                std::mem::size_of_val(filter_val.as_slice()),
+            )
+        })?;
+    }
+    let out_idx = primary.lease_device_buffer(
+        n_usize
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )?;
+    let out_count = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let stream = lease
+        .pooled
+        .as_ref()
+        .expect("pooled stream just set")
+        .stream;
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    const BLOCK: u32 = 256;
+    let mut group_arg = resident
+        .device_ptr()
+        .checked_add(group_byte_offset)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut agg_arg = resident
+        .device_ptr()
+        .checked_add(agg_byte_offset)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut n_arg = n;
+    let mut nclauses_arg = n_clauses;
+    let mut coff_arg = clause_off_buf.ptr;
+    let mut fcol_arg = filter_col_buf.ptr;
+    let mut fop_arg = filter_op_buf.ptr;
+    let mut fval_arg = filter_val_buf.ptr;
+    let mut outidx_arg = out_idx.ptr;
+    let mut outcnt_arg = out_count.ptr;
+    let mut args = [
+        (&mut group_arg as *mut u64).cast::<c_void>(),
+        (&mut agg_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut nclauses_arg as *mut u64).cast::<c_void>(),
+        (&mut coff_arg as *mut u64).cast::<c_void>(),
+        (&mut fcol_arg as *mut u64).cast::<c_void>(),
+        (&mut fop_arg as *mut u64).cast::<c_void>(),
+        (&mut fval_arg as *mut u64).cast::<c_void>(),
+        (&mut outidx_arg as *mut u64).cast::<c_void>(),
+        (&mut outcnt_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            1,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    resident.record_kernel_event_elapsed_us(None);
+
+    let mut count: u32 = 0;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut count as *mut u32).cast::<c_void>(),
+            out_count.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })
+    .map_err(drain_err)?;
+    let count_usize = count as usize;
+    if count_usize > n_usize {
+        return Err(drain_err(CudaRuntimeProbeError::InvalidInputLength(
+            count_usize,
+        )));
+    }
+    let mut indices = vec![0_u32; count_usize];
+    if count_usize > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                indices.as_mut_ptr().cast::<c_void>(),
+                out_idx.ptr,
+                count_usize * std::mem::size_of::<u32>(),
+            )
+        })
+        .map_err(drain_err)?;
+    }
+    drop(lease);
+    Ok(indices)
+}
+
 fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     resident: &R,
     byte_offset: u64,
@@ -16482,6 +16736,186 @@ mod tests {
                     "adaptive argsort != bitonic reference for n={n} descending={desc}"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_having_filter_dnf_matches_construction() {
+        // P2 §9.5/S4 — GPU HAVING DNF filter. CONSTRUCTION oracle (no CPU filter re-impl): lay out
+        // group[r] = 1000+r and agg[r] = r, so each predicate's survivors are a known arithmetic
+        // range/union and the col selector is unambiguous (group values 1000.. never overlap agg
+        // values 0..n). Covers all five ops, both columns, AND within a clause, OR across clauses,
+        // mixed-column clauses, empty/all results, and n spanning multiple grid-stride waves.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let retain = |group: &[i64], agg: &[i64]| {
+            let n = group.len();
+            // SAFETY: i64 is POD; native little-endian bytes; the slices outlive the retain copy.
+            let group_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(group.as_ptr().cast::<u8>(), n * 8) };
+            let agg_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(agg.as_ptr().cast::<u8>(), n * 8) };
+            let agg_off = (n * 8) as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    (n * 16) as u64,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: group_bytes,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: agg_off,
+                            bytes: agg_bytes,
+                        },
+                    ],
+                )
+                .expect("retain group+agg");
+            (resident, agg_off)
+        };
+
+        // op encoding: 0=Eq 1=Lt 2=Lte 3=Gt 4=Gte ; col 0=group, 1=agg.
+        for &n in &[10_usize, 256, 257, 1_000, 5_000] {
+            let group: Vec<i64> = (0..n as i64).map(|r| 1_000 + r).collect();
+            let agg: Vec<i64> = (0..n as i64).collect();
+            let (resident, agg_off) = retain(&group, &agg);
+            let nn = n as u64;
+            let run = |clauses: &[Vec<(u32, u32, i64)>]| {
+                launch_cuda_resident_having_filter(&resident, 0, agg_off, nn, clauses)
+                    .expect("having filter")
+            };
+            let range = |lo: usize, hi: usize| -> Vec<u32> { (lo..hi).map(|r| r as u32).collect() };
+            let (k, a, b) = ((n / 3) as i64, (n / 4) as i64, (3 * n / 4) as i64);
+
+            // agg > K (Gt) -> (K, n)
+            assert_eq!(
+                run(&[vec![(1, 3, k)]]),
+                range(k as usize + 1, n),
+                "agg>K n={n}"
+            );
+            // agg <= K (Lte) -> [0, K]
+            assert_eq!(
+                run(&[vec![(1, 2, k)]]),
+                range(0, k as usize + 1),
+                "agg<=K n={n}"
+            );
+            // agg >= A AND agg < B (Gte, Lt) -> [A, B)
+            assert_eq!(
+                run(&[vec![(1, 4, a), (1, 1, b)]]),
+                range(a as usize, b as usize),
+                "A<=agg<B n={n}"
+            );
+            // group == 1000+target (Eq, col 0) -> single row `target`
+            let target = (n / 2) as i64;
+            assert_eq!(
+                run(&[vec![(0, 0, 1_000 + target)]]),
+                vec![target as u32],
+                "group==v n={n}"
+            );
+            // (group < 1000+A) OR (agg >= B) -> [0, A) ∪ [B, n)  (mixed cols, OR)
+            let mut expect_or = range(0, a as usize);
+            expect_or.extend(range(b as usize, n));
+            assert_eq!(
+                run(&[vec![(0, 1, 1_000 + a)], vec![(1, 4, b)]]),
+                expect_or,
+                "group<A OR agg>=B n={n}"
+            );
+            // group >= 1000+A AND agg < B -> [A, B)  (mixed cols, AND)
+            assert_eq!(
+                run(&[vec![(0, 4, 1_000 + a), (1, 1, b)]]),
+                range(a as usize, b as usize),
+                "group>=A AND agg<B n={n}"
+            );
+            // empty (agg > n+10) and all (agg >= 0)
+            assert!(
+                run(&[vec![(1, 3, n as i64 + 10)]]).is_empty(),
+                "empty n={n}"
+            );
+            assert_eq!(run(&[vec![(1, 4, 0)]]), range(0, n), "all n={n}");
+            // deep AND (3 filters): agg > AA AND agg < BB AND group >= 1000+CC -> [CC, BB)
+            let (aa, cc, bb) = ((n / 5) as i64, (2 * n / 5) as i64, (3 * n / 5) as i64);
+            assert_eq!(
+                run(&[vec![(1, 3, aa), (1, 1, bb), (0, 4, 1_000 + cc)]]),
+                range(cc as usize, bb as usize),
+                "deep-AND n={n}"
+            );
+            // three OR clauses: agg==1 OR agg==n/2 OR agg==n-1 -> {1, n/2, n-1} ascending
+            assert_eq!(
+                run(&[
+                    vec![(1, 0, 1)],
+                    vec![(1, 0, (n / 2) as i64)],
+                    vec![(1, 0, n as i64 - 1)],
+                ]),
+                vec![1_u32, (n / 2) as u32, n as u32 - 1],
+                "three-OR n={n}"
+            );
+            // vacuous: an empty clause (vacuous AND) matches all; OR short-circuits to all
+            assert_eq!(run(&[vec![]]), range(0, n), "vacuous-empty-clause n={n}");
+            assert_eq!(
+                run(&[vec![], vec![(1, 3, n as i64 + 10)]]),
+                range(0, n),
+                "vacuous-clause-OR n={n}"
+            );
+        }
+
+        // Negatives, i64 extremes, and scattered (non-contiguous) survivors — the construction loop
+        // above only uses distinct/monotone non-negative data, so cover the auditor-flagged paths.
+        let mk_range = |lo: usize, hi: usize| -> Vec<u32> { (lo..hi).map(|r| r as u32).collect() };
+        {
+            // negatives: agg[r] = r - 500 over n = 1000
+            let n = 1_000_usize;
+            let group: Vec<i64> = (0..n as i64).collect();
+            let agg: Vec<i64> = (0..n as i64).map(|r| r - 500).collect();
+            let (resident, agg_off) = retain(&group, &agg);
+            let run = |c: &[Vec<(u32, u32, i64)>]| {
+                launch_cuda_resident_having_filter(&resident, 0, agg_off, n as u64, c)
+                    .expect("having neg")
+            };
+            assert_eq!(run(&[vec![(1, 4, 0)]]), mk_range(500, 1_000), "neg agg>=0");
+            assert_eq!(run(&[vec![(1, 2, -1)]]), mk_range(0, 500), "neg agg<=-1");
+            assert_eq!(
+                run(&[vec![(1, 3, -250), (1, 1, 250)]]),
+                mk_range(251, 750),
+                "neg -250<agg<250"
+            );
+        }
+        {
+            // i64 extremes (explicit dataset)
+            let group: Vec<i64> = vec![0, 1, 2, 3, 4];
+            let agg: Vec<i64> = vec![i64::MIN, -1, 0, 1, i64::MAX];
+            let (resident, agg_off) = retain(&group, &agg);
+            let run = |c: &[Vec<(u32, u32, i64)>]| {
+                launch_cuda_resident_having_filter(&resident, 0, agg_off, 5, c).expect("having ext")
+            };
+            assert_eq!(run(&[vec![(1, 4, 0)]]), vec![2_u32, 3, 4], "ext agg>=0");
+            assert_eq!(run(&[vec![(1, 2, 0)]]), vec![0_u32, 1, 2], "ext agg<=0");
+            assert_eq!(
+                run(&[vec![(1, 3, i64::MIN)]]),
+                vec![1_u32, 2, 3, 4],
+                "ext agg>MIN"
+            );
+            assert_eq!(run(&[vec![(1, 0, i64::MAX)]]), vec![4_u32], "ext agg==MAX");
+            assert_eq!(
+                run(&[vec![(1, 1, i64::MAX), (1, 3, i64::MIN)]]),
+                vec![1_u32, 2, 3],
+                "ext MIN<agg<MAX"
+            );
+        }
+        {
+            // scattered (non-contiguous) survivors: agg[r] = r % 2 over n = 100
+            let n = 100_usize;
+            let group: Vec<i64> = (0..n as i64).collect();
+            let agg: Vec<i64> = (0..n as i64).map(|r| r % 2).collect();
+            let (resident, agg_off) = retain(&group, &agg);
+            let run = |c: &[Vec<(u32, u32, i64)>]| {
+                launch_cuda_resident_having_filter(&resident, 0, agg_off, n as u64, c)
+                    .expect("having scat")
+            };
+            let odds: Vec<u32> = (0..n / 2).map(|k| (2 * k + 1) as u32).collect();
+            let evens: Vec<u32> = (0..n / 2).map(|k| (2 * k) as u32).collect();
+            assert_eq!(run(&[vec![(1, 0, 1)]]), odds, "scattered odd rows");
+            assert_eq!(run(&[vec![(1, 0, 0)]]), evens, "scattered even rows");
         }
     }
 }
