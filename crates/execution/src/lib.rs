@@ -9199,6 +9199,39 @@ fn launch_cuda_resident_i64_argsort_adaptive(
     }
 }
 
+/// GPU ORDER BY ... LIMIT/OFFSET operator (S4): adaptive-argsort the resident i64 key column, then
+/// take the ordered window `[offset, offset+limit)` of original row indices. This is the complete,
+/// correct LIMIT/OFFSET primitive — the sort (the GPU-worthy work) runs on-device; the window is a
+/// host slice of the returned permutation. `offset`/`limit` are clamped to the available rows;
+/// `limit = None` returns everything from `offset`.
+///
+/// NOTE: for a LARGE result with a SMALL limit this still does a full sort. A partial top-K
+/// (block-local top-K + merge, or radix-select) that avoids the full sort is a tracked perf
+/// follow-up — deferred until S5 wires a large-result ORDER BY caller so the optimization can be
+/// benchmark-justified rather than built speculatively.
+#[allow(dead_code)] // wired into the engine ORDER BY/LIMIT path in S5.
+fn launch_cuda_resident_i64_order_by_limit(
+    resident: &CudaResidentDeviceMemory,
+    keys_byte_offset: u64,
+    n: u64,
+    descending: bool,
+    offset: u64,
+    limit: Option<u64>,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    let perm =
+        launch_cuda_resident_i64_argsort_adaptive(resident, keys_byte_offset, n, descending)?;
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(perm.len());
+    let end = match limit {
+        Some(lim) => start
+            .saturating_add(usize::try_from(lim).unwrap_or(usize::MAX))
+            .min(perm.len()),
+        None => perm.len(),
+    };
+    Ok(perm[start..end].to_vec())
+}
+
 /// Serial single-thread GPU LSD-radix argsort — the GPU-native parity ORACLE + benchmark
 /// baseline for the parallel `launch_cuda_resident_i64_argsort_radix` (S3). One device thread
 /// runs a textbook stable counting sort: 16 LSD passes of 4 bits each over a signed→unsigned
@@ -16917,5 +16950,60 @@ mod tests {
             assert_eq!(run(&[vec![(1, 0, 1)]]), odds, "scattered odd rows");
             assert_eq!(run(&[vec![(1, 0, 0)]]), evens, "scattered even rows");
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_order_by_limit_windows_the_sorted_keys() {
+        // P2 §9.5/S4 — ORDER BY ... LIMIT/OFFSET. CONSTRUCTION oracle: keys[r] = r, so the ascending
+        // order is [0,1,..,n-1] and descending is [n-1,..,0]; each (offset, limit) window is a known
+        // slice. Also checks the offset/limit clamps. GPU sort + host window; no CPU sort oracle.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let retain_keys = |keys: &[i64]| {
+            let n = keys.len() as u64;
+            // SAFETY: i64 is POD; native bytes; `keys` outlives the synchronous retain copy.
+            let key_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(keys.as_ptr().cast::<u8>(), keys.len() * 8) };
+            let header = n.to_le_bytes();
+            let off = std::mem::size_of::<u64>() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    off + key_bytes.len() as u64,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: off,
+                            bytes: key_bytes,
+                        },
+                    ],
+                )
+                .expect("retain keys");
+            (resident, off)
+        };
+
+        let n = 100_usize;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let (resident, off) = retain_keys(&keys);
+        let nn = n as u64;
+        let run = |desc: bool, offset: u64, limit: Option<u64>| {
+            launch_cuda_resident_i64_order_by_limit(&resident, off, nn, desc, offset, limit)
+                .expect("order_by_limit")
+        };
+
+        // ascending order is [0, n): windows are contiguous slices.
+        assert_eq!(run(false, 0, Some(5)), vec![0_u32, 1, 2, 3, 4]);
+        assert_eq!(run(false, 10, Some(3)), vec![10_u32, 11, 12]);
+        assert_eq!(run(false, 95, None), vec![95_u32, 96, 97, 98, 99]);
+        assert_eq!(run(false, 0, None), (0..n as u32).collect::<Vec<_>>());
+        // descending order is [n-1, .., 0].
+        assert_eq!(run(true, 0, Some(3)), vec![99_u32, 98, 97]);
+        assert_eq!(run(true, 2, Some(2)), vec![97_u32, 96]);
+        // clamps: offset past the end -> empty; limit past the end -> clamped.
+        assert!(run(false, 200, Some(5)).is_empty());
+        assert_eq!(run(false, 98, Some(10)), vec![98_u32, 99]);
     }
 }
