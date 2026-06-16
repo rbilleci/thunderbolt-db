@@ -586,18 +586,48 @@ pub enum ColumnDefault {
     },
 }
 
+/// A storable column type. `Numeric` carries the PostgreSQL `numeric(p,s)` typmod
+/// (`precision`/`scale`); every variant's payload is `Copy`, so `SqlType` stays
+/// `Copy` exactly like the original `Int4`/`Text`-only enum (the ~60 `== SqlType::Int4`
+/// guards and by-value passes are unaffected by the widening).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlType {
     Int4,
+    Int8,
+    /// PostgreSQL `numeric(precision, scale)` — stored as a fixed-point [`Decimal128`].
+    Numeric {
+        precision: u8,
+        scale: u8,
+    },
+    Bool,
     Text,
 }
 
-pub const SUPPORTED_SQL_TYPES: [SqlType; 2] = [SqlType::Int4, SqlType::Text];
+/// The default `numeric` typmod when a `NUMERIC`/`DECIMAL` column omits `(p,s)`.
+/// PostgreSQL treats unconstrained `numeric` specially; we pin a wide fixed typmod
+/// (38 significant digits — the i128 mantissa ceiling) so values round-trip without
+/// a bignum fallback (>38 digits is a documented, errored edge — a future milestone).
+pub const NUMERIC_DEFAULT_PRECISION: u8 = 38;
+pub const NUMERIC_DEFAULT_SCALE: u8 = 0;
+
+pub const SUPPORTED_SQL_TYPES: [SqlType; 5] = [
+    SqlType::Int4,
+    SqlType::Int8,
+    SqlType::Numeric {
+        precision: NUMERIC_DEFAULT_PRECISION,
+        scale: NUMERIC_DEFAULT_SCALE,
+    },
+    SqlType::Bool,
+    SqlType::Text,
+];
 
 impl SqlType {
     pub const fn postgres_oid(self) -> u32 {
         match self {
             Self::Int4 => 23,
+            Self::Int8 => 20,
+            Self::Numeric { .. } => 1700,
+            Self::Bool => 16,
             Self::Text => 25,
         }
     }
@@ -605,6 +635,9 @@ impl SqlType {
     pub const fn type_size(self) -> i16 {
         match self {
             Self::Int4 => 4,
+            Self::Int8 => 8,
+            Self::Numeric { .. } => -1,
+            Self::Bool => 1,
             Self::Text => -1,
         }
     }
@@ -612,8 +645,286 @@ impl SqlType {
     pub const fn catalog_name(self) -> &'static str {
         match self {
             Self::Int4 => "int4",
+            Self::Int8 => "int8",
+            Self::Numeric { .. } => "numeric",
+            Self::Bool => "bool",
             Self::Text => "text",
         }
+    }
+}
+
+/// A fixed-point decimal: an `i128` unscaled `mantissa` and a `u8` `scale`
+/// (number of fractional digits). `12345.67` at scale 2 is `{ mantissa: 1234567, scale: 2 }`.
+///
+/// Chosen over a string representation for NUMERIC storage: 16 bytes inline (no
+/// per-value heap allocation), hardware-speed compare/arithmetic on the i128
+/// mantissa, a fixed width amenable to GPU residency, and — because a value is
+/// reduced to a single `(mantissa, scale)` pair — canonical-by-construction
+/// equality at a *given* scale. Cross-scale equality is handled by [`Decimal128::cmp`]
+/// (scale-aligned), and the engine's value-index keys on a canonical scale so that
+/// `1.0` and `1.00` collide. Overflow beyond the i128 mantissa range is a clean
+/// errored edge (no bignum fallback) — values needing >38 significant digits are a
+/// documented future milestone.
+#[derive(Debug, Clone, Copy)]
+pub struct Decimal128 {
+    pub mantissa: i128,
+    pub scale: u8,
+}
+
+/// Error raised when a `numeric` value or operation exceeds the i128 mantissa range
+/// (or its column `precision`). Mirrors PostgreSQL's `22003 numeric_value_out_of_range`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("numeric field overflow")]
+pub struct NumericOverflow;
+
+impl Decimal128 {
+    pub const ZERO: Self = Self {
+        mantissa: 0,
+        scale: 0,
+    };
+
+    pub const fn new(mantissa: i128, scale: u8) -> Self {
+        Self { mantissa, scale }
+    }
+
+    /// 10^exp as i128, or `None` on overflow.
+    fn pow10(exp: u8) -> Option<i128> {
+        let mut acc: i128 = 1;
+        for _ in 0..exp {
+            acc = acc.checked_mul(10)?;
+        }
+        Some(acc)
+    }
+
+    /// Rescale to `target_scale`, rounding half-up (away from zero on a tie), the
+    /// PostgreSQL rounding mode. Returns [`NumericOverflow`] if the rescaled mantissa
+    /// leaves i128 range. Used for casts, AVG, and division to a target scale.
+    pub fn rescale(self, target_scale: u8) -> Result<Self, NumericOverflow> {
+        if target_scale == self.scale {
+            return Ok(self);
+        }
+        if target_scale > self.scale {
+            let factor = Self::pow10(target_scale - self.scale).ok_or(NumericOverflow)?;
+            let mantissa = self.mantissa.checked_mul(factor).ok_or(NumericOverflow)?;
+            return Ok(Self {
+                mantissa,
+                scale: target_scale,
+            });
+        }
+        // Reducing scale: divide by 10^(drop), rounding half-up on the discarded digits.
+        let drop = self.scale - target_scale;
+        let factor = Self::pow10(drop).ok_or(NumericOverflow)?;
+        let negative = self.mantissa < 0;
+        let abs = self.mantissa.unsigned_abs();
+        let factor_abs = factor as u128;
+        let quotient = abs / factor_abs;
+        let remainder = abs % factor_abs;
+        let rounded = if remainder * 2 >= factor_abs {
+            quotient + 1
+        } else {
+            quotient
+        };
+        let mantissa = i128::try_from(rounded).map_err(|_| NumericOverflow)?;
+        let mantissa = if negative { -mantissa } else { mantissa };
+        Ok(Self {
+            mantissa,
+            scale: target_scale,
+        })
+    }
+
+    /// The truncated-toward-zero integer part as an `i128` — always representable, since
+    /// `|mantissa / 10^scale| ≤ |mantissa|`. For `scale ≥ 39`, `10^scale` exceeds i128
+    /// range while `|mantissa| < 10^39 ≤ 10^scale`, so the integer part is `0`.
+    fn integer_part(&self) -> i128 {
+        match Self::pow10(self.scale) {
+            Some(factor) => self.mantissa / factor,
+            None => 0,
+        }
+    }
+
+    /// Scale-aligned ordering: compares the two values at the wider of the two scales (so
+    /// `1.0` and `1.00` compare equal). This is the shared kernel behind the
+    /// [`Ord`]/[`PartialOrd`]/[`PartialEq`] impls, so it MUST be a consistent total order —
+    /// a broken one silently corrupts any `BTreeMap` keyed on `SqlValue` (e.g. GROUP BY).
+    ///
+    /// When up-aligning to the wider scale overflows i128, it resolves WITHOUT overflow:
+    /// by sign, then by truncated integer part (both per-value keys, hence transitive),
+    /// then by the values rounded DOWN to the narrower scale (down-rescaling only shrinks
+    /// the magnitude, so it cannot overflow when the scale gap ≤ 38). This branch is only
+    /// reachable comparing extreme (>~38-digit) values at *differing* scales — never for a
+    /// stored column value (scale ≤ precision ≤ 38), and never inside a GROUP BY BTreeMap
+    /// (whose keys share one column's scale and so always take the same-scale fast path).
+    pub fn compare(&self, other: &Self) -> core::cmp::Ordering {
+        if self.scale == other.scale {
+            return self.mantissa.cmp(&other.mantissa);
+        }
+        let target = self.scale.max(other.scale);
+        if let (Ok(left), Ok(right)) = (self.rescale(target), other.rescale(target)) {
+            return left.mantissa.cmp(&right.mantissa);
+        }
+        // Exact up-alignment overflowed i128 (pathological extreme magnitudes).
+        let by_sign = self.mantissa.signum().cmp(&other.mantissa.signum());
+        if by_sign != core::cmp::Ordering::Equal {
+            return by_sign;
+        }
+        let by_integer = self.integer_part().cmp(&other.integer_part());
+        if by_integer != core::cmp::Ordering::Equal {
+            return by_integer;
+        }
+        // Equal sign and integer part: discriminate the fraction at the narrower scale
+        // (rescaling DOWN cannot overflow for a scale gap ≤ 38). A gap > 38 with equal
+        // integer parts is unrepresentable for an i128 mantissa, so `Equal` is unreachable.
+        let narrower = self.scale.min(other.scale);
+        match (self.rescale(narrower), other.rescale(narrower)) {
+            (Ok(left), Ok(right)) => left.mantissa.cmp(&right.mantissa),
+            _ => core::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Whether two values are numerically equal regardless of scale (`1.0 == 1.00`).
+    pub fn numeric_eq(&self, other: &Self) -> bool {
+        self.compare(other) == core::cmp::Ordering::Equal
+    }
+
+    /// The canonical form: trailing decimal zeros stripped (so `1.00` → `1`, `1.050` → `1.05`).
+    /// Two values that are numerically equal share one canonical `(mantissa, scale)`, so an
+    /// equality value-index keyed on the canonical form collides `1.0` with `1.00`.
+    pub fn canonical(self) -> Self {
+        let mut mantissa = self.mantissa;
+        let mut scale = self.scale;
+        while scale > 0 && mantissa % 10 == 0 {
+            mantissa /= 10;
+            scale -= 1;
+        }
+        Self { mantissa, scale }
+    }
+
+    fn add_sub(self, other: Self, subtract: bool) -> Result<Self, NumericOverflow> {
+        let target = self.scale.max(other.scale);
+        let left = self.rescale(target)?;
+        let right = other.rescale(target)?;
+        let mantissa = if subtract {
+            left.mantissa.checked_sub(right.mantissa)
+        } else {
+            left.mantissa.checked_add(right.mantissa)
+        }
+        .ok_or(NumericOverflow)?;
+        Ok(Self {
+            mantissa,
+            scale: target,
+        })
+    }
+
+    /// Scale-aligned addition (result scale = max of the two), overflow-checked.
+    pub fn checked_add(self, other: Self) -> Result<Self, NumericOverflow> {
+        self.add_sub(other, false)
+    }
+
+    /// Scale-aligned subtraction (result scale = max of the two), overflow-checked.
+    pub fn checked_sub(self, other: Self) -> Result<Self, NumericOverflow> {
+        self.add_sub(other, true)
+    }
+
+    /// Parse a decimal literal (`"-12.50"`, `"42"`, `"0.001"`) at `target_scale`,
+    /// rounding half-up. Returns `None` on a malformed literal and on overflow.
+    pub fn parse_at_scale(input: &str, target_scale: u8) -> Option<Self> {
+        let parsed = Self::parse(input)?;
+        parsed.rescale(target_scale).ok()
+    }
+
+    /// Parse a decimal literal, inferring `scale` from the number of fractional
+    /// digits present (`"4.50"` → scale 2, `"42"` → scale 0). Returns `None` on a
+    /// malformed literal or i128 overflow. This is the literal's *natural* scale; the
+    /// caller rescales to a column's typmod via [`Decimal128::rescale`].
+    pub fn parse(input: &str) -> Option<Self> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (negative, body) = match trimmed.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+        };
+        if body.is_empty() {
+            return None;
+        }
+        let (whole, frac) = body.split_once('.').unwrap_or((body, ""));
+        // A bare "." or "-." is malformed; at least one digit must be present.
+        if whole.is_empty() && frac.is_empty() {
+            return None;
+        }
+        if !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let scale = u8::try_from(frac.len()).ok()?;
+        let digits = format!("{whole}{frac}");
+        // An all-empty / dot-only digit string (e.g. "." parsed to whole="" frac="")
+        // is rejected above; "0" / "00" parse to magnitude 0. Parse the magnitude as
+        // u128 then apply the sign, so the `i128::MIN` magnitude (2^127, one past
+        // i128::MAX) round-trips with `to_decimal_string` instead of failing the parse.
+        let magnitude: u128 = if digits.is_empty() {
+            0
+        } else {
+            digits.parse::<u128>().ok()?
+        };
+        let mantissa = if negative {
+            match i128::try_from(magnitude) {
+                Ok(value) => -value,
+                // 2^127 is exactly |i128::MIN|; anything larger is out of range.
+                Err(_) if magnitude == (i128::MAX as u128) + 1 => i128::MIN,
+                Err(_) => return None,
+            }
+        } else {
+            i128::try_from(magnitude).ok()?
+        };
+        Some(Self { mantissa, scale })
+    }
+
+    /// Format to a decimal string with exactly `scale` fractional digits and a leading
+    /// `-` for negatives (`{ mantissa: 1234567, scale: 2 }` → `"12345.67"`). Round-trips
+    /// with [`Decimal128::parse`] at the same scale, so AVG's scale-16 output is byte-stable.
+    pub fn to_decimal_string(&self) -> String {
+        if self.scale == 0 {
+            return self.mantissa.to_string();
+        }
+        let negative = self.mantissa < 0;
+        let digits = self.mantissa.unsigned_abs().to_string();
+        let scale = self.scale as usize;
+        let (whole, frac) = if digits.len() > scale {
+            let split = digits.len() - scale;
+            (digits[..split].to_string(), digits[split..].to_string())
+        } else {
+            let mut frac = "0".repeat(scale - digits.len());
+            frac.push_str(&digits);
+            ("0".to_string(), frac)
+        };
+        format!("{}{whole}.{frac}", if negative { "-" } else { "" })
+    }
+}
+
+impl core::fmt::Display for Decimal128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.to_decimal_string())
+    }
+}
+
+impl PartialEq for Decimal128 {
+    fn eq(&self, other: &Self) -> bool {
+        self.numeric_eq(other)
+    }
+}
+
+impl Eq for Decimal128 {}
+
+impl PartialOrd for Decimal128 {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Decimal128 {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.compare(other)
     }
 }
 
@@ -651,7 +962,11 @@ pub struct UpdateAssignment {
 pub enum SqlValue {
     Int4(i32),
     Int8(i64),
-    Numeric(String),
+    /// A fixed-point decimal (`numeric`). Equality and ordering are scale-aligned via
+    /// [`Decimal128`], so `1.0` and `1.00` compare equal — which is why a value-index
+    /// equality lookup on a NUMERIC column must key on a canonical scale.
+    Numeric(Decimal128),
+    Bool(bool),
     Text(String),
 }
 
@@ -723,6 +1038,12 @@ pub enum CopyParseError {
     NullNotSupported,
     #[error("invalid input syntax for type integer")]
     InvalidInt4,
+    #[error("invalid input syntax for type bigint")]
+    InvalidInt8,
+    #[error("invalid input syntax for type numeric")]
+    InvalidNumeric,
+    #[error("invalid input syntax for type boolean")]
+    InvalidBool,
     #[error("unterminated COPY escape sequence")]
     UnterminatedEscape,
     #[error("malformed CSV quoted field")]
@@ -740,7 +1061,9 @@ impl CopyParseError {
         match self {
             Self::InvalidUtf8 => "22021",
             Self::NullNotSupported => "0A000",
-            Self::InvalidInt4 => "22P02",
+            Self::InvalidInt4 | Self::InvalidInt8 | Self::InvalidNumeric | Self::InvalidBool => {
+                "22P02"
+            }
             Self::UnterminatedEscape
             | Self::MalformedCsvQuotedField
             | Self::UnterminatedCsvQuotedField
@@ -756,6 +1079,9 @@ impl CopyParseError {
                 "COPY NULL values are not supported by the compatibility endpoint"
             }
             Self::InvalidInt4 => "invalid input syntax for type integer",
+            Self::InvalidInt8 => "invalid input syntax for type bigint",
+            Self::InvalidNumeric => "invalid input syntax for type numeric",
+            Self::InvalidBool => "invalid input syntax for type boolean",
             Self::UnterminatedEscape => "unterminated COPY escape sequence",
             Self::MalformedCsvQuotedField => "malformed CSV quoted field",
             Self::UnterminatedCsvQuotedField => "unterminated CSV quoted field",
@@ -1006,12 +1332,54 @@ fn parse_copy_text_value(input: &str, ty: SqlType) -> Result<SqlValue, CopyParse
         return Err(CopyParseError::NullNotSupported);
     }
     let text = decode_copy_text(input)?;
+    parse_copy_typed_value(&text, ty)
+}
+
+/// Parse an already-unescaped COPY field into the column's type. Shared by the text
+/// and CSV copy paths so the typed-column vocabulary (int4/int8/numeric/bool/text)
+/// is decoded identically.
+fn parse_copy_typed_value(text: &str, ty: SqlType) -> Result<SqlValue, CopyParseError> {
     match ty {
         SqlType::Int4 => text
             .parse::<i32>()
             .map(SqlValue::Int4)
             .map_err(|_| CopyParseError::InvalidInt4),
-        SqlType::Text => Ok(SqlValue::Text(text)),
+        SqlType::Int8 => text
+            .parse::<i64>()
+            .map(SqlValue::Int8)
+            .map_err(|_| CopyParseError::InvalidInt8),
+        SqlType::Numeric { scale, .. } => Decimal128::parse_at_scale(text, scale)
+            .map(SqlValue::Numeric)
+            .ok_or(CopyParseError::InvalidNumeric),
+        SqlType::Bool => parse_bool_value(text)
+            .map(SqlValue::Bool)
+            .ok_or(CopyParseError::InvalidBool),
+        SqlType::Text => Ok(SqlValue::Text(text.to_string())),
+    }
+}
+
+/// Parse a PostgreSQL boolean *value* literal (for a `bool` column / `::bool` cast).
+/// Accepts the canonical wire forms plus the spelled-out / single-letter aliases
+/// PostgreSQL recognizes, case-insensitively. Distinct from [`parse_bool_literal`],
+/// which is the stricter `true`/`t`/`false`/`f`-only parser for option arguments.
+fn parse_bool_value(input: &str) -> Option<bool> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("t")
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+        || trimmed == "1"
+    {
+        Some(true)
+    } else if trimmed.eq_ignore_ascii_case("f")
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed == "0"
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1112,14 +1480,7 @@ fn parse_copy_csv_value(field: &CopyCsvField, ty: SqlType) -> Result<SqlValue, C
     if !field.quoted && field.text.is_empty() {
         return Err(CopyParseError::NullNotSupported);
     }
-    match ty {
-        SqlType::Int4 => field
-            .text
-            .parse::<i32>()
-            .map(SqlValue::Int4)
-            .map_err(|_| CopyParseError::InvalidInt4),
-        SqlType::Text => Ok(SqlValue::Text(field.text.clone())),
-    }
+    parse_copy_typed_value(&field.text, ty)
 }
 
 fn is_simple_copy_table_name(table: &str) -> bool {
@@ -2766,19 +3127,50 @@ fn parse_rename_constraint(input: &str) -> Result<RenameConstraint, ParseError> 
     })
 }
 
+/// Split off the leading identifier (a column or type name) from `input`, returning
+/// `(name, rest)`. The name runs to the first ASCII whitespace.
+fn split_leading_word(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return None;
+    }
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    Some((&input[..end], input[end..].trim_start()))
+}
+
+/// Split a column type token from `input`, returning `(type_token, tail)`. The token
+/// is a name optionally followed by a balanced `(...)` typmod group, so a spaced
+/// `NUMERIC(12, 2)` is kept intact (unlike a naive whitespace split).
+fn split_column_type(input: &str) -> Option<(&str, &str)> {
+    let (word, rest) = split_leading_word(input)?;
+    // A `(` may begin the word's typmod immediately, or follow after whitespace
+    // (`NUMERIC (12,2)`); accept both, balancing parens within the original input.
+    let after_word_offset = word.as_ptr() as usize - input.as_ptr() as usize + word.len();
+    let rest_trimmed = rest.trim_start();
+    if rest_trimmed.starts_with('(') {
+        let open = after_word_offset + (rest.len() - rest_trimmed.len());
+        let close = find_matching_paren(input, open)?;
+        return Some((input[..close + 1].trim(), input[close + 1..].trim_start()));
+    }
+    Some((word, rest))
+}
+
+/// Resolve a column's declared type token to a `(SqlType, domain)` pair. A token that
+/// is not a built-in type is treated as a domain reference (defaulting to `Int4`,
+/// matching the pre-existing behavior). `serial`/`serial4` is handled by the caller.
+fn resolve_column_type(token: &str) -> Result<(SqlType, Option<String>), ParseError> {
+    match parse_supported_sql_type_name(token) {
+        Some(ty) => Ok((ty, None)),
+        None => Ok((SqlType::Int4, Some(normalize_relation_identifier(token)?))),
+    }
+}
+
 fn parse_column_def(input: &str) -> Result<ColumnDef, ParseError> {
-    let mut parts = input.split_whitespace();
-    let name = parts
-        .next()
-        .ok_or(ParseError::InvalidRelationalSql)
-        .and_then(normalize_identifier)?;
-    let raw_ty = parts.next().ok_or(ParseError::InvalidRelationalSql)?;
-    let (ty, domain) = match raw_ty {
-        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => (SqlType::Int4, None),
-        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => (SqlType::Text, None),
-        ty => (SqlType::Int4, Some(normalize_relation_identifier(ty)?)),
-    };
-    let tail = parts.collect::<Vec<_>>().join(" ");
+    let (name, after_name) = split_leading_word(input).ok_or(ParseError::InvalidRelationalSql)?;
+    let name = normalize_identifier(name)?;
+    let (raw_ty, tail) = split_column_type(after_name).ok_or(ParseError::InvalidRelationalSql)?;
+    let (ty, domain) = resolve_column_type(raw_ty)?;
+    let tail = tail.to_string();
     if domain.is_some() && !tail.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
@@ -2849,11 +3241,37 @@ fn parse_typed_column_default(
     implicit_serial_sequence: Option<String>,
 ) -> Result<ColumnDefault, ParseError> {
     let default = parse_column_default_expr(input, implicit_serial_sequence)?;
-    match (&default, ty) {
-        (ColumnDefault::Literal(SqlValue::Int4(_)), SqlType::Int4)
-        | (ColumnDefault::Literal(SqlValue::Text(_)), SqlType::Text)
-        | (ColumnDefault::SequenceNextVal { .. }, SqlType::Int4) => Ok(default),
-        _ => Err(ParseError::InvalidRelationalSql),
+    match default {
+        // A literal default is coerced to the column's declared type, so e.g. `DEFAULT 0`
+        // on a NUMERIC column is stored as a `Numeric` (not the inferred `Int4`), and
+        // `DEFAULT TRUE` on a BOOL column is a `Bool`. We re-parse from the rendered
+        // literal text rather than trusting the inferred variant.
+        ColumnDefault::Literal(value) => {
+            let rendered = render_default_literal_for_coercion(&value);
+            let coerced = parse_typed_value_from_str(&rendered, ty)?;
+            Ok(ColumnDefault::Literal(coerced))
+        }
+        // `nextval(...)` (serial) is integer-only, as before.
+        ColumnDefault::SequenceNextVal { .. } if ty == SqlType::Int4 => Ok(default),
+        ColumnDefault::SequenceNextVal { .. } => Err(ParseError::InvalidRelationalSql),
+    }
+}
+
+/// Render an inferred default literal back to the textual form `parse_typed_value_from_str`
+/// expects, so it can be re-parsed at the column's declared type.
+fn render_default_literal_for_coercion(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Int4(value) => value.to_string(),
+        SqlValue::Int8(value) => value.to_string(),
+        SqlValue::Numeric(value) => value.to_decimal_string(),
+        SqlValue::Bool(value) => {
+            if *value {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        SqlValue::Text(value) => value.clone(),
     }
 }
 
@@ -3117,23 +3535,20 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             });
             continue;
         }
-        let mut parts = raw_column.split_whitespace();
-        let name = parts
-            .next()
-            .ok_or(ParseError::InvalidRelationalSql)
-            .and_then(normalize_identifier)?;
-        let raw_ty = parts.next().ok_or(ParseError::InvalidRelationalSql)?;
+        let (name, after_name) =
+            split_leading_word(raw_column).ok_or(ParseError::InvalidRelationalSql)?;
+        let name = normalize_identifier(name)?;
+        let (raw_ty, tail) =
+            split_column_type(after_name).ok_or(ParseError::InvalidRelationalSql)?;
         let mut serial_sequence = None;
-        let (ty, domain) = match raw_ty {
-            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => (SqlType::Int4, None),
-            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => (SqlType::Text, None),
-            ty if ty.eq_ignore_ascii_case("serial") || ty.eq_ignore_ascii_case("serial4") => {
+        let (ty, domain) =
+            if raw_ty.eq_ignore_ascii_case("serial") || raw_ty.eq_ignore_ascii_case("serial4") {
                 serial_sequence = Some(format!("{}_{}_seq", table, name));
                 (SqlType::Int4, None)
-            }
-            ty => (SqlType::Int4, Some(normalize_relation_identifier(ty)?)),
-        };
-        let mut tail = parts.collect::<Vec<_>>().join(" ");
+            } else {
+                resolve_column_type(raw_ty)?
+            };
+        let mut tail = tail.to_string();
         let mut column_primary_key = false;
         let mut column_unique = false;
         if let Some(primary_pos) = find_keyword_outside_quotes(&tail, "PRIMARY") {
@@ -5062,16 +5477,60 @@ fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
     } else {
         input
     };
-    if ty.eq_ignore_ascii_case("INT")
-        || ty.eq_ignore_ascii_case("INT4")
-        || ty.eq_ignore_ascii_case("INTEGER")
+    // Split off an optional `(...)` typmod (only NUMERIC/DECIMAL accept one).
+    let (base, typmod) = match ty.find('(') {
+        Some(open) => {
+            let close = find_matching_paren(ty, open)?;
+            if !ty[close + 1..].trim().is_empty() {
+                return None;
+            }
+            (ty[..open].trim(), Some(ty[open + 1..close].trim()))
+        }
+        None => (ty.trim(), None),
+    };
+    if base.eq_ignore_ascii_case("INT")
+        || base.eq_ignore_ascii_case("INT4")
+        || base.eq_ignore_ascii_case("INTEGER")
     {
-        Some(SqlType::Int4)
-    } else if ty.eq_ignore_ascii_case("TEXT") {
-        Some(SqlType::Text)
+        typmod.is_none().then_some(SqlType::Int4)
+    } else if base.eq_ignore_ascii_case("INT8") || base.eq_ignore_ascii_case("BIGINT") {
+        typmod.is_none().then_some(SqlType::Int8)
+    } else if base.eq_ignore_ascii_case("NUMERIC") || base.eq_ignore_ascii_case("DECIMAL") {
+        parse_numeric_typmod(typmod)
+    } else if base.eq_ignore_ascii_case("BOOL") || base.eq_ignore_ascii_case("BOOLEAN") {
+        typmod.is_none().then_some(SqlType::Bool)
+    } else if base.eq_ignore_ascii_case("TEXT") {
+        typmod.is_none().then_some(SqlType::Text)
     } else {
         None
     }
+}
+
+/// Parse a `numeric` typmod body (`"12,2"`, `"10"`, or absent) into a
+/// `SqlType::Numeric { precision, scale }`. An absent typmod yields the
+/// unconstrained default; precision must be 1..=38 (the i128 ceiling) and scale
+/// 0..=precision, mirroring PostgreSQL's `numeric(p,s)` constraints.
+fn parse_numeric_typmod(typmod: Option<&str>) -> Option<SqlType> {
+    let Some(body) = typmod else {
+        return Some(SqlType::Numeric {
+            precision: NUMERIC_DEFAULT_PRECISION,
+            scale: NUMERIC_DEFAULT_SCALE,
+        });
+    };
+    let mut parts = body.split(',');
+    let precision: u8 = parts.next()?.trim().parse().ok()?;
+    let scale: u8 = match parts.next() {
+        Some(scale) => scale.trim().parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some()
+        || precision == 0
+        || precision > NUMERIC_DEFAULT_PRECISION
+        || scale > precision
+    {
+        return None;
+    }
+    Some(SqlType::Numeric { precision, scale })
 }
 
 fn parse_insert(input: &str) -> Result<Insert, ParseError> {
@@ -5404,7 +5863,7 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => {
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Text(_) => {
             Err(ParseError::InvalidRelationalSql)
         }
     }
@@ -5414,7 +5873,7 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeOffset),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => {
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Text(_) => {
             Err(ParseError::InvalidRelationalSql)
         }
     }
@@ -5649,19 +6108,65 @@ fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
         let value = inner.replace("''", "'");
         return match cast {
             None | Some(SqlType::Text) => Ok(SqlValue::Text(value)),
-            Some(SqlType::Int4) => value
-                .parse::<i32>()
-                .map(SqlValue::Int4)
-                .map_err(|_| ParseError::InvalidRelationalSql),
+            Some(ty) => parse_typed_value_from_str(&value, ty),
         };
     }
-    let value = s
-        .parse::<i32>()
-        .map_err(|_| ParseError::InvalidRelationalSql)?;
+    // Unquoted literal. A cast pins the target type; otherwise we infer it (a bare
+    // integer stays Int4 as before — widening only kicks in for the new shapes:
+    // `TRUE`/`FALSE` → Bool, a value with a decimal point → Numeric, and an integer
+    // that overflows i32 → Int8).
     match cast {
-        None | Some(SqlType::Int4) => Ok(SqlValue::Int4(value)),
-        Some(SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
+        Some(ty) => parse_typed_value_from_str(s, ty),
+        None => parse_inferred_unquoted_literal(s),
     }
+}
+
+/// Parse `text` into a specific [`SqlType`] (used for an explicit `::type` cast and
+/// for a quoted literal carrying a cast). The numeric arm rounds to the column scale.
+fn parse_typed_value_from_str(text: &str, ty: SqlType) -> Result<SqlValue, ParseError> {
+    match ty {
+        SqlType::Int4 => text
+            .parse::<i32>()
+            .map(SqlValue::Int4)
+            .map_err(|_| ParseError::InvalidRelationalSql),
+        SqlType::Int8 => text
+            .parse::<i64>()
+            .map(SqlValue::Int8)
+            .map_err(|_| ParseError::InvalidRelationalSql),
+        SqlType::Numeric { scale, .. } => Decimal128::parse_at_scale(text, scale)
+            .map(SqlValue::Numeric)
+            .ok_or(ParseError::InvalidRelationalSql),
+        SqlType::Bool => parse_bool_value(text)
+            .map(SqlValue::Bool)
+            .ok_or(ParseError::InvalidRelationalSql),
+        SqlType::Text => Ok(SqlValue::Text(text.to_string())),
+    }
+}
+
+/// Infer a [`SqlValue`] from an unquoted, uncast literal. Preserves the pre-existing
+/// rule that a bare integer is `Int4`; widens only to the genuinely new shapes.
+fn parse_inferred_unquoted_literal(s: &str) -> Result<SqlValue, ParseError> {
+    if s.eq_ignore_ascii_case("TRUE") {
+        return Ok(SqlValue::Bool(true));
+    }
+    if s.eq_ignore_ascii_case("FALSE") {
+        return Ok(SqlValue::Bool(false));
+    }
+    if let Ok(value) = s.parse::<i32>() {
+        return Ok(SqlValue::Int4(value));
+    }
+    // A decimal point means NUMERIC; carry the literal's natural scale (its fractional
+    // digit count) so `1.00` keeps scale 2 until the engine rescales to the column.
+    if s.contains('.') {
+        if let Some(decimal) = Decimal128::parse(s) {
+            return Ok(SqlValue::Numeric(decimal));
+        }
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    // An integer too wide for i32 widens to Int8 (rather than the old hard error).
+    s.parse::<i64>()
+        .map(SqlValue::Int8)
+        .map_err(|_| ParseError::InvalidRelationalSql)
 }
 
 fn split_supported_sql_value_cast(input: &str) -> Result<(&str, Option<SqlType>), ParseError> {
@@ -5681,13 +6186,7 @@ fn split_supported_sql_value_cast(input: &str) -> Result<(&str, Option<SqlType>)
     } else {
         ty
     };
-    let cast = if ty.eq_ignore_ascii_case("int4") || ty.eq_ignore_ascii_case("integer") {
-        SqlType::Int4
-    } else if ty.eq_ignore_ascii_case("text") {
-        SqlType::Text
-    } else {
-        return Err(ParseError::InvalidRelationalSql);
-    };
+    let cast = parse_supported_sql_type_name(ty).ok_or(ParseError::InvalidRelationalSql)?;
     Ok((value, Some(cast)))
 }
 
@@ -6446,4 +6945,245 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     }
 
     Err(ParseError::Unsupported(s.to_string()))
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+
+    #[test]
+    fn parses_decimal_inferring_natural_scale() {
+        assert_eq!(
+            Decimal128::parse("12345.67"),
+            Some(Decimal128::new(1234567, 2))
+        );
+        assert_eq!(Decimal128::parse("42"), Some(Decimal128::new(42, 0)));
+        assert_eq!(Decimal128::parse("0.001"), Some(Decimal128::new(1, 3)));
+        assert_eq!(Decimal128::parse("-12.50"), Some(Decimal128::new(-1250, 2)));
+        assert_eq!(Decimal128::parse("+7"), Some(Decimal128::new(7, 0)));
+        assert_eq!(Decimal128::parse("0"), Some(Decimal128::new(0, 0)));
+        assert_eq!(Decimal128::parse("0.00"), Some(Decimal128::new(0, 2)));
+    }
+
+    #[test]
+    fn rejects_malformed_decimal_literals() {
+        assert_eq!(Decimal128::parse(""), None);
+        assert_eq!(Decimal128::parse("."), None);
+        assert_eq!(Decimal128::parse("-"), None);
+        assert_eq!(Decimal128::parse("1.2.3"), None);
+        assert_eq!(Decimal128::parse("1e5"), None);
+        assert_eq!(Decimal128::parse("abc"), None);
+        assert_eq!(Decimal128::parse("12 34"), None);
+    }
+
+    #[test]
+    fn formats_round_trips_with_parse_preserving_scale() {
+        for literal in ["12345.67", "-12.50", "0.001", "42", "1000000.000", "-0.99"] {
+            let parsed = Decimal128::parse(literal).unwrap();
+            assert_eq!(parsed.to_decimal_string(), literal, "round-trip {literal}");
+        }
+        // Fractional magnitude smaller than scale pads with leading zeros.
+        assert_eq!(Decimal128::new(5, 3).to_decimal_string(), "0.005");
+        assert_eq!(Decimal128::new(-5, 3).to_decimal_string(), "-0.005");
+    }
+
+    #[test]
+    fn compares_scale_aligned_so_one_point_zero_equals_one_point_zero_zero() {
+        let a = Decimal128::new(10, 1); // 1.0
+        let b = Decimal128::new(100, 2); // 1.00
+        assert_eq!(a.cmp(&b), core::cmp::Ordering::Equal);
+        assert!(a.numeric_eq(&b));
+        assert_eq!(a, b); // PartialEq is scale-aligned.
+
+        let c = Decimal128::new(101, 2); // 1.01
+        assert!(a < c);
+        assert!(c > b);
+
+        let neg = Decimal128::new(-1, 0);
+        let pos = Decimal128::new(1, 2);
+        assert!(neg < pos);
+    }
+
+    #[test]
+    fn compare_is_a_consistent_total_order_when_scale_alignment_overflows() {
+        // Up-aligning to the wider scale overflows i128 (3e37 * 10^18), the case the old
+        // raw-mantissa fallback got wrong. Truth: 3e37 (scale 0) > 1.6e20 (scale 18).
+        let big = Decimal128::new(30_000_000_000_000_000_000_000_000_000_000_000_000, 0);
+        let small = Decimal128::new(160_000_000_000_000_000_000_000_000_000_000_000_000, 18);
+        assert_eq!(big.compare(&small), core::cmp::Ordering::Greater);
+        assert_eq!(small.compare(&big), core::cmp::Ordering::Less); // antisymmetric
+        assert_ne!(big, small);
+        // Same magnitude, opposite signs still resolve by sign even at the ceiling.
+        let neg_big = Decimal128::new(-30_000_000_000_000_000_000_000_000_000_000_000_000, 0);
+        assert_eq!(neg_big.compare(&small), core::cmp::Ordering::Less);
+        assert_eq!(small.compare(&neg_big), core::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn parse_and_format_round_trip_at_the_i128_min_boundary() {
+        // i128::MIN's magnitude is 2^127 = |i128::MAX| + 1; parsing must not overflow.
+        let formatted = Decimal128::new(i128::MIN, 0).to_decimal_string();
+        assert_eq!(
+            Decimal128::parse(&formatted),
+            Some(Decimal128::new(i128::MIN, 0))
+        );
+        assert_eq!(
+            Decimal128::new(i128::MAX, 0)
+                .to_decimal_string()
+                .parse::<i128>(),
+            Ok(i128::MAX)
+        );
+        // One past i128::MIN's magnitude is still rejected.
+        assert_eq!(
+            Decimal128::parse("-170141183460469231731687303715884105729"),
+            None
+        );
+    }
+
+    #[test]
+    fn rescale_rounds_half_up_postgres_style() {
+        // Widening scale is exact.
+        assert_eq!(
+            Decimal128::new(125, 1).rescale(3).unwrap(),
+            Decimal128::new(12500, 3)
+        );
+        // 1.25 -> scale 1 rounds half-up to 1.3.
+        assert_eq!(
+            Decimal128::new(125, 2).rescale(1).unwrap(),
+            Decimal128::new(13, 1)
+        );
+        // 1.24 -> scale 1 rounds down to 1.2.
+        assert_eq!(
+            Decimal128::new(124, 2).rescale(1).unwrap(),
+            Decimal128::new(12, 1)
+        );
+        // Negative rounds away from zero on a tie: -1.25 -> -1.3.
+        assert_eq!(
+            Decimal128::new(-125, 2).rescale(1).unwrap(),
+            Decimal128::new(-13, 1)
+        );
+        // Half-up at the boundary: 0.5 -> scale 0 is 1.
+        assert_eq!(
+            Decimal128::new(5, 1).rescale(0).unwrap(),
+            Decimal128::new(1, 0)
+        );
+    }
+
+    #[test]
+    fn parse_at_scale_rounds_to_target() {
+        assert_eq!(
+            Decimal128::parse_at_scale("1.005", 2),
+            Some(Decimal128::new(101, 2))
+        );
+        assert_eq!(
+            Decimal128::parse_at_scale("1.004", 2),
+            Some(Decimal128::new(100, 2))
+        );
+        assert_eq!(
+            Decimal128::parse_at_scale("5", 2),
+            Some(Decimal128::new(500, 2))
+        );
+    }
+
+    #[test]
+    fn add_sub_align_scales_and_check_overflow() {
+        // 10.50 + 0.005 = 10.505 (result scale = max scale).
+        assert_eq!(
+            Decimal128::new(1050, 2)
+                .checked_add(Decimal128::new(5, 3))
+                .unwrap(),
+            Decimal128::new(10505, 3)
+        );
+        // 10.00 - 2.50 = 7.50.
+        assert_eq!(
+            Decimal128::new(1000, 2)
+                .checked_sub(Decimal128::new(250, 2))
+                .unwrap(),
+            Decimal128::new(750, 2)
+        );
+        // Overflow near the i128 ceiling.
+        assert_eq!(
+            Decimal128::new(i128::MAX, 0).checked_add(Decimal128::new(1, 0)),
+            Err(NumericOverflow)
+        );
+        // Rescaling overflow: widening i128::MAX by a digit overflows.
+        assert_eq!(
+            Decimal128::new(i128::MAX, 0).rescale(1),
+            Err(NumericOverflow)
+        );
+    }
+
+    #[test]
+    fn parses_supported_type_names_including_typmod() {
+        assert_eq!(parse_supported_sql_type_name("INT"), Some(SqlType::Int4));
+        assert_eq!(
+            parse_supported_sql_type_name("integer"),
+            Some(SqlType::Int4)
+        );
+        assert_eq!(parse_supported_sql_type_name("BIGINT"), Some(SqlType::Int8));
+        assert_eq!(parse_supported_sql_type_name("int8"), Some(SqlType::Int8));
+        assert_eq!(parse_supported_sql_type_name("text"), Some(SqlType::Text));
+        assert_eq!(parse_supported_sql_type_name("BOOL"), Some(SqlType::Bool));
+        assert_eq!(
+            parse_supported_sql_type_name("boolean"),
+            Some(SqlType::Bool)
+        );
+        assert_eq!(
+            parse_supported_sql_type_name("NUMERIC(12,2)"),
+            Some(SqlType::Numeric {
+                precision: 12,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            parse_supported_sql_type_name("numeric(12, 2)"),
+            Some(SqlType::Numeric {
+                precision: 12,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            parse_supported_sql_type_name("DECIMAL(10)"),
+            Some(SqlType::Numeric {
+                precision: 10,
+                scale: 0
+            })
+        );
+        assert_eq!(
+            parse_supported_sql_type_name("NUMERIC"),
+            Some(SqlType::Numeric {
+                precision: NUMERIC_DEFAULT_PRECISION,
+                scale: NUMERIC_DEFAULT_SCALE
+            })
+        );
+        // A typmod on a non-numeric type, or an out-of-range numeric typmod, is rejected.
+        assert_eq!(parse_supported_sql_type_name("INT(4)"), None);
+        assert_eq!(parse_supported_sql_type_name("NUMERIC(0,0)"), None);
+        assert_eq!(parse_supported_sql_type_name("NUMERIC(2,5)"), None);
+        assert_eq!(parse_supported_sql_type_name("NUMERIC(99)"), None);
+    }
+
+    #[test]
+    fn parses_typed_literals_and_casts() {
+        // Bare literal inference: integer stays Int4, decimal becomes Numeric, TRUE/FALSE bool.
+        assert_eq!(parse_sql_value("5").unwrap(), SqlValue::Int4(5));
+        assert_eq!(
+            parse_sql_value("1.50").unwrap(),
+            SqlValue::Numeric(Decimal128::new(150, 2))
+        );
+        assert_eq!(parse_sql_value("TRUE").unwrap(), SqlValue::Bool(true));
+        assert_eq!(parse_sql_value("false").unwrap(), SqlValue::Bool(false));
+        // An integer beyond i32 widens to Int8.
+        assert_eq!(
+            parse_sql_value("9000000000").unwrap(),
+            SqlValue::Int8(9_000_000_000)
+        );
+        // Casts pin the type (numeric cast rounds to the typmod scale).
+        assert_eq!(
+            parse_sql_value("'1.005'::numeric(12,2)").unwrap(),
+            SqlValue::Numeric(Decimal128::new(101, 2))
+        );
+        assert_eq!(parse_sql_value("'t'::bool").unwrap(), SqlValue::Bool(true));
+        assert_eq!(parse_sql_value("'42'::int8").unwrap(), SqlValue::Int8(42));
+    }
 }

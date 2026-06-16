@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalColumn};
-use gpu_db_sql::{parse_command, Command, ParseError, Select, SqlType, SqlValue};
+use gpu_db_sql::{parse_command, Command, Decimal128, ParseError, Select, SqlType, SqlValue};
 
 pub mod pg_adapter;
 mod point_lookup_batcher;
@@ -45,16 +45,20 @@ pub enum LogicalType {
     Int4,
     Int8,
     Numeric,
+    Bool,
     Text,
 }
 
 /// Neutral value vocabulary. Owned by the façade so the protocol crate's
-/// `SqlValue` does not cross the boundary.
+/// `SqlValue` does not cross the boundary. `Numeric` carries the engine's
+/// fixed-point [`Decimal128`]; the wire adapter renders it to text (the binary
+/// numeric wire codec is a later milestone).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbValue {
     Int4(i32),
     Int8(i64),
-    Numeric(String),
+    Numeric(Decimal128),
+    Bool(bool),
     Text(String),
 }
 
@@ -625,6 +629,9 @@ fn map_execute_error(err: ExecuteError) -> DbError {
 fn map_logical_type(ty: SqlType) -> LogicalType {
     match ty {
         SqlType::Int4 => LogicalType::Int4,
+        SqlType::Int8 => LogicalType::Int8,
+        SqlType::Numeric { .. } => LogicalType::Numeric,
+        SqlType::Bool => LogicalType::Bool,
         SqlType::Text => LogicalType::Text,
     }
 }
@@ -641,6 +648,7 @@ fn map_value(value: SqlValue) -> DbValue {
         SqlValue::Int4(value) => DbValue::Int4(value),
         SqlValue::Int8(value) => DbValue::Int8(value),
         SqlValue::Numeric(value) => DbValue::Numeric(value),
+        SqlValue::Bool(value) => DbValue::Bool(value),
         SqlValue::Text(value) => DbValue::Text(value),
     }
 }
@@ -838,5 +846,188 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    // ---- Phase-3 M1: typed storable columns (NUMERIC / BIGINT / BOOL) ----
+
+    /// Run a SELECT and return its rows, panicking on anything else.
+    fn select_rows(facade: &mut EngineFacade, session: SessionId, sql: &str) -> Vec<Vec<DbValue>> {
+        match facade.execute(session, sql).unwrap() {
+            QueryOutcome::Rows { rows, .. } => rows,
+            other => panic!("expected rows from {sql:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_columns_round_trip_create_insert_select_and_text_wire() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade
+            .execute(
+                session,
+                "CREATE TABLE acct (bal NUMERIC(12,2), n BIGINT, ok BOOL)",
+            )
+            .unwrap();
+        facade
+            .execute(
+                session,
+                "INSERT INTO acct (bal, n, ok) VALUES (1234.5, 9000000000, TRUE)",
+            )
+            .unwrap();
+
+        let outcome = facade
+            .execute(session, "SELECT bal, n, ok FROM acct")
+            .unwrap();
+        let QueryOutcome::Rows { columns, rows } = outcome else {
+            panic!("expected rows");
+        };
+        // Column logical types map to numeric / int8 / bool.
+        assert_eq!(
+            columns.iter().map(|c| c.logical_type).collect::<Vec<_>>(),
+            vec![LogicalType::Numeric, LogicalType::Int8, LogicalType::Bool]
+        );
+        // Stored values round-trip; the numeric rescales to the column scale (2).
+        assert_eq!(
+            rows,
+            vec![vec![
+                DbValue::Numeric(Decimal128::new(123450, 2)),
+                DbValue::Int8(9_000_000_000),
+                DbValue::Bool(true),
+            ]]
+        );
+        // Text wire encoding: money with two decimals, plain bigint, `t` for true.
+        let wire: Vec<String> = rows[0].iter().map(pg_adapter::db_value_text).collect();
+        assert_eq!(wire, vec!["1234.50", "9000000000", "t"]);
+    }
+
+    #[test]
+    fn numeric_equality_is_scale_insensitive_on_the_cpu_path() {
+        // A stored `1.0` (declared NUMERIC(12,2), so persisted as 1.00) must match a
+        // `WHERE bal = 1.00` literal — canonical-by-construction value-index equality.
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade
+            .execute(session, "CREATE TABLE m (bal NUMERIC(12,2))")
+            .unwrap();
+        facade
+            .execute(session, "INSERT INTO m (bal) VALUES (1.0)")
+            .unwrap();
+
+        let matched = select_rows(&mut facade, session, "SELECT bal FROM m WHERE bal = 1.00");
+        assert_eq!(
+            matched,
+            vec![vec![DbValue::Numeric(Decimal128::new(100, 2))]]
+        );
+        // And the equality fast-path renders the stored money form on the wire.
+        assert_eq!(pg_adapter::db_value_text(&matched[0][0]), "1.00");
+
+        // A different value does not match.
+        let unmatched = select_rows(&mut facade, session, "SELECT bal FROM m WHERE bal = 2.00");
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn numeric_foreign_key_equality_links_parent_and_child() {
+        // A NUMERIC equality check across a declared FK exercises the value-index equality
+        // path on Decimal128 keys end to end (42.0 stored under NUMERIC(12,2) == 42.00).
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade
+            .execute(
+                session,
+                "CREATE TABLE parent (id NUMERIC(12,2) PRIMARY KEY)",
+            )
+            .unwrap();
+        facade
+            .execute(session, "INSERT INTO parent (id) VALUES (42.00)")
+            .unwrap();
+        facade
+            .execute(session, "CREATE TABLE child (pid NUMERIC(12,2))")
+            .unwrap();
+        facade
+            .execute(
+                session,
+                "ALTER TABLE ONLY public.child ADD CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES public.parent(id)",
+            )
+            .unwrap();
+        // The FK check resolves the parent row by NUMERIC equality (42.0 == 42.00).
+        facade
+            .execute(session, "INSERT INTO child (pid) VALUES (42.0)")
+            .unwrap();
+        // A missing parent key is rejected by the FK.
+        let err = facade
+            .execute(session, "INSERT INTO child (pid) VALUES (7.00)")
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn numeric_overflow_beyond_precision_is_a_clean_error() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade
+            .execute(session, "CREATE TABLE small (bal NUMERIC(4,2))")
+            .unwrap();
+        // 999.99 needs 5 significant digits but the column allows 4 -> numeric field overflow.
+        let err = facade
+            .execute(session, "INSERT INTO small (bal) VALUES (999.99)")
+            .unwrap_err();
+        assert!(
+            err.message.contains("numeric field overflow"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn count_star_returns_a_neutral_int8() {
+        // Phase-3 widening: COUNT(*) is now Int8 (the expectation the P0-M1 test anticipated).
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade.execute(session, "CREATE TABLE t (a INT)").unwrap();
+        facade
+            .execute(session, "INSERT INTO t (a) VALUES (1)")
+            .unwrap();
+        facade
+            .execute(session, "INSERT INTO t (a) VALUES (2)")
+            .unwrap();
+        let rows = select_rows(&mut facade, session, "SELECT COUNT(*) FROM t");
+        assert_eq!(rows, vec![vec![DbValue::Int8(2)]]);
+    }
+
+    #[test]
+    fn bigint_and_bool_round_trip_with_filters() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        facade
+            .execute(session, "CREATE TABLE flags (n BIGINT, ok BOOL)")
+            .unwrap();
+        facade
+            .execute(
+                session,
+                "INSERT INTO flags (n, ok) VALUES (10000000000, TRUE)",
+            )
+            .unwrap();
+        facade
+            .execute(
+                session,
+                "INSERT INTO flags (n, ok) VALUES (20000000000, FALSE)",
+            )
+            .unwrap();
+        // BIGINT range filter on the CPU path.
+        let big = select_rows(
+            &mut facade,
+            session,
+            "SELECT n FROM flags WHERE n > 15000000000",
+        );
+        assert_eq!(big, vec![vec![DbValue::Int8(20_000_000_000)]]);
+        // BOOL equality filter, and the `f` text wire form.
+        let off = select_rows(
+            &mut facade,
+            session,
+            "SELECT ok FROM flags WHERE ok = FALSE",
+        );
+        assert_eq!(off, vec![vec![DbValue::Bool(false)]]);
+        assert_eq!(pg_adapter::db_value_text(&off[0][0]), "f");
     }
 }

@@ -2200,7 +2200,9 @@ fn sql_value_text(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
-        SqlValue::Numeric(value) | SqlValue::Text(value) => value.clone(),
+        SqlValue::Numeric(value) => value.to_decimal_string(),
+        SqlValue::Bool(value) => if *value { "t" } else { "f" }.to_string(),
+        SqlValue::Text(value) => value.clone(),
     }
 }
 

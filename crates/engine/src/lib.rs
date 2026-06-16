@@ -29,14 +29,15 @@ use gpu_db_sql::{
     ColumnDef, ColumnDefault, Command, CommentTarget, CopyColumn, CopyFromStdin, CreateDatabase,
     CreateDomain, CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication,
     CreateRole, CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace,
-    CreateView, DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropExtension,
-    DropIndex, DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence,
-    DropSubscription, DropTable, DropTablespace, DropView, FunctionPrivilege, Insert, ParseError,
-    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
-    RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
-    RenameTablespace, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction,
-    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
-    TablespacePrivilege, TruncateTable, Update,
+    CreateView, DatabasePrivilege, Decimal128, Delete, DropConstraint, DropDatabase, DropDomain,
+    DropExtension, DropIndex, DropMaterializedView, DropPublication, DropRole, DropSchema,
+    DropSequence, DropSubscription, DropTable, DropTablespace, DropView, FunctionPrivilege, Insert,
+    ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
+    RenameDatabase, RenameFunction, RenameIndex, RenameMaterializedView, RenameRole,
+    RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
+    SelectFilterOp, SelectFunction, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType,
+    SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
+    NUMERIC_DEFAULT_PRECISION,
 };
 use gpu_db_storage::{
     InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore, TupleVersion,
@@ -7586,6 +7587,18 @@ fn parse_bounded_sql_function_body(
             .parse::<i32>()
             .map(SqlValue::Int4)
             .map_err(|_| unsupported_function_body_error()),
+        SqlType::Int8 => literal
+            .parse::<i64>()
+            .map(SqlValue::Int8)
+            .map_err(|_| unsupported_function_body_error()),
+        SqlType::Numeric { scale, .. } => Decimal128::parse_at_scale(literal, scale)
+            .map(SqlValue::Numeric)
+            .ok_or_else(unsupported_function_body_error),
+        SqlType::Bool => match literal.to_ascii_lowercase().as_str() {
+            "true" | "t" => Ok(SqlValue::Bool(true)),
+            "false" | "f" => Ok(SqlValue::Bool(false)),
+            _ => Err(unsupported_function_body_error()),
+        },
         SqlType::Text => parse_bounded_text_literal(literal)
             .map(SqlValue::Text)
             .ok_or_else(unsupported_function_body_error),
@@ -8862,8 +8875,102 @@ impl RelationalColumn {
 fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
     matches!(
         (value, ty),
-        (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
+        (SqlValue::Int4(_), SqlType::Int4)
+            | (SqlValue::Int8(_), SqlType::Int8)
+            | (SqlValue::Numeric(_), SqlType::Numeric { .. })
+            | (SqlValue::Bool(_), SqlType::Bool)
+            | (SqlValue::Text(_), SqlType::Text)
     )
+}
+
+/// Validate `value` against the column type and coerce it into storable form. For a
+/// NUMERIC column this rescales the value to the column's declared `scale` (round-half-up)
+/// and enforces the `precision` budget, raising a PostgreSQL-style `numeric field overflow`
+/// when the rescaled mantissa exceeds `10^precision` or leaves i128 range. Non-numeric
+/// types pass through unchanged after the type check.
+fn coerce_insert_value(
+    value: SqlValue,
+    ty: SqlType,
+    column_name: &str,
+) -> Result<SqlValue, EngineError> {
+    if !sql_value_matches_type(&value, ty) {
+        return Err(EngineError::ApplyFailed(format!(
+            "invalid value for column \"{column_name}\""
+        )));
+    }
+    match (value, ty) {
+        (SqlValue::Numeric(decimal), SqlType::Numeric { precision, scale }) => {
+            let rescaled = decimal
+                .rescale(scale)
+                .map_err(|_| EngineError::ApplyFailed("numeric field overflow".to_string()))?;
+            if numeric_exceeds_precision(rescaled.mantissa, precision) {
+                return Err(EngineError::ApplyFailed(
+                    "numeric field overflow".to_string(),
+                ));
+            }
+            Ok(SqlValue::Numeric(rescaled))
+        }
+        (value, _) => Ok(value),
+    }
+}
+
+/// Whether `mantissa` needs more than `precision` significant decimal digits (the
+/// PostgreSQL `numeric(p,s)` overflow condition once the value is at the column scale).
+fn numeric_exceeds_precision(mantissa: i128, precision: u8) -> bool {
+    let mut bound: i128 = 1;
+    for _ in 0..precision {
+        match bound.checked_mul(10) {
+            Some(next) => bound = next,
+            // 10^precision overflowed i128, so any in-range mantissa fits.
+            None => return false,
+        }
+    }
+    mantissa.unsigned_abs() >= bound.unsigned_abs()
+}
+
+/// Convert a decimal to an exact `i128` integer, or `None` if it carries a fractional
+/// part. Used to coerce an integral numeric literal (`5.0`) to an integer column.
+fn decimal_to_i128_exact(value: &Decimal128) -> Option<i128> {
+    let canonical = value.canonical();
+    (canonical.scale == 0).then_some(canonical.mantissa)
+}
+
+/// Coerce a WHERE-clause filter literal to `column_ty`, applying the implicit casts
+/// PostgreSQL allows across the integer/numeric tower: a bare-int literal matches a
+/// `numeric`/`int8` column (`WHERE bal = 5`, `WHERE big = 5`) and an integral numeric
+/// literal matches an integer column (`WHERE id = 5.0`). This also fixes the equality
+/// value-INDEX probe — the index keys on the column-typed encoding, so an un-coerced
+/// `Int4(5)` would key `i:5` and miss a numeric column's `d:5:0` slot. A literal with no
+/// implicit cast to the column type (or one out of the column's range) is returned
+/// unchanged: it then compares unequal (correct — `5.5` matches no integer row) and the
+/// index probe keys on the literal's own type and correctly finds nothing.
+fn coerce_filter_literal(value: SqlValue, column_ty: SqlType) -> SqlValue {
+    match (value, column_ty) {
+        (SqlValue::Int4(v), SqlType::Numeric { .. }) => {
+            SqlValue::Numeric(Decimal128::new(i128::from(v), 0))
+        }
+        (SqlValue::Int8(v), SqlType::Numeric { .. }) => {
+            SqlValue::Numeric(Decimal128::new(i128::from(v), 0))
+        }
+        (SqlValue::Int4(v), SqlType::Int8) => SqlValue::Int8(i64::from(v)),
+        (SqlValue::Int8(v), SqlType::Int4) => match i32::try_from(v) {
+            Ok(narrowed) => SqlValue::Int4(narrowed),
+            Err(_) => SqlValue::Int8(v),
+        },
+        (SqlValue::Numeric(d), SqlType::Int4) => match decimal_to_i128_exact(&d) {
+            Some(i) => i32::try_from(i)
+                .map(SqlValue::Int4)
+                .unwrap_or(SqlValue::Numeric(d)),
+            None => SqlValue::Numeric(d),
+        },
+        (SqlValue::Numeric(d), SqlType::Int8) => match decimal_to_i128_exact(&d) {
+            Some(i) => i64::try_from(i)
+                .map(SqlValue::Int8)
+                .unwrap_or(SqlValue::Numeric(d)),
+            None => SqlValue::Numeric(d),
+        },
+        (other, _) => other,
+    }
 }
 
 fn column_default_matches_type(value: &ColumnDefault, ty: SqlType) -> bool {
@@ -8898,7 +9005,14 @@ fn relational_index_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => format!("i:{value}"),
         SqlValue::Int8(value) => format!("n:{value}"),
-        SqlValue::Numeric(value) => format!("d:{value}"),
+        // The equality value-index keys on the CANONICAL decimal (trailing zeros stripped)
+        // so a stored `1.0` and a `WHERE bal = 1.00` literal hash to the same slot
+        // regardless of their declared scale (numeric equality is scale-insensitive).
+        SqlValue::Numeric(value) => {
+            let canonical = value.canonical();
+            format!("d:{}:{}", canonical.mantissa, canonical.scale)
+        }
+        SqlValue::Bool(value) => format!("b:{}", if *value { 't' } else { 'f' }),
         SqlValue::Text(value) => format!("t:{value}"),
     }
 }
@@ -8952,9 +9066,11 @@ fn render_sql_value_literal(value: &SqlValue) -> Result<String, EngineError> {
     match value {
         SqlValue::Int4(value) => Ok(value.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) => Err(EngineError::ApplyFailed(
-            "COPY-to-engine ingestion supports int4/text rows only".to_string(),
-        )),
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) => {
+            Err(EngineError::ApplyFailed(
+                "COPY-to-engine ingestion supports int4/text rows only".to_string(),
+            ))
+        }
     }
 }
 
@@ -8962,7 +9078,9 @@ fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
     match value {
         SqlValue::Int4(_) => 4,
         SqlValue::Int8(_) => 8,
-        SqlValue::Numeric(value) => value.len() as u64,
+        // A NUMERIC is a fixed-width i128 mantissa + u8 scale.
+        SqlValue::Numeric(_) => (std::mem::size_of::<i128>() + std::mem::size_of::<u8>()) as u64,
+        SqlValue::Bool(_) => 1,
         SqlValue::Text(value) => value.len() as u64,
     }
 }
@@ -8973,7 +9091,10 @@ fn encode_relational_row(values: &[SqlValue]) -> String {
         .map(|value| match value {
             SqlValue::Int4(value) => format!("i:{value}"),
             SqlValue::Int8(value) => format!("n:{value}"),
-            SqlValue::Numeric(value) => format!("d:{value}"),
+            // Storage preserves the value's declared scale (`d:<mantissa>:<scale>`); the
+            // value-index canonicalizes separately for scale-insensitive equality lookups.
+            SqlValue::Numeric(value) => format!("d:{}:{}", value.mantissa, value.scale),
+            SqlValue::Bool(value) => format!("b:{}", if *value { 't' } else { 'f' }),
             SqlValue::Text(value) => {
                 format!("t:{}", value.replace('\\', "\\\\").replace('|', "\\|"))
             }
@@ -8995,28 +9116,74 @@ fn decode_relational_row(
     parts
         .into_iter()
         .zip(columns.iter())
-        .map(|(part, column)| {
-            match (
-                part.strip_prefix("i:"),
-                part.strip_prefix("t:"),
-                part.strip_prefix("n:"),
-                column.ty,
-            ) {
-                (Some(value), _, _, SqlType::Int4) => {
-                    value.parse::<i32>().map(SqlValue::Int4).map_err(|_| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(
-                            "stored INT value is invalid".to_string(),
-                        ))
-                    })
-                }
-                (_, Some(value), _, SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
-                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "stored value for column \"{}\" has wrong type",
-                    column.name
-                )))),
-            }
-        })
+        .map(|(part, column)| decode_relational_value(&part, column))
         .collect()
+}
+
+/// Decode one stored, escape-resolved cell into a [`SqlValue`] of the column's type.
+/// The storage prefix vocabulary is `i:`int4 `n:`int8 `d:`numeric(`mantissa:scale`)
+/// `b:`bool `t:`text — chosen to mirror [`relational_index_value`]'s key vocabulary.
+fn decode_relational_value(
+    part: &str,
+    column: &RelationalColumn,
+) -> Result<SqlValue, ExecuteError> {
+    let wrong_type = || {
+        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "stored value for column \"{}\" has wrong type",
+            column.name
+        )))
+    };
+    match column.ty {
+        SqlType::Int4 => {
+            let value = part.strip_prefix("i:").ok_or_else(wrong_type)?;
+            value.parse::<i32>().map(SqlValue::Int4).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored INT value is invalid".to_string(),
+                ))
+            })
+        }
+        SqlType::Int8 => {
+            let value = part.strip_prefix("n:").ok_or_else(wrong_type)?;
+            value.parse::<i64>().map(SqlValue::Int8).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored BIGINT value is invalid".to_string(),
+                ))
+            })
+        }
+        SqlType::Numeric { .. } => {
+            let body = part.strip_prefix("d:").ok_or_else(wrong_type)?;
+            let (mantissa, scale) = body.split_once(':').ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored NUMERIC value is invalid".to_string(),
+                ))
+            })?;
+            let mantissa = mantissa.parse::<i128>().map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored NUMERIC value is invalid".to_string(),
+                ))
+            })?;
+            let scale = scale.parse::<u8>().map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored NUMERIC value is invalid".to_string(),
+                ))
+            })?;
+            Ok(SqlValue::Numeric(Decimal128::new(mantissa, scale)))
+        }
+        SqlType::Bool => {
+            let value = part.strip_prefix("b:").ok_or_else(wrong_type)?;
+            match value {
+                "t" => Ok(SqlValue::Bool(true)),
+                "f" => Ok(SqlValue::Bool(false)),
+                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored BOOL value is invalid".to_string(),
+                ))),
+            }
+        }
+        SqlType::Text => {
+            let value = part.strip_prefix("t:").ok_or_else(wrong_type)?;
+            Ok(SqlValue::Text(value.to_string()))
+        }
+    }
 }
 
 fn split_escaped_row(input: &str) -> Vec<String> {
@@ -9049,61 +9216,47 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
         (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
         (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
         (SqlValue::Int8(left), SqlValue::Int4(right)) => left.cmp(&i64::from(*right)),
-        (SqlValue::Numeric(left), SqlValue::Numeric(right)) => compare_numeric_strings(left, right),
+        // Numeric vs numeric is scale-aligned (1.0 == 1.00). Integer-vs-numeric promotes the
+        // integer to a scale-0 Decimal128 so `bal > 5` works across the int4/numeric boundary.
+        (SqlValue::Numeric(left), SqlValue::Numeric(right)) => left.cmp(right),
+        (SqlValue::Int4(left), SqlValue::Numeric(right)) => {
+            Decimal128::new(i128::from(*left), 0).cmp(right)
+        }
+        (SqlValue::Int8(left), SqlValue::Numeric(right)) => {
+            Decimal128::new(i128::from(*left), 0).cmp(right)
+        }
+        (SqlValue::Numeric(left), SqlValue::Int4(right)) => {
+            left.cmp(&Decimal128::new(i128::from(*right), 0))
+        }
+        (SqlValue::Numeric(left), SqlValue::Int8(right)) => {
+            left.cmp(&Decimal128::new(i128::from(*right), 0))
+        }
+        (SqlValue::Bool(left), SqlValue::Bool(right)) => left.cmp(right),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Numeric(_) | SqlValue::Text(_)) => {
+        // Cross-family ordering follows the variant order int < numeric < bool < text. This
+        // only surfaces for heterogeneous comparisons (e.g. sorting a mixed projection) — the
+        // typed engine never compares a numeric to a bool in a real predicate.
+        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Bool(_) | SqlValue::Text(_)) => {
             Ordering::Less
         }
-        (SqlValue::Numeric(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => Ordering::Greater,
-        (SqlValue::Numeric(_), SqlValue::Text(_)) => Ordering::Less,
-        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_)) => {
+        (SqlValue::Numeric(_), SqlValue::Bool(_) | SqlValue::Text(_)) => Ordering::Less,
+        (SqlValue::Bool(_), SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_)) => {
             Ordering::Greater
         }
+        (SqlValue::Bool(_), SqlValue::Text(_)) => Ordering::Less,
+        (
+            SqlValue::Text(_),
+            SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_),
+        ) => Ordering::Greater,
     }
-}
-
-fn compare_numeric_strings(left: &str, right: &str) -> Ordering {
-    let (left_negative, left_abs) = left
-        .strip_prefix('-')
-        .map_or((false, left), |value| (true, value));
-    let (right_negative, right_abs) = right
-        .strip_prefix('-')
-        .map_or((false, right), |value| (true, value));
-    match (left_negative, right_negative) {
-        (true, false) => return Ordering::Less,
-        (false, true) => return Ordering::Greater,
-        _ => {}
-    }
-    let magnitude = compare_unsigned_numeric_strings(left_abs, right_abs);
-    if left_negative {
-        magnitude.reverse()
-    } else {
-        magnitude
-    }
-}
-
-fn compare_unsigned_numeric_strings(left: &str, right: &str) -> Ordering {
-    let (left_whole, left_frac) = left.split_once('.').unwrap_or((left, ""));
-    let (right_whole, right_frac) = right.split_once('.').unwrap_or((right, ""));
-    let left_whole = left_whole.trim_start_matches('0');
-    let right_whole = right_whole.trim_start_matches('0');
-    left_whole
-        .len()
-        .cmp(&right_whole.len())
-        .then_with(|| left_whole.cmp(right_whole))
-        .then_with(|| {
-            let width = left_frac.len().max(right_frac.len());
-            let mut left_padded = left_frac.to_string();
-            let mut right_padded = right_frac.to_string();
-            left_padded.extend(std::iter::repeat_n('0', width - left_padded.len()));
-            right_padded.extend(std::iter::repeat_n('0', width - right_padded.len()));
-            left_padded.cmp(&right_padded)
-        })
 }
 
 fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) -> bool {
     match op {
-        SelectFilterOp::Eq => left == right,
+        // Eq is scale/type-aware like the ordering ops, so `numeric = int` matches across
+        // the numeric tower. Bound filter literals are pre-coerced to the column type, but
+        // routing Eq through compare_sql_values keeps it correct for any direct caller too.
+        SelectFilterOp::Eq => compare_sql_values(left, right).is_eq(),
         SelectFilterOp::Lt => compare_sql_values(left, right).is_lt(),
         SelectFilterOp::Lte => !compare_sql_values(left, right).is_gt(),
         SelectFilterOp::Gt => compare_sql_values(left, right).is_gt(),
@@ -9191,16 +9344,26 @@ fn bind_relational_select(
             SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => "max",
             SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
         };
-        let (aggregate_ty, aggregate_type_oid, aggregate_type_size) = if matches!(
-            select.projection,
-            SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. }
-        ) {
-            (SqlType::Int4, 1700, -1)
-        } else {
-            match aggregate_source_column(table, select)? {
+        let (aggregate_ty, aggregate_type_oid, aggregate_type_size) = match &select.projection {
+            // AVG yields a fixed-point numeric at scale 16 (numeric OID 1700).
+            SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => (
+                SqlType::Numeric {
+                    precision: NUMERIC_DEFAULT_PRECISION,
+                    scale: AVG_RESULT_SCALE,
+                },
+                1700,
+                -1,
+            ),
+            // COUNT is int8 (OID 20) regardless of the counted column (Phase-3 widening).
+            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => {
+                (SqlType::Int8, 20, 8)
+            }
+            // SUM/MIN/MAX inherit the source column's wire type (SUM's value widens to int8,
+            // but its declared result type tracks the source as before).
+            _ => match aggregate_source_column(table, select)? {
                 Some(column) => (column.ty, column.type_oid, column.type_size),
                 None => (SqlType::Int4, 20, 8),
-            }
+            },
         };
         let aggregate_attnum = selected_columns.len() as i16 + 1;
         selected_columns.push(RelationalColumn {
@@ -9235,8 +9398,13 @@ fn bind_relational_select(
             group
                 .into_iter()
                 .map(|filter| {
-                    relational_column_index(table, &filter.column)
-                        .map(|idx| (idx, filter.op, filter.value))
+                    relational_column_index(table, &filter.column).map(|idx| {
+                        // PG implicitly casts the literal to the column type across the
+                        // integer/numeric tower, so `WHERE bal = 5` matches a numeric
+                        // column and the equality index probe keys on the right slot.
+                        let value = coerce_filter_literal(filter.value, table.columns[idx].ty);
+                        (idx, filter.op, value)
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
@@ -9485,13 +9653,16 @@ fn bind_delete_filter_groups(
                 .into_iter()
                 .map(|filter| {
                     let idx = relational_column_index(table, &filter.column)?;
-                    if !sql_value_matches_type(&filter.value, table.columns[idx].ty) {
+                    // Coerce across the integer/numeric tower for parity with SELECT; a
+                    // value with no implicit cast to the column type still errors loudly.
+                    let value = coerce_filter_literal(filter.value, table.columns[idx].ty);
+                    if !sql_value_matches_type(&value, table.columns[idx].ty) {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                             "invalid value for column \"{}\"",
                             filter.column
                         ))));
                     }
-                    Ok((idx, filter.op, filter.value))
+                    Ok((idx, filter.op, value))
                 })
                 .collect()
         })
@@ -9759,32 +9930,41 @@ fn aggregate_int4_error_message(aggregate: &str) -> &'static str {
 fn int4_aggregate_value(value: &SqlValue, aggregate: &'static str) -> Result<i32, ExecuteError> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => Err(ExecuteError::Engine(
-            EngineError::ApplyFailed(aggregate_int4_error_message(aggregate).to_string()),
-        )),
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Text(_) => {
+            Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                aggregate_int4_error_message(aggregate).to_string(),
+            )))
+        }
     }
 }
 
+/// The scale AVG results carry: 16 fractional digits, matching PostgreSQL's default
+/// `numeric` AVG and the engine's historical text output (so `24.5` prints as
+/// `24.5000000000000000`).
+const AVG_RESULT_SCALE: u8 = 16;
+
 fn average_sql_value(sum: i128, count: usize) -> SqlValue {
     if count == 0 {
-        return SqlValue::Numeric(String::new());
+        // AVG over zero matched rows. Historically rendered as an empty numeric; we keep a
+        // canonical zero sentinel (the no-match case never reaches a real money computation).
+        return SqlValue::Numeric(Decimal128::ZERO);
     }
     let count = count as i128;
     let negative = sum.is_negative();
     let abs_sum = sum.abs();
-    let whole = abs_sum / count;
+    // Build the scale-16 mantissa = floor(abs_sum * 10^16 / count) digit-by-digit (matching the
+    // prior text formatter exactly, and avoiding an `abs_sum * 10^16` i128 overflow for large sums).
+    let mut mantissa = abs_sum / count;
     let mut remainder = abs_sum % count;
-    let mut fractional = String::with_capacity(16);
-    for _ in 0..16 {
+    for _ in 0..AVG_RESULT_SCALE {
         remainder *= 10;
-        fractional.push(char::from(b'0' + u8::try_from(remainder / count).unwrap()));
+        mantissa = mantissa * 10 + remainder / count;
         remainder %= count;
     }
-    SqlValue::Numeric(format!(
-        "{}{}.{fractional}",
-        if negative { "-" } else { "" },
-        whole
-    ))
+    if negative {
+        mantissa = -mantissa;
+    }
+    SqlValue::Numeric(Decimal128::new(mantissa, AVG_RESULT_SCALE))
 }
 
 fn current_timestamp_micros() -> u64 {
@@ -14896,13 +15076,9 @@ impl Engine {
             for (source_idx, target_idx) in column_indexes.iter().copied().enumerate() {
                 let value = row[source_idx].clone();
                 let expected_ty = table.columns[target_idx].ty;
-                if !sql_value_matches_type(&value, expected_ty) {
-                    return Err(EngineError::ApplyFailed(format!(
-                        "invalid value for column \"{}\"",
-                        table.columns[target_idx].name
-                    )));
-                }
-                values[target_idx] = Some(value);
+                let coerced =
+                    coerce_insert_value(value, expected_ty, &table.columns[target_idx].name)?;
+                values[target_idx] = Some(coerced);
             }
             for (idx, value) in values.iter_mut().enumerate() {
                 if value.is_none() {
@@ -16376,13 +16552,12 @@ impl Engine {
                     for (source_idx, target_idx) in column_indexes.iter().copied().enumerate() {
                         let value = row[source_idx].clone();
                         let expected_ty = table.columns[target_idx].ty;
-                        if !sql_value_matches_type(&value, expected_ty) {
-                            return Err(EngineError::ApplyFailed(format!(
-                                "invalid value for column \"{}\"",
-                                table.columns[target_idx].name
-                            )));
-                        }
-                        values[target_idx] = Some(value);
+                        let coerced = coerce_insert_value(
+                            value,
+                            expected_ty,
+                            &table.columns[target_idx].name,
+                        )?;
+                        values[target_idx] = Some(coerced);
                     }
                     for (idx, value) in values.iter_mut().enumerate() {
                         if value.is_none() {
@@ -18429,7 +18604,7 @@ impl Engine {
                 snapshot.row_count
             ))));
         }
-        let count = i32::try_from(row_count).map_err(|_| {
+        let count = i64::try_from(row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory row count {row_count} exceeds supported COUNT(*) result range"
             )))
@@ -18440,7 +18615,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
             fallback_reason: None,
@@ -18545,7 +18720,7 @@ impl Engine {
             })?;
             gpu_id = partition.gpu_id;
         }
-        let count = i32::try_from(total_count).map_err(|_| {
+        let count = i64::try_from(total_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "partitioned resident row count {total_count} exceeds supported COUNT(*) result range"
             )))
@@ -18556,7 +18731,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(gpu_id),
             executed_target: DeviceTarget::Gpu(gpu_id),
             fallback_reason: None,
@@ -20075,7 +20250,7 @@ impl Engine {
         let filtered_count = device_memory
             .count_i32_equal_from_payload(byte_offset, row_count, needle)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-        let count = i32::try_from(filtered_count).map_err(|_| {
+        let count = i64::try_from(filtered_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory filtered count {filtered_count} exceeds supported COUNT(*) result range"
             )))
@@ -20083,7 +20258,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -20178,7 +20353,7 @@ impl Engine {
                 .saturating_mul(std::mem::size_of::<u64>() as u64)
                 .saturating_add(layout.bytes_len),
         );
-        let count = i32::try_from(matched_count).map_err(|_| {
+        let count = i64::try_from(matched_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory text-prefix count {matched_count} exceeds supported COUNT(*) result range"
             )))
@@ -20186,7 +20361,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -20303,7 +20478,7 @@ impl Engine {
         let membership_count = device_memory
             .count_i32_in_from_payload(byte_offset, row_count, &needles)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-        let count = i32::try_from(membership_count).map_err(|_| {
+        let count = i64::try_from(membership_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory membership count {membership_count} exceeds supported COUNT(*) result range"
             )))
@@ -20311,7 +20486,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -20401,7 +20576,7 @@ impl Engine {
         let filtered_count = device_memory
             .count_i32_compare_from_payload(byte_offset, row_count, needle, comparison)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-        let count = i32::try_from(filtered_count).map_err(|_| {
+        let count = i64::try_from(filtered_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory range count {filtered_count} exceeds supported COUNT(*) result range"
             )))
@@ -20409,7 +20584,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -20543,7 +20718,7 @@ impl Engine {
             .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
         self.metrics
             .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
-        let count = i32::try_from(between_count).map_err(|_| {
+        let count = i64::try_from(between_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory BETWEEN count {between_count} exceeds supported COUNT(*) result range"
             )))
@@ -20551,7 +20726,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -20686,7 +20861,7 @@ impl Engine {
             self.metrics
                 .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
         }
-        let count = i32::try_from(matched_count).map_err(|_| {
+        let count = i64::try_from(matched_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory filter-group count {matched_count} exceeds supported COUNT(*) result range"
             )))
@@ -20694,7 +20869,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int4(count)]],
+            rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -21385,13 +21560,13 @@ impl Engine {
             .map(|group| {
                 let aggregate: SqlValue = match &select.projection {
                     SelectProjection::GroupedCount { .. } => {
-                        let count = i32::try_from(group.count).map_err(|_| {
+                        let count = i64::try_from(group.count).map_err(|_| {
                             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                                 "resident device-memory grouped count {} exceeds supported COUNT(*) result range",
                                 group.count
                             )))
                         })?;
-                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(count))
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int8(count))
                     }
                     SelectProjection::GroupedSum { .. } => {
                         Ok::<SqlValue, ExecuteError>(SqlValue::Int8(group.sum))
@@ -21613,13 +21788,13 @@ impl Engine {
             .map(|group| {
                 let aggregate: SqlValue = match &select.projection {
                     SelectProjection::GroupedCount { .. } => {
-                        let count = i32::try_from(group.count).map_err(|_| {
+                        let count = i64::try_from(group.count).map_err(|_| {
                             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                                 "resident device-memory filtered grouped count {} exceeds supported COUNT(*) result range",
                                 group.count
                             )))
                         })?;
-                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(count))
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int8(count))
                     }
                     SelectProjection::GroupedSum { .. } => {
                         Ok::<SqlValue, ExecuteError>(SqlValue::Int8(group.sum))
@@ -22218,6 +22393,15 @@ impl Engine {
                     }
                     text_values.insert(idx, values);
                 }
+                // Typed (int8/numeric/bool) columns never reach a GPU-resident projection route
+                // — `resident_route_shape` rejects them upstream so they take the CPU path. Guard
+                // defensively in case a future route admits them before the kernels support them.
+                SqlType::Int8 | SqlType::Numeric { .. } | SqlType::Bool => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident device-memory projection supports only int4/text columns"
+                            .to_string(),
+                    )));
+                }
             }
         }
         let elapsed = started.elapsed();
@@ -22690,6 +22874,14 @@ impl Engine {
                             ))));
                         }
                         text_values.insert(*idx, values);
+                    }
+                    // See the multi-column route above: typed columns take the CPU path; this
+                    // GPU projection only handles int4/text.
+                    SqlType::Int8 | SqlType::Numeric { .. } | SqlType::Bool => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "resident device-memory projection supports only int4/text columns"
+                                .to_string(),
+                        )));
                     }
                 }
             }
@@ -23811,7 +24003,7 @@ impl Engine {
 
         if select_is_aggregate(select) {
             let mut aggregate_rows = match &select.projection {
-                SelectProjection::CountAll => vec![vec![SqlValue::Int4(rows.len() as i32)]],
+                SelectProjection::CountAll => vec![vec![SqlValue::Int8(rows.len() as i64)]],
                 SelectProjection::GroupedCount { .. } => {
                     let group_idx = bound
                         .group_by_index
@@ -23822,7 +24014,7 @@ impl Engine {
                     }
                     counts
                         .into_iter()
-                        .map(|(value, count)| vec![value, SqlValue::Int4(count as i32)])
+                        .map(|(value, count)| vec![value, SqlValue::Int8(count as i64)])
                         .collect::<Vec<_>>()
                 }
                 SelectProjection::Sum { column } => {
@@ -31347,7 +31539,7 @@ mod tests {
 
         assert_eq!(resident.columns, cpu.columns);
         assert_eq!(resident.rows, cpu.rows);
-        assert_eq!(resident.rows, vec![vec![SqlValue::Int4(3)]]);
+        assert_eq!(resident.rows, vec![vec![SqlValue::Int8(3)]]);
         assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
         assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(resident.fallback_reason, None);
@@ -32852,7 +33044,7 @@ mod tests {
         let before = e.metrics().snapshot();
         let result = e.execute_relational_select(&select).unwrap();
         let after = e.metrics().snapshot();
-        assert_eq!(result.rows, vec![vec![SqlValue::Int4(1024)]]);
+        assert_eq!(result.rows, vec![vec![SqlValue::Int8(1024)]]);
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(result.fallback_reason, None);
         let decision = e
@@ -33895,7 +34087,9 @@ mod tests {
         let after = e.metrics().snapshot();
         assert_eq!(
             result.rows,
-            vec![vec![SqlValue::Numeric("24.5000000000000000".to_string())]]
+            vec![vec![SqlValue::Numeric(
+                Decimal128::parse("24.5000000000000000").unwrap()
+            )]]
         );
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(result.fallback_reason, None);
@@ -33927,7 +34121,11 @@ mod tests {
             unreachable!()
         };
         let no_match = e.execute_relational_select(&no_match_select).unwrap();
-        assert_eq!(no_match.rows, vec![vec![SqlValue::Numeric(String::new())]]);
+        // AVG over zero matched rows now yields the canonical-zero numeric sentinel.
+        assert_eq!(
+            no_match.rows,
+            vec![vec![SqlValue::Numeric(Decimal128::ZERO)]]
+        );
 
         e.execute_text(
             2,
@@ -34449,7 +34647,9 @@ mod tests {
         let after = e.metrics().snapshot();
         assert_eq!(
             result.rows,
-            vec![vec![SqlValue::Numeric("25.6250000000000000".to_string())]]
+            vec![vec![SqlValue::Numeric(
+                Decimal128::parse("25.6250000000000000").unwrap()
+            )]]
         );
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(result.fallback_reason, None);
@@ -34479,7 +34679,11 @@ mod tests {
             unreachable!()
         };
         let no_match = e.execute_relational_select(&no_match_select).unwrap();
-        assert_eq!(no_match.rows, vec![vec![SqlValue::Numeric(String::new())]]);
+        // AVG over zero matched rows now yields the canonical-zero numeric sentinel.
+        assert_eq!(
+            no_match.rows,
+            vec![vec![SqlValue::Numeric(Decimal128::ZERO)]]
+        );
 
         e.execute_text(
             2,
@@ -34789,7 +34993,7 @@ mod tests {
             let result = e.execute_relational_select(&select).unwrap();
             assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
             assert_eq!(result.fallback_reason, None);
-            assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
+            assert_eq!(result.rows, vec![vec![SqlValue::Int8(3)]]);
             assert!(report
                 .route_ready_tables
                 .iter()
@@ -50160,7 +50364,7 @@ mod tests {
 
         assert_eq!(
             result.rows,
-            vec![vec![SqlValue::Text("Grace".to_string()), SqlValue::Int4(2)]]
+            vec![vec![SqlValue::Text("Grace".to_string()), SqlValue::Int8(2)]]
         );
         assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
@@ -50183,7 +50387,7 @@ mod tests {
         let count_result = e
             .execute_relational_select_with_backend(&count_select, &FirstCudaSliceParityBackend)
             .unwrap();
-        assert_eq!(count_result.rows, vec![vec![SqlValue::Int4(2)]]);
+        assert_eq!(count_result.rows, vec![vec![SqlValue::Int8(2)]]);
         assert_eq!(count_result.fallback_reason, None);
 
         let Command::Select(sum_select) = parse_command(
@@ -50218,7 +50422,7 @@ mod tests {
             avg_result.rows,
             vec![vec![
                 SqlValue::Text("Linus".to_string()),
-                SqlValue::Numeric("4.0000000000000000".to_string())
+                SqlValue::Numeric(Decimal128::parse("4.0000000000000000").unwrap())
             ]]
         );
         assert_eq!(avg_result.planned_target, DeviceTarget::Gpu(0));
@@ -50238,7 +50442,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             avg_scalar_result.rows,
-            vec![vec![SqlValue::Numeric("2.5000000000000000".to_string())]]
+            vec![vec![SqlValue::Numeric(
+                Decimal128::parse("2.5000000000000000").unwrap()
+            )]]
         );
         assert_eq!(avg_scalar_result.fallback_reason, None);
 
@@ -50273,6 +50479,95 @@ mod tests {
             vec![vec![SqlValue::Text("Grace".to_string())]]
         );
         assert_eq!(max_result.fallback_reason, None);
+    }
+
+    #[test]
+    fn where_equality_coerces_literal_across_the_numeric_tower() {
+        // Blocker regression: `WHERE numeric_col = <int literal>` (and the integral-numeric
+        // reverse) must match via PostgreSQL's implicit cross-type coercion, not silently
+        // miss — both the in-memory predicate and the equality value-index probe.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE acct (id INT, bal NUMERIC(10,2))")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO acct (id, bal) VALUES (5, 100.00), (6, 1.50), (7, 2.00)",
+        )
+        .unwrap();
+        let run = |e: &Engine, sql: &str| {
+            let Command::Select(s) = parse_command(sql).unwrap() else {
+                panic!("expected SELECT");
+            };
+            e.execute_relational_select(&s).unwrap().rows
+        };
+
+        // numeric column = bare-int literal (the reported blocker) and = different-scale numeric.
+        assert_eq!(
+            run(&e, "SELECT id FROM acct WHERE bal = 100"),
+            vec![vec![SqlValue::Int4(5)]]
+        );
+        assert_eq!(
+            run(&e, "SELECT id FROM acct WHERE bal = 1.5"),
+            vec![vec![SqlValue::Int4(6)]]
+        );
+        // integer column = integral numeric literal matches; a fractional literal matches nothing.
+        assert_eq!(
+            run(&e, "SELECT id FROM acct WHERE id = 7.0"),
+            vec![vec![SqlValue::Int4(7)]]
+        );
+        assert!(run(&e, "SELECT id FROM acct WHERE id = 7.5").is_empty());
+        // Equality is now consistent with the ordering ops across the int/numeric boundary.
+        assert_eq!(
+            run(&e, "SELECT id FROM acct WHERE bal >= 2 ORDER BY id"),
+            vec![vec![SqlValue::Int4(5)], vec![SqlValue::Int4(7)]]
+        );
+        // DELETE coerces the same way (parity with SELECT, not a type error).
+        e.execute_text(3, "DELETE FROM acct WHERE bal = 100")
+            .unwrap();
+        assert!(run(&e, "SELECT id FROM acct WHERE bal = 100").is_empty());
+    }
+
+    #[test]
+    fn coerce_filter_literal_spans_the_integer_numeric_tower() {
+        let num = SqlType::Numeric {
+            precision: 10,
+            scale: 2,
+        };
+        // int -> numeric / int8, and the integral-numeric -> int reverses.
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Int4(5), num),
+            SqlValue::Numeric(Decimal128::new(5, 0))
+        );
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Int4(5), SqlType::Int8),
+            SqlValue::Int8(5)
+        );
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Int8(5), num),
+            SqlValue::Numeric(Decimal128::new(5, 0))
+        );
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Numeric(Decimal128::new(700, 2)), SqlType::Int4),
+            SqlValue::Int4(7)
+        );
+        // No implicit cast / out of range: returned unchanged (then compares unequal).
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Numeric(Decimal128::new(75, 1)), SqlType::Int4),
+            SqlValue::Numeric(Decimal128::new(75, 1))
+        );
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Int8(5_000_000_000), SqlType::Int4),
+            SqlValue::Int8(5_000_000_000)
+        );
+        // Same-type and unrelated types pass through untouched.
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Int4(9), SqlType::Int4),
+            SqlValue::Int4(9)
+        );
+        assert_eq!(
+            coerce_filter_literal(SqlValue::Text("x".into()), num),
+            SqlValue::Text("x".into())
+        );
     }
 
     #[test]

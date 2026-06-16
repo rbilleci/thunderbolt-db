@@ -13,6 +13,7 @@ pub fn logical_type_oid(ty: LogicalType) -> u32 {
         LogicalType::Int4 => 23,
         LogicalType::Int8 => 20,
         LogicalType::Numeric => 1700,
+        LogicalType::Bool => 16,
         LogicalType::Text => 25,
     }
 }
@@ -23,16 +24,21 @@ pub fn logical_type_size(ty: LogicalType) -> i16 {
         LogicalType::Int4 => 4,
         LogicalType::Int8 => 8,
         LogicalType::Numeric => -1,
+        LogicalType::Bool => 1,
         LogicalType::Text => -1,
     }
 }
 
-/// Text-format wire encoding of a neutral value.
+/// Text-format wire encoding of a neutral value. A `Numeric` renders via its
+/// fixed-point decimal string (with the decimal point); a `Bool` renders as the
+/// PostgreSQL `t`/`f` text form.
 pub fn db_value_text(value: &DbValue) -> String {
     match value {
         DbValue::Int4(value) => value.to_string(),
         DbValue::Int8(value) => value.to_string(),
-        DbValue::Numeric(value) | DbValue::Text(value) => value.clone(),
+        DbValue::Numeric(value) => value.to_decimal_string(),
+        DbValue::Bool(value) => if *value { "t" } else { "f" }.to_string(),
+        DbValue::Text(value) => value.clone(),
     }
 }
 

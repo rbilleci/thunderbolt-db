@@ -9895,8 +9895,18 @@ default: Some(ColumnDefault::SequenceNextVal {
             parse_command("CREATE TABLE accounts (id account_id DEFAULT 1)"),
             Err(ParseError::InvalidRelationalSql)
         ));
+        // `bigint` is a storable base type as of Phase-3 M1, so a domain over it now parses
+        // (previously only int4/text were supported base types). A parenthesized typmod
+        // (e.g. `numeric(12,2)`) on a domain stays rejected — domain typmods are out of M1 scope.
+        assert_eq!(
+            parse_command("CREATE DOMAIN account_id AS bigint").unwrap(),
+            Command::CreateDomain(CreateDomain {
+                name: "account_id".to_string(),
+                base_type: SqlType::Int8,
+            })
+        );
         assert!(matches!(
-            parse_command("CREATE DOMAIN account_id AS bigint"),
+            parse_command("CREATE DOMAIN money_amount AS numeric(12,2)"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
@@ -9980,12 +9990,18 @@ default: Some(ColumnDefault::SequenceNextVal {
             ),
             Err(ParseError::InvalidRelationalSql)
         ));
-        assert!(matches!(
+        // `bigint` is a storable return type as of Phase-3 M1 (previously unsupported).
+        assert_eq!(
             parse_command(
                 "CREATE FUNCTION public.answer() RETURNS bigint LANGUAGE sql AS 'SELECT 42'"
-            ),
-            Err(ParseError::InvalidRelationalSql)
-        ));
+            )
+            .unwrap(),
+            Command::CreateFunction(CreateFunction {
+                name: "answer".to_string(),
+                return_type: SqlType::Int8,
+                body: "SELECT 42".to_string(),
+            })
+        );
         assert!(matches!(
             parse_command(
                 "CREATE FUNCTION public.answer() RETURNS int4 LANGUAGE plpgsql AS 'BEGIN END'"

@@ -72,7 +72,7 @@ psql:348_protocol_psql_functions.sql:41: ERROR:  function does not exist
 psql:348_protocol_psql_functions.sql:42: ERROR:  query shape is not supported by the compatibility stub
 psql:348_protocol_psql_functions.sql:43: ERROR:  function already exists with same argument types
 psql:348_protocol_psql_functions.sql:44: ERROR:  query shape is not supported by the compatibility stub
-psql:348_protocol_psql_functions.sql:45: ERROR:  query shape is not supported by the compatibility stub
+CREATE FUNCTION
 psql:348_protocol_psql_functions.sql:46: ERROR:  query shape is not supported by the compatibility stub
 psql:348_protocol_psql_functions.sql:47: ERROR:  function does not exist
 psql:348_protocol_psql_functions.sql:48: ERROR:  function does not exist
@@ -80,7 +80,8 @@ DROP FUNCTION
 DROP FUNCTION
 DROP FUNCTION
 DROP FUNCTION
-                       List of functions
- Schema | Name | Result data type | Argument data types | Type
---------+------+------------------+---------------------+------
-(0 rows)
+                          List of functions
+ Schema |    Name     | Result data type | Argument data types | Type
+--------+-------------+------------------+---------------------+------
+ public | unsupported | bigint           |                     | func
+(1 row)

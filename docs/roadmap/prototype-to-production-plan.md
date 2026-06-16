@@ -651,7 +651,10 @@ choices. (Same spirit as Phase 7's data-structure sweep, focused on the type lay
   the additive bignum/CPU fallback here — a new value variant + a distinct storage tag, no re-encode of
   i128 values; see the §"larger NUMERIC" reasoning), NUMERIC round-half-up vs PG, float8 NaN/±Inf,
   varchar(n) length + text collation, timestamp[tz]/date ranges + ±infinity, uuid/bytea/json(b)
-  canonicalization, and `SUM()` accumulator overflow at extreme scale.
+  canonicalization, and accumulator overflow at extreme scale in `SUM()` **and `AVG()`** (the M1
+  `average_sql_value` digit-by-digit `mantissa*10` loop needs checked arithmetic — and to surface an
+  overflow error — before AVG accepts int8/numeric inputs; unreachable while AVG is int4-only, see
+  [[gpu-phase3]] M1 follow-ups).
 - **GPU-representation optimization.** Classify every type: **GPU-resident-amenable** (fixed-width,
   alloc-free — int2/4/8, float8, bool, the i128 decimal, uuid (128-bit), date/timestamp (i32/i64)) vs
   **variable-length / CPU-only** (text/varchar, json(b), arbitrary bytea, the bignum-NUMERIC fallback).

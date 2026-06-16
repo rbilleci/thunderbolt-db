@@ -102,6 +102,18 @@ fn bool_column(name: &str) -> Column {
     }
 }
 
+/// Result-set [`Column`] metadata for a declared column type. Maps each storable
+/// `SqlType` to its wire OID/size via the per-type helpers above.
+fn column_for_sql_type(ty: gpu_db_protocol::SqlType, name: &str) -> Column {
+    match ty {
+        gpu_db_protocol::SqlType::Int4 => int4_column(name),
+        gpu_db_protocol::SqlType::Int8 => int8_column(name),
+        gpu_db_protocol::SqlType::Numeric { .. } => numeric_column(name),
+        gpu_db_protocol::SqlType::Bool => bool_column(name),
+        gpu_db_protocol::SqlType::Text => text_column(name),
+    }
+}
+
 fn copy_parse_error_field(error: CopyParseError) -> ErrorField {
     ErrorField {
         code: error.postgres_code(),
@@ -126,70 +138,42 @@ fn column_default_matches_type(value: &ColumnDefault, ty: gpu_db_protocol::SqlTy
 }
 
 fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
+    use gpu_db_protocol::Decimal128;
     match (left, right) {
         (SqlValue::Int4(left), SqlValue::Int4(right)) => left.cmp(right),
         (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
         (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
         (SqlValue::Int8(left), SqlValue::Int4(right)) => left.cmp(&i64::from(*right)),
-        (SqlValue::Numeric(left), SqlValue::Numeric(right)) => compare_numeric_strings(left, right),
+        // Numeric is now a fixed-point Decimal128: compare scale-aligned (1.0 == 1.00), and
+        // promote an integer to a scale-0 decimal for cross-type comparison.
+        (SqlValue::Numeric(left), SqlValue::Numeric(right)) => left.cmp(right),
         (SqlValue::Int4(left), SqlValue::Numeric(right)) => {
-            compare_numeric_strings(&left.to_string(), right)
+            Decimal128::new(i128::from(*left), 0).cmp(right)
         }
         (SqlValue::Int8(left), SqlValue::Numeric(right)) => {
-            compare_numeric_strings(&left.to_string(), right)
+            Decimal128::new(i128::from(*left), 0).cmp(right)
         }
         (SqlValue::Numeric(left), SqlValue::Int4(right)) => {
-            compare_numeric_strings(left, &right.to_string())
+            left.cmp(&Decimal128::new(i128::from(*right), 0))
         }
         (SqlValue::Numeric(left), SqlValue::Int8(right)) => {
-            compare_numeric_strings(left, &right.to_string())
+            left.cmp(&Decimal128::new(i128::from(*right), 0))
         }
+        (SqlValue::Bool(left), SqlValue::Bool(right)) => left.cmp(right),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
-        (SqlValue::Numeric(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
-        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_)) => {
+        (
+            SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_),
+            SqlValue::Bool(_) | SqlValue::Text(_),
+        ) => std::cmp::Ordering::Less,
+        (SqlValue::Bool(_), SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_)) => {
             std::cmp::Ordering::Greater
         }
+        (SqlValue::Bool(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
+        (
+            SqlValue::Text(_),
+            SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_),
+        ) => std::cmp::Ordering::Greater,
     }
-}
-
-fn compare_numeric_strings(left: &str, right: &str) -> std::cmp::Ordering {
-    let (left_negative, left_abs) = left
-        .strip_prefix('-')
-        .map_or((false, left), |value| (true, value));
-    let (right_negative, right_abs) = right
-        .strip_prefix('-')
-        .map_or((false, right), |value| (true, value));
-    match (left_negative, right_negative) {
-        (true, false) => return std::cmp::Ordering::Less,
-        (false, true) => return std::cmp::Ordering::Greater,
-        _ => {}
-    }
-    let magnitude = compare_unsigned_numeric_strings(left_abs, right_abs);
-    if left_negative {
-        magnitude.reverse()
-    } else {
-        magnitude
-    }
-}
-
-fn compare_unsigned_numeric_strings(left: &str, right: &str) -> std::cmp::Ordering {
-    let (left_whole, left_frac) = left.split_once('.').unwrap_or((left, ""));
-    let (right_whole, right_frac) = right.split_once('.').unwrap_or((right, ""));
-    let left_whole = left_whole.trim_start_matches('0');
-    let right_whole = right_whole.trim_start_matches('0');
-    left_whole
-        .len()
-        .cmp(&right_whole.len())
-        .then_with(|| left_whole.cmp(right_whole))
-        .then_with(|| {
-            let width = left_frac.len().max(right_frac.len());
-            let mut left_padded = left_frac.to_string();
-            let mut right_padded = right_frac.to_string();
-            left_padded.extend(std::iter::repeat_n('0', width - left_padded.len()));
-            right_padded.extend(std::iter::repeat_n('0', width - right_padded.len()));
-            left_padded.cmp(&right_padded)
-        })
 }
 
 fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) -> bool {
@@ -407,10 +391,7 @@ fn execute_select_result_inner(
                 columns: view
                     .columns
                     .iter()
-                    .map(|column| match column.def.ty {
-                        gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
-                        gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
-                    })
+                    .map(|column| column_for_sql_type(column.def.ty, &column.def.name))
                     .collect(),
                 rows: view
                     .rows
@@ -579,10 +560,7 @@ fn execute_select_result_inner(
         }
         let columns = selected_columns
             .iter()
-            .map(|column| match column.def.ty {
-                gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
-                gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
-            })
+            .map(|column| column_for_sql_type(column.def.ty, &column.def.name))
             .collect::<Vec<_>>();
         let rows = projected
             .iter()
@@ -619,10 +597,7 @@ fn execute_select_result_inner(
     }
     let columns = selected_columns
         .iter()
-        .map(|column| match column.def.ty {
-            gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
-            gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
-        })
+        .map(|column| column_for_sql_type(column.def.ty, &column.def.name))
         .collect::<Vec<_>>();
     let rows = rows
         .iter()
@@ -654,10 +629,7 @@ fn execute_function_result(
         return Err(error);
     }
     let value = parse_bounded_sql_function_body(&function.body, function.return_type)?;
-    let column = match function.return_type {
-        SqlType::Int4 => int4_column(&function.name),
-        SqlType::Text => text_column(&function.name),
-    };
+    let column = column_for_sql_type(function.return_type, &function.name);
     Ok(SelectResult {
         columns: vec![column],
         rows: vec![vec![Some(format_sql_value(&value))]],
@@ -688,6 +660,20 @@ fn parse_bounded_sql_function_body(
             .parse::<i32>()
             .map(SqlValue::Int4)
             .map_err(|_| unsupported_function_body_error()),
+        SqlType::Int8 => literal
+            .parse::<i64>()
+            .map(SqlValue::Int8)
+            .map_err(|_| unsupported_function_body_error()),
+        SqlType::Numeric { scale, .. } => {
+            gpu_db_protocol::Decimal128::parse_at_scale(literal, scale)
+                .map(SqlValue::Numeric)
+                .ok_or_else(unsupported_function_body_error)
+        }
+        SqlType::Bool => match literal.to_ascii_lowercase().as_str() {
+            "true" | "t" => Ok(SqlValue::Bool(true)),
+            "false" | "f" => Ok(SqlValue::Bool(false)),
+            _ => Err(unsupported_function_body_error()),
+        },
         SqlType::Text => parse_bounded_text_literal(literal)
             .map(SqlValue::Text)
             .ok_or_else(unsupported_function_body_error),
@@ -952,10 +938,7 @@ fn execute_aggregate_select_result(
                 .get(group_idx)
                 .expect("group column index came from table");
             let columns = vec![
-                match group_column.def.ty {
-                    gpu_db_protocol::SqlType::Int4 => int4_column(&group_column.def.name),
-                    gpu_db_protocol::SqlType::Text => text_column(&group_column.def.name),
-                },
+                column_for_sql_type(group_column.def.ty, &group_column.def.name),
                 int8_column("count"),
             ];
             let rows = grouped
@@ -1085,10 +1068,7 @@ fn execute_aggregate_select_result(
                 .get(group_idx)
                 .expect("group column index came from table");
             let columns = vec![
-                match group_column_def.def.ty {
-                    gpu_db_protocol::SqlType::Int4 => int4_column(&group_column_def.def.name),
-                    gpu_db_protocol::SqlType::Text => text_column(&group_column_def.def.name),
-                },
+                column_for_sql_type(group_column_def.def.ty, &group_column_def.def.name),
                 int8_column("sum"),
             ];
             let rows = grouped
@@ -1164,9 +1144,15 @@ fn execute_aggregate_select_result(
             grouped = grouped
                 .into_iter()
                 .filter_map(|(group_value, (sum, count))| {
+                    // HAVING evaluates the AVG against a numeric literal; both must be Decimal128.
+                    // `average_text` yields a scale-16 string, so parse it back at scale 16.
                     let aggregate = SqlValue::Numeric(
-                        average_text(sum, count)
-                            .unwrap_or_else(|| "0.0000000000000000".to_string()),
+                        gpu_db_protocol::Decimal128::parse_at_scale(
+                            &average_text(sum, count)
+                                .unwrap_or_else(|| "0.0000000000000000".to_string()),
+                            16,
+                        )
+                        .unwrap_or(gpu_db_protocol::Decimal128::ZERO),
                     );
                     match grouped_row_matches_having(
                         select,
@@ -1381,10 +1367,7 @@ fn column_index(table: &Table, column: &str) -> Result<usize, ErrorField> {
 }
 
 fn aggregate_result_column(table: &Table, idx: usize, name: &str) -> Column {
-    match table.columns[idx].def.ty {
-        gpu_db_protocol::SqlType::Int4 => int4_column(name),
-        gpu_db_protocol::SqlType::Text => text_column(name),
-    }
+    column_for_sql_type(table.columns[idx].def.ty, name)
 }
 
 fn int4_column_index(table: &Table, column: &str) -> Result<usize, ErrorField> {
@@ -1424,11 +1407,13 @@ fn int4_value(value: &SqlValue) -> Result<i32, ErrorField> {
 fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result<i32, ErrorField> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => Err(ErrorField {
-            code: "0A000",
-            message: aggregate_int4_error_message(aggregate),
-            position: None,
-        }),
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Text(_) => {
+            Err(ErrorField {
+                code: "0A000",
+                message: aggregate_int4_error_message(aggregate),
+                position: None,
+            })
+        }
     }
 }
 
@@ -1474,7 +1459,8 @@ fn format_sql_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
-        SqlValue::Numeric(value) => value.clone(),
+        SqlValue::Numeric(value) => value.to_decimal_string(),
+        SqlValue::Bool(value) => bool_text(*value),
         SqlValue::Text(value) => value.clone(),
     }
 }
@@ -1494,6 +1480,34 @@ fn parse_materialized_row_value(
                     position: None,
                 })
         }
+        gpu_db_protocol::SqlType::Int8 => {
+            value
+                .parse::<i64>()
+                .map(SqlValue::Int8)
+                .map_err(|_| ErrorField {
+                    code: "22P02",
+                    message: "invalid input syntax for type bigint",
+                    position: None,
+                })
+        }
+        gpu_db_protocol::SqlType::Numeric { scale, .. } => {
+            gpu_db_protocol::Decimal128::parse_at_scale(value, scale)
+                .map(SqlValue::Numeric)
+                .ok_or(ErrorField {
+                    code: "22P02",
+                    message: "invalid input syntax for type numeric",
+                    position: None,
+                })
+        }
+        gpu_db_protocol::SqlType::Bool => match value.to_ascii_lowercase().as_str() {
+            "t" | "true" => Ok(SqlValue::Bool(true)),
+            "f" | "false" => Ok(SqlValue::Bool(false)),
+            _ => Err(ErrorField {
+                code: "22P02",
+                message: "invalid input syntax for type boolean",
+                position: None,
+            }),
+        },
         gpu_db_protocol::SqlType::Text => Ok(SqlValue::Text(value.to_string())),
     }
 }
@@ -2603,7 +2617,8 @@ fn format_default_expr(value: &SqlValue) -> String {
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Text(value) => format!("'{}'::text", value.replace('\'', "''")),
         SqlValue::Int8(value) => value.to_string(),
-        SqlValue::Numeric(value) => value.clone(),
+        SqlValue::Numeric(value) => value.to_decimal_string(),
+        SqlValue::Bool(value) => bool_text(*value),
     }
 }
 
@@ -13864,7 +13879,7 @@ fn execute_statement(
                 text_column("typname"),
                 int4_column("typlen"),
             ],
-            &catalog_type_rows_by_oid(),
+            &catalog_type_rows_by_oid_in(&[23, 25]),
         );
     }
     if canonical
@@ -13877,7 +13892,7 @@ fn execute_statement(
                 int4_column("oid"),
                 int4_column("typlen"),
             ],
-            &catalog_type_rows_by_name(),
+            &catalog_type_rows_by_name_in(&["int4", "text"]),
         );
     }
     if canonical
@@ -14924,7 +14939,9 @@ fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
         SqlValue::Int4(_) => 4,
         SqlValue::Text(value) => value.len() as u64,
         SqlValue::Int8(_) => 8,
-        SqlValue::Numeric(value) => value.len() as u64,
+        // Numeric is sent as text on this endpoint; report its rendered text length.
+        SqlValue::Numeric(value) => value.to_decimal_string().len() as u64,
+        SqlValue::Bool(_) => 1,
     }
 }
 
@@ -16375,6 +16392,9 @@ fn pg_dump_default_acl_metadata_rows(session: &Session) -> Vec<Vec<Option<String
 fn sql_type_alignment_code(ty: SqlType) -> &'static str {
     match ty {
         SqlType::Int4 => "i",
+        SqlType::Int8 => "d",
+        SqlType::Numeric { .. } => "i",
+        SqlType::Bool => "c",
         SqlType::Text => "i",
     }
 }
@@ -17521,6 +17541,9 @@ fn catalog_describe_attribute_rows(session: &Session, oid: u32) -> Vec<Vec<Optio
 fn sql_type_storage_code(ty: SqlType) -> &'static str {
     match ty {
         SqlType::Int4 => "p",
+        SqlType::Int8 => "p",
+        SqlType::Numeric { .. } => "m",
+        SqlType::Bool => "p",
         SqlType::Text => "x",
     }
 }
@@ -17528,6 +17551,9 @@ fn sql_type_storage_code(ty: SqlType) -> &'static str {
 fn sql_type_display_name(ty: SqlType) -> &'static str {
     match ty {
         SqlType::Int4 => "integer",
+        SqlType::Int8 => "bigint",
+        SqlType::Numeric { .. } => "numeric",
+        SqlType::Bool => "boolean",
         SqlType::Text => "text",
     }
 }
@@ -18386,6 +18412,12 @@ fn information_schema_extended_column_rows_for_catalog_table(
 fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>, Option<i32>) {
     match ty {
         SqlType::Int4 => (Some(32), Some(2), Some(0)),
+        SqlType::Int8 => (Some(64), Some(2), Some(0)),
+        // For NUMERIC(p,s) PostgreSQL reports the declared precision/scale in radix 10.
+        SqlType::Numeric { precision, scale } => {
+            (Some(i32::from(precision)), Some(10), Some(i32::from(scale)))
+        }
+        SqlType::Bool => (None, None, None),
         SqlType::Text => (None, None, None),
     }
 }
@@ -19436,6 +19468,10 @@ fn psql_list_object_descriptions_query(canonical: &str) -> bool {
         && canonical.ends_with("order by 1, 2, 3")
 }
 
+/// The full supported-type catalog ordered by OID. Test fixture documenting the
+/// complete `(oid, typname, typlen)` listing (the live `pg_type` handlers filter to the
+/// query's literal OID/name set via `catalog_type_rows_by_oid_in`/`_by_name_in`).
+#[cfg(test)]
 fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
     let mut types = SUPPORTED_SQL_TYPES;
     types.sort_by_key(|ty| ty.postgres_oid());
@@ -19451,8 +19487,52 @@ fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+/// The full supported-type catalog ordered by name (test fixture; see above).
+#[cfg(test)]
 fn catalog_type_rows_by_name() -> Vec<Vec<Option<String>>> {
     let mut types = SUPPORTED_SQL_TYPES;
+    types.sort_by_key(|ty| ty.catalog_name());
+    types
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some(ty.catalog_name().to_string()),
+                Some(ty.postgres_oid().to_string()),
+                Some(ty.type_size().to_string()),
+            ]
+        })
+        .collect()
+}
+
+/// `(oid, typname, typlen)` rows for the supported types whose OID is in `oids`, in
+/// OID order. Backs the hardcoded `pg_type WHERE oid IN (...)` introspection query so it
+/// honors the literal OID set instead of dumping every supported type (a latent gap that
+/// only surfaced once the supported-type set grew past int4/text).
+fn catalog_type_rows_by_oid_in(oids: &[u32]) -> Vec<Vec<Option<String>>> {
+    let mut types: Vec<SqlType> = SUPPORTED_SQL_TYPES
+        .into_iter()
+        .filter(|ty| oids.contains(&ty.postgres_oid()))
+        .collect();
+    types.sort_by_key(|ty| ty.postgres_oid());
+    types
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some(ty.postgres_oid().to_string()),
+                Some(ty.catalog_name().to_string()),
+                Some(ty.type_size().to_string()),
+            ]
+        })
+        .collect()
+}
+
+/// `(typname, oid, typlen)` rows for the supported types named in `names`, in name order.
+/// Backs the hardcoded `pg_type WHERE typname IN (...)` introspection query.
+fn catalog_type_rows_by_name_in(names: &[&str]) -> Vec<Vec<Option<String>>> {
+    let mut types: Vec<SqlType> = SUPPORTED_SQL_TYPES
+        .into_iter()
+        .filter(|ty| names.contains(&ty.catalog_name()))
+        .collect();
     types.sort_by_key(|ty| ty.catalog_name());
     types
         .into_iter()
@@ -20558,10 +20638,7 @@ fn column_def_to_result_column(column: &CatalogColumn) -> Column {
 }
 
 fn column_def_to_result_column_with_name(column: &CatalogColumn, name: &str) -> Column {
-    match column.def.ty {
-        SqlType::Int4 => int4_column(name),
-        SqlType::Text => text_column(name),
-    }
+    column_for_sql_type(column.def.ty, name)
 }
 
 fn describe_parameterized_select_shape(query: &str) -> Option<(String, SelectProjection)> {
@@ -24693,7 +24770,22 @@ mod tests {
             vec![
                 vec![
                     Some("pg_catalog".to_string()),
+                    Some("bigint".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("boolean".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
                     Some("integer".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("numeric".to_string()),
                     None
                 ],
                 vec![
@@ -24708,9 +24800,39 @@ mod tests {
             vec![
                 vec![
                     Some("pg_catalog".to_string()),
+                    Some("bigint".to_string()),
+                    Some("int8".to_string()),
+                    Some(String::new()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("boolean".to_string()),
+                    Some("bool".to_string()),
+                    Some(String::new()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
                     Some("integer".to_string()),
                     Some("int4".to_string()),
                     Some("4".to_string()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("numeric".to_string()),
+                    Some("numeric".to_string()),
+                    Some("var".to_string()),
                     None,
                     Some("postgres".to_string()),
                     None,
@@ -25610,6 +25732,16 @@ mod tests {
             catalog_type_rows_by_oid(),
             vec![
                 vec![
+                    Some("16".to_string()),
+                    Some("bool".to_string()),
+                    Some("1".to_string()),
+                ],
+                vec![
+                    Some("20".to_string()),
+                    Some("int8".to_string()),
+                    Some("8".to_string()),
+                ],
+                vec![
                     Some("23".to_string()),
                     Some("int4".to_string()),
                     Some("4".to_string()),
@@ -25619,15 +25751,35 @@ mod tests {
                     Some("text".to_string()),
                     Some("-1".to_string()),
                 ],
+                vec![
+                    Some("1700".to_string()),
+                    Some("numeric".to_string()),
+                    Some("-1".to_string()),
+                ],
             ]
         );
         assert_eq!(
             catalog_type_rows_by_name(),
             vec![
                 vec![
+                    Some("bool".to_string()),
+                    Some("16".to_string()),
+                    Some("1".to_string()),
+                ],
+                vec![
                     Some("int4".to_string()),
                     Some("23".to_string()),
                     Some("4".to_string()),
+                ],
+                vec![
+                    Some("int8".to_string()),
+                    Some("20".to_string()),
+                    Some("8".to_string()),
+                ],
+                vec![
+                    Some("numeric".to_string()),
+                    Some("1700".to_string()),
+                    Some("-1".to_string()),
                 ],
                 vec![
                     Some("text".to_string()),

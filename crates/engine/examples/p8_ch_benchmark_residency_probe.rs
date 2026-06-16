@@ -857,6 +857,7 @@ fn assert_single_numeric(
     let gpu_db_sql::SqlValue::Numeric(actual) = value else {
         return Err(format!("{label} returned non-numeric value {value:?}").into());
     };
+    let actual = actual.to_decimal_string();
     if actual != expected {
         return Err(format!("{label} returned {actual}, expected {expected}").into());
     }
@@ -1190,9 +1191,10 @@ fn expected_result_for_case(
     let value = match case.name {
         "order_line_count_all" => gpu_db_sql::SqlValue::Int8(rows as i64),
         "order_line_sum_amount" => gpu_db_sql::SqlValue::Int8(expected_amount_sum(rows)),
-        "order_line_avg_quantity_between" => {
-            gpu_db_sql::SqlValue::Numeric(expected_quantity_between_avg(rows))
-        }
+        "order_line_avg_quantity_between" => gpu_db_sql::SqlValue::Numeric(
+            gpu_db_sql::Decimal128::parse_at_scale(&expected_quantity_between_avg(rows), 16)
+                .expect("scale-16 average literal parses"),
+        ),
         "order_line_max_amount_filter" => {
             let lower = (rows / 4).max(1) as i32;
             expected_amount_max_filter(rows, lower)
