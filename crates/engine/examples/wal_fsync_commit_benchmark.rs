@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&tmp_dir)?;
 
     // --- 1. In-memory baseline: commit cost without the durability fsync. -----------------------
-    let mut mem = Engine::new_local();
+    let mem = Engine::new_local();
     mem.execute_text(1, "CREATE TABLE t (id INT)")?;
     let started = Instant::now();
     for i in 0..commits {
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // --- 2. Durable, serialized writer: one fsync per commit (group size 1). --------------------
     let segment_path = tmp_dir.join("commit-path.wal");
-    let mut durable = Engine::with_durable_wal_segment(&segment_path);
+    let durable = Engine::with_durable_wal_segment(&segment_path);
     durable.execute_text(1, "CREATE TABLE t (id INT)")?;
     let started = Instant::now();
     for i in 0..commits {

@@ -235,8 +235,8 @@ fn run_workload(
     row_count: usize,
     queries: &[Select],
 ) -> Result<WorkloadReport, Box<dyn Error>> {
-    let mut cpu = seeded_engine(row_count)?;
-    let mut gpu = seeded_engine(row_count)?;
+    let cpu = seeded_engine(row_count)?;
+    let gpu = seeded_engine(row_count)?;
 
     let cpu_start = Instant::now();
     let (cpu_results, cpu_latencies) =
@@ -351,7 +351,7 @@ fn percentile_nearest_rank(sorted_values: &[u128], percentile: usize) -> u128 {
 }
 
 fn seeded_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     engine.execute_text(
         1,
         "CREATE TABLE events (id INT, account TEXT, amount INT, category TEXT)",

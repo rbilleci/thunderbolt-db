@@ -248,7 +248,7 @@ fn write_demo_fixture(dir: &Path) -> Result<(), String> {
     let prune_timeline_path = dir.join("timeline-prune").join("TIMELINE");
     let registry_path = dir.join("TIMELINE_REGISTRY");
 
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     engine
         .execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .map_err(|err| err.to_string())?;

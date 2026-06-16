@@ -953,7 +953,7 @@ fn run_probe(args: &Args) -> Result<(), Box<dyn Error>> {
     }
 
     let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let mut cpu = seed_engine(args.rows)?;
+    let cpu = seed_engine(args.rows)?;
     let mut gpu = seed_engine(args.rows)?;
     let snapshot = gpu.populate_relational_residency_snapshot("order_line")?;
     let queries = query_cases(args.rows)?;
@@ -1097,7 +1097,7 @@ fn run_query_case(
 }
 
 fn seed_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     engine.execute_text(
         1,
         "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",

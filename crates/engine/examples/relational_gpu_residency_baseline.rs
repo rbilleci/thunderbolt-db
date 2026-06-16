@@ -1814,7 +1814,7 @@ fn print_probe(report: &ProbeReport) {
 }
 
 fn seeded_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     engine.execute_text(
         1,
         "CREATE TABLE events (id INT, account TEXT, amount INT, category TEXT, bucket INT)",

@@ -104,7 +104,7 @@ fn run() -> Result<(), String> {
 }
 
 fn seeded_engine() -> Result<Engine, String> {
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     engine
         .execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
         .map_err(|err| err.to_string())?;

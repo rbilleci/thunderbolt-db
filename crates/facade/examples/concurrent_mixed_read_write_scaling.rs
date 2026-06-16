@@ -13,6 +13,7 @@
 //!     write lock did.
 //!   - `concurrent` (Stage 4): no external lock; reads run lock-free on a snapshot, writes take
 //!     only the short commit lock.
+//!
 //! The only difference is the reader-vs-writer exclusion, so the READ p50/p99/qps gap is exactly
 //! what Stage 4 bought. The thesis holds if concurrent read qps RISES with reader concurrency and
 //! read p99 stays bounded, where the serialized model's reads stall behind the writers.

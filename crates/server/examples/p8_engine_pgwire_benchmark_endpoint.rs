@@ -339,6 +339,7 @@ impl RetainedReadRuntime {
         self.work_txs.get(worker_idx).cloned()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_work(
         &self,
         completed: u64,
@@ -1122,6 +1123,7 @@ impl EndpointState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_multi_literal_select_batch(
         &mut self,
         items: &[(String, Select)],
@@ -1276,59 +1278,64 @@ impl EndpointState {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX);
-            if self.select_fact_detail.emits_phase() && decision.is_some() {
-                let decision = decision.as_ref().expect("decision is present");
-                self.fact(
-                    "select_phase_json",
-                    SelectPhaseFact {
-                        sql,
-                        query_shape: &decision.query_shape,
-                        scheduler_queue_wait_micros,
-                        engine_execute_micros,
-                        result_materialize_micros,
-                        client_write_micros,
-                        retained_wall_micros: decision.last_execution_wall_micros,
-                        retained_device_lookup_micros: decision.last_execution_device_lookup_micros,
-                        retained_match_index_micros: decision.last_execution_match_index_micros,
-                        retained_selected_projection_micros: decision
-                            .last_execution_selected_projection_micros,
-                        retained_result_materialization_micros: decision
-                            .last_execution_result_materialization_micros,
-                        retained_cuda_event_micros: decision.last_execution_kernel_event_elapsed_us,
-                        retained_matched_rows: decision
-                            .last_execution_matched_rows
-                            .map(|value| value.try_into().unwrap_or(u64::MAX)),
-                        retained_read_job_route_id: read_jobs
-                            .as_ref()
-                            .map(|read_jobs| read_jobs[unique_idx].route_id.as_str()),
-                        retained_snapshot_generation: snapshot_handle
-                            .as_ref()
-                            .map(|handle| handle.generation)
-                            .or(decision.snapshot_generation),
-                        retained_read_submit_micros,
-                        retained_read_complete_micros,
-                        retained_read_pending_queue_micros: None,
-                        retained_read_pending_inflight_at_submit: None,
-                        h2d_delta,
-                        d2h_delta,
-                        kernel_delta,
-                        result_rows: result.rows.len(),
-                        microbatch_kind,
-                        microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
-                        microbatch_unique_selects: u64::try_from(selects.len()).unwrap_or(u64::MAX),
-                        microbatch_admission_wait_micros,
-                        microbatch_route_key,
-                        microbatch_ready_lane_count: u64::try_from(microbatch_ready_lane_count)
-                            .unwrap_or(u64::MAX),
-                        retained_read_job_path: use_retained_read_jobs,
-                    },
-                )?;
+            if self.select_fact_detail.emits_phase() {
+                if let Some(decision) = decision.as_ref() {
+                    self.fact(
+                        "select_phase_json",
+                        SelectPhaseFact {
+                            sql,
+                            query_shape: &decision.query_shape,
+                            scheduler_queue_wait_micros,
+                            engine_execute_micros,
+                            result_materialize_micros,
+                            client_write_micros,
+                            retained_wall_micros: decision.last_execution_wall_micros,
+                            retained_device_lookup_micros: decision
+                                .last_execution_device_lookup_micros,
+                            retained_match_index_micros: decision.last_execution_match_index_micros,
+                            retained_selected_projection_micros: decision
+                                .last_execution_selected_projection_micros,
+                            retained_result_materialization_micros: decision
+                                .last_execution_result_materialization_micros,
+                            retained_cuda_event_micros: decision
+                                .last_execution_kernel_event_elapsed_us,
+                            retained_matched_rows: decision
+                                .last_execution_matched_rows
+                                .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                            retained_read_job_route_id: read_jobs
+                                .as_ref()
+                                .map(|read_jobs| read_jobs[unique_idx].route_id.as_str()),
+                            retained_snapshot_generation: snapshot_handle
+                                .as_ref()
+                                .map(|handle| handle.generation)
+                                .or(decision.snapshot_generation),
+                            retained_read_submit_micros,
+                            retained_read_complete_micros,
+                            retained_read_pending_queue_micros: None,
+                            retained_read_pending_inflight_at_submit: None,
+                            h2d_delta,
+                            d2h_delta,
+                            kernel_delta,
+                            result_rows: result.rows.len(),
+                            microbatch_kind,
+                            microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
+                            microbatch_unique_selects: u64::try_from(selects.len())
+                                .unwrap_or(u64::MAX),
+                            microbatch_admission_wait_micros,
+                            microbatch_route_key,
+                            microbatch_ready_lane_count: u64::try_from(microbatch_ready_lane_count)
+                                .unwrap_or(u64::MAX),
+                            retained_read_job_path: use_retained_read_jobs,
+                        },
+                    )?;
+                }
             }
             outputs.push(output);
         }
         Ok(outputs)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_prepared_retained_literal_batch(
         &mut self,
         items: Vec<(String, Select)>,
@@ -1480,51 +1487,57 @@ impl EndpointState {
         for ((sql, _select), unique_idx) in items.iter().zip(item_to_unique) {
             let result = &results[unique_idx];
             let rendered = render_select_result(result)?;
-            if self.select_fact_detail.emits_phase() && decision.is_some() {
-                let decision = decision.as_ref().expect("decision is present");
-                self.fact(
-                    "select_phase_json",
-                    SelectPhaseFact {
-                        sql,
-                        query_shape: &decision.query_shape,
-                        scheduler_queue_wait_micros,
-                        engine_execute_micros,
-                        result_materialize_micros: rendered.result_materialize_micros,
-                        client_write_micros: rendered.client_write_micros,
-                        retained_wall_micros: decision.last_execution_wall_micros,
-                        retained_device_lookup_micros: decision.last_execution_device_lookup_micros,
-                        retained_match_index_micros: decision.last_execution_match_index_micros,
-                        retained_selected_projection_micros: decision
-                            .last_execution_selected_projection_micros,
-                        retained_result_materialization_micros: decision
-                            .last_execution_result_materialization_micros,
-                        retained_cuda_event_micros: decision.last_execution_kernel_event_elapsed_us,
-                        retained_matched_rows: decision
-                            .last_execution_matched_rows
-                            .map(|value| value.try_into().unwrap_or(u64::MAX)),
-                        retained_read_job_route_id: Some(read_jobs[unique_idx].route_id.as_str()),
-                        retained_snapshot_generation: snapshot_handle
-                            .as_ref()
-                            .map(|handle| handle.generation)
-                            .or(decision.snapshot_generation),
-                        retained_read_submit_micros: Some(retained_read_submit_micros),
-                        retained_read_complete_micros: Some(retained_read_complete_micros),
-                        retained_read_pending_queue_micros: pending_queue_micros,
-                        retained_read_pending_inflight_at_submit: pending_inflight_at_submit,
-                        h2d_delta,
-                        d2h_delta,
-                        kernel_delta,
-                        result_rows: result.rows.len(),
-                        microbatch_kind,
-                        microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
-                        microbatch_unique_selects: u64::try_from(selects.len()).unwrap_or(u64::MAX),
-                        microbatch_admission_wait_micros,
-                        microbatch_route_key: microbatch_route_key.as_deref(),
-                        microbatch_ready_lane_count: u64::try_from(microbatch_ready_lane_count)
-                            .unwrap_or(u64::MAX),
-                        retained_read_job_path: true,
-                    },
-                )?;
+            if self.select_fact_detail.emits_phase() {
+                if let Some(decision) = decision.as_ref() {
+                    self.fact(
+                        "select_phase_json",
+                        SelectPhaseFact {
+                            sql,
+                            query_shape: &decision.query_shape,
+                            scheduler_queue_wait_micros,
+                            engine_execute_micros,
+                            result_materialize_micros: rendered.result_materialize_micros,
+                            client_write_micros: rendered.client_write_micros,
+                            retained_wall_micros: decision.last_execution_wall_micros,
+                            retained_device_lookup_micros: decision
+                                .last_execution_device_lookup_micros,
+                            retained_match_index_micros: decision.last_execution_match_index_micros,
+                            retained_selected_projection_micros: decision
+                                .last_execution_selected_projection_micros,
+                            retained_result_materialization_micros: decision
+                                .last_execution_result_materialization_micros,
+                            retained_cuda_event_micros: decision
+                                .last_execution_kernel_event_elapsed_us,
+                            retained_matched_rows: decision
+                                .last_execution_matched_rows
+                                .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                            retained_read_job_route_id: Some(
+                                read_jobs[unique_idx].route_id.as_str(),
+                            ),
+                            retained_snapshot_generation: snapshot_handle
+                                .as_ref()
+                                .map(|handle| handle.generation)
+                                .or(decision.snapshot_generation),
+                            retained_read_submit_micros: Some(retained_read_submit_micros),
+                            retained_read_complete_micros: Some(retained_read_complete_micros),
+                            retained_read_pending_queue_micros: pending_queue_micros,
+                            retained_read_pending_inflight_at_submit: pending_inflight_at_submit,
+                            h2d_delta,
+                            d2h_delta,
+                            kernel_delta,
+                            result_rows: result.rows.len(),
+                            microbatch_kind,
+                            microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
+                            microbatch_unique_selects: u64::try_from(selects.len())
+                                .unwrap_or(u64::MAX),
+                            microbatch_admission_wait_micros,
+                            microbatch_route_key: microbatch_route_key.as_deref(),
+                            microbatch_ready_lane_count: u64::try_from(microbatch_ready_lane_count)
+                                .unwrap_or(u64::MAX),
+                            retained_read_job_path: true,
+                        },
+                    )?;
+                }
             }
             outputs.push(rendered.bytes);
         }
@@ -1857,6 +1870,7 @@ struct EngineRequestSender {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum RetainedSelectBatchCandidate {
     Literal {
         batch_key: RetainedSelectLiteralBatchKey,

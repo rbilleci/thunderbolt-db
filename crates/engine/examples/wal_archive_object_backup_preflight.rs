@@ -187,7 +187,7 @@ fn required_path<'a>(path: &'a Option<PathBuf>, flag: &str) -> Result<&'a Path, 
 fn write_demo_fixture(dir: &Path) -> Result<(), String> {
     let manifest_path = dir.join("archive").join("MANIFEST");
     let segment_dir = dir.join("archive").join("segments");
-    let mut engine = Engine::new_local();
+    let engine = Engine::new_local();
     engine
         .execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
         .map_err(|err| err.to_string())?;

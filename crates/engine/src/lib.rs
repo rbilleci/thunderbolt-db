@@ -6661,16 +6661,6 @@ impl PartitionResidentDeviceMemoryMap {
         next.retain(|(cell_table, _), _| cell_table != table);
         self.cells.store(Arc::new(next));
     }
-
-    /// Number of partitions with a published owner (tombstones excluded). Test-only.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.cells
-            .load()
-            .values()
-            .filter(|cell| cell.load().get().is_some())
-            .count()
-    }
 }
 
 /// One `(column, value)` slot of a table's equality value-index. The owning table is implied by
@@ -7417,7 +7407,7 @@ impl RelationalRetainedReadSubmission {
         match self.inner {
             RelationalRetainedReadSubmissionInner::Ready(results) => Ok(results),
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => Ok(
-                Engine::complete_relational_retained_int4_projection_submission_detached(pending)?
+                Engine::complete_relational_retained_int4_projection_submission_detached(*pending)?
                     .results,
             ),
         }
@@ -7426,7 +7416,11 @@ impl RelationalRetainedReadSubmission {
 
 enum RelationalRetainedReadSubmissionInner {
     Ready(Vec<RelationalSelectResult>),
-    PendingInt4Projection(RelationalRetainedInt4ProjectionSubmission),
+    // Boxed: this variant's payload is a large struct (table + several Vecs + a CUDA submission),
+    // dwarfing the sibling `Ready(Vec<..>)`; boxing keeps the enum small to move (clippy
+    // large_enum_variant). The submission is heap-heavy and created once per batch, so the box
+    // alloc is negligible.
+    PendingInt4Projection(Box<RelationalRetainedInt4ProjectionSubmission>),
 }
 
 struct RelationalRetainedInt4ProjectionSubmission {
@@ -18628,7 +18622,7 @@ impl Engine {
         match submission.inner {
             RelationalRetainedReadSubmissionInner::Ready(results) => Ok(results),
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
-                self.complete_relational_retained_int4_projection_submission(pending)
+                self.complete_relational_retained_int4_projection_submission(*pending)
             }
         }
     }
@@ -18790,7 +18784,7 @@ impl Engine {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX),
-            inner: RelationalRetainedReadSubmissionInner::PendingInt4Projection(
+            inner: RelationalRetainedReadSubmissionInner::PendingInt4Projection(Box::new(
                 RelationalRetainedInt4ProjectionSubmission {
                     table,
                     snapshot_gpu_id,
@@ -18800,7 +18794,7 @@ impl Engine {
                     batch_started,
                     submission: cuda_submission,
                 },
-            ),
+            )),
         }))
     }
 
@@ -50911,7 +50905,7 @@ mod tests {
         // Blocker regression: `WHERE numeric_col = <int literal>` (and the integral-numeric
         // reverse) must match via PostgreSQL's implicit cross-type coercion, not silently
         // miss — both the in-memory predicate and the equality value-index probe.
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE acct (id INT, bal NUMERIC(10,2))")
             .unwrap();
         e.execute_text(
@@ -50997,7 +50991,7 @@ mod tests {
 
     #[test]
     fn insert_and_update_widen_literals_across_the_numeric_tower() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE acct (id INT, bal NUMERIC(10,2), big BIGINT)",
@@ -51040,7 +51034,7 @@ mod tests {
 
     #[test]
     fn column_defaults_coerce_cross_type_literals() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         // Cross-type DEFAULT literals (int -> numeric / int8) are accepted at CREATE and
         // stored at the column type/scale; before this they errored "invalid default".
         e.execute_text(
@@ -51086,7 +51080,7 @@ mod tests {
 
     #[test]
     fn engine_answers_single_relation_pg_catalog_queries() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "CREATE TABLE orders (id INT)").unwrap();
@@ -51151,7 +51145,7 @@ mod tests {
 
     #[test]
     fn engine_answers_pg_attribute_pg_type_and_information_schema() {
-        let mut e = Engine::new_local();
+        let e = Engine::new_local();
         e.execute_text(
             1,
             "CREATE TABLE people (id INT, name TEXT, bal NUMERIC(10,2))",
