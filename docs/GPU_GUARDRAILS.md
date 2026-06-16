@@ -7,11 +7,14 @@ For the architectural north star behind these rules, read
 
 ## Non-Negotiable Rules
 
-1. **Dual-target operator contract**
-   - Every new physical operator must define:
-     - CPU path (reference semantics)
-     - GPU path (or an explicit fallback rule linked to a tracked GPU parity issue and milestone)
-   - No operator merges without a declared device strategy.
+1. **GPU is the operator target; CPU is reference/debt**
+   - Every new physical operator **targets the GPU** as its execution path.
+   - A CPU path is permitted ONLY as (a) reference semantics for CPU↔GPU parity
+     tests, or (b) a temporary bootstrap scaffold — and only when linked to a
+     tracked GPU parity issue and milestone. A CPU path is never a co-equal
+     target and never the product answer for hot relational work.
+   - No operator merges without a declared device strategy whose target is the
+     GPU.
 
 2. **No CPU-only data model decisions**
    - Any schema/storage change must include GPU memory/layout impact:
@@ -28,9 +31,12 @@ For the architectural north star behind these rules, read
    - WAL-before-visibility must be enforced always.
    - Epoch/barrier semantics are part of the transaction model (even with small early batches).
 
-5. **Fallback is a correctness tool, not product direction**
-   - CPU fallback is required for safety.
-   - Every fallback path must have a tracked GPU parity issue with owner and milestone.
+5. **CPU relational execution is parity/bootstrap debt, not product direction**
+   - CPU relational execution exists solely as parity-reference or temporary
+     bootstrap scaffold; it is tracked GPU-parity **debt** with a milestone,
+     never a design pillar and never the optimized hot path.
+   - Every CPU/fallback path must stay visible and have a tracked GPU parity
+     issue with owner and milestone.
    - Bootstrap mapping currently lives in `gpu_db_metrics::FallbackReason::gpu_parity_issue`.
 
 6. **Performance budgets include GPU metrics immediately**
@@ -61,6 +67,19 @@ For the architectural north star behind these rules, read
     - Report both:
       - SQL compatibility %
       - GPU-executed workload % on benchmark mix
+
+11. **Catalog is GPU-native**
+    - `pg_catalog` and `information_schema` are GPU-resident system relations,
+      executed by the SAME GPU operators as user tables — no CPU catalog
+      carve-out.
+    - Catalog introspection (including the multi-relation joins `psql \d` and
+      ORMs issue) runs on the GPU join path, not a CPU-side metadata answer.
+
+12. **Joins are GPU operators**
+    - Relational joins are first-class GPU execution (partitioned/hash join over
+      GPU-resident relations).
+    - CPU nested-loop or CPU hash join is not the design — it is only valid as
+      parity-reference or tracked bootstrap debt, never the join implementation.
 
 ## Definition of Done Addendum
 

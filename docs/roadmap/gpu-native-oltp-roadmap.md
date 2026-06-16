@@ -33,10 +33,14 @@ The v1 GPU-native OLTP target is:
    - Tenant/account/security filters are part of the route, not post-filter
      decoration.
 
-3. **Bounded join route**
-   - Join one or two tables where fanout is bounded by key, tenant, date range,
-     or page limit.
+3. **Join route (GPU join operator)**
+   - Joins are first-class GPU operators (partitioned/hash join over
+     GPU-resident relations), never CPU nested-loop. The bounded one/two-table
+     join — fanout bounded by key, tenant, date range, or page limit — is the
+     first proof of this operator, not its ceiling.
    - Produce stable projections suitable for response-buffer reuse.
+   - The same GPU join path serves catalog introspection joins (`psql \d`, ORM
+     multi-relation catalog queries) over the GPU-resident catalog relations.
 
 4. **Computed detail route**
    - Fetch one entity plus computed values such as balance, count, status, or
@@ -47,6 +51,15 @@ The v1 GPU-native OLTP target is:
 5. **Throughput batch route**
    - Same-shape retained reads grouped for GPU occupancy and qps.
    - Optimizes throughput rather than p50 floor.
+
+6. **Catalog introspection route (GPU-native catalog)**
+   - `pg_catalog` and `information_schema` are GPU-resident system relations,
+     executed by the SAME GPU operators and the GPU join path as user tables —
+     not a CPU-side metadata carve-out.
+   - Covers `psql \d`, ORM, and tooling catalog queries, including the
+     multi-relation catalog joins they issue.
+   - Catalog introspection is a GPU route class; CPU catalog execution is only
+     parity-reference or tracked bootstrap debt, never the target.
 
 ## Executable Milestones
 
@@ -196,16 +209,23 @@ Evidence:
 - queue wait and D2H bytes per page
 - correctness with tenant isolation cases
 
-### M6: Bounded Two-Table Join Route
+### M6: Bounded Two-Table Join Route (first proof of the GPU join operator)
 
-Add a route for one bounded join where one side is key/page bounded.
+Add a route for one bounded join where one side is key/page bounded. This is the
+first proof of a **general GPU join operator** (partitioned/hash join over
+GPU-resident relations) — the bounded case lands first, but the operator is the
+target, and it is the same GPU join path that later serves catalog introspection
+joins (`psql \d`, ORM multi-relation catalog queries). It is never a CPU
+nested-loop join.
 
 Deliverables:
 
 - route metadata for join keys and fanout bound
 - resident join-side layout and lookup structure
+- GPU join execution (partitioned/hash join over GPU-resident relations)
 - projection plan spanning two tables
-- fallback reason when fanout is unbounded
+- fallback reason when fanout is unbounded (tracked as parity/bootstrap debt,
+  not the intended answer)
 
 Evidence:
 

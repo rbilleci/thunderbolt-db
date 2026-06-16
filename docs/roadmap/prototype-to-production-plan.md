@@ -25,7 +25,7 @@ database to customers, and against the revised performance targets in
 
 What the project needs to ship is **one** engine that is simultaneously
 (a) wire-compatible and feature-rich, (b) durable and transactional, (c) highly
-concurrent, and (d) GPU-accelerated. Today **each of those properties lives in a
+concurrent, and (d) GPU-native. Today **each of those properties lives in a
 different place, and the places do not talk to each other**:
 
 1. **The feature-rich CPU server** — `crates/protocol/src/bin/gpu-db-server.rs`
@@ -56,7 +56,7 @@ different place, and the places do not talk to each other**:
 into one unified engine.** Until that happens, every "the database does X" claim
 is true of one of the three halves and false of the product.
 
-### 1.2 The GPU thesis is real but barely exercised — and not the current bottleneck
+### 1.2 The GPU thesis is real but barely exercised — building the real parallel GPU engine is now THE priority thrust
 
 The GPU path is **not a mock**. The engine dynamically loads the CUDA driver
 (`libloading` → `libcuda.so.1`, `execution/lib.rs:1309`), allocates real device
@@ -77,6 +77,24 @@ But it is shallow in three ways that matter:
   overlap), and no pinned memory. The **write path does no GPU work at all** — it is
   CPU with fabricated GPU telemetry (`engine/lib.rs:14597-14605`,
   `// ... before CUDA is wired in`).
+
+**Conclusion (forward-looking).** The above are honest, measured facts about the
+*prototype's* GPU layer, and they remain true. But the premise that justified
+deferring deep GPU work — "the concurrency substrate must be built *first*, the
+GPU isn't the bottleneck yet" — has now been **discharged on this branch**: the
+read/dispatch concurrency substrate is committed (reader/writer `&self` read path,
+`Arc<SharedEngine>` concurrent dispatch ~58× to 106k qps @ c256, async ingress,
+the GPU shared-context + stream-pool substrate, batched submission). With that
+substrate in place, the CPU-serialization wall is no longer what stands between
+the engine and its targets — the **shallow GPU execution layer is**. Per the
+GPU-native charter (`docs/architecture/00-gpu-native-principles.md`), building the
+**real parallel GPU execution engine — parallel kernels, a plan→kernel compiler
+over all column types, first-class GPU joins, and a GPU-resident catalog — is now
+THE priority thrust, not deferred work.** PG-compatibility (types, catalog) and
+durability are sequenced as **enablers** of that engine (they feed typed GPU
+columns and the GPU-resident catalog), not as gates ahead of it. See the
+"GPU-native priority spine" (§1.4) and `docs/roadmap/gpu-native-oltp-roadmap.md`
+for the authoritative GPU-engine track.
 
 ### 1.3 Where we are vs. the revised targets (`DESIGN.md §1.1`)
 
@@ -104,9 +122,58 @@ honest, execute-from-snapshot path is **~4× short on rate and ~3× short on p50
 and the tail and connection-scale targets are **not yet measurable** — the harness
 tops out at 64 connections, fires 8 requests/session, and captures no p99.9.
 
-**Conclusion:** the targets are not close, and more importantly several of them
-are **not yet measurable** on the current substrate. The first job is not to tune;
-it is to build the substrate on which the targets can even be evaluated.
+**Conclusion:** the targets are not close, and several of them remain **not yet
+measurable** until the Phase-5 open-loop / p99.9 / steady-state harness lands —
+that honest gap stands. But the *read* substrate on which the targets are
+evaluated is now built (reader/writer split, concurrent dispatch, async ingress,
+GPU shared-context/stream pool, batched submission — all committed on this
+branch). The first job is therefore no longer to build the read substrate; it is
+to **build the real GPU execution engine on top of it** — parallel kernels, a
+stream-pool/async/pinned device path, a plan→kernel compiler over all column
+types, first-class **GPU joins**, a **GPU-resident catalog**, and the GPU write
+path — with PG-compat types/catalog and durability sequenced as enablers of that
+engine. (The Phase-5 harness work is the parallel prerequisite for *trusting* the
+resulting numbers, not a gate ahead of the engine.)
+
+### 1.4 GPU-native priority spine (the one ordering future work must follow)
+
+This project is **GPU-native** (charter: `docs/architecture/00-gpu-native-principles.md`):
+the GPU is the execution substrate for the *entire* relational data path —
+scans, filters, projections, aggregates, **joins**, sorts, grouping — over
+GPU-resident columnar snapshots, **including the system catalog**. The CPU is the
+host/control plane only. Any CPU relational execution is reference-parity or a
+temporary bootstrap scaffold, tracked as **debt**, never product direction. Given
+the concurrency substrate is now built (§1.2), the priority order for the
+remaining program is:
+
+1. **The real parallel GPU execution engine — the lead thrust:**
+   1. **Parallel kernels** (grid/block sizing, strided scans, block/grid
+      reductions) replacing the `(1,1,1)` serial loops.
+   2. **Stream pool + async H2D/D2H + pinned memory** so read jobs overlap.
+   3. **Plan→kernel compiler over ALL column types** (not just `int4`) —
+      retire the ~30 per-shape methods; typed columns go GPU-resident.
+   4. **GPU join operator** — a first-class partitioned/hash join over
+      GPU-resident relations (covers the catalog `\d`/ORM multi-relation joins
+      and bounded OLTP joins). **Never a CPU nested-loop.**
+   5. **GPU-resident catalog** — `pg_catalog`/`information_schema` as
+      GPU-resident system relations executed by the *same* GPU operators
+      (including the GPU join path), superseding any CPU catalog synthesis.
+   6. **GPU write path** — real device work on commit (build/mutate the next
+      GPU-resident generation), replacing the simulated write telemetry.
+
+2. **PG-compatibility (types + catalog) and durability are ENABLERS, sequenced to
+   feed the engine — not gates ahead of it.** The type system exists so typed
+   columns become GPU-resident (step 1.3); the real catalog exists so it can be
+   made GPU-resident (step 1.5); durability/WAL exists so the GPU write path
+   (step 1.6) is crash-safe. Where a CPU type/catalog/join implementation lands
+   first, it is an explicit **stepping-stone / parity-reference**, tracked as
+   GPU-parity debt with a milestone — never the optimized hot path.
+
+The authoritative, milestone-level track for this engine spine is
+`docs/roadmap/gpu-native-oltp-roadmap.md`. The phase plan in §5 is sequenced to
+serve this spine: **Phase 2 (real GPU execution engine) is the lead/priority
+phase**; Phases 3 (PG-compat) and 4 (durability) are its enablers; Phases 5-8
+productize, scale, and certify it.
 
 ---
 
@@ -460,8 +527,17 @@ and a harness that measures it:
 | Memory residency under concurrency | Phase 2 (generation chains) | partial — per-table cell, no chains yet |
 | **Measuring** concurrency at load | minimal harness (above) → Phase 5 | not started |
 
-### Phase 2 — Real GPU execution engine
-**Goal:** make the GPU-native thesis real and parallel.
+### Phase 2 — Real GPU execution engine (THE lead/priority phase — the GPU-native spine)
+**Goal:** make the GPU-native thesis real and parallel — this is the **priority
+thrust** of the program (§1.2, §1.4). With the concurrency substrate built (Phase
+1 read half / dispatch / async ingress committed), the shallow GPU execution layer
+is now the wall between the engine and its targets. The GPU-native charter
+(`docs/architecture/00-gpu-native-principles.md`) governs this phase: the GPU
+executes the *entire* relational data path — including **joins** and the **system
+catalog** — and the items below **supersede the CPU stepping-stones** in Phases 3-4
+(CPU type/catalog/join code is parity-reference scaffold, tracked as GPU-parity
+debt, never the hot path). The authoritative milestone track is
+`docs/roadmap/gpu-native-oltp-roadmap.md`.
 - **GPU build pipeline.** Add `build.rs` + `.cu` kernels compiled by `nvcc` to
   fatbins for `sm_80/90/100/120` (or formalize runtime-PTX with module caching).
 - **Parallel kernels.** Replace `(1,1,1)` serial loops with real grid/block sizing,
@@ -490,31 +566,70 @@ and a harness that measures it:
 - **Stream pool + async copies + pinned memory.** Real `cuStream*`, async H2D/D2H,
   `cuMemHostAlloc` staging, so submit/complete actually overlap. Measure D2H from
   real copy sizes (not row/col estimates) and time uniformly with `cuEventElapsedTime`.
-- **Plan → kernel compiler.** Retire the ~30 per-shape `_with_resident_device_memory_
-  probe` methods and the `String` shape tags; build a physical-plan → operator-
-  pipeline compiler over arbitrary column types (not just `int4`), composable
-  filters/projections/aggregates, and the roadmap route classes (entity, page,
-  bounded join, computed detail).
+- **Plan → kernel compiler over ALL column types.** Retire the ~30 per-shape
+  `_with_resident_device_memory_probe` methods and the `String` shape tags; build a
+  physical-plan → operator-pipeline compiler over **arbitrary column types (not just
+  `int4`)** — composable filters/projections/aggregates, and the roadmap route
+  classes (entity, page, bounded join, computed detail). This is where the typed
+  columns of Phase 3 become **GPU-resident** (the GPU-native payoff for the type
+  system), not where they stay on the CPU path.
+- **GPU join operator (first-class milestone).** Build a **real GPU join** —
+  partitioned/hash join over GPU-resident relations (build a hash table on the
+  keyed/smaller side on-device, probe the other side in parallel), not a CPU
+  nested-loop and not a CPU hash join. It must cover (a) the **catalog `\d` / ORM
+  multi-relation joins** (the `pg_catalog`/`information_schema` joins `psql \d` and
+  ORMs issue, which run on this same GPU join path once the catalog is GPU-resident)
+  and (b) **bounded OLTP joins** (one or two tables where at least one side is keyed
+  or tenant-bounded). Per the charter, joins are GPU operators by definition; any CPU
+  join is parity-reference/bootstrap debt with a GPU milestone, never the answer.
+- **GPU-resident catalog.** Make `pg_catalog` and `information_schema` **GPU-resident
+  system relations executed by the SAME GPU operators as user tables** (scans,
+  filters, and the GPU join operator above) — **superseding any CPU catalog
+  synthesis / canned-query matching** (today's ~6k-line CPU `pg_catalog` matcher and
+  any Phase-3 CPU catalog tables are stepping-stones, tracked as GPU-parity debt).
+  Catalog introspection — including multi-relation catalog joins — runs on the GPU
+  join path. This is the GPU-native target the Phase-3 "real queryable catalog"
+  enabler feeds into.
+- **GPU write path.** Make the write path do **real device work** — build/mutate the
+  next GPU-resident generation on commit — replacing the simulated GPU telemetry. The
+  Phase-4 durability work is the enabler that makes this crash-safe.
 - **Fix residency granularity.** Invalidate only the *mutated* table; add incremental/
   delta refresh; keep real generation chains alive for in-flight readers (replace
-  one-slot-per-table). Make the write path do real device work or drop simulated
-  telemetry.
-- **Exit:** a non-int4, multi-operator query (incl. one bounded join) executes on the
-  GPU; multiple in-flight read jobs overlap on distinct streams; a write invalidates
+  one-slot-per-table).
+- **Exit:** a non-int4, multi-operator query executes on the GPU; a **bounded join
+  runs on the GPU join operator** (and a `psql \d`-class catalog query resolves via
+  GPU-resident catalog relations on that same join path); multiple in-flight read
+  jobs overlap on distinct streams; a write does real device work and invalidates
   only its table.
 
-### Phase 3 — PostgreSQL compatibility for real OLTP
-**Goal:** run real banking/e-commerce SQL with correct types.
+### Phase 3 — PostgreSQL compatibility for real OLTP (ENABLER of the GPU engine)
+**Goal:** run real banking/e-commerce SQL with correct types. Phase 3 is an
+**enabler of the Phase-2 GPU engine** (§1.4), not a gate ahead of it: its type
+system exists so typed columns become GPU-resident (Phase 2's plan→kernel
+compiler), and its catalog/joins exist so they can be made GPU-resident / run on
+the GPU join operator (Phase 2). The CPU implementations Phase 3 lands first are
+**stepping-stones / parity-reference, tracked as GPU-parity debt** — the
+GPU-native target is GPU-resident, never the CPU path.
 - **Replace the hand-rolled parser with `pg_query`/`libpg_query`** (the design's
-  choice). Unlock joins, subqueries, CTEs, `RETURNING`, `ON CONFLICT`, expressions
-  in projection/predicate, multi-table DML.
+  choice; roadmap M5). Unlock joins, subqueries, CTEs, `RETURNING`, `ON CONFLICT`,
+  expressions in projection/predicate, multi-table DML. **GPU-native target:** the
+  *execution* of these joins is a **GPU join operator** (Phase 2), never a CPU
+  nested-loop — `pg_query` produces the plan; the GPU runs it. Any CPU join that
+  lands first is a parity-reference stepping-stone, tracked as debt.
 - **Type system.** Add `NUMERIC(p,s)` with correct rounding (money), plus `int8`,
   `int2`, `bool`, `timestamp[tz]`, `date`, `uuid`, `bytea`, `float8`, `varchar`,
   `json/jsonb` — each with parse + storage + text **and binary** wire codecs + OIDs.
+  **GPU-native target:** these typed columns become **GPU-resident** in Phase 2 (the
+  plan→kernel compiler over all types); the Phase-3 CPU type path is the
+  stepping-stone, the GPU-resident representation (per Phase 8) is the product.
 - **True server-side parameter binding** (stop string substitution); support NULL
   params and binary format.
-- **Real queryable `pg_catalog`/`information_schema`** backed by catalog tables,
-  replacing canned-query matching — ORMs/tools depend on this.
+- **Real queryable `pg_catalog`/`information_schema`** backed by catalog tables
+  (roadmap M2), replacing canned-query matching — ORMs/tools depend on this.
+  **GPU-native target:** the catalog tables are made **GPU-resident system relations
+  executed by the GPU operators (incl. the GPU join path)** in Phase 2 — that
+  supersedes both today's canned-query matcher and these Phase-3 CPU catalog tables,
+  which are the stepping-stone tracked as GPU-parity debt.
 - **Exit:** a representative banking schema (accounts/ledger with NUMERIC, FKs,
   multi-table transfer transaction) runs through a real ORM driver with correct
   money math and constraint enforcement.
@@ -639,10 +754,12 @@ milestone-by-milestone in Phase 3), to (a) certify **PostgreSQL compatibility** 
 type and (b) **optimize each type's representation for the GPU engine**. Phase 3 lands types with local,
 pragmatic decisions — e.g. NUMERIC as an i128 fixed-point decimal with a ~38-digit cap + a *deferred*
 bignum fallback (chosen for scale/perf + GPU-amenability over an arbitrary-precision string), and every
-non-int4/text type riding the CPU path because the GPU-resident routes are int4-shaped. This addendum
-makes the whole type system coherent — no PG-compat gap slips through a per-milestone seam, and no type
-is stuck on a representation that's wrong for a GPU-native engine — rather than a patchwork of one-off
-choices. (Same spirit as Phase 7's data-structure sweep, focused on the type layer.)
+non-int4/text type riding the CPU path *as a stepping-stone* because today's GPU-resident routes are
+int4-shaped (the CPU path is tracked GPU-parity debt per the charter, not the product direction). This
+addendum makes the whole type system coherent — no PG-compat gap slips through a per-milestone seam, and
+no type is left on a CPU representation that the GPU-native engine should own — rather than a patchwork of
+one-off choices, and it is where every type **graduates to a GPU-resident route**. (Same spirit as Phase
+7's data-structure sweep, focused on the type layer.)
 - **PG-compat inventory.** One row per supported type: storage + **text AND binary** wire codecs +
   OID/typmod + value semantics (compare, arithmetic, casts/coercion, NULL, text collation, timestamp
   tz/infinity) + the edge cases that diverge from PostgreSQL. Verify against PG's *observable* behavior
@@ -655,14 +772,20 @@ choices. (Same spirit as Phase 7's data-structure sweep, focused on the type lay
   `average_sql_value` digit-by-digit `mantissa*10` loop needs checked arithmetic — and to surface an
   overflow error — before AVG accepts int8/numeric inputs; unreachable while AVG is int4-only, see
   [[gpu-phase3]] M1 follow-ups).
-- **GPU-representation optimization.** Classify every type: **GPU-resident-amenable** (fixed-width,
-  alloc-free — int2/4/8, float8, bool, the i128 decimal, uuid (128-bit), date/timestamp (i32/i64)) vs
-  **variable-length / CPU-only** (text/varchar, json(b), arbitrary bytea, the bignum-NUMERIC fallback).
-  Design the GPU-resident column encoding + scan/filter/aggregate route for each amenable type — the
-  GPU-native payoff for typed columns (today only int4/text are resident; Phase 3 leaves the rest on the
-  CPU path by design) — and decide whether/how variable-length types get GPU treatment (dictionary-encoded
-  text, fixed-prefix, offset arrays) vs staying CPU. This is where NUMERIC/int8/etc. graduate from the
-  Phase-3 CPU path to real GPU routes.
+- **GPU-representation optimization (every type goes GPU-resident; CPU handling is tracked debt).**
+  Per the GPU-native charter, **all** column types target GPU-resident execution — this is part of
+  building the engine (Phase 2's plan→kernel compiler over all types), not a separate CPU/GPU split by
+  design. Classify every type: (a) **fixed-width / alloc-free** (int2/4/8, float8, bool, the i128
+  decimal, uuid (128-bit), date/timestamp (i32/i64)) go GPU-resident directly; (b) **variable-length**
+  (text/varchar, json(b), bytea, the bignum-NUMERIC fallback) go GPU-resident via
+  **dictionary-encoding, fixed-prefix columns, and offset/length arrays** (the GPU target — e.g.
+  dictionary-encoded text scans/filters/joins as fixed-width code columns on-device), NOT "CPU-only by
+  design." Design the GPU-resident column encoding + scan/filter/aggregate route for each type. Any type
+  still riding the **CPU path is tracked GPU-parity debt with a milestone**, never the intended product
+  shape (today only int4/text are resident and Phase 3 lands the rest on the CPU path *as a
+  stepping-stone* — this addendum is where they graduate to real GPU-resident routes). The "per-type GPU
+  routes" intent folds into the Phase-2 GPU-engine priority: typed columns going GPU-resident *is* part
+  of building the engine.
 - **Method.** The inventory table + a PG-gap analysis + a per-type representation decision, each with the
   same per-op-cost-vs-n + alloc-per-op scaling rigor as Phase 7, backed by a before/after benchmark
   (GPU vs CPU per type; representation A/B) and a compat re-check.
@@ -679,7 +802,7 @@ Hitting **all** revised targets at once — >100k sustained TPS, sub-0.5ms p50,
 sub-5ms p99.9, 100k–1M connections, banking ACID, multi-node HA — is a multi-year
 program. Attempting it as one push will stall. Recommended staging:
 
-- **v1 (first commercial envelope):** single-node, GPU-accelerated, **read-mostly
+- **v1 (first commercial envelope):** single-node, GPU-native, **read-mostly
   OLTP** with **real ACID** (MVCC + fsync WAL), the **core type set including
   NUMERIC**, real concurrency to ~10k connections, `pg_query`-grade SQL on a
   bounded-but-general subset, and the latency win on hot prepared routes. This is

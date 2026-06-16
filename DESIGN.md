@@ -2,12 +2,14 @@
 
 ## 1 Introduction and Requirements
 
+> **GPU‑native charter (the project's defining property).**  This engine is **GPU‑native**: the GPU is the execution substrate for the **entire relational data path** — scans, filters, projections, aggregates, **joins**, sorts, and grouping — over GPU‑resident columnar snapshots, **including the system catalog** (`pg_catalog`/`information_schema` are GPU‑resident system relations executed by the same GPU operators as user tables).  The CPU is the host/control plane **only** (wire protocol, SQL parse/plan, transaction coordination, WAL/durability I/O, GPU orchestration).  There is **no "hybrid CPU‑GPU" co‑execution design principle and no permanent CPU fallback for hot relational work**: CPU relational execution exists solely as (a) reference semantics for CPU↔GPU parity tests and (b) a temporary bootstrap scaffold for GPU‑absent dev/CI — both tracked as GPU‑parity **debt** with a milestone, never product direction and never the optimized hot path.  The authoritative statement of this charter is `docs/architecture/00-gpu-native-principles.md`.
+
 Modern core‑banking workloads require strict transactional guarantees, auditability and regulatory compliance.  Relational database management systems (RDBMS) have been the default choice for financial applications because they are **ACID‑compliant** (atomicity, consistency, isolation, durability) and provide strong data integrity and audit trails.  A 2026 industry overview notes that the financial industry chooses relational DBMS because they deliver **ACID compliance and data integrity**, with PostgreSQL and Oracle often recommended for banking due to their reliability and advanced features【976295677179754†L60-L82】.  The goal of this design is to build an engine that:
 
 * Speaks the **PostgreSQL frontend/back‑end protocol** (targeting **PostgreSQL 16** wire‑protocol semantics) so that existing PostgreSQL drivers and tools can connect without modification.  The wire protocol is message‑based; it has a startup phase with authentication and parameter negotiation, followed by normal operation where clients send simple or extended queries and the server responds with structured messages.  The extended query protocol supports **pipelining** – sending multiple queries without waiting for previous ones – which reduces network round trips【583181887545674†L581-L604】.
 * Implements the **core SQL standard** (data types, DDL, DML, transactions, triggers, stored procedures) and PostgreSQL 16 semantics, including multi‑version concurrency control (MVCC).  PostgreSQL uses MVCC so that each statement sees a snapshot of the database as it existed at some point in time, preventing readers from blocking writers and vice‑versa【997194816604558†L33-L47】.  This isolation model must be preserved.
 * Provides **ACID properties** and high availability suitable for banking.  Durability should be ensured by a disk‑resident write‑ahead log (WAL) and replication across nodes.  The system must support **strong consistency** and auditing.
-* Supports **hybrid CPU–GPU execution**.  GPU memory is limited (high‑end devices provide up to ~192 GB)【64261708151474†L63-L66】, so the engine cannot assume that all data fits on the GPU.  Hot partitions or tables will be cached or replicated into GPU memory, while the remainder stays in CPU memory or on disk.  The system must operate at full correctness in **CPU‑only mode** when GPUs are unavailable.
+* Uses the **GPU as the relational execution substrate, with CPU as host/control plane**.  GPU memory is the hot data tier; because it is limited (high‑end devices provide up to ~192 GB)【64261708151474†L63-L66】, the engine cannot assume all data fits on the GPU, so host memory and disk serve as **staging/spill tiers** (not a co‑equal CPU execution tier).  Hot partitions or tables are made GPU‑resident, while the remainder stays in host memory or on disk awaiting residency.  GPU‑absent **CPU‑only operation is a temporary bootstrap scaffold** for dev/CI and an operational‑safety mechanism — tracked as GPU‑parity debt with a milestone, **not a co‑equal execution mode and not product direction**.
 * Scales across **multiple GPUs**.  Recent research highlights that multi‑GPU DBMS architectures can aggregate GPU memory capacity and computational power but require careful data placement and replication strategies【64261708151474†L64-L75】.  The design should support clustering multiple GPUs as a unified resource and coordinate caching and replication across them【64261708151474†L91-L110】.
 
 ### 1.1 Performance targets
@@ -42,7 +44,7 @@ The system is organized into the following layers, with each layer depending onl
 1. **Platform layer:**  OS, CUDA runtime, NVML, NCCL, filesystem.
 2. **Storage I/O and WAL:**  Disk I/O, WAL writer, WAL archiver, GPUDirect Storage interface.
 3. **Buffer and memory management:**  CPU shared buffer pool, GPU buffer pool, pinned‑memory pool, slab allocators.
-4. **Catalog and metadata:**  Schema definitions, system catalogs (`pg_catalog`), shard mappings, GPU placement metadata, statistics.
+4. **Catalog and metadata:**  Schema definitions, shard mappings, GPU placement metadata, statistics.  The system catalogs (`pg_catalog`, `information_schema`) are **GPU‑resident system relations executed by the same GPU operators as user tables** — not a CPU‑side metadata carve‑out — so catalog introspection (including the multi‑relation joins `psql \d`/ORMs issue) runs on the GPU join path.
 5. **Transaction manager:**  Transaction ID assignment, snapshot creation, visibility determination, lock management, commit/abort, MVCC garbage collection.
 6. **Execution engine:**  CPU operators, GPU kernels, batch scheduler, operator fusion, result merging.
 7. **Query planner/optimizer:**  AST transformation, cost model, CPU/GPU routing, plan caching, statistics integration.
@@ -119,7 +121,7 @@ Banking workloads combine OLTP and analytical processing.  Row‑oriented storag
 
 * **Row‑oriented base tables** for transactional records (accounts, transactions, ledger entries).  Each row stores metadata (transaction ID, creation timestamp) used for MVCC.  Updates append a new version rather than overwriting.
 * **Columnar projections or materialized segments** for analytical queries on large tables (e.g., reporting, compliance).  Analytical segments can be loaded onto GPUs for acceleration.
-* **TOAST (The Oversized‑Attribute Storage Technique):**  Values exceeding the page threshold (default ~2 KB) are compressed and/or stored out‑of‑line in a companion TOAST table, matching PostgreSQL semantics.  TOAST values on CPU use the standard chunk storage.  On GPU, oversized values are not transferred to GPU memory — queries referencing TOASTed columns fall back to CPU unless the column is detoasted at scan time and fits in the GPU buffer pool.  JSON and TEXT columns commonly trigger TOAST; the planner accounts for detoast cost in the CPU/GPU routing decision.
+* **TOAST (The Oversized‑Attribute Storage Technique):**  Values exceeding the page threshold (default ~2 KB) are compressed and/or stored out‑of‑line in a companion TOAST table, matching PostgreSQL semantics.  The durable/host representation uses the standard chunk storage.  **The GPU‑native target is to make oversized/variable‑length values GPU‑resident** via detoast/encoding (dictionary or fixed‑prefix) so queries referencing these columns execute on the GPU path; the detoast/encoding cost is accounted for at residency/scan time.  Any interim CPU handling of un‑encoded TOASTed columns is tracked **GPU‑parity debt** with a milestone, not a design fallback.  JSON and TEXT columns commonly trigger TOAST.
 * **Variable‑length data on GPU:**  For GPU‑resident shards, variable‑length columns (VARCHAR, TEXT, BYTEA) that fit within the TOAST threshold are stored in a **variable‑length pool** per shard: a contiguous byte array with a parallel offset/length index.  The offset index is aligned for coalesced access.  Fixed‑length columns remain in SoA arrays.  Variable‑length columns that are not accessed by a GPU kernel are not transferred (column pruning).
 
 ### 3.2 CPU‑side buffer pool
@@ -311,7 +313,7 @@ Batching uses a **dual‑trigger** mechanism rather than a fixed batch size:
 
 ### 4.2 Query processing on GPU
 
-* **Operator fusion:**  Analytical queries (scans, filters, aggregations, joins) are fused into GPU kernels.  For OLTP queries, only point reads/writes are offloaded to the GPU if the data is present in GPU memory.  Complex expressions or user‑defined functions fall back to the CPU.
+* **Operator fusion:**  Analytical queries (scans, filters, aggregations, joins) are fused into GPU kernels.  **The GPU is also the execution substrate for OLTP routes** — entity fetches, page reads, bounded joins, and computed‑detail routes — over GPU‑resident snapshots, not just isolated point reads/writes.  Complex expressions are **GPU expression‑evaluated** (the target; see §4.3.4 GPU expression evaluation); user‑defined functions and any interim un‑evaluable cases are routed to the CPU only as tracked **GPU‑parity debt** with a milestone, not a design fallback.
 * **GPU hash join:**  Build phase allocates a hash table in GPU global memory (open addressing, linear probing, 70% load factor).  Each build thread inserts one tuple using `atomicCAS`.  Probe phase: each thread hashes its probe key and walks the chain.  For joins where the build side fits in shared memory (< 48 KB), a **shared‑memory hash join** is used — the build side is loaded cooperatively by the thread block, then each probe thread accesses shared memory (avoiding global memory latency).  For larger builds, a **partitioned hash join** splits both sides into GPU‑cache‑friendly partitions (radix partitioning), then executes shared‑memory joins per partition.  Anti‑joins and semi‑joins supported via bloom filter pre‑filtering: a GPU‑resident bloom filter (64 KB–1 MB, 8 hash functions) is built from the inner side and checked before probing the hash table, eliminating non‑matching tuples early.
 * **GPU memory management:**  See Section 4.3.
 * **Replication and synchronization across GPUs:**  When using multiple GPUs, hot shards may be replicated on multiple devices.  Cross‑GPU communication uses NVLink or PCIe.  The engine detects conflicting updates across replicated shards and propagates changes via the WAL stream.  Strong consistency for cross‑GPU replicated shards: a write must be applied to all replicas before the transaction commits.
@@ -357,7 +359,7 @@ Avoid traditional pointer‑based version chains on GPU.  Use contiguous, pre‑
 * **Visibility bitmap:**  Precompute visibility in a separate kernel pass that reads all xmin values (coalesced), computes visibility bits, stores them in a bitmap.  The execution kernel uses the bitmap rather than re‑reading metadata.
 * **Alignment:**  Version array elements aligned to 4/8‑byte boundaries.  Short fields padded to 4 bytes within SoA layout.
 * **NULL handling in SoA:**  A per‑column **null bitmap** stored as a separate array (1 bit per row, packed into 32‑bit words for warp‑coalesced reads).  GPU kernels check the null bitmap before reading column values, avoiding undefined memory access.  Null‑aware arithmetic operators short‑circuit on null inputs.
-* **GPU expression evaluation:**  Simple expressions (arithmetic, comparison, CASE/WHEN, COALESCE, IS NULL) are compiled into GPU‑executable expression trees at plan time.  Each expression node is represented as an opcode in a flat bytecode array interpreted by a GPU expression evaluator kernel.  For frequently executed expressions, NVRTC (runtime compilation) generates optimized PTX from CUDA C expression templates, avoiding interpretation overhead.  The host‑side Rust code invokes NVRTC via `cudarc`'s safe wrappers.  Expressions involving string operations (LIKE, regex) or complex casts fall back to CPU.
+* **GPU expression evaluation:**  Simple expressions (arithmetic, comparison, CASE/WHEN, COALESCE, IS NULL) are compiled into GPU‑executable expression trees at plan time.  Each expression node is represented as an opcode in a flat bytecode array interpreted by a GPU expression evaluator kernel.  For frequently executed expressions, NVRTC (runtime compilation) generates optimized PTX from CUDA C expression templates, avoiding interpretation overhead.  The host‑side Rust code invokes NVRTC via `cudarc`'s safe wrappers.  String operations (LIKE, regex) and complex casts are **GPU‑evaluated** (the target); any interim CPU evaluation of expressions not yet ported to the GPU evaluator is tracked **GPU‑parity debt** with a milestone, not a design fallback.
 
 ### 4.4 CUDA error handling and GPU abstraction
 
@@ -402,12 +404,12 @@ Triggers and stored procedures are classified into tiers:
 
 A "GPU‑eligible" subset of trigger/procedure semantics is documented.  Users are advised how to stay within it for maximum performance.
 
-## 5 Hybrid CPU–GPU and Multi‑GPU Scaling
+## 5 GPU‑Native Data Tiering and Multi‑GPU Scaling
 
-The dataset in a core banking system often exceeds a single GPU's memory.  A hybrid design leverages CPU memory and multiple GPUs:
+The dataset in a core banking system often exceeds a single GPU's memory.  The GPU is the relational execution substrate; this section covers how the engine **tiers data** (GPU hot tier, host memory/disk as cold staging/spill) and **scales across multiple GPUs** to aggregate capacity for the relational data path:
 
-* **Hybrid CPU‑GPU execution:**  CPU memory for cold data, GPU memory for hot partitions.  CPU‑GPU DBMS designs exploit both CPU and GPU parallelism while minimizing data transfer overhead【64261708151474†L64-L71】.  Queries may execute partially on CPU and GPU, with results merged.
-* **Cross‑device join strategy:**  When a join spans CPU‑resident and GPU‑resident data, the planner chooses between: (a) **ship‑inner‑to‑GPU** — transfer the smaller (inner) relation to GPU memory and execute the join on GPU; (b) **ship‑results‑to‑CPU** — scan the GPU‑resident side, stream qualifying rows to CPU, and join on CPU; (c) **partition‑wise join** — if both sides are partitioned on the join key, execute partition‑local joins on whichever device holds each partition pair, then union results.  The cost model (Section 5.1) selects the cheapest strategy based on data sizes and transfer costs.
+* **GPU‑native data tiering:**  GPU memory holds the hot working set; host memory and disk are cold **staging/spill tiers** (not a co‑equal CPU execution tier).  Multi‑GPU memory is aggregated to grow the resident hot tier【64261708151474†L64-L71】.  When a relation referenced by a query is not yet GPU‑resident, the target is to make it resident (or spill an intermediate) rather than to co‑execute the relational operators on the CPU; any CPU execution while residency catches up is tracked **GPU‑parity debt**, not a design principle.
+* **Join strategy (GPU operators):**  Joins are **first‑class GPU operators** (partitioned/hash join over GPU‑resident relations; see §4.2 GPU hash join), never CPU nested‑loop.  When a join input is not yet GPU‑resident, the planner chooses between: (a) **ship‑inner‑to‑GPU** — make the smaller (inner) relation GPU‑resident and execute the join on GPU; (b) **partitioned GPU join** — radix‑partition both sides on the join key and execute partition‑local GPU joins, then union results, staging cold partitions into GPU memory as needed.  The cost model (Section 5.1) selects the cheapest **GPU** strategy based on data sizes and transfer/residency costs.  Falling back to a CPU join is a tracked **GPU‑parity debt** path (parity reference or bootstrap), not a design strategy.
 * **GPU sort operations:**  GPU‑accelerated merge sort for `ORDER BY`, `GROUP BY` pre‑sorting, and sort‑merge joins.  Uses a bitonic sort network for small arrays (< 32K elements within a thread block) and a multi‑pass radix sort for larger datasets across global memory.  Sort stability is guaranteed for deterministic query results.
 * **Multi‑GPU scaling:**  Multi‑GPU systems aggregate memory and compute power【64261708151474†L64-L75】.  Lancelot's **cache‑aware replication policy** selectively replicates data to balance caching and replication costs【64261708151474†L100-L110】.  The replication policy includes a resilience dimension: critical shards replicated on >= 2 GPUs.
 * **Unified multi‑GPU abstraction:**  Treat multiple GPUs as a single logical device to reduce complexity【64261708151474†L91-L96】.  The abstraction maintains per‑device shard mappings, health state, and circuit breakers.  Query planners operate over the unified GPU memory space; the runtime routes operations to specific devices.
@@ -425,7 +427,7 @@ The query planner uses an explicit cost model to decide execution device:
 | **GPU queue depth** | Current utilization of GPU compute and memory.  If GPUs are saturated, route to CPU. |
 | **Result size** | Large result sets increase D2H transfer cost. |
 
-The planner produces cost estimates for pure‑CPU, pure‑GPU, and hybrid plans, then selects the cheapest.
+The planner's GPU‑native default is to execute the relational path on the GPU; the cost model governs **residency/transfer decisions** (which inputs to make GPU‑resident, and when to stage/spill).  Routing relational operators to the CPU is a parity/bootstrap path (tracked GPU‑parity debt), not a co‑equal "hybrid plan" the planner balances against the GPU plan as a design goal.
 
 **Adaptive re‑routing:**  If GPU resources are unavailable at execution time (not just plan time), the executor transparently re‑routes operators to CPU equivalents.  Every GPU operator has a CPU counterpart with identical semantics.
 
@@ -543,11 +545,11 @@ Each GPU maintains a health state: `HEALTHY` → `DEGRADED` → `FAULTED` → `R
 | Thermal throttling | NVML temperature/clock monitoring | Reduce batch size, shed load to CPU, GPU → DEGRADED |
 | GPU memory exhaustion | `cudaMalloc` failure | Abort batch, evict cold shards, retry; if retry fails, open circuit breaker |
 
-#### 7.2.2 Graceful CPU fallback
+#### 7.2.2 CPU fallback on GPU failure/absence (operational safety + bootstrap, not a co‑equal mode)
 
-The system operates at full correctness in **CPU‑only mode**.  A runtime capability flag (`gpu_available`) is checked by the planner.  When false, all plans use CPU‑only operators.  Transition between modes is transparent to connected clients.
+CPU relational execution exists here as an **operational‑safety mechanism** (preserve correctness when a GPU faults) and a **dev/CI bootstrap scaffold** (run GPU‑absent) — it is **explicitly not a co‑equal execution mode and not product direction**, and is tracked as GPU‑parity debt with a milestone.  For correctness during a fault, the engine can still produce correct results via the CPU parity/reference operators: a runtime capability flag (`gpu_available`) is checked by the planner, and when false, plans use the CPU parity operators rather than rejecting work.  Transition between modes is transparent to connected clients.
 
-If a GPU fails mid‑batch: abort the batch, return all transactions to the CPU‑side queue, re‑execute on CPU.  Since the WAL was not flushed for uncommitted batches, no durability invariant is violated.
+If a GPU fails mid‑batch: abort the batch, return all transactions to the CPU‑side queue, re‑execute on the CPU parity path.  Since the WAL was not flushed for uncommitted batches, no durability invariant is violated.
 
 #### 7.2.3 Partial multi‑GPU failure
 
@@ -844,10 +846,10 @@ The following phases outline an implementation roadmap:
 7. **Trigger classification:**  Tier 1 (GPU‑inlined), Tier 2 (bulk audit append), Tier 3 (CPU fallback).
 8. **Testing:**  Dual‑execution harness (CPU vs. GPU), linearizability checker, GPU fault injection, compute‑sanitizer, performance benchmarks.
 
-### Phase 3 – Multi‑GPU and hybrid execution
+### Phase 3 – Multi‑GPU scaling and GPU‑native data tiering
 
 1. **Unified GPU abstraction:**  Device‑to‑shard mapping with health state and circuit breakers per device.  Cache‑aware replication with resilience dimension.
-2. **Distributed query planner:**  Hybrid plans splitting work between CPU and GPUs.  Operator pipelining, async execution, result merging.
+2. **Distributed query planner:**  Multi‑GPU plans splitting the relational path across GPUs (with host memory/disk as cold staging/spill).  Operator pipelining, async execution, cross‑GPU result merging.
 3. **Cross‑device coordination:**  Transaction coordination across GPUs.  Cross‑device consistency verification (checksum comparison).  Quorum reads for critical paths.
 4. **GPU‑to‑GPU communication:**  NCCL for broadcast/replicate, `cudaMemcpyPeerAsync` for point‑to‑point, topology detection.
 5. **Testing:**  Multi‑GPU chaos testing, cross‑GPU consistency verification, partition testing, load/stress testing.
@@ -871,7 +873,7 @@ The following phases outline an implementation roadmap:
 
 ## 12 Conclusion
 
-This design combines the reliability and features of PostgreSQL with the computational power of GPUs.  By maintaining a disk‑based WAL with the WAL‑before‑visibility invariant and using GPU memory as an execution cache, the engine ensures durability while accelerating workloads.  A multi‑GPU, hybrid CPU–GPU architecture with cache‑aware replication allows the system to handle datasets larger than a single GPU's capacity【64261708151474†L64-L75】.  Adaptive batching with dual‑trigger formation balances GPU throughput against banking latency SLAs.  Full CPU‑only fallback guarantees correctness when GPUs are unavailable.
+This design combines the reliability and features of PostgreSQL with the computational power of GPUs.  The architecture is **GPU‑native**: the GPU is the execution substrate for the entire relational data path (including the catalog), with the CPU as host/control plane.  By maintaining a disk‑based WAL with the WAL‑before‑visibility invariant and using GPU memory as the execution tier backed by that durable log, the engine ensures durability while accelerating workloads.  A multi‑GPU design with GPU‑native data tiering (GPU hot tier; host memory/disk as cold staging/spill) and cache‑aware replication allows the system to handle datasets larger than a single GPU's capacity【64261708151474†L64-L75】.  Adaptive batching with dual‑trigger formation balances GPU throughput against banking latency SLAs.  CPU‑only operation is a **bootstrap/operational‑safety scaffold** (tracked GPU‑parity debt), not a design pillar.
 
 The design addresses critical concerns identified through multi‑perspective review: explicit interface contracts between all subsystems, a cost model for CPU/GPU routing, comprehensive error taxonomy and GPU error propagation, page‑level checksums and full‑page writes for data integrity, circuit breakers and backpressure for resilience, security integrated from Phase 1, and a testing strategy spanning compatibility, correctness, chaos, and performance.
 
@@ -881,4 +883,4 @@ Adhering to PostgreSQL 16's protocol and SQL semantics (with `libpg_query` for g
 
 The following diagram illustrates the high‑level architecture of the proposed engine.  It shows the CPU host with disk‑resident storage and WAL, multiple GPUs with their own memory partitions, and clients connecting via the PostgreSQL wire protocol.  Arrows depict the flow of WAL data from disk to GPU memory and the data flow between CPU and GPU.
 
-![Hybrid CPU–GPU database architecture]({{file:file-1xyzngUSjQuKhw8ZA5NpL7}})
+![GPU-native database architecture]({{file:file-1xyzngUSjQuKhw8ZA5NpL7}})

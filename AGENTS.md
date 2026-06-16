@@ -12,8 +12,15 @@ optimize for that thesis unless the user explicitly changes direction.
   primary-key microbenchmarks.
 - Prefer designs where hot data, lookup structures, encoded columns, and read
   snapshots live in GPU memory.
-- Use CPU execution as reference semantics, control plane, fallback, ingress,
-  and validation support. Do not let CPU convenience become the hot-path design.
+- The CPU is the host/control plane ONLY: wire protocol, SQL parse/plan,
+  transaction coordination, WAL/durability I/O, and GPU orchestration. CPU
+  relational execution exists solely as parity-reference plus temporary
+  bootstrap scaffold, tracked as debt with a GPU milestone — never product
+  direction and never the hot-path design.
+- The catalog is GPU-native and joins are GPU operators: `pg_catalog` and
+  `information_schema` are GPU-resident system relations, and catalog joins
+  (`psql \d`, ORM introspection) run on the GPU join path. Do not build a CPU
+  catalog or CPU nested-loop/hash join as the target answer.
 - For hot reads, prefer prepared route ids, typed parameters, resident snapshot
   handles, and device-ready projection plans over repeated SQL-text parsing.
 - Favor immutable/versioned GPU-resident snapshots for read concurrency.
@@ -28,7 +35,8 @@ optimize for that thesis unless the user explicitly changes direction.
 When choosing between implementation approaches:
 
 1. Keep the GPU hot path explicit and measurable.
-2. Preserve CPU/GPU semantic parity, but track CPU fallback as debt.
+2. Preserve CPU/GPU semantic parity, but treat CPU relational execution as
+   parity-reference/bootstrap debt with a milestone — never product direction.
 3. Avoid adding CPU caches or CPU indexes as the primary answer for benchmark
    wins unless the change is clearly documented as a non-GPU-native escape
    hatch.

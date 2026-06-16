@@ -1,18 +1,38 @@
 # GPU-Native Principles
 
-This project is betting on GPU-native database execution: GPU technology,
-memory capacity, interconnects, and programming models are expected to improve,
-so the architecture should make the GPU the primary hot execution target rather
-than a side accelerator.
+This project is **GPU-native**: the GPU is the engine's execution substrate for
+the entire relational data path, not a side accelerator on a CPU engine. GPU
+technology, memory capacity, interconnects, and programming models are expected
+to keep improving, and the architecture commits to that bet — every relational
+capability is designed for the GPU first.
+
+> **Charter (the one rule future work must not violate).** The GPU executes the
+> whole relational data path — scans, filters, projections, aggregates, **joins**,
+> sorts, grouping — over GPU-resident columnar snapshots, **including the system
+> catalog**. The CPU is the host/control plane ONLY. There is no "hybrid
+> CPU–GPU" co-execution design and no permanent CPU fallback for hot relational
+> work. CPU relational execution exists solely as (a) reference semantics for
+> CPU↔GPU parity tests and (b) a temporary bootstrap scaffold for GPU-absent
+> dev/CI — both are tracked GPU-parity **debt** with a milestone, never product
+> direction and never the optimized hot path. If a design choice routes hot
+> relational work to the CPU as its answer, it is wrong by definition here.
 
 ## What GPU-Native Means Here
 
 - **GPU memory is the hot data tier.** Resident columns, lookup structures,
-  dictionaries, indexes, and read snapshots should be designed for device
-  execution first.
-- **CPU is the control plane and reference path.** CPU execution remains
-  necessary for correctness, fallback, compatibility, and bootstrap, but it
-  should not quietly become the optimized hot path.
+  dictionaries, indexes, and read snapshots are designed for device execution
+  first. Host memory and disk are staging/spill tiers, not an execution tier.
+- **CPU is the host/control plane only.** The CPU owns wire protocol, SQL
+  parse/plan, transaction coordination, WAL/durability I/O, and GPU
+  orchestration — never the relational execution path. Any CPU relational
+  execution is parity-reference or temporary bootstrap scaffold (see the Charter
+  above), tracked as debt with a GPU milestone — never the optimized hot path.
+- **The catalog is GPU-native.** `pg_catalog` and `information_schema` are
+  GPU-resident system relations, executed by the SAME GPU operators as user
+  tables — not a CPU-side metadata carve-out. Catalog introspection (including
+  the multi-relation joins `psql \d`/ORMs issue) runs on the GPU join path.
+- **Joins are GPU operators.** Relational joins are first-class GPU execution
+  (partitioned/hash join over GPU-resident relations), never a CPU nested-loop.
 - **Hot reads should become prepared routes.** SQL text can exist at the
   protocol boundary, but latency-sensitive retained reads should compile into
   route ids, typed parameters, device-ready projection plans, and snapshot
@@ -70,8 +90,10 @@ serialized COPY/write/DDL path
 ```
 
 This is a concurrent execution state machine, not unconstrained shared mutable
-state. Mutable catalog, residency, and generation publication remain controlled
-and serialized until the transaction model says otherwise.
+state. The catalog itself is a GPU-resident set of system relations (queried by
+the same GPU operators as user tables); its mutation, residency, and generation
+publication remain controlled and serialized until the transaction model says
+otherwise.
 
 ## Design Rules
 
@@ -116,6 +138,10 @@ and serialized until the transaction model says otherwise.
 - CPU indexes as the main answer for hot retained point reads.
 - CPU response caches as the primary product latency path.
 - GPU only as a batch analytics accelerator while OLTP reads stay CPU-first.
+- CPU execution of catalog / `pg_catalog` / `information_schema` introspection as
+  the answer — the catalog is GPU-resident and its joins run on the GPU join path.
+- CPU nested-loop or CPU hash joins as the join implementation — joins are GPU
+  operators.
 - Ad hoc locks around mutable CUDA/device state to create accidental
   multi-threaded execution.
 - Scheduler policies that improve one benchmark by hiding GPU fallback or
