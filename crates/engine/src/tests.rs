@@ -3300,9 +3300,13 @@ fn gpu_resident_device_memory_distinct_projection_probe_materializes_int4_result
     assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(resident.fallback_reason, None);
     assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+    // Kernel-less projection D2Hs only the i32 column (no device `out_count` readback): the
+    // unfiltered distinct path reads exactly the value bytes. The `+ size_of::<u64>()` count term
+    // was dropped in 38451a28 (which updated the plain-projection test but missed this DISTINCT
+    // one); the filtered-distinct sibling still reads the u64 match-count, so it keeps the term.
     assert_eq!(
         after.d2h_bytes_total - before.d2h_bytes_total,
-        5 * std::mem::size_of::<i32>() as u64 + std::mem::size_of::<u64>() as u64
+        5 * std::mem::size_of::<i32>() as u64
     );
     assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
 
