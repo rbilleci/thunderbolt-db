@@ -1186,6 +1186,29 @@ P1-M3 step 1 (2026-06-13); full analysis in doc 14's *Long-term GPU context mode
   real-GPU resident tests + the step-1 soundness probe stay green; a documented
   assertion that residency owns no context.
 
+### 9.4 GPU-ify the CPU-execution resident routes (charter debt)
+
+**Debt:** three resident routes D2H the column and run their filter/match on the
+**CPU**, not the GPU — `launch_cuda_resident_i32_between_row_indices` (range filter →
+row indices), `launch_cuda_resident_text_prefix_count` (text prefix match + count),
+and `launch_cuda_resident_text_project` (text projection / UTF-8 reconstruction).
+Under the GPU-native charter (`docs/architecture/00-gpu-native-principles.md`) this is
+CPU relational execution = tracked debt, **not** "optimal" — and `between_row_indices`
+even has a GPU sibling (`equal_row_indices`) that already runs its filter on-device.
+Found 2026-06-16 while classifying the P2-M2 serial-route migration (the serial-kernel
+holdouts compare-count/project/sum/between-stats/grouped-stats were migrated first, by
+explicit decision to finish the serial-kernel thrust before this).
+- **End state:** real GPU kernels — a between/range filter → row-indices kernel (mirror
+  `equal_row_indices` with the `[lower,upper]` range test the count/stats routes already
+  do on-device), and GPU text-prefix-filter + text-projection-filter kernels (or fold
+  into the plan→kernel compiler, §1.4 step 1.3). Text projection's necessary D2H of the
+  payload bytes stays; only the per-row *filter/match* predicate moves to the GPU.
+- **Trigger:** after the serial-kernel thrust (between_stats ✅, grouped_stats), a
+  natural fit alongside §1.4 step 1.3 (plan→kernel compiler over all column types).
+- **Acceptance:** these routes execute their filter/match on the GPU (no CPU per-row
+  predicate loop); CPU↔GPU parity tests green; any CPU path kept only as a
+  `#[cfg(test)]` parity reference or a labeled bootstrap fallback, never the hot path.
+
 > Status note: these are referenced from the Phase 0 "Structural findings" block
 > and from the P0-M3 / P1-M3-step-1 run reports. Update each subsection's status when
 > picked up; do not let the three-server state, the engine→protocol edge, or the
