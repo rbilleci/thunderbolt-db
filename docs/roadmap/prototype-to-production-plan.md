@@ -1236,13 +1236,19 @@ as a radix sort that would sort the wrong key and be discarded.
   crossover where radix's ~12-launch overhead dominates; radix's O(n) + constant 4 passes
   wins above, where bitonic's O(log²n) global stages explode). **Slice sequence** — each:
   implement → adversarial audit → execution + engine GPU gates → benchmark → commit:
-  - **S1** `grouped_stats` → GPU **hash aggregation** (the group-by: parallel atomic
-    open-addressing table → unordered groups; the last serial-kernel holdout).
-  - **S2** **bitonic** sort primitive (small): single-block + multi-block-merge over
-    (key, payload).
-  - **S3** **LSD radix** sort primitive (large): 4-pass histogram + exclusive scan +
-    stable scatter, adapting compare_project's partition+prefix-sum pattern.
-  - **S4** **adaptive dispatch + HAVING + LIMIT**: size-threshold (calibrated) picks
+  - **S1 ✅ DONE `25354288`** `grouped_stats` → GPU **hash aggregation** (the group-by: parallel
+    atomic open-addressing table → unordered groups; the last serial-kernel holdout).
+  - **S2 ✅ DONE `bba43b43`** **bitonic** argsort primitive (small): `launch_cuda_resident_i64_argsort_bitonic`,
+    stable i64→Vec<u32> perm both directions, host-looped bitonic over n_pad=next_pow2(n) on a
+    pooled stream. Direction-dependent padding sentinel (MAX asc / MIN desc) so padding sinks to
+    the unread end. Bench 100→0.066ms … 1M→1.365ms (O(log²N) launch-bound).
+  - **S3 ✅ DONE `6e83a99b`** **LSD radix** argsort primitive (large): `launch_cuda_resident_i64_argsort_radix`,
+    16× 4-bit passes (histogram → single-block multi-tile Hillis-Steele scan → match.any.sync
+    stable scatter), ping-pong, signed→unsigned XOR transform. Validated parallel == serial-radix
+    oracle == bitonic (byte-identical), incl. multi-tile-scan large-n cases. **Crossover ~10k**
+    (the hypothesis), radix advantage WIDENS: 1.27× @100k → **3.10× @10M**. Follow-ups for more
+    throughput: coalesced scatter (shared-mem local sort) + 8-bit digits.
+  - **S4** **adaptive dispatch + HAVING + LIMIT**: size-threshold (~10k, S2/S3-calibrated) picks
     bitonic/radix, + HAVING predicate filter + LIMIT top-K = the full ORDER BY/HAVING/LIMIT
     operator over the result.
   - **S5** **engine wiring**: replace the CPU `.sort_by`/HAVING/LIMIT for resident grouped
@@ -1253,6 +1259,37 @@ as a radix sort that would sort the wrong key and be discarded.
 - **Acceptance:** ORDER BY/HAVING/LIMIT for resident grouped + projected queries execute on
   the GPU (no CPU per-result sort/filter on the hot path); CPU↔GPU parity tests green;
   d2h/telemetry assertions updated.
+
+### 9.6 Decompose the exceptionally large source files (structural debt)
+
+**Debt:** several crate roots have grown far past navigable/reviewable size, taxing humans,
+rust-analyzer, review, and merge-conflict surface (measured 2026-06-16):
+`engine/lib.rs` **57,196** lines (≈half is one trailing inline `#[cfg(test)]` module — ~28k
+production + ~29k tests), `protocol/src/bin/gpu-db-server.rs` **31,547**, `replication/lib.rs`
+**20,039**, `execution/lib.rs` **16,373**, `protocol/lib.rs` **10,262**. These are a maintainability
+problem, not a behavioral one — tracked debt under the GPU-native charter (a pure structural
+refactor, no GPU/CPU semantics change).
+- **Approach (behavior-preserving, incremental):**
+  1. **Tests-first (cheapest, lowest-risk, highest-value):** extract the inline `#[cfg(test)]`
+     modules. Public-API-only tests → `tests/` integration files; private-API/GPU-probe tests →
+     sibling in-crate `#[cfg(test)] mod tests;` (own file, still a crate submodule so `super::*` /
+     `crate::` access is preserved). Roughly *halves* `engine/lib.rs` with near-zero risk (tests
+     are their own compilation; the public surface is unchanged).
+  2. **Then production code → cohesive `mod`s:** pure `mod foo;` extraction + `pub(crate) use`
+     re-exports so every call site and the crate's public surface stay identical. One cohesive
+     module per commit, each GREEN on the full GPU + golden suites; NEVER mix a move with a logic
+     change (keeps diffs reviewable + bisectable). Proposed `execution` axes: infra
+     (pooled-stream/`cached_function`/leases/`check_cuda`), `resident` (device-memory types), and
+     kernel families `sort` (bitonic/radix), `compare`, `grouped`, `project`, `text`, `between`.
+     `engine` needs its own analysis (likely: catalog, type-system/coercion, relational-exec,
+     write-half/MVCC, residency-probes, parser-entry).
+- **Sequencing (user-chosen 2026-06-16, "track + tests-first soon"):** do the inline-test
+  extraction at the next clean boundary, **engine-first by pain**; defer the production-code module
+  splits until **after the §9.5 sort arc (S5)**. Do NOT interleave a split with active feature work
+  on the same file (e.g. while §9.5 churns `execution/lib.rs`).
+- **Acceptance:** each crate root materially smaller; the full test suite (unit + golden + GPU
+  `--ignored`) green after every move; public API and behavior unchanged; no logic edits inside a
+  move commit.
 
 > Status note: these are referenced from the Phase 0 "Structural findings" block
 > and from the P0-M3 / P1-M3-step-1 run reports. Update each subsection's status when
