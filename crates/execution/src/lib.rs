@@ -6545,6 +6545,74 @@ fn launch_cuda_resident_i32_project(
     byte_offset: u64,
     row_count: u64,
 ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+
+    // P2-M2 — projecting a resident int4 column is a pure column read: the values returned ARE the
+    // resident column bytes. The old route ran a single-thread `(1,1,1)` "identity copy" kernel
+    // (resident -> a fresh device buffer) and THEN D2H'd that buffer — a redundant device->device
+    // copy (2x memory traffic) behind a per-call `cuModuleLoadData` (re-JIT) + two `cuMemAlloc`. We
+    // drop the kernel entirely and D2H the resident column straight into the host result on a pooled
+    // private stream: `cu_memcpy_dtoh_async` keeps the copy OFF the synchronizing null stream, and
+    // `launch_on_pooled_stream` event-times it (telemetry), covering-syncs, and drains the stream
+    // before any error propagates. Blocking fallback for drivers lacking the async symbol. Net: 1x
+    // traffic, no kernel, no JIT, no output alloc; the public signature and callers are unchanged.
+    let end_offset = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if end_offset > resident.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            end_offset as usize,
+        ));
+    }
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let len = usize::try_from(row_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let copy_bytes = len
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let src = resident
+        .device_ptr()
+        .checked_add(byte_offset)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut values = vec![0_i32; len];
+    let dst = values.as_mut_ptr().cast::<c_void>();
+
+    if let Some(dtoh_async) = resident.primary().cu_memcpy_dtoh_async {
+        // Whole-column D2H staged on a pooled private stream. `dst` is a raw pointer into `values`
+        // (no live borrow); the helper covering-syncs before it returns, so the GPU copy completes
+        // before `values` is read below — no use-after-free, no observation of partial data.
+        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+            dtoh_async(dst, src, copy_bytes, stream)
+        })?;
+    } else {
+        // Old-driver fallback (async D2H symbol absent): one blocking copy.
+        let cu_memcpy_dtoh = unsafe {
+            resident
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        check_cuda(unsafe { cu_memcpy_dtoh(dst, src, copy_bytes) })?;
+    }
+    Ok(values)
+}
+
+/// Single-thread `(1,1,1)` serial identity-copy projection — retained ONLY (under `#[cfg(test)]`)
+/// as the on-GPU A/B parity + perf baseline for the P2-M2 kernel-less project migration. The
+/// production route is the kernel-less `launch_cuda_resident_i32_project` (a direct pooled-stream
+/// D2H of the resident column); this is the previously-shipped device->device copy kernel kept as a
+/// device-side reference oracle (no CPU operator re-implementation).
+#[cfg(test)]
+fn launch_cuda_resident_i32_project_serial(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_count: u64,
+) -> Result<Vec<i32>, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
@@ -13493,6 +13561,100 @@ mod tests {
             largest_parallel_ms < largest_serial_ms,
             "parallel kernel ({largest_parallel_ms:.3} ms) did not beat the serial (1,1,1) \
              kernel ({largest_serial_ms:.3} ms) on the largest table — milestone premise unmet"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_kernelless_i32_project_matches_serial_and_wins_on_large_tables() {
+        // P2-M2 — project migration parity + perf gate (GPU-native oracle).
+        //
+        // Projecting a resident int4 column is a pure column read: `launch_cuda_resident_i32_project`
+        // dropped its redundant single-thread `(1,1,1)` device->device "identity copy" kernel and now
+        // D2Hs the resident column straight to the host on a pooled private stream. Mirroring the
+        // compare-count gate, this A/Bs the kernel-less route against the retained serial kernel ON
+        // THE GPU (no CPU oracle): it hard-asserts the kernel-less result EQUALS the serial-kernel
+        // result at every size (and that both round-trip the source column), and that the kernel-less
+        // route beats the serial `(1,1,1)` copy kernel on the largest table.
+        use std::time::Instant;
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let sizes: [u64; 6] = [1, 257, 4_096, 65_536, 1 << 20, 1 << 24];
+        println!("p2_m2_project: value[i] = i % 7");
+        println!("| rows | serial ms | kernel-less ms | speedup |");
+        println!("|---:|---:|---:|---:|");
+
+        let mut largest_serial_ms = 0.0_f64;
+        let mut largest_kernelless_ms = 0.0_f64;
+        for &n in &sizes {
+            let values: Vec<i32> = (0..n).map(|i| (i % 7) as i32).collect();
+            // SAFETY: `i32` is POD; viewing the Vec as native (little-endian) bytes matches the
+            // resident column layout, and `values` outlives the retain copy.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let allocated = std::mem::size_of::<u64>() as u64 + column_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: std::mem::size_of::<u64>() as u64,
+                            bytes: column_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident column");
+            let offset = std::mem::size_of::<u64>() as u64;
+
+            // Parity: kernel-less D2H == serial kernel (GPU-vs-GPU; the serial reference is the
+            // previously-shipped kernel). Both must also round-trip the source column.
+            let serial = launch_cuda_resident_i32_project_serial(&resident, offset, n)
+                .expect("serial project");
+            let kernelless = resident
+                .project_i32_from_payload(offset, n)
+                .expect("kernel-less project");
+            assert_eq!(
+                serial, values,
+                "serial project != source column at rows={n}"
+            );
+            assert_eq!(
+                kernelless, serial,
+                "kernel-less project != serial at rows={n}"
+            );
+
+            // Timing: best-of-3 latency, like the equal/compare_count gates.
+            let mut serial_ms = f64::MAX;
+            let mut kernelless_ms = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                launch_cuda_resident_i32_project_serial(&resident, offset, n).unwrap();
+                serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                let t = Instant::now();
+                resident.project_i32_from_payload(offset, n).unwrap();
+                kernelless_ms = kernelless_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let speedup = if kernelless_ms > 0.0 {
+                serial_ms / kernelless_ms
+            } else {
+                0.0
+            };
+            println!("| {n} | {serial_ms:.3} | {kernelless_ms:.3} | {speedup:.1}x |");
+            largest_serial_ms = serial_ms;
+            largest_kernelless_ms = kernelless_ms;
+        }
+
+        assert!(
+            largest_kernelless_ms < largest_serial_ms,
+            "kernel-less project ({largest_kernelless_ms:.3} ms) did not beat the serial (1,1,1) \
+             copy kernel ({largest_serial_ms:.3} ms) on the largest table — milestone premise unmet"
         );
     }
 }

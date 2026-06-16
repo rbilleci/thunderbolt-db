@@ -23548,10 +23548,11 @@ impl Engine {
             .project_i32_from_payload(projection_offset, row_count)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let elapsed = started.elapsed();
+        // Kernel-less projection D2Hs only the i32 column (no device `out_count` readback), so the
+        // d2h estimate is exactly the value bytes — drop the old `+ size_of::<u64>()` count term.
         let result_d2h_bytes = values
             .len()
             .checked_mul(std::mem::size_of::<i32>())
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
             .and_then(|bytes| u64::try_from(bytes).ok())
             .unwrap_or(u64::MAX);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
