@@ -35,13 +35,7 @@ pub(crate) enum ResidentBinaryOp {
     Le,
     Gt,
     Ge,
-    // The SQL mapper produces And/Or from `BoolExpr` in the next slice; until then a non-test lib
-    // build sees them only pattern-matched (the interpreter already lowers them), never constructed.
-    // The programmatic boolean GPU test constructs them today. Drop these allows when the BoolExpr
-    // mapper lands.
-    #[allow(dead_code)]
     And,
-    #[allow(dead_code)]
     Or,
 }
 

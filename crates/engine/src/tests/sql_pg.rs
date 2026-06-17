@@ -150,7 +150,7 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     assert_sql_err_contains(&e, "SELECT count(*) FROM t WHERE a > 0", "plain columns"); // aggregate
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 0 ORDER BY a", "ORDER BY"); // ordering
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a / b > 1", "/"); // unsupported operator
-    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 1 AND b < 2", "AND"); // BoolExpr (slice 4)
+    assert_sql_err_contains(&e, "SELECT a FROM t WHERE NOT a > 1", "NOT"); // unary NOT (AND/OR are ok)
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 'x'", "int4 literals"); // non-int literal
     // A column qualifier that does not name the FROM relation is PG's "missing FROM-clause entry",
     // never silently resolved to t.a (load-bearing once joins make same-named columns ambiguous).
@@ -250,5 +250,71 @@ fn gpu_execute_resident_expr_select_sql_runs_predicate_from_sql_text() {
     assert_eq!(
         aliased.rows, compared_expected,
         "alias-qualified `x.a > 500` must equal `a > 500`"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_boolean_predicates_from_sql_text() {
+    // AND / OR from SQL text -> BoolExpr -> Binary{And/Or} -> the mask VM on the GPU. Closed-form
+    // oracle: a[i]=b[i]=i, so each comparison is a contiguous range and the boolean combinator is set
+    // algebra on those ranges.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+
+    const N: i32 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // a>200 AND b<400 => i in (200,400) = [201,400). Differs from `a>200` alone ([201,600)), so a pass
+    // proves the b<400 conjunct was AND-combined, not dropped.
+    let and_rows = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a > 200 AND b < 400")
+        .expect("SQL `a>200 AND b<400` -> GPU");
+    let and_expected: Vec<Vec<SqlValue>> = (201..400).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(and_rows.rows, and_expected, "a>200 AND b<400 => [201, 400)");
+    assert_eq!(and_rows.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(and_rows.fallback_reason, None);
+
+    // a<100 OR b>500 => [0,100) U [501,600).
+    let or_rows = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a < 100 OR b > 500")
+        .expect("SQL `a<100 OR b>500` -> GPU");
+    let mut or_expected: Vec<Vec<SqlValue>> = (0..100).map(|i| vec![SqlValue::Int4(i)]).collect();
+    or_expected.extend((501..N).map(|i| vec![SqlValue::Int4(i)]));
+    assert_eq!(or_rows.rows, or_expected, "a<100 OR b>500 => [0,100) U [501,600)");
+
+    // A 3-way chain: libpg_query flattens `a AND a AND b` into one BoolExpr with 3 args, so the
+    // left-fold must handle N>2. a>100 AND a<500 AND b>300 => i in (300,500) = [301,500).
+    let chain = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a > 100 AND a < 500 AND b > 300")
+        .expect("SQL 3-way AND chain -> GPU");
+    let chain_expected: Vec<Vec<SqlValue>> = (301..500).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(
+        chain.rows, chain_expected,
+        "a>100 AND a<500 AND b>300 => [301, 500) (N-arg BoolExpr left-folded)"
+    );
+
+    // Nested mixed AND/OR with NO parens: AND binds tighter than OR, so libpg_query yields
+    // OR(a<50, AND(a>200, b<400)) and the mapper must preserve that nesting. => [0,50) U [201,400).
+    let nested = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a < 50 OR a > 200 AND b < 400")
+        .expect("SQL nested AND/OR -> GPU");
+    let mut nested_expected: Vec<Vec<SqlValue>> = (0..50).map(|i| vec![SqlValue::Int4(i)]).collect();
+    nested_expected.extend((201..400).map(|i| vec![SqlValue::Int4(i)]));
+    assert_eq!(
+        nested.rows, nested_expected,
+        "a<50 OR a>200 AND b<400 => [0,50) U [201,400) (AND precedence preserved)"
     );
 }

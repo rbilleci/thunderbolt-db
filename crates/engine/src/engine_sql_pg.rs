@@ -10,7 +10,9 @@
 
 use super::*;
 
-use pg_query::protobuf::{a_const, AExpr, AExprKind, ColumnRef, Node, SelectStmt, SetOperation};
+use pg_query::protobuf::{
+    a_const, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, Node, SelectStmt, SetOperation,
+};
 use pg_query::NodeEnum;
 
 use crate::engine_expr::{ResidentBinaryOp, ResidentExpr};
@@ -213,13 +215,45 @@ fn map_predicate_node(
             )),
         },
         NodeEnum::AExpr(a_expr) => map_a_expr(a_expr, table, qualifier),
-        NodeEnum::BoolExpr(_) => Err(sql_pg_error(
-            "AND / OR / NOT predicates are not on the Expr path yet".to_string(),
-        )),
+        NodeEnum::BoolExpr(bool_expr) => map_bool_expr(bool_expr, table, qualifier),
         _ => Err(sql_pg_error(
             "unsupported expression node for the general GPU executor".to_string(),
         )),
     }
+}
+
+/// Map a `BoolExpr` (`AND` / `OR` / `NOT`) to the general IR. `AND` / `OR` left-fold their operands
+/// into a binary tree of `Binary{And/Or}` — libpg_query flattens `a AND b AND c` into one BoolExpr
+/// with N args, so a chain becomes `((a AND b) AND c)`. `NOT` (a unary boolean) has no IR node yet and
+/// is a hard error.
+fn map_bool_expr(
+    bool_expr: &BoolExpr,
+    table: &RelationalTable,
+    qualifier: &str,
+) -> Result<ResidentExpr, ExecuteError> {
+    let op = if bool_expr.boolop == BoolExprType::AndExpr as i32 {
+        ResidentBinaryOp::And
+    } else if bool_expr.boolop == BoolExprType::OrExpr as i32 {
+        ResidentBinaryOp::Or
+    } else {
+        // NOT_EXPR (or an unexpected/Undefined boolop): unary NOT is not on the Expr path yet.
+        return Err(sql_pg_error(
+            "NOT predicates are not on the Expr path yet".to_string(),
+        ));
+    };
+    let mut args = bool_expr.args.iter();
+    let first = args
+        .next()
+        .ok_or_else(|| sql_pg_error("boolean expression has no operands".to_string()))?;
+    let mut folded = map_predicate_node(first, table, qualifier)?;
+    for arg in args {
+        folded = ResidentExpr::Binary {
+            op,
+            lhs: Box::new(folded),
+            rhs: Box::new(map_predicate_node(arg, table, qualifier)?),
+        };
+    }
+    Ok(folded)
 }
 
 /// Map an `A_Expr` (a binary-operator expression) to a `ResidentExpr::Binary`. Only `AEXPR_OP` (a
