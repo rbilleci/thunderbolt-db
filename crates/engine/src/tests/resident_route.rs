@@ -109,10 +109,12 @@ fn p8_default_resident_route_executes_accepted_shapes() {
         "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
     )
     .unwrap();
-    // Bucket sums are kept distinct (b1=30, b2=40) so `ORDER BY sum DESC LIMIT 1`
-    // below is unambiguous. The GPU sum-order path has no deterministic tie-break
-    // for equal sums yet (tracked §9.5 follow-up: "sum-tie 2-key gather"), so a tie
-    // would make the cross-path parity check non-deterministic/flaky.
+    // Bucket sums are kept distinct (b1=30, b2=40) so `ORDER BY sum DESC LIMIT 1` is unambiguous.
+    // The RESIDENT grouped path now breaks equal-SUM ties deterministically by group ASC (host
+    // finalization in `launch_cuda_resident_i32_grouped_stats`; covered by the execution test
+    // `gpu_grouped_stats_ordered_by_sum_breaks_ties_by_group`). The cuda-driver-probe path used by
+    // `expected` here still breaks SUM ties differently, so a tie would fail this CROSS-PATH parity
+    // check — making the paths share one tie-break convention is a separate follow-up.
     e.execute_text(
             2,
             "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 40, 'alpine')",

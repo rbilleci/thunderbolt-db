@@ -7475,14 +7475,42 @@ compact_done:
                 )
             };
             let full_perm = match order.column {
-                GroupedI64SortColumn::Sum => launch_cuda_resident_i64_order_by_limit(
-                    resident,
-                    out_sums.ptr,
-                    output_count,
-                    order.descending,
-                    0,
-                    None,
-                )?,
+                // SUM is a full i64, so (unlike count/min/max/group) the i32 group can't be
+                // packed into the same composite sort key. Order the M groups by
+                // (sum <dir>, group ASC) on the host — the same host tier that filters HAVING
+                // survivors and windows LIMIT/OFFSET below — so equal sums break deterministically
+                // by group instead of by the nondeterministic hash-emission order. The GPU still
+                // does the O(rows) grouped aggregate; only the small M-group result is ordered
+                // here. (Tracked follow-up: a fully on-device two-key (sum, group) sort.)
+                GroupedI64SortColumn::Sum => {
+                    let mut sums = vec![0_i64; output_len];
+                    let mut group_keys = vec![0_i32; output_len];
+                    check_cuda(unsafe {
+                        cu_memcpy_dtoh(
+                            sums.as_mut_ptr().cast::<c_void>(),
+                            out_sums.ptr,
+                            output_len * std::mem::size_of::<i64>(),
+                        )
+                    })?;
+                    check_cuda(unsafe {
+                        cu_memcpy_dtoh(
+                            group_keys.as_mut_ptr().cast::<c_void>(),
+                            out_groups.ptr,
+                            output_len * std::mem::size_of::<i32>(),
+                        )
+                    })?;
+                    let mut perm: Vec<u32> = (0..output_len as u32).collect();
+                    perm.sort_by(|&a, &b| {
+                        let (a, b) = (a as usize, b as usize);
+                        let primary = if order.descending {
+                            sums[b].cmp(&sums[a])
+                        } else {
+                            sums[a].cmp(&sums[b])
+                        };
+                        primary.then_with(|| group_keys[a].cmp(&group_keys[b]))
+                    });
+                    perm
+                }
                 GroupedI64SortColumn::Count => pack_then_sort(
                     include_bytes!("pack.ptx"),
                     c"gpu_db_pack_count_group",
@@ -17714,6 +17742,88 @@ mod tests {
             groups_of(order(true, Some(2))),
             vec![1, 2],
             "count DESC LIMIT 2"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_grouped_stats_ordered_by_sum_breaks_ties_by_group() {
+        // §9.5 follow-up — SUM ORDER BY breaks equal-sum ties by GROUP ASCENDING, deterministically.
+        // SUM is a full i64 so it can't pack the group into a composite key (as count/min/max/group
+        // do); the M-group result is ordered on the host by (sum <dir>, group ASC). CONSTRUCTION:
+        // groups 1 and 2 both sum to 50 (tied at the TOP), group 3 sums to 10 — so the order is fully
+        // determined, and `... ORDER BY sum DESC LIMIT 1` is deterministically group 1 (was the flake).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let retain = |groups: &[i32], values: &[i32]| {
+            let n = groups.len() as u64;
+            // SAFETY: i32 POD; native bytes; the columns outlive the synchronous retain copy.
+            let group_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(groups.as_ptr().cast::<u8>(), groups.len() * 4)
+            };
+            let value_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let hsize = std::mem::size_of::<u64>() as u64;
+            let group_off = hsize;
+            let value_off = hsize + group_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    hsize + group_bytes.len() as u64 + value_bytes.len() as u64,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: group_off,
+                            bytes: group_bytes,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: value_off,
+                            bytes: value_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident columns");
+            (resident, group_off, value_off)
+        };
+
+        // groups 1,1,2,3 with values 25,25,50,10 -> sums: g1=50, g2=50 (tied), g3=10.
+        let groups = vec![1_i32, 1, 2, 3];
+        let values = vec![25_i32, 25, 50, 10];
+        let n = groups.len() as u64;
+        let (resident, go, vo) = retain(&groups, &values);
+        let order = |descending, limit| GroupedI64Order {
+            column: GroupedI64SortColumn::Sum,
+            descending,
+            offset: 0,
+            limit,
+        };
+        let groups_of = |o| {
+            resident
+                .grouped_stats_i32_ordered_from_payload(go, vo, n, o, None)
+                .expect("ordered grouped")
+                .0
+                .iter()
+                .map(|g| g.group)
+                .collect::<Vec<_>>()
+        };
+        // sum DESC: g1=50 & g2=50 tie -> GROUP ASC (1,2), then g3=10.
+        assert_eq!(
+            groups_of(order(true, None)),
+            vec![1, 2, 3],
+            "sum DESC tie->group asc"
+        );
+        // sum ASC: g3=10 first, then the sum-50 tie group-asc (1,2).
+        assert_eq!(groups_of(order(false, None)), vec![3, 1, 2], "sum ASC");
+        // sum DESC LIMIT 1: the tied TOP resolves deterministically to group 1 (group ASC) — not the
+        // nondeterministic hash-emission order that previously flaked the cross-path parity test.
+        assert_eq!(
+            groups_of(order(true, Some(1))),
+            vec![1],
+            "sum DESC LIMIT 1 tie->group 1"
         );
     }
 
