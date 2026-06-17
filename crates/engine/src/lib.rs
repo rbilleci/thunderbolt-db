@@ -21968,19 +21968,31 @@ impl Engine {
             ))
         })?;
         // §9.5/S5a.3 slice 1: ORDER BY the SUM aggregate (no HAVING) runs on the GPU over the
-        // resident output — out_sums argsorted in place + windowed (no re-upload), matching the host
-        // sum-then-group order (sums distinct here; the general group tie-break + count/min/max/group
-        // ORDER BY + GPU HAVING are later slices). AVG (Numeric) and the rest stay on the host path.
+        // resident output — argsorted in place + windowed (no re-upload). SUM (distinct) sorts
+        // out_sums directly; COUNT ties, so it packs (count, group) into a composite key carrying the
+        // host's group-ascending tie-break (counts must fit u32 -> row_count <= u32::MAX). min/max/
+        // group ORDER BY + GPU HAVING are later slices; AVG (Numeric) and the rest stay on the host.
         let gpu_order: Option<GroupedI64Order> = if select.having_groups.is_empty() {
             select.order_by.as_ref().and_then(|order| {
                 let by_aggregate = select_is_aggregate_result_column(select, &order.column);
+                let limit = select.limit.map(|limit| limit as u64);
                 match &select.projection {
                     SelectProjection::GroupedSum { .. } if by_aggregate => Some(GroupedI64Order {
                         column: GroupedI64SortColumn::Sum,
                         descending: order.descending,
                         offset: 0,
-                        limit: select.limit.map(|limit| limit as u64),
+                        limit,
                     }),
+                    SelectProjection::GroupedCount { .. }
+                        if by_aggregate && row_count <= u64::from(u32::MAX) =>
+                    {
+                        Some(GroupedI64Order {
+                            column: GroupedI64SortColumn::Count,
+                            descending: order.descending,
+                            offset: 0,
+                            limit,
+                        })
+                    }
                     _ => None,
                 }
             })

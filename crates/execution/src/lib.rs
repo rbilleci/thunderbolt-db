@@ -7423,18 +7423,44 @@ compact_done:
     // argsorted directly as i64; the result is the windowed list of compact-order group indices.
     let ordered_indices: Option<Vec<u32>> = match order {
         Some(order) if output_len > 0 => {
-            let key_ptr = match order.column {
-                GroupedI64SortColumn::Count => out_counts.ptr,
-                GroupedI64SortColumn::Sum => out_sums.ptr,
+            let perm = match order.column {
+                // Sum: distinct in practice; argsort out_sums directly (i64). A general group
+                // tie-break for sum-ties (a 2-key gather) is a tracked follow-up.
+                GroupedI64SortColumn::Sum => launch_cuda_resident_i64_order_by_limit(
+                    resident,
+                    out_sums.ptr,
+                    output_count,
+                    order.descending,
+                    order.offset,
+                    order.limit,
+                )?,
+                // Count ties, so pack (count, group) into one composite i64 key carrying the group
+                // tie-break, then ASCENDING argsort (the direction is baked into the composite).
+                GroupedI64SortColumn::Count => {
+                    let composite = primary.lease_device_buffer(
+                        output_len
+                            .checked_mul(std::mem::size_of::<i64>())
+                            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+                    )?;
+                    launch_cuda_resident_pack_count_group(
+                        resident,
+                        out_counts.ptr,
+                        out_groups.ptr,
+                        output_count,
+                        order.descending,
+                        composite.ptr,
+                    )?;
+                    launch_cuda_resident_i64_order_by_limit(
+                        resident,
+                        composite.ptr,
+                        output_count,
+                        false,
+                        order.offset,
+                        order.limit,
+                    )?
+                }
             };
-            Some(launch_cuda_resident_i64_order_by_limit(
-                resident,
-                key_ptr,
-                output_count,
-                order.descending,
-                order.offset,
-                order.limit,
-            )?)
+            Some(perm)
         }
         Some(_) => Some(Vec::new()),
         None => None,
@@ -8043,6 +8069,115 @@ done:
             max,
         })
         .collect())
+}
+
+/// §9.5/S5a.3 slice 2 — pack (count u64≤u32, group i32) into one i64 sort key per group so that an
+/// ASCENDING argsort reproduces the host "ORDER BY count <dir>, group ASC tie-break" order: the
+/// direction is baked into the high 32 bits (DESC => 0xFFFFFFFF-count), the group is u32-biased into
+/// the low 32 bits (ascending), and the composite is XOR 0x8000…0 so signed-i64 sort == unsigned sort.
+/// Writes `out_key_device_ptr[0..n]` (i64). Caller must ensure counts ≤ u32::MAX (row_count ≤ u32::MAX).
+fn launch_cuda_resident_pack_count_group(
+    resident: &CudaResidentDeviceMemory,
+    counts_device_ptr: u64,
+    groups_device_ptr: u64,
+    n: u64,
+    descending: bool,
+    out_key_device_ptr: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("pack.ptx");
+
+    if n == 0 {
+        return Ok(());
+    }
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_pack_count_group", &ptx)?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let stream = lease
+        .pooled
+        .as_ref()
+        .expect("pooled stream just set")
+        .stream;
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut counts_arg = counts_device_ptr;
+    let mut groups_arg = groups_device_ptr;
+    let mut n_arg = n;
+    let mut desc_arg = u32::from(descending);
+    let mut outk_arg = out_key_device_ptr;
+    let mut args = [
+        (&mut counts_arg as *mut u64).cast::<c_void>(),
+        (&mut groups_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut desc_arg as *mut u32).cast::<c_void>(),
+        (&mut outk_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    resident.record_kernel_event_elapsed_us(None);
+    drop(lease);
+    Ok(())
 }
 
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
@@ -17221,6 +17356,85 @@ mod tests {
         assert_eq!(
             (g.group, g.count, g.sum, g.min, g.max),
             (3, 1, 100, 100, 100)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_grouped_stats_ordered_by_count_breaks_ties_by_group() {
+        // P2 §9.5/S5a.3 slice 2 — count ORDER BY breaks ties by GROUP ASCENDING (the pack's composite
+        // key), matching the host. CONSTRUCTION: groups 1, 2, 5 all have count 2 (tied), group 3 has
+        // count 1 — so the order is fully determined by the count + the group tie-break.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let retain = |groups: &[i32], values: &[i32]| {
+            let n = groups.len() as u64;
+            // SAFETY: i32 POD; native bytes; the columns outlive the synchronous retain copy.
+            let group_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(groups.as_ptr().cast::<u8>(), groups.len() * 4)
+            };
+            let value_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let hsize = std::mem::size_of::<u64>() as u64;
+            let group_off = hsize;
+            let value_off = hsize + group_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    hsize + group_bytes.len() as u64 + value_bytes.len() as u64,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: group_off,
+                            bytes: group_bytes,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: value_off,
+                            bytes: value_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident columns");
+            (resident, group_off, value_off)
+        };
+
+        // groups 1,1,2,2,3,5,5 -> counts: g1=2, g2=2, g3=1, g5=2.
+        let groups = vec![1_i32, 1, 2, 2, 3, 5, 5];
+        let values = vec![1_i32, 1, 2, 2, 3, 5, 5];
+        let n = groups.len() as u64;
+        let (resident, go, vo) = retain(&groups, &values);
+        let order = |descending, limit| GroupedI64Order {
+            column: GroupedI64SortColumn::Count,
+            descending,
+            offset: 0,
+            limit,
+        };
+        let groups_of = |o| {
+            resident
+                .grouped_stats_i32_ordered_from_payload(go, vo, n, o)
+                .expect("ordered grouped")
+                .0
+                .iter()
+                .map(|g| g.group)
+                .collect::<Vec<_>>()
+        };
+        // count DESC: the three count-2 groups tie -> GROUP ASC (1,2,5), then count-1 group 3.
+        assert_eq!(
+            groups_of(order(true, None)),
+            vec![1, 2, 5, 3],
+            "count DESC tie->group asc"
+        );
+        // count ASC: count-1 group 3 first, then count-2 group-asc (1,2,5).
+        assert_eq!(groups_of(order(false, None)), vec![3, 1, 2, 5], "count ASC");
+        // LIMIT windows the tied top: top-2 by count desc = groups 1, 2.
+        assert_eq!(
+            groups_of(order(true, Some(2))),
+            vec![1, 2],
+            "count DESC LIMIT 2"
         );
     }
 }
