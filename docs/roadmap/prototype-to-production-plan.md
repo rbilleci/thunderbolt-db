@@ -88,9 +88,9 @@ the GPU shared-context + stream-pool substrate, batched submission). With that
 substrate in place, the CPU-serialization wall is no longer what stands between
 the engine and its targets — the **shallow GPU execution layer is**. Per the
 GPU-native charter (`docs/architecture/00-gpu-native-principles.md`), building the
-**real parallel GPU execution engine — parallel kernels, a plan→kernel compiler
-over all column types, first-class GPU joins, and a GPU-resident catalog — is now
-THE priority thrust, not deferred work.** PG-compatibility (types, catalog) and
+**real parallel GPU execution engine — parallel kernels, a general `Expr`/operator
+executor (Charter rule 2; not a catalog of hand-coded shapes), first-class GPU
+joins, and a GPU-resident catalog — is now THE priority thrust, not deferred work.** PG-compatibility (types, catalog) and
 durability are sequenced as **enablers** of that engine (they feed typed GPU
 columns and the GPU-resident catalog), not as gates ahead of it. See the
 "GPU-native priority spine" (§1.4) and `docs/roadmap/gpu-native-oltp-roadmap.md`
@@ -129,8 +129,8 @@ evaluated is now built (reader/writer split, concurrent dispatch, async ingress,
 GPU shared-context/stream pool, batched submission — all committed on this
 branch). The first job is therefore no longer to build the read substrate; it is
 to **build the real GPU execution engine on top of it** — parallel kernels, a
-stream-pool/async/pinned device path, a plan→kernel compiler over all column
-types, first-class **GPU joins**, a **GPU-resident catalog**, and the GPU write
+stream-pool/async/pinned device path, a general `Expr`/operator executor (Charter
+rule 2), first-class **GPU joins**, a **GPU-resident catalog**, and the GPU write
 path — with PG-compat types/catalog and durability sequenced as enablers of that
 engine. (The Phase-5 harness work is the parallel prerequisite for *trusting* the
 resulting numbers, not a gate ahead of the engine.)
@@ -150,8 +150,23 @@ remaining program is:
    1. **Parallel kernels** (grid/block sizing, strided scans, block/grid
       reductions) replacing the `(1,1,1)` serial loops.
    2. **Stream pool + async H2D/D2H + pinned memory** so read jobs overlap.
-   3. **Plan→kernel compiler over ALL column types** (not just `int4`) —
-      retire the ~30 per-shape methods; typed columns go GPU-resident.
+   3. **General GPU executor (Charter rule 2) — a general `Expr`/operator
+      interpreter, NOT a catalog of hand-coded query shapes.** The GPU evaluates
+      *arbitrary* SQL (scalar-expression trees + relational-operator DAGs) via a
+      device bytecode VM over composable primitive kernels; the tuned per-shape
+      fused kernels are kept as **peephole fast-paths UNDER it**, so this *retires*
+      the ~30 `_with_resident_device_memory_probe` methods rather than adding more
+      of them. **Built for any int4 `WHERE` predicate** — arbitrary arithmetic +
+      comparisons + col-vs-col + AND/OR, filter **and** row materialization on the
+      device (`7b19e7ef`..`01e0c4e2`, exec/engine GPU green). **NEXT: SQL→`Expr`
+      binding via `libpg_query`** (user-decided 2026-06-17 — parse real SQL into the
+      IR and route it to the general path), then types beyond int4 and operators
+      beyond filter+project (aggregates, joins=step 1.4, grouped, sort). Design:
+      `docs/architecture/17-general-gpu-executor.md`; SQL→Expr handoff:
+      `18-sql-to-expr-handoff.md`. *(Previously framed as a "plan→kernel compiler
+      over all column types"; the enumerate-shapes reading of that phrase was the
+      anti-pattern Charter rule 2 exists to correct — grow by node/type/operator,
+      never by adding a query-shape method.)*
    4. **GPU join operator** — a first-class partitioned/hash join over
       GPU-resident relations (covers the catalog `\d`/ORM multi-relation joins
       and bounded OLTP joins). **Never a CPU nested-loop.**
@@ -307,8 +322,12 @@ for *any* of the targets; they are the critical path.
    correctness, concurrent writes.*
 4. **No commit durability.** Commit-path WAL is a no-op; replication never blocks on
    durable acks. *Blocks: RPO 0, the banking premise.*
-5. **Benchmark-shaped execution.** ~30 hand-coded int4-only query shapes instead of
-   a plan→kernel compiler; no joins. *Blocks: generality.*
+5. **General execution — in progress (Charter rule 2).** The general GPU executor
+   (an `Expr`/operator interpreter, not a shape catalog) now runs any int4 `WHERE`
+   predicate on the device; the ~30 hand-coded shape methods are being retired into
+   peephole fast-paths under it. Remaining generality gaps: SQL→Expr binding
+   (`libpg_query`, NEXT), types beyond int4, operators beyond filter+project
+   (aggregates/joins/grouped/sort). *Blocks: generality — closing.*
 6. **Two-type system.** No NUMERIC/money, no temporal/uuid/bool/etc. *Blocks: real
    OLTP and banking outright.*
 7. **Shallow GPU.** Single-thread kernels, no streams/pinned memory, global stop-the-
@@ -328,7 +347,7 @@ for *any* of the targets; they are the critical path.
 | P99 < 1 ms / P99.9 < 5 ms | Tail-at-load instrumentation (P5) + bounded admission/fairness runtime (P1/P5) — currently unmeasured |
 | 100k–1M connections | Async ingress + session admission / effective-session-counting (P1/P5); thread-per-conn cannot reach this |
 | ACID / RPO 0 (banking) | Real MVCC (P1/P3), fsync WAL on commit + group commit (P1), synchronous durable replication (P4) |
-| General SQL | pg_query parser + joins/subqueries (P3), NUMERIC + core types (P3), plan→kernel compiler (P2) |
+| General SQL | General GPU executor — `Expr`/operator interpreter, Charter rule 2 (P2; built for int4 `WHERE`) + `libpg_query` SQL→Expr binding (NEXT) + types beyond int4 + joins/subqueries (P3) |
 
 ---
 
@@ -581,13 +600,18 @@ debt, never the hot path). The authoritative milestone track is
 - **Stream pool + async copies + pinned memory.** Real `cuStream*`, async H2D/D2H,
   `cuMemHostAlloc` staging, so submit/complete actually overlap. Measure D2H from
   real copy sizes (not row/col estimates) and time uniformly with `cuEventElapsedTime`.
-- **Plan → kernel compiler over ALL column types.** Retire the ~30 per-shape
-  `_with_resident_device_memory_probe` methods and the `String` shape tags; build a
-  physical-plan → operator-pipeline compiler over **arbitrary column types (not just
-  `int4`)** — composable filters/projections/aggregates, and the roadmap route
-  classes (entity, page, bounded join, computed detail). This is where the typed
-  columns of Phase 3 become **GPU-resident** (the GPU-native payoff for the type
-  system), not where they stay on the CPU path.
+- **General GPU executor (Charter rule 2), not a shape catalog.** Build a general
+  `Expr`/operator interpreter — a device bytecode VM over composable primitive
+  kernels — that evaluates *arbitrary* SQL, and retire the ~30 per-shape
+  `_with_resident_device_memory_probe` methods + `String` shape tags by keeping the
+  tuned fused kernels as **peephole fast-paths under it** (dispatched by IR
+  pattern-match, never by a shape name). **Status:** built for any int4 `WHERE`
+  predicate (arithmetic + comparisons + col-vs-col + AND/OR), filter + materialization
+  on-device (`docs/architecture/17-general-gpu-executor.md`, `7b19e7ef`..`01e0c4e2`).
+  Grow it by **node / type / operator** — composable filters/projections/aggregates
+  over arbitrary column types (the GPU-native payoff for Phase-3 typed columns) — and
+  bind real SQL to it via `libpg_query` (`18-sql-to-expr-handoff.md`). Adding "one
+  more query-shape method" is the anti-pattern this step exists to end.
 - **GPU join operator (first-class milestone).** Build a **real GPU join** —
   partitioned/hash join over GPU-resident relations (build a hash table on the
   keyed/smaller side on-device, probe the other side in parallel), not a CPU
@@ -620,8 +644,8 @@ debt, never the hot path). The authoritative milestone track is
 ### Phase 3 — PostgreSQL compatibility for real OLTP (ENABLER of the GPU engine)
 **Goal:** run real banking/e-commerce SQL with correct types. Phase 3 is an
 **enabler of the Phase-2 GPU engine** (§1.4), not a gate ahead of it: its type
-system exists so typed columns become GPU-resident (Phase 2's plan→kernel
-compiler), and its catalog/joins exist so they can be made GPU-resident / run on
+system exists so typed columns become GPU-resident (Phase 2's general GPU
+executor), and its catalog/joins exist so they can be made GPU-resident / run on
 the GPU join operator (Phase 2). The CPU implementations Phase 3 lands first are
 **stepping-stones / parity-reference, tracked as GPU-parity debt** — the
 GPU-native target is GPU-resident, never the CPU path.
@@ -635,7 +659,7 @@ GPU-native target is GPU-resident, never the CPU path.
   `int2`, `bool`, `timestamp[tz]`, `date`, `uuid`, `bytea`, `float8`, `varchar`,
   `json/jsonb` — each with parse + storage + text **and binary** wire codecs + OIDs.
   **GPU-native target:** these typed columns become **GPU-resident** in Phase 2 (the
-  plan→kernel compiler over all types); the Phase-3 CPU type path is the
+  general GPU executor (Charter rule 2)); the Phase-3 CPU type path is the
   stepping-stone, the GPU-resident representation (per Phase 8) is the product.
 - **True server-side parameter binding** (stop string substitution); support NULL
   params and binary format.
@@ -800,7 +824,7 @@ one-off choices, and it is where every type **graduates to a GPU-resident route*
   [[gpu-phase3]] M1 follow-ups).
 - **GPU-representation optimization (every type goes GPU-resident; CPU handling is tracked debt).**
   Per the GPU-native charter, **all** column types target GPU-resident execution — this is part of
-  building the engine (Phase 2's plan→kernel compiler over all types), not a separate CPU/GPU split by
+  building the engine (Phase 2's general GPU executor (Charter rule 2)), not a separate CPU/GPU split by
   design. Classify every type: (a) **fixed-width / alloc-free** (int2/4/8, float8, bool, the i128
   decimal, uuid (128-bit), date/timestamp (i32/i64)) go GPU-resident directly; (b) **variable-length**
   (text/varchar, json(b), bytea, the bignum-NUMERIC fallback) go GPU-resident via
@@ -1201,10 +1225,10 @@ explicit decision to finish the serial-kernel thrust before this).
 - **End state:** real GPU kernels — a between/range filter → row-indices kernel (mirror
   `equal_row_indices` with the `[lower,upper]` range test the count/stats routes already
   do on-device), and GPU text-prefix-filter + text-projection-filter kernels (or fold
-  into the plan→kernel compiler, §1.4 step 1.3). Text projection's necessary D2H of the
+  into the general GPU executor, §1.4 step 1.3). Text projection's necessary D2H of the
   payload bytes stays; only the per-row *filter/match* predicate moves to the GPU.
 - **Trigger:** after the serial-kernel thrust (between_stats ✅, grouped_stats), a
-  natural fit alongside §1.4 step 1.3 (plan→kernel compiler over all column types).
+  natural fit alongside §1.4 step 1.3 (general GPU executor (Charter rule 2)).
 - **Acceptance:** these routes execute their filter/match on the GPU (no CPU per-row
   predicate loop); CPU↔GPU parity tests green; any CPU path kept only as a
   `#[cfg(test)]` parity reference or a labeled bootstrap fallback, never the hot path.
@@ -1255,7 +1279,7 @@ as a radix sort that would sort the wrong key and be discarded.
     queries (then projection/DISTINCT ORDER BY) with the GPU operator.
   - **Benchmark deliverable:** adaptive latency across 100/1k/10k/100k/1M, confirming the
     dispatch picks the faster path and locating the crossover.
-  Companion to §1.4 step 1.3 (plan→kernel compiler) and §9.4 (CPU-execution routes).
+  Companion to §1.4 step 1.3 (general GPU executor) and §9.4 (CPU-execution routes).
 - **Acceptance:** ORDER BY/HAVING/LIMIT for resident grouped + projected queries execute on
   the GPU (no CPU per-result sort/filter on the hot path); CPU↔GPU parity tests green;
   d2h/telemetry assertions updated.
