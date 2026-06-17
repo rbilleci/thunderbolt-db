@@ -27,6 +27,7 @@ mod resident_probe; // resident-snapshot GPU probe execution
 mod resident_route; // p8 resident-route planning + partitioned probes
 mod snapshot_residency; // snapshot meta + residency invalidation
 mod sql_catalog; // numeric coercion, pg_catalog, GPU bridge, constraints
+mod sql_pg; // SQL -> ResidentExpr binding via libpg_query (general GPU executor, Charter rule 2)
 mod sql_dml; // relational SQL CRUD, COPY, ALTER COLUMN, sequences, matviews
 mod text_batching; // execute_text/read, batching, transactions, replication-role gating
 mod write_half; // SI ledger, active snapshots, concurrent DML, stage-0 replay

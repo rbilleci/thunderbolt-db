@@ -20,6 +20,10 @@ gpu_db_planner = { path = "../planner" }
 gpu_db_execution = { path = "../execution" }
 gpu_db_storage = { path = "../storage" }
 gpu_db_snapshot = { path = "../snapshot" }
+# libpg_query bindings (vendors + builds the real PostgreSQL parser as C): the
+# SQL->ResidentExpr binding for the general GPU executor (docs/architecture/18).
+# Heavy first build; isolated to this one crate (Charter rule 2, doc 18 §2.4).
+pg_query = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

@@ -1,0 +1,12 @@
+# The `pg_query` crate (libpg_query, the real PostgreSQL parser used for the
+# general GPU executor's SQL->Expr binding — docs/architecture/18) runs bindgen
+# (libclang) over the C headers at build time. This box ships `libclang` but not
+# clang's builtin resource headers, so libclang cannot find the compiler-provided
+# <stddef.h>; point it at gcc's internal include dir, which has it.
+#
+# Graceful elsewhere: clang silently ignores an extra/non-existent `-I` include
+# directory, so on a box that already has clang's resource headers (or a different
+# gcc version) this is a harmless no-op. Cargo's `[env]` does not override a value
+# already set in the real environment, so a developer can still override it.
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/lib/gcc/x86_64-linux-gnu/15/include"
