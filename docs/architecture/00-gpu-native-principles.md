@@ -6,16 +6,41 @@ technology, memory capacity, interconnects, and programming models are expected
 to keep improving, and the architecture commits to that bet — every relational
 capability is designed for the GPU first.
 
-> **Charter (the one rule future work must not violate).** The GPU executes the
-> whole relational data path — scans, filters, projections, aggregates, **joins**,
-> sorts, grouping — over GPU-resident columnar snapshots, **including the system
-> catalog**. The CPU is the host/control plane ONLY. There is no "hybrid
-> CPU–GPU" co-execution design and no permanent CPU fallback for hot relational
-> work. CPU relational execution exists solely as (a) reference semantics for
-> CPU↔GPU parity tests and (b) a temporary bootstrap scaffold for GPU-absent
-> dev/CI — both are tracked GPU-parity **debt** with a milestone, never product
-> direction and never the optimized hot path. If a design choice routes hot
-> relational work to the CPU as its answer, it is wrong by definition here.
+> **Charter (the rules future work must not violate).**
+>
+> **1 — The GPU executes the whole relational data path.** Scans, filters,
+> projections, aggregates, **joins**, sorts, grouping — over GPU-resident
+> columnar snapshots, **including the system catalog**. The CPU is the
+> host/control plane ONLY. There is no "hybrid CPU–GPU" co-execution design and
+> no permanent CPU fallback for hot relational work. CPU relational execution
+> exists solely as (a) reference semantics for CPU↔GPU parity tests and (b) a
+> temporary bootstrap scaffold for GPU-absent dev/CI — both are tracked
+> GPU-parity **debt** with a milestone, never product direction and never the
+> optimized hot path.
+>
+> **2 — The GPU executor is GENERAL-PURPOSE.** It evaluates *arbitrary* SQL —
+> arbitrary scalar-expression trees and arbitrary relational-operator DAGs — and
+> is **not** a catalog of hand-coded query shapes. Postgres compatibility
+> *requires* this: SQL expressions and operator trees compose without bound, so
+> the supported space cannot be enumerated. The mechanism is a **general
+> expression/operator IR evaluated on the device** — a vectorized interpreter
+> over a library of primitive kernels now, per-query PTX/JIT codegen later.
+> Shape-specialized fused kernels (an int4 equality count, a BETWEEN aggregate, a
+> batched point lookup) are **peephole fast-paths** the planner routes recognized
+> sub-trees to — an optimization *under* the general executor, **never the
+> executor itself**. The general path must answer anything the fast-paths do not.
+>
+> **Why this is a charter rule, not a preference.** The engine already has a
+> general executor — on the **CPU** (it is the parity oracle). "PG-compatible"
+> is satisfied today by that CPU executor; the charter's ambition is to make the
+> general executor **GPU-resident** and retire the CPU one. An enumerated GPU
+> accelerator can never retire it, because it can never be complete. Generality
+> on the GPU *is* the goal, not a nice-to-have.
+>
+> If a design choice (a) routes hot relational work to the CPU as its answer, or
+> (b) answers SQL by enumerating per-shape kernels instead of generally
+> evaluating an expression/operator tree, it is wrong by definition here. See
+> `docs/architecture/17-general-gpu-executor.md` for the executor design.
 
 ## What GPU-Native Means Here
 
@@ -33,10 +58,15 @@ capability is designed for the GPU first.
   the multi-relation joins `psql \d`/ORMs issue) runs on the GPU join path.
 - **Joins are GPU operators.** Relational joins are first-class GPU execution
   (partitioned/hash join over GPU-resident relations), never a CPU nested-loop.
-- **Hot reads should become prepared routes.** SQL text can exist at the
-  protocol boundary, but latency-sensitive retained reads should compile into
-  route ids, typed parameters, device-ready projection plans, and snapshot
-  handles.
+- **The executor is general; prepared routes are a cache over it, not a
+  replacement for it.** The unit of *execution* is a general expression/operator
+  tree evaluated on the device. A prepared route is that general plan
+  **compiled, specialized, and cached** for re-execution — a route id, typed
+  parameters, a device program (interpreter plan now, JIT'd kernel later), and a
+  snapshot handle. Routes accelerate *repeated* hot reads; they never define a
+  closed set of supported query shapes, and the general path must answer every
+  route-cache miss. Compiling a fixed list of query shapes into bespoke methods
+  is the anti-pattern this rule exists to prevent.
 - **Concurrent reads should run over immutable snapshots.** Read concurrency
   should come from GPU-resident snapshot generations that workers can execute
   against safely. Writers publish new generations through a serialized commit
@@ -60,8 +90,11 @@ prioritize hot, bounded, high-concurrency routes such as:
 - **Computed detail routes:** entity/detail views with derived values,
   summaries, balances, or correlated lookup-like fields.
 
-The core optimization unit should become a prepared OLTP route, not an arbitrary
-SQL string. A prepared route records:
+The core optimization unit for *latency* should become a prepared OLTP route,
+not a re-parsed SQL string — but a route is a **cached, parameterized general
+plan**, and the unit of *execution* remains a general expression/operator tree.
+Routes specialize and cache general plans; they must not become a fixed catalog
+of hand-coded query shapes (Charter rule 2). A prepared route records:
 
 - route id and SQL/protocol source
 - snapshot generation
@@ -142,6 +175,11 @@ otherwise.
   the answer — the catalog is GPU-resident and its joins run on the GPU join path.
 - CPU nested-loop or CPU hash joins as the join implementation — joins are GPU
   operators.
+- **A catalog of hand-coded per-query-shape kernels/methods as the executor.**
+  This cannot reach SQL/Postgres completeness (the expression/operator space is
+  unbounded). The executor is a general expression/operator evaluator; specialized
+  fused kernels are peephole fast-paths *under* it, dispatched by pattern match —
+  never the substrate. Adding "one more method per shape" is a smell, not progress.
 - Ad hoc locks around mutable CUDA/device state to create accidental
   multi-threaded execution.
 - Scheduler policies that improve one benchmark by hiding GPU fallback or
