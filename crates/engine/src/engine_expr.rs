@@ -77,6 +77,87 @@ fn compare_op_code(op: ResidentBinaryOp) -> Option<u32> {
     }
 }
 
+/// Flip a comparison code for a swapped operand order: `k <cmp> value` == `value <flip(cmp)> k`.
+/// eq stays eq; lt<->gt; le<->ge.
+fn flip_comparison_code(code: u32) -> u32 {
+    match code {
+        1 => 3,
+        2 => 4,
+        3 => 1,
+        4 => 2,
+        other => other,
+    }
+}
+
+fn is_int4_literal(expr: &ResidentExpr) -> bool {
+    matches!(expr, ResidentExpr::Int4Literal(_))
+}
+
+/// Compile an int4 arithmetic value expression into postfix [`ExprArithStep`] bytecode for the device
+/// VM. Recurses: a `Column` loads to a buffer; a `Binary{arith}` emits its operands then a buffer x
+/// buffer op, or folds an immediate literal operand into a buffer x scalar op (preserving operand
+/// side). Rejects non-arithmetic ops and literal-only subtrees (host constant-folding is a later
+/// step) — the predicate's top-level comparison is handled by the caller.
+fn compile_arith_program(
+    expr: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprArithStep>,
+) -> Result<(), ExecuteError> {
+    match expr {
+        ResidentExpr::Column(col) => {
+            let byte_offset = resident_device_int4_column_offset(snapshot, table, *col)?;
+            program.push(ExprArithStep::LoadColumn { byte_offset });
+            Ok(())
+        }
+        ResidentExpr::Binary { op, lhs, rhs } => {
+            let op_code = arith_op_code(*op).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident Expr arithmetic position requires an arithmetic op (add/sub/mul)"
+                        .to_string(),
+                ))
+            })?;
+            match (lhs.as_ref(), rhs.as_ref()) {
+                (value, ResidentExpr::Int4Literal(scalar)) if !is_int4_literal(value) => {
+                    compile_arith_program(value, table, snapshot, program)?;
+                    program.push(ExprArithStep::ScalarBinary {
+                        op: op_code,
+                        scalar: *scalar,
+                        scalar_on_left: false,
+                    });
+                    Ok(())
+                }
+                (ResidentExpr::Int4Literal(scalar), value) if !is_int4_literal(value) => {
+                    compile_arith_program(value, table, snapshot, program)?;
+                    program.push(ExprArithStep::ScalarBinary {
+                        op: op_code,
+                        scalar: *scalar,
+                        scalar_on_left: true,
+                    });
+                    Ok(())
+                }
+                (lhs_expr, rhs_expr)
+                    if !is_int4_literal(lhs_expr) && !is_int4_literal(rhs_expr) =>
+                {
+                    compile_arith_program(lhs_expr, table, snapshot, program)?;
+                    compile_arith_program(rhs_expr, table, snapshot, program)?;
+                    program.push(ExprArithStep::BufferBinary { op: op_code });
+                    Ok(())
+                }
+                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident Expr interpreter does not yet constant-fold literal-only arithmetic \
+                     subtrees"
+                        .to_string(),
+                ))),
+            }
+        }
+        ResidentExpr::Int4Literal(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident Expr arithmetic value cannot be a bare literal (constant-folding pending)"
+                .to_string(),
+        ))),
+    }
+}
+
 impl Engine {
     /// General GPU executor entry (Charter rule 2): run `SELECT <int4 columns> FROM <table>` filtered
     /// by a general predicate [`ResidentExpr`], evaluating the predicate on the GPU via the device
@@ -197,45 +278,70 @@ impl Engine {
         device_memory: &CudaResidentDeviceMemory,
         row_count: u64,
     ) -> Result<Vec<u32>, ExecuteError> {
-        if let ResidentExpr::Binary {
+        let ResidentExpr::Binary {
             op: compare,
             lhs,
             rhs,
         } = predicate
+        else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident Expr predicate must be a top-level comparison".to_string(),
+            )));
+        };
+        let Some(comparison) = compare_op_code(*compare) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident Expr predicate requires a comparison op (eq/lt/le/gt/ge)".to_string(),
+            )));
+        };
+
+        // PEEPHOLE fast-path (design: tuned fused kernels live UNDER the general executor): the exact
+        // shape `Compare(arith(Column, Column), Int4Literal)` lowers to the single fused 2-col kernel
+        // instead of the 3-launch VM program. Behavior-identical to the VM; just fewer launches.
+        if let (
+            ResidentExpr::Binary {
+                op: arith,
+                lhs: a,
+                rhs: b,
+            },
+            ResidentExpr::Int4Literal(needle),
+        ) = (lhs.as_ref(), rhs.as_ref())
         {
-            if let (Some(comparison), ResidentExpr::Int4Literal(needle)) =
-                (compare_op_code(*compare), rhs.as_ref())
+            if let (Some(op_code), ResidentExpr::Column(col_a), ResidentExpr::Column(col_b)) =
+                (arith_op_code(*arith), a.as_ref(), b.as_ref())
             {
-                if let ResidentExpr::Binary {
-                    op: arith,
-                    lhs: a,
-                    rhs: b,
-                } = lhs.as_ref()
-                {
-                    if let (
-                        Some(op_code),
-                        ResidentExpr::Column(col_a),
-                        ResidentExpr::Column(col_b),
-                    ) = (arith_op_code(*arith), a.as_ref(), b.as_ref())
-                    {
-                        let a_offset = resident_device_int4_column_offset(snapshot, table, *col_a)?;
-                        let b_offset = resident_device_int4_column_offset(snapshot, table, *col_b)?;
-                        return device_memory
-                            .expr_filter_two_col_compare_from_payload(
-                                a_offset, b_offset, op_code, row_count, *needle, comparison,
-                            )
-                            .map_err(|err| {
-                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
-                            });
-                    }
-                }
+                let a_offset = resident_device_int4_column_offset(snapshot, table, *col_a)?;
+                let b_offset = resident_device_int4_column_offset(snapshot, table, *col_b)?;
+                return device_memory
+                    .expr_filter_two_col_compare_from_payload(
+                        a_offset, b_offset, op_code, row_count, *needle, comparison,
+                    )
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    });
             }
         }
-        Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident Expr interpreter currently lowers Compare(arith(col, col), int4_literal); \
-             fuller trees (deeper arithmetic, AND/OR, col-vs-col) land via the device bytecode VM \
-             (docs/architecture/17-general-gpu-executor.md §2.3)"
-                .to_string(),
-        )))
+
+        // GENERAL path: `Compare(arith_tree, literal)` (or `literal <cmp> arith_tree`, flipping the
+        // comparison) compiles the arithmetic side to bytecode and runs the device VM. Col-vs-col /
+        // expr-vs-expr comparisons need a mask + boolean primitives (the next slice).
+        let (value_expr, needle, comparison) = match (lhs.as_ref(), rhs.as_ref()) {
+            (value, ResidentExpr::Int4Literal(needle)) => (value, *needle, comparison),
+            (ResidentExpr::Int4Literal(needle), value) => {
+                (value, *needle, flip_comparison_code(comparison))
+            }
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident Expr interpreter requires one side of the comparison to be an int4 \
+                     literal; column-vs-column comparisons land with the mask/boolean primitives \
+                     (docs/architecture/17-general-gpu-executor.md section 2.3)"
+                        .to_string(),
+                )));
+            }
+        };
+        let mut program = Vec::new();
+        compile_arith_program(value_expr, table, snapshot, &mut program)?;
+        device_memory
+            .run_expr_arith_filter(&program, row_count, comparison, needle)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
     }
 }

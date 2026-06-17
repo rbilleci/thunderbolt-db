@@ -85,3 +85,93 @@ fn gpu_resident_expr_select_evaluates_arithmetic_predicate_and_materializes_rows
         "unsupported Expr must be a hard error, not a silent fallback"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_select_evaluates_deep_arithmetic_tree_via_vm() {
+    // A DEEPER arithmetic tree than the 2-col fast-path — `WHERE (a + b) * 2 - 5 > K` — routes
+    // through the engine's Expr compiler -> device bytecode VM (not the peephole), evaluated and
+    // materialized on the GPU. Closed-form oracle: a[i]=b[i]=i => value = 4*i - 5 (monotone), so
+    // 4i-5 > K <=> i >= (K+5+3)/4 ; with K=395, 4i > 400 <=> i >= 101. Projected a[i]=i => the
+    // result rows are exactly those indices.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+
+    const N: i32 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}"))
+        .unwrap();
+
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let Command::Select(select) = parse_command("SELECT a FROM t").unwrap() else {
+        unreachable!()
+    };
+    // (a + b) * 2 - 5  : Binary(Sub, Binary(Mul, Binary(Add, a, b), 2), 5)
+    const K: i32 = 395;
+    let value_expr = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Sub,
+        lhs: Box::new(ResidentExpr::Binary {
+            op: ResidentBinaryOp::Mul,
+            lhs: Box::new(ResidentExpr::Binary {
+                op: ResidentBinaryOp::Add,
+                lhs: Box::new(ResidentExpr::Column(0)),
+                rhs: Box::new(ResidentExpr::Column(1)),
+            }),
+            rhs: Box::new(ResidentExpr::Int4Literal(2)),
+        }),
+        rhs: Box::new(ResidentExpr::Int4Literal(5)),
+    };
+    let predicate = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Gt,
+        lhs: Box::new(value_expr),
+        rhs: Box::new(ResidentExpr::Int4Literal(K)),
+    };
+
+    let result = e
+        .execute_resident_expr_select(&select, &predicate)
+        .expect("deep arithmetic tree via VM on GPU");
+
+    let start = 101; // 4i - 5 > 395 <=> i >= 101
+    let expected: Vec<Vec<SqlValue>> = (start..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(
+        result.rows, expected,
+        "GPU (a+b)*2-5 > {K} must materialize a-values for rows i in [{start}, {N})"
+    );
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+
+    // Literal on the LEFT flips the comparison: `K < (a+b)*2 - 5` is the same predicate.
+    let predicate_flipped = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Lt,
+        lhs: Box::new(ResidentExpr::Int4Literal(K)),
+        rhs: Box::new(ResidentExpr::Binary {
+            op: ResidentBinaryOp::Sub,
+            lhs: Box::new(ResidentExpr::Binary {
+                op: ResidentBinaryOp::Mul,
+                lhs: Box::new(ResidentExpr::Binary {
+                    op: ResidentBinaryOp::Add,
+                    lhs: Box::new(ResidentExpr::Column(0)),
+                    rhs: Box::new(ResidentExpr::Column(1)),
+                }),
+                rhs: Box::new(ResidentExpr::Int4Literal(2)),
+            }),
+            rhs: Box::new(ResidentExpr::Int4Literal(5)),
+        }),
+    };
+    let flipped = e
+        .execute_resident_expr_select(&select, &predicate_flipped)
+        .expect("flipped literal-on-left predicate via VM");
+    assert_eq!(
+        flipped.rows, expected,
+        "K < (a+b)*2-5 must equal (a+b)*2-5 > K (comparison flipped)"
+    );
+}

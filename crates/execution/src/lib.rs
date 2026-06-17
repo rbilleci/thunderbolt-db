@@ -1357,6 +1357,20 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Run an arithmetic bytecode `program` (docs/architecture/17 section 2.3) over the resident
+    /// columns to evaluate an arbitrary int4 arithmetic tree on device, then compare the result to
+    /// `needle` and return the matching row indices (host-sorted ascending). The general recursive
+    /// interpreter behind the engine's `ResidentExpr` lowering; `comparison` 0=eq/1=lt/2=le/3=gt/4=ge.
+    pub fn run_expr_arith_filter(
+        &self,
+        program: &[ExprArithStep],
+        row_count: u64,
+        comparison: u32,
+        needle: i32,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_expr_arith_filter(self, program, row_count, comparison, needle)
+    }
+
     pub fn project_i32_compare_ordered_from_payload(
         &self,
         byte_offset: u64,
@@ -8731,6 +8745,311 @@ fn launch_cuda_resident_expr_two_col_filter(
     Ok(indices)
 }
 
+/// One step of the resident arithmetic bytecode (docs/architecture/17 section 2.3): a postfix
+/// program over a stack of device buffers that evaluates an int4 arithmetic expression tree. The
+/// engine compiles a `ResidentExpr` arithmetic subtree to a `Vec<ExprArithStep>`; the VM
+/// (`run_expr_arith_filter`) executes it on device, then compares the single result buffer to a
+/// literal to produce the matching row indices. `op` is 0=add, 1=sub, 2=mul.
+#[derive(Debug, Clone, Copy)]
+pub enum ExprArithStep {
+    /// Push the resident int4 column at `byte_offset` (loaded into a fresh buffer).
+    LoadColumn { byte_offset: u64 },
+    /// Pop b, pop a, push `a <op> b` (buffer x buffer).
+    BufferBinary { op: u32 },
+    /// Pop a, push `a <op> scalar` (or `scalar <op> a` if `scalar_on_left`) — folds an immediate
+    /// literal operand without materializing a constant buffer.
+    ScalarBinary {
+        op: u32,
+        scalar: i32,
+        scalar_on_left: bool,
+    },
+}
+
+/// Compare an int4 value buffer (absolute device ptr) to `needle` and return the matching row
+/// indices, host-sorted ascending. Shared compare-and-compact tail for the arithmetic VM (the 2-col
+/// fast-path launcher keeps its own fused copy). `comparison`: 0=eq, 1=lt, 2=le, 3=gt, 4=ge.
+fn compact_buffer_i32_compare_to_indices(
+    resident: &CudaResidentDeviceMemory,
+    value_device_ptr: u64,
+    n: u64,
+    needle: i32,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let byte_len = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn = primary.cached_function(c"gpu_db_buffer_i32_compare_to_indices", &ptx)?;
+
+    let indices_buf = primary.lease_device_buffer(byte_len)?;
+    let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+    let zero = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            count_buf.ptr,
+            (&zero as *const u32).cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut in_arg = value_device_ptr;
+    let mut n_arg = n;
+    let mut needle_arg = needle;
+    let mut cmp_arg = comparison;
+    let mut count_arg = count_buf.ptr;
+    let mut idx_arg = indices_buf.ptr;
+    let mut args = [
+        (&mut in_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut cmp_arg as *mut u32).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+        (&mut idx_arg as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            compare_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    let mut match_count = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut match_count as *mut u32).cast::<c_void>(),
+            count_buf.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    let match_count = usize::try_from(match_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?
+        .min(n_usize);
+    let mut indices = vec![0_u32; match_count];
+    if match_count > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                indices.as_mut_ptr().cast::<c_void>(),
+                indices_buf.ptr,
+                match_count * std::mem::size_of::<u32>(),
+            )
+        })?;
+    }
+    indices.sort_unstable();
+    Ok(indices)
+}
+
+/// PROTOTYPE — the resident arithmetic bytecode VM (docs/architecture/17 section 2.3). Runs a postfix
+/// `program` over a stack of leased device buffers to evaluate an ARBITRARY int4 arithmetic tree on
+/// device (each step launches one buffer->buffer primitive), then compares the single result buffer
+/// to `needle` and returns the matching row indices. This is the general recursive interpreter that
+/// generalizes the fixed 2-col fast-path: arbitrary depth lowers to a longer program of the same
+/// primitives. Correctness-first: each step runs on a pooled stream that syncs, so an intermediate
+/// is valid before the next step reads it (pipelining/fusion is a later perf lever).
+fn launch_cuda_resident_expr_arith_filter(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprArithStep],
+    n: u64,
+    compare_code: u32,
+    needle: i32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let byte_len = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let load_fn = primary.cached_function(c"gpu_db_resident_i32_load_column", &ptx)?;
+    let buffer_binary_fn = primary.cached_function(c"gpu_db_buffer_i32_binary", &ptx)?;
+    let scalar_binary_fn = primary.cached_function(c"gpu_db_buffer_i32_binary_scalar", &ptx)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let resident_base = resident.device_ptr();
+    let launch = |function: *mut c_void, args: &mut [*mut c_void]| -> Result<(), CudaRuntimeProbeError> {
+        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+            cu_launch_kernel(
+                function,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+    };
+
+    // Stack of leased intermediate buffers. Popped operands drop (return to the pool) after their
+    // consuming step's stream has synced, so the pool churns at most ~tree-depth live buffers.
+    let mut stack: Vec<PooledBufferLease> = Vec::new();
+    for step in program {
+        match *step {
+            ExprArithStep::LoadColumn { byte_offset } => {
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = byte_offset;
+                let mut a2 = n;
+                let mut a3 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                ];
+                launch(load_fn, &mut args)?;
+                stack.push(out);
+            }
+            ExprArithStep::BufferBinary { op } => {
+                let rhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let lhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = lhs.ptr;
+                let mut a1 = rhs.ptr;
+                let mut a2 = op;
+                let mut a3 = n;
+                let mut a4 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                ];
+                launch(buffer_binary_fn, &mut args)?;
+                stack.push(out);
+            }
+            ExprArithStep::ScalarBinary {
+                op,
+                scalar,
+                scalar_on_left,
+            } => {
+                let lhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = lhs.ptr;
+                let mut a1 = scalar;
+                let mut a2 = op;
+                let mut a3 = u32::from(scalar_on_left);
+                let mut a4 = n;
+                let mut a5 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut i32).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u32).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
+                ];
+                launch(scalar_binary_fn, &mut args)?;
+                stack.push(out);
+            }
+        }
+    }
+
+    let value = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        // A well-formed arithmetic program leaves exactly one value on the stack.
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    compact_buffer_i32_compare_to_indices(resident, value.ptr, n, needle, compare_code)
+}
+
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
 // operator). Sorts N i64 keys (resident, at `keys_byte_offset`) by (key, original index) and returns
 // the permutation indices, ascending or descending. Two kernels on one pooled stream:
@@ -15336,6 +15655,101 @@ mod tests {
             all, expected_all,
             "a+b > i32::MIN matches every row, in ascending row order"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_expr_arith_vm_evaluates_deep_trees_on_gpu() {
+        // Recursive interpreter (device bytecode VM, docs/architecture/17 section 2.3): an ARBITRARY
+        // int4 arithmetic tree evaluated on the GPU by chaining buffer->buffer primitives over a stack
+        // of intermediates (LoadColumn / BufferBinary / ScalarBinary), then compared to a literal. GPU
+        // -NATIVE CLOSED-FORM oracle (a[i]=b[i]=i so every tree below is monotone in i => matches are a
+        // contiguous range derived in closed form, never a CPU re-implementation of the operator).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const ROW_COUNT: u64 = 600;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let b_off = a_off + ROW_COUNT * std::mem::size_of::<i32>() as u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&ROW_COUNT.to_le_bytes());
+        let mut a_bytes = Vec::new();
+        let mut b_bytes = Vec::new();
+        for row in 0..ROW_COUNT as i32 {
+            a_bytes.extend_from_slice(&row.to_le_bytes());
+            b_bytes.extend_from_slice(&row.to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                b_off + b_bytes.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: b_off,
+                        bytes: &b_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // Tree 1: (a + b) * 2 - 5 = 4*i - 5. Predicate > 395 <=> 4i > 400 <=> i >= 101.
+        // Exercises BufferBinary(add) + ScalarBinary(mul, right) + ScalarBinary(sub, right).
+        let p1 = [
+            ExprArithStep::LoadColumn { byte_offset: a_off },
+            ExprArithStep::LoadColumn { byte_offset: b_off },
+            ExprArithStep::BufferBinary { op: 0 },
+            ExprArithStep::ScalarBinary {
+                op: 2,
+                scalar: 2,
+                scalar_on_left: false,
+            },
+            ExprArithStep::ScalarBinary {
+                op: 1,
+                scalar: 5,
+                scalar_on_left: false,
+            },
+        ];
+        let got1 = resident
+            .run_expr_arith_filter(&p1, ROW_COUNT, 3, 395)
+            .expect("vm (a+b)*2-5 > 395");
+        let expected1: Vec<u32> = (101..ROW_COUNT).map(|i| i as u32).collect();
+        assert_eq!(got1, expected1, "(a+b)*2-5 > 395 <=> i >= 101");
+
+        // Tree 2: (a + b) * a = 2*i*i. Predicate > 200 <=> i*i > 100 <=> i >= 11. Buffer x buffer mul.
+        let p2 = [
+            ExprArithStep::LoadColumn { byte_offset: a_off },
+            ExprArithStep::LoadColumn { byte_offset: b_off },
+            ExprArithStep::BufferBinary { op: 0 },
+            ExprArithStep::LoadColumn { byte_offset: a_off },
+            ExprArithStep::BufferBinary { op: 2 },
+        ];
+        let got2 = resident
+            .run_expr_arith_filter(&p2, ROW_COUNT, 3, 200)
+            .expect("vm (a+b)*a > 200");
+        let expected2: Vec<u32> = (11..ROW_COUNT).map(|i| i as u32).collect();
+        assert_eq!(got2, expected2, "(a+b)*a = 2i^2 > 200 <=> i >= 11");
+
+        // Tree 3: 10 - a. Predicate > 0 <=> i < 10. Exercises scalar_on_left (non-commutative sub).
+        let p3 = [
+            ExprArithStep::LoadColumn { byte_offset: a_off },
+            ExprArithStep::ScalarBinary {
+                op: 1,
+                scalar: 10,
+                scalar_on_left: true,
+            },
+        ];
+        let got3 = resident
+            .run_expr_arith_filter(&p3, ROW_COUNT, 3, 0)
+            .expect("vm 10-a > 0");
+        let expected3: Vec<u32> = (0..10).collect();
+        assert_eq!(got3, expected3, "10 - a > 0 <=> i < 10 (scalar_on_left)");
     }
 
     #[test]
