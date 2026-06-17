@@ -12,11 +12,11 @@
 //! column-vs-column compares) land as the device bytecode VM in §2.3 of the design doc — by
 //! extending this interpreter, never by adding a new shape method.
 //!
-//! Forward-API module: the IR, the op-code maps, and `execute_resident_expr_select` are exercised by
-//! the GPU parity tests today and wired to the parser/planner next; until then they are unused in a
-//! non-test build, so the whole module allows dead code. Drop this allow once a production caller
-//! (the SQL->Expr binding) lands.
-#![allow(dead_code)]
+//! The IR + op-code maps + `execute_resident_expr_select_with_binding` are now the production path the
+//! SQL->Expr binding (`engine_sql_pg`) routes into; the GPU parity tests exercise the same lowering
+//! via programmatic `ResidentExpr`s. The 2-arg `execute_resident_expr_select` convenience wrapper (run
+//! a select with a programmatic predicate, binding internally) has no production caller yet — a
+//! prepared-route / facade caller is the likely one — so it carries a targeted `allow(dead_code)`.
 
 use super::*;
 
@@ -35,7 +35,13 @@ pub(crate) enum ResidentBinaryOp {
     Le,
     Gt,
     Ge,
+    // The SQL mapper produces And/Or from `BoolExpr` in the next slice; until then a non-test lib
+    // build sees them only pattern-matched (the interpreter already lowers them), never constructed.
+    // The programmatic boolean GPU test constructs them today. Drop these allows when the BoolExpr
+    // mapper lands.
+    #[allow(dead_code)]
     And,
+    #[allow(dead_code)]
     Or,
 }
 
@@ -248,12 +254,33 @@ impl Engine {
     /// recognized shape); the `Select` carries the table + projection + MVCC binding. NOT routed
     /// through `resident_route_query_shape` — this is the general path, parallel to the (frozen)
     /// enumerated probe dispatch.
+    // Forward API: run a select with a PROGRAMMATIC predicate (binds the catalog internally). The GPU
+    // parity tests use it; the production caller is the SQL->Expr entry, which binds once itself and
+    // calls `execute_resident_expr_select_with_binding` directly, so this wrapper has no non-test
+    // caller yet.
+    #[allow(dead_code)]
     pub(crate) fn execute_resident_expr_select(
         &self,
         select: &Select,
         predicate: &ResidentExpr,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        self.execute_resident_expr_select_with_binding(select, &table, bound, copin_s, predicate)
+    }
+
+    /// As [`Engine::execute_resident_expr_select`] but over an ALREADY-BOUND table/projection: the
+    /// caller bound the catalog once and resolved the predicate's `Column` indices against this SAME
+    /// `table`. The SQL->Expr entry (`engine_sql_pg`) routes through here so the predicate's column
+    /// indices, the projection, and the residency snapshot all derive from one catalog generation — a
+    /// concurrent shape-changing DDL cannot split the column resolution from the execution.
+    pub(crate) fn execute_resident_expr_select_with_binding(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        bound: BoundRelationalSelect,
+        copin_s: Index,
+        predicate: &ResidentExpr,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         if bound.selected_indexes.is_empty() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident Expr select requires at least one projected column".to_string(),
@@ -269,7 +296,7 @@ impl Engine {
         }
 
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
+            self.relational_select_mvcc_query_pinned(select, table, &bound, copin_s)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -309,7 +336,7 @@ impl Engine {
         // Evaluate the predicate on the GPU -> surviving row indices (ascending).
         let indices = self.lower_resident_predicate(
             predicate,
-            &table,
+            table,
             &snapshot,
             &device_memory,
             row_count,
@@ -319,7 +346,7 @@ impl Engine {
         // Materialize: gather each projected int4 column at the surviving row indices on the GPU.
         let mut projected_columns: Vec<Vec<i32>> = Vec::with_capacity(bound.selected_indexes.len());
         for &col in &bound.selected_indexes {
-            let byte_offset = resident_device_int4_column_offset(&snapshot, &table, col)?;
+            let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
             let values = device_memory
                 .project_i32_rows_from_payload(byte_offset, &indices_u64)
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;

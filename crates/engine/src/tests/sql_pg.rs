@@ -6,6 +6,8 @@
 //! both proves the heavy libpg_query C build links and documents the navigation, so a future
 //! `pg_query` API drift fails here loudly rather than silently in the mapper.
 
+use super::*;
+
 use crate::engine_sql_pg::parse_single_select;
 use pg_query::protobuf::{a_const, AConst, AExpr, AExprKind, ColumnRef, Node};
 use pg_query::NodeEnum;
@@ -117,5 +119,136 @@ fn parse_single_select_rejects_non_select_and_multi_statement() {
     assert!(
         parse_single_select("SELECT a FROM").is_err(),
         "a syntactically invalid statement surfaces the libpg_query parse error"
+    );
+}
+
+// ---- Slice 3: SQL text -> ResidentExpr -> general GPU executor ----
+
+/// Assert `sql` errors through the SQL->Expr entry with a message containing `needle` (never returns
+/// rows). Rejections must be hard errors so the routing layer decides, not silent mis-answers.
+fn assert_sql_err_contains(engine: &Engine, sql: &str, needle: &str) {
+    match engine.execute_resident_expr_select_sql(sql) {
+        Ok(_) => panic!("expected `{sql}` to error, but it returned rows"),
+        Err(err) => assert!(
+            err.to_string().contains(needle),
+            "`{sql}` should error mentioning `{needle}`, got: {err}"
+        ),
+    }
+}
+
+#[test]
+fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
+    // Every shape the mapper cannot represent is a HARD error (deterministic, no GPU needed): build-
+    // stage rejections (multiple FROM relations, aggregate projection, ORDER BY) fire before the
+    // residency check; mapper-stage rejections (unsupported operator, AND/OR, non-int literal) fire
+    // after the single bind. None silently mis-answer.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+
+    assert_sql_err_contains(&e, "SELECT a FROM t", "WHERE"); // a filter needs a predicate
+    assert_sql_err_contains(&e, "SELECT a FROM t x, t y WHERE a > 0", "one FROM relation"); // join
+    assert_sql_err_contains(&e, "SELECT count(*) FROM t WHERE a > 0", "plain columns"); // aggregate
+    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 0 ORDER BY a", "ORDER BY"); // ordering
+    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a / b > 1", "/"); // unsupported operator
+    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 1 AND b < 2", "AND"); // BoolExpr (slice 4)
+    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 'x'", "int4 literals"); // non-int literal
+    // A column qualifier that does not name the FROM relation is PG's "missing FROM-clause entry",
+    // never silently resolved to t.a (load-bearing once joins make same-named columns ambiguous).
+    assert_sql_err_contains(&e, "SELECT a FROM t WHERE wrong.a > 0", "missing FROM-clause");
+    assert_sql_err_contains(&e, "SELECT wrong.a FROM t WHERE a > 0", "missing FROM-clause");
+    // An alias HIDES the relation name (PG): once `FROM t AS x`, `t.a` no longer names the relation.
+    assert_sql_err_contains(&e, "SELECT a FROM t x WHERE t.a > 0", "missing FROM-clause");
+}
+
+#[test]
+fn execute_resident_expr_select_sql_maps_supported_predicate_and_reaches_gpu_dispatch() {
+    // A supported single-table int4 SELECT parses + maps + binds and reaches the GPU residency check —
+    // proving the full SQL -> ResidentExpr binding succeeds end to end up to device dispatch. With no
+    // residency snapshot populated it stops at the residency error (deterministic on any box), which
+    // is PAST parse/map/bind — i.e. NOT a mapper rejection. (The GPU e2e test below runs it through.)
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    match e.execute_resident_expr_select_sql("SELECT a FROM t WHERE a + b > 400") {
+        Ok(_) => panic!("no residency snapshot populated, so this cannot return rows"),
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("resident"),
+                "a supported predicate must reach GPU dispatch (residency stage), not a mapper \
+                 rejection; got: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_predicate_from_sql_text() {
+    // The whole loop: a SQL STRING -> libpg_query -> ResidentExpr -> general GPU executor, end to end.
+    // Same GPU-native closed-form oracle as the programmatic Expr tests, now driven from real SQL.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+
+    const N: i32 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // Arithmetic predicate (the canonical handoff query): a[i]=b[i]=i, a+b=2i monotone, so
+    // {i : a+b>400} = [201, 600); projected a[i]=i. Distinct from "only a" (a>400 => [401, 600)).
+    let added = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a + b > 400")
+        .expect("SQL `a + b > 400` -> GPU");
+    let added_expected: Vec<Vec<SqlValue>> = (201..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(added.columns.len(), 1);
+    assert_eq!(added.columns[0].name, "a");
+    assert_eq!(
+        added.rows, added_expected,
+        "SQL `a + b > 400` on GPU must be a-values for i in [201, 600)"
+    );
+    assert_eq!(added.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(added.fallback_reason, None);
+    assert_ne!(
+        added.rows.len(),
+        (N - 401) as usize,
+        "must differ from a>400 — proves column b was read, not just a"
+    );
+
+    // A plain column-vs-literal comparison from SQL (exercises the comparison mapping + the simple
+    // value-buffer compare path): a > 500 => [501, 600).
+    let compared = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a > 500")
+        .expect("SQL `a > 500` -> GPU");
+    let compared_expected: Vec<Vec<SqlValue>> = (501..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(
+        compared.rows, compared_expected,
+        "SQL `a > 500` on GPU must be a-values for i in [501, 600)"
+    );
+
+    // A qualifier that DOES name the FROM relation resolves to its column: bare `t.a` and the alias
+    // `x.a` both mean column a (a stray qualifier hard-errors — covered by the host rejection test).
+    let qualified = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE t.a > 500")
+        .expect("SQL `t.a > 500` -> GPU");
+    assert_eq!(
+        qualified.rows, compared_expected,
+        "qualified `t.a > 500` must equal `a > 500`"
+    );
+    let aliased = e
+        .execute_resident_expr_select_sql("SELECT x.a FROM t AS x WHERE x.a > 500")
+        .expect("SQL alias `x.a > 500` -> GPU");
+    assert_eq!(
+        aliased.rows, compared_expected,
+        "alias-qualified `x.a > 500` must equal `a > 500`"
     );
 }
