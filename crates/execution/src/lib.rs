@@ -17716,4 +17716,157 @@ mod tests {
             "count DESC LIMIT 2"
         );
     }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_s9_5_scaling_benchmarks() {
+        // §9.5 scaling benchmarks for every GPU path: the argsort primitives (bitonic / radix /
+        // adaptive / order_by_limit), the HAVING DNF filter, and the end-to-end resident grouped
+        // pipeline (hash-agg + ORDER BY <col> [+ HAVING] + window). Best-of-3.
+        use std::time::Instant;
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let bench = |f: &dyn Fn()| -> f64 {
+            let mut ms = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                f();
+                ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ms
+        };
+        let chunk = |off: u64, bytes: &[u8]| CudaDeviceMemoryChunk {
+            byte_offset: off,
+            bytes: unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) },
+        };
+        let as_bytes_i64 = |v: &[i64]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        let as_bytes_i32 = |v: &[i32]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+
+        // ---- 1. argsort primitives: latency vs N keys (i64) ----
+        println!("\n### argsort primitives (i64 keys) latency vs N (ms, best-of-3)");
+        println!("| N | bitonic | radix | adaptive | order_by_limit(LIMIT 100) |");
+        println!("|---:|---:|---:|---:|---:|");
+        for &n in &[1_000_usize, 10_000, 100_000, 1_000_000, 10_000_000] {
+            let keys: Vec<i64> = (0..n)
+                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % n as u64) as i64)
+                .collect();
+            let header = (n as u64).to_le_bytes();
+            let res = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    8 + (n * 8) as u64,
+                    &[chunk(0, &header), chunk(8, as_bytes_i64(&keys))],
+                )
+                .expect("retain keys");
+            let kp = res.device_ptr() + 8;
+            let nn = n as u64;
+            let bit = bench(&|| {
+                launch_cuda_resident_i64_argsort_bitonic(&res, kp, nn, false).unwrap();
+            });
+            let rad = bench(&|| {
+                launch_cuda_resident_i64_argsort_radix(&res, kp, nn, false).unwrap();
+            });
+            let adp = bench(&|| {
+                launch_cuda_resident_i64_argsort_adaptive(&res, kp, nn, false).unwrap();
+            });
+            let obl = bench(&|| {
+                launch_cuda_resident_i64_order_by_limit(&res, kp, nn, false, 0, Some(100)).unwrap();
+            });
+            println!("| {n} | {bit:.3} | {rad:.3} | {adp:.3} | {obl:.3} |");
+        }
+
+        // ---- 2. HAVING DNF filter: latency vs M groups (i64 group + agg) ----
+        println!("\n### HAVING DNF filter (single-block) latency vs M groups (ms, best-of-3)");
+        println!("| M (groups) | HAVING agg > M/2 |");
+        println!("|---:|---:|");
+        for &m in &[1_000_usize, 10_000, 100_000, 1_000_000] {
+            let col: Vec<i64> = (0..m as i64).collect();
+            let header = (m as u64).to_le_bytes();
+            let go = 8_u64;
+            let ao = 8 + (m * 8) as u64;
+            let res = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    8 + (m * 16) as u64,
+                    &[
+                        chunk(0, &header),
+                        chunk(go, as_bytes_i64(&col)),
+                        chunk(ao, as_bytes_i64(&col)),
+                    ],
+                )
+                .expect("retain group+agg");
+            let (gp, ap) = (res.device_ptr() + go, res.device_ptr() + ao);
+            let clauses = vec![vec![(1_u32, 3_u32, (m / 2) as i64)]];
+            let h = bench(&|| {
+                launch_cuda_resident_having_filter(&res, gp, ap, m as u64, &clauses).unwrap();
+            });
+            println!("| {m} | {h:.3} |");
+        }
+
+        // ---- 3. resident grouped pipeline: latency vs rows (hash-agg + ORDER BY + window) ----
+        println!("\n### resident grouped pipeline latency vs rows (ms, best-of-3)");
+        println!("| rows | M | ORDER BY sum | count | min | group | + HAVING(count>=2) |");
+        println!("|---:|---:|---:|---:|---:|---:|---:|");
+        for &(rows, m) in &[
+            (100_000_u64, 256_i64),
+            (1_000_000, 4_096),
+            (10_000_000, 65_536),
+        ] {
+            let group: Vec<i32> = (0..rows).map(|i| (i % m as u64) as i32).collect();
+            let value: Vec<i32> = (0..rows).map(|i| (i % 1000) as i32).collect();
+            let header = rows.to_le_bytes();
+            let go = 8_u64;
+            let vo = 8 + (rows * 4);
+            let res = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    8 + rows * 8,
+                    &[
+                        chunk(0, &header),
+                        chunk(go, as_bytes_i32(&group)),
+                        chunk(vo, as_bytes_i32(&value)),
+                    ],
+                )
+                .expect("retain group+value");
+            let ord = |col, having| {
+                let o = GroupedI64Order {
+                    column: col,
+                    descending: true,
+                    offset: 0,
+                    limit: None,
+                };
+                bench(&|| {
+                    res.grouped_stats_i32_ordered_from_payload(go, vo, rows, o, having)
+                        .unwrap();
+                })
+            };
+            let sum = ord(GroupedI64SortColumn::Sum, None);
+            let cnt = ord(GroupedI64SortColumn::Count, None);
+            let min = ord(GroupedI64SortColumn::Min, None);
+            let grp = ord(GroupedI64SortColumn::Group, None);
+            let clauses = vec![vec![(1_u32, 4_u32, 2_i64)]];
+            let hav = {
+                let o = GroupedI64Order {
+                    column: GroupedI64SortColumn::Group,
+                    descending: false,
+                    offset: 0,
+                    limit: None,
+                };
+                bench(&|| {
+                    res.grouped_stats_i32_ordered_from_payload(
+                        go,
+                        vo,
+                        rows,
+                        o,
+                        Some((GroupedI64SortColumn::Count, &clauses)),
+                    )
+                    .unwrap();
+                })
+            };
+            println!("| {rows} | {m} | {sum:.3} | {cnt:.3} | {min:.3} | {grp:.3} | {hav:.3} |");
+        }
+    }
 }
