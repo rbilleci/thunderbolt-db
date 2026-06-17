@@ -1666,3 +1666,46 @@ fn checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary() {
         Some("open".to_string())
     );
 }
+
+#[test]
+fn checkpoint_vacuum_rejects_unsafe_boundaries() {
+    // Stage 4 reasons in `commit_seq`/`Index` space (was façade-`txn_id`): the durable boundary is
+    // `committed_seq`, and the active-snapshot guard is the oldest active READ SNAPSHOT.
+    let e = Engine::new_local();
+    let no_commit_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
+    assert!(
+        no_commit_err
+            .to_string()
+            .contains("requires a durable commit boundary"),
+        "got: {no_commit_err}"
+    );
+
+    // Two committed writes → committed_seq advances to 2 (the durable boundary).
+    e.execute_text(1, "SET acct:1=open").unwrap();
+    e.execute_text(2, "SET acct:1=closed").unwrap();
+    assert_eq!(e.committed_seq(), 2);
+
+    // safe_commit_seq newer than the durable boundary is rejected.
+    let newer_than_durable_err = e.checkpoint_vacuum_mvcc_versions(3).unwrap_err();
+    assert!(
+        newer_than_durable_err
+            .to_string()
+            .contains("newer than the durable commit boundary 2"),
+        "got: {newer_than_durable_err}"
+    );
+
+    // An in-flight read snapshot at commit_seq 1 makes safe_commit_seq >= 1 unsafe (it could
+    // prune a version that snapshot still needs).
+    let guard = e.register_active_snapshot(1);
+    let active_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
+    assert!(
+        active_err
+            .to_string()
+            .contains("crosses active read snapshot 1"),
+        "got: {active_err}"
+    );
+    drop(guard);
+
+    // With no active snapshot, pruning strictly below the durable boundary is allowed.
+    e.checkpoint_vacuum_mvcc_versions(1).unwrap();
+}
