@@ -21967,60 +21967,109 @@ impl Engine {
                     .to_string(),
             ))
         })?;
-        // §9.5/S5a.3 slice 1: ORDER BY the SUM aggregate (no HAVING) runs on the GPU over the
-        // resident output — argsorted in place + windowed (no re-upload). SUM (distinct) sorts
-        // out_sums directly; COUNT ties, so it packs (count, group) into a composite key carrying the
-        // host's group-ascending tie-break (counts must fit u32 -> row_count <= u32::MAX). min/max/
-        // group ORDER BY + GPU HAVING are later slices; AVG (Numeric) and the rest stay on the host.
-        let gpu_order: Option<GroupedI64Order> = if select.having_groups.is_empty() {
-            select.order_by.as_ref().and_then(|order| {
-                let by_aggregate = select_is_aggregate_result_column(select, &order.column);
-                let mk = |column| {
-                    Some(GroupedI64Order {
-                        column,
-                        descending: order.descending,
-                        offset: 0,
-                        limit: select.limit.map(|limit| limit as u64),
-                    })
-                };
-                match &select.projection {
-                    // ORDER BY the aggregate result (i64-representable). COUNT packs (count, group)
-                    // so counts must fit u32; SUM is direct i64; MIN/MAX pack the i32 value + group.
-                    SelectProjection::GroupedSum { .. } if by_aggregate => {
-                        mk(GroupedI64SortColumn::Sum)
-                    }
-                    SelectProjection::GroupedCount { .. }
-                        if by_aggregate && row_count <= u64::from(u32::MAX) =>
-                    {
-                        mk(GroupedI64SortColumn::Count)
-                    }
-                    SelectProjection::GroupedMin { .. } if by_aggregate => {
-                        mk(GroupedI64SortColumn::Min)
-                    }
-                    SelectProjection::GroupedMax { .. } if by_aggregate => {
-                        mk(GroupedI64SortColumn::Max)
-                    }
-                    // ORDER BY the group column (not the aggregate) — any non-AVG grouped projection.
-                    SelectProjection::GroupedCount { .. }
-                    | SelectProjection::GroupedSum { .. }
-                    | SelectProjection::GroupedMin { .. }
-                    | SelectProjection::GroupedMax { .. }
-                        if !by_aggregate =>
-                    {
-                        mk(GroupedI64SortColumn::Group)
-                    }
-                    // AVG (Numeric) — any order — stays on the host.
-                    _ => None,
-                }
-            })
-        } else {
-            None
+        // §9.5/S5a.3: ORDER BY + HAVING + LIMIT run on the GPU over the resident output (no
+        // re-upload). The projection's aggregate as an i64 sort column (None for AVG -> Numeric,
+        // stays host). COUNT packs (count, group) so counts must fit u32; SUM is direct i64; MIN/MAX
+        // pack the i32 value + group; ORDER BY the group column packs group-by-group.
+        let aggregate_col = match &select.projection {
+            SelectProjection::GroupedCount { .. } => Some(GroupedI64SortColumn::Count),
+            SelectProjection::GroupedSum { .. } => Some(GroupedI64SortColumn::Sum),
+            SelectProjection::GroupedMin { .. } => Some(GroupedI64SortColumn::Min),
+            SelectProjection::GroupedMax { .. } => Some(GroupedI64SortColumn::Max),
+            _ => None,
         };
+        let gpu_order: Option<GroupedI64Order> = {
+            let limit = select.limit.map(|limit| limit as u64);
+            let order_col = match &select.order_by {
+                Some(order) => {
+                    let by_aggregate = select_is_aggregate_result_column(select, &order.column);
+                    match (aggregate_col, by_aggregate) {
+                        // ORDER BY count needs counts to fit u32 (the composite pack).
+                        (Some(GroupedI64SortColumn::Count), true) => (row_count
+                            <= u64::from(u32::MAX))
+                        .then_some(GroupedI64SortColumn::Count),
+                        (Some(col), true) => Some(col), // Sum / Min / Max
+                        (Some(_), false) => Some(GroupedI64SortColumn::Group), // ORDER BY group col
+                        (None, _) => None,              // AVG
+                    }
+                }
+                // HAVING with no ORDER BY: the host group-sorts first, so mirror with ORDER BY group.
+                None if !select.having_groups.is_empty() && aggregate_col.is_some() => {
+                    Some(GroupedI64SortColumn::Group)
+                }
+                None => None,
+            };
+            order_col.map(|column| GroupedI64Order {
+                column,
+                descending: select.order_by.as_ref().is_some_and(|o| o.descending),
+                offset: 0,
+                limit,
+            })
+        };
+        // Translate HAVING (DNF) to GPU clauses (col 0=group / 1=aggregate; op 0..4; i64 value).
+        // None when HAVING is present but not GPU-able (non-group/agg column, LikePrefix, non-i64
+        // value, or AVG) -> the whole query falls back to the host.
+        let gpu_having: Option<Vec<Vec<(u32, u32, i64)>>> = if select.having_groups.is_empty() {
+            None
+        } else {
+            let aggregate_name = select_aggregate_result_column_name(select);
+            (|| -> Option<Vec<Vec<(u32, u32, i64)>>> {
+                aggregate_col?; // AVG has no i64 aggregate column
+                let agg_name = aggregate_name?;
+                select
+                    .having_groups
+                    .iter()
+                    .map(|clause| {
+                        clause
+                            .iter()
+                            .map(|filter| {
+                                let col = if &filter.column == group_column {
+                                    0_u32
+                                } else if filter.column.eq_ignore_ascii_case(agg_name) {
+                                    1
+                                } else {
+                                    return None;
+                                };
+                                let op = match filter.op {
+                                    SelectFilterOp::Eq => 0_u32,
+                                    SelectFilterOp::Lt => 1,
+                                    SelectFilterOp::Lte => 2,
+                                    SelectFilterOp::Gt => 3,
+                                    SelectFilterOp::Gte => 4,
+                                    SelectFilterOp::LikePrefix => return None,
+                                };
+                                let val = match &filter.value {
+                                    SqlValue::Int4(v) => i64::from(*v),
+                                    SqlValue::Int8(v) => *v,
+                                    _ => return None,
+                                };
+                                Some((col, op, val))
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })()
+        };
+        let having_translatable = select.having_groups.is_empty() || gpu_having.is_some();
+        let use_gpu = gpu_order.is_some() && having_translatable;
 
         let started = Instant::now();
-        let (mut grouped_stats, copied_group_count) = if let Some(spec) = gpu_order {
+        let (mut grouped_stats, copied_group_count) = if use_gpu {
+            let spec = gpu_order.expect("use_gpu implies gpu_order");
+            let having = gpu_having.as_ref().map(|clauses| {
+                (
+                    aggregate_col.expect("HAVING translated => agg col"),
+                    clauses.as_slice(),
+                )
+            });
             device_memory
-                .grouped_stats_i32_ordered_from_payload(group_offset, value_offset, row_count, spec)
+                .grouped_stats_i32_ordered_from_payload(
+                    group_offset,
+                    value_offset,
+                    row_count,
+                    spec,
+                    having,
+                )
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
         } else {
             let stats = device_memory
@@ -22032,7 +22081,7 @@ impl Engine {
         let elapsed = started.elapsed();
         // When the order ran on the GPU, the rows are already ordered + windowed; skip the host
         // sort/HAVING/LIMIT below (kept for the not-yet-GPU cases + as the parity reference).
-        let gpu_ordered = gpu_order.is_some();
+        let gpu_ordered = use_gpu;
         let mut rows = grouped_stats
             .drain(..)
             .map(|group| {

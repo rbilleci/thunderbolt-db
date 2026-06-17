@@ -1242,16 +1242,18 @@ impl CudaResidentDeviceMemory {
         .map(|(rows, _)| rows)
     }
 
-    /// Resident grouped aggregate with GPU ORDER BY (count/sum) + LIMIT/OFFSET applied on-device
-    /// before D2H (S5a.2): the hash-agg's `out_counts`/`out_sums` are argsorted in place (no
+    /// Resident grouped aggregate with GPU ORDER BY + optional HAVING + LIMIT/OFFSET applied on-device
+    /// before D2H (S5a.3): the hash-agg's compacted columns are filtered/argsorted in place (no
     /// re-upload) and only the windowed groups are returned. Yields `(windowed_rows, group_count)`
     /// where group_count is the FULL distinct-group count M (the D2H-bytes basis, window-independent).
+    /// `having` = (the aggregate column referenced by HAVING column-1, the DNF clauses).
     pub fn grouped_stats_i32_ordered_from_payload(
         &self,
         group_byte_offset: u64,
         value_byte_offset: u64,
         row_count: u64,
         order: GroupedI64Order,
+        having: Option<GroupedI64Having<'_>>,
     ) -> Result<(Vec<CudaI32GroupedStats>, usize), CudaRuntimeProbeError> {
         launch_cuda_resident_i32_grouped_stats(
             self,
@@ -1259,7 +1261,7 @@ impl CudaResidentDeviceMemory {
             value_byte_offset,
             None,
             row_count,
-            Some(order),
+            Some(GroupedI64Post { order, having }),
         )
     }
 
@@ -1399,6 +1401,20 @@ pub struct GroupedI64Order {
     pub descending: bool,
     pub offset: u64,
     pub limit: Option<u64>,
+}
+
+/// HAVING for the resident grouped pipeline: which aggregate column is HAVING column-1 (Count/Sum/
+/// Min/Max — never Group) and the DNF clauses (each filter `(col: 0=group/1=agg, op: 0..4, i64 value)`,
+/// OR across clauses, AND within a clause).
+pub type GroupedI64Having<'a> = (GroupedI64SortColumn, &'a [Vec<(u32, u32, i64)>]);
+
+/// GPU post-aggregation work applied to the RESIDENT grouped output before D2H (S5a.3): an ORDER BY
+/// plus an optional HAVING (S4p2's GPU DNF filter). Survivors are computed first, then the ORDER BY
+/// perm is filtered to them and the OFFSET/LIMIT window is applied on the host.
+#[derive(Clone, Copy)]
+pub struct GroupedI64Post<'a> {
+    pub order: GroupedI64Order,
+    pub having: Option<GroupedI64Having<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6781,7 +6797,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     value_byte_offset: u64,
     filter: Option<(u64, i32, CudaI32Comparison)>,
     row_count: u64,
-    order: Option<GroupedI64Order>,
+    post: Option<GroupedI64Post<'_>>,
 ) -> Result<(Vec<CudaI32GroupedStats>, usize), CudaRuntimeProbeError> {
     // Returns (rows, group_count): `rows` is windowed/ordered when `order` is set, else all groups;
     // `group_count` is the FULL distinct-group count M (the D2H'd-bytes basis for the caller's
@@ -7424,14 +7440,16 @@ compact_done:
     // S5a.2: GPU ORDER BY (count/sum) + LIMIT/OFFSET on the RESIDENT compacted output, before D2H —
     // no re-upload. `out_counts` (u64, counts are non-negative ≤ row_count) and `out_sums` (i64) are
     // argsorted directly as i64; the result is the windowed list of compact-order group indices.
-    let ordered_indices: Option<Vec<u32>> = match order {
-        Some(order) if output_len > 0 => {
-            // Keys narrower than i64 (count u64≤u32, min/max/group i32) are packed with the group
-            // into one composite i64 key (direction baked in) so an ASCENDING argsort reproduces the
-            // host "agg <dir>, group ASC tie-break" order; SUM (i64) argsorts directly.
+    let ordered_indices: Option<Vec<u32>> = match post {
+        Some(post) if output_len > 0 => {
+            let order = post.order;
             let key_bytes = output_len
                 .checked_mul(std::mem::size_of::<i64>())
                 .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            // FULL sorted permutation (no window yet — HAVING filters it first, then we window).
+            // Keys narrower than i64 (count u64≤u32, min/max/group i32) are packed with the group
+            // into one composite i64 key (direction baked in) so an ASCENDING argsort reproduces the
+            // host "agg <dir>, group ASC tie-break" order; SUM (i64) argsorts directly.
             let pack_then_sort = |ptx: &[u8],
                                   name: &'static core::ffi::CStr,
                                   agg_ptr: u64|
@@ -7452,18 +7470,18 @@ compact_done:
                     composite.ptr,
                     output_count,
                     false,
-                    order.offset,
-                    order.limit,
+                    0,
+                    None,
                 )
             };
-            let perm = match order.column {
+            let full_perm = match order.column {
                 GroupedI64SortColumn::Sum => launch_cuda_resident_i64_order_by_limit(
                     resident,
                     out_sums.ptr,
                     output_count,
                     order.descending,
-                    order.offset,
-                    order.limit,
+                    0,
+                    None,
                 )?,
                 GroupedI64SortColumn::Count => pack_then_sort(
                     include_bytes!("pack.ptx"),
@@ -7486,7 +7504,78 @@ compact_done:
                     out_groups.ptr,
                 )?,
             };
-            Some(perm)
+
+            // HAVING (S4p2 GPU DNF filter) over the resident group + aggregate columns widened to
+            // i64 -> surviving compact-order indices; filter the ORDER BY perm to them.
+            let ordered: Vec<u32> = if let Some((agg_col, clauses)) = post.having {
+                let group_i64 = primary.lease_device_buffer(key_bytes)?;
+                launch_cuda_resident_widen_i32_to_i64(
+                    resident,
+                    out_groups.ptr,
+                    output_count,
+                    group_i64.ptr,
+                )?;
+                let mut agg_widen = None;
+                let agg_ptr = match agg_col {
+                    GroupedI64SortColumn::Count => out_counts.ptr,
+                    GroupedI64SortColumn::Sum => out_sums.ptr,
+                    GroupedI64SortColumn::Min => {
+                        let buf = primary.lease_device_buffer(key_bytes)?;
+                        launch_cuda_resident_widen_i32_to_i64(
+                            resident,
+                            out_mins.ptr,
+                            output_count,
+                            buf.ptr,
+                        )?;
+                        let ptr = buf.ptr;
+                        agg_widen = Some(buf);
+                        ptr
+                    }
+                    GroupedI64SortColumn::Max => {
+                        let buf = primary.lease_device_buffer(key_bytes)?;
+                        launch_cuda_resident_widen_i32_to_i64(
+                            resident,
+                            out_maxs.ptr,
+                            output_count,
+                            buf.ptr,
+                        )?;
+                        let ptr = buf.ptr;
+                        agg_widen = Some(buf);
+                        ptr
+                    }
+                    // HAVING column-1 is always an aggregate, never the group key.
+                    GroupedI64SortColumn::Group => {
+                        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+                    }
+                };
+                let survivors = launch_cuda_resident_having_filter(
+                    resident,
+                    group_i64.ptr,
+                    agg_ptr,
+                    output_count,
+                    clauses,
+                )?;
+                drop(agg_widen);
+                let survivor_set: std::collections::HashSet<u32> = survivors.into_iter().collect();
+                full_perm
+                    .into_iter()
+                    .filter(|index| survivor_set.contains(index))
+                    .collect()
+            } else {
+                full_perm
+            };
+
+            // OFFSET / LIMIT window on the host (applied after HAVING).
+            let start = usize::try_from(order.offset)
+                .unwrap_or(usize::MAX)
+                .min(ordered.len());
+            let end = match order.limit {
+                Some(limit) => start
+                    .saturating_add(usize::try_from(limit).unwrap_or(usize::MAX))
+                    .min(ordered.len()),
+                None => ordered.len(),
+            };
+            Some(ordered[start..end].to_vec())
         }
         Some(_) => Some(Vec::new()),
         None => None,
@@ -8185,6 +8274,107 @@ fn launch_cuda_resident_pack_grouped_sort_key(
         (&mut n_arg as *mut u64).cast::<c_void>(),
         (&mut desc_arg as *mut u32).cast::<c_void>(),
         (&mut outk_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+    resident.record_kernel_event_elapsed_us(None);
+    drop(lease);
+    Ok(())
+}
+
+/// §9.5/S5a.3 slice 4 — widen an i32 device column (`src_device_ptr[0..n]`) to i64 (sign-extend) into
+/// `dst_device_ptr[0..n]`, so the grouped result's i32 group/min/max columns can be fed to the GPU
+/// HAVING filter (which compares i64 group + i64 aggregate).
+fn launch_cuda_resident_widen_i32_to_i64(
+    resident: &CudaResidentDeviceMemory,
+    src_device_ptr: u64,
+    n: u64,
+    dst_device_ptr: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("widen.ptx");
+
+    if n == 0 {
+        return Ok(());
+    }
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_widen_i32_to_i64", &ptx)?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        pooled: Option<PooledStream>,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let stream = lease
+        .pooled
+        .as_ref()
+        .expect("pooled stream just set")
+        .stream;
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut src_arg = src_device_ptr;
+    let mut n_arg = n;
+    let mut dst_arg = dst_device_ptr;
+    let mut args = [
+        (&mut src_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut dst_arg as *mut u64).cast::<c_void>(),
     ];
     check_cuda(unsafe {
         cu_launch_kernel(
@@ -17325,7 +17515,7 @@ mod tests {
         };
         let groups_of = |o| {
             resident
-                .grouped_stats_i32_ordered_from_payload(go, vo, n, o)
+                .grouped_stats_i32_ordered_from_payload(go, vo, n, o, None)
                 .expect("ordered grouped")
                 .0
                 .iter()
@@ -17360,6 +17550,39 @@ mod tests {
             groups_of(order(Group, false, 0, None)),
             vec![0, 1, 2, 3],
             "group ASC"
+        );
+
+        // HAVING (GPU DNF filter) composed with ORDER BY + the host window.
+        let having = |o, agg, clauses: &[Vec<(u32, u32, i64)>]| {
+            resident
+                .grouped_stats_i32_ordered_from_payload(go, vo, n, o, Some((agg, clauses)))
+                .expect("having grouped")
+                .0
+                .iter()
+                .map(|g| g.group)
+                .collect::<Vec<_>>()
+        };
+        // count >= 2 keeps g0,g1,g2 (counts 4,3,2), drops g3; ORDER BY count DESC.
+        assert_eq!(
+            having(order(Count, true, 0, None), Count, &[vec![(1, 4, 2)]]),
+            vec![0, 1, 2],
+            "HAVING count>=2"
+        );
+        // min >= 20 keeps g2,g3 (mins 20,100); ORDER BY group ASC.
+        assert_eq!(
+            having(order(Group, false, 0, None), Min, &[vec![(1, 4, 20)]]),
+            vec![2, 3],
+            "HAVING min>=20"
+        );
+        // (group <= 1) OR (min >= 100): g0,g1 (group<=1) plus g3 (min 100); ORDER BY group ASC.
+        assert_eq!(
+            having(
+                order(Group, false, 0, None),
+                Min,
+                &[vec![(0, 2, 1)], vec![(1, 4, 100)]]
+            ),
+            vec![0, 1, 3],
+            "HAVING group<=1 OR min>=100"
         );
 
         // counts g0..g3 = 4,3,2,1 ; sums = 4,15,40,100.
@@ -17401,7 +17624,7 @@ mod tests {
 
         // Materialized values for the windowed result are correct (group + count + sum + min/max).
         let (top_by_sum, group_count) = resident
-            .grouped_stats_i32_ordered_from_payload(go, vo, n, order(Sum, true, 0, Some(1)))
+            .grouped_stats_i32_ordered_from_payload(go, vo, n, order(Sum, true, 0, Some(1)), None)
             .expect("top by sum");
         assert_eq!(
             group_count, 4,
@@ -17471,7 +17694,7 @@ mod tests {
         };
         let groups_of = |o| {
             resident
-                .grouped_stats_i32_ordered_from_payload(go, vo, n, o)
+                .grouped_stats_i32_ordered_from_payload(go, vo, n, o, None)
                 .expect("ordered grouped")
                 .0
                 .iter()
