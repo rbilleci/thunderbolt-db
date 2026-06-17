@@ -1331,6 +1331,32 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_compare_project(self, byte_offset, row_count, needle, comparison)
     }
 
+    /// PROTOTYPE for the general GPU executor (docs/architecture/17 §5): evaluate the predicate
+    /// `(a <op> b) <cmp> needle` over two resident int4 columns by composing two buffer->buffer
+    /// primitives (elementwise binary into an intermediate buffer, then compare->matching-row-
+    /// indices). Returns the matching row indices, host-sorted ascending. `op_code` 0=add/1=sub/2=mul;
+    /// `comparison` 0=eq/1=lt/2=le/3=gt/4=ge. Demonstrates the vectorized-interpreter model (an Expr
+    /// tree lowered to a pipeline of primitives over intermediates), not a new shape kernel.
+    pub fn expr_filter_two_col_compare_from_payload(
+        &self,
+        a_byte_offset: u64,
+        b_byte_offset: u64,
+        op_code: u32,
+        row_count: u64,
+        needle: i32,
+        comparison: u32,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_expr_two_col_filter(
+            self,
+            a_byte_offset,
+            b_byte_offset,
+            op_code,
+            row_count,
+            needle,
+            comparison,
+        )
+    }
+
     pub fn project_i32_compare_ordered_from_payload(
         &self,
         byte_offset: u64,
@@ -8514,6 +8540,197 @@ fn launch_cuda_resident_gather_i64_by_u32_perm(
     })
 }
 
+// PROTOTYPE — general GPU executor (docs/architecture/17-general-gpu-executor.md §5).
+// Evaluates the predicate `(a <op> b) <cmp> needle` over two resident int4 columns by COMPOSING two
+// buffer->buffer primitives on one pooled stream — the vectorized-interpreter model that replaces
+// hand-coded per-shape kernels:
+//   (1) `gpu_db_resident_i32_binary_elementwise` writes the INTERMEDIATE `t = a <op> b` into a leased
+//       device buffer (the key generalization: `t` is not a resident payload column);
+//   (2) `gpu_db_buffer_i32_compare_to_indices` scans the intermediate `t` and atomic-appends the
+//       matching row indices.
+// Returns the matching row indices, host-sorted ascending for determinism (the atomic-append order is
+// the non-deterministic GPU schedule; same pattern as `..._equal_row_indices`). The caller gathers
+// the projected column at these indices via the existing `project_i32_rows_from_payload`. This is a
+// proof of the buffer-intermediate + Expr-lowering + primitive-composition models, NOT a new shape
+// method — the predicate is interpreted, and arbitrary trees lower to longer pipelines of the same
+// primitives.
+fn launch_cuda_resident_expr_two_col_filter(
+    resident: &CudaResidentDeviceMemory,
+    a_byte_offset: u64,
+    b_byte_offset: u64,
+    op_code: u32,
+    n: u64,
+    needle: i32,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let byte_len = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let elementwise_fn =
+        primary.cached_function(c"gpu_db_resident_i32_binary_elementwise", &ptx)?;
+    let compare_fn = primary.cached_function(c"gpu_db_buffer_i32_compare_to_indices", &ptx)?;
+
+    // Intermediate `t` buffer, the matching-index output buffer, and the atomic counter.
+    let intermediate = primary.lease_device_buffer(byte_len)?;
+    let indices_buf = primary.lease_device_buffer(byte_len)?;
+    let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+    // Zero the atomic counter with a blocking HtoD before the kernels (synchronous, so it completes
+    // before the pooled-stream launches read it).
+    let zero = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            count_buf.ptr,
+            (&zero as *const u32).cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+
+    let mut res_arg = resident.device_ptr();
+    let mut a_arg = a_byte_offset;
+    let mut b_arg = b_byte_offset;
+    let mut n_arg = n;
+    let mut op_arg = op_code;
+    let mut t_arg = intermediate.ptr;
+    let mut ew_args = [
+        (&mut res_arg as *mut u64).cast::<c_void>(),
+        (&mut a_arg as *mut u64).cast::<c_void>(),
+        (&mut b_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut op_arg as *mut u32).cast::<c_void>(),
+        (&mut t_arg as *mut u64).cast::<c_void>(),
+    ];
+
+    let mut in_arg = intermediate.ptr;
+    let mut n2_arg = n;
+    let mut needle_arg = needle;
+    let mut cmp_arg = comparison;
+    let mut count_arg = count_buf.ptr;
+    let mut idx_arg = indices_buf.ptr;
+    let mut cmp_args = [
+        (&mut in_arg as *mut u64).cast::<c_void>(),
+        (&mut n2_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut cmp_arg as *mut u32).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+        (&mut idx_arg as *mut u64).cast::<c_void>(),
+    ];
+
+    // Both kernels on ONE pooled stream: stream order makes the compare read `t` only after the
+    // elementwise write completes. `launch_on_pooled_stream` syncs (and drains on error) before
+    // returning, so the blocking readback below sees finished work.
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let first = unsafe {
+            cu_launch_kernel(
+                elementwise_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                ew_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if first != 0 {
+            return first;
+        }
+        unsafe {
+            cu_launch_kernel(
+                compare_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                cmp_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+
+    let mut match_count = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut match_count as *mut u32).cast::<c_void>(),
+            count_buf.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    let match_count = usize::try_from(match_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?
+        .min(n_usize);
+    let mut indices = vec![0_u32; match_count];
+    if match_count > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                indices.as_mut_ptr().cast::<c_void>(),
+                indices_buf.ptr,
+                match_count * std::mem::size_of::<u32>(),
+            )
+        })?;
+    }
+    // Atomic-append order is the GPU schedule; sort for a deterministic result (matches the engine's
+    // stable row order and the `..._equal_row_indices` host-sort).
+    indices.sort_unstable();
+    Ok(indices)
+}
+
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
 // operator). Sorts N i64 keys (resident, at `keys_byte_offset`) by (key, original index) and returns
 // the permutation indices, ascending or descending. Two kernels on one pooled stream:
@@ -15021,6 +15238,103 @@ mod tests {
         assert_eq!(
             all, column,
             "Gte i32::MIN must return the whole column in row order"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_expr_two_col_filter_evaluates_arithmetic_predicate_on_gpu() {
+        // PROTOTYPE for the general GPU executor (docs/architecture/17-general-gpu-executor.md §5):
+        // prove a predicate the enumerated shape-path CANNOT express — an ARITHMETIC expression
+        // `(a <op> b) <cmp> k` — runs fully on the GPU by COMPOSING two buffer->buffer primitives
+        // (elementwise into an intermediate device buffer, then compare->matching-row-indices). This
+        // is the vectorized-interpreter model that replaces hand-coded per-shape kernels.
+        //
+        // GPU-NATIVE oracle = CLOSED FORM, never a CPU re-implementation of the operator (project
+        // rule). With a[i]=i and b[i]=i the intermediate is a+b = 2*i, MONOTONE in the row index, so
+        // {i : 2*i > k} is exactly the contiguous range [k/2 + 1, n). That closed form is distinct
+        // from "only column a" ({i : i > k}) and from "a*b" ({i : i*i > k}), so matching it proves the
+        // kernel actually evaluated the Add-then-Gt tree over the intermediate, not a shortcut.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const ROW_COUNT: u64 = 5000;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let b_off = a_off + ROW_COUNT * std::mem::size_of::<i32>() as u64;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&ROW_COUNT.to_le_bytes());
+        let mut a_bytes = Vec::new();
+        let mut b_bytes = Vec::new();
+        for row in 0..ROW_COUNT as i32 {
+            a_bytes.extend_from_slice(&row.to_le_bytes());
+            b_bytes.extend_from_slice(&row.to_le_bytes());
+        }
+        let allocated_len = b_off + b_bytes.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: b_off,
+                        bytes: &b_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // op_code 0=add, comparison 3=gt. a+b = 2*i > K  <=>  i >= K/2 + 1  (K even).
+        const K: i32 = 4000;
+        let got = resident
+            .expr_filter_two_col_compare_from_payload(a_off, b_off, 0, ROW_COUNT, K, 3)
+            .expect("expr_filter add+gt");
+        let add_start = (K as u64 / 2) + 1; // 2001
+        let expected_add: Vec<u32> = (add_start..ROW_COUNT).map(|i| i as u32).collect();
+        assert_eq!(
+            got, expected_add,
+            "GPU a+b>{K} must be the closed-form monotone range [{add_start}, {ROW_COUNT}) — proves \
+             the interpreter evaluated Add then Gt over the intermediate buffer"
+        );
+        // Guard vacuity: 'only column a' (a>K) would be [K+1, n) = 999 matches, not 2999.
+        let only_a_count = (ROW_COUNT - (K as u64 + 1)) as usize;
+        assert_ne!(
+            got.len(),
+            only_a_count,
+            "result must differ from a>K — else the kernel ignored column b (read the intermediate?)"
+        );
+
+        // op_code 2=mul: a*b = i*i > M  <=>  i >= isqrt(M)+1. M = 3969 = 63*63 => i >= 64.
+        const M: i32 = 3969;
+        const MUL_START: u64 = 64;
+        let got_mul = resident
+            .expr_filter_two_col_compare_from_payload(a_off, b_off, 2, ROW_COUNT, M, 3)
+            .expect("expr_filter mul+gt");
+        let expected_mul: Vec<u32> = (MUL_START..ROW_COUNT).map(|i| i as u32).collect();
+        assert_eq!(
+            got_mul, expected_mul,
+            "GPU a*b>{M} must be [{MUL_START}, {ROW_COUNT}) — proves op_code routing (mul != add)"
+        );
+
+        // Boundaries: 0 matches (a+b can never exceed i32::MAX here) and all matches.
+        let none = resident
+            .expr_filter_two_col_compare_from_payload(a_off, b_off, 0, ROW_COUNT, i32::MAX, 3)
+            .expect("expr_filter zero-match");
+        assert!(none.is_empty(), "a+b > i32::MAX matches nothing");
+        let all = resident
+            .expr_filter_two_col_compare_from_payload(a_off, b_off, 0, ROW_COUNT, i32::MIN, 3)
+            .expect("expr_filter all-match");
+        let expected_all: Vec<u32> = (0..ROW_COUNT).map(|i| i as u32).collect();
+        assert_eq!(
+            all, expected_all,
+            "a+b > i32::MIN matches every row, in ascending row order"
         );
     }
 

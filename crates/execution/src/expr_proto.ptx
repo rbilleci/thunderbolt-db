@@ -1,0 +1,184 @@
+.version 6.0
+.target sm_60
+.address_size 64
+
+// Prototype primitives for the GENERAL GPU executor (docs/architecture/17-general-gpu-executor.md).
+// These prove the buffer->buffer model a vectorized Expr interpreter needs: an interior Expr node
+// (e.g. a+b) writes an INTERMEDIATE device buffer, not a resident payload column, and a later node
+// consumes that buffer. Two composable primitives; the interpreter chains them. Pure ASCII (the
+// runtime JIT rejects non-ASCII PTX even in comments).
+
+// out[i] = a[i] <op> b[i] over two resident int4 columns into a leased intermediate buffer.
+// op_code: 0=add, 1=sub, 2=mul. Grid-stride. `resident_ptr` is the payload base; columns are at
+// resident_ptr + a_byte_offset / + b_byte_offset (i32, row-major). `out_ptr` is an absolute
+// (leased) buffer of n*4 bytes.
+.visible .entry gpu_db_resident_i32_binary_elementwise(
+    .param .u64 resident_ptr,
+    .param .u64 a_byte_offset,
+    .param .u64 b_byte_offset,
+    .param .u64 n,
+    .param .u32 op_code,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %p_sub;
+    .reg .pred %p_mul;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %op;
+    .reg .s32 %va;
+    .reg .s32 %vb;
+    .reg .s32 %vr;
+    .reg .s32 %vtmp;
+    .reg .u64 %res;
+    .reg .u64 %abase;
+    .reg .u64 %bbase;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+
+    ld.param.u64 %res, [resident_ptr];
+    ld.param.u64 %abase, [a_byte_offset];
+    ld.param.u64 %bbase, [b_byte_offset];
+    ld.param.u64 %n, [n];
+    ld.param.u32 %op, [op_code];
+    ld.param.u64 %out, [out_ptr];
+    add.u64 %abase, %res, %abase;
+    add.u64 %bbase, %res, %bbase;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_ew:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_ew;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %abase, %o4;
+    ld.global.s32 %va, [%addr];
+    add.u64 %addr, %bbase, %o4;
+    ld.global.s32 %vb, [%addr];
+    add.s32 %vr, %va, %vb;
+    setp.eq.u32 %p_sub, %op, 1;
+    sub.s32 %vtmp, %va, %vb;
+    @%p_sub mov.b32 %vr, %vtmp;
+    setp.eq.u32 %p_mul, %op, 2;
+    mul.lo.s32 %vtmp, %va, %vb;
+    @%p_mul mov.b32 %vr, %vtmp;
+    add.u64 %addr, %out, %o4;
+    st.global.s32 [%addr], %vr;
+    add.u64 %i, %i, %stride;
+    bra loop_ew;
+done_ew:
+    ret;
+}
+
+// Compare an int4 INTERMEDIATE buffer to a scalar and append the matching row indices to
+// out_indices via an atomic counter at out_count_ptr[0]. comparison: 0=eq,1=lt,2=le,3=gt,4=ge.
+// Order is atomic-schedule (non-deterministic); the host sorts the returned indices for
+// determinism (mirrors gpu_db_resident_i32_equal_row_indices). out_indices capacity is n*4 bytes,
+// out_count_ptr is a single u32 pre-zeroed by the caller.
+.visible .entry gpu_db_buffer_i32_compare_to_indices(
+    .param .u64 in_ptr,
+    .param .u64 n,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 out_count_ptr,
+    .param .u64 out_indices_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %p_eq;
+    .reg .pred %p_lt;
+    .reg .pred %p_le;
+    .reg .pred %p_gt;
+    .reg .pred %p_ge;
+    .reg .pred %c_eq;
+    .reg .pred %c_lt;
+    .reg .pred %c_le;
+    .reg .pred %c_gt;
+    .reg .pred %c_ge;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %cmp;
+    .reg .u32 %pos;
+    .reg .u32 %iu;
+    .reg .s32 %needle;
+    .reg .s32 %v;
+    .reg .u64 %in;
+    .reg .u64 %n;
+    .reg .u64 %count;
+    .reg .u64 %outidx;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %cmp, [comparison];
+    ld.param.u64 %count, [out_count_ptr];
+    ld.param.u64 %outidx, [out_indices_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_cmp:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_cmp;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %in, %o4;
+    ld.global.s32 %v, [%addr];
+    setp.eq.s32 %p_eq, %v, %needle;
+    setp.lt.s32 %p_lt, %v, %needle;
+    setp.le.s32 %p_le, %v, %needle;
+    setp.gt.s32 %p_gt, %v, %needle;
+    setp.ge.s32 %p_ge, %v, %needle;
+    setp.eq.u32 %c_eq, %cmp, 0;
+    setp.eq.u32 %c_lt, %cmp, 1;
+    setp.eq.u32 %c_le, %cmp, 2;
+    setp.eq.u32 %c_gt, %cmp, 3;
+    setp.eq.u32 %c_ge, %cmp, 4;
+    mov.pred %match, 0;
+    and.pred %p_eq, %p_eq, %c_eq;
+    or.pred %match, %match, %p_eq;
+    and.pred %p_lt, %p_lt, %c_lt;
+    or.pred %match, %match, %p_lt;
+    and.pred %p_le, %p_le, %c_le;
+    or.pred %match, %match, %p_le;
+    and.pred %p_gt, %p_gt, %c_gt;
+    or.pred %match, %match, %p_gt;
+    and.pred %p_ge, %p_ge, %c_ge;
+    or.pred %match, %match, %p_ge;
+    @!%match bra next_cmp;
+    atom.global.add.u32 %pos, [%count], 1;
+    cvt.u32.u64 %iu, %i;
+    mul.lo.u32 %t32, %pos, 4;
+    cvt.u64.u32 %addr, %t32;
+    add.u64 %addr, %outidx, %addr;
+    st.global.u32 [%addr], %iu;
+next_cmp:
+    add.u64 %i, %i, %stride;
+    bra loop_cmp;
+done_cmp:
+    ret;
+}
