@@ -140,6 +140,28 @@ Primitive-kernel library (★ = exists today as a fused/probe kernel, reusable;
 | argsort / sort | `Sort` | ★ (two-key sort built in §9.5) |
 | hash build/probe | `Join` | + (spine 1.4) |
 
+#### Numeric overflow: checked, on-device, never-wrong (decided 2026-06-18)
+
+int4 arithmetic (`+ - *`) is **checked on the device**, matching PostgreSQL's
+`integer out of range` (Charter rule 2 PG-fidelity) — it is *never* allowed to
+silently wrap and mis-answer, and it is *never* gated to a CPU path (Charter rule
+1). Each op is evaluated in 64-bit on the GPU (`cvt.s64.s32`, `mul.lo.s32` →
+`mul.lo.s64`), range-checked against the inclusive int32 bounds, and an
+out-of-range result ORs into one device overflow flag shared by the whole bytecode
+program; after the program runs the host reads the flag once and raises the error.
+The stored value remains the wrapped low-32-bit result, which is only consumed when
+no row overflowed. The general type matrix (§6) extends this rule per type
+(int8/numeric compute checked too), additively.
+
+One **conscious, stricter-than-PG-but-never-wrong** property follows from the
+vectorized model: the interpreter evaluates every arithmetic sub-expression over
+*all* rows before combining masks, so a query errors if **any** row overflows in
+**any** conjunct — even a row another conjunct would have filtered out. PG's
+short-circuit there is plan-dependent and unspecified, so this only ever *errors
+where PG might not*; it never returns a wrong row. (If exact PG short-circuit
+parity is later required, it is a per-operator lazy-evaluation change, not a
+semantics reversal.)
+
 ### 2.4 Peephole fast-paths (where the enumerated kernels go)
 
 After the planner builds the physical plan, a **peephole pass** matches

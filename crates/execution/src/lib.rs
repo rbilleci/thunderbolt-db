@@ -1990,6 +1990,12 @@ pub enum CudaRuntimeProbeError {
     /// A comparison code outside the range the called primitive supports (the fused
     /// scalar/buffer compact kernels handle 0=eq..4=ge; `5=ne` is mask-path only).
     UnsupportedComparison(u32),
+    /// On-device int4 arithmetic (`+`/`-`/`*`) overflowed the int32 range on at least one row. The
+    /// device VM evaluates each op in 64-bit, range-checks it, and sets an overflow flag; the host
+    /// surfaces this so the query errors exactly as PostgreSQL's `integer out of range` (Charter
+    /// rule 2 PG-fidelity), never silently wrapping. GPU-native: detected on the device, no CPU
+    /// fallback.
+    IntegerOutOfRange,
 }
 
 impl fmt::Display for CudaRuntimeProbeError {
@@ -2006,6 +2012,9 @@ impl fmt::Display for CudaRuntimeProbeError {
             Self::UnsupportedComparison(code) => {
                 write!(f, "unsupported comparison code for this primitive: {code}")
             }
+            // Surfaced verbatim as the engine's error message, so it reads as PostgreSQL's
+            // `integer out of range` (SQLSTATE 22003) to a client.
+            Self::IntegerOutOfRange => write!(f, "integer out of range"),
         }
     }
 }
@@ -8665,12 +8674,22 @@ fn launch_cuda_resident_expr_two_col_filter(
     let intermediate = primary.lease_device_buffer(byte_len)?;
     let indices_buf = primary.lease_device_buffer(byte_len)?;
     let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
-    // Zero the atomic counter with a blocking HtoD before the kernels (synchronous, so it completes
-    // before the pooled-stream launches read it).
+    // CHECKED int4 arithmetic (Charter rule 2 PG-fidelity): the elementwise kernel ORs 1 into this
+    // flag if `a <op> b` overflows int32; the host raises `integer out of range` after the launches.
+    let overflow_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+    // Zero the atomic counter AND the overflow flag with blocking HtoDs before the kernels
+    // (synchronous, so they complete before the pooled-stream launches read/write them).
     let zero = 0_u32;
     check_cuda(unsafe {
         cu_memcpy_htod(
             count_buf.ptr,
+            (&zero as *const u32).cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            overflow_buf.ptr,
             (&zero as *const u32).cast::<c_void>(),
             std::mem::size_of::<u32>(),
         )
@@ -8685,6 +8704,7 @@ fn launch_cuda_resident_expr_two_col_filter(
     let mut n_arg = n;
     let mut op_arg = op_code;
     let mut t_arg = intermediate.ptr;
+    let mut ovf_arg = overflow_buf.ptr;
     let mut ew_args = [
         (&mut res_arg as *mut u64).cast::<c_void>(),
         (&mut a_arg as *mut u64).cast::<c_void>(),
@@ -8692,6 +8712,7 @@ fn launch_cuda_resident_expr_two_col_filter(
         (&mut n_arg as *mut u64).cast::<c_void>(),
         (&mut op_arg as *mut u32).cast::<c_void>(),
         (&mut t_arg as *mut u64).cast::<c_void>(),
+        (&mut ovf_arg as *mut u64).cast::<c_void>(),
     ];
 
     let mut in_arg = intermediate.ptr;
@@ -8747,6 +8768,21 @@ fn launch_cuda_resident_expr_two_col_filter(
             )
         }
     })?;
+
+    // PG-fidelity: if any row's `a <op> b` overflowed int32, the elementwise kernel set the flag.
+    // Raise `integer out of range` and discard the (now-untrustworthy) comparison result, exactly as
+    // Postgres aborts the statement. Read before the count so an overflow never returns rows.
+    let mut overflow = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut overflow as *mut u32).cast::<c_void>(),
+            overflow_buf.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    if overflow != 0 {
+        return Err(CudaRuntimeProbeError::IntegerOutOfRange);
+    }
 
     let mut match_count = 0_u32;
     check_cuda(unsafe {
@@ -9104,6 +9140,8 @@ fn run_resident_arith_program<'r>(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -9119,6 +9157,20 @@ fn run_resident_arith_program<'r>(
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
@@ -9130,6 +9182,21 @@ fn run_resident_arith_program<'r>(
     let compare_buffers_mask_fn =
         primary.cached_function(c"gpu_db_buffer_i32_compare_buffers_to_mask", &ptx)?;
     let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &ptx)?;
+
+    // CHECKED int4 arithmetic (Charter rule 2 PG-fidelity): ONE overflow flag shared by every
+    // arithmetic step of the program. The checked kernels OR 1 into it when an op overflows int32;
+    // after the program runs (each pooled-stream launch syncs) the host reads it once and raises
+    // `integer out of range`, exactly like Postgres — never a silent wrap, and on-device (no CPU
+    // fallback). Zeroed with a blocking HtoD so it is initialized before the first launch reads it.
+    let overflow_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+    let overflow_zero = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            overflow_buf.ptr,
+            (&overflow_zero as *const u32).cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+        )
+    })?;
 
     const BLOCK: u32 = 256;
     let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -9185,12 +9252,14 @@ fn run_resident_arith_program<'r>(
                 let mut a2 = op;
                 let mut a3 = n;
                 let mut a4 = out.ptr;
+                let mut a5 = overflow_buf.ptr;
                 let mut args = [
                     (&mut a0 as *mut u64).cast::<c_void>(),
                     (&mut a1 as *mut u64).cast::<c_void>(),
                     (&mut a2 as *mut u32).cast::<c_void>(),
                     (&mut a3 as *mut u64).cast::<c_void>(),
                     (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
                 ];
                 launch(buffer_binary_fn, &mut args)?;
                 stack.push(out);
@@ -9210,6 +9279,7 @@ fn run_resident_arith_program<'r>(
                 let mut a3 = u32::from(scalar_on_left);
                 let mut a4 = n;
                 let mut a5 = out.ptr;
+                let mut a6 = overflow_buf.ptr;
                 let mut args = [
                     (&mut a0 as *mut u64).cast::<c_void>(),
                     (&mut a1 as *mut i32).cast::<c_void>(),
@@ -9217,6 +9287,7 @@ fn run_resident_arith_program<'r>(
                     (&mut a3 as *mut u32).cast::<c_void>(),
                     (&mut a4 as *mut u64).cast::<c_void>(),
                     (&mut a5 as *mut u64).cast::<c_void>(),
+                    (&mut a6 as *mut u64).cast::<c_void>(),
                 ];
                 launch(scalar_binary_fn, &mut args)?;
                 stack.push(out);
@@ -9295,6 +9366,22 @@ fn run_resident_arith_program<'r>(
             }
         }
     }
+
+    // Every arithmetic launch has synced; read the shared overflow flag once. Any int4-overflowing
+    // op set it, so the whole query must error like Postgres (`integer out of range`) rather than
+    // return rows computed from a silently-wrapped value.
+    let mut overflow = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut overflow as *mut u32).cast::<c_void>(),
+            overflow_buf.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    if overflow != 0 {
+        return Err(CudaRuntimeProbeError::IntegerOutOfRange);
+    }
+
     Ok(stack)
 }
 
