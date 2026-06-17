@@ -1987,6 +1987,9 @@ pub enum CudaRuntimeProbeError {
     InvalidDeviceCount(i32),
     InvalidInputLength(usize),
     KernelLaunchFailed(i32),
+    /// A comparison code outside the range the called primitive supports (the fused
+    /// scalar/buffer compact kernels handle 0=eq..4=ge; `5=ne` is mask-path only).
+    UnsupportedComparison(u32),
 }
 
 impl fmt::Display for CudaRuntimeProbeError {
@@ -2000,6 +2003,9 @@ impl fmt::Display for CudaRuntimeProbeError {
             Self::InvalidDeviceCount(count) => write!(f, "invalid CUDA device count: {count}"),
             Self::InvalidInputLength(len) => write!(f, "invalid CUDA input length: {len}"),
             Self::KernelLaunchFailed(code) => write!(f, "CUDA kernel launch failed: {code}"),
+            Self::UnsupportedComparison(code) => {
+                write!(f, "unsupported comparison code for this primitive: {code}")
+            }
         }
     }
 }
@@ -8827,6 +8833,11 @@ fn compact_buffer_i32_compare_to_indices(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
+    // The scalar compact kernel switches on codes 0=eq..4=ge only; reject 5=ne (mask-path only) so a
+    // caller gets an error, not a silently-empty result.
+    if comparison > 4 {
+        return Err(CudaRuntimeProbeError::UnsupportedComparison(comparison));
+    }
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -8964,6 +8975,10 @@ fn compact_buffers_i32_compare_to_indices(
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
+    // The buffer compact kernel switches on codes 0=eq..4=ge only; reject 5=ne (mask-path only).
+    if comparison > 4 {
+        return Err(CudaRuntimeProbeError::UnsupportedComparison(comparison));
+    }
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -16329,6 +16344,126 @@ mod tests {
         let mut ne_expected: Vec<u32> = (0..300).collect();
         ne_expected.extend(301..N as u32);
         assert_eq!(got_ne, ne_expected, "a != 300 <=> all rows but index 300");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_expr_comparison_codes_and_operand_order_coverage() {
+        // Closes adversarial-audit coverage gaps (all verified correct by the audit, now permanent):
+        // every comparison code on BOTH the fused compact path (run_expr_arith_filter, codes 0..4) and
+        // the mask path (run_expr_predicate_filter, codes 0..5), the mask CompareScalar
+        // {scalar_on_left:true} branch (reachable from `WHERE 5 < a`), buffer-vs-buffer le/lt/ne, and
+        // the new cmp>4 guard on the fused compact fns. a[i]=i; closed-form ranges.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const N: u64 = 600;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&N.to_le_bytes());
+        let mut a_bytes = Vec::new();
+        for i in 0..N as i32 {
+            a_bytes.extend_from_slice(&i.to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                a_off + a_bytes.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+        let load = ExprStep::LoadColumn { byte_offset: a_off };
+        let range = |lo: u32, hi: u32| -> Vec<u32> { (lo..hi).collect() };
+
+        // Fused compact path (run_expr_arith_filter, value buffer vs scalar): eq / le / ge.
+        assert_eq!(
+            resident.run_expr_arith_filter(&[load], N, 0, 300).unwrap(),
+            vec![300u32],
+            "a == 300"
+        );
+        assert_eq!(
+            resident.run_expr_arith_filter(&[load], N, 2, 100).unwrap(),
+            range(0, 101),
+            "a <= 100"
+        );
+        assert_eq!(
+            resident.run_expr_arith_filter(&[load], N, 4, 500).unwrap(),
+            range(500, 600),
+            "a >= 500"
+        );
+        // cmp 5 (ne) is mask-path only — the fused path now rejects it instead of returning empty.
+        assert!(
+            resident.run_expr_arith_filter(&[load], N, 5, 0).is_err(),
+            "cmp=ne must be rejected by the fused compact path, not silently empty"
+        );
+
+        // Mask path (run_expr_predicate_filter): eq / le / ge + scalar_on_left:true.
+        let csm = |cmp: u32, scalar: i32, left: bool| ExprStep::CompareScalar {
+            cmp,
+            scalar,
+            scalar_on_left: left,
+        };
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&[load, csm(0, 300, false)], N)
+                .unwrap(),
+            vec![300u32],
+            "mask a == 300"
+        );
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&[load, csm(2, 100, false)], N)
+                .unwrap(),
+            range(0, 101),
+            "mask a <= 100"
+        );
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&[load, csm(4, 500, false)], N)
+                .unwrap(),
+            range(500, 600),
+            "mask a >= 500"
+        );
+        // scalar_on_left: `5 < a` <=> a > 5 <=> [6, 600).
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&[load, csm(1, 5, true)], N)
+                .unwrap(),
+            range(6, 600),
+            "5 < a (scalar_on_left) <=> a > 5"
+        );
+        // `5 >= a` <=> a <= 5 <=> [0, 6).
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&[load, csm(4, 5, true)], N)
+                .unwrap(),
+            range(0, 6),
+            "5 >= a (scalar_on_left) <=> a <= 5"
+        );
+
+        // Buffer-vs-buffer mask, self-compare: a<=a all, a<a none, a!=a none.
+        let cb = |cmp: u32| [load, load, ExprStep::CompareBuffers { cmp }];
+        assert_eq!(
+            resident.run_expr_predicate_filter(&cb(2), N).unwrap(),
+            range(0, N as u32),
+            "a <= a is all rows"
+        );
+        assert!(
+            resident.run_expr_predicate_filter(&cb(1), N).unwrap().is_empty(),
+            "a < a is empty"
+        );
+        assert!(
+            resident.run_expr_predicate_filter(&cb(5), N).unwrap().is_empty(),
+            "a != a is empty"
+        );
     }
 
     #[test]
