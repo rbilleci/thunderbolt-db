@@ -93,7 +93,7 @@ fn is_int4_literal(expr: &ResidentExpr) -> bool {
     matches!(expr, ResidentExpr::Int4Literal(_))
 }
 
-/// Compile an int4 arithmetic value expression into postfix [`ExprArithStep`] bytecode for the device
+/// Compile an int4 arithmetic value expression into postfix [`ExprStep`] bytecode for the device
 /// VM. Recurses: a `Column` loads to a buffer; a `Binary{arith}` emits its operands then a buffer x
 /// buffer op, or folds an immediate literal operand into a buffer x scalar op (preserving operand
 /// side). Rejects non-arithmetic ops and literal-only subtrees (host constant-folding is a later
@@ -102,12 +102,12 @@ fn compile_arith_program(
     expr: &ResidentExpr,
     table: &RelationalTable,
     snapshot: &RelationalResidencySnapshot,
-    program: &mut Vec<ExprArithStep>,
+    program: &mut Vec<ExprStep>,
 ) -> Result<(), ExecuteError> {
     match expr {
         ResidentExpr::Column(col) => {
             let byte_offset = resident_device_int4_column_offset(snapshot, table, *col)?;
-            program.push(ExprArithStep::LoadColumn { byte_offset });
+            program.push(ExprStep::LoadColumn { byte_offset });
             Ok(())
         }
         ResidentExpr::Binary { op, lhs, rhs } => {
@@ -120,7 +120,7 @@ fn compile_arith_program(
             match (lhs.as_ref(), rhs.as_ref()) {
                 (value, ResidentExpr::Int4Literal(scalar)) if !is_int4_literal(value) => {
                     compile_arith_program(value, table, snapshot, program)?;
-                    program.push(ExprArithStep::ScalarBinary {
+                    program.push(ExprStep::ScalarBinary {
                         op: op_code,
                         scalar: *scalar,
                         scalar_on_left: false,
@@ -129,7 +129,7 @@ fn compile_arith_program(
                 }
                 (ResidentExpr::Int4Literal(scalar), value) if !is_int4_literal(value) => {
                     compile_arith_program(value, table, snapshot, program)?;
-                    program.push(ExprArithStep::ScalarBinary {
+                    program.push(ExprStep::ScalarBinary {
                         op: op_code,
                         scalar: *scalar,
                         scalar_on_left: true,
@@ -141,7 +141,7 @@ fn compile_arith_program(
                 {
                     compile_arith_program(lhs_expr, table, snapshot, program)?;
                     compile_arith_program(rhs_expr, table, snapshot, program)?;
-                    program.push(ExprArithStep::BufferBinary { op: op_code });
+                    program.push(ExprStep::BufferBinary { op: op_code });
                     Ok(())
                 }
                 _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -153,6 +153,88 @@ fn compile_arith_program(
         }
         ResidentExpr::Int4Literal(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "resident Expr arithmetic value cannot be a bare literal (constant-folding pending)"
+                .to_string(),
+        ))),
+    }
+}
+
+/// Device comparison code including `Ne` (matches the mask kernels: 0=eq, 1=lt, 2=le, 3=gt, 4=ge,
+/// 5=ne), used by the mask-based predicate VM. (`compare_op_code` omits `Ne` because the fused
+/// scalar/buffer compact kernels only cover 0-4.)
+fn predicate_compare_code(op: ResidentBinaryOp) -> Option<u32> {
+    match op {
+        ResidentBinaryOp::Eq => Some(0),
+        ResidentBinaryOp::Lt => Some(1),
+        ResidentBinaryOp::Le => Some(2),
+        ResidentBinaryOp::Gt => Some(3),
+        ResidentBinaryOp::Ge => Some(4),
+        ResidentBinaryOp::Ne => Some(5),
+        _ => None,
+    }
+}
+
+/// Device boolean-combinator code for the mask `MaskBinary` step (0=and, 1=or), or `None`.
+fn boolean_op_code(op: ResidentBinaryOp) -> Option<u32> {
+    match op {
+        ResidentBinaryOp::And => Some(0),
+        ResidentBinaryOp::Or => Some(1),
+        _ => None,
+    }
+}
+
+/// Compile a boolean predicate expression into postfix [`ExprStep`] bytecode that leaves one MASK on
+/// the VM stack. Recurses: `AND`/`OR` compile both operand predicates then a `MaskBinary`; a
+/// comparison compiles its arithmetic operand(s) (via [`compile_arith_program`]) then a
+/// `CompareScalar`/`CompareBuffers` mask step. The predicate VM compacts the final mask to indices.
+fn compile_predicate_program(
+    expr: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+) -> Result<(), ExecuteError> {
+    let ResidentExpr::Binary { op, lhs, rhs } = expr else {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident predicate must be a comparison or boolean (AND/OR) combination".to_string(),
+        )));
+    };
+    if let Some(bool_op) = boolean_op_code(*op) {
+        compile_predicate_program(lhs, table, snapshot, program)?;
+        compile_predicate_program(rhs, table, snapshot, program)?;
+        program.push(ExprStep::MaskBinary { op: bool_op });
+        return Ok(());
+    }
+    let Some(cmp) = predicate_compare_code(*op) else {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident predicate node must be a comparison (eq/ne/lt/le/gt/ge) or AND/OR".to_string(),
+        )));
+    };
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (value, ResidentExpr::Int4Literal(scalar)) if !is_int4_literal(value) => {
+            compile_arith_program(value, table, snapshot, program)?;
+            program.push(ExprStep::CompareScalar {
+                cmp,
+                scalar: *scalar,
+                scalar_on_left: false,
+            });
+            Ok(())
+        }
+        (ResidentExpr::Int4Literal(scalar), value) if !is_int4_literal(value) => {
+            compile_arith_program(value, table, snapshot, program)?;
+            program.push(ExprStep::CompareScalar {
+                cmp,
+                scalar: *scalar,
+                scalar_on_left: true,
+            });
+            Ok(())
+        }
+        (lhs_expr, rhs_expr) if !is_int4_literal(lhs_expr) && !is_int4_literal(rhs_expr) => {
+            compile_arith_program(lhs_expr, table, snapshot, program)?;
+            compile_arith_program(rhs_expr, table, snapshot, program)?;
+            program.push(ExprStep::CompareBuffers { cmp });
+            Ok(())
+        }
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident predicate comparison cannot be literal-vs-literal (constant-folding pending)"
                 .to_string(),
         ))),
     }
@@ -285,12 +367,28 @@ impl Engine {
         } = predicate
         else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident Expr predicate must be a top-level comparison".to_string(),
+                "resident Expr predicate must be a top-level comparison or AND/OR".to_string(),
             )));
         };
+
+        // Boolean combinators (AND/OR) and `Ne` lower to the general mask-based predicate VM (each
+        // comparison -> a mask, MaskBinary combines, the terminal compacts). The fused 2-col / arith
+        // / col-vs-col fast paths below handle the single eq/lt/le/gt/ge comparisons.
+        if matches!(
+            compare,
+            ResidentBinaryOp::And | ResidentBinaryOp::Or | ResidentBinaryOp::Ne
+        ) {
+            let mut program = Vec::new();
+            compile_predicate_program(predicate, table, snapshot, &mut program)?;
+            return device_memory
+                .run_expr_predicate_filter(&program, row_count)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
+        }
+
         let Some(comparison) = compare_op_code(*compare) else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident Expr predicate requires a comparison op (eq/lt/le/gt/ge)".to_string(),
+                "resident Expr predicate requires a comparison op (eq/lt/le/gt/ge/ne) or AND/OR"
+                    .to_string(),
             )));
         };
 

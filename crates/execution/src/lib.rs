@@ -1363,7 +1363,7 @@ impl CudaResidentDeviceMemory {
     /// interpreter behind the engine's `ResidentExpr` lowering; `comparison` 0=eq/1=lt/2=le/3=gt/4=ge.
     pub fn run_expr_arith_filter(
         &self,
-        program: &[ExprArithStep],
+        program: &[ExprStep],
         row_count: u64,
         comparison: u32,
         needle: i32,
@@ -1377,11 +1377,22 @@ impl CudaResidentDeviceMemory {
     /// 4=ge.
     pub fn run_expr_compare_buffers_filter(
         &self,
-        program: &[ExprArithStep],
+        program: &[ExprStep],
         row_count: u64,
         comparison: u32,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_resident_expr_compare_buffers_filter(self, program, row_count, comparison)
+    }
+
+    /// Run a boolean predicate bytecode `program` (comparisons producing masks, combined by
+    /// `MaskBinary` AND/OR) to one mask buffer, then compact it to the matching row indices. The
+    /// general boolean-predicate VM behind the engine's `AND`/`OR`/`Ne` lowering.
+    pub fn run_expr_predicate_filter(
+        &self,
+        program: &[ExprStep],
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_expr_predicate_filter(self, program, row_count)
     }
 
     pub fn project_i32_compare_ordered_from_payload(
@@ -8758,13 +8769,14 @@ fn launch_cuda_resident_expr_two_col_filter(
     Ok(indices)
 }
 
-/// One step of the resident arithmetic bytecode (docs/architecture/17 section 2.3): a postfix
-/// program over a stack of device buffers that evaluates an int4 arithmetic expression tree. The
-/// engine compiles a `ResidentExpr` arithmetic subtree to a `Vec<ExprArithStep>`; the VM
-/// (`run_expr_arith_filter`) executes it on device, then compares the single result buffer to a
-/// literal to produce the matching row indices. `op` is 0=add, 1=sub, 2=mul.
+/// One step of the resident expression bytecode (docs/architecture/17 section 2.3): a postfix
+/// program over a stack of device buffers. Value steps build an int4 arithmetic expression into a
+/// value buffer; comparison steps turn value buffer(s) into a 0/1 MASK buffer; `MaskBinary` combines
+/// masks. A boolean predicate program leaves one mask (compacted to indices by the predicate VM); the
+/// arithmetic / col-vs-col filters use only the value steps and fuse the terminal comparison. `op` is
+/// 0=add/1=sub/2=mul (arithmetic) or 0=and/1=or (mask); `cmp` is 0=eq/1=lt/2=le/3=gt/4=ge/5=ne.
 #[derive(Debug, Clone, Copy)]
-pub enum ExprArithStep {
+pub enum ExprStep {
     /// Push the resident int4 column at `byte_offset` (loaded into a fresh buffer).
     LoadColumn { byte_offset: u64 },
     /// Pop b, pop a, push `a <op> b` (buffer x buffer).
@@ -8776,6 +8788,16 @@ pub enum ExprArithStep {
         scalar: i32,
         scalar_on_left: bool,
     },
+    /// Pop a (value), push the mask `(scalar_on_left ? scalar <cmp> a : a <cmp> scalar) ? 1 : 0`.
+    CompareScalar {
+        cmp: u32,
+        scalar: i32,
+        scalar_on_left: bool,
+    },
+    /// Pop b, pop a (values), push the mask `(a <cmp> b) ? 1 : 0`.
+    CompareBuffers { cmp: u32 },
+    /// Pop b, pop a (masks), push `op==0 ? a&&b : a||b` (0/1).
+    MaskBinary { op: u32 },
 }
 
 /// Compare an int4 value buffer (absolute device ptr) to `needle` and return the matching row
@@ -9051,7 +9073,7 @@ fn compact_buffers_i32_compare_to_indices(
 /// two for a buffer-vs-buffer compare). Callers handle `n == 0` before calling.
 fn run_resident_arith_program<'r>(
     resident: &'r CudaResidentDeviceMemory,
-    program: &[ExprArithStep],
+    program: &[ExprStep],
     n: u64,
 ) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
@@ -9088,6 +9110,11 @@ fn run_resident_arith_program<'r>(
     let load_fn = primary.cached_function(c"gpu_db_resident_i32_load_column", &ptx)?;
     let buffer_binary_fn = primary.cached_function(c"gpu_db_buffer_i32_binary", &ptx)?;
     let scalar_binary_fn = primary.cached_function(c"gpu_db_buffer_i32_binary_scalar", &ptx)?;
+    let compare_scalar_mask_fn =
+        primary.cached_function(c"gpu_db_buffer_i32_compare_scalar_to_mask", &ptx)?;
+    let compare_buffers_mask_fn =
+        primary.cached_function(c"gpu_db_buffer_i32_compare_buffers_to_mask", &ptx)?;
+    let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &ptx)?;
 
     const BLOCK: u32 = 256;
     let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -9115,7 +9142,7 @@ fn run_resident_arith_program<'r>(
     let mut stack: Vec<PooledBufferLease> = Vec::new();
     for step in program {
         match *step {
-            ExprArithStep::LoadColumn { byte_offset } => {
+            ExprStep::LoadColumn { byte_offset } => {
                 let out = primary.lease_device_buffer(byte_len)?;
                 let mut a0 = resident_base;
                 let mut a1 = byte_offset;
@@ -9130,7 +9157,7 @@ fn run_resident_arith_program<'r>(
                 launch(load_fn, &mut args)?;
                 stack.push(out);
             }
-            ExprArithStep::BufferBinary { op } => {
+            ExprStep::BufferBinary { op } => {
                 let rhs = stack
                     .pop()
                     .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -9153,7 +9180,7 @@ fn run_resident_arith_program<'r>(
                 launch(buffer_binary_fn, &mut args)?;
                 stack.push(out);
             }
-            ExprArithStep::ScalarBinary {
+            ExprStep::ScalarBinary {
                 op,
                 scalar,
                 scalar_on_left,
@@ -9179,6 +9206,78 @@ fn run_resident_arith_program<'r>(
                 launch(scalar_binary_fn, &mut args)?;
                 stack.push(out);
             }
+            ExprStep::CompareScalar {
+                cmp,
+                scalar,
+                scalar_on_left,
+            } => {
+                let value = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = value.ptr;
+                let mut a1 = scalar;
+                let mut a2 = u32::from(scalar_on_left);
+                let mut a3 = cmp;
+                let mut a4 = n;
+                let mut a5 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut i32).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u32).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
+                ];
+                launch(compare_scalar_mask_fn, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::CompareBuffers { cmp } => {
+                let rhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let lhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = lhs.ptr;
+                let mut a1 = rhs.ptr;
+                let mut a2 = cmp;
+                let mut a3 = n;
+                let mut a4 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                ];
+                launch(compare_buffers_mask_fn, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::MaskBinary { op } => {
+                let rhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let lhs = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = lhs.ptr;
+                let mut a1 = rhs.ptr;
+                let mut a2 = op;
+                let mut a3 = n;
+                let mut a4 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                ];
+                launch(mask_binary_fn, &mut args)?;
+                stack.push(out);
+            }
         }
     }
     Ok(stack)
@@ -9187,7 +9286,7 @@ fn run_resident_arith_program<'r>(
 /// Evaluate an arithmetic `program` to one value buffer, then compare it to `needle` -> row indices.
 fn launch_cuda_resident_expr_arith_filter(
     resident: &CudaResidentDeviceMemory,
-    program: &[ExprArithStep],
+    program: &[ExprStep],
     n: u64,
     compare_code: u32,
     needle: i32,
@@ -9211,7 +9310,7 @@ fn launch_cuda_resident_expr_arith_filter(
 /// filter behind the engine's `Compare(expr, expr)` lowering.
 fn launch_cuda_resident_expr_compare_buffers_filter(
     resident: &CudaResidentDeviceMemory,
-    program: &[ExprArithStep],
+    program: &[ExprStep],
     n: u64,
     comparison: u32,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -9229,6 +9328,151 @@ fn launch_cuda_resident_expr_compare_buffers_filter(
         return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
     }
     compact_buffers_i32_compare_to_indices(resident, lhs.ptr, rhs.ptr, n, comparison)
+}
+
+/// Compact a 0/1 mask buffer (absolute device ptr) to the matching row indices, host-sorted. The
+/// terminal of the boolean predicate VM.
+fn compact_mask_i32_to_indices(
+    resident: &CudaResidentDeviceMemory,
+    mask_device_ptr: u64,
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let byte_len = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compact_fn = primary.cached_function(c"gpu_db_mask_compact_to_indices", &ptx)?;
+
+    let indices_buf = primary.lease_device_buffer(byte_len)?;
+    let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+    let zero = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            count_buf.ptr,
+            (&zero as *const u32).cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut mask_arg = mask_device_ptr;
+    let mut n_arg = n;
+    let mut count_arg = count_buf.ptr;
+    let mut idx_arg = indices_buf.ptr;
+    let mut args = [
+        (&mut mask_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+        (&mut idx_arg as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            compact_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    let mut match_count = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut match_count as *mut u32).cast::<c_void>(),
+            count_buf.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    let match_count = usize::try_from(match_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?
+        .min(n_usize);
+    let mut indices = vec![0_u32; match_count];
+    if match_count > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                indices.as_mut_ptr().cast::<c_void>(),
+                indices_buf.ptr,
+                match_count * std::mem::size_of::<u32>(),
+            )
+        })?;
+    }
+    indices.sort_unstable();
+    Ok(indices)
+}
+
+/// Evaluate a boolean predicate `program` (comparisons -> masks, combined by `MaskBinary`) to one
+/// mask buffer, then compact it to the matching row indices. The general boolean-predicate VM behind
+/// the engine's AND/OR / Ne lowering.
+fn launch_cuda_resident_expr_predicate_filter(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stack = run_resident_arith_program(resident, program, n)?;
+    let mask = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        // A well-formed predicate program leaves exactly one mask on the stack.
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
 }
 
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
@@ -15883,15 +16127,15 @@ mod tests {
         // Tree 1: (a + b) * 2 - 5 = 4*i - 5. Predicate > 395 <=> 4i > 400 <=> i >= 101.
         // Exercises BufferBinary(add) + ScalarBinary(mul, right) + ScalarBinary(sub, right).
         let p1 = [
-            ExprArithStep::LoadColumn { byte_offset: a_off },
-            ExprArithStep::LoadColumn { byte_offset: b_off },
-            ExprArithStep::BufferBinary { op: 0 },
-            ExprArithStep::ScalarBinary {
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::LoadColumn { byte_offset: b_off },
+            ExprStep::BufferBinary { op: 0 },
+            ExprStep::ScalarBinary {
                 op: 2,
                 scalar: 2,
                 scalar_on_left: false,
             },
-            ExprArithStep::ScalarBinary {
+            ExprStep::ScalarBinary {
                 op: 1,
                 scalar: 5,
                 scalar_on_left: false,
@@ -15905,11 +16149,11 @@ mod tests {
 
         // Tree 2: (a + b) * a = 2*i*i. Predicate > 200 <=> i*i > 100 <=> i >= 11. Buffer x buffer mul.
         let p2 = [
-            ExprArithStep::LoadColumn { byte_offset: a_off },
-            ExprArithStep::LoadColumn { byte_offset: b_off },
-            ExprArithStep::BufferBinary { op: 0 },
-            ExprArithStep::LoadColumn { byte_offset: a_off },
-            ExprArithStep::BufferBinary { op: 2 },
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::LoadColumn { byte_offset: b_off },
+            ExprStep::BufferBinary { op: 0 },
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::BufferBinary { op: 2 },
         ];
         let got2 = resident
             .run_expr_arith_filter(&p2, ROW_COUNT, 3, 200)
@@ -15919,8 +16163,8 @@ mod tests {
 
         // Tree 3: 10 - a. Predicate > 0 <=> i < 10. Exercises scalar_on_left (non-commutative sub).
         let p3 = [
-            ExprArithStep::LoadColumn { byte_offset: a_off },
-            ExprArithStep::ScalarBinary {
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::ScalarBinary {
                 op: 1,
                 scalar: 10,
                 scalar_on_left: true,
@@ -15975,8 +16219,8 @@ mod tests {
 
         // a < b  (cmp=1): program leaves [a, b]; 2i < 599 <=> i <= 299.
         let p_ab = [
-            ExprArithStep::LoadColumn { byte_offset: a_off },
-            ExprArithStep::LoadColumn { byte_offset: b_off },
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::LoadColumn { byte_offset: b_off },
         ];
         let lt = resident
             .run_expr_compare_buffers_filter(&p_ab, N, 1)
@@ -15993,9 +16237,9 @@ mod tests {
 
         // expr-vs-expr: a < a*2  (a=i, a*2=2i): i < 2i <=> i >= 1.
         let p_expr = [
-            ExprArithStep::LoadColumn { byte_offset: a_off },
-            ExprArithStep::LoadColumn { byte_offset: a_off },
-            ExprArithStep::ScalarBinary {
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::ScalarBinary {
                 op: 2,
                 scalar: 2,
                 scalar_on_left: false,
@@ -16006,6 +16250,85 @@ mod tests {
             .expect("a < a*2");
         let expr_expected: Vec<u32> = (1..N as u32).collect();
         assert_eq!(expr_lt, expr_expected, "a < a*2 <=> i >= 1");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_expr_predicate_filter_evaluates_boolean_predicates_on_gpu() {
+        // AND/OR/Ne over masks (boolean combinators): each comparison produces a 0/1 mask, MaskBinary
+        // combines them, the terminal compacts the mask. GPU-NATIVE closed-form oracle: a[i]=i, so the
+        // matching sets are explicit index ranges (no CPU re-implementation of the operator).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const N: u64 = 600;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&N.to_le_bytes());
+        let mut a_bytes = Vec::new();
+        for i in 0..N as i32 {
+            a_bytes.extend_from_slice(&i.to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                a_off + a_bytes.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        let cmp_scalar = |cmp: u32, scalar: i32| ExprStep::CompareScalar {
+            cmp,
+            scalar,
+            scalar_on_left: false,
+        };
+        let load = ExprStep::LoadColumn { byte_offset: a_off };
+
+        // a > 200 AND a < 400  ->  i in (200, 400) = [201, 400).
+        let p_and = [
+            load,
+            cmp_scalar(3, 200),
+            load,
+            cmp_scalar(1, 400),
+            ExprStep::MaskBinary { op: 0 },
+        ];
+        let got_and = resident
+            .run_expr_predicate_filter(&p_and, N)
+            .expect("a>200 AND a<400");
+        let and_expected: Vec<u32> = (201..400).collect();
+        assert_eq!(got_and, and_expected, "a>200 AND a<400 <=> i in [201, 400)");
+
+        // a < 100 OR a > 500  ->  [0, 100) U [501, 600).
+        let p_or = [
+            load,
+            cmp_scalar(1, 100),
+            load,
+            cmp_scalar(3, 500),
+            ExprStep::MaskBinary { op: 1 },
+        ];
+        let got_or = resident
+            .run_expr_predicate_filter(&p_or, N)
+            .expect("a<100 OR a>500");
+        let mut or_expected: Vec<u32> = (0..100).collect();
+        or_expected.extend(501..N as u32);
+        assert_eq!(got_or, or_expected, "a<100 OR a>500 <=> [0,100) U [501,600)");
+
+        // a != 300  ->  everything except index 300.
+        let p_ne = [load, cmp_scalar(5, 300)];
+        let got_ne = resident
+            .run_expr_predicate_filter(&p_ne, N)
+            .expect("a != 300");
+        let mut ne_expected: Vec<u32> = (0..300).collect();
+        ne_expected.extend(301..N as u32);
+        assert_eq!(got_ne, ne_expected, "a != 300 <=> all rows but index 300");
     }
 
     #[test]

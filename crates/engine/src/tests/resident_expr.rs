@@ -234,3 +234,71 @@ fn gpu_resident_expr_select_evaluates_column_vs_column_predicates() {
     let gt_expected: Vec<Vec<SqlValue>> = (200..N).map(|i| vec![SqlValue::Int4(i)]).collect();
     assert_eq!(gt.rows, gt_expected, "a*2 > b <=> i >= 200");
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_select_evaluates_boolean_and_or_ne_predicates() {
+    // Boolean predicates (AND / OR / Ne) through the engine's mask-based predicate VM, evaluated and
+    // materialized on the GPU. Closed-form oracle over a[i]=i: matching sets are explicit index
+    // ranges.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
+
+    const N: i32 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a) VALUES {values}"))
+        .unwrap();
+
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let Command::Select(select) = parse_command("SELECT a FROM t").unwrap() else {
+        unreachable!()
+    };
+    let cmp = |op: ResidentBinaryOp, k: i32| ResidentExpr::Binary {
+        op,
+        lhs: Box::new(ResidentExpr::Column(0)),
+        rhs: Box::new(ResidentExpr::Int4Literal(k)),
+    };
+
+    // a > 200 AND a < 400  ->  i in [201, 400).
+    let and_pred = ResidentExpr::Binary {
+        op: ResidentBinaryOp::And,
+        lhs: Box::new(cmp(ResidentBinaryOp::Gt, 200)),
+        rhs: Box::new(cmp(ResidentBinaryOp::Lt, 400)),
+    };
+    let got_and = e
+        .execute_resident_expr_select(&select, &and_pred)
+        .expect("a>200 AND a<400 on GPU");
+    let and_expected: Vec<Vec<SqlValue>> = (201..400).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(got_and.rows, and_expected, "a>200 AND a<400 <=> [201, 400)");
+
+    // a < 100 OR a > 500  ->  [0, 100) U [501, 600).
+    let or_pred = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Or,
+        lhs: Box::new(cmp(ResidentBinaryOp::Lt, 100)),
+        rhs: Box::new(cmp(ResidentBinaryOp::Gt, 500)),
+    };
+    let got_or = e
+        .execute_resident_expr_select(&select, &or_pred)
+        .expect("a<100 OR a>500 on GPU");
+    let mut or_expected: Vec<Vec<SqlValue>> = (0..100).map(|i| vec![SqlValue::Int4(i)]).collect();
+    or_expected.extend((501..N).map(|i| vec![SqlValue::Int4(i)]));
+    assert_eq!(got_or.rows, or_expected, "a<100 OR a>500 <=> [0,100) U [501,600)");
+
+    // a != 300  ->  everything except 300.
+    let ne_pred = cmp(ResidentBinaryOp::Ne, 300);
+    let got_ne = e
+        .execute_resident_expr_select(&select, &ne_pred)
+        .expect("a != 300 on GPU");
+    let mut ne_expected: Vec<Vec<SqlValue>> = (0..300).map(|i| vec![SqlValue::Int4(i)]).collect();
+    ne_expected.extend((301..N).map(|i| vec![SqlValue::Int4(i)]));
+    assert_eq!(got_ne.rows, ne_expected, "a != 300 <=> all rows but 300");
+}
