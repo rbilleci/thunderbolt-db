@@ -12,8 +12,8 @@ use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32Comparison,
     CudaI32EqualAnyProjectSubmission, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
     CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
-    FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator,
-    RouteDecision, ScanOperator, SortOperator,
+    FilterOperator, GroupedI64Order, GroupedI64SortColumn, LimitOperator, MockGpuRuntime, Operator,
+    PlannedOp, ProjectOperator, RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -21967,12 +21967,43 @@ impl Engine {
                     .to_string(),
             ))
         })?;
+        // §9.5/S5a.3 slice 1: ORDER BY the SUM aggregate (no HAVING) runs on the GPU over the
+        // resident output — out_sums argsorted in place + windowed (no re-upload), matching the host
+        // sum-then-group order (sums distinct here; the general group tie-break + count/min/max/group
+        // ORDER BY + GPU HAVING are later slices). AVG (Numeric) and the rest stay on the host path.
+        let gpu_order: Option<GroupedI64Order> = if select.having_groups.is_empty() {
+            select.order_by.as_ref().and_then(|order| {
+                let by_aggregate = select_is_aggregate_result_column(select, &order.column);
+                match &select.projection {
+                    SelectProjection::GroupedSum { .. } if by_aggregate => Some(GroupedI64Order {
+                        column: GroupedI64SortColumn::Sum,
+                        descending: order.descending,
+                        offset: 0,
+                        limit: select.limit.map(|limit| limit as u64),
+                    }),
+                    _ => None,
+                }
+            })
+        } else {
+            None
+        };
+
         let started = Instant::now();
-        let mut grouped_stats = device_memory
-            .grouped_stats_i32_from_payload(group_offset, value_offset, row_count)
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let (mut grouped_stats, copied_group_count) = if let Some(spec) = gpu_order {
+            device_memory
+                .grouped_stats_i32_ordered_from_payload(group_offset, value_offset, row_count, spec)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
+        } else {
+            let stats = device_memory
+                .grouped_stats_i32_from_payload(group_offset, value_offset, row_count)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            let group_count = stats.len();
+            (stats, group_count)
+        };
         let elapsed = started.elapsed();
-        let copied_group_count = grouped_stats.len();
+        // When the order ran on the GPU, the rows are already ordered + windowed; skip the host
+        // sort/HAVING/LIMIT below (kept for the not-yet-GPU cases + as the parity reference).
+        let gpu_ordered = gpu_order.is_some();
         let mut rows = grouped_stats
             .drain(..)
             .map(|group| {
@@ -22006,44 +22037,46 @@ impl Engine {
                 Ok(vec![SqlValue::Int4(group.group), aggregate])
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
-        rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
-        if !select.having_groups.is_empty() {
-            let aggregate_name =
-                select_aggregate_result_column_name(select).expect("grouped aggregate projection");
-            rows = rows
-                .into_iter()
-                .filter_map(|row| {
-                    let matches = grouped_row_matches_having(
-                        select,
-                        group_column,
-                        &row[0],
-                        aggregate_name,
-                        &row[1],
-                    );
-                    match matches {
-                        Ok(true) => Some(Ok(row)),
-                        Ok(false) => None,
-                        Err(err) => Some(Err(err)),
-                    }
-                })
-                .collect::<Result<Vec<_>, ExecuteError>>()?;
-        }
-        if let Some(order) = &select.order_by {
-            let order_by_sum = select_is_aggregate_result_column(select, &order.column);
-            rows.sort_by(|left, right| {
-                let ordering = if order_by_sum {
-                    compare_sql_values(&left[1], &right[1])
-                } else {
-                    compare_sql_values(&left[0], &right[0])
-                };
-                ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
-            });
-            if order.descending {
-                rows.reverse();
+        if !gpu_ordered {
+            rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
+            if !select.having_groups.is_empty() {
+                let aggregate_name = select_aggregate_result_column_name(select)
+                    .expect("grouped aggregate projection");
+                rows = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let matches = grouped_row_matches_having(
+                            select,
+                            group_column,
+                            &row[0],
+                            aggregate_name,
+                            &row[1],
+                        );
+                        match matches {
+                            Ok(true) => Some(Ok(row)),
+                            Ok(false) => None,
+                            Err(err) => Some(Err(err)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
             }
-        }
-        if let Some(limit) = select.limit {
-            rows.truncate(limit);
+            if let Some(order) = &select.order_by {
+                let order_by_sum = select_is_aggregate_result_column(select, &order.column);
+                rows.sort_by(|left, right| {
+                    let ordering = if order_by_sum {
+                        compare_sql_values(&left[1], &right[1])
+                    } else {
+                        compare_sql_values(&left[0], &right[0])
+                    };
+                    ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
+                });
+                if order.descending {
+                    rows.reverse();
+                }
+            }
+            if let Some(limit) = select.limit {
+                rows.truncate(limit);
+            }
         }
         let result_d2h_bytes = copied_group_count
             .checked_mul(
@@ -22201,6 +22234,9 @@ impl Engine {
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let elapsed = started.elapsed();
         let copied_group_count = grouped_stats.len();
+        // The filtered grouped probe does not yet run ORDER BY on the GPU (slice 1 wired the
+        // unfiltered probe); HAVING/ORDER BY/LIMIT stay on the host here.
+        let gpu_ordered = false;
         let mut rows = grouped_stats
             .drain(..)
             .map(|group| {
@@ -22234,44 +22270,46 @@ impl Engine {
                 Ok(vec![SqlValue::Int4(group.group), aggregate])
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
-        rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
-        if !select.having_groups.is_empty() {
-            let aggregate_name =
-                select_aggregate_result_column_name(select).expect("grouped aggregate projection");
-            rows = rows
-                .into_iter()
-                .filter_map(|row| {
-                    let matches = grouped_row_matches_having(
-                        select,
-                        group_column,
-                        &row[0],
-                        aggregate_name,
-                        &row[1],
-                    );
-                    match matches {
-                        Ok(true) => Some(Ok(row)),
-                        Ok(false) => None,
-                        Err(err) => Some(Err(err)),
-                    }
-                })
-                .collect::<Result<Vec<_>, ExecuteError>>()?;
-        }
-        if let Some(order) = &select.order_by {
-            let order_by_sum = select_is_aggregate_result_column(select, &order.column);
-            rows.sort_by(|left, right| {
-                let ordering = if order_by_sum {
-                    compare_sql_values(&left[1], &right[1])
-                } else {
-                    compare_sql_values(&left[0], &right[0])
-                };
-                ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
-            });
-            if order.descending {
-                rows.reverse();
+        if !gpu_ordered {
+            rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
+            if !select.having_groups.is_empty() {
+                let aggregate_name = select_aggregate_result_column_name(select)
+                    .expect("grouped aggregate projection");
+                rows = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let matches = grouped_row_matches_having(
+                            select,
+                            group_column,
+                            &row[0],
+                            aggregate_name,
+                            &row[1],
+                        );
+                        match matches {
+                            Ok(true) => Some(Ok(row)),
+                            Ok(false) => None,
+                            Err(err) => Some(Err(err)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
             }
-        }
-        if let Some(limit) = select.limit {
-            rows.truncate(limit);
+            if let Some(order) = &select.order_by {
+                let order_by_sum = select_is_aggregate_result_column(select, &order.column);
+                rows.sort_by(|left, right| {
+                    let ordering = if order_by_sum {
+                        compare_sql_values(&left[1], &right[1])
+                    } else {
+                        compare_sql_values(&left[0], &right[0])
+                    };
+                    ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
+                });
+                if order.descending {
+                    rows.reverse();
+                }
+            }
+            if let Some(limit) = select.limit {
+                rows.truncate(limit);
+            }
         }
         let result_d2h_bytes = copied_group_count
             .checked_mul(

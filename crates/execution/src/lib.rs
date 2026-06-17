@@ -1239,18 +1239,20 @@ impl CudaResidentDeviceMemory {
             row_count,
             None,
         )
+        .map(|(rows, _)| rows)
     }
 
     /// Resident grouped aggregate with GPU ORDER BY (count/sum) + LIMIT/OFFSET applied on-device
     /// before D2H (S5a.2): the hash-agg's `out_counts`/`out_sums` are argsorted in place (no
-    /// re-upload) and only the windowed groups are returned.
+    /// re-upload) and only the windowed groups are returned. Yields `(windowed_rows, group_count)`
+    /// where group_count is the FULL distinct-group count M (the D2H-bytes basis, window-independent).
     pub fn grouped_stats_i32_ordered_from_payload(
         &self,
         group_byte_offset: u64,
         value_byte_offset: u64,
         row_count: u64,
         order: GroupedI64Order,
-    ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+    ) -> Result<(Vec<CudaI32GroupedStats>, usize), CudaRuntimeProbeError> {
         launch_cuda_resident_i32_grouped_stats(
             self,
             group_byte_offset,
@@ -1278,6 +1280,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             None,
         )
+        .map(|(rows, _)| rows)
     }
 
     pub fn filtered_stats_i32_compare_from_payload(
@@ -6776,7 +6779,10 @@ fn launch_cuda_resident_i32_grouped_stats(
     filter: Option<(u64, i32, CudaI32Comparison)>,
     row_count: u64,
     order: Option<GroupedI64Order>,
-) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+) -> Result<(Vec<CudaI32GroupedStats>, usize), CudaRuntimeProbeError> {
+    // Returns (rows, group_count): `rows` is windowed/ordered when `order` is set, else all groups;
+    // `group_count` is the FULL distinct-group count M (the D2H'd-bytes basis for the caller's
+    // telemetry, independent of any LIMIT window).
     type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
@@ -7182,7 +7188,7 @@ compact_done:
             (group_byte_offset, 0, 0)
         };
     if row_count == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     // Open-addressing table sized to >= 2x worst-case distinct groups (= row_count) -> load factor
@@ -7479,36 +7485,43 @@ compact_done:
     drop(lease);
 
     if let Some(indices) = ordered_indices {
-        // Materialize only the ordered/windowed groups, in sorted order.
-        return Ok(indices
-            .into_iter()
-            .map(|i| {
-                let i = i as usize;
-                CudaI32GroupedStats {
-                    group: groups[i],
-                    count: counts_host[i],
-                    sum: sums_host[i],
-                    min: mins_host[i],
-                    max: maxs_host[i],
-                }
-            })
-            .collect());
+        // Materialize only the ordered/windowed groups, in sorted order. `output_len` (the full
+        // group count) is returned alongside for the caller's D2H-bytes telemetry.
+        return Ok((
+            indices
+                .into_iter()
+                .map(|i| {
+                    let i = i as usize;
+                    CudaI32GroupedStats {
+                        group: groups[i],
+                        count: counts_host[i],
+                        sum: sums_host[i],
+                        min: mins_host[i],
+                        max: maxs_host[i],
+                    }
+                })
+                .collect(),
+            output_len,
+        ));
     }
 
-    Ok(groups
-        .into_iter()
-        .zip(counts_host)
-        .zip(sums_host)
-        .zip(mins_host)
-        .zip(maxs_host)
-        .map(|((((group, count), sum), min), max)| CudaI32GroupedStats {
-            group,
-            count,
-            sum,
-            min,
-            max,
-        })
-        .collect())
+    Ok((
+        groups
+            .into_iter()
+            .zip(counts_host)
+            .zip(sums_host)
+            .zip(mins_host)
+            .zip(maxs_host)
+            .map(|((((group, count), sum), min), max)| CudaI32GroupedStats {
+                group,
+                count,
+                sum,
+                min,
+                max,
+            })
+            .collect(),
+        output_len,
+    ))
 }
 
 /// Single-thread `(1,1,1)` serial linear-probe grouped aggregation — retained ONLY (under
@@ -16373,7 +16386,8 @@ mod tests {
             );
             let hash = sorted(
                 launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None)
-                    .expect("hash-agg grouped"),
+                    .expect("hash-agg grouped")
+                    .0,
             );
             assert_eq!(
                 hash, serial,
@@ -16387,7 +16401,8 @@ mod tests {
             );
             let hash_f = sorted(
                 launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, n, None)
-                    .expect("hash-agg filtered grouped"),
+                    .expect("hash-agg filtered grouped")
+                    .0,
             );
             assert_eq!(
                 hash_f, serial_f,
@@ -16408,7 +16423,8 @@ mod tests {
             );
             let hash = sorted(
                 launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, 2_000, None)
-                    .expect("hash-agg negatives"),
+                    .expect("hash-agg negatives")
+                    .0,
             );
             assert_eq!(
                 hash, serial,
@@ -16435,7 +16451,8 @@ mod tests {
             );
             let hash = sorted(
                 launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, 2_000, None)
-                    .expect("hash-agg fully-filtered"),
+                    .expect("hash-agg fully-filtered")
+                    .0,
             );
             assert_eq!(
                 hash, serial,
@@ -17147,6 +17164,7 @@ mod tests {
             resident
                 .grouped_stats_i32_ordered_from_payload(go, vo, n, o)
                 .expect("ordered grouped")
+                .0
                 .iter()
                 .map(|g| g.group)
                 .collect::<Vec<_>>()
@@ -17191,9 +17209,13 @@ mod tests {
         );
 
         // Materialized values for the windowed result are correct (group + count + sum + min/max).
-        let top_by_sum = resident
+        let (top_by_sum, group_count) = resident
             .grouped_stats_i32_ordered_from_payload(go, vo, n, order(Sum, true, 0, Some(1)))
             .expect("top by sum");
+        assert_eq!(
+            group_count, 4,
+            "M (full group count) is returned for d2h telemetry"
+        );
         assert_eq!(top_by_sum.len(), 1);
         let g = top_by_sum[0];
         assert_eq!(
