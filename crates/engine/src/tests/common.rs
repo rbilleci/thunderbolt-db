@@ -27,7 +27,6 @@ impl MvccExecutionBackend for FirstCudaSliceParityBackend {
     }
 }
 
-
 pub(crate) fn assert_mvcc_query_uses_tracked_cpu_fallback(
     engine: &Engine,
     result: &MvccReadResult,
@@ -45,4 +44,12 @@ pub(crate) fn assert_mvcc_query_uses_tracked_cpu_fallback(
             .fallback_for(FallbackReason::GpuMvccReadParityGap),
         expected_total_fallbacks
     );
+}
+
+pub(crate) fn test_wal_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "gpu-db-engine-{name}-{}-{}.segment",
+        std::process::id(),
+        NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+    ))
 }

@@ -47,7 +47,6 @@ fn execute_mvcc_query_runs_visibility_filtered_scan_through_execution_layer() {
     );
 }
 
-
 #[derive(Debug, Clone)]
 struct RecordingMvccBackend {
     executed_target: DeviceTarget,
@@ -62,7 +61,6 @@ impl MvccExecutionBackend for RecordingMvccBackend {
         })
     }
 }
-
 
 fn first_cuda_slice_support_query() -> MvccReadQuery {
     MvccReadQuery {
@@ -701,7 +699,6 @@ fn first_cuda_slice_gap_labels_are_stable_for_docs_and_future_routing() {
         "empty_logical_filter_tree"
     );
 }
-
 
 #[test]
 fn execute_mvcc_query_keeps_result_contract_stable_across_backend_swap() {
