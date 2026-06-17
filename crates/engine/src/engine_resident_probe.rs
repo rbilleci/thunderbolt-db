@@ -3202,11 +3202,16 @@ impl Engine {
                     } else {
                         compare_sql_values(&left[0], &right[0])
                     };
+                    // Direction on the aggregate only; the group-ASC tie-break (index 0) is kept
+                    // so equal aggregates order identically to the GPU grouped path — never a
+                    // whole-vector reverse, which would flip the tie-break to group DESC.
+                    let ordering = if order.descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
                     ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
                 });
-                if order.descending {
-                    rows.reverse();
-                }
             }
             if let Some(limit) = select.limit {
                 rows.truncate(limit);
@@ -3435,11 +3440,16 @@ impl Engine {
                     } else {
                         compare_sql_values(&left[0], &right[0])
                     };
+                    // Direction on the aggregate only; the group-ASC tie-break (index 0) is kept
+                    // so equal aggregates order identically to the GPU grouped path — never a
+                    // whole-vector reverse, which would flip the tie-break to group DESC.
+                    let ordering = if order.descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
                     ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
                 });
-                if order.descending {
-                    rows.reverse();
-                }
             }
             if let Some(limit) = select.limit {
                 rows.truncate(limit);

@@ -663,13 +663,21 @@ impl Engine {
                 } else {
                     0
                 };
+                // ORDER BY <aggregate> with a deterministic group-ASC tie-break for equal
+                // aggregates: apply the direction to the AGGREGATE only, never a whole-vector
+                // reverse (which would also flip the group tie-break to DESC and disagree with the
+                // GPU resident path, whose composite-pack / host SUM finalization both break ties
+                // by group ASC). For a non-aggregate ORDER BY the tie-break column IS the order
+                // column (index 0), so it is a no-op and the direction behaves exactly as before.
                 aggregate_rows.sort_by(|left, right| {
-                    compare_sql_values(&left[order_idx], &right[order_idx])
-                        .then_with(|| compare_sql_values(&left[0], &right[0]))
+                    let primary = compare_sql_values(&left[order_idx], &right[order_idx]);
+                    let primary = if order.descending {
+                        primary.reverse()
+                    } else {
+                        primary
+                    };
+                    primary.then_with(|| compare_sql_values(&left[0], &right[0]))
                 });
-                if order.descending {
-                    aggregate_rows.reverse();
-                }
             }
             if let Some(offset) = select.offset {
                 aggregate_rows = aggregate_rows.into_iter().skip(offset).collect();
