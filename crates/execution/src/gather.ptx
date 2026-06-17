@@ -1,0 +1,64 @@
+.version 6.0
+.target sm_60
+.address_size 64
+
+// Gather i64 values by a u32 permutation: out[i] = in[perm[i]], grid-stride. Reorders the grouped
+// SUM column into group-ascending order (perm = the group argsort) so a stable SUM argsort over it
+// yields the (sum <dir>, group ASC) order fully on-device. Pure ASCII (the runtime JIT rejects
+// non-ASCII PTX even in comments).
+.visible .entry gpu_db_gather_i64_by_u32_perm(
+    .param .u64 in_ptr,
+    .param .u64 perm_ptr,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %pidx;
+    .reg .u64 %in;
+    .reg .u64 %perm;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o4;
+    .reg .u64 %o8;
+    .reg .u64 %psrc;
+    .reg .u64 %addr;
+    .reg .s64 %v;
+
+    ld.param.u64 %in, [in_ptr];
+    ld.param.u64 %perm, [perm_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %perm, %o4;
+    ld.global.u32 %pidx, [%addr];
+    cvt.u64.u32 %psrc, %pidx;
+    mul.lo.u64 %o8, %psrc, 8;
+    add.u64 %addr, %in, %o8;
+    ld.global.s64 %v, [%addr];
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %out, %o8;
+    st.global.s64 [%addr], %v;
+    add.u64 %i, %i, %stride;
+    bra loop;
+done:
+    ret;
+}

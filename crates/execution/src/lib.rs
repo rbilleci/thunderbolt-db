@@ -7475,41 +7475,43 @@ compact_done:
                 )
             };
             let full_perm = match order.column {
-                // SUM is a full i64, so (unlike count/min/max/group) the i32 group can't be
-                // packed into the same composite sort key. Order the M groups by
-                // (sum <dir>, group ASC) on the host — the same host tier that filters HAVING
-                // survivors and windows LIMIT/OFFSET below — so equal sums break deterministically
-                // by group instead of by the nondeterministic hash-emission order. The GPU still
-                // does the O(rows) grouped aggregate; only the small M-group result is ordered
-                // here. (Tracked follow-up: a fully on-device two-key (sum, group) sort.)
+                // SUM is a full i64, so (unlike count/min/max/group) the i32 group can't be packed
+                // into the same composite sort key. Sort it on-device with a two-key (sum <dir>,
+                // group ASC) pass: argsort the groups ASCENDING, gather the sums into that order,
+                // then stable-argsort by sum — equal sums keep the group-ascending order. This
+                // matches the group-ASC tie-break of count/min/max/group without leaving the device.
                 GroupedI64SortColumn::Sum => {
-                    let mut sums = vec![0_i64; output_len];
-                    let mut group_keys = vec![0_i32; output_len];
-                    check_cuda(unsafe {
-                        cu_memcpy_dtoh(
-                            sums.as_mut_ptr().cast::<c_void>(),
-                            out_sums.ptr,
-                            output_len * std::mem::size_of::<i64>(),
-                        )
-                    })?;
-                    check_cuda(unsafe {
-                        cu_memcpy_dtoh(
-                            group_keys.as_mut_ptr().cast::<c_void>(),
-                            out_groups.ptr,
-                            output_len * std::mem::size_of::<i32>(),
-                        )
-                    })?;
-                    let mut perm: Vec<u32> = (0..output_len as u32).collect();
-                    perm.sort_by(|&a, &b| {
-                        let (a, b) = (a as usize, b as usize);
-                        let primary = if order.descending {
-                            sums[b].cmp(&sums[a])
-                        } else {
-                            sums[a].cmp(&sums[b])
-                        };
-                        primary.then_with(|| group_keys[a].cmp(&group_keys[b]))
-                    });
-                    perm
+                    let group_i64 = primary.lease_device_buffer(key_bytes)?;
+                    launch_cuda_resident_widen_i32_to_i64(
+                        resident,
+                        out_groups.ptr,
+                        output_count,
+                        group_i64.ptr,
+                    )?;
+                    let perm_g = launch_cuda_resident_i64_order_by_limit(
+                        resident,
+                        group_i64.ptr,
+                        output_count,
+                        false,
+                        0,
+                        None,
+                    )?;
+                    let sums_g = primary.lease_device_buffer(key_bytes)?;
+                    launch_cuda_resident_gather_i64_by_u32_perm(
+                        resident,
+                        out_sums.ptr,
+                        &perm_g,
+                        sums_g.ptr,
+                    )?;
+                    let perm_s = launch_cuda_resident_i64_order_by_limit(
+                        resident,
+                        sums_g.ptr,
+                        output_count,
+                        order.descending,
+                        0,
+                        None,
+                    )?;
+                    perm_s.iter().map(|&s| perm_g[s as usize]).collect()
                 }
                 GroupedI64SortColumn::Count => pack_then_sort(
                     include_bytes!("pack.ptx"),
@@ -8424,6 +8426,92 @@ fn launch_cuda_resident_widen_i32_to_i64(
     resident.record_kernel_event_elapsed_us(None);
     drop(lease);
     Ok(())
+}
+
+// Gather i64 values by a host u32 permutation: out[i] = in[perm[i]]. Uploads the (small, M-group)
+// permutation to the device, then runs the grid-stride gather on a pooled private stream. Used by
+// the on-device two-key SUM sort to reorder the SUM column into group-ascending order before the
+// stable SUM argsort, so equal sums break by group ASC fully on-device (SUM is a full i64 and can't
+// be packed with the group into a composite key like count/min/max/group).
+fn launch_cuda_resident_gather_i64_by_u32_perm(
+    resident: &CudaResidentDeviceMemory,
+    in_device_ptr: u64,
+    perm: &[u32],
+    out_device_ptr: u64,
+) -> Result<(), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("gather.ptx");
+
+    let n = perm.len() as u64;
+    if n == 0 {
+        return Ok(());
+    }
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_gather_i64_by_u32_perm", &ptx)?;
+
+    let perm_bytes = std::mem::size_of_val(perm);
+    let perm_buf = primary.lease_device_buffer(perm_bytes)?;
+    check_cuda(unsafe {
+        cu_memcpy_htod(perm_buf.ptr, perm.as_ptr().cast::<c_void>(), perm_bytes)
+    })?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut in_arg = in_device_ptr;
+    let mut perm_arg = perm_buf.ptr;
+    let mut n_arg = n;
+    let mut out_arg = out_device_ptr;
+    let mut args = [
+        (&mut in_arg as *mut u64).cast::<c_void>(),
+        (&mut perm_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut out_arg as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
 }
 
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
@@ -17754,7 +17842,8 @@ mod tests {
     fn gpu_grouped_stats_ordered_by_sum_breaks_ties_by_group() {
         // §9.5 follow-up — SUM ORDER BY breaks equal-sum ties by GROUP ASCENDING, deterministically.
         // SUM is a full i64 so it can't pack the group into a composite key (as count/min/max/group
-        // do); the M-group result is ordered on the host by (sum <dir>, group ASC). CONSTRUCTION:
+        // do); it is ordered on-device by a two-key (sum <dir>, group ASC) sort (argsort group ->
+        // gather sums -> argsort sum -> compose). CONSTRUCTION:
         // groups 1 and 2 both sum to 50 (tied at the TOP), group 3 sums to 10 — so the order is fully
         // determined, and `... ORDER BY sum DESC LIMIT 1` is deterministically group 1 (was the flake).
         let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
