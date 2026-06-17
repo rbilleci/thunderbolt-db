@@ -192,11 +192,25 @@ execution. Routes never define the set of answerable queries.
 
 ---
 
-## 5. Thin vertical prototype (de-risk B before committing)
+## 5. Thin vertical prototype (de-risk B before committing) — DONE `7b19e7ef`
 
-Goal: prove a predicate the **enumerated path cannot express** runs end-to-end
-**on the GPU** through an `Expr` interpreter composing primitive buffer→buffer
-kernels — and matches the CPU oracle.
+**Status: built + green (2026-06-17, commit `7b19e7ef`).** `WHERE a+b > k` evaluates
+fully on the GPU by composing two ptxas-validated buffer→buffer primitives
+(`expr_proto.ptx`: `gpu_db_resident_i32_binary_elementwise` → intermediate buffer,
+then `gpu_db_buffer_i32_compare_to_indices`) chained on one pooled stream by
+`launch_cuda_resident_expr_two_col_filter` (pub method
+`expr_filter_two_col_compare_from_payload`). GPU-native **closed-form** parity test
+(`a=b=i` ⇒ `a+b=2i` monotone ⇒ matches are the contiguous range `[k/2+1, n)`,
+distinct from "only a" and from "a*b"). Execution GPU 37/0, host 22/0, clippy
+clean; the enumerated paths are untouched (not routed through
+`resident_route_query_shape`). The three target models — buffer-intermediates,
+Expr-lowering-to-a-pipeline, primitive-composition — are proven. Next: lift this
+into the engine as a real `Expr`/`PhysicalOp` IR + interpreter (§2) and grow the
+primitive library by node.
+
+Goal (as designed): prove a predicate the **enumerated path cannot express** runs
+end-to-end **on the GPU** through an `Expr` interpreter composing primitive
+buffer→buffer kernels — and matches a GPU-native (closed-form) oracle.
 
 **Chosen query:** `SELECT a FROM t WHERE a + b > k` over two resident int4
 columns. This is decisively non-enumerated: it requires evaluating an
