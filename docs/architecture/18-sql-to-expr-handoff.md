@@ -1,12 +1,56 @@
 # Handoff: SQL → Expr binding via libpg_query
 
-Status: **handoff for the next session** (2026-06-17). The parser fork is **resolved by
-the user: adopt `libpg_query`** (Postgres's real grammar) for the general GPU
-executor's parsing — not extend the hand-rolled parser. This doc is the plan,
-the current state, the entry points, and the audit-tracked debt.
+Status: **COMPLETE (2026-06-18)** on `phase0-m1-engine-facade`. A real SQL string with an
+arithmetic / boolean `WHERE` now runs end-to-end on the GPU via the general executor. The
+parser fork was resolved by the user (adopt `libpg_query`, Postgres's real grammar). The
+original plan is preserved below as design reference; what shipped is summarised here.
 
-Read `17-general-gpu-executor.md` (the design + Charter rule 2) first. This is the
-"close the loop" step: SQL text → general GPU execution.
+## What landed (2026-06-18)
+
+- **Slice 1** (`517c99b8`): `pg_query` v6 (libpg_query) added to the engine;
+  `parse_single_select` + the API-pinning test. `.cargo/config.toml` points bindgen at
+  gcc's internal include dir so libclang finds `<stddef.h>` on this box.
+- **Slice 2** (`b35e0e3f`): **checked int4 arithmetic on-device** — `+ - *` evaluate in
+  64-bit, range-check the inclusive int32 bounds, and raise Postgres `integer out of
+  range` via a shared device overflow flag; never wrap, never CPU-fallback (the user's
+  load-bearing decision). Independent adversarial audit: SHIP.
+- **Slice 3** (`8a0a6b1c`): the **AST → `ResidentExpr` mapper** + the `pub`
+  `Engine::execute_resident_expr_select_sql` entry. Single bind (the predicate's column
+  indices resolve against the SAME bound table the execution uses); qualified columns are
+  validated against the FROM relation (PG "missing FROM-clause entry"). Audit:
+  SHIP-WITH-FIXES (all fixed). Caught a proto-enum bug: `SETOP_NONE = 1` (Undefined = 0).
+- **Slice 4** (`16eea73f`): **`BoolExpr` AND/OR** mapping (N-arg left-fold,
+  precedence-correct via the real parser).
+- **Slice 5** (this commit): **routing** — `execute_relational_select_text` tries the
+  hand-rolled parser FIRST (it gates the tuned enumerated fast-paths + the catalog and
+  strictly REJECTS what it cannot express) and routes the rejected arithmetic / boolean
+  WHERE to the general Expr executor on the GPU. Only ADDS coverage; no perf regression;
+  the strict `parse_command` (legacy pgwire server) is untouched (dual-entry).
+
+## Routing design + the end state
+
+The integration is **hand-rolled-first** (general path for what it cannot parse), not yet
+**general-first** (every shape an IR peephole), because the general path's peephole
+coverage is currently the 2-col arithmetic shape only — routing simple equality /
+projection / aggregate through the general VM would lose their tuned fused kernels (a perf
+regression on the hottest OLTP shapes). The charter end state (doc 17 §3.4) is general-
+first with the enumerated kernels re-expressed as IR peepholes under the general executor;
+until that migration, hand-rolled-first is the non-regressing stepping stone. The
+`hand_rolled_parser_rejects_arithmetic_...` test guards the boundary (the hand-rolled
+parser must keep strictly rejecting arithmetic, so routing never silently mis-answers).
+
+## Coverage today / not yet
+
+Runs on the GPU: a single int4 table, int4 column projection, int4 `WHERE` over arithmetic
+(`+ - *`), comparisons (`= <> < <= > >=`), column-vs-column, and `AND`/`OR`. NOT yet (each
+a hard error or stays on the existing path): other types (int8 / numeric / text / bool),
+`NOT`, `IN` / `LIKE` / `BETWEEN`, division / modulo, aggregates / GROUP BY / HAVING /
+ORDER BY / DISTINCT / LIMIT on the Expr path, joins (M5), and arithmetic over a
+non-resident table (errors — the hand-rolled CPU path cannot express it).
+
+Read `17-general-gpu-executor.md` (the design + Charter rule 2) for the executor itself.
+
+---
 
 ---
 

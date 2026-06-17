@@ -318,3 +318,98 @@ fn gpu_execute_resident_expr_select_sql_runs_boolean_predicates_from_sql_text() 
         "a<50 OR a>200 AND b<400 => [0,50) U [201,400) (AND precedence preserved)"
     );
 }
+
+#[test]
+fn hand_rolled_parser_rejects_arithmetic_so_routing_is_unambiguous() {
+    // Routing precondition (slice 5): the text dispatch tries the hand-rolled parser FIRST (it gates
+    // the tuned enumerated fast-paths + catalog) and only routes to the general Expr path when the
+    // hand-rolled parser CANNOT express the SELECT. For that to never be a silent mis-answer, the
+    // hand-rolled parser must ERROR (not mis-parse) on exactly the predicates the general path adds:
+    // ARITHMETIC (column op column, scalar arithmetic, deeper trees), incl. arithmetic mixed with a
+    // boolean. This test guards the boundary — if the hand-rolled parser ever starts accepting one of
+    // these, the routing would silently skip the general path, so this must fail loudly.
+    for sql in [
+        "SELECT a FROM t WHERE a + b > 400",
+        "SELECT a FROM t WHERE a * 2 > b",
+        "SELECT a FROM t WHERE (a + b) * 2 - 5 > 395",
+        "SELECT a FROM t WHERE a + b > 400 AND a < 500",
+    ] {
+        assert!(
+            parse_command(sql).is_err(),
+            "hand-rolled parser must REJECT `{sql}` so the text dispatch routes it to the general \
+             Expr path"
+        );
+    }
+
+    // Conversely, SIMPLE comparison conjunctions ARE hand-rolled-parseable (column op literal, ANDed/
+    // ORed) and are handled by the existing path (resident-route filter groups), NOT the general path.
+    // The general path's own boolean support still covers them when reached directly or mixed with
+    // arithmetic; here we just pin that the routing boundary is "arithmetic", not "boolean".
+    for sql in [
+        "SELECT a FROM t WHERE a > 200 AND b < 400",
+        "SELECT a FROM t WHERE a < 100 OR b > 500",
+    ] {
+        assert!(
+            parse_command(sql).is_ok(),
+            "hand-rolled parser handles simple comparison conjunctions (`{sql}`) — they stay on the \
+             existing path"
+        );
+    }
+}
+
+#[test]
+fn select_text_keeps_simple_predicates_on_the_existing_path() {
+    // A hand-rolled-parseable SELECT (a simple comparison) is NOT routed to the general Expr path: the
+    // text dispatch runs it through the existing path (here CPU, no residency populated) and returns
+    // the right rows. Proves the routing only ADDS arithmetic coverage and never hijacks the shapes
+    // the hand-rolled parser + tuned fast-paths already own.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a, b) VALUES (5, 1), (6, 2), (7, 3)")
+        .unwrap();
+    let result = e
+        .execute_relational_select_text("SELECT a FROM t WHERE a = 6")
+        .expect("simple equality runs on the existing path");
+    assert_eq!(
+        result.rows,
+        vec![vec![SqlValue::Int4(6)]],
+        "a = 6 -> the single matching row, via the existing path"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_select_text_routes_arithmetic_predicate_to_general_expr_path() {
+    // The TEXT dispatch (execute_relational_select_text — what a consolidated server calls) routes an
+    // arithmetic-WHERE SELECT, which the hand-rolled parser cannot express, to the general GPU Expr
+    // executor, end to end. Same closed-form oracle as the direct entry; this proves the ROUTING hook
+    // (not just the standalone SQL->Expr method).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+
+    const N: i32 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let result = e
+        .execute_relational_select_text("SELECT a FROM t WHERE a + b > 400")
+        .expect("text dispatch routes the arithmetic WHERE to the general GPU path");
+    let expected: Vec<Vec<SqlValue>> = (201..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(
+        result.rows, expected,
+        "routed `a + b > 400` must materialize a-values for i in [201, 600) on the GPU"
+    );
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.fallback_reason, None);
+}

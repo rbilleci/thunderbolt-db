@@ -19,15 +19,31 @@ impl Engine {
     /// `pg_catalog`/`information_schema` catalog relations (Phase-3 M2). This is the
     /// text -> rows entry a consolidated server uses for catalog introspection; user SQL
     /// without a catalog reference parses and runs exactly as via the strict path.
+    ///
+    /// Routing (Charter rule 2, the general GPU executor): the hand-rolled parser is tried FIRST — it
+    /// gates the tuned enumerated resident-route fast-paths + the catalog, and it strictly REJECTS
+    /// (never mis-parses) the predicates it cannot express. When it rejects (an arithmetic / boolean
+    /// `WHERE` it cannot represent — e.g. `a + b > 400`, possibly mixed with `AND`/`OR`), the SELECT is
+    /// routed to the GENERAL Expr executor: SQL text -> libpg_query -> `ResidentExpr` -> evaluated on
+    /// the table's GPU-resident snapshot. This only ADDS coverage; it never shadows the hand-rolled
+    /// path, so simple shapes keep their fused kernels and there is no perf regression. The general
+    /// path runs on the GPU only when the residency snapshot reflects the visible committed set (it
+    /// enforces the snapshot validity/identity invariant) and raises a hard error otherwise — there is
+    /// no CPU re-execution of an arithmetic predicate (the hand-rolled CPU path cannot express it).
+    /// The strict `parse_command` entry the legacy pgwire server uses is untouched (dual-entry).
     pub fn execute_relational_select_text(
         &self,
         text: &str,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        match parse_command_allowing_catalog(text)? {
-            Command::Select(select) => self.execute_relational_select(&select),
-            _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+        match parse_command_allowing_catalog(text) {
+            Ok(Command::Select(select)) => self.execute_relational_select(&select),
+            Ok(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "expected a SELECT statement".to_string(),
             ))),
+            // The hand-rolled parser cannot express this SELECT; route it to the general GPU Expr
+            // executor. (For a SELECT it does parse, the line above already ran it — the fast-paths and
+            // catalog are unchanged.)
+            Err(_) => self.execute_resident_expr_select_sql(text),
         }
     }
 
