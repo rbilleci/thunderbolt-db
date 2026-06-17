@@ -27,3 +27,22 @@ impl MvccExecutionBackend for FirstCudaSliceParityBackend {
     }
 }
 
+
+pub(crate) fn assert_mvcc_query_uses_tracked_cpu_fallback(
+    engine: &Engine,
+    result: &MvccReadResult,
+    expected_total_fallbacks: u64,
+) {
+    assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.executed_target, DeviceTarget::Cpu);
+    assert_eq!(
+        result.fallback_reason,
+        Some(FallbackReason::GpuMvccReadParityGap)
+    );
+    assert_eq!(
+        engine
+            .metrics()
+            .fallback_for(FallbackReason::GpuMvccReadParityGap),
+        expected_total_fallbacks
+    );
+}
