@@ -25,7 +25,7 @@ def check():
 
 def flagged(out):
     names = set()
-    for m in re.finditer(r"method `([a-z_0-9]+)` is private", out):
+    for m in re.finditer(r"(?:method|associated function) `([a-z_0-9]+)` is private", out):
         names.add(m.group(1))
     return names
 
