@@ -1385,6 +1385,9 @@ impl CudaI32Comparison {
 pub enum GroupedI64SortColumn {
     Count,
     Sum,
+    Min,
+    Max,
+    Group,
 }
 
 /// GPU ORDER BY ... LIMIT/OFFSET applied over the RESIDENT grouped output before D2H (S5a.2): the
@@ -7423,9 +7426,37 @@ compact_done:
     // argsorted directly as i64; the result is the windowed list of compact-order group indices.
     let ordered_indices: Option<Vec<u32>> = match order {
         Some(order) if output_len > 0 => {
+            // Keys narrower than i64 (count u64≤u32, min/max/group i32) are packed with the group
+            // into one composite i64 key (direction baked in) so an ASCENDING argsort reproduces the
+            // host "agg <dir>, group ASC tie-break" order; SUM (i64) argsorts directly.
+            let key_bytes = output_len
+                .checked_mul(std::mem::size_of::<i64>())
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let pack_then_sort = |ptx: &[u8],
+                                  name: &'static core::ffi::CStr,
+                                  agg_ptr: u64|
+             -> Result<Vec<u32>, CudaRuntimeProbeError> {
+                let composite = primary.lease_device_buffer(key_bytes)?;
+                launch_cuda_resident_pack_grouped_sort_key(
+                    resident,
+                    ptx,
+                    name,
+                    agg_ptr,
+                    out_groups.ptr,
+                    output_count,
+                    order.descending,
+                    composite.ptr,
+                )?;
+                launch_cuda_resident_i64_order_by_limit(
+                    resident,
+                    composite.ptr,
+                    output_count,
+                    false,
+                    order.offset,
+                    order.limit,
+                )
+            };
             let perm = match order.column {
-                // Sum: distinct in practice; argsort out_sums directly (i64). A general group
-                // tie-break for sum-ties (a 2-key gather) is a tracked follow-up.
                 GroupedI64SortColumn::Sum => launch_cuda_resident_i64_order_by_limit(
                     resident,
                     out_sums.ptr,
@@ -7434,31 +7465,26 @@ compact_done:
                     order.offset,
                     order.limit,
                 )?,
-                // Count ties, so pack (count, group) into one composite i64 key carrying the group
-                // tie-break, then ASCENDING argsort (the direction is baked into the composite).
-                GroupedI64SortColumn::Count => {
-                    let composite = primary.lease_device_buffer(
-                        output_len
-                            .checked_mul(std::mem::size_of::<i64>())
-                            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
-                    )?;
-                    launch_cuda_resident_pack_count_group(
-                        resident,
-                        out_counts.ptr,
-                        out_groups.ptr,
-                        output_count,
-                        order.descending,
-                        composite.ptr,
-                    )?;
-                    launch_cuda_resident_i64_order_by_limit(
-                        resident,
-                        composite.ptr,
-                        output_count,
-                        false,
-                        order.offset,
-                        order.limit,
-                    )?
-                }
+                GroupedI64SortColumn::Count => pack_then_sort(
+                    include_bytes!("pack.ptx"),
+                    c"gpu_db_pack_count_group",
+                    out_counts.ptr,
+                )?,
+                GroupedI64SortColumn::Min => pack_then_sort(
+                    include_bytes!("pack_i32.ptx"),
+                    c"gpu_db_pack_i32agg_group",
+                    out_mins.ptr,
+                )?,
+                GroupedI64SortColumn::Max => pack_then_sort(
+                    include_bytes!("pack_i32.ptx"),
+                    c"gpu_db_pack_i32agg_group",
+                    out_maxs.ptr,
+                )?,
+                GroupedI64SortColumn::Group => pack_then_sort(
+                    include_bytes!("pack_i32.ptx"),
+                    c"gpu_db_pack_i32agg_group",
+                    out_groups.ptr,
+                )?,
             };
             Some(perm)
         }
@@ -8071,14 +8097,19 @@ done:
         .collect())
 }
 
-/// §9.5/S5a.3 slice 2 — pack (count u64≤u32, group i32) into one i64 sort key per group so that an
-/// ASCENDING argsort reproduces the host "ORDER BY count <dir>, group ASC tie-break" order: the
-/// direction is baked into the high 32 bits (DESC => 0xFFFFFFFF-count), the group is u32-biased into
-/// the low 32 bits (ascending), and the composite is XOR 0x8000…0 so signed-i64 sort == unsigned sort.
-/// Writes `out_key_device_ptr[0..n]` (i64). Caller must ensure counts ≤ u32::MAX (row_count ≤ u32::MAX).
-fn launch_cuda_resident_pack_count_group(
+/// §9.5/S5a.3 (slices 2–3) — pack a grouped aggregate + its group into one i64 sort key per group so
+/// that an ASCENDING argsort reproduces the host "ORDER BY agg <dir>, group ASC tie-break" order: the
+/// direction is baked into the high 32 bits (DESC => 0xFFFFFFFF-key), the group is u32-biased into the
+/// low 32 bits (ascending), and the composite is XOR 0x8000…0 so signed-i64 sort == the intended sort.
+/// Writes `out_key_device_ptr[0..n]` (i64). `ptx_source`/`kernel_name` pick the aggregate width:
+/// `pack.ptx`/`gpu_db_pack_count_group` (count u64≤u32) or `pack_i32.ptx`/`gpu_db_pack_i32agg_group`
+/// (i32 min/max, or group-by-group). Caller ensures count keys fit u32 (row_count ≤ u32::MAX).
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_resident_pack_grouped_sort_key(
     resident: &CudaResidentDeviceMemory,
-    counts_device_ptr: u64,
+    ptx_source: &[u8],
+    kernel_name: &'static core::ffi::CStr,
+    agg_device_ptr: u64,
     groups_device_ptr: u64,
     n: u64,
     descending: bool,
@@ -8097,7 +8128,6 @@ fn launch_cuda_resident_pack_count_group(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    const PTX: &[u8] = include_bytes!("pack.ptx");
 
     if n == 0 {
         return Ok(());
@@ -8108,12 +8138,10 @@ fn launch_cuda_resident_pack_count_group(
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
+    let mut ptx = Vec::with_capacity(ptx_source.len() + 1);
+    ptx.extend_from_slice(ptx_source);
     ptx.push(0);
-    let kernel_fn = resident
-        .primary()
-        .cached_function(c"gpu_db_pack_count_group", &ptx)?;
+    let kernel_fn = resident.primary().cached_function(kernel_name, &ptx)?;
 
     let primary = resident.primary();
     primary.set_current()?;
@@ -8146,13 +8174,13 @@ fn launch_cuda_resident_pack_count_group(
 
     const BLOCK: u32 = 256;
     let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
-    let mut counts_arg = counts_device_ptr;
+    let mut agg_arg = agg_device_ptr;
     let mut groups_arg = groups_device_ptr;
     let mut n_arg = n;
     let mut desc_arg = u32::from(descending);
     let mut outk_arg = out_key_device_ptr;
     let mut args = [
-        (&mut counts_arg as *mut u64).cast::<c_void>(),
+        (&mut agg_arg as *mut u64).cast::<c_void>(),
         (&mut groups_arg as *mut u64).cast::<c_void>(),
         (&mut n_arg as *mut u64).cast::<c_void>(),
         (&mut desc_arg as *mut u32).cast::<c_void>(),
@@ -17304,7 +17332,35 @@ mod tests {
                 .map(|g| g.group)
                 .collect::<Vec<_>>()
         };
-        use GroupedI64SortColumn::{Count, Sum};
+        use GroupedI64SortColumn::{Count, Group, Max, Min, Sum};
+
+        // Each group's value is constant, so min == max == value: g0..g3 = 1,5,20,100 (distinct).
+        // group/min/max ORDER BY go through the i32-aggregate composite pack (slice 3).
+        assert_eq!(
+            groups_of(order(Min, true, 0, None)),
+            vec![3, 2, 1, 0],
+            "min DESC"
+        );
+        assert_eq!(
+            groups_of(order(Max, true, 0, None)),
+            vec![3, 2, 1, 0],
+            "max DESC"
+        );
+        assert_eq!(
+            groups_of(order(Min, false, 0, Some(2))),
+            vec![0, 1],
+            "min ASC LIMIT 2"
+        );
+        assert_eq!(
+            groups_of(order(Group, true, 0, None)),
+            vec![3, 2, 1, 0],
+            "group DESC"
+        );
+        assert_eq!(
+            groups_of(order(Group, false, 0, None)),
+            vec![0, 1, 2, 3],
+            "group ASC"
+        );
 
         // counts g0..g3 = 4,3,2,1 ; sums = 4,15,40,100.
         assert_eq!(

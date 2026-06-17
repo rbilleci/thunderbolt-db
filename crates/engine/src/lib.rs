@@ -21975,24 +21975,41 @@ impl Engine {
         let gpu_order: Option<GroupedI64Order> = if select.having_groups.is_empty() {
             select.order_by.as_ref().and_then(|order| {
                 let by_aggregate = select_is_aggregate_result_column(select, &order.column);
-                let limit = select.limit.map(|limit| limit as u64);
-                match &select.projection {
-                    SelectProjection::GroupedSum { .. } if by_aggregate => Some(GroupedI64Order {
-                        column: GroupedI64SortColumn::Sum,
+                let mk = |column| {
+                    Some(GroupedI64Order {
+                        column,
                         descending: order.descending,
                         offset: 0,
-                        limit,
-                    }),
+                        limit: select.limit.map(|limit| limit as u64),
+                    })
+                };
+                match &select.projection {
+                    // ORDER BY the aggregate result (i64-representable). COUNT packs (count, group)
+                    // so counts must fit u32; SUM is direct i64; MIN/MAX pack the i32 value + group.
+                    SelectProjection::GroupedSum { .. } if by_aggregate => {
+                        mk(GroupedI64SortColumn::Sum)
+                    }
                     SelectProjection::GroupedCount { .. }
                         if by_aggregate && row_count <= u64::from(u32::MAX) =>
                     {
-                        Some(GroupedI64Order {
-                            column: GroupedI64SortColumn::Count,
-                            descending: order.descending,
-                            offset: 0,
-                            limit,
-                        })
+                        mk(GroupedI64SortColumn::Count)
                     }
+                    SelectProjection::GroupedMin { .. } if by_aggregate => {
+                        mk(GroupedI64SortColumn::Min)
+                    }
+                    SelectProjection::GroupedMax { .. } if by_aggregate => {
+                        mk(GroupedI64SortColumn::Max)
+                    }
+                    // ORDER BY the group column (not the aggregate) — any non-AVG grouped projection.
+                    SelectProjection::GroupedCount { .. }
+                    | SelectProjection::GroupedSum { .. }
+                    | SelectProjection::GroupedMin { .. }
+                    | SelectProjection::GroupedMax { .. }
+                        if !by_aggregate =>
+                    {
+                        mk(GroupedI64SortColumn::Group)
+                    }
+                    // AVG (Numeric) — any order — stays on the host.
                     _ => None,
                 }
             })
