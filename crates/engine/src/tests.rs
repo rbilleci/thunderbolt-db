@@ -4551,9 +4551,13 @@ fn p8_default_resident_route_executes_accepted_shapes() {
         "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
     )
     .unwrap();
+    // Bucket sums are kept distinct (b1=30, b2=40) so `ORDER BY sum DESC LIMIT 1`
+    // below is unambiguous. The GPU sum-order path has no deterministic tie-break
+    // for equal sums yet (tracked §9.5 follow-up: "sum-tie 2-key gather"), so a tie
+    // would make the cross-path parity check non-deterministic/flaky.
     e.execute_text(
             2,
-            "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 30, 'alpine')",
+            "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 40, 'alpine')",
         )
         .unwrap();
     e.populate_relational_residency_snapshot("events").unwrap();
