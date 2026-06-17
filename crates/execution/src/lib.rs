@@ -1237,6 +1237,27 @@ impl CudaResidentDeviceMemory {
             value_byte_offset,
             None,
             row_count,
+            None,
+        )
+    }
+
+    /// Resident grouped aggregate with GPU ORDER BY (count/sum) + LIMIT/OFFSET applied on-device
+    /// before D2H (S5a.2): the hash-agg's `out_counts`/`out_sums` are argsorted in place (no
+    /// re-upload) and only the windowed groups are returned.
+    pub fn grouped_stats_i32_ordered_from_payload(
+        &self,
+        group_byte_offset: u64,
+        value_byte_offset: u64,
+        row_count: u64,
+        order: GroupedI64Order,
+    ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_grouped_stats(
+            self,
+            group_byte_offset,
+            value_byte_offset,
+            None,
+            row_count,
+            Some(order),
         )
     }
 
@@ -1255,6 +1276,7 @@ impl CudaResidentDeviceMemory {
             value_byte_offset,
             Some((filter_byte_offset, needle, comparison)),
             row_count,
+            None,
         )
     }
 
@@ -1351,6 +1373,26 @@ impl CudaI32Comparison {
             Self::Gte => 4,
         }
     }
+}
+
+/// Which i64-width compacted aggregate column the resident grouped pipeline orders by (S5a.2).
+/// COUNT (u64, always non-negative ≤ row_count) and SUM (i64) are read directly as i64 — no widen
+/// needed. Ordering by the i32 group/min/max columns (a widen) is a later slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedI64SortColumn {
+    Count,
+    Sum,
+}
+
+/// GPU ORDER BY ... LIMIT/OFFSET applied over the RESIDENT grouped output before D2H (S5a.2): the
+/// hash-agg's compacted `out_counts`/`out_sums` are argsorted on-device (no re-upload), then the
+/// `[offset, offset+limit)` window selects which groups are materialized.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupedI64Order {
+    pub column: GroupedI64SortColumn,
+    pub descending: bool,
+    pub offset: u64,
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6733,6 +6775,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     value_byte_offset: u64,
     filter: Option<(u64, i32, CudaI32Comparison)>,
     row_count: u64,
+    order: Option<GroupedI64Order>,
 ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
     type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
@@ -7368,6 +7411,29 @@ compact_done:
     }
     let output_len = usize::try_from(output_count)
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    // S5a.2: GPU ORDER BY (count/sum) + LIMIT/OFFSET on the RESIDENT compacted output, before D2H —
+    // no re-upload. `out_counts` (u64, counts are non-negative ≤ row_count) and `out_sums` (i64) are
+    // argsorted directly as i64; the result is the windowed list of compact-order group indices.
+    let ordered_indices: Option<Vec<u32>> = match order {
+        Some(order) if output_len > 0 => {
+            let key_ptr = match order.column {
+                GroupedI64SortColumn::Count => out_counts.ptr,
+                GroupedI64SortColumn::Sum => out_sums.ptr,
+            };
+            Some(launch_cuda_resident_i64_order_by_limit(
+                resident,
+                key_ptr,
+                output_count,
+                order.descending,
+                order.offset,
+                order.limit,
+            )?)
+        }
+        Some(_) => Some(Vec::new()),
+        None => None,
+    };
+
     let mut groups = vec![0_i32; output_len];
     let mut counts_host = vec![0_u64; output_len];
     let mut sums_host = vec![0_i64; output_len];
@@ -7411,6 +7477,23 @@ compact_done:
         })?;
     }
     drop(lease);
+
+    if let Some(indices) = ordered_indices {
+        // Materialize only the ordered/windowed groups, in sorted order.
+        return Ok(indices
+            .into_iter()
+            .map(|i| {
+                let i = i as usize;
+                CudaI32GroupedStats {
+                    group: groups[i],
+                    count: counts_host[i],
+                    sum: sums_host[i],
+                    min: mins_host[i],
+                    max: maxs_host[i],
+                }
+            })
+            .collect());
+    }
 
     Ok(groups
         .into_iter()
@@ -16289,7 +16372,7 @@ mod tests {
                     .expect("serial grouped"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None)
                     .expect("hash-agg grouped"),
             );
             assert_eq!(
@@ -16303,7 +16386,7 @@ mod tests {
                     .expect("serial filtered grouped"),
             );
             let hash_f = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, n)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, n, None)
                     .expect("hash-agg filtered grouped"),
             );
             assert_eq!(
@@ -16324,7 +16407,7 @@ mod tests {
                     .expect("serial negatives"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, 2_000)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, 2_000, None)
                     .expect("hash-agg negatives"),
             );
             assert_eq!(
@@ -16351,7 +16434,7 @@ mod tests {
                     .expect("serial fully-filtered"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, 2_000)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, 2_000, None)
                     .expect("hash-agg fully-filtered"),
             );
             assert_eq!(
@@ -16381,7 +16464,7 @@ mod tests {
                 launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n).unwrap();
                 serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 let t = Instant::now();
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n).unwrap();
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None).unwrap();
                 hash_ms = hash_ms.min(t.elapsed().as_secs_f64() * 1e3);
             }
             let speedup = if hash_ms > 0.0 {
@@ -16995,5 +17078,127 @@ mod tests {
         // clamps: offset past the end -> empty; limit past the end -> clamped.
         assert!(run(false, 200, Some(5)).is_empty());
         assert_eq!(run(false, 98, Some(10)), vec![98_u32, 99]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_grouped_stats_ordered_by_count_sum_windows_on_device() {
+        // P2 §9.5/S5a.2 — resident GPU ORDER BY (count/sum) + LIMIT/OFFSET applied to the grouped
+        // output BEFORE D2H (no re-upload). CONSTRUCTION oracle: per-group counts and sums are
+        // DISTINCT and deliberately ANTI-CORRELATED, so the count-order and sum-order are different
+        // known sequences (ties impossible; no CPU sort oracle).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let retain = |groups: &[i32], values: &[i32]| {
+            let n = groups.len() as u64;
+            // SAFETY: i32 POD; native bytes match the resident column layout; columns outlive copy.
+            let group_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(groups.as_ptr().cast::<u8>(), groups.len() * 4)
+            };
+            let value_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let hsize = std::mem::size_of::<u64>() as u64;
+            let group_off = hsize;
+            let value_off = hsize + group_bytes.len() as u64;
+            let allocated = hsize + group_bytes.len() as u64 + value_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: group_off,
+                            bytes: group_bytes,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: value_off,
+                            bytes: value_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident columns");
+            (resident, group_off, value_off)
+        };
+
+        // (group, count, value): counts 4,3,2,1 (desc in g); sums 4,15,40,100 (asc in g) — anti-correlated.
+        let spec = [(0_i32, 4, 1_i32), (1, 3, 5), (2, 2, 20), (3, 1, 100)];
+        let (mut groups, mut values) = (Vec::new(), Vec::new());
+        for &(g, cnt, v) in &spec {
+            for _ in 0..cnt {
+                groups.push(g);
+                values.push(v);
+            }
+        }
+        let n = groups.len() as u64; // 10
+        let (resident, go, vo) = retain(&groups, &values);
+
+        let order = |column, descending, offset, limit| GroupedI64Order {
+            column,
+            descending,
+            offset,
+            limit,
+        };
+        let groups_of = |o| {
+            resident
+                .grouped_stats_i32_ordered_from_payload(go, vo, n, o)
+                .expect("ordered grouped")
+                .iter()
+                .map(|g| g.group)
+                .collect::<Vec<_>>()
+        };
+        use GroupedI64SortColumn::{Count, Sum};
+
+        // counts g0..g3 = 4,3,2,1 ; sums = 4,15,40,100.
+        assert_eq!(
+            groups_of(order(Count, true, 0, None)),
+            vec![0, 1, 2, 3],
+            "count DESC"
+        );
+        assert_eq!(
+            groups_of(order(Count, false, 0, None)),
+            vec![3, 2, 1, 0],
+            "count ASC"
+        );
+        assert_eq!(
+            groups_of(order(Count, true, 0, Some(2))),
+            vec![0, 1],
+            "count DESC LIMIT 2"
+        );
+        assert_eq!(
+            groups_of(order(Count, true, 1, Some(2))),
+            vec![1, 2],
+            "count DESC OFFSET 1 LIMIT 2"
+        );
+        assert_eq!(
+            groups_of(order(Sum, true, 0, None)),
+            vec![3, 2, 1, 0],
+            "sum DESC"
+        );
+        assert_eq!(
+            groups_of(order(Sum, false, 0, None)),
+            vec![0, 1, 2, 3],
+            "sum ASC"
+        );
+        assert_eq!(
+            groups_of(order(Sum, true, 0, Some(2))),
+            vec![3, 2],
+            "sum DESC LIMIT 2"
+        );
+
+        // Materialized values for the windowed result are correct (group + count + sum + min/max).
+        let top_by_sum = resident
+            .grouped_stats_i32_ordered_from_payload(go, vo, n, order(Sum, true, 0, Some(1)))
+            .expect("top by sum");
+        assert_eq!(top_by_sum.len(), 1);
+        let g = top_by_sum[0];
+        assert_eq!(
+            (g.group, g.count, g.sum, g.min, g.max),
+            (3, 1, 100, 100, 100)
+        );
     }
 }
