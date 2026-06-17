@@ -16266,9 +16266,10 @@ mod tests {
         // wiring it into the route: a real grid/block strided scan + global reduction
         // (`launch_cuda_resident_i32_equal_count_parallel`). It A/Bs the parallel kernel
         // vs the serial one across a row-count sweep, hard-asserting (a) the parallel count
-        // EQUALS the serial count EQUALS the CPU-computed expected at every size (the
-        // soundness claim — atomic reduction + grid-stride bounds are correct), and (b) on
-        // a large table the parallel kernel is faster (the milestone hypothesis).
+        // EQUALS the previously-shipped serial (1,1,1) scan at every size — the serial kernel
+        // is the GPU-native oracle (no CPU re-implementation of the count operator as the
+        // expected), so matching it proves the atomic reduction + grid-stride bounds correct —
+        // and (b) on a large table the parallel kernel is faster (the milestone hypothesis).
         use std::time::Instant;
 
         let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
@@ -16308,15 +16309,18 @@ mod tests {
                 )
                 .expect("retain resident column");
             let offset = std::mem::size_of::<u64>() as u64;
-            let expected = values.iter().filter(|&&v| v == needle).count() as u64;
 
-            // Correctness (also warms each kernel's module load).
+            // Correctness (also warms each kernel's module load): the parallel kernel must EQUAL
+            // the previously-shipped serial (1,1,1) scan ON THE GPU — the serial scan is the
+            // GPU-native oracle (no CPU re-implementation of the count operator as the expected).
             let serial = launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle)
                 .expect("serial count");
             let parallel = launch_cuda_resident_i32_equal_count(&resident, offset, n, needle)
                 .expect("parallel count");
-            assert_eq!(serial, expected, "serial count wrong at rows={n}");
-            assert_eq!(parallel, expected, "parallel count wrong at rows={n}");
+            assert_eq!(
+                parallel, serial,
+                "parallel count != serial reference at rows={n}"
+            );
 
             // Timing: best of 3 (latency).
             let mut serial_ms = f64::MAX;
@@ -16334,7 +16338,7 @@ mod tests {
             } else {
                 0.0
             };
-            println!("| {n} | {expected} | {serial_ms:.3} | {parallel_ms:.3} | {speedup:.1}x |");
+            println!("| {n} | {serial} | {serial_ms:.3} | {parallel_ms:.3} | {speedup:.1}x |");
             largest_serial_ms = serial_ms;
             largest_parallel_ms = parallel_ms;
         }
