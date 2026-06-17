@@ -22,6 +22,7 @@ mod mvcc_provenance; // provenance + source-composition + value-chain queries
 mod mvcc_query; // MVCC query basics: scan/first-cuda-slice/cuda-native/composition
 mod recovery; // durable-WAL recovery + archive retention + checkpoint vacuum
 mod replication_backlog; // replication watermarks + backlog blockers
+mod resident_expr; // general GPU executor: Expr IR + device interpreter (Charter rule 2)
 mod resident_probe; // resident-snapshot GPU probe execution
 mod resident_route; // p8 resident-route planning + partitioned probes
 mod snapshot_residency; // snapshot meta + residency invalidation

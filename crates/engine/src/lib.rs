@@ -90,6 +90,7 @@ mod engine_dml_prepare;
 mod engine_introspection;
 mod engine_lifecycle;
 mod engine_mvcc_dispatch;
+mod engine_expr;
 mod engine_residency;
 mod engine_resident_probe;
 mod engine_retained_read;
