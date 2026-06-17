@@ -879,7 +879,7 @@ fn timed_resident_device_count_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine.execute_relational_count_with_resident_device_memory_probe(query)?;
+    let result = engine.execute_resident_count(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
@@ -921,7 +921,7 @@ fn timed_resident_device_filtered_count_probe(
     let before = engine.metrics().snapshot();
     let start = Instant::now();
     let result =
-        engine.execute_relational_filtered_count_with_resident_device_memory_probe(query)?;
+        engine.execute_resident_count(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
@@ -1088,7 +1088,7 @@ fn timed_resident_device_range_count_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine.execute_relational_range_count_with_resident_device_memory_probe(query)?;
+    let result = engine.execute_resident_count(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;

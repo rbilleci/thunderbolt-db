@@ -236,7 +236,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_relational_count_with_resident_device_memory_probe(&select)
+        .execute_resident_count(&select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -247,7 +247,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_relational_filtered_count_with_resident_device_memory_probe(&filtered_select)
+        .execute_resident_count(&filtered_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -280,7 +280,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_relational_range_count_with_resident_device_memory_probe(&range_select)
+        .execute_resident_count(&range_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));

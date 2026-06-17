@@ -299,7 +299,9 @@ impl Engine {
         }
         let route_started = Instant::now();
         let result = match decision.query_shape.as_str() {
-            "count_all" => self.execute_relational_count_with_resident_device_memory_probe(select),
+            "count_all" | "int4_equality_count" | "int4_range_count" => {
+                self.execute_resident_count(select)
+            }
             "partitioned_count_all" => self
                 .execute_relational_partitioned_count_with_resident_device_memory_probe(select),
             "partitioned_int4_equality_projection" => self
@@ -330,12 +332,6 @@ impl Engine {
                 .execute_relational_partitioned_filtered_max_with_resident_device_memory_probe(
                     select,
                 ),
-            "int4_equality_count" => {
-                self.execute_relational_filtered_count_with_resident_device_memory_probe(select)
-            }
-            "int4_range_count" => {
-                self.execute_relational_range_count_with_resident_device_memory_probe(select)
-            }
             "text_prefix_like_count" => {
                 self.execute_relational_text_prefix_count_with_resident_device_memory_probe(select)
             }
