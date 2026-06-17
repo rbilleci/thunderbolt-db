@@ -236,7 +236,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_resident_count(&select)
+        .execute_resident_plan(&select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -247,7 +247,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_resident_count(&filtered_select)
+        .execute_resident_plan(&filtered_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -280,7 +280,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_resident_count(&range_select)
+        .execute_resident_plan(&range_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -289,7 +289,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_relational_sum_with_resident_device_memory_probe(&sum_select)
+        .execute_resident_plan(&sum_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -298,7 +298,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_relational_scalar_aggregate_with_resident_device_memory_probe(&avg_select)
+        .execute_resident_plan(&avg_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -309,7 +309,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
+        .execute_resident_plan(
             &filtered_avg_select,
         )
         .unwrap_err()
@@ -436,7 +436,7 @@ fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_tele
     let cpu = e.execute_relational_select(&select).unwrap();
     let before = e.metrics().snapshot();
     let resident = e
-        .execute_relational_sum_with_resident_device_memory_probe(&select)
+        .execute_resident_plan(&select)
         .unwrap();
     let after = e.metrics().snapshot();
 
@@ -469,7 +469,7 @@ fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_tele
     let empty_cpu = e.execute_relational_select(&empty_select).unwrap();
     let before_empty = e.metrics().snapshot();
     let empty_resident = e
-        .execute_relational_sum_with_resident_device_memory_probe(&empty_select)
+        .execute_resident_plan(&empty_select)
         .unwrap();
     let after_empty = e.metrics().snapshot();
 
@@ -1347,7 +1347,7 @@ fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results()
         let cpu = e.execute_relational_select(&select).unwrap();
         let before = e.metrics().snapshot();
         let resident = e
-            .execute_relational_scalar_aggregate_with_resident_device_memory_probe(&select)
+            .execute_resident_plan(&select)
             .unwrap();
         let after = e.metrics().snapshot();
 
@@ -1369,7 +1369,7 @@ fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results()
         unreachable!()
     };
     assert!(e
-        .execute_relational_scalar_aggregate_with_resident_device_memory_probe(&unsupported)
+        .execute_resident_plan(&unsupported)
         .unwrap_err()
         .to_string()
         .contains("AVG only supports int4 columns"));
@@ -1379,7 +1379,7 @@ fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results()
         unreachable!()
     };
     assert!(e
-        .execute_relational_scalar_aggregate_with_resident_device_memory_probe(&select)
+        .execute_resident_plan(&select)
         .unwrap_err()
         .to_string()
         .contains("resident snapshot is invalid"));
@@ -1415,7 +1415,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         let cpu = e.execute_relational_select(&select).unwrap();
         let before = e.metrics().snapshot();
         let resident = e
-            .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(&select)
+            .execute_resident_plan(&select)
             .unwrap();
         let after = e.metrics().snapshot();
 
@@ -1442,7 +1442,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         unreachable!()
     };
     let err = e
-        .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
+        .execute_resident_plan(
             &unsupported_text,
         )
         .unwrap_err()
@@ -1455,7 +1455,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         unreachable!()
     };
     let err = e
-        .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
+        .execute_resident_plan(
             &unsupported_cross_column,
         )
         .unwrap_err()
@@ -1470,7 +1470,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
     let cpu = e.execute_relational_select(&empty_max).unwrap();
     let before = e.metrics().snapshot();
     let resident = e
-        .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(&empty_max)
+        .execute_resident_plan(&empty_max)
         .unwrap();
     let after = e.metrics().snapshot();
     assert_eq!(resident.columns, cpu.columns);
@@ -1492,7 +1492,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
     };
     e.mark_gpu_memory_pressured(0);
     assert!(e
-        .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(&select)
+        .execute_resident_plan(&select)
         .unwrap_err()
         .to_string()
         .contains("resident snapshot is invalid"));
@@ -1529,7 +1529,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
         let cpu = e.execute_relational_select(&select).unwrap();
         let before = e.metrics().snapshot();
         let resident = e
-            .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(&select)
+            .execute_resident_plan(&select)
             .unwrap();
         let after = e.metrics().snapshot();
 
@@ -1570,7 +1570,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
         unreachable!()
     };
     let err = e
-        .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+        .execute_resident_plan(
             &unsupported_text,
         )
         .unwrap_err()
@@ -1583,7 +1583,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
         unreachable!()
     };
     let err = e
-        .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+        .execute_resident_plan(
             &unsupported_cross_column,
         )
         .unwrap_err()
@@ -1595,13 +1595,14 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
     else {
         unreachable!()
     };
+    // Under the unified plan compiler a single equality filter on the aggregate column compiles via
+    // the comparison path (the resident stats kernels evaluate only non-equality int4 comparisons),
+    // so the rejection is the comparison-shape diagnostic rather than the old BETWEEN-arity one.
     let err = e
-        .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
-            &equality_only,
-        )
+        .execute_resident_plan(&equality_only)
         .unwrap_err()
         .to_string();
-    assert!(err.contains("one int4 BETWEEN predicate"));
+    assert!(err.contains("supports only non-equality int4 comparisons"));
 
     let Command::Select(select) =
         parse_command("SELECT SUM(amount) FROM events WHERE amount BETWEEN 10 AND 30").unwrap()
@@ -1610,7 +1611,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
     };
     e.mark_gpu_memory_pressured(0);
     assert!(e
-        .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(&select)
+        .execute_resident_plan(&select)
         .unwrap_err()
         .to_string()
         .contains("resident snapshot is invalid"));

@@ -299,8 +299,9 @@ impl Engine {
         }
         let route_started = Instant::now();
         let result = match decision.query_shape.as_str() {
-            "count_all" | "int4_equality_count" | "int4_range_count" => {
-                self.execute_resident_count(select)
+            "count_all" | "int4_equality_count" | "int4_range_count" | "int4_scalar_aggregate"
+            | "int4_filtered_scalar_aggregate" | "int4_between_scalar_aggregate" => {
+                self.execute_resident_plan(select)
             }
             "partitioned_count_all" => self
                 .execute_relational_partitioned_count_with_resident_device_memory_probe(select),
@@ -338,22 +339,6 @@ impl Engine {
             "int4_filter_group_count" => {
                 self.execute_relational_filter_group_count_with_resident_device_memory_probe(select)
             }
-            "int4_scalar_aggregate"
-                if matches!(select.projection, SelectProjection::Sum { .. }) =>
-            {
-                self.execute_relational_sum_with_resident_device_memory_probe(select)
-            }
-            "int4_scalar_aggregate" => {
-                self.execute_relational_scalar_aggregate_with_resident_device_memory_probe(select)
-            }
-            "int4_filtered_scalar_aggregate" => self
-                .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
-                    select,
-                ),
-            "int4_between_scalar_aggregate" => self
-                .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
-                    select,
-                ),
             "int4_grouped_aggregate" => {
                 self.execute_relational_grouped_aggregate_with_resident_device_memory_probe(select)
             }

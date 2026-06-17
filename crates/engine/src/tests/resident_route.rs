@@ -226,7 +226,7 @@ fn p8_default_resident_route_executes_accepted_shapes() {
                 }
                 // Filtered scalar aggregate copies a scalar-stats struct (count + sum +
                 // min/max, no group key) + result length — matches the actual D2H in
-                // execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe
+                // run_resident_scalar_aggregate (the unified plan->kernel driver's Int4Compare arm)
                 // and resident_route_d2h_bytes_estimate.
                 "int4_filtered_scalar_aggregate" => {
                     (std::mem::size_of::<u64>()

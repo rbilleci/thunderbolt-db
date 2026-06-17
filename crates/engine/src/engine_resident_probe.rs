@@ -11,7 +11,7 @@ use super::*;
 /// The GPU-resident filter predicate IR for the plan->kernel compiler (P0 spine 1.3): exactly the
 /// shapes the resident kernels evaluate on device. Column fields are indices into the bound table;
 /// the executor resolves them to device byte-offsets against the snapshot layout. Grows as more
-/// shapes migrate (text prefix, IN, BETWEEN, DNF, non-int4 types).
+/// shapes migrate (text prefix, IN, DNF, non-int4 types).
 #[derive(Debug, Clone)]
 pub(crate) enum ResidentPredicate {
     /// No filter — every row (e.g. COUNT(*) over the whole table).
@@ -24,6 +24,45 @@ pub(crate) enum ResidentPredicate {
         needle: i32,
         comparison: CudaI32Comparison,
     },
+    /// `int4_col BETWEEN lower AND upper` (both inclusive).
+    Int4Between {
+        col: usize,
+        lower: i32,
+        upper: i32,
+    },
+}
+
+/// A single-row scalar aggregate the resident plan computes over the predicate-selected rows (P0
+/// spine 1.3). Column fields are table column indices; the executor resolves device byte-offsets.
+/// `Count` carries no column (COUNT(*) counts rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentScalarAggregate {
+    Count,
+    Sum { col: usize },
+    Avg { col: usize },
+    Min { col: usize },
+    Max { col: usize },
+}
+
+/// The relational operator a resident plan evaluates on device over the predicate-selected rows.
+/// Grows one variant per migrated shape family (grouped aggregate, projection, ...).
+#[derive(Debug, Clone)]
+pub(crate) enum ResidentOp {
+    /// One single-row scalar aggregate (COUNT/SUM/AVG/MIN/MAX) over the predicate-selected rows.
+    ScalarAggregate(ResidentScalarAggregate),
+}
+
+/// A compiled GPU-resident query plan (P0 spine 1.3 plan->kernel compiler): a device [predicate]
+/// plus the [operator] to evaluate over the rows it selects. [`Engine::execute_resident_plan`] runs
+/// the shared residency skeleton once and dispatches the matching device kernel by (predicate, op)
+/// shape — replacing the per-shape resident probe methods.
+///
+/// [predicate]: ResidentPredicate
+/// [operator]: ResidentOp
+#[derive(Debug, Clone)]
+pub(crate) struct ResidentPlan {
+    predicate: ResidentPredicate,
+    op: ResidentOp,
 }
 
 /// Compile a bound COUNT(*) WHERE clause into a [`ResidentPredicate`], or reject shapes the resident
@@ -78,30 +117,198 @@ fn resident_count_to_i64(count: u64) -> Result<i64, ExecuteError> {
     })
 }
 
+/// Compile the WHERE clause of a resident scalar aggregate (SUM/AVG/MIN/MAX) into a
+/// [`ResidentPredicate`]. The retained stats kernels evaluate the predicate on the SAME column they
+/// aggregate, so a filter must target `agg_col`; supported shapes are unfiltered, one int4
+/// non-equality comparison, or one inclusive int4 `BETWEEN`. (The check order — cross-column before
+/// literal type before bound type — matches the pre-unification probe diagnostics.)
+fn compile_resident_scalar_aggregate_predicate(
+    bound: &BoundRelationalSelect,
+    agg_col: usize,
+) -> Result<ResidentPredicate, ExecuteError> {
+    if bound.filter_groups.is_empty() {
+        return Ok(ResidentPredicate::All);
+    }
+    if bound.filter_groups.len() == 1 {
+        let predicates = &bound.filter_groups[0];
+        if predicates.len() == 1 {
+            let (filter_idx, op, value) = predicates[0].clone();
+            if filter_idx != agg_col {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident scalar aggregate requires the predicate column to match the aggregate column"
+                        .to_string(),
+                )));
+            }
+            let Some(comparison) = resident_device_i32_comparison(op) else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident scalar aggregate supports only non-equality int4 comparisons"
+                        .to_string(),
+                )));
+            };
+            let SqlValue::Int4(needle) = value else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident scalar aggregate supports only int4 comparison literals".to_string(),
+                )));
+            };
+            return Ok(ResidentPredicate::Int4Compare {
+                col: agg_col,
+                needle,
+                comparison,
+            });
+        }
+        if predicates.len() == 2 {
+            let mut lower = None;
+            let mut upper = None;
+            for (filter_idx, op, value) in predicates {
+                if *filter_idx != agg_col {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident scalar aggregate requires the predicate column to match the aggregate column"
+                            .to_string(),
+                    )));
+                }
+                let SqlValue::Int4(bound_value) = value else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident scalar aggregate BETWEEN supports only int4 bounds".to_string(),
+                    )));
+                };
+                match op {
+                    SelectFilterOp::Gte => lower = Some(*bound_value),
+                    SelectFilterOp::Lte => upper = Some(*bound_value),
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "resident scalar aggregate BETWEEN supports only inclusive int4 bounds"
+                                .to_string(),
+                        )));
+                    }
+                }
+            }
+            let lower = lower.ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident scalar aggregate BETWEEN requires a lower inclusive bound".to_string(),
+                ))
+            })?;
+            let upper = upper.ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident scalar aggregate BETWEEN requires an upper inclusive bound".to_string(),
+                ))
+            })?;
+            return Ok(ResidentPredicate::Int4Between {
+                col: agg_col,
+                lower,
+                upper,
+            });
+        }
+    }
+    Err(ExecuteError::Engine(EngineError::ApplyFailed(
+        "resident scalar aggregate supports only one int4 BETWEEN predicate or one int4 comparison on the aggregate column"
+            .to_string(),
+    )))
+}
+
+/// Compile a bound `SELECT` into a [`ResidentPlan`], or reject shapes the resident kernels do not
+/// cover. Slice 2 covers the single-row scalar aggregate family: `COUNT(*)` and `SUM/AVG/MIN/MAX`
+/// over an int4 column, each with the predicate envelope its kernels support.
+fn compile_resident_plan(
+    table: &RelationalTable,
+    bound: &BoundRelationalSelect,
+    select: &Select,
+) -> Result<ResidentPlan, ExecuteError> {
+    if select.distinct
+        || select.group_by.is_some()
+        || !select.having_groups.is_empty()
+        || select.order_by.is_some()
+        || select.limit.is_some()
+        || select.offset.is_some()
+    {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident scalar aggregate proof supports only single-row COUNT(*)/SUM/AVG/MIN/MAX without DISTINCT/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET"
+                .to_string(),
+        )));
+    }
+    match &select.projection {
+        SelectProjection::CountAll => Ok(ResidentPlan {
+            predicate: compile_resident_count_predicate(table, bound)?,
+            op: ResidentOp::ScalarAggregate(ResidentScalarAggregate::Count),
+        }),
+        SelectProjection::Sum { column }
+        | SelectProjection::Avg { column }
+        | SelectProjection::Min { column }
+        | SelectProjection::Max { column } => {
+            let col = relational_column_index(table, column)?;
+            // Compile the predicate first: it validates literal/bound types and the predicate-column
+            // match before the aggregate column's int4 check, matching the pre-unification order.
+            let predicate = compile_resident_scalar_aggregate_predicate(bound, col)?;
+            if table.columns[col].ty != SqlType::Int4 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident scalar aggregate proof currently supports only int4 aggregate columns"
+                        .to_string(),
+                )));
+            }
+            let aggregate = match &select.projection {
+                SelectProjection::Sum { .. } => ResidentScalarAggregate::Sum { col },
+                SelectProjection::Avg { .. } => ResidentScalarAggregate::Avg { col },
+                SelectProjection::Min { .. } => ResidentScalarAggregate::Min { col },
+                SelectProjection::Max { .. } => ResidentScalarAggregate::Max { col },
+                _ => unreachable!("projection matched a scalar aggregate above"),
+            };
+            Ok(ResidentPlan {
+                predicate,
+                op: ResidentOp::ScalarAggregate(aggregate),
+            })
+        }
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident scalar aggregate proof currently supports only COUNT(*)/SUM/AVG/MIN/MAX(int4_column)"
+                .to_string(),
+        ))),
+    }
+}
+
+/// Materialize a SUM/AVG/MIN/MAX result from the retained `CudaI32Stats` a filter/BETWEEN stats
+/// kernel returns (shared by the filtered and BETWEEN scalar-aggregate paths). An empty MIN/MAX
+/// domain yields the empty-text sentinel the CPU engine emits for an empty aggregate.
+fn materialize_resident_scalar_stats(
+    aggregate: ResidentScalarAggregate,
+    stats: &CudaI32Stats,
+) -> Result<SqlValue, ExecuteError> {
+    Ok(match aggregate {
+        ResidentScalarAggregate::Sum { .. } => SqlValue::Int8(stats.sum),
+        ResidentScalarAggregate::Avg { .. } => average_sql_value(
+            i128::from(stats.sum),
+            usize::try_from(stats.count).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident scalar aggregate count {} exceeds AVG result range",
+                    stats.count
+                )))
+            })?,
+        ),
+        ResidentScalarAggregate::Min { .. } => stats
+            .min
+            .map(SqlValue::Int4)
+            .unwrap_or_else(|| SqlValue::Text(String::new())),
+        ResidentScalarAggregate::Max { .. } => stats
+            .max
+            .map(SqlValue::Int4)
+            .unwrap_or_else(|| SqlValue::Text(String::new())),
+        ResidentScalarAggregate::Count => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident scalar stats materialization received COUNT".to_string(),
+            )));
+        }
+    })
+}
+
 impl Engine {
-    /// Plan->kernel driver for the resident COUNT(*) family (P0 spine 1.3): ONE path for every
-    /// resident COUNT(*) shape. Binds + validates the count shape, compiles the WHERE into a
-    /// [`ResidentPredicate`], prepares residency, dispatches the matching count kernel by predicate,
-    /// and returns the single-row count — replacing the per-shape resident count methods.
-    pub fn execute_resident_count(
+    /// Plan->kernel driver for the resident scalar-aggregate family (P0 spine 1.3): ONE path for
+    /// every resident `COUNT(*)`/`SUM`/`AVG`/`MIN`/`MAX` shape. Binds the select, compiles it into a
+    /// [`ResidentPlan`], runs the shared residency skeleton (MVCC pin -> snapshot -> identity ->
+    /// validity) once, then dispatches the matching device kernel by (predicate, op) shape —
+    /// replacing the per-shape resident count and scalar-aggregate probe methods.
+    pub fn execute_resident_plan(
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        if select.distinct
-            || !matches!(select.projection, SelectProjection::CountAll)
-            || select.group_by.is_some()
-            || !select.having_groups.is_empty()
-            || select.order_by.is_some()
-            || select.limit.is_some()
-            || select.offset.is_some()
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident COUNT(*) proof supports only SELECT COUNT(*) [WHERE <resident predicate>]"
-                    .to_string(),
-            )));
-        }
-        let predicate = compile_resident_count_predicate(&table, &bound)?;
+        let plan = compile_resident_plan(&table, &bound, select)?;
 
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
@@ -124,6 +331,33 @@ impl Engine {
                 table.name
             ))));
         }
+
+        match plan.op {
+            ResidentOp::ScalarAggregate(ResidentScalarAggregate::Count) => {
+                self.run_resident_count(&table, bound, &snapshot, &plan.predicate, access_path)
+            }
+            ResidentOp::ScalarAggregate(aggregate) => self.run_resident_scalar_aggregate(
+                &table,
+                bound,
+                &snapshot,
+                &plan.predicate,
+                aggregate,
+                access_path,
+            ),
+        }
+    }
+
+    /// Physical path for the resident `COUNT(*)` family: dispatch the matching count kernel by
+    /// predicate and return the single-row count. Unfiltered COUNT proves residency with a device
+    /// header-count (recorded as a route device lookup); the int4 predicate forms scan the payload.
+    fn run_resident_count(
+        &self,
+        table: &RelationalTable,
+        bound: BoundRelationalSelect,
+        snapshot: &RelationalResidencySnapshot,
+        predicate: &ResidentPredicate,
+        access_path: RelationalAccessPath,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         let snapshot_gpu_id = snapshot.gpu_id;
         let device_memory = self
             .read_state
@@ -137,7 +371,7 @@ impl Engine {
                 )))
             })?;
 
-        let count: i64 = match predicate {
+        let count: i64 = match *predicate {
             ResidentPredicate::All => {
                 // Unfiltered COUNT(*): a device header-count kernel proves residency (recorded as a
                 // route device lookup), validated against the snapshot's expected row count.
@@ -162,8 +396,8 @@ impl Engine {
                 resident_count_to_i64(row_count)?
             }
             ResidentPredicate::Int4Equal { col, needle } => {
-                let byte_offset = resident_device_int4_column_offset(&snapshot, &table, col)?;
-                let row_count = resident_snapshot_row_count(&snapshot)?;
+                let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+                let row_count = resident_snapshot_row_count(snapshot)?;
                 let matched = device_memory
                     .count_i32_equal_from_payload(byte_offset, row_count, needle)
                     .map_err(|err| {
@@ -176,14 +410,19 @@ impl Engine {
                 needle,
                 comparison,
             } => {
-                let byte_offset = resident_device_int4_column_offset(&snapshot, &table, col)?;
-                let row_count = resident_snapshot_row_count(&snapshot)?;
+                let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+                let row_count = resident_snapshot_row_count(snapshot)?;
                 let matched = device_memory
                     .count_i32_compare_from_payload(byte_offset, row_count, needle, comparison)
                     .map_err(|err| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                     })?;
                 resident_count_to_i64(matched)?
+            }
+            ResidentPredicate::Int4Between { .. } => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident COUNT(*) compiler does not emit a BETWEEN predicate".to_string(),
+                )));
             }
         };
 
@@ -195,6 +434,228 @@ impl Engine {
             fallback_reason: None,
             access_path,
         })
+    }
+
+    /// Physical path for the resident scalar `SUM`/`AVG`/`MIN`/`MAX` family: resolve the aggregate
+    /// column's payload offset, dispatch the matching stats kernel by predicate, and materialize the
+    /// single-row result. Unfiltered SUM uses the header sum kernel; unfiltered AVG/MIN/MAX reduce
+    /// the self-grouped stats kernel; filtered/BETWEEN forms read a `CudaI32Stats` from the payload.
+    fn run_resident_scalar_aggregate(
+        &self,
+        table: &RelationalTable,
+        bound: BoundRelationalSelect,
+        snapshot: &RelationalResidencySnapshot,
+        predicate: &ResidentPredicate,
+        aggregate: ResidentScalarAggregate,
+        access_path: RelationalAccessPath,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let gpu_id = snapshot.gpu_id;
+        let agg_col = match aggregate {
+            ResidentScalarAggregate::Sum { col }
+            | ResidentScalarAggregate::Avg { col }
+            | ResidentScalarAggregate::Min { col }
+            | ResidentScalarAggregate::Max { col } => col,
+            ResidentScalarAggregate::Count => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident COUNT routed to the scalar SUM/AVG/MIN/MAX path".to_string(),
+                )));
+            }
+        };
+        let row_count = resident_snapshot_row_count(snapshot)?;
+
+        // MAX over a provably-empty int4 compare domain: the retained column stats already prove the
+        // result is empty, so answer from them with no kernel launch (matches the pre-unification
+        // filtered probe's fast path; only the D2H of the i64 result counter is charged).
+        if let (
+            ResidentScalarAggregate::Max { col },
+            ResidentPredicate::Int4Compare {
+                needle, comparison, ..
+            },
+        ) = (aggregate, predicate)
+        {
+            if resident_device_int4_column_stats(snapshot, table, col)
+                .is_some_and(|stats| resident_i32_comparison_domain_is_empty(stats, *needle, *comparison))
+            {
+                self.metrics
+                    .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
+                return Ok(self.resident_scalar_result(
+                    bound,
+                    SqlValue::Text(String::new()),
+                    gpu_id,
+                    access_path,
+                ));
+            }
+        }
+
+        let device_memory = self
+            .read_state
+            .residency
+            .device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        // The stats kernels scan one column for both the filter and the aggregate; the compiler
+        // guarantees a filter targets the aggregate column, so the scanned column is the predicate's
+        // (when filtered) or the aggregate's (unfiltered) — identical by construction.
+        let scan_col = match predicate {
+            ResidentPredicate::Int4Compare { col, .. }
+            | ResidentPredicate::Int4Between { col, .. } => *col,
+            ResidentPredicate::All | ResidentPredicate::Int4Equal { .. } => agg_col,
+        };
+        let byte_offset = resident_device_int4_column_offset(snapshot, table, scan_col)?;
+
+        match predicate {
+            ResidentPredicate::All => match aggregate {
+                ResidentScalarAggregate::Sum { .. } => {
+                    let started = Instant::now();
+                    let sum = device_memory
+                        .sum_i32_from_payload(byte_offset, row_count)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    let elapsed = started.elapsed();
+                    self.metrics
+                        .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
+                    self.metrics.observe_kernel_exec_ms(
+                        elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                    );
+                    Ok(self.resident_scalar_result(bound, SqlValue::Int8(sum), gpu_id, access_path))
+                }
+                ResidentScalarAggregate::Avg { .. }
+                | ResidentScalarAggregate::Min { .. }
+                | ResidentScalarAggregate::Max { .. } => {
+                    // Unfiltered AVG/MIN/MAX reduce the self-grouped stats kernel (group == value
+                    // column), so the D2H scales with the distinct-value count it copies back.
+                    let started = Instant::now();
+                    let grouped_stats = device_memory
+                        .grouped_stats_i32_from_payload(byte_offset, byte_offset, row_count)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    let elapsed = started.elapsed();
+                    let copied_group_count = grouped_stats.len();
+                    let total_count = grouped_stats.iter().map(|group| group.count).sum::<u64>();
+                    let total_sum = grouped_stats.iter().map(|group| group.sum).sum::<i64>();
+                    let result_value = match aggregate {
+                        ResidentScalarAggregate::Avg { .. } => average_sql_value(
+                            i128::from(total_sum),
+                            usize::try_from(total_count).map_err(|_| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                    "resident device-memory scalar aggregate count {total_count} exceeds AVG result range"
+                                )))
+                            })?,
+                        ),
+                        ResidentScalarAggregate::Min { .. } => grouped_stats
+                            .iter()
+                            .map(|group| group.min)
+                            .min()
+                            .map(SqlValue::Int4)
+                            .unwrap_or_else(|| SqlValue::Text(String::new())),
+                        ResidentScalarAggregate::Max { .. } => grouped_stats
+                            .iter()
+                            .map(|group| group.max)
+                            .max()
+                            .map(SqlValue::Int4)
+                            .unwrap_or_else(|| SqlValue::Text(String::new())),
+                        _ => unreachable!("matched AVG/MIN/MAX above"),
+                    };
+                    let result_d2h_bytes = copied_group_count
+                        .checked_mul(
+                            std::mem::size_of::<i32>()
+                                + std::mem::size_of::<u64>()
+                                + std::mem::size_of::<i64>()
+                                + (2 * std::mem::size_of::<i32>()),
+                        )
+                        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                        .and_then(|bytes| u64::try_from(bytes).ok())
+                        .unwrap_or(u64::MAX);
+                    self.metrics.observe_d2h_bytes(result_d2h_bytes);
+                    self.metrics.observe_kernel_exec_ms(
+                        elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                    );
+                    Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
+                }
+                ResidentScalarAggregate::Count => Err(ExecuteError::Engine(
+                    EngineError::ApplyFailed("resident COUNT routed to scalar path".to_string()),
+                )),
+            },
+            ResidentPredicate::Int4Compare {
+                needle, comparison, ..
+            } => {
+                let started = Instant::now();
+                let stats = device_memory
+                    .filtered_stats_i32_compare_from_payload(
+                        byte_offset,
+                        row_count,
+                        *needle,
+                        *comparison,
+                    )
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                let elapsed = started.elapsed();
+                let result_value = materialize_resident_scalar_stats(aggregate, &stats)?;
+                let result_d2h_bytes = (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>())
+                    + std::mem::size_of::<u64>()) as u64;
+                self.metrics.observe_d2h_bytes(result_d2h_bytes);
+                self.metrics
+                    .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+                Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
+            }
+            ResidentPredicate::Int4Between { lower, upper, .. } => {
+                let (lower, upper) = (*lower, *upper);
+                let started = Instant::now();
+                let stats = device_memory
+                    .stats_i32_between_from_payload(byte_offset, row_count, lower, upper)
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                let elapsed = started.elapsed();
+                let result_value = materialize_resident_scalar_stats(aggregate, &stats)?;
+                let result_d2h_bytes = if lower > upper {
+                    0
+                } else {
+                    (std::mem::size_of::<u64>()
+                        + std::mem::size_of::<i64>()
+                        + (2 * std::mem::size_of::<i32>())
+                        + std::mem::size_of::<u64>()) as u64
+                };
+                self.metrics.observe_d2h_bytes(result_d2h_bytes);
+                if lower <= upper {
+                    self.metrics.observe_kernel_exec_ms(
+                        elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                    );
+                }
+                Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
+            }
+            ResidentPredicate::Int4Equal { .. } => Err(ExecuteError::Engine(
+                EngineError::ApplyFailed(
+                    "resident scalar aggregate compiler does not emit an equality predicate"
+                        .to_string(),
+                ),
+            )),
+        }
+    }
+
+    /// Build the single-row result a resident scalar aggregate returns (one column, one value, on
+    /// the snapshot's GPU).
+    fn resident_scalar_result(
+        &self,
+        bound: BoundRelationalSelect,
+        value: SqlValue,
+        gpu_id: u16,
+        access_path: RelationalAccessPath,
+    ) -> RelationalSelectResult {
+        RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![value]],
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path,
+        }
     }
 
     pub fn execute_relational_partitioned_count_with_resident_device_memory_probe(
@@ -2248,568 +2709,6 @@ impl Engine {
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
             rows: vec![vec![SqlValue::Int8(count)]],
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            fallback_reason: None,
-            access_path,
-        })
-    }
-
-    pub fn execute_relational_sum_with_resident_device_memory_probe(
-        &self,
-        select: &Select,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        let SelectProjection::Sum { column } = &select.projection else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory SUM proof currently supports only SELECT SUM(int4_column)"
-                    .to_string(),
-            )));
-        };
-        if select.distinct
-            || select.group_by.is_some()
-            || !select.having_groups.is_empty()
-            || select.filter.is_some()
-            || !select.filters.is_empty()
-            || !select.filter_groups.is_empty()
-            || select.order_by.is_some()
-            || select.limit.is_some()
-            || select.offset.is_some()
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory SUM proof currently supports only unfiltered SELECT SUM(int4_column)"
-                    .to_string(),
-            )));
-        }
-        let sum_idx = relational_column_index(&table, column)?;
-        if table.columns[sum_idx].ty != SqlType::Int4 {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory SUM proof currently supports only int4 columns".to_string(),
-            )));
-        }
-
-        let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
-        let snapshot = self
-            .relational_residency_snapshot(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no resident snapshot",
-                    table.name
-                )))
-            })?;
-        if snapshot.schema != table.schema || snapshot.table != table.name {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot no longer matches catalog table identity".to_string(),
-            )));
-        }
-        if !snapshot.is_valid() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" resident snapshot is invalid",
-                table.name
-            ))));
-        }
-        let device_memory = self
-            .read_state
-            .residency
-            .device_memory
-            .get(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    table.name
-                )))
-            })?;
-        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, sum_idx)?;
-        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot row count exceeds retained device-memory proof range"
-                    .to_string(),
-            ))
-        })?;
-        let started = Instant::now();
-        let sum = device_memory
-            .sum_i32_from_payload(byte_offset, row_count)
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-        let elapsed = started.elapsed();
-        self.metrics
-            .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
-        self.metrics
-            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
-
-        Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
-            rows: vec![vec![SqlValue::Int8(sum)]],
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            fallback_reason: None,
-            access_path,
-        })
-    }
-
-    pub fn execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
-        &self,
-        select: &Select,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        let (aggregate_column, aggregate_name) = match &select.projection {
-            SelectProjection::Sum { column } => (column, "SUM"),
-            SelectProjection::Avg { column } => (column, "AVG"),
-            SelectProjection::Min { column } => (column, "MIN"),
-            SelectProjection::Max { column } => (column, "MAX"),
-            _ => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident device-memory filtered scalar aggregate proof currently supports only SUM/AVG/MIN/MAX(int4_column)"
-                        .to_string(),
-                )));
-            }
-        };
-        if select.distinct
-            || select.group_by.is_some()
-            || !select.having_groups.is_empty()
-            || select.order_by.is_some()
-            || select.limit.is_some()
-            || select.offset.is_some()
-            || bound.filter_groups.len() != 1
-            || bound.filter_groups[0].len() != 1
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory filtered scalar aggregate proof currently supports only one int4 comparison predicate"
-                    .to_string(),
-            )));
-        }
-        let aggregate_idx = relational_column_index(&table, aggregate_column)?;
-        let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
-        if filter_idx != aggregate_idx {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory filtered scalar aggregate proof currently requires the predicate column to match the aggregate column"
-                    .to_string(),
-            )));
-        }
-        let Some(comparison) = resident_device_i32_comparison(op) else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory filtered scalar aggregate proof currently supports only non-equality int4 comparisons"
-                    .to_string(),
-            )));
-        };
-        let SqlValue::Int4(needle) = value else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory filtered scalar aggregate proof currently supports only int4 comparison literals"
-                    .to_string(),
-            )));
-        };
-        if table.columns[aggregate_idx].ty != SqlType::Int4 {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "resident device-memory filtered scalar aggregate proof currently supports only int4 columns for {aggregate_name}"
-            ))));
-        }
-
-        let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
-        let snapshot = self
-            .relational_residency_snapshot(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no resident snapshot",
-                    table.name
-                )))
-            })?;
-        if snapshot.schema != table.schema || snapshot.table != table.name {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot no longer matches catalog table identity".to_string(),
-            )));
-        }
-        if !snapshot.is_valid() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" resident snapshot is invalid",
-                table.name
-            ))));
-        }
-        if matches!(select.projection, SelectProjection::Max { .. })
-            && resident_device_int4_column_stats(&snapshot, &table, aggregate_idx).is_some_and(
-                |stats| resident_i32_comparison_domain_is_empty(stats, needle, comparison),
-            )
-        {
-            self.metrics
-                .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
-            return Ok(RelationalSelectResult {
-                columns: bound.selected_columns,
-                rows: vec![vec![SqlValue::Text(String::new())]],
-                planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-                executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
-                fallback_reason: None,
-                access_path,
-            });
-        }
-        let device_memory = self
-            .read_state
-            .residency
-            .device_memory
-            .get(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    table.name
-                )))
-            })?;
-        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, aggregate_idx)?;
-        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot row count exceeds retained device-memory proof range"
-                    .to_string(),
-            ))
-        })?;
-        let started = Instant::now();
-        let stats = device_memory
-            .filtered_stats_i32_compare_from_payload(byte_offset, row_count, needle, comparison)
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-        let elapsed = started.elapsed();
-        let result_value = match &select.projection {
-            SelectProjection::Sum { .. } => SqlValue::Int8(stats.sum),
-            SelectProjection::Avg { .. } => average_sql_value(
-                i128::from(stats.sum),
-                usize::try_from(stats.count).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "resident device-memory filtered aggregate count {} exceeds AVG result range",
-                        stats.count
-                    )))
-                })?,
-            ),
-            SelectProjection::Min { .. } => stats
-                .min
-                .map(SqlValue::Int4)
-                .unwrap_or_else(|| SqlValue::Text(String::new())),
-            SelectProjection::Max { .. } => stats
-                .max
-                .map(SqlValue::Int4)
-                .unwrap_or_else(|| SqlValue::Text(String::new())),
-            _ => unreachable!(),
-        };
-        let result_d2h_bytes = (std::mem::size_of::<u64>()
-            + std::mem::size_of::<i64>()
-            + (2 * std::mem::size_of::<i32>())
-            + std::mem::size_of::<u64>()) as u64;
-        self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.metrics
-            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
-
-        Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
-            rows: vec![vec![result_value]],
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            fallback_reason: None,
-            access_path,
-        })
-    }
-
-    pub fn execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
-        &self,
-        select: &Select,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        let (aggregate_column, aggregate_name) = match &select.projection {
-            SelectProjection::Sum { column } => (column, "SUM"),
-            SelectProjection::Avg { column } => (column, "AVG"),
-            SelectProjection::Min { column } => (column, "MIN"),
-            SelectProjection::Max { column } => (column, "MAX"),
-            _ => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident device-memory BETWEEN scalar aggregate proof currently supports only SUM/AVG/MIN/MAX(int4_column)"
-                        .to_string(),
-                )));
-            }
-        };
-        if select.distinct
-            || select.group_by.is_some()
-            || !select.having_groups.is_empty()
-            || select.order_by.is_some()
-            || select.limit.is_some()
-            || select.offset.is_some()
-            || bound.filter_groups.len() != 1
-            || bound.filter_groups[0].len() != 2
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory BETWEEN scalar aggregate proof currently supports only one int4 BETWEEN predicate"
-                    .to_string(),
-            )));
-        }
-        let aggregate_idx = relational_column_index(&table, aggregate_column)?;
-        let mut filter_idx = None;
-        let mut lower = None;
-        let mut upper = None;
-        for (idx, op, value) in &bound.filter_groups[0] {
-            if filter_idx
-                .replace(*idx)
-                .is_some_and(|existing| existing != *idx)
-            {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident device-memory BETWEEN scalar aggregate proof requires both range bounds to target the same column"
-                        .to_string(),
-                )));
-            }
-            let SqlValue::Int4(value) = value else {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident device-memory BETWEEN scalar aggregate proof supports only int4 bounds"
-                        .to_string(),
-                )));
-            };
-            match op {
-                SelectFilterOp::Gte => lower = Some(*value),
-                SelectFilterOp::Lte => upper = Some(*value),
-                _ => {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident device-memory BETWEEN scalar aggregate proof currently supports only inclusive int4 bounds"
-                            .to_string(),
-                    )));
-                }
-            }
-        }
-        let filter_idx = filter_idx.ok_or_else(|| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory BETWEEN scalar aggregate proof requires an int4 predicate column"
-                    .to_string(),
-            ))
-        })?;
-        if filter_idx != aggregate_idx {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory BETWEEN scalar aggregate proof currently requires the predicate column to match the aggregate column"
-                    .to_string(),
-            )));
-        }
-        let lower = lower.ok_or_else(|| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory BETWEEN scalar aggregate proof requires a lower inclusive bound"
-                    .to_string(),
-            ))
-        })?;
-        let upper = upper.ok_or_else(|| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory BETWEEN scalar aggregate proof requires an upper inclusive bound"
-                    .to_string(),
-            ))
-        })?;
-        if table.columns[aggregate_idx].ty != SqlType::Int4 {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "resident device-memory BETWEEN scalar aggregate proof currently supports only int4 columns for {aggregate_name}"
-            ))));
-        }
-
-        let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
-        let snapshot = self
-            .relational_residency_snapshot(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no resident snapshot",
-                    table.name
-                )))
-            })?;
-        if snapshot.schema != table.schema || snapshot.table != table.name {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot no longer matches catalog table identity".to_string(),
-            )));
-        }
-        if !snapshot.is_valid() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" resident snapshot is invalid",
-                table.name
-            ))));
-        }
-        let device_memory = self
-            .read_state
-            .residency
-            .device_memory
-            .get(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    table.name
-                )))
-            })?;
-        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, aggregate_idx)?;
-        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot row count exceeds retained device-memory proof range"
-                    .to_string(),
-            ))
-        })?;
-        let started = Instant::now();
-        let stats = device_memory
-            .stats_i32_between_from_payload(byte_offset, row_count, lower, upper)
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-        let elapsed = started.elapsed();
-        let result_value = match &select.projection {
-            SelectProjection::Sum { .. } => SqlValue::Int8(stats.sum),
-            SelectProjection::Avg { .. } => average_sql_value(
-                i128::from(stats.sum),
-                usize::try_from(stats.count).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "resident device-memory BETWEEN aggregate count {} exceeds AVG result range",
-                        stats.count
-                    )))
-                })?,
-            ),
-            SelectProjection::Min { .. } => stats
-                .min
-                .map(SqlValue::Int4)
-                .unwrap_or_else(|| SqlValue::Text(String::new())),
-            SelectProjection::Max { .. } => stats
-                .max
-                .map(SqlValue::Int4)
-                .unwrap_or_else(|| SqlValue::Text(String::new())),
-            _ => unreachable!(),
-        };
-        let result_d2h_bytes = if lower > upper {
-            0
-        } else {
-            (std::mem::size_of::<u64>()
-                + std::mem::size_of::<i64>()
-                + (2 * std::mem::size_of::<i32>())
-                + std::mem::size_of::<u64>()) as u64
-        };
-        self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        if lower <= upper {
-            self.metrics
-                .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
-        }
-
-        Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
-            rows: vec![vec![result_value]],
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            fallback_reason: None,
-            access_path,
-        })
-    }
-
-    pub fn execute_relational_scalar_aggregate_with_resident_device_memory_probe(
-        &self,
-        select: &Select,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        let aggregate_column = match &select.projection {
-            SelectProjection::Avg { column }
-            | SelectProjection::Min { column }
-            | SelectProjection::Max { column } => column,
-            _ => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident device-memory scalar aggregate proof currently supports only AVG/MIN/MAX(int4_column)"
-                        .to_string(),
-                )));
-            }
-        };
-        if select.distinct
-            || select.group_by.is_some()
-            || !select.having_groups.is_empty()
-            || select.filter.is_some()
-            || !select.filters.is_empty()
-            || !select.filter_groups.is_empty()
-            || select.order_by.is_some()
-            || select.limit.is_some()
-            || select.offset.is_some()
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory scalar aggregate proof currently supports only unfiltered AVG/MIN/MAX(int4_column)"
-                    .to_string(),
-            )));
-        }
-        let aggregate_idx = relational_column_index(&table, aggregate_column)?;
-        if table.columns[aggregate_idx].ty != SqlType::Int4 {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory scalar aggregate proof currently supports only int4 columns"
-                    .to_string(),
-            )));
-        }
-
-        let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
-        let snapshot = self
-            .relational_residency_snapshot(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no resident snapshot",
-                    table.name
-                )))
-            })?;
-        if snapshot.schema != table.schema || snapshot.table != table.name {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot no longer matches catalog table identity".to_string(),
-            )));
-        }
-        if !snapshot.is_valid() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" resident snapshot is invalid",
-                table.name
-            ))));
-        }
-        let device_memory = self
-            .read_state
-            .residency
-            .device_memory
-            .get(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    table.name
-                )))
-            })?;
-        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, aggregate_idx)?;
-        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot row count exceeds retained device-memory proof range"
-                    .to_string(),
-            ))
-        })?;
-        let started = Instant::now();
-        let grouped_stats = device_memory
-            .grouped_stats_i32_from_payload(byte_offset, byte_offset, row_count)
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-        let elapsed = started.elapsed();
-        let copied_group_count = grouped_stats.len();
-        let total_count = grouped_stats.iter().map(|group| group.count).sum::<u64>();
-        let total_sum = grouped_stats.iter().map(|group| group.sum).sum::<i64>();
-        let result_value = match &select.projection {
-            SelectProjection::Avg { .. } => average_sql_value(
-                i128::from(total_sum),
-                usize::try_from(total_count).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "resident device-memory scalar aggregate count {total_count} exceeds AVG result range"
-                    )))
-                })?,
-            ),
-            SelectProjection::Min { .. } => grouped_stats
-                .iter()
-                .map(|group| group.min)
-                .min()
-                .map(SqlValue::Int4)
-                .unwrap_or_else(|| SqlValue::Text(String::new())),
-            SelectProjection::Max { .. } => grouped_stats
-                .iter()
-                .map(|group| group.max)
-                .max()
-                .map(SqlValue::Int4)
-                .unwrap_or_else(|| SqlValue::Text(String::new())),
-            _ => unreachable!(),
-        };
-        let result_d2h_bytes = copied_group_count
-            .checked_mul(
-                std::mem::size_of::<i32>()
-                    + std::mem::size_of::<u64>()
-                    + std::mem::size_of::<i64>()
-                    + (2 * std::mem::size_of::<i32>()),
-            )
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .unwrap_or(u64::MAX);
-        self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.metrics
-            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
-
-        Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
-            rows: vec![vec![result_value]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,

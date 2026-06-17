@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32Comparison,
-    CudaI32EqualAnyProjectSubmission, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
+    CudaI32EqualAnyProjectSubmission, CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
     CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
     FilterOperator, GroupedI64Order, GroupedI64SortColumn, LimitOperator, MockGpuRuntime, Operator,
     PlannedOp, ProjectOperator, RouteDecision, ScanOperator, SortOperator,
