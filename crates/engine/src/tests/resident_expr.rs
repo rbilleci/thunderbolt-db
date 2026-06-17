@@ -175,3 +175,62 @@ fn gpu_resident_expr_select_evaluates_deep_arithmetic_tree_via_vm() {
         "K < (a+b)*2-5 must equal (a+b)*2-5 > K (comparison flipped)"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_select_evaluates_column_vs_column_predicates() {
+    // Column-vs-column / expr-vs-expr predicates (the comparison RHS is an expression, not a literal)
+    // through the engine's col-vs-col VM. Closed-form oracle: a[i]=i, b[i]=N-1-i (strictly decreasing,
+    // never ties a). `a < b` <=> 2i < N-1 ; `a*2 > b` <=> 3i > N-1. Projected a[i]=i => result rows
+    // are the matching indices.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+
+    const N: i32 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {})", N - 1 - i));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}"))
+        .unwrap();
+
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let Command::Select(select) = parse_command("SELECT a FROM t").unwrap() else {
+        unreachable!()
+    };
+
+    // a < b  : i < N-1-i <=> 2i < N-1 <=> i in [0, 300) for N=600.
+    let a_lt_b = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Lt,
+        lhs: Box::new(ResidentExpr::Column(0)),
+        rhs: Box::new(ResidentExpr::Column(1)),
+    };
+    let lt = e
+        .execute_resident_expr_select(&select, &a_lt_b)
+        .expect("a < b col-vs-col on GPU");
+    let lt_expected: Vec<Vec<SqlValue>> = (0..300).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(lt.rows, lt_expected, "a < b <=> i in [0, 300)");
+
+    // a*2 > b : 2i > N-1-i <=> 3i > N-1 <=> i >= 200 for N=600.
+    let a2_gt_b = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Gt,
+        lhs: Box::new(ResidentExpr::Binary {
+            op: ResidentBinaryOp::Mul,
+            lhs: Box::new(ResidentExpr::Column(0)),
+            rhs: Box::new(ResidentExpr::Int4Literal(2)),
+        }),
+        rhs: Box::new(ResidentExpr::Column(1)),
+    };
+    let gt = e
+        .execute_resident_expr_select(&select, &a2_gt_b)
+        .expect("a*2 > b expr-vs-col on GPU");
+    let gt_expected: Vec<Vec<SqlValue>> = (200..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(gt.rows, gt_expected, "a*2 > b <=> i >= 200");
+}

@@ -321,27 +321,39 @@ impl Engine {
             }
         }
 
-        // GENERAL path: `Compare(arith_tree, literal)` (or `literal <cmp> arith_tree`, flipping the
-        // comparison) compiles the arithmetic side to bytecode and runs the device VM. Col-vs-col /
-        // expr-vs-expr comparisons need a mask + boolean primitives (the next slice).
-        let (value_expr, needle, comparison) = match (lhs.as_ref(), rhs.as_ref()) {
-            (value, ResidentExpr::Int4Literal(needle)) => (value, *needle, comparison),
+        // GENERAL path: compile the arithmetic side(s) to bytecode and run the device VM.
+        //   - `arith_tree <cmp> literal`        -> arith VM (one value buffer vs scalar)
+        //   - `literal <cmp> arith_tree`        -> arith VM, comparison flipped
+        //   - `arith_tree <cmp> arith_tree`     -> compile both, col-vs-col / expr-vs-expr VM
+        // (AND/OR over masks is the next slice.)
+        match (lhs.as_ref(), rhs.as_ref()) {
+            (value, ResidentExpr::Int4Literal(needle)) => {
+                let mut program = Vec::new();
+                compile_arith_program(value, table, snapshot, &mut program)?;
+                device_memory
+                    .run_expr_arith_filter(&program, row_count, comparison, *needle)
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
+            }
             (ResidentExpr::Int4Literal(needle), value) => {
-                (value, *needle, flip_comparison_code(comparison))
+                let mut program = Vec::new();
+                compile_arith_program(value, table, snapshot, &mut program)?;
+                device_memory
+                    .run_expr_arith_filter(
+                        &program,
+                        row_count,
+                        flip_comparison_code(comparison),
+                        *needle,
+                    )
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
             }
-            _ => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident Expr interpreter requires one side of the comparison to be an int4 \
-                     literal; column-vs-column comparisons land with the mask/boolean primitives \
-                     (docs/architecture/17-general-gpu-executor.md section 2.3)"
-                        .to_string(),
-                )));
+            (lhs_expr, rhs_expr) => {
+                let mut program = Vec::new();
+                compile_arith_program(lhs_expr, table, snapshot, &mut program)?;
+                compile_arith_program(rhs_expr, table, snapshot, &mut program)?;
+                device_memory
+                    .run_expr_compare_buffers_filter(&program, row_count, comparison)
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
             }
-        };
-        let mut program = Vec::new();
-        compile_arith_program(value_expr, table, snapshot, &mut program)?;
-        device_memory
-            .run_expr_arith_filter(&program, row_count, comparison, needle)
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
+        }
     }
 }

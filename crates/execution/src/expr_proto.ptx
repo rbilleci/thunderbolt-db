@@ -381,3 +381,105 @@ loop_bs:
 done_bs:
     ret;
 }
+
+// Compare two int4 intermediate buffers elementwise and atomic-append the matching row indices:
+// out_indices[atomicAdd(out_count)] = i  where  a[i] <cmp> b[i]. comparison: 0=eq,1=lt,2=le,3=gt,4=ge.
+// Generalizes the comparison RHS from a scalar to an arbitrary expression buffer (col-vs-col /
+// expr-vs-expr). Order is atomic-schedule; the host sorts. out_count pre-zeroed by the caller.
+.visible .entry gpu_db_buffer_i32_compare_buffers_to_indices(
+    .param .u64 a_ptr,
+    .param .u64 b_ptr,
+    .param .u64 n,
+    .param .u32 comparison,
+    .param .u64 out_count_ptr,
+    .param .u64 out_indices_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %p_eq;
+    .reg .pred %p_lt;
+    .reg .pred %p_le;
+    .reg .pred %p_gt;
+    .reg .pred %p_ge;
+    .reg .pred %c_eq;
+    .reg .pred %c_lt;
+    .reg .pred %c_le;
+    .reg .pred %c_gt;
+    .reg .pred %c_ge;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %cmp;
+    .reg .u32 %pos;
+    .reg .u32 %iu;
+    .reg .s32 %va;
+    .reg .s32 %vb;
+    .reg .u64 %a;
+    .reg .u64 %b;
+    .reg .u64 %n;
+    .reg .u64 %count;
+    .reg .u64 %outidx;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %b, [b_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u32 %cmp, [comparison];
+    ld.param.u64 %count, [out_count_ptr];
+    ld.param.u64 %outidx, [out_indices_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_cb:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_cb;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %a, %o4;
+    ld.global.s32 %va, [%addr];
+    add.u64 %addr, %b, %o4;
+    ld.global.s32 %vb, [%addr];
+    setp.eq.s32 %p_eq, %va, %vb;
+    setp.lt.s32 %p_lt, %va, %vb;
+    setp.le.s32 %p_le, %va, %vb;
+    setp.gt.s32 %p_gt, %va, %vb;
+    setp.ge.s32 %p_ge, %va, %vb;
+    setp.eq.u32 %c_eq, %cmp, 0;
+    setp.eq.u32 %c_lt, %cmp, 1;
+    setp.eq.u32 %c_le, %cmp, 2;
+    setp.eq.u32 %c_gt, %cmp, 3;
+    setp.eq.u32 %c_ge, %cmp, 4;
+    mov.pred %match, 0;
+    and.pred %p_eq, %p_eq, %c_eq;
+    or.pred %match, %match, %p_eq;
+    and.pred %p_lt, %p_lt, %c_lt;
+    or.pred %match, %match, %p_lt;
+    and.pred %p_le, %p_le, %c_le;
+    or.pred %match, %match, %p_le;
+    and.pred %p_gt, %p_gt, %c_gt;
+    or.pred %match, %match, %p_gt;
+    and.pred %p_ge, %p_ge, %c_ge;
+    or.pred %match, %match, %p_ge;
+    @!%match bra next_cb;
+    atom.global.add.u32 %pos, [%count], 1;
+    cvt.u32.u64 %iu, %i;
+    mul.lo.u32 %t32, %pos, 4;
+    cvt.u64.u32 %addr, %t32;
+    add.u64 %addr, %outidx, %addr;
+    st.global.u32 [%addr], %iu;
+next_cb:
+    add.u64 %i, %i, %stride;
+    bra loop_cb;
+done_cb:
+    ret;
+}

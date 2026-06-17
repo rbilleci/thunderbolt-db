@@ -1371,6 +1371,19 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_expr_arith_filter(self, program, row_count, comparison, needle)
     }
 
+    /// Run an arithmetic bytecode `program` that leaves TWO value buffers (compiled lhs then rhs),
+    /// then compare them elementwise (`lhs <cmp> rhs`) and return the matching row indices. Behind the
+    /// engine's column-vs-column / expr-vs-expr predicate lowering; `comparison` 0=eq/1=lt/2=le/3=gt/
+    /// 4=ge.
+    pub fn run_expr_compare_buffers_filter(
+        &self,
+        program: &[ExprArithStep],
+        row_count: u64,
+        comparison: u32,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_expr_compare_buffers_filter(self, program, row_count, comparison)
+    }
+
     pub fn project_i32_compare_ordered_from_payload(
         &self,
         byte_offset: u64,
@@ -8902,13 +8915,145 @@ fn compact_buffer_i32_compare_to_indices(
 /// generalizes the fixed 2-col fast-path: arbitrary depth lowers to a longer program of the same
 /// primitives. Correctness-first: each step runs on a pooled stream that syncs, so an intermediate
 /// is valid before the next step reads it (pipelining/fusion is a later perf lever).
-fn launch_cuda_resident_expr_arith_filter(
+/// Compare two int4 value buffers (absolute device ptrs) elementwise and return the matching row
+/// indices, host-sorted ascending. The col-vs-col / expr-vs-expr analogue of
+/// `compact_buffer_i32_compare_to_indices`. `comparison`: 0=eq, 1=lt, 2=le, 3=gt, 4=ge.
+fn compact_buffers_i32_compare_to_indices(
     resident: &CudaResidentDeviceMemory,
+    lhs_device_ptr: u64,
+    rhs_device_ptr: u64,
+    n: u64,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let byte_len = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn = primary.cached_function(c"gpu_db_buffer_i32_compare_buffers_to_indices", &ptx)?;
+
+    let indices_buf = primary.lease_device_buffer(byte_len)?;
+    let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+    let zero = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            count_buf.ptr,
+            (&zero as *const u32).cast::<c_void>(),
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a_arg = lhs_device_ptr;
+    let mut b_arg = rhs_device_ptr;
+    let mut n_arg = n;
+    let mut cmp_arg = comparison;
+    let mut count_arg = count_buf.ptr;
+    let mut idx_arg = indices_buf.ptr;
+    let mut args = [
+        (&mut a_arg as *mut u64).cast::<c_void>(),
+        (&mut b_arg as *mut u64).cast::<c_void>(),
+        (&mut n_arg as *mut u64).cast::<c_void>(),
+        (&mut cmp_arg as *mut u32).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+        (&mut idx_arg as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            compare_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    let mut match_count = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut match_count as *mut u32).cast::<c_void>(),
+            count_buf.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    let match_count = usize::try_from(match_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?
+        .min(n_usize);
+    let mut indices = vec![0_u32; match_count];
+    if match_count > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                indices.as_mut_ptr().cast::<c_void>(),
+                indices_buf.ptr,
+                match_count * std::mem::size_of::<u32>(),
+            )
+        })?;
+    }
+    indices.sort_unstable();
+    Ok(indices)
+}
+
+/// Execute an arithmetic bytecode `program` over a stack of leased device buffers and return the
+/// resulting stack (each step launches one buffer->buffer primitive on a syncing pooled stream). The
+/// returned leases borrow `resident`; the caller consumes the stack (one value for a scalar compare,
+/// two for a buffer-vs-buffer compare). Callers handle `n == 0` before calling.
+fn run_resident_arith_program<'r>(
+    resident: &'r CudaResidentDeviceMemory,
     program: &[ExprArithStep],
     n: u64,
-    compare_code: u32,
-    needle: i32,
-) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -8924,9 +9069,6 @@ fn launch_cuda_resident_expr_arith_filter(
     ) -> i32;
     const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    if n == 0 {
-        return Ok(Vec::new());
-    }
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let byte_len = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -9039,7 +9181,21 @@ fn launch_cuda_resident_expr_arith_filter(
             }
         }
     }
+    Ok(stack)
+}
 
+/// Evaluate an arithmetic `program` to one value buffer, then compare it to `needle` -> row indices.
+fn launch_cuda_resident_expr_arith_filter(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprArithStep],
+    n: u64,
+    compare_code: u32,
+    needle: i32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stack = run_resident_arith_program(resident, program, n)?;
     let value = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -9048,6 +9204,31 @@ fn launch_cuda_resident_expr_arith_filter(
         return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
     }
     compact_buffer_i32_compare_to_indices(resident, value.ptr, n, needle, compare_code)
+}
+
+/// Evaluate a `program` that leaves TWO value buffers (the compiled lhs then rhs of a comparison),
+/// then compare them elementwise (`lhs <cmp> rhs`) -> row indices. The col-vs-col / expr-vs-expr
+/// filter behind the engine's `Compare(expr, expr)` lowering.
+fn launch_cuda_resident_expr_compare_buffers_filter(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprArithStep],
+    n: u64,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stack = run_resident_arith_program(resident, program, n)?;
+    let rhs = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let lhs = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    compact_buffers_i32_compare_to_indices(resident, lhs.ptr, rhs.ptr, n, comparison)
 }
 
 // P2 §9.5/S2 — stable bitonic argsort primitive (the small-result branch of the adaptive GPU sort
@@ -15750,6 +15931,81 @@ mod tests {
             .expect("vm 10-a > 0");
         let expected3: Vec<u32> = (0..10).collect();
         assert_eq!(got3, expected3, "10 - a > 0 <=> i < 10 (scalar_on_left)");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_expr_compare_buffers_filter_evaluates_col_vs_col_on_gpu() {
+        // Col-vs-col / expr-vs-expr comparisons: the comparison RHS is an arbitrary expression buffer,
+        // not just a literal. GPU-NATIVE closed-form oracle: a[i]=i, b[i]=N-1-i (strictly decreasing),
+        // so `a < b` <=> i < N-1-i <=> 2i < N-1 (a contiguous range), and a/b never tie.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const N: u64 = 600;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let b_off = a_off + N * std::mem::size_of::<i32>() as u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&N.to_le_bytes());
+        let mut a_bytes = Vec::new();
+        let mut b_bytes = Vec::new();
+        for i in 0..N as i32 {
+            a_bytes.extend_from_slice(&i.to_le_bytes());
+            b_bytes.extend_from_slice(&(N as i32 - 1 - i).to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                b_off + b_bytes.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: b_off,
+                        bytes: &b_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // a < b  (cmp=1): program leaves [a, b]; 2i < 599 <=> i <= 299.
+        let p_ab = [
+            ExprArithStep::LoadColumn { byte_offset: a_off },
+            ExprArithStep::LoadColumn { byte_offset: b_off },
+        ];
+        let lt = resident
+            .run_expr_compare_buffers_filter(&p_ab, N, 1)
+            .expect("a < b");
+        let lt_expected: Vec<u32> = (0..300).collect();
+        assert_eq!(lt, lt_expected, "a < b <=> i in [0, 300)");
+
+        // a > b  (cmp=3): the complementary range (a and b never tie).
+        let gt = resident
+            .run_expr_compare_buffers_filter(&p_ab, N, 3)
+            .expect("a > b");
+        let gt_expected: Vec<u32> = (300..N as u32).collect();
+        assert_eq!(gt, gt_expected, "a > b <=> i in [300, 600)");
+
+        // expr-vs-expr: a < a*2  (a=i, a*2=2i): i < 2i <=> i >= 1.
+        let p_expr = [
+            ExprArithStep::LoadColumn { byte_offset: a_off },
+            ExprArithStep::LoadColumn { byte_offset: a_off },
+            ExprArithStep::ScalarBinary {
+                op: 2,
+                scalar: 2,
+                scalar_on_left: false,
+            },
+        ];
+        let expr_lt = resident
+            .run_expr_compare_buffers_filter(&p_expr, N, 1)
+            .expect("a < a*2");
+        let expr_expected: Vec<u32> = (1..N as u32).collect();
+        assert_eq!(expr_lt, expr_expected, "a < a*2 <=> i >= 1");
     }
 
     #[test]
