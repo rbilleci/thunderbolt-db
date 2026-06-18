@@ -753,6 +753,15 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
         .expect("price > 10.5 on GPU");
     assert_eq!(gt_low.rows, gt_expected, "price > 10.5 (scale 1) == price > 10.50");
 
+    // trailing zeros are insignificant: price > 10.500 (written scale 3) == price > 10.50 => [11, N).
+    let gt_trailing = e
+        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.500")
+        .expect("price > 10.500 on GPU");
+    assert_eq!(
+        gt_trailing.rows, gt_expected,
+        "price > 10.500 (trailing zeros) == price > 10.50"
+    );
+
     // col-vs-col, equal scale: price < cost => i+0.50 < (N-1-i)+0.50 => 2i < N-1 => [0, 300).
     let cols = e
         .execute_resident_expr_select_sql("SELECT price FROM t WHERE price < cost")

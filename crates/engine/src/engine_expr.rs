@@ -194,6 +194,9 @@ fn column_numeric_scale(table: &RelationalTable, column_idx: usize) -> Option<u8
 /// column is rejected: rescaling it down would round, and PG compares numerics exactly — rounding
 /// would yield wrong rows. Cross-scale comparison (rescaling the column on the GPU) is a follow-on.
 fn rescale_numeric_literal(literal: Decimal128, column_scale: u8) -> Result<i128, ExecuteError> {
+    // Canonicalize first (strip trailing zeros) so `10.500` is treated as `10.5` — PG ignores trailing
+    // zeros (10.500 == 10.50), so it must NOT be rejected just for a wider written scale.
+    let literal = literal.canonical();
     if literal.scale > column_scale {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "numeric literal has more fractional digits than the column scale (exact cross-scale \
