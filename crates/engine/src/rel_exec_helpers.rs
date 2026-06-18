@@ -14,6 +14,7 @@ pub(crate) fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
             | (SqlValue::Bool(_), SqlType::Bool)
             | (SqlValue::Text(_), SqlType::Text)
             | (SqlValue::Date(_), SqlType::Date)
+            | (SqlValue::Timestamp(_), SqlType::Timestamp)
     )
 }
 
@@ -48,16 +49,30 @@ pub(crate) fn coerce_insert_value(
     ty: SqlType,
     column_name: &str,
 ) -> Result<SqlValue, EngineError> {
-    // A string literal assigned to a date column is parsed as a date (PG coerces an unknown-type
-    // literal to the column type). An already-typed `Date` value passes through the check below.
-    if let (SqlValue::Text(text), SqlType::Date) = (&value, ty) {
-        return gpu_db_sql::datetime::parse_date(text)
-            .map(SqlValue::Date)
-            .ok_or_else(|| {
-                EngineError::ApplyFailed(format!(
-                    "invalid input syntax for type date: \"{text}\""
-                ))
-            });
+    // A string literal assigned to a date/timestamp column is parsed as that type (PG coerces an
+    // unknown-type literal to the column type). An already-typed value passes through the check below.
+    if let SqlValue::Text(text) = &value {
+        match ty {
+            SqlType::Date => {
+                return gpu_db_sql::datetime::parse_date(text)
+                    .map(SqlValue::Date)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "invalid input syntax for type date: \"{text}\""
+                        ))
+                    });
+            }
+            SqlType::Timestamp => {
+                return gpu_db_sql::datetime::parse_timestamp(text)
+                    .map(SqlValue::Timestamp)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "invalid input syntax for type timestamp: \"{text}\""
+                        ))
+                    });
+            }
+            _ => {}
+        }
     }
     let value = widen_value_to_column_type(value, ty);
     if !sql_value_matches_type(&value, ty) {
@@ -204,6 +219,7 @@ pub(crate) fn relational_index_value(value: &SqlValue) -> String {
         SqlValue::Bool(value) => format!("b:{}", if *value { 't' } else { 'f' }),
         SqlValue::Text(value) => format!("t:{value}"),
         SqlValue::Date(value) => format!("date:{value}"),
+        SqlValue::Timestamp(value) => format!("ts:{value}"),
     }
 }
 
@@ -256,7 +272,11 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
     match value {
         SqlValue::Int4(value) => Ok(value.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Date(_) => {
+        SqlValue::Int8(_)
+        | SqlValue::Numeric(_)
+        | SqlValue::Bool(_)
+        | SqlValue::Date(_)
+        | SqlValue::Timestamp(_) => {
             Err(EngineError::ApplyFailed(
                 "COPY-to-engine ingestion supports int4/text rows only".to_string(),
             ))
@@ -273,6 +293,7 @@ pub(crate) fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
         SqlValue::Bool(_) => 1,
         SqlValue::Text(value) => value.len() as u64,
         SqlValue::Date(_) => 4,
+        SqlValue::Timestamp(_) => 8,
     }
 }
 
@@ -346,6 +367,7 @@ pub(crate) fn information_schema_data_type(ty: SqlType) -> &'static str {
         SqlType::Bool => "boolean",
         SqlType::Text => "text",
         SqlType::Date => "date",
+        SqlType::Timestamp => "timestamp",
     }
 }
 
@@ -633,6 +655,7 @@ pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
                 format!("t:{}", value.replace('\\', "\\\\").replace('|', "\\|"))
             }
             SqlValue::Date(value) => format!("date:{value}"),
+            SqlValue::Timestamp(value) => format!("ts:{value}"),
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -726,6 +749,14 @@ pub(crate) fn decode_relational_value(
                 ))
             })
         }
+        SqlType::Timestamp => {
+            let value = part.strip_prefix("ts:").ok_or_else(wrong_type)?;
+            value.parse::<i64>().map(SqlValue::Timestamp).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored TIMESTAMP value is invalid".to_string(),
+                ))
+            })
+        }
     }
 }
 
@@ -809,6 +840,26 @@ pub(crate) fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering 
             | SqlValue::Numeric(_)
             | SqlValue::Bool(_)
             | SqlValue::Text(_),
+        ) => Ordering::Greater,
+        // Timestamp is the last tier (sorts after date); same-type compares by microsecond count.
+        (SqlValue::Timestamp(left), SqlValue::Timestamp(right)) => left.cmp(right),
+        (
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_),
+            SqlValue::Timestamp(_),
+        ) => Ordering::Less,
+        (
+            SqlValue::Timestamp(_),
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_),
         ) => Ordering::Greater,
     }
 }
@@ -1513,7 +1564,8 @@ pub(crate) fn int4_aggregate_value(
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
-        | SqlValue::Date(_) => {
+        | SqlValue::Date(_)
+        | SqlValue::Timestamp(_) => {
             Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 aggregate_int4_error_message(aggregate).to_string(),
             )))

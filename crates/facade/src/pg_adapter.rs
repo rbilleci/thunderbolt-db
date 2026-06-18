@@ -16,6 +16,7 @@ pub fn logical_type_oid(ty: LogicalType) -> u32 {
         LogicalType::Bool => 16,
         LogicalType::Text => 25,
         LogicalType::Date => 1082,
+        LogicalType::Timestamp => 1114,
     }
 }
 
@@ -28,6 +29,7 @@ pub fn logical_type_size(ty: LogicalType) -> i16 {
         LogicalType::Bool => 1,
         LogicalType::Text => -1,
         LogicalType::Date => 4,
+        LogicalType::Timestamp => 8,
     }
 }
 
@@ -42,6 +44,7 @@ pub fn db_value_text(value: &DbValue) -> String {
         DbValue::Bool(value) => if *value { "t" } else { "f" }.to_string(),
         DbValue::Text(value) => value.clone(),
         DbValue::Date(value) => gpu_db_sql::datetime::format_date(*value),
+        DbValue::Timestamp(value) => gpu_db_sql::datetime::format_timestamp(*value),
     }
 }
 

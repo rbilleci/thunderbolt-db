@@ -475,6 +475,9 @@ pub(crate) fn parse_bounded_sql_function_body(
         SqlType::Date => gpu_db_sql::datetime::parse_date(literal)
             .map(SqlValue::Date)
             .ok_or_else(unsupported_function_body_error),
+        SqlType::Timestamp => gpu_db_sql::datetime::parse_timestamp(literal)
+            .map(SqlValue::Timestamp)
+            .ok_or_else(unsupported_function_body_error),
     }
 }
 
@@ -634,16 +637,17 @@ pub(crate) fn resident_device_int8_column_offset(
             "resident device-memory predicate column is outside the catalog table".to_string(),
         ))
     })?;
-    if column.ty != SqlType::Int8 {
+    // int8 and timestamp share the i64 section (a timestamp is i64 microseconds), so resolve either.
+    if !matches!(column.ty, SqlType::Int8 | SqlType::Timestamp) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident device-memory predicate column is not int8".to_string(),
+            "resident device-memory predicate column is not int8/timestamp".to_string(),
         )));
     }
     let int8_ordinal = table
         .columns
         .iter()
         .take(column_idx)
-        .filter(|candidate| candidate.ty == SqlType::Int8)
+        .filter(|candidate| matches!(candidate.ty, SqlType::Int8 | SqlType::Timestamp))
         .count();
     if snapshot
         .resident_device_int8_columns

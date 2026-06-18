@@ -1336,3 +1336,105 @@ fn gpu_execute_resident_expr_select_sql_runs_date_comparisons() {
         "invalid date literal => hard error"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_timestamp_comparisons() {
+    // Timestamp comparison on the general GPU executor (the type matrix, doc 19): a `timestamp` is
+    // i64 microseconds since 2000-01-01, reusing the int8 section + the i64 compare kernels (the i64
+    // micro literal exceeds the i32 VM scalar, so it uses expr_i64_compare_scalar_filter directly).
+    // event_at[i] = 2024-01-15 i:00:00, created_at = constant 2024-01-15 12:00:00, label = i.
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (event_at TIMESTAMP, created_at TIMESTAMP, label INT)",
+    )
+    .unwrap();
+    const N: i64 = 24; // hours 00:00:00 .. 23:00:00
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!(
+            "('2024-01-15 {i:02}:00:00', '2024-01-15 12:00:00', {i})"
+        ));
+    }
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (event_at, created_at, label) VALUES {values}"),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let labels = |range: std::ops::Range<i64>| -> Vec<Vec<SqlValue>> {
+        range.map(|i| vec![SqlValue::Int4(i as i32)]).collect()
+    };
+
+    // = '2024-01-15 10:00:00' -> hour 10 -> row 10
+    let eq = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE event_at = '2024-01-15 10:00:00'",
+        )
+        .expect("event_at = ts on GPU");
+    assert_eq!(eq.rows, vec![vec![SqlValue::Int4(10)]], "= 10:00:00 => row 10");
+    assert_eq!(eq.executed_target, DeviceTarget::Gpu(0));
+
+    // > '2024-01-15 10:00:00' -> [11, 24)
+    let gt = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE event_at > '2024-01-15 10:00:00'",
+        )
+        .expect("event_at > ts on GPU");
+    assert_eq!(gt.rows, labels(11..N), "> 10:00:00 => [11, 24)");
+
+    // fractional / sub-hour literal: < '2024-01-15 05:30:00' -> hours 0..5 -> [0, 6)
+    let lt = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE event_at < '2024-01-15 05:30:00'",
+        )
+        .expect("event_at < ts on GPU");
+    assert_eq!(lt.rows, labels(0..6), "< 05:30:00 => [0, 6)");
+
+    // literal on the LEFT
+    let lit_left = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE '2024-01-15 10:00:00' < event_at",
+        )
+        .expect("ts < event_at on GPU");
+    assert_eq!(lit_left.rows, labels(11..N), "10:00:00 < event_at => [11, 24)");
+
+    // col-vs-col: event_at > created_at (noon) -> hours > 12 -> [13, 24)
+    let col_col = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE event_at > created_at")
+        .expect("event_at > created_at on GPU");
+    assert_eq!(col_col.rows, labels(13..N), "event_at > created_at (noon) => [13, 24)");
+
+    // projecting the TIMESTAMP column yields SqlValue::Timestamp(micros)
+    let proj = e
+        .execute_resident_expr_select_sql(
+            "SELECT event_at FROM t WHERE event_at = '2024-01-15 10:00:00'",
+        )
+        .expect("project timestamp on GPU");
+    let micros = gpu_db_sql::datetime::parse_timestamp("2024-01-15 10:00:00").expect("valid ts");
+    assert_eq!(
+        proj.rows,
+        vec![vec![SqlValue::Timestamp(micros)]],
+        "projecting event_at returns the timestamp value"
+    );
+
+    // REJECTIONS -- hard errors, never wrong rows:
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE event_at = 5")
+            .is_err(),
+        "timestamp compared to an integer => hard error"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE event_at = 'not-a-ts'")
+            .is_err(),
+        "invalid timestamp literal => hard error"
+    );
+}

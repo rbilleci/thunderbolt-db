@@ -48,6 +48,7 @@ pub enum LogicalType {
     Bool,
     Text,
     Date,
+    Timestamp,
 }
 
 /// Neutral value vocabulary. Owned by the façade so the protocol crate's
@@ -63,6 +64,8 @@ pub enum DbValue {
     Text(String),
     /// A `date` as i32 days since 2000-01-01 (PostgreSQL's date epoch).
     Date(i32),
+    /// A `timestamp` as i64 microseconds since 2000-01-01 00:00:00.
+    Timestamp(i64),
 }
 
 /// Neutral column metadata: a name and a logical type. No OID, no typmod.
@@ -637,6 +640,7 @@ fn map_logical_type(ty: SqlType) -> LogicalType {
         SqlType::Bool => LogicalType::Bool,
         SqlType::Text => LogicalType::Text,
         SqlType::Date => LogicalType::Date,
+        SqlType::Timestamp => LogicalType::Timestamp,
     }
 }
 
@@ -655,6 +659,7 @@ fn map_value(value: SqlValue) -> DbValue {
         SqlValue::Bool(value) => DbValue::Bool(value),
         SqlValue::Text(value) => DbValue::Text(value),
         SqlValue::Date(value) => DbValue::Date(value),
+        SqlValue::Timestamp(value) => DbValue::Timestamp(value),
     }
 }
 

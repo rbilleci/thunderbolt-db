@@ -102,9 +102,16 @@ The executor is int4 end to end; each new type extends the same four layers:
    a day count (`parse_date`) at lowering and emits an I32 `CompareScalar`/`CompareBuffers`;
    projection tags the i32 as `Date`. `hire_date = '2024-01-15'`, `> / < / <>`, literal-on-left, and
    col-vs-col all run on the GPU. Date AND/OR / arithmetic, and date-vs-non-date, are hard errors.
-   NEXT: **timestamp** (i64 microseconds -> the int8 section + i64 VM, same pattern + time-of-day
-   parsing), then time/interval.
-5. **bool** (1-byte).
+5. **timestamp** — **COMPARISON DONE**: a `timestamp` is i64 MICROSECONDS since 2000-01-01 00:00:00,
+   so it REUSES the int8 residency section + the i64 compare KERNELS (`expr_i64_compare_*` -- the i64
+   micro literal exceeds the i32 `ExprStep` VM scalar, so it calls the kernels directly, not the VM).
+   `parse_timestamp`/`format_timestamp` extend the calendar module (`HH:MM[:SS[.ffffff]]`, `T` or space
+   separator, sub-second truncated to 6 digits). The int8 residency builder + `resident_device_int8_
+   column_offset` accept `Int8 | Timestamp`; `try_lower_timestamp_predicate` coerces the string literal
+   to micros at lowering; projection tags the i64 as Timestamp. `event_at = '2024-01-15 10:00:00'`,
+   `>/<`, literal-on-left, and col-vs-col all run on the GPU. NEXT temporal = timestamptz / time /
+   interval (follow-ons). **TEMPORAL CLUSTER (date + timestamp) DONE.**
+6. **bool** (1-byte).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

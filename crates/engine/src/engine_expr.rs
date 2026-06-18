@@ -260,6 +260,52 @@ fn date_literal_days(expr: &ResidentExpr) -> Result<i32, ExecuteError> {
     }
 }
 
+/// The column index if `expr` is a `Column` of `timestamp` type, else `None`.
+fn timestamp_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
+    match expr {
+        ResidentExpr::Column(idx)
+            if table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Timestamp) =>
+        {
+            Some(*idx)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` mentions a timestamp COLUMN anywhere (the predicate is "timestamp" when a timestamp
+/// column is involved; a bare string literal is the timestamp VALUE, resolved at lowering).
+fn expr_mentions_timestamp(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Timestamp)
+        }
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_timestamp(lhs, table) || expr_mentions_timestamp(rhs, table)
+        }
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => false,
+    }
+}
+
+/// The i64 microsecond count of a timestamp literal: a `TextLiteral` parsed as `YYYY-MM-DD HH:MM:SS`.
+/// Anything else is a type error -- a timestamp column compares only to a timestamp literal or column.
+fn timestamp_literal_micros(expr: &ResidentExpr) -> Result<i64, ExecuteError> {
+    match expr {
+        ResidentExpr::TextLiteral(text) => {
+            gpu_db_sql::datetime::parse_timestamp(text).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "invalid input syntax for type timestamp: \"{text}\""
+                )))
+            })
+        }
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a timestamp column compares only to a timestamp literal or another timestamp column"
+                .to_string(),
+        ))),
+    }
+}
+
 /// Compile a SQL `LIKE` pattern to the device kernel's u32 token array: one token per output position,
 /// `(op << 8) | literal_byte`, op 0 = literal byte, 1 = any-one (`_`), 2 = any-run (`%`). The default
 /// `\` escape is resolved here (`\%` / `\_` / `\\` -> a literal byte); a lone trailing `\` is an error
@@ -809,10 +855,11 @@ impl Engine {
                 && ty != SqlType::Int8
                 && !matches!(ty, SqlType::Numeric { .. })
                 && ty != SqlType::Date
+                && ty != SqlType::Timestamp
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident Expr select currently materializes int4 / int8 / numeric / date \
-                     projection columns only"
+                    "resident Expr select currently materializes int4 / int8 / numeric / date / \
+                     timestamp projection columns only"
                         .to_string(),
                 )));
             }
@@ -873,6 +920,7 @@ impl Engine {
             Int8(Vec<i64>),
             Numeric(Vec<i128>, u8),
             Date(Vec<i32>),
+            Timestamp(Vec<i64>),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
@@ -906,6 +954,16 @@ impl Engine {
                         })?;
                     ProjectedColumn::Date(values)
                 }
+                SqlType::Timestamp => {
+                    // Timestamp rides the i64 section; project it as i64 then tag it as a timestamp.
+                    let byte_offset = resident_device_int8_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_i64_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Timestamp(values)
+                }
                 _ => {
                     let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
                     let values = device_memory
@@ -929,6 +987,7 @@ impl Engine {
                             SqlValue::Numeric(Decimal128::new(values[row], *scale))
                         }
                         ProjectedColumn::Date(values) => SqlValue::Date(values[row]),
+                        ProjectedColumn::Timestamp(values) => SqlValue::Timestamp(values[row]),
                     })
                     .collect()
             })
@@ -1162,6 +1221,71 @@ impl Engine {
             }
             (None, None) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "a date predicate must involve a date column".to_string(),
+            ))),
+        }
+    }
+
+    /// Try to lower a SIMPLE timestamp comparison (`ts_col <cmp> 'YYYY-MM-DD HH:MM:SS'`, either order,
+    /// or `ts_col <cmp> ts_col`) to surviving row indices via the i64 compare KERNELS (the type matrix,
+    /// doc 19): a `timestamp` is i64 microseconds, so it reuses the int8 residency section + the i64
+    /// compare kernels. (The i64 microsecond literal exceeds the i32 `ExprStep` scalar, so this uses
+    /// `expr_i64_compare_scalar_filter` directly, not the VM's i32-scalar step.) Returns None for a
+    /// non-timestamp predicate. Timestamp `AND`/`OR` / arithmetic, and a timestamp compared to a
+    /// non-timestamp value, are hard errors -- never a silent mis-answer.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_timestamp_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        if !(expr_mentions_timestamp(lhs, table) || expr_mentions_timestamp(rhs, table)) {
+            return Ok(None);
+        }
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only simple timestamp comparisons (timestamp \
+                 AND/OR and arithmetic are follow-ons)"
+                    .to_string(),
+            )));
+        };
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        match (
+            timestamp_column_index(lhs, table),
+            timestamp_column_index(rhs, table),
+        ) {
+            (Some(col), None) => {
+                let micros = timestamp_literal_micros(rhs)?;
+                let offset = resident_device_int8_column_offset(snapshot, table, col)?;
+                device_memory
+                    .expr_i64_compare_scalar_filter(offset, micros, false, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (None, Some(col)) => {
+                let micros = timestamp_literal_micros(lhs)?;
+                let offset = resident_device_int8_column_offset(snapshot, table, col)?;
+                device_memory
+                    .expr_i64_compare_scalar_filter(offset, micros, true, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (Some(a), Some(b)) => {
+                let a_offset = resident_device_int8_column_offset(snapshot, table, a)?;
+                let b_offset = resident_device_int8_column_offset(snapshot, table, b)?;
+                device_memory
+                    .expr_i64_compare_columns_filter(a_offset, b_offset, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (None, None) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a timestamp predicate must involve a timestamp column".to_string(),
             ))),
         }
     }
@@ -1486,6 +1610,21 @@ impl Engine {
         // date literal is a string literal the text path would otherwise grab. None for a non-date
         // predicate; errors on date AND/OR / arithmetic / mixed.
         if let Some(indices) = self.try_lower_date_predicate(
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
+            return Ok(indices);
+        }
+
+        // timestamp path (type matrix, doc 19): a SIMPLE timestamp comparison (i64 microseconds ->
+        // the int8 compare kernels). BEFORE the text path (the literal is a string). None for a
+        // non-timestamp predicate; errors on timestamp AND/OR / arithmetic / mixed.
+        if let Some(indices) = self.try_lower_timestamp_predicate(
             *compare,
             lhs,
             rhs,

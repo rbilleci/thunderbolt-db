@@ -605,6 +605,9 @@ pub enum SqlType {
     Text,
     /// PostgreSQL `date` — stored as i32 DAYS since 2000-01-01 (so it reuses the int4 device path).
     Date,
+    /// PostgreSQL `timestamp` (without time zone) — stored as i64 MICROSECONDS since 2000-01-01
+    /// 00:00:00 (so it reuses the int8 device path).
+    Timestamp,
 }
 
 /// The default `numeric` typmod when a `NUMERIC`/`DECIMAL` column omits `(p,s)`.
@@ -614,7 +617,7 @@ pub enum SqlType {
 pub const NUMERIC_DEFAULT_PRECISION: u8 = 38;
 pub const NUMERIC_DEFAULT_SCALE: u8 = 0;
 
-pub const SUPPORTED_SQL_TYPES: [SqlType; 6] = [
+pub const SUPPORTED_SQL_TYPES: [SqlType; 7] = [
     SqlType::Int4,
     SqlType::Int8,
     SqlType::Numeric {
@@ -624,6 +627,7 @@ pub const SUPPORTED_SQL_TYPES: [SqlType; 6] = [
     SqlType::Bool,
     SqlType::Text,
     SqlType::Date,
+    SqlType::Timestamp,
 ];
 
 impl SqlType {
@@ -635,6 +639,7 @@ impl SqlType {
             Self::Bool => 16,
             Self::Text => 25,
             Self::Date => 1082,
+            Self::Timestamp => 1114,
         }
     }
 
@@ -646,6 +651,7 @@ impl SqlType {
             Self::Bool => 1,
             Self::Text => -1,
             Self::Date => 4,
+            Self::Timestamp => 8,
         }
     }
 
@@ -657,6 +663,7 @@ impl SqlType {
             Self::Bool => "bool",
             Self::Text => "text",
             Self::Date => "date",
+            Self::Timestamp => "timestamp",
         }
     }
 }
@@ -979,6 +986,9 @@ pub enum SqlValue {
     /// A `date` as i32 DAYS since 2000-01-01 (PostgreSQL's date epoch). Ordering is the natural
     /// integer ordering of the day count.
     Date(i32),
+    /// A `timestamp` as i64 MICROSECONDS since 2000-01-01 00:00:00. Ordering is the natural integer
+    /// ordering of the microsecond count.
+    Timestamp(i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1057,6 +1067,8 @@ pub enum CopyParseError {
     InvalidBool,
     #[error("invalid input syntax for type date")]
     InvalidDate,
+    #[error("invalid input syntax for type timestamp")]
+    InvalidTimestamp,
     #[error("unterminated COPY escape sequence")]
     UnterminatedEscape,
     #[error("malformed CSV quoted field")]
@@ -1078,7 +1090,8 @@ impl CopyParseError {
             | Self::InvalidInt8
             | Self::InvalidNumeric
             | Self::InvalidBool
-            | Self::InvalidDate => "22P02",
+            | Self::InvalidDate
+            | Self::InvalidTimestamp => "22P02",
             Self::UnterminatedEscape
             | Self::MalformedCsvQuotedField
             | Self::UnterminatedCsvQuotedField
@@ -1098,6 +1111,7 @@ impl CopyParseError {
             Self::InvalidNumeric => "invalid input syntax for type numeric",
             Self::InvalidBool => "invalid input syntax for type boolean",
             Self::InvalidDate => "invalid input syntax for type date",
+            Self::InvalidTimestamp => "invalid input syntax for type timestamp",
             Self::UnterminatedEscape => "unterminated COPY escape sequence",
             Self::MalformedCsvQuotedField => "malformed CSV quoted field",
             Self::UnterminatedCsvQuotedField => "unterminated CSV quoted field",
@@ -1374,6 +1388,9 @@ fn parse_copy_typed_value(text: &str, ty: SqlType) -> Result<SqlValue, CopyParse
         SqlType::Date => crate::datetime::parse_date(text)
             .map(SqlValue::Date)
             .ok_or(CopyParseError::InvalidDate),
+        SqlType::Timestamp => crate::datetime::parse_timestamp(text)
+            .map(SqlValue::Timestamp)
+            .ok_or(CopyParseError::InvalidTimestamp),
     }
 }
 
@@ -3295,6 +3312,7 @@ fn render_default_literal_for_coercion(value: &SqlValue) -> String {
         }
         SqlValue::Text(value) => value.clone(),
         SqlValue::Date(value) => crate::datetime::format_date(*value),
+        SqlValue::Timestamp(value) => crate::datetime::format_timestamp(*value),
     }
 }
 
@@ -5526,6 +5544,9 @@ fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
         typmod.is_none().then_some(SqlType::Text)
     } else if base.eq_ignore_ascii_case("DATE") {
         typmod.is_none().then_some(SqlType::Date)
+    } else if base.eq_ignore_ascii_case("TIMESTAMP") {
+        // `timestamp` (without time zone); a fractional-second typmod is a follow-on.
+        typmod.is_none().then_some(SqlType::Timestamp)
     } else {
         None
     }
@@ -5899,7 +5920,8 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
-        | SqlValue::Date(_) => {
+        | SqlValue::Date(_)
+        | SqlValue::Timestamp(_) => {
             Err(ParseError::InvalidRelationalSql)
         }
     }
@@ -5913,7 +5935,8 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
-        | SqlValue::Date(_) => {
+        | SqlValue::Date(_)
+        | SqlValue::Timestamp(_) => {
             Err(ParseError::InvalidRelationalSql)
         }
     }
@@ -6182,6 +6205,9 @@ fn parse_typed_value_from_str(text: &str, ty: SqlType) -> Result<SqlValue, Parse
         SqlType::Text => Ok(SqlValue::Text(text.to_string())),
         SqlType::Date => crate::datetime::parse_date(text)
             .map(SqlValue::Date)
+            .ok_or(ParseError::InvalidRelationalSql),
+        SqlType::Timestamp => crate::datetime::parse_timestamp(text)
+            .map(SqlValue::Timestamp)
             .ok_or(ParseError::InvalidRelationalSql),
     }
 }

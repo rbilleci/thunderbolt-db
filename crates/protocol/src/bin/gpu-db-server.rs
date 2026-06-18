@@ -116,6 +116,11 @@ fn column_for_sql_type(ty: gpu_db_protocol::SqlType, name: &str) -> Column {
             oid: gpu_db_protocol::SqlType::Date.postgres_oid(),
             type_size: gpu_db_protocol::SqlType::Date.type_size(),
         },
+        gpu_db_protocol::SqlType::Timestamp => Column {
+            name: name.to_string(),
+            oid: gpu_db_protocol::SqlType::Timestamp.postgres_oid(),
+            type_size: gpu_db_protocol::SqlType::Timestamp.type_size(),
+        },
     }
 }
 
@@ -196,6 +201,26 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
             | SqlValue::Numeric(_)
             | SqlValue::Bool(_)
             | SqlValue::Text(_),
+        ) => std::cmp::Ordering::Greater,
+        // Timestamp is the last tier (sorts after date); same-type compares by microsecond count.
+        (SqlValue::Timestamp(left), SqlValue::Timestamp(right)) => left.cmp(right),
+        (
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_),
+            SqlValue::Timestamp(_),
+        ) => std::cmp::Ordering::Less,
+        (
+            SqlValue::Timestamp(_),
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_),
         ) => std::cmp::Ordering::Greater,
     }
 }
@@ -703,6 +728,9 @@ fn parse_bounded_sql_function_body(
             .ok_or_else(unsupported_function_body_error),
         SqlType::Date => gpu_db_protocol::datetime::parse_date(literal)
             .map(SqlValue::Date)
+            .ok_or_else(unsupported_function_body_error),
+        SqlType::Timestamp => gpu_db_protocol::datetime::parse_timestamp(literal)
+            .map(SqlValue::Timestamp)
             .ok_or_else(unsupported_function_body_error),
     }
 }
@@ -1438,7 +1466,8 @@ fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
-        | SqlValue::Date(_) => {
+        | SqlValue::Date(_)
+        | SqlValue::Timestamp(_) => {
             Err(ErrorField {
                 code: "0A000",
                 message: aggregate_int4_error_message(aggregate),
@@ -1494,6 +1523,7 @@ fn format_sql_value(value: &SqlValue) -> String {
         SqlValue::Bool(value) => bool_text(*value),
         SqlValue::Text(value) => value.clone(),
         SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value),
+        SqlValue::Timestamp(value) => gpu_db_protocol::datetime::format_timestamp(*value),
     }
 }
 
@@ -1546,6 +1576,13 @@ fn parse_materialized_row_value(
             .ok_or(ErrorField {
                 code: "22P02",
                 message: "invalid input syntax for type date",
+                position: None,
+            }),
+        gpu_db_protocol::SqlType::Timestamp => gpu_db_protocol::datetime::parse_timestamp(value)
+            .map(SqlValue::Timestamp)
+            .ok_or(ErrorField {
+                code: "22P02",
+                message: "invalid input syntax for type timestamp",
                 position: None,
             }),
     }
@@ -2661,6 +2698,10 @@ fn format_default_expr(value: &SqlValue) -> String {
         SqlValue::Date(value) => {
             format!("'{}'::date", gpu_db_protocol::datetime::format_date(*value))
         }
+        SqlValue::Timestamp(value) => format!(
+            "'{}'::timestamp",
+            gpu_db_protocol::datetime::format_timestamp(*value)
+        ),
     }
 }
 
@@ -14986,6 +15027,9 @@ fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
         SqlValue::Bool(_) => 1,
         // Date is sent as its ISO text (YYYY-MM-DD) on this endpoint.
         SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value).len() as u64,
+        SqlValue::Timestamp(value) => {
+            gpu_db_protocol::datetime::format_timestamp(*value).len() as u64
+        }
     }
 }
 
@@ -16441,6 +16485,7 @@ fn sql_type_alignment_code(ty: SqlType) -> &'static str {
         SqlType::Bool => "c",
         SqlType::Text => "i",
         SqlType::Date => "i",
+        SqlType::Timestamp => "d",
     }
 }
 
@@ -17591,6 +17636,7 @@ fn sql_type_storage_code(ty: SqlType) -> &'static str {
         SqlType::Bool => "p",
         SqlType::Text => "x",
         SqlType::Date => "p",
+        SqlType::Timestamp => "p",
     }
 }
 
@@ -17602,6 +17648,7 @@ fn sql_type_display_name(ty: SqlType) -> &'static str {
         SqlType::Bool => "boolean",
         SqlType::Text => "text",
         SqlType::Date => "date",
+        SqlType::Timestamp => "timestamp without time zone",
     }
 }
 
@@ -18467,6 +18514,7 @@ fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>
         SqlType::Bool => (None, None, None),
         SqlType::Text => (None, None, None),
         SqlType::Date => (None, None, None),
+        SqlType::Timestamp => (None, None, None),
     }
 }
 

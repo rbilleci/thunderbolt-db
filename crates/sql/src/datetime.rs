@@ -1,11 +1,25 @@
 //! Minimal proleptic-Gregorian calendar math for the temporal types (the type matrix, doc 19).
 //! Hand-rolled (no `chrono`/`time` dependency): the conversions are Howard Hinnant's standard
 //! `days_from_civil` / `civil_from_days` algorithms. A `DATE` is stored as i32 DAYS since 2000-01-01
-//! (the PostgreSQL date epoch), so byte-for-byte it is an i32 column and reuses the int4 device path.
+//! (the PostgreSQL date epoch), so byte-for-byte it is an i32 column and reuses the int4 device path;
+//! a `TIMESTAMP` is i64 MICROSECONDS since 2000-01-01 00:00:00, reusing the int8 device path.
 
 /// Days from 1970-01-01 (the algorithm's Unix epoch) to 2000-01-01 (PostgreSQL's date epoch). Used to
 /// rebase between the two so `DATE` values are days-since-2000.
 const PG_EPOCH_UNIX_DAYS: i64 = 10957;
+
+/// Microseconds per day / per second -- the `timestamp` is i64 microseconds since the PG epoch.
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+const MICROS_PER_SEC: i64 = 1_000_000;
+
+/// An ASCII-digits-only unsigned component (a date/time field), as i64. Rejects an empty string and a
+/// leading sign / whitespace that Rust's integer parse would otherwise accept (PG rejects `+2024`).
+fn ascii_digits(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
 
 /// Days from a proleptic-Gregorian civil date to 1970-01-01 (Howard Hinnant's `days_from_civil`).
 /// `m` is `[1, 12]`, `d` is `[1, 31]`; the result is exact for any in-range year.
@@ -40,18 +54,10 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// tolerated. Non-ISO styles and BC/negative years are not accepted yet (a follow-on).
 pub fn parse_date(text: &str) -> Option<i32> {
     let trimmed = text.trim();
-    // Each component is ASCII digits only -- reject the leading `+`/`-` and whitespace that Rust's
-    // integer parse would otherwise accept (PG rejects `+2024-01-15`, `2024-+01-15`).
-    let component = |s: &str| -> Option<i64> {
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        s.parse().ok()
-    };
     let mut parts = trimmed.splitn(3, '-');
-    let y = component(parts.next()?)?;
-    let m = component(parts.next()?)?;
-    let d = component(parts.next()?)?;
+    let y = ascii_digits(parts.next()?)?;
+    let m = ascii_digits(parts.next()?)?;
+    let d = ascii_digits(parts.next()?)?;
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
@@ -67,6 +73,75 @@ pub fn parse_date(text: &str) -> Option<i32> {
 pub fn format_date(days: i32) -> String {
     let (y, m, d) = civil_from_days(i64::from(days) + PG_EPOCH_UNIX_DAYS);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Parse a time-of-day `HH:MM[:SS[.ffffff]]` to microseconds within the day. Seconds default to 0
+/// (`HH:MM`). The fractional part is right-padded / truncated to 6 digits (microseconds).
+fn parse_time_of_day(text: &str) -> Option<i64> {
+    let (hms, frac) = match text.split_once('.') {
+        Some((hms, frac)) => (hms, Some(frac)),
+        None => (text, None),
+    };
+    let mut parts = hms.split(':');
+    let h = ascii_digits(parts.next()?)?;
+    let m = ascii_digits(parts.next()?)?;
+    let s = match parts.next() {
+        Some(sec) => ascii_digits(sec)?,
+        None => 0,
+    };
+    if parts.next().is_some() || h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    let frac_micros = match frac {
+        None => 0,
+        Some(f) => {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // Right-pad (or truncate) the fractional digits to exactly 6 -> microseconds.
+            let mut micros = [b'0'; 6];
+            for (slot, byte) in micros.iter_mut().zip(f.bytes()) {
+                *slot = byte;
+            }
+            std::str::from_utf8(&micros).ok()?.parse::<i64>().ok()?
+        }
+    };
+    Some(h * 3_600_000_000 + m * 60_000_000 + s * MICROS_PER_SEC + frac_micros)
+}
+
+/// Parse a PostgreSQL `TIMESTAMP` literal `YYYY-MM-DD[ T]HH:MM[:SS[.ffffff]]` (the time part optional,
+/// defaulting to midnight) to i64 MICROSECONDS since 2000-01-01 00:00:00. `None` for a malformed,
+/// out-of-calendar, or i64-out-of-range timestamp; the caller raises PG's "invalid input syntax for
+/// type timestamp". Non-ISO styles and time zones are not accepted yet (a follow-on).
+pub fn parse_timestamp(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    let (date_part, time_part) = match trimmed.find([' ', 'T']) {
+        Some(pos) => (&trimmed[..pos], Some(trimmed[pos + 1..].trim())),
+        None => (trimmed, None),
+    };
+    let days = i64::from(parse_date(date_part)?);
+    let tod = match time_part {
+        Some(t) if !t.is_empty() => parse_time_of_day(t)?,
+        _ => 0,
+    };
+    days.checked_mul(MICROS_PER_DAY)?.checked_add(tod)
+}
+
+/// Format i64 microseconds since 2000-01-01 00:00:00 as the text PostgreSQL emits: `YYYY-MM-DD
+/// HH:MM:SS`, plus a `.ffffff` fractional part (trailing zeros trimmed) when non-zero.
+pub fn format_timestamp(micros: i64) -> String {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let tod = micros.rem_euclid(MICROS_PER_DAY);
+    let (y, mo, d) = civil_from_days(days + PG_EPOCH_UNIX_DAYS);
+    let secs = tod / MICROS_PER_SEC;
+    let frac = tod % MICROS_PER_SEC;
+    let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let mut out = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+    if frac != 0 {
+        out.push('.');
+        out.push_str(format!("{frac:06}").trim_end_matches('0'));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -119,5 +194,71 @@ mod tests {
         assert_eq!(parse_date("2024-+01-15"), None, "leading + on the month");
         assert_eq!(parse_date("2024-01-+15"), None, "leading + on the day");
         assert_eq!(parse_date("2024- 01-15"), None, "embedded space in a component");
+    }
+
+    #[test]
+    fn timestamp_epoch_and_units() {
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00"), Some(0), "the timestamp epoch is micro 0");
+        assert_eq!(parse_timestamp("2000-01-01 00:00:01"), Some(1_000_000), "one second");
+        assert_eq!(parse_timestamp("2000-01-01 00:01:00"), Some(60_000_000), "one minute");
+        assert_eq!(parse_timestamp("2000-01-01 01:00:00"), Some(3_600_000_000), "one hour");
+        assert_eq!(parse_timestamp("2000-01-02 00:00:00"), Some(MICROS_PER_DAY), "one day");
+        // no time part -> midnight; 'T' separator accepted; HH:MM defaults seconds to 0.
+        assert_eq!(parse_timestamp("2000-01-02"), Some(MICROS_PER_DAY), "date-only => midnight");
+        assert_eq!(
+            parse_timestamp("2000-01-01T00:01:00"),
+            Some(60_000_000),
+            "'T' separator"
+        );
+        assert_eq!(parse_timestamp("2000-01-01 00:01"), Some(60_000_000), "HH:MM (no seconds)");
+    }
+
+    #[test]
+    fn timestamp_fractional_seconds() {
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00.5"), Some(500_000), ".5 => 500000 us");
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00.000001"), Some(1), "one microsecond");
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00.123456"), Some(123_456));
+        // PG trims trailing zeros from the fractional part on output, omits it when zero.
+        assert_eq!(format_timestamp(0), "2000-01-01 00:00:00");
+        assert_eq!(format_timestamp(500_000), "2000-01-01 00:00:00.5");
+        assert_eq!(format_timestamp(123_456), "2000-01-01 00:00:00.123456");
+    }
+
+    #[test]
+    fn timestamp_round_trips_incl_before_epoch() {
+        for s in [
+            "2024-01-15 10:30:45",
+            "2024-12-31 23:59:59",
+            "2000-01-01 00:00:00",
+            "1999-12-31 12:00:00", // before the epoch (negative micros)
+            "1970-01-01 00:00:00",
+            "2024-06-15 08:09:10.123456",
+        ] {
+            let micros = parse_timestamp(s).unwrap_or_else(|| panic!("parse {s}"));
+            assert_eq!(format_timestamp(micros), s, "round-trip {s}");
+        }
+        // a full day-by-day + noon sweep stays monotone in micros.
+        let mut prev = parse_timestamp("2020-01-01 12:00:00").unwrap();
+        for day in 1..400 {
+            let micros = prev + MICROS_PER_DAY;
+            assert_eq!(
+                parse_timestamp(&format_timestamp(micros)),
+                Some(micros),
+                "round-trip day {day}"
+            );
+            assert_eq!(micros, prev + MICROS_PER_DAY);
+            prev = micros;
+        }
+    }
+
+    #[test]
+    fn timestamp_rejects_malformed() {
+        assert_eq!(parse_timestamp("2024-01-15 25:00:00"), None, "hour 25");
+        assert_eq!(parse_timestamp("2024-01-15 10:60:00"), None, "minute 60");
+        assert_eq!(parse_timestamp("2024-01-15 10:00:60"), None, "second 60");
+        assert_eq!(parse_timestamp("2024-13-01 10:00:00"), None, "bad date part");
+        assert_eq!(parse_timestamp("2024-01-15 10:00:00:00"), None, "too many time parts");
+        assert_eq!(parse_timestamp("2024-01-15 10:xx:00"), None, "non-numeric minute");
+        assert_eq!(parse_timestamp("2024-01-15 10:00:00.abc"), None, "non-numeric fraction");
     }
 }

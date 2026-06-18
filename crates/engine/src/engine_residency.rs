@@ -85,10 +85,12 @@ impl Engine {
                 max: i32::MIN,
             })
             .collect::<Vec<_>>();
+        // int8 AND timestamp columns share the i64 section: a `timestamp` is i64 microseconds, so it
+        // rides the int8 residency layout + the i64 compare kernels (the type matrix, doc 19).
         let resident_device_int8_columns = catalog_table
             .columns
             .iter()
-            .filter(|column| column.ty == SqlType::Int8)
+            .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let resident_device_numeric_columns = catalog_table
@@ -126,13 +128,15 @@ impl Engine {
             .columns
             .iter()
             .enumerate()
-            .filter(|(_idx, column)| column.ty == SqlType::Int8)
+            .filter(|(_idx, column)| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
             .map(|(idx, _column)| idx)
         {
             for row in &resident_rows {
-                let SqlValue::Int8(value) = row[column_idx] else {
+                // A timestamp column stores its i64 microsecond count in this i64 section.
+                let (SqlValue::Int8(value) | SqlValue::Timestamp(value)) = row[column_idx] else {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident snapshot int8 payload encountered non-int8 value".to_string(),
+                        "resident snapshot int8/timestamp payload encountered a non-i64 value"
+                            .to_string(),
                     )));
                 };
                 device_payload.extend_from_slice(&value.to_le_bytes());
