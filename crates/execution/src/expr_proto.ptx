@@ -2435,3 +2435,132 @@ loop_bcb128:
 done_bcb128:
     ret;
 }
+
+// out[i] = a[i] * scalar : CHECKED signed int128 multiply (the scalar is a literal, widened to i128).
+// Computes the full signed 256-bit product -- an unsigned 4-limb schoolbook of the 128-bit
+// bit-patterns, then a sign correction (subtract s<<128 if a<0, a<<128 if s<0) -- keeps the low 128
+// bits as the result, and flags overflow when the high 128 bits are NOT the sign-extension of the low
+// 128 (the product left i128 range) -> PG `numeric field overflow`. op_code / scalar_on_left are
+// ignored (multiply is commutative). The buffer is lease-pool (8-byte aligned), so 8-byte loads.
+.visible .entry gpu_db_buffer_i128_mul_scalar(
+    .param .u64 a_ptr,
+    .param .u64 scalar_lo,
+    .param .u64 scalar_hi,
+    .param .u32 op_code,
+    .param .u32 scalar_on_left,
+    .param .u64 n,
+    .param .u64 out_ptr,
+    .param .u64 out_overflow_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %a_neg;
+    .reg .pred %s_neg;
+    .reg .pred %ov1;
+    .reg .pred %ov2;
+    .reg .pred %p_ovf;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %one;
+    .reg .b64 %a_lo;
+    .reg .b64 %a_hi;
+    .reg .b64 %s_lo;
+    .reg .b64 %s_hi;
+    .reg .b64 %r0;
+    .reg .b64 %r1;
+    .reg .b64 %r2;
+    .reg .b64 %r3;
+    .reg .b64 %pll_hi;
+    .reg .b64 %plh_lo;
+    .reg .b64 %plh_hi;
+    .reg .b64 %phl_lo;
+    .reg .b64 %phl_hi;
+    .reg .b64 %phh_lo;
+    .reg .b64 %phh_hi;
+    .reg .b64 %cy1;
+    .reg .b64 %cy1b;
+    .reg .b64 %cy2;
+    .reg .b64 %cy2b;
+    .reg .b64 %cy2c;
+    .reg .b64 %sgn;
+    .reg .u64 %a;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %ovf;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o16;
+    .reg .u64 %addr;
+
+    ld.param.u64 %a, [a_ptr];
+    ld.param.u64 %s_lo, [scalar_lo];
+    ld.param.u64 %s_hi, [scalar_hi];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %ovf, [out_overflow_ptr];
+    mov.u32 %one, 1;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_ms128:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_ms128;
+    mul.lo.u64 %o16, %i, 16;
+    add.u64 %addr, %a, %o16;
+    ld.global.u64 %a_lo, [%addr];
+    ld.global.u64 %a_hi, [%addr+8];
+    // unsigned 4-limb product of the 128-bit bit-patterns (r3:r2:r1:r0)
+    mul.lo.u64 %r0, %a_lo, %s_lo;
+    mul.hi.u64 %pll_hi, %a_lo, %s_lo;
+    mul.lo.u64 %plh_lo, %a_lo, %s_hi;
+    mul.hi.u64 %plh_hi, %a_lo, %s_hi;
+    mul.lo.u64 %phl_lo, %a_hi, %s_lo;
+    mul.hi.u64 %phl_hi, %a_hi, %s_lo;
+    mul.lo.u64 %phh_lo, %a_hi, %s_hi;
+    mul.hi.u64 %phh_hi, %a_hi, %s_hi;
+    // r1 = pll_hi + plh_lo + phl_lo (carries accumulate into cy1)
+    add.cc.u64 %r1, %pll_hi, %plh_lo;
+    addc.u64 %cy1, 0, 0;
+    add.cc.u64 %r1, %r1, %phl_lo;
+    addc.u64 %cy1b, 0, 0;
+    add.u64 %cy1, %cy1, %cy1b;
+    // r2 = plh_hi + phl_hi + phh_lo + cy1 (carries accumulate into cy2)
+    add.cc.u64 %r2, %plh_hi, %phl_hi;
+    addc.u64 %cy2, 0, 0;
+    add.cc.u64 %r2, %r2, %phh_lo;
+    addc.u64 %cy2b, 0, 0;
+    add.cc.u64 %r2, %r2, %cy1;
+    addc.u64 %cy2c, 0, 0;
+    add.u64 %cy2, %cy2, %cy2b;
+    add.u64 %cy2, %cy2, %cy2c;
+    // r3 = phh_hi + cy2
+    add.u64 %r3, %phh_hi, %cy2;
+    // sign correction: if a < 0, (r3:r2) -= s; if s < 0, (r3:r2) -= a
+    setp.lt.s64 %a_neg, %a_hi, 0;
+    @%a_neg sub.cc.u64 %r2, %r2, %s_lo;
+    @%a_neg subc.u64 %r3, %r3, %s_hi;
+    setp.lt.s64 %s_neg, %s_hi, 0;
+    @%s_neg sub.cc.u64 %r2, %r2, %a_lo;
+    @%s_neg subc.u64 %r3, %r3, %a_hi;
+    // result = (r1:r0); overflow if (r3:r2) is not the sign-extension of r1
+    shr.s64 %sgn, %r1, 63;
+    setp.ne.u64 %ov1, %r2, %sgn;
+    setp.ne.u64 %ov2, %r3, %sgn;
+    or.pred %p_ovf, %ov1, %ov2;
+    @%p_ovf red.global.or.b32 [%ovf], %one;
+    add.u64 %addr, %out, %o16;
+    st.global.u64 [%addr], %r0;
+    st.global.u64 [%addr+8], %r1;
+    add.u64 %i, %i, %stride;
+    bra loop_ms128;
+done_ms128:
+    ret;
+}

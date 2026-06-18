@@ -842,15 +842,66 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_arithmetic() {
     let all_expected: Vec<Vec<SqlValue>> = (0..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
     assert_eq!(cmp_buffers.rows, all_expected, "price+cost>price <=> cost>0 => all rows");
 
-    // REJECTIONS — hard errors, never wrong rows:
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 2 > 100")
-            .is_err(),
-        "numeric multiply => follow-on, hard error"
-    );
+    // REJECTION — a mixed numeric + int4 column in arithmetic is a hard error, never wrong rows.
+    // (integer-literal multiply is now supported — see ..._runs_numeric_multiply.)
     assert!(
         e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price + label > 100")
             .is_err(),
         "mixed numeric + int4 column in arithmetic => hard error"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
+    // numeric (i128) CHECKED multiply by an INTEGER literal end-to-end from SQL (the type matrix,
+    // doc 19): price*2 = 2i+1.00 (mantissa 200i+100). Fractional + column*column multipliers (which
+    // change the result scale) are rejected.
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,2), label INT)",
+    )
+    .unwrap();
+
+    const N: i64 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}.50, {i}.25, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // price * 2 > 100 : (200i+100) > 10000 => 200i > 9900 => i >= 50 => [50, N).
+    let mul = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 2 > 100")
+        .expect("price*2>100 on GPU");
+    let mul_expected: Vec<Vec<SqlValue>> = (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(mul.rows, mul_expected, "price*2>100 => label in [50, 600)");
+    assert_eq!(mul.executed_target, DeviceTarget::Gpu(0));
+
+    // commutative: 2 * price > 100 is the same set.
+    let mul_left = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE 2 * price > 100")
+        .expect("2*price>100 on GPU");
+    assert_eq!(mul_left.rows, mul_expected, "2*price>100 == price*2>100 (commutative)");
+
+    // REJECTIONS — hard errors, never wrong rows:
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 1.5 > 100")
+            .is_err(),
+        "fractional multiplier (scale addition) => follow-on, hard error"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > 100")
+            .is_err(),
+        "column*column multiply => follow-on, hard error"
     );
 }

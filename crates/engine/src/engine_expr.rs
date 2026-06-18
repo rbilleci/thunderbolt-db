@@ -264,17 +264,53 @@ fn compile_numeric_arith(
         }
         ResidentExpr::Binary { op, lhs, rhs } => {
             let op_code = match arith_op_code(*op) {
-                Some(code @ (0 | 1)) => code, // add / sub
-                _ => {
+                Some(code) => code, // 0=add, 1=sub, 2=mul
+                None => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "the general GPU executor supports numeric add/sub only (multiply is a \
-                         follow-on)"
-                            .to_string(),
+                        "the general GPU executor supports numeric +, -, * arithmetic only".to_string(),
                     )));
                 }
             };
             let lhs_lit = numeric_literal_value(lhs);
             let rhs_lit = numeric_literal_value(rhs);
+            if op_code == 2 {
+                // MULTIPLY: scalar only, by an INTEGER literal (scale 0, so the result stays at the
+                // column scale). column*column and fractional multipliers (which ADD scales, changing
+                // the result scale) are follow-ons.
+                let int_mul_scalar = |literal: Decimal128| -> Result<i32, ExecuteError> {
+                    let canonical = literal.canonical();
+                    if canonical.scale != 0 {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "numeric multiply by a fractional literal is not supported yet (it changes \
+                             the result scale)"
+                                .to_string(),
+                        )));
+                    }
+                    i32::try_from(canonical.mantissa).map_err(|_| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "numeric multiply literal is too large for the fast path yet".to_string(),
+                        ))
+                    })
+                };
+                let (value, literal) = match (lhs_lit, rhs_lit) {
+                    (None, Some(literal)) => (lhs.as_ref(), literal),
+                    (Some(literal), None) => (rhs.as_ref(), literal), // multiply is commutative
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "numeric multiply requires one integer-literal operand (column*column is a \
+                             follow-on)"
+                                .to_string(),
+                        )));
+                    }
+                };
+                compile_numeric_arith(value, table, snapshot, scale, program)?;
+                program.push(ExprStep::ScalarBinary {
+                    op: 2,
+                    scalar: int_mul_scalar(literal)?,
+                    scalar_on_left: false,
+                });
+                return Ok(());
+            }
             let scalar_step = |literal: Decimal128, scalar_on_left: bool| -> Result<ExprStep, ExecuteError> {
                 let mantissa = rescale_numeric_literal(literal, scale)?;
                 let scalar = i32::try_from(mantissa).map_err(|_| {

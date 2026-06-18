@@ -9756,6 +9756,15 @@ fn run_resident_arith_program<'r>(
     let compare_scalar_mask_fn = primary.cached_function(compare_scalar_name, &ptx)?;
     let compare_buffers_mask_fn = primary.cached_function(compare_buffers_name, &ptx)?;
     let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &ptx)?;
+    // numeric (i128) multiply is a SEPARATE kernel — the signed 128x128->256 product is too large to
+    // inline into the add/sub binary kernel — loaded only for I128. int4/int8 multiply lives in their
+    // binary kernel (mul.hi), so this stays None there.
+    let i128_mul_scalar_fn = match elem {
+        ResidentElemType::I128 => {
+            Some(primary.cached_function(c"gpu_db_buffer_i128_mul_scalar", &ptx)?)
+        }
+        ResidentElemType::I32 | ResidentElemType::I64 => None,
+    };
 
     // CHECKED int4 arithmetic (Charter rule 2 PG-fidelity): ONE overflow flag shared by every
     // arithmetic step of the program. The checked kernels OR 1 into it when an op overflows int32;
@@ -9897,7 +9906,13 @@ fn run_resident_arith_program<'r>(
                             (&mut a5 as *mut u64).cast::<c_void>(),
                             (&mut a6 as *mut u64).cast::<c_void>(),
                         ];
-                        launch(scalar_binary_fn, &mut args)?;
+                        // op 2 (multiply) uses the dedicated i128 mul kernel; add/sub the binary kernel.
+                        let function = if op == 2 {
+                            i128_mul_scalar_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?
+                        } else {
+                            scalar_binary_fn
+                        };
+                        launch(function, &mut args)?;
                     }
                 }
                 stack.push(out);
@@ -20630,6 +20645,125 @@ mod tests {
         assert!(
             err.to_string().contains("numeric field overflow"),
             "i128 overflow must raise `numeric field overflow`, got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_buffer_i128_mul_scalar_checks_overflow() {
+        // numeric (i128) CHECKED scalar multiply via the signed 128x128->256 mul kernel + the I128 VM
+        // (the type matrix, doc 19). Values beyond i64 range, a NEGATIVE multiplier (exact product),
+        // and an i128 overflow boundary -> PG `numeric field overflow`.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const N: u64 = 600;
+        let base: i128 = 1i128 << 70;
+        let elem = std::mem::size_of::<i128>() as u64;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let c_off = a_off + N * elem;
+        let negc_off = c_off + N * elem;
+        let big_off = negc_off + N * elem;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&N.to_le_bytes());
+        let mut a = Vec::new();
+        let mut c = Vec::new();
+        let mut negc = Vec::new();
+        let mut big = Vec::new();
+        for i in 0..N as i128 {
+            a.extend_from_slice(&(base + i).to_le_bytes());
+            c.extend_from_slice(&(3 * base + i).to_le_bytes());
+            negc.extend_from_slice(&(-3 * (base + i)).to_le_bytes());
+            big.extend_from_slice(&i128::MAX.to_le_bytes());
+        }
+        let allocated_len = big_off + big.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: c_off,
+                        bytes: &c,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: negc_off,
+                        bytes: &negc,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: big_off,
+                        bytes: &big,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // a * 3 > c : (3*base+3i) > (3*base+i) => i > 0 => [1, 600). Positive scalar, beyond i64.
+        let mul_prog = [
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::ScalarBinary {
+                op: 2,
+                scalar: 3,
+                scalar_on_left: false,
+            },
+            ExprStep::LoadColumn { byte_offset: c_off },
+            ExprStep::CompareBuffers { cmp: 3 },
+        ];
+        let gt = resident
+            .run_expr_predicate_filter(&mul_prog, N, ResidentElemType::I128)
+            .expect("a*3>c on GPU");
+        let gt_expected: Vec<u32> = (1..N as u32).collect();
+        assert_eq!(gt, gt_expected, "a*3 > c => [1, 600)");
+
+        // a * (-3) == negc : exact NEGATIVE-scalar product => all rows.
+        let neg_prog = [
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::ScalarBinary {
+                op: 2,
+                scalar: -3,
+                scalar_on_left: false,
+            },
+            ExprStep::LoadColumn {
+                byte_offset: negc_off,
+            },
+            ExprStep::CompareBuffers { cmp: 0 },
+        ];
+        let eq = resident
+            .run_expr_predicate_filter(&neg_prog, N, ResidentElemType::I128)
+            .expect("a*(-3)==negc on GPU");
+        let all_expected: Vec<u32> = (0..N as u32).collect();
+        assert_eq!(eq, all_expected, "a*(-3) == negc => all rows (exact negative product)");
+
+        // big * 2 with big = i128::MAX overflows i128 -> numeric field overflow (never wraps).
+        let ovf_prog = [
+            ExprStep::LoadColumn {
+                byte_offset: big_off,
+            },
+            ExprStep::ScalarBinary {
+                op: 2,
+                scalar: 2,
+                scalar_on_left: false,
+            },
+            ExprStep::CompareScalar {
+                cmp: 3,
+                scalar: 0,
+                scalar_on_left: false,
+            },
+        ];
+        let err = resident
+            .run_expr_predicate_filter(&ovf_prog, N, ResidentElemType::I128)
+            .expect_err("i128::MAX * 2 must overflow");
+        assert!(
+            err.to_string().contains("numeric field overflow"),
+            "i128 multiply overflow must raise `numeric field overflow`, got: {err}"
         );
     }
 }

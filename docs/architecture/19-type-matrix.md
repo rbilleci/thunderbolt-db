@@ -56,13 +56,16 @@ The executor is int4 end to end; each new type extends the same four layers:
    rounding would mis-answer; PG compares exactly) and runs the i128 compare filters; type-aware i128
    projection. The decimal SCALE is a per-column catalog constant (values rescaled on insert), so the
    snapshot stores only the mantissa. **Checked add/sub ARITHMETIC also DONE end to end from SQL**
-   (`price + cost > 100`, `price - 5 > 100`): an i128 buffer VM (`ResidentElemType::I128`) with 2-limb
-   add/sub (manual carry/borrow), overflow via the high-limb sign rule -> PG `numeric field overflow`;
-   the engine compiles the arithmetic to i128 load / add-sub / compare steps at the columns' common
-   scale (same-scale only this slice; the i32 `ExprStep` scalar bounds in-arith literals). Mixed
-   numeric/integer, multiply, cross-scale (unequal-scale columns), numeric `AND`/`OR`, and large
-   in-arith literals are hard errors. NEXT: i128*i128 multiply (256-bit intermediate + overflow),
-   then cross-scale + numeric AND/OR.
+   (`price + cost > 100`, `price - 5 > 100`) AND **integer-literal MULTIPLY** (`price * 2 > 100`):
+   an i128 buffer VM (`ResidentElemType::I128`) with 2-limb add/sub (manual carry/borrow) + a signed
+   128x128->256-bit multiply (4-limb unsigned schoolbook + sign correction), overflow via the
+   high-limb sign rule (add/sub) / "high 128 != sign-extension of low 128" (mul) -> PG `numeric field
+   overflow`. The engine compiles arithmetic to i128 load / add-sub / mul-scalar / compare steps at the
+   columns' common scale (same-scale add/sub; multiply only by an INTEGER literal so the result stays
+   at the column scale; the i32 `ExprStep` scalar bounds in-arith literals). Mixed numeric/integer,
+   column*column or fractional-literal multiply, cross-scale (unequal-scale columns), numeric `AND`/`OR`,
+   and large in-arith literals are hard errors. NEXT: column*column / fractional multiply (result
+   scale = sum of scales), then cross-scale + numeric AND/OR.
 
    NOTE (gotcha): PTX comments must be PURE ASCII — the runtime JIT's ptxas rejects a non-ASCII byte
    ("Unexpected non-ASCII character", INVALID_PTX 218) that the LOCAL ptxas tolerates. A guard test
