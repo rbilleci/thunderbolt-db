@@ -478,6 +478,9 @@ pub(crate) fn parse_bounded_sql_function_body(
         SqlType::Timestamp => gpu_db_sql::datetime::parse_timestamp(literal)
             .map(SqlValue::Timestamp)
             .ok_or_else(unsupported_function_body_error),
+        SqlType::Uuid => gpu_db_sql::uuid::parse_uuid(literal)
+            .map(SqlValue::Uuid)
+            .ok_or_else(unsupported_function_body_error),
     }
 }
 
@@ -700,16 +703,17 @@ pub(crate) fn resident_device_numeric_column_offset(
             "resident device-memory predicate column is outside the catalog table".to_string(),
         ))
     })?;
-    if !matches!(column.ty, SqlType::Numeric { .. }) {
+    // numeric and uuid share the 16-byte section (a uuid is 16 raw bytes), so resolve either here.
+    if !matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident device-memory predicate column is not numeric".to_string(),
+            "resident device-memory predicate column is not numeric/uuid".to_string(),
         )));
     }
     let numeric_ordinal = table
         .columns
         .iter()
         .take(column_idx)
-        .filter(|candidate| matches!(candidate.ty, SqlType::Numeric { .. }))
+        .filter(|candidate| matches!(candidate.ty, SqlType::Numeric { .. } | SqlType::Uuid))
         .count();
     if snapshot
         .resident_device_numeric_columns

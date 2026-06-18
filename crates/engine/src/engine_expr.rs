@@ -306,6 +306,49 @@ fn timestamp_literal_micros(expr: &ResidentExpr) -> Result<i64, ExecuteError> {
     }
 }
 
+/// The column index if `expr` is a `Column` of `uuid` type, else `None`.
+fn uuid_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
+    match expr {
+        ResidentExpr::Column(idx)
+            if table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Uuid) =>
+        {
+            Some(*idx)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` mentions a uuid COLUMN anywhere (the predicate is "uuid" when a uuid column is
+/// involved; a bare string literal is the uuid VALUE, resolved at lowering).
+fn expr_mentions_uuid(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Uuid)
+        }
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table)
+        }
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => false,
+    }
+}
+
+/// The 16 bytes of a uuid literal: a `TextLiteral` parsed as a uuid. Anything else is a type error --
+/// a uuid column compares only to a uuid literal or another uuid column.
+fn uuid_literal_bytes(expr: &ResidentExpr) -> Result<[u8; 16], ExecuteError> {
+    match expr {
+        ResidentExpr::TextLiteral(text) => gpu_db_sql::uuid::parse_uuid(text).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "invalid input syntax for type uuid: \"{text}\""
+            )))
+        }),
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a uuid column compares only to a uuid literal or another uuid column".to_string(),
+        ))),
+    }
+}
+
 /// Compile a SQL `LIKE` pattern to the device kernel's u32 token array: one token per output position,
 /// `(op << 8) | literal_byte`, op 0 = literal byte, 1 = any-one (`_`), 2 = any-run (`%`). The default
 /// `\` escape is resolved here (`\%` / `\_` / `\\` -> a literal byte); a lone trailing `\` is an error
@@ -856,10 +899,11 @@ impl Engine {
                 && !matches!(ty, SqlType::Numeric { .. })
                 && ty != SqlType::Date
                 && ty != SqlType::Timestamp
+                && ty != SqlType::Uuid
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "resident Expr select currently materializes int4 / int8 / numeric / date / \
-                     timestamp projection columns only"
+                     timestamp / uuid projection columns only"
                         .to_string(),
                 )));
             }
@@ -921,6 +965,8 @@ impl Engine {
             Numeric(Vec<i128>, u8),
             Date(Vec<i32>),
             Timestamp(Vec<i64>),
+            // Stored as the i128 the i128 projector returns; the raw 16 uuid bytes are its LE form.
+            Uuid(Vec<i128>),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
@@ -964,6 +1010,16 @@ impl Engine {
                         })?;
                     ProjectedColumn::Timestamp(values)
                 }
+                SqlType::Uuid => {
+                    // Uuid rides the i128 section; project as i128 (its LE bytes are the raw uuid).
+                    let byte_offset = resident_device_numeric_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_i128_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Uuid(values)
+                }
                 _ => {
                     let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
                     let values = device_memory
@@ -988,6 +1044,9 @@ impl Engine {
                         }
                         ProjectedColumn::Date(values) => SqlValue::Date(values[row]),
                         ProjectedColumn::Timestamp(values) => SqlValue::Timestamp(values[row]),
+                        ProjectedColumn::Uuid(values) => {
+                            SqlValue::Uuid(values[row].to_le_bytes())
+                        }
                     })
                     .collect()
             })
@@ -1286,6 +1345,66 @@ impl Engine {
             }
             (None, None) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "a timestamp predicate must involve a timestamp column".to_string(),
+            ))),
+        }
+    }
+
+    /// Try to lower a SIMPLE uuid comparison (`id <cmp> 'uuid-literal'`, either operand order, or
+    /// `id <cmp> id2`) to surviving row indices via the byte-wise uuid compare kernel (the type matrix,
+    /// doc 19): a `uuid` is 16 raw bytes in the i128 section; PG compares uuids by an unsigned
+    /// big-endian memcmp. The string literal is parsed to 16 bytes at lowering. Returns None for a
+    /// non-uuid predicate. Uuid `AND`/`OR`, and a uuid compared to a non-uuid value, are hard errors.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_uuid_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        if !(expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table)) {
+            return Ok(None);
+        }
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only simple uuid comparisons (uuid AND/OR is a \
+                 follow-on)"
+                    .to_string(),
+            )));
+        };
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        match (uuid_column_index(lhs, table), uuid_column_index(rhs, table)) {
+            (Some(col), None) => {
+                let needle = uuid_literal_bytes(rhs)?;
+                let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
+                device_memory
+                    .expr_uuid_compare_scalar_filter(offset, &needle, false, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (None, Some(col)) => {
+                let needle = uuid_literal_bytes(lhs)?;
+                let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
+                device_memory
+                    .expr_uuid_compare_scalar_filter(offset, &needle, true, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (Some(a), Some(b)) => {
+                let a_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
+                let b_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
+                device_memory
+                    .expr_uuid_compare_columns_filter(a_offset, b_offset, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (None, None) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a uuid predicate must involve a uuid column".to_string(),
             ))),
         }
     }
@@ -1625,6 +1744,21 @@ impl Engine {
         // the int8 compare kernels). BEFORE the text path (the literal is a string). None for a
         // non-timestamp predicate; errors on timestamp AND/OR / arithmetic / mixed.
         if let Some(indices) = self.try_lower_timestamp_predicate(
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
+            return Ok(indices);
+        }
+
+        // uuid path (type matrix, doc 19): a SIMPLE uuid comparison via the byte-wise compare kernel.
+        // BEFORE the text path (the literal is a string). None for a non-uuid predicate; errors on
+        // uuid AND/OR / mixed.
+        if let Some(indices) = self.try_lower_uuid_predicate(
             *compare,
             lhs,
             rhs,

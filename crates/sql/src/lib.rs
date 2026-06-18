@@ -9,6 +9,7 @@
 //! (roadmap §9.2: invert the engine→protocol dependency).
 
 pub mod datetime;
+pub mod uuid;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,6 +609,9 @@ pub enum SqlType {
     /// PostgreSQL `timestamp` (without time zone) — stored as i64 MICROSECONDS since 2000-01-01
     /// 00:00:00 (so it reuses the int8 device path).
     Timestamp,
+    /// PostgreSQL `uuid` — 16 raw bytes, compared byte-wise (unsigned). Reuses the i128 (16-byte)
+    /// residency section, but with a byte-wise compare kernel rather than the signed i128 one.
+    Uuid,
 }
 
 /// The default `numeric` typmod when a `NUMERIC`/`DECIMAL` column omits `(p,s)`.
@@ -617,7 +621,7 @@ pub enum SqlType {
 pub const NUMERIC_DEFAULT_PRECISION: u8 = 38;
 pub const NUMERIC_DEFAULT_SCALE: u8 = 0;
 
-pub const SUPPORTED_SQL_TYPES: [SqlType; 7] = [
+pub const SUPPORTED_SQL_TYPES: [SqlType; 8] = [
     SqlType::Int4,
     SqlType::Int8,
     SqlType::Numeric {
@@ -628,6 +632,7 @@ pub const SUPPORTED_SQL_TYPES: [SqlType; 7] = [
     SqlType::Text,
     SqlType::Date,
     SqlType::Timestamp,
+    SqlType::Uuid,
 ];
 
 impl SqlType {
@@ -640,6 +645,7 @@ impl SqlType {
             Self::Text => 25,
             Self::Date => 1082,
             Self::Timestamp => 1114,
+            Self::Uuid => 2950,
         }
     }
 
@@ -652,6 +658,7 @@ impl SqlType {
             Self::Text => -1,
             Self::Date => 4,
             Self::Timestamp => 8,
+            Self::Uuid => 16,
         }
     }
 
@@ -664,6 +671,7 @@ impl SqlType {
             Self::Text => "text",
             Self::Date => "date",
             Self::Timestamp => "timestamp",
+            Self::Uuid => "uuid",
         }
     }
 }
@@ -989,6 +997,9 @@ pub enum SqlValue {
     /// A `timestamp` as i64 MICROSECONDS since 2000-01-01 00:00:00. Ordering is the natural integer
     /// ordering of the microsecond count.
     Timestamp(i64),
+    /// A `uuid` as its 16 raw bytes. Ordering is the byte-wise (unsigned) order of `[u8; 16]`, which
+    /// is how PostgreSQL compares uuids.
+    Uuid([u8; 16]),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1069,6 +1080,8 @@ pub enum CopyParseError {
     InvalidDate,
     #[error("invalid input syntax for type timestamp")]
     InvalidTimestamp,
+    #[error("invalid input syntax for type uuid")]
+    InvalidUuid,
     #[error("unterminated COPY escape sequence")]
     UnterminatedEscape,
     #[error("malformed CSV quoted field")]
@@ -1091,7 +1104,8 @@ impl CopyParseError {
             | Self::InvalidNumeric
             | Self::InvalidBool
             | Self::InvalidDate
-            | Self::InvalidTimestamp => "22P02",
+            | Self::InvalidTimestamp
+            | Self::InvalidUuid => "22P02",
             Self::UnterminatedEscape
             | Self::MalformedCsvQuotedField
             | Self::UnterminatedCsvQuotedField
@@ -1112,6 +1126,7 @@ impl CopyParseError {
             Self::InvalidBool => "invalid input syntax for type boolean",
             Self::InvalidDate => "invalid input syntax for type date",
             Self::InvalidTimestamp => "invalid input syntax for type timestamp",
+            Self::InvalidUuid => "invalid input syntax for type uuid",
             Self::UnterminatedEscape => "unterminated COPY escape sequence",
             Self::MalformedCsvQuotedField => "malformed CSV quoted field",
             Self::UnterminatedCsvQuotedField => "unterminated CSV quoted field",
@@ -1391,6 +1406,9 @@ fn parse_copy_typed_value(text: &str, ty: SqlType) -> Result<SqlValue, CopyParse
         SqlType::Timestamp => crate::datetime::parse_timestamp(text)
             .map(SqlValue::Timestamp)
             .ok_or(CopyParseError::InvalidTimestamp),
+        SqlType::Uuid => crate::uuid::parse_uuid(text)
+            .map(SqlValue::Uuid)
+            .ok_or(CopyParseError::InvalidUuid),
     }
 }
 
@@ -3313,6 +3331,7 @@ fn render_default_literal_for_coercion(value: &SqlValue) -> String {
         SqlValue::Text(value) => value.clone(),
         SqlValue::Date(value) => crate::datetime::format_date(*value),
         SqlValue::Timestamp(value) => crate::datetime::format_timestamp(*value),
+        SqlValue::Uuid(value) => crate::uuid::format_uuid(value),
     }
 }
 
@@ -5547,6 +5566,8 @@ fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
     } else if base.eq_ignore_ascii_case("TIMESTAMP") {
         // `timestamp` (without time zone); a fractional-second typmod is a follow-on.
         typmod.is_none().then_some(SqlType::Timestamp)
+    } else if base.eq_ignore_ascii_case("UUID") {
+        typmod.is_none().then_some(SqlType::Uuid)
     } else {
         None
     }
@@ -5921,7 +5942,8 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
         | SqlValue::Date(_)
-        | SqlValue::Timestamp(_) => {
+        | SqlValue::Timestamp(_)
+        | SqlValue::Uuid(_) => {
             Err(ParseError::InvalidRelationalSql)
         }
     }
@@ -5936,7 +5958,8 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
         | SqlValue::Date(_)
-        | SqlValue::Timestamp(_) => {
+        | SqlValue::Timestamp(_)
+        | SqlValue::Uuid(_) => {
             Err(ParseError::InvalidRelationalSql)
         }
     }
@@ -6208,6 +6231,9 @@ fn parse_typed_value_from_str(text: &str, ty: SqlType) -> Result<SqlValue, Parse
             .ok_or(ParseError::InvalidRelationalSql),
         SqlType::Timestamp => crate::datetime::parse_timestamp(text)
             .map(SqlValue::Timestamp)
+            .ok_or(ParseError::InvalidRelationalSql),
+        SqlType::Uuid => crate::uuid::parse_uuid(text)
+            .map(SqlValue::Uuid)
             .ok_or(ParseError::InvalidRelationalSql),
     }
 }

@@ -96,7 +96,9 @@ impl Engine {
         let resident_device_numeric_columns = catalog_table
             .columns
             .iter()
-            .filter(|column| matches!(column.ty, SqlType::Numeric { .. }))
+            // numeric AND uuid share the 16-byte section: a `uuid` is 16 raw bytes (a byte-wise
+            // compare kernel reads them; numeric stores its i128 mantissa). The type matrix, doc 19.
+            .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let mut device_payload = vec![0; std::mem::size_of::<u64>()];
@@ -149,16 +151,23 @@ impl Engine {
             .columns
             .iter()
             .enumerate()
-            .filter(|(_idx, column)| matches!(column.ty, SqlType::Numeric { .. }))
+            .filter(|(_idx, column)| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
             .map(|(idx, _column)| idx)
         {
             for row in &resident_rows {
-                let SqlValue::Numeric(value) = &row[column_idx] else {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident snapshot numeric payload encountered non-numeric value".to_string(),
-                    )));
-                };
-                device_payload.extend_from_slice(&value.mantissa.to_le_bytes());
+                // numeric -> its i128 mantissa (16 bytes LE); uuid -> its 16 raw bytes.
+                match &row[column_idx] {
+                    SqlValue::Numeric(value) => {
+                        device_payload.extend_from_slice(&value.mantissa.to_le_bytes());
+                    }
+                    SqlValue::Uuid(bytes) => device_payload.extend_from_slice(bytes),
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "resident snapshot numeric/uuid payload encountered a wrong-typed value"
+                                .to_string(),
+                        )));
+                    }
+                }
             }
         }
         for (column_idx, column) in catalog_table

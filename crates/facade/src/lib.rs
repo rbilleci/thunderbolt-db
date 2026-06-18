@@ -49,6 +49,7 @@ pub enum LogicalType {
     Text,
     Date,
     Timestamp,
+    Uuid,
 }
 
 /// Neutral value vocabulary. Owned by the façade so the protocol crate's
@@ -66,6 +67,8 @@ pub enum DbValue {
     Date(i32),
     /// A `timestamp` as i64 microseconds since 2000-01-01 00:00:00.
     Timestamp(i64),
+    /// A `uuid` as its 16 raw bytes.
+    Uuid([u8; 16]),
 }
 
 /// Neutral column metadata: a name and a logical type. No OID, no typmod.
@@ -641,6 +644,7 @@ fn map_logical_type(ty: SqlType) -> LogicalType {
         SqlType::Text => LogicalType::Text,
         SqlType::Date => LogicalType::Date,
         SqlType::Timestamp => LogicalType::Timestamp,
+        SqlType::Uuid => LogicalType::Uuid,
     }
 }
 
@@ -660,6 +664,7 @@ fn map_value(value: SqlValue) -> DbValue {
         SqlValue::Text(value) => DbValue::Text(value),
         SqlValue::Date(value) => DbValue::Date(value),
         SqlValue::Timestamp(value) => DbValue::Timestamp(value),
+        SqlValue::Uuid(value) => DbValue::Uuid(value),
     }
 }
 

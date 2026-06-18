@@ -121,6 +121,11 @@ fn column_for_sql_type(ty: gpu_db_protocol::SqlType, name: &str) -> Column {
             oid: gpu_db_protocol::SqlType::Timestamp.postgres_oid(),
             type_size: gpu_db_protocol::SqlType::Timestamp.type_size(),
         },
+        gpu_db_protocol::SqlType::Uuid => Column {
+            name: name.to_string(),
+            oid: gpu_db_protocol::SqlType::Uuid.postgres_oid(),
+            type_size: gpu_db_protocol::SqlType::Uuid.type_size(),
+        },
     }
 }
 
@@ -221,6 +226,28 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
             | SqlValue::Bool(_)
             | SqlValue::Text(_)
             | SqlValue::Date(_),
+        ) => std::cmp::Ordering::Greater,
+        // Uuid is the final tier; same-type compares byte-wise (PG's uuid order).
+        (SqlValue::Uuid(left), SqlValue::Uuid(right)) => left.cmp(right),
+        (
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_)
+            | SqlValue::Timestamp(_),
+            SqlValue::Uuid(_),
+        ) => std::cmp::Ordering::Less,
+        (
+            SqlValue::Uuid(_),
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_)
+            | SqlValue::Timestamp(_),
         ) => std::cmp::Ordering::Greater,
     }
 }
@@ -731,6 +758,9 @@ fn parse_bounded_sql_function_body(
             .ok_or_else(unsupported_function_body_error),
         SqlType::Timestamp => gpu_db_protocol::datetime::parse_timestamp(literal)
             .map(SqlValue::Timestamp)
+            .ok_or_else(unsupported_function_body_error),
+        SqlType::Uuid => gpu_db_protocol::uuid::parse_uuid(literal)
+            .map(SqlValue::Uuid)
             .ok_or_else(unsupported_function_body_error),
     }
 }
@@ -1467,7 +1497,8 @@ fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
         | SqlValue::Date(_)
-        | SqlValue::Timestamp(_) => {
+        | SqlValue::Timestamp(_)
+        | SqlValue::Uuid(_) => {
             Err(ErrorField {
                 code: "0A000",
                 message: aggregate_int4_error_message(aggregate),
@@ -1524,6 +1555,7 @@ fn format_sql_value(value: &SqlValue) -> String {
         SqlValue::Text(value) => value.clone(),
         SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value),
         SqlValue::Timestamp(value) => gpu_db_protocol::datetime::format_timestamp(*value),
+        SqlValue::Uuid(value) => gpu_db_protocol::uuid::format_uuid(value),
     }
 }
 
@@ -1583,6 +1615,13 @@ fn parse_materialized_row_value(
             .ok_or(ErrorField {
                 code: "22P02",
                 message: "invalid input syntax for type timestamp",
+                position: None,
+            }),
+        gpu_db_protocol::SqlType::Uuid => gpu_db_protocol::uuid::parse_uuid(value)
+            .map(SqlValue::Uuid)
+            .ok_or(ErrorField {
+                code: "22P02",
+                message: "invalid input syntax for type uuid",
                 position: None,
             }),
     }
@@ -2702,6 +2741,7 @@ fn format_default_expr(value: &SqlValue) -> String {
             "'{}'::timestamp",
             gpu_db_protocol::datetime::format_timestamp(*value)
         ),
+        SqlValue::Uuid(value) => format!("'{}'::uuid", gpu_db_protocol::uuid::format_uuid(value)),
     }
 }
 
@@ -15030,6 +15070,7 @@ fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
         SqlValue::Timestamp(value) => {
             gpu_db_protocol::datetime::format_timestamp(*value).len() as u64
         }
+        SqlValue::Uuid(_) => 36, // canonical hyphenated text length
     }
 }
 
@@ -16486,6 +16527,7 @@ fn sql_type_alignment_code(ty: SqlType) -> &'static str {
         SqlType::Text => "i",
         SqlType::Date => "i",
         SqlType::Timestamp => "d",
+        SqlType::Uuid => "c",
     }
 }
 
@@ -17637,6 +17679,7 @@ fn sql_type_storage_code(ty: SqlType) -> &'static str {
         SqlType::Text => "x",
         SqlType::Date => "p",
         SqlType::Timestamp => "p",
+        SqlType::Uuid => "p",
     }
 }
 
@@ -17649,6 +17692,7 @@ fn sql_type_display_name(ty: SqlType) -> &'static str {
         SqlType::Text => "text",
         SqlType::Date => "date",
         SqlType::Timestamp => "timestamp without time zone",
+        SqlType::Uuid => "uuid",
     }
 }
 
@@ -18515,6 +18559,7 @@ fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>
         SqlType::Text => (None, None, None),
         SqlType::Date => (None, None, None),
         SqlType::Timestamp => (None, None, None),
+        SqlType::Uuid => (None, None, None),
     }
 }
 

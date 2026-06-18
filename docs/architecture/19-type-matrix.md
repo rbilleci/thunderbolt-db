@@ -111,7 +111,19 @@ The executor is int4 end to end; each new type extends the same four layers:
    to micros at lowering; projection tags the i64 as Timestamp. `event_at = '2024-01-15 10:00:00'`,
    `>/<`, literal-on-left, and col-vs-col all run on the GPU. NEXT temporal = timestamptz / time /
    interval (follow-ons). **TEMPORAL CLUSTER (date + timestamp) DONE.**
-6. **bool** (1-byte).
+6. **uuid** — **COMPARISON DONE**: a `uuid` is 16 raw bytes; PG compares two uuids by an unsigned
+   big-endian `memcmp`. It REUSES the i128 (16-byte) residency section (`resident_device_numeric_
+   column_offset` + the residency builder accept `Numeric | Uuid`; uuid stores its raw bytes where
+   numeric stores its mantissa) but needs a NEW compare kernel: `gpu_db_resident_uuid_compare_scalar_
+   to_mask` / `_columns_to_mask` do a per-row 16-byte byte-wise memcmp (read with `ld.global.u8`, so
+   ALIGNMENT-SAFE regardless of the 16-byte section's offset) -> ordering -> the 6-way cmp result ->
+   mask -> shared compactor; `scalar_on_left` negates the ordering. `crates/sql/src/uuid.rs` parses
+   the canonical/bare/braced hex to `[u8; 16]` and formats canonical lowercase. `SqlType::Uuid`
+   (oid 2950) + `SqlValue::Uuid([u8; 16])`; `try_lower_uuid_predicate` parses the string literal to
+   16 bytes at lowering (dispatched before text); projection reuses the i128 projector (the raw bytes
+   are the i128's LE form, recovered via `to_le_bytes`). `id = '...'`, all six comparators, literal-
+   on-left, `<>`, and col-vs-col run on the GPU. Uuid `AND`/`OR`, and uuid-vs-non-uuid, hard-error.
+7. **bool** (1-byte).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

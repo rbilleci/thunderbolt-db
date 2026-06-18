@@ -2994,3 +2994,265 @@ mwrite:
 done_tlike:
     ret;
 }
+
+// out_mask[i] = (uuid[i] <cmp> needle) ? 1 : 0  over a resident UUID column (16 raw bytes at
+// resident_ptr + byte_offset + i*16). needle_ptr is a 16-byte device copy of the literal uuid. The
+// compare is an unsigned big-endian 16-byte memcmp (PG's uuid order): the first differing byte (read
+// as an unsigned u8) decides. cmp: 0=eq, 1=lt, 2=le, 3=gt, 4=ge, 5=ne. scalar_on_left reverses the
+// operand order (literal <cmp> column) by negating the comparison sign. Bytes read with ld.global.u8
+// (always aligned) so the 16-byte section's alignment never faults.
+.visible .entry gpu_db_resident_uuid_compare_scalar_to_mask(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 needle_ptr,
+    .param .u32 scalar_on_left,
+    .param .u32 comparison,
+    .param .u64 n,
+    .param .u64 out_mask_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %ceq;
+    .reg .pred %clt;
+    .reg .pred %cle;
+    .reg .pred %cgt;
+    .reg .pred %cge;
+    .reg .pred %cne;
+    .reg .pred %req;
+    .reg .pred %rlt;
+    .reg .pred %rle;
+    .reg .pred %rgt;
+    .reg .pred %rge;
+    .reg .pred %rne;
+    .reg .pred %tmp;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %onleft;
+    .reg .u32 %cmp;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .s32 %ord;
+    .reg .b32 %mask;
+    .reg .u64 %base;
+    .reg .u64 %needle;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o16;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %rowbase;
+    .reg .u64 %j;
+    .reg .u64 %a_addr;
+    .reg .u64 %b_addr;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %addr, [byte_offset];
+    add.u64 %base, %base, %addr;
+    ld.param.u64 %needle, [needle_ptr];
+    ld.param.u32 %onleft, [scalar_on_left];
+    ld.param.u32 %cmp, [comparison];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_mask_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_uuid:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_uuid;
+    mul.lo.u64 %o16, %i, 16;
+    add.u64 %rowbase, %base, %o16;
+    mov.s32 %ord, 0;
+    mov.u64 %j, 0;
+uuid_byte:
+    setp.ge.u64 %p, %j, 16;
+    @%p bra uuid_after;
+    add.u64 %a_addr, %rowbase, %j;
+    ld.global.u8 %abyte, [%a_addr];
+    add.u64 %b_addr, %needle, %j;
+    ld.global.u8 %bbyte, [%b_addr];
+    setp.eq.u32 %p, %abyte, %bbyte;
+    @%p bra uuid_byte_next;
+    mov.s32 %ord, 1;
+    setp.lt.u32 %p, %abyte, %bbyte;
+    @%p mov.s32 %ord, -1;
+    bra uuid_after;
+uuid_byte_next:
+    add.u64 %j, %j, 1;
+    bra uuid_byte;
+uuid_after:
+    setp.ne.u32 %p, %onleft, 0;
+    @%p neg.s32 %ord, %ord;
+    setp.eq.u32 %ceq, %cmp, 0;
+    setp.eq.u32 %clt, %cmp, 1;
+    setp.eq.u32 %cle, %cmp, 2;
+    setp.eq.u32 %cgt, %cmp, 3;
+    setp.eq.u32 %cge, %cmp, 4;
+    setp.eq.u32 %cne, %cmp, 5;
+    setp.eq.s32 %req, %ord, 0;
+    setp.lt.s32 %rlt, %ord, 0;
+    setp.le.s32 %rle, %ord, 0;
+    setp.gt.s32 %rgt, %ord, 0;
+    setp.ge.s32 %rge, %ord, 0;
+    setp.ne.s32 %rne, %ord, 0;
+    mov.pred %match, 0;
+    and.pred %tmp, %ceq, %req;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %clt, %rlt;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cle, %rle;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cgt, %rgt;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cge, %rge;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cne, %rne;
+    or.pred %match, %match, %tmp;
+    selp.b32 %mask, 1, 0, %match;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %out, %o4;
+    st.global.b32 [%addr], %mask;
+    add.u64 %i, %i, %stride;
+    bra loop_uuid;
+done_uuid:
+    ret;
+}
+
+// out_mask[i] = (a[i] <cmp> b[i]) ? 1 : 0  over two resident UUID columns (16 raw bytes each, at
+// resident_ptr + a_byte_offset/+ b_byte_offset + i*16). Unsigned big-endian 16-byte memcmp; cmp codes
+// as above. Bytes read with ld.global.u8 (alignment-safe).
+.visible .entry gpu_db_resident_uuid_compare_columns_to_mask(
+    .param .u64 resident_ptr,
+    .param .u64 a_byte_offset,
+    .param .u64 b_byte_offset,
+    .param .u32 comparison,
+    .param .u64 n,
+    .param .u64 out_mask_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %ceq;
+    .reg .pred %clt;
+    .reg .pred %cle;
+    .reg .pred %cgt;
+    .reg .pred %cge;
+    .reg .pred %cne;
+    .reg .pred %req;
+    .reg .pred %rlt;
+    .reg .pred %rle;
+    .reg .pred %rgt;
+    .reg .pred %rge;
+    .reg .pred %rne;
+    .reg .pred %tmp;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %cmp;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .s32 %ord;
+    .reg .b32 %mask;
+    .reg .u64 %abase;
+    .reg .u64 %bbase;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o16;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %arow;
+    .reg .u64 %brow;
+    .reg .u64 %j;
+    .reg .u64 %a_addr;
+    .reg .u64 %b_addr;
+
+    ld.param.u64 %abase, [resident_ptr];
+    ld.param.u64 %addr, [a_byte_offset];
+    add.u64 %abase, %abase, %addr;
+    ld.param.u64 %bbase, [resident_ptr];
+    ld.param.u64 %addr, [b_byte_offset];
+    add.u64 %bbase, %bbase, %addr;
+    ld.param.u32 %cmp, [comparison];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_mask_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_uuidc:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_uuidc;
+    mul.lo.u64 %o16, %i, 16;
+    add.u64 %arow, %abase, %o16;
+    add.u64 %brow, %bbase, %o16;
+    mov.s32 %ord, 0;
+    mov.u64 %j, 0;
+uuidc_byte:
+    setp.ge.u64 %p, %j, 16;
+    @%p bra uuidc_after;
+    add.u64 %a_addr, %arow, %j;
+    ld.global.u8 %abyte, [%a_addr];
+    add.u64 %b_addr, %brow, %j;
+    ld.global.u8 %bbyte, [%b_addr];
+    setp.eq.u32 %p, %abyte, %bbyte;
+    @%p bra uuidc_byte_next;
+    mov.s32 %ord, 1;
+    setp.lt.u32 %p, %abyte, %bbyte;
+    @%p mov.s32 %ord, -1;
+    bra uuidc_after;
+uuidc_byte_next:
+    add.u64 %j, %j, 1;
+    bra uuidc_byte;
+uuidc_after:
+    setp.eq.u32 %ceq, %cmp, 0;
+    setp.eq.u32 %clt, %cmp, 1;
+    setp.eq.u32 %cle, %cmp, 2;
+    setp.eq.u32 %cgt, %cmp, 3;
+    setp.eq.u32 %cge, %cmp, 4;
+    setp.eq.u32 %cne, %cmp, 5;
+    setp.eq.s32 %req, %ord, 0;
+    setp.lt.s32 %rlt, %ord, 0;
+    setp.le.s32 %rle, %ord, 0;
+    setp.gt.s32 %rgt, %ord, 0;
+    setp.ge.s32 %rge, %ord, 0;
+    setp.ne.s32 %rne, %ord, 0;
+    mov.pred %match, 0;
+    and.pred %tmp, %ceq, %req;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %clt, %rlt;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cle, %rle;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cgt, %rgt;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cge, %rge;
+    or.pred %match, %match, %tmp;
+    and.pred %tmp, %cne, %rne;
+    or.pred %match, %match, %tmp;
+    selp.b32 %mask, 1, 0, %match;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %out, %o4;
+    st.global.b32 [%addr], %mask;
+    add.u64 %i, %i, %stride;
+    bra loop_uuidc;
+done_uuidc:
+    ret;
+}

@@ -1220,6 +1220,46 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Surviving row indices of `uuid[i] <cmp> needle` over a resident UUID column (the type matrix,
+    /// doc 19). The column is 16 raw bytes/row in the i128 section; `needle` is the literal's 16 bytes.
+    /// Comparison is an unsigned big-endian 16-byte memcmp (PG's uuid order). `cmp`: 0=eq/1=lt/2=le/
+    /// 3=gt/4=ge/5=ne; `scalar_on_left` reverses the operand order.
+    pub fn expr_uuid_compare_scalar_filter(
+        &self,
+        byte_offset: u64,
+        needle: &[u8; 16],
+        scalar_on_left: bool,
+        comparison: u32,
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_uuid_compare_scalar_filter(
+            self,
+            byte_offset,
+            needle,
+            scalar_on_left,
+            comparison,
+            row_count,
+        )
+    }
+
+    /// Surviving row indices of `a <cmp> b` over two resident UUID columns (the type matrix, doc 19),
+    /// each 16 raw bytes/row; unsigned big-endian 16-byte memcmp.
+    pub fn expr_uuid_compare_columns_filter(
+        &self,
+        a_byte_offset: u64,
+        b_byte_offset: u64,
+        comparison: u32,
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_uuid_compare_columns_filter(
+            self,
+            a_byte_offset,
+            b_byte_offset,
+            comparison,
+            row_count,
+        )
+    }
+
     /// Surviving row indices of `a <cmp> b` over two resident numeric (i128) columns of the SAME scale
     /// (the type matrix, doc 19).
     pub fn expr_i128_compare_columns_filter(
@@ -4217,6 +4257,190 @@ fn launch_cuda_resident_text_eq_scalar_filter(
                 std::ptr::null_mut(),
             )
         }
+    })?;
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+/// Evaluate `uuid[i] <cmp> needle` over a resident UUID column (16 raw bytes/row) to surviving row
+/// indices (the type matrix, doc 19): copy the 16 needle bytes H2D, run the byte-wise compare kernel
+/// to a mask, then the shared compactor.
+fn launch_cuda_resident_uuid_compare_scalar_filter(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    needle: &[u8; 16],
+    scalar_on_left: bool,
+    comparison: u32,
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn =
+        primary.cached_function(c"gpu_db_resident_uuid_compare_scalar_to_mask", &ptx)?;
+
+    let needle_lease = primary.lease_device_buffer(16)?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = byte_offset;
+    let mut a2 = needle_lease.ptr;
+    let mut a3 = u32::from(scalar_on_left);
+    let mut a4 = comparison;
+    let mut a5 = n;
+    let mut a6 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u32).cast::<c_void>(),
+        (&mut a4 as *mut u32).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+        (&mut a6 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                needle_lease.ptr,
+                needle.as_ptr().cast::<c_void>(),
+                16,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        unsafe {
+            cu_launch_kernel(
+                compare_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+/// Evaluate `a <cmp> b` over two resident UUID columns (16 raw bytes/row each) to surviving row
+/// indices (the type matrix, doc 19): the byte-wise compare kernel to a mask, then the compactor.
+fn launch_cuda_resident_uuid_compare_columns_filter(
+    resident: &CudaResidentDeviceMemory,
+    a_byte_offset: u64,
+    b_byte_offset: u64,
+    comparison: u32,
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn =
+        primary.cached_function(c"gpu_db_resident_uuid_compare_columns_to_mask", &ptx)?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = a_byte_offset;
+    let mut a2 = b_byte_offset;
+    let mut a3 = comparison;
+    let mut a4 = n;
+    let mut a5 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u32).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            compare_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
     })?;
     compact_mask_i32_to_indices(resident, mask.ptr, n)
 }

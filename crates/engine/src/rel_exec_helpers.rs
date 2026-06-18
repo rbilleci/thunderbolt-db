@@ -15,6 +15,7 @@ pub(crate) fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
             | (SqlValue::Text(_), SqlType::Text)
             | (SqlValue::Date(_), SqlType::Date)
             | (SqlValue::Timestamp(_), SqlType::Timestamp)
+            | (SqlValue::Uuid(_), SqlType::Uuid)
     )
 }
 
@@ -68,6 +69,15 @@ pub(crate) fn coerce_insert_value(
                     .ok_or_else(|| {
                         EngineError::ApplyFailed(format!(
                             "invalid input syntax for type timestamp: \"{text}\""
+                        ))
+                    });
+            }
+            SqlType::Uuid => {
+                return gpu_db_sql::uuid::parse_uuid(text)
+                    .map(SqlValue::Uuid)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "invalid input syntax for type uuid: \"{text}\""
                         ))
                     });
             }
@@ -220,6 +230,7 @@ pub(crate) fn relational_index_value(value: &SqlValue) -> String {
         SqlValue::Text(value) => format!("t:{value}"),
         SqlValue::Date(value) => format!("date:{value}"),
         SqlValue::Timestamp(value) => format!("ts:{value}"),
+        SqlValue::Uuid(bytes) => format!("uuid:{}", gpu_db_sql::uuid::format_uuid(bytes)),
     }
 }
 
@@ -276,7 +287,8 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Date(_)
-        | SqlValue::Timestamp(_) => {
+        | SqlValue::Timestamp(_)
+        | SqlValue::Uuid(_) => {
             Err(EngineError::ApplyFailed(
                 "COPY-to-engine ingestion supports int4/text rows only".to_string(),
             ))
@@ -294,6 +306,7 @@ pub(crate) fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
         SqlValue::Text(value) => value.len() as u64,
         SqlValue::Date(_) => 4,
         SqlValue::Timestamp(_) => 8,
+        SqlValue::Uuid(_) => 16,
     }
 }
 
@@ -368,6 +381,7 @@ pub(crate) fn information_schema_data_type(ty: SqlType) -> &'static str {
         SqlType::Text => "text",
         SqlType::Date => "date",
         SqlType::Timestamp => "timestamp",
+        SqlType::Uuid => "uuid",
     }
 }
 
@@ -656,6 +670,7 @@ pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
             }
             SqlValue::Date(value) => format!("date:{value}"),
             SqlValue::Timestamp(value) => format!("ts:{value}"),
+            SqlValue::Uuid(bytes) => format!("uuid:{}", gpu_db_sql::uuid::format_uuid(bytes)),
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -756,6 +771,16 @@ pub(crate) fn decode_relational_value(
                     "stored TIMESTAMP value is invalid".to_string(),
                 ))
             })
+        }
+        SqlType::Uuid => {
+            let value = part.strip_prefix("uuid:").ok_or_else(wrong_type)?;
+            gpu_db_sql::uuid::parse_uuid(value)
+                .map(SqlValue::Uuid)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "stored UUID value is invalid".to_string(),
+                    ))
+                })
         }
     }
 }
@@ -860,6 +885,28 @@ pub(crate) fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering 
             | SqlValue::Bool(_)
             | SqlValue::Text(_)
             | SqlValue::Date(_),
+        ) => Ordering::Greater,
+        // Uuid is the final tier; same-type compares byte-wise (PG's uuid order).
+        (SqlValue::Uuid(left), SqlValue::Uuid(right)) => left.cmp(right),
+        (
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_)
+            | SqlValue::Timestamp(_),
+            SqlValue::Uuid(_),
+        ) => Ordering::Less,
+        (
+            SqlValue::Uuid(_),
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_)
+            | SqlValue::Date(_)
+            | SqlValue::Timestamp(_),
         ) => Ordering::Greater,
     }
 }
@@ -1565,7 +1612,8 @@ pub(crate) fn int4_aggregate_value(
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
         | SqlValue::Date(_)
-        | SqlValue::Timestamp(_) => {
+        | SqlValue::Timestamp(_)
+        | SqlValue::Uuid(_) => {
             Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 aggregate_int4_error_message(aggregate).to_string(),
             )))

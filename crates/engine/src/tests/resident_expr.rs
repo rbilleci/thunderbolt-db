@@ -1438,3 +1438,115 @@ fn gpu_execute_resident_expr_select_sql_runs_timestamp_comparisons() {
         "invalid timestamp literal => hard error"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_uuid_comparisons() {
+    // UUID comparison on the general GPU executor (the type matrix, doc 19): a `uuid` is 16 raw bytes
+    // in the i128 (16-byte) section, compared by an unsigned big-endian memcmp kernel (PG's uuid
+    // order). id[i] = ...{i:02x} (last byte = i, so byte-wise ascending), peer = constant ...0a,
+    // label = i.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id UUID, peer UUID, label INT)")
+        .unwrap();
+    const N: i64 = 20;
+    let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
+    let peer = uuid_for(10);
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("('{}', '{peer}', {i})", uuid_for(i)));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (id, peer, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let labels = |range: std::ops::Range<i64>| -> Vec<Vec<SqlValue>> {
+        range.map(|i| vec![SqlValue::Int4(i as i32)]).collect()
+    };
+
+    // = '...0a' -> last byte 10 -> row 10
+    let eq = e
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT label FROM t WHERE id = '{}'",
+            uuid_for(10)
+        ))
+        .expect("id = uuid on GPU");
+    assert_eq!(eq.rows, vec![vec![SqlValue::Int4(10)]], "= ...0a => row 10");
+    assert_eq!(eq.executed_target, DeviceTarget::Gpu(0));
+
+    // > '...0a' -> [11, 20)
+    let gt = e
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT label FROM t WHERE id > '{}'",
+            uuid_for(10)
+        ))
+        .expect("id > uuid on GPU");
+    assert_eq!(gt.rows, labels(11..N), "> ...0a => [11, 20)");
+
+    // < '...05' -> [0, 5)
+    let lt = e
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT label FROM t WHERE id < '{}'",
+            uuid_for(5)
+        ))
+        .expect("id < uuid on GPU");
+    assert_eq!(lt.rows, labels(0..5), "< ...05 => [0, 5)");
+
+    // literal on the LEFT
+    let lit_left = e
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT label FROM t WHERE '{}' < id",
+            uuid_for(10)
+        ))
+        .expect("uuid < id on GPU");
+    assert_eq!(lit_left.rows, labels(11..N), "...0a < id => [11, 20)");
+
+    // col-vs-col: id > peer (constant ...0a) -> [11, 20)
+    let col_col = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE id > peer")
+        .expect("id > peer on GPU");
+    assert_eq!(col_col.rows, labels(11..N), "id > peer (...0a) => [11, 20)");
+
+    // <> excludes only the equal row
+    let ne = e
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT label FROM t WHERE id <> '{}'",
+            uuid_for(10)
+        ))
+        .expect("id <> uuid on GPU");
+    let mut expected_ne = labels(0..10);
+    expected_ne.extend(labels(11..N));
+    assert_eq!(ne.rows, expected_ne, "<> ...0a => all but row 10");
+
+    // projecting the UUID column yields SqlValue::Uuid(bytes)
+    let proj = e
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT id FROM t WHERE id = '{}'",
+            uuid_for(10)
+        ))
+        .expect("project uuid on GPU");
+    let bytes = gpu_db_sql::uuid::parse_uuid(&uuid_for(10)).expect("valid uuid");
+    assert_eq!(
+        proj.rows,
+        vec![vec![SqlValue::Uuid(bytes)]],
+        "projecting id returns the uuid value"
+    );
+
+    // REJECTIONS -- hard errors, never wrong rows:
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE id = 5")
+            .is_err(),
+        "uuid compared to an integer => hard error"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE id = 'not-a-uuid'")
+            .is_err(),
+        "invalid uuid literal => hard error"
+    );
+}
