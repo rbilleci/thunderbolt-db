@@ -893,15 +893,31 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
         .expect("2*price>100 on GPU");
     assert_eq!(mul_left.rows, mul_expected, "2*price>100 == price*2>100 (commutative)");
 
+    // fractional-literal multiply: price*1.5 (result scale 2+1=3): (1500i+750) > 100000 => i >= 67.
+    let frac = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 1.5 > 100")
+        .expect("price*1.5>100 on GPU");
+    let frac_expected: Vec<Vec<SqlValue>> = (67..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(frac.rows, frac_expected, "price*1.5>100 => label in [67, 600)");
+
+    // column*column multiply: price*cost (result scale 2+2=4): (100i+50)(100i+25) > 1000000 => i >= 10.
+    let cols = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > 100")
+        .expect("price*cost>100 on GPU");
+    let cols_expected: Vec<Vec<SqlValue>> = (10..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(cols.rows, cols_expected, "price*cost>100 => label in [10, 600)");
+
     // REJECTIONS — hard errors, never wrong rows:
+    // a comparison whose two sides differ in scale (price*cost is scale 4, price is scale 2).
     assert!(
-        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 1.5 > 100")
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > price")
             .is_err(),
-        "fractional multiplier (scale addition) => follow-on, hard error"
+        "cross-scale numeric comparison => follow-on, hard error"
     );
+    // a mixed numeric * int4 column.
     assert!(
-        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > 100")
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * label > 100")
             .is_err(),
-        "column*column multiply => follow-on, hard error"
+        "mixed numeric * int4 column => hard error"
     );
 }

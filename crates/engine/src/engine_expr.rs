@@ -214,137 +214,116 @@ fn rescale_numeric_literal(literal: Decimal128, column_scale: u8) -> Result<i128
         })
 }
 
-/// The single scale shared by every numeric COLUMN in `expr`, or `None` if it mentions no numeric
-/// column (only literals). Columns of differing scales are a hard error — cross-scale numeric
-/// arithmetic (rescaling a column on the GPU) is a follow-on; this slice is same-scale add/sub.
-fn numeric_common_scale(
-    expr: &ResidentExpr,
-    table: &RelationalTable,
-) -> Result<Option<u8>, ExecuteError> {
-    match expr {
-        ResidentExpr::Column(idx) => Ok(column_numeric_scale(table, *idx)),
-        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => Ok(None),
-        ResidentExpr::Binary { lhs, rhs, .. } => {
-            let lhs_scale = numeric_common_scale(lhs, table)?;
-            let rhs_scale = numeric_common_scale(rhs, table)?;
-            match (lhs_scale, rhs_scale) {
-                (Some(a), Some(b)) if a != b => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "numeric arithmetic over columns of different scales is not supported yet \
-                     (cross-scale rescaling on the GPU is a follow-on)"
-                        .to_string(),
-                ))),
-                (Some(a), _) => Ok(Some(a)),
-                (None, other) => Ok(other),
-            }
-        }
-    }
-}
-
-/// Compile a numeric ARITHMETIC subtree (`+`/`-` only, same scale `scale`) to i128 VM steps: numeric
-/// columns load from their device offset; a literal operand folds into a `ScalarBinary` carrying its
-/// mantissa rescaled to `scale` (which must fit i32 — the larger-literal fast path is a follow-on).
-/// Multiplication is rejected (the i128*i128 kernel is a follow-on). Mirrors `compile_arith_program`.
+/// Compile a numeric ARITHMETIC subtree to i128 VM steps, RETURNING the result's scale (computed
+/// bottom-up). A `Column` loads from its device offset (scale = its catalog scale). `+`/`-` require
+/// both operands at the SAME scale (cross-scale rescaling is a follow-on) and keep it; `*` ADDS the
+/// operand scales (PG numeric multiply). A literal operand folds into a `ScalarBinary`: for `+`/`-`
+/// its mantissa rescales to the other operand's scale; for `*` its CANONICAL mantissa is the
+/// multiplier and its canonical scale adds to the result. Every scalar must fit i32 (the `ExprStep`
+/// bound; larger literals are a follow-on). Mirrors `compile_arith_program`.
 fn compile_numeric_arith(
     expr: &ResidentExpr,
     table: &RelationalTable,
     snapshot: &RelationalResidencySnapshot,
-    scale: u8,
     program: &mut Vec<ExprStep>,
-) -> Result<(), ExecuteError> {
+) -> Result<u8, ExecuteError> {
+    let scalar_i32 = |mantissa: i128| -> Result<i32, ExecuteError> {
+        i32::try_from(mantissa).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "numeric arithmetic literal is too large for the fast path yet".to_string(),
+            ))
+        })
+    };
+    let scale_overflow = || {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "numeric multiply result scale exceeds the supported range".to_string(),
+        ))
+    };
+    let literal_only = || {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "the general GPU executor does not constant-fold literal-only numeric arithmetic"
+                .to_string(),
+        ))
+    };
     match expr {
         ResidentExpr::Column(col) => {
-            if column_numeric_scale(table, *col) != Some(scale) {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "numeric arithmetic operand has a different scale than the expression".to_string(),
-                )));
-            }
+            let scale = column_numeric_scale(table, *col).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "numeric arithmetic operand is not a numeric column".to_string(),
+                ))
+            })?;
             let byte_offset = resident_device_numeric_column_offset(snapshot, table, *col)?;
             program.push(ExprStep::LoadColumn { byte_offset });
-            Ok(())
+            Ok(scale)
         }
         ResidentExpr::Binary { op, lhs, rhs } => {
-            let op_code = match arith_op_code(*op) {
-                Some(code) => code, // 0=add, 1=sub, 2=mul
-                None => {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "the general GPU executor supports numeric +, -, * arithmetic only".to_string(),
-                    )));
-                }
-            };
+            let op_code = arith_op_code(*op).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "the general GPU executor supports numeric +, -, * arithmetic only".to_string(),
+                ))
+            })?;
             let lhs_lit = numeric_literal_value(lhs);
             let rhs_lit = numeric_literal_value(rhs);
             if op_code == 2 {
-                // MULTIPLY: scalar only, by an INTEGER literal (scale 0, so the result stays at the
-                // column scale). column*column and fractional multipliers (which ADD scales, changing
-                // the result scale) are follow-ons.
-                let int_mul_scalar = |literal: Decimal128| -> Result<i32, ExecuteError> {
-                    let canonical = literal.canonical();
-                    if canonical.scale != 0 {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "numeric multiply by a fractional literal is not supported yet (it changes \
-                             the result scale)"
-                                .to_string(),
-                        )));
+                // MULTIPLY: the result scale is the SUM of the operand scales. A literal multiplier
+                // contributes its canonical mantissa + canonical scale (so `* 1.5` adds scale 1).
+                return match (lhs_lit, rhs_lit) {
+                    (None, Some(literal)) | (Some(literal), None) => {
+                        let value = if lhs_lit.is_none() { lhs.as_ref() } else { rhs.as_ref() };
+                        let value_scale = compile_numeric_arith(value, table, snapshot, program)?;
+                        let canonical = literal.canonical();
+                        program.push(ExprStep::ScalarBinary {
+                            op: 2,
+                            scalar: scalar_i32(canonical.mantissa)?,
+                            scalar_on_left: false, // multiply is commutative
+                        });
+                        value_scale.checked_add(canonical.scale).ok_or_else(scale_overflow)
                     }
-                    i32::try_from(canonical.mantissa).map_err(|_| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(
-                            "numeric multiply literal is too large for the fast path yet".to_string(),
-                        ))
-                    })
-                };
-                let (value, literal) = match (lhs_lit, rhs_lit) {
-                    (None, Some(literal)) => (lhs.as_ref(), literal),
-                    (Some(literal), None) => (rhs.as_ref(), literal), // multiply is commutative
-                    _ => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "numeric multiply requires one integer-literal operand (column*column is a \
-                             follow-on)"
-                                .to_string(),
-                        )));
+                    (None, None) => {
+                        let lhs_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
+                        let rhs_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
+                        program.push(ExprStep::BufferBinary { op: 2 });
+                        lhs_scale.checked_add(rhs_scale).ok_or_else(scale_overflow)
                     }
+                    (Some(_), Some(_)) => Err(literal_only()),
                 };
-                compile_numeric_arith(value, table, snapshot, scale, program)?;
-                program.push(ExprStep::ScalarBinary {
-                    op: 2,
-                    scalar: int_mul_scalar(literal)?,
-                    scalar_on_left: false,
-                });
-                return Ok(());
             }
-            let scalar_step = |literal: Decimal128, scalar_on_left: bool| -> Result<ExprStep, ExecuteError> {
-                let mantissa = rescale_numeric_literal(literal, scale)?;
-                let scalar = i32::try_from(mantissa).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(
-                        "numeric arithmetic literal is too large for the fast path yet".to_string(),
-                    ))
-                })?;
-                Ok(ExprStep::ScalarBinary {
-                    op: op_code,
-                    scalar,
-                    scalar_on_left,
-                })
-            };
+            // ADD / SUB: both operands at the same scale, which the result keeps.
             match (lhs_lit, rhs_lit) {
                 (None, Some(literal)) => {
-                    compile_numeric_arith(lhs, table, snapshot, scale, program)?;
-                    program.push(scalar_step(literal, false)?);
-                    Ok(())
+                    let value_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
+                    let mantissa = rescale_numeric_literal(literal, value_scale)?;
+                    program.push(ExprStep::ScalarBinary {
+                        op: op_code,
+                        scalar: scalar_i32(mantissa)?,
+                        scalar_on_left: false,
+                    });
+                    Ok(value_scale)
                 }
                 (Some(literal), None) => {
-                    compile_numeric_arith(rhs, table, snapshot, scale, program)?;
-                    program.push(scalar_step(literal, true)?);
-                    Ok(())
+                    let value_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
+                    let mantissa = rescale_numeric_literal(literal, value_scale)?;
+                    program.push(ExprStep::ScalarBinary {
+                        op: op_code,
+                        scalar: scalar_i32(mantissa)?,
+                        scalar_on_left: true,
+                    });
+                    Ok(value_scale)
                 }
                 (None, None) => {
-                    compile_numeric_arith(lhs, table, snapshot, scale, program)?;
-                    compile_numeric_arith(rhs, table, snapshot, scale, program)?;
+                    let lhs_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
+                    let rhs_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
+                    if lhs_scale != rhs_scale {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "numeric add/sub over operands of different scales is not supported yet \
+                             (cross-scale rescaling is a follow-on)"
+                                .to_string(),
+                        )));
+                    }
                     program.push(ExprStep::BufferBinary { op: op_code });
-                    Ok(())
+                    Ok(lhs_scale)
                 }
-                (Some(_), Some(_)) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "the general GPU executor does not constant-fold literal-only numeric arithmetic"
-                        .to_string(),
-                ))),
+                (Some(_), Some(_)) => Err(literal_only()),
             }
         }
         ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => {
@@ -863,29 +842,11 @@ impl Engine {
                     .map_err(map_err)
             }
             _ => {
-                // Numeric ARITHMETIC comparison (e.g. `price + tax > 100.00`, `100 < price - fee`):
-                // compile the arithmetic side(s) to i128 add/sub steps at the columns' common scale,
-                // then a terminal compare, and run the i128 VM. Same-scale add/sub only (this slice).
-                let scale = match (
-                    numeric_common_scale(lhs, table)?,
-                    numeric_common_scale(rhs, table)?,
-                ) {
-                    (Some(a), Some(b)) if a != b => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "numeric arithmetic over columns of different scales is not supported yet"
-                                .to_string(),
-                        )));
-                    }
-                    (Some(a), _) | (_, Some(a)) => a,
-                    (None, None) => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "the general GPU executor cannot evaluate a numeric predicate with no \
-                             numeric column"
-                                .to_string(),
-                        )));
-                    }
-                };
-                let needle = |literal: Decimal128| -> Result<i32, ExecuteError> {
+                // Numeric ARITHMETIC comparison (`price * tax > 100`, `100 < price - fee`, ...):
+                // compile the arithmetic side(s) to i128 VM steps -- compile_numeric_arith returns each
+                // side's RESULT scale (columns at their catalog scale; `+`/`-` keep the operand scale,
+                // `*` adds scales) -- then a terminal compare at that scale, and run the i128 VM.
+                let needle = |literal: Decimal128, scale: u8| -> Result<i32, ExecuteError> {
                     let mantissa = rescale_numeric_literal(literal, scale)?;
                     i32::try_from(mantissa).map_err(|_| {
                         ExecuteError::Engine(EngineError::ApplyFailed(
@@ -896,24 +857,31 @@ impl Engine {
                 let mut program = Vec::new();
                 match (numeric_literal_value(lhs), numeric_literal_value(rhs)) {
                     (Some(literal), None) => {
-                        compile_numeric_arith(rhs, table, snapshot, scale, &mut program)?;
+                        let scale = compile_numeric_arith(rhs, table, snapshot, &mut program)?;
                         program.push(ExprStep::CompareScalar {
                             cmp,
-                            scalar: needle(literal)?,
+                            scalar: needle(literal, scale)?,
                             scalar_on_left: true,
                         });
                     }
                     (None, Some(literal)) => {
-                        compile_numeric_arith(lhs, table, snapshot, scale, &mut program)?;
+                        let scale = compile_numeric_arith(lhs, table, snapshot, &mut program)?;
                         program.push(ExprStep::CompareScalar {
                             cmp,
-                            scalar: needle(literal)?,
+                            scalar: needle(literal, scale)?,
                             scalar_on_left: false,
                         });
                     }
                     (None, None) => {
-                        compile_numeric_arith(lhs, table, snapshot, scale, &mut program)?;
-                        compile_numeric_arith(rhs, table, snapshot, scale, &mut program)?;
+                        let lhs_scale = compile_numeric_arith(lhs, table, snapshot, &mut program)?;
+                        let rhs_scale = compile_numeric_arith(rhs, table, snapshot, &mut program)?;
+                        if lhs_scale != rhs_scale {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "numeric comparison requires both sides at the same scale (cross-scale \
+                                 comparison is a follow-on)"
+                                    .to_string(),
+                            )));
+                        }
                         program.push(ExprStep::CompareBuffers { cmp });
                     }
                     (Some(_), Some(_)) => {

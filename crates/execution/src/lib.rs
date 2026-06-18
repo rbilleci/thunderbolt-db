@@ -9765,6 +9765,12 @@ fn run_resident_arith_program<'r>(
         }
         ResidentElemType::I32 | ResidentElemType::I64 => None,
     };
+    // column*column multiply for I128 is its own kernel too; None for int4/int8 (their binary kernel
+    // handles multiply), so the BufferBinary arm keeps using buffer_binary_fn there.
+    let i128_mul_buffer_fn = match elem {
+        ResidentElemType::I128 => Some(primary.cached_function(c"gpu_db_buffer_i128_mul", &ptx)?),
+        ResidentElemType::I32 | ResidentElemType::I64 => None,
+    };
 
     // CHECKED int4 arithmetic (Charter rule 2 PG-fidelity): ONE overflow flag shared by every
     // arithmetic step of the program. The checked kernels OR 1 into it when an op overflows int32;
@@ -9844,7 +9850,14 @@ fn run_resident_arith_program<'r>(
                     (&mut a4 as *mut u64).cast::<c_void>(),
                     (&mut a5 as *mut u64).cast::<c_void>(),
                 ];
-                launch(buffer_binary_fn, &mut args)?;
+                // op 2 (multiply) over two i128 buffers uses the dedicated i128 column*column mul
+                // kernel; add/sub (and all int4/int8 ops, where i128_mul_buffer_fn is None) use the
+                // binary kernel.
+                let function = match i128_mul_buffer_fn {
+                    Some(mul_fn) if op == 2 => mul_fn,
+                    _ => buffer_binary_fn,
+                };
+                launch(function, &mut args)?;
                 stack.push(out);
             }
             ExprStep::ScalarBinary {
@@ -20764,6 +20777,107 @@ mod tests {
         assert!(
             err.to_string().contains("numeric field overflow"),
             "i128 multiply overflow must raise `numeric field overflow`, got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_buffer_i128_mul_columns_checks_overflow() {
+        // numeric (i128) CHECKED column*column multiply via gpu_db_buffer_i128_mul + the I128 VM
+        // (BufferBinary op 2). Exact product (vs a precomputed column) beyond i64 range + an overflow.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const N: u64 = 600;
+        let base: i128 = 1i128 << 70;
+        let elem = std::mem::size_of::<i128>() as u64;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let b_off = a_off + N * elem;
+        let prod_off = b_off + N * elem;
+        let big_off = prod_off + N * elem;
+        let two_off = big_off + N * elem;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&N.to_le_bytes());
+        let (mut a, mut b, mut prod, mut big, mut two) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..N as i128 {
+            a.extend_from_slice(&(base + i).to_le_bytes());
+            b.extend_from_slice(&(i + 2).to_le_bytes());
+            prod.extend_from_slice(&((base + i) * (i + 2)).to_le_bytes());
+            big.extend_from_slice(&i128::MAX.to_le_bytes());
+            two.extend_from_slice(&2i128.to_le_bytes());
+        }
+        let allocated_len = two_off + two.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: b_off,
+                        bytes: &b,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: prod_off,
+                        bytes: &prod,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: big_off,
+                        bytes: &big,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: two_off,
+                        bytes: &two,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // a * b == prod : exact column*column product (beyond i64) => all rows.
+        let eq_prog = [
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::LoadColumn { byte_offset: b_off },
+            ExprStep::BufferBinary { op: 2 },
+            ExprStep::LoadColumn {
+                byte_offset: prod_off,
+            },
+            ExprStep::CompareBuffers { cmp: 0 },
+        ];
+        let eq = resident
+            .run_expr_predicate_filter(&eq_prog, N, ResidentElemType::I128)
+            .expect("a*b==prod on GPU");
+        let all_expected: Vec<u32> = (0..N as u32).collect();
+        assert_eq!(eq, all_expected, "a*b == prod => all rows (exact col*col)");
+
+        // big * two with big = i128::MAX overflows i128 -> numeric field overflow.
+        let ovf_prog = [
+            ExprStep::LoadColumn {
+                byte_offset: big_off,
+            },
+            ExprStep::LoadColumn {
+                byte_offset: two_off,
+            },
+            ExprStep::BufferBinary { op: 2 },
+            ExprStep::CompareScalar {
+                cmp: 3,
+                scalar: 0,
+                scalar_on_left: false,
+            },
+        ];
+        let err = resident
+            .run_expr_predicate_filter(&ovf_prog, N, ResidentElemType::I128)
+            .expect_err("i128::MAX * 2 (col*col) must overflow");
+        assert!(
+            err.to_string().contains("numeric field overflow"),
+            "col*col multiply overflow must raise `numeric field overflow`, got: {err}"
         );
     }
 }

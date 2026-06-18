@@ -55,17 +55,20 @@ The executor is int4 end to end; each new type extends the same four layers:
    the column scale (UP only — a literal with more fractional digits than the column is rejected, since
    rounding would mis-answer; PG compares exactly) and runs the i128 compare filters; type-aware i128
    projection. The decimal SCALE is a per-column catalog constant (values rescaled on insert), so the
-   snapshot stores only the mantissa. **Checked add/sub ARITHMETIC also DONE end to end from SQL**
-   (`price + cost > 100`, `price - 5 > 100`) AND **integer-literal MULTIPLY** (`price * 2 > 100`):
-   an i128 buffer VM (`ResidentElemType::I128`) with 2-limb add/sub (manual carry/borrow) + a signed
-   128x128->256-bit multiply (4-limb unsigned schoolbook + sign correction), overflow via the
-   high-limb sign rule (add/sub) / "high 128 != sign-extension of low 128" (mul) -> PG `numeric field
-   overflow`. The engine compiles arithmetic to i128 load / add-sub / mul-scalar / compare steps at the
-   columns' common scale (same-scale add/sub; multiply only by an INTEGER literal so the result stays
-   at the column scale; the i32 `ExprStep` scalar bounds in-arith literals). Mixed numeric/integer,
-   column*column or fractional-literal multiply, cross-scale (unequal-scale columns), numeric `AND`/`OR`,
-   and large in-arith literals are hard errors. NEXT: column*column / fractional multiply (result
-   scale = sum of scales), then cross-scale + numeric AND/OR.
+   snapshot stores only the mantissa. **Checked ARITHMETIC also DONE end to end from SQL** -- add/sub
+   (`price + cost > 100`, `price - 5 > 100`) AND full MULTIPLY incl. **column*column and fractional**
+   (`price * 2`, `price * 1.5`, `price * tax`): an i128 buffer VM (`ResidentElemType::I128`) with 2-limb
+   add/sub (manual carry/borrow) + a signed 128x128->256-bit multiply (4-limb unsigned schoolbook + sign
+   correction) in both scalar (`gpu_db_buffer_i128_mul_scalar`) and column*column
+   (`gpu_db_buffer_i128_mul`) kernels; overflow via the high-limb sign rule (add/sub) / "high 128 !=
+   sign-extension of low 128" (mul) -> PG `numeric field overflow`. `compile_numeric_arith` computes
+   each subexpression's RESULT SCALE bottom-up: `+`/`-` keep the (equal) operand scale, `*` ADDS the
+   operand scales (literal `*` adds its canonical scale); the terminal compare rescales the literal to
+   that scale, and arith-vs-arith requires equal scales. The i32 `ExprStep` scalar bounds in-arith
+   literals. Mixed numeric/integer, cross-scale add/sub (unequal-scale operands), cross-scale compare,
+   numeric `AND`/`OR`, and large in-arith literals are hard errors. **FOUR audits all SHIP** (compare
+   found the alignment P0; add/sub 19k-fuzz; multiply-scalar 310k-fuzz; col*col next). NEXT: cross-scale
+   add/sub + comparison (rescale a column on the GPU), then numeric `AND`/`OR`.
 
    NOTE (gotcha): PTX comments must be PURE ASCII — the runtime JIT's ptxas rejects a non-ASCII byte
    ("Unexpected non-ASCII character", INVALID_PTX 218) that the LOCAL ptxas tolerates. A guard test
