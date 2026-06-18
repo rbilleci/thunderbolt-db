@@ -55,10 +55,18 @@ The executor is int4 end to end; each new type extends the same four layers:
    the column scale (UP only — a literal with more fractional digits than the column is rejected, since
    rounding would mis-answer; PG compares exactly) and runs the i128 compare filters; type-aware i128
    projection. The decimal SCALE is a per-column catalog constant (values rescaled on insert), so the
-   snapshot stores only the mantissa. Mixed numeric/integer, equal-scale-only col-vs-col, and (for now)
-   numeric `AND`/`OR` + arithmetic are hard errors. NEXT: checked numeric arithmetic via 64-bit limbs
-   (add/sub with carry, mul via limb products) with PG `numeric field overflow`, then numeric AND/OR
-   and cross-scale comparison.
+   snapshot stores only the mantissa. **Checked add/sub ARITHMETIC also DONE end to end from SQL**
+   (`price + cost > 100`, `price - 5 > 100`): an i128 buffer VM (`ResidentElemType::I128`) with 2-limb
+   add/sub (manual carry/borrow), overflow via the high-limb sign rule -> PG `numeric field overflow`;
+   the engine compiles the arithmetic to i128 load / add-sub / compare steps at the columns' common
+   scale (same-scale only this slice; the i32 `ExprStep` scalar bounds in-arith literals). Mixed
+   numeric/integer, multiply, cross-scale (unequal-scale columns), numeric `AND`/`OR`, and large
+   in-arith literals are hard errors. NEXT: i128*i128 multiply (256-bit intermediate + overflow),
+   then cross-scale + numeric AND/OR.
+
+   NOTE (gotcha): PTX comments must be PURE ASCII — the runtime JIT's ptxas rejects a non-ASCII byte
+   ("Unexpected non-ASCII character", INVALID_PTX 218) that the LOCAL ptxas tolerates. A guard test
+   (`expr_proto_ptx_is_pure_ascii`) enforces it.
 3. **text** (already retained in residency) — equality / inequality + `LIKE`-prefix over
    offsets + bytes; folds the enumerated `text_prefix_like` route toward a general-path
    peephole.

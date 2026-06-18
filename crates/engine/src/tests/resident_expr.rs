@@ -791,3 +791,66 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
         "numeric AND/OR => hard error (follow-on)"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_numeric_arithmetic() {
+    // numeric (i128) CHECKED add/sub arithmetic end-to-end from SQL (the type matrix, doc 19).
+    // price[i]=i.50, cost[i]=i.25 (NUMERIC(10,2)), label[i]=i. Closed-form; mul + mixed are rejected.
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,2), label INT)",
+    )
+    .unwrap();
+
+    const N: i64 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}.50, {i}.25, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // col+col add then scalar compare: price+cost = 2i+0.75; > 100 => 200i+75 > 10000 => i >= 50.
+    let added = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE price + cost > 100")
+        .expect("price+cost>100 on GPU");
+    let added_expected: Vec<Vec<SqlValue>> = (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(added.rows, added_expected, "price+cost>100 => label in [50, 600)");
+    assert_eq!(added.executed_target, DeviceTarget::Gpu(0));
+
+    // scalar sub then compare: price-5 = (i-5)+0.50; > 100 => 100i-450 > 10000 => i >= 105.
+    let subbed = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE price - 5 > 100")
+        .expect("price-5>100 on GPU");
+    let subbed_expected: Vec<Vec<SqlValue>> =
+        (105..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(subbed.rows, subbed_expected, "price-5>100 => label in [105, 600)");
+
+    // buffer-vs-buffer (arith on the left, column on the right): price+cost > price <=> cost > 0 => all.
+    let cmp_buffers = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE price + cost > price")
+        .expect("price+cost>price on GPU");
+    let all_expected: Vec<Vec<SqlValue>> = (0..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(cmp_buffers.rows, all_expected, "price+cost>price <=> cost>0 => all rows");
+
+    // REJECTIONS — hard errors, never wrong rows:
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 2 > 100")
+            .is_err(),
+        "numeric multiply => follow-on, hard error"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price + label > 100")
+            .is_err(),
+        "mixed numeric + int4 column in arithmetic => hard error"
+    );
+}

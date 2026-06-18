@@ -214,6 +214,111 @@ fn rescale_numeric_literal(literal: Decimal128, column_scale: u8) -> Result<i128
         })
 }
 
+/// The single scale shared by every numeric COLUMN in `expr`, or `None` if it mentions no numeric
+/// column (only literals). Columns of differing scales are a hard error — cross-scale numeric
+/// arithmetic (rescaling a column on the GPU) is a follow-on; this slice is same-scale add/sub.
+fn numeric_common_scale(
+    expr: &ResidentExpr,
+    table: &RelationalTable,
+) -> Result<Option<u8>, ExecuteError> {
+    match expr {
+        ResidentExpr::Column(idx) => Ok(column_numeric_scale(table, *idx)),
+        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => Ok(None),
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            let lhs_scale = numeric_common_scale(lhs, table)?;
+            let rhs_scale = numeric_common_scale(rhs, table)?;
+            match (lhs_scale, rhs_scale) {
+                (Some(a), Some(b)) if a != b => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "numeric arithmetic over columns of different scales is not supported yet \
+                     (cross-scale rescaling on the GPU is a follow-on)"
+                        .to_string(),
+                ))),
+                (Some(a), _) => Ok(Some(a)),
+                (None, other) => Ok(other),
+            }
+        }
+    }
+}
+
+/// Compile a numeric ARITHMETIC subtree (`+`/`-` only, same scale `scale`) to i128 VM steps: numeric
+/// columns load from their device offset; a literal operand folds into a `ScalarBinary` carrying its
+/// mantissa rescaled to `scale` (which must fit i32 — the larger-literal fast path is a follow-on).
+/// Multiplication is rejected (the i128*i128 kernel is a follow-on). Mirrors `compile_arith_program`.
+fn compile_numeric_arith(
+    expr: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    scale: u8,
+    program: &mut Vec<ExprStep>,
+) -> Result<(), ExecuteError> {
+    match expr {
+        ResidentExpr::Column(col) => {
+            if column_numeric_scale(table, *col) != Some(scale) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "numeric arithmetic operand has a different scale than the expression".to_string(),
+                )));
+            }
+            let byte_offset = resident_device_numeric_column_offset(snapshot, table, *col)?;
+            program.push(ExprStep::LoadColumn { byte_offset });
+            Ok(())
+        }
+        ResidentExpr::Binary { op, lhs, rhs } => {
+            let op_code = match arith_op_code(*op) {
+                Some(code @ (0 | 1)) => code, // add / sub
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "the general GPU executor supports numeric add/sub only (multiply is a \
+                         follow-on)"
+                            .to_string(),
+                    )));
+                }
+            };
+            let lhs_lit = numeric_literal_value(lhs);
+            let rhs_lit = numeric_literal_value(rhs);
+            let scalar_step = |literal: Decimal128, scalar_on_left: bool| -> Result<ExprStep, ExecuteError> {
+                let mantissa = rescale_numeric_literal(literal, scale)?;
+                let scalar = i32::try_from(mantissa).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "numeric arithmetic literal is too large for the fast path yet".to_string(),
+                    ))
+                })?;
+                Ok(ExprStep::ScalarBinary {
+                    op: op_code,
+                    scalar,
+                    scalar_on_left,
+                })
+            };
+            match (lhs_lit, rhs_lit) {
+                (None, Some(literal)) => {
+                    compile_numeric_arith(lhs, table, snapshot, scale, program)?;
+                    program.push(scalar_step(literal, false)?);
+                    Ok(())
+                }
+                (Some(literal), None) => {
+                    compile_numeric_arith(rhs, table, snapshot, scale, program)?;
+                    program.push(scalar_step(literal, true)?);
+                    Ok(())
+                }
+                (None, None) => {
+                    compile_numeric_arith(lhs, table, snapshot, scale, program)?;
+                    compile_numeric_arith(rhs, table, snapshot, scale, program)?;
+                    program.push(ExprStep::BufferBinary { op: op_code });
+                    Ok(())
+                }
+                (Some(_), Some(_)) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "the general GPU executor does not constant-fold literal-only numeric arithmetic"
+                        .to_string(),
+                ))),
+            }
+        }
+        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => {
+            Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a bare numeric literal cannot be an arithmetic value".to_string(),
+            )))
+        }
+    }
+}
+
 /// Compile an int4 arithmetic value expression into postfix [`ExprStep`] bytecode for the device
 /// VM. Recurses: a `Column` loads to a buffer; a `Binary{arith}` emits its operands then a buffer x
 /// buffer op, or folds an immediate literal operand into a buffer x scalar op (preserving operand
@@ -721,11 +826,73 @@ impl Engine {
                     .map(Some)
                     .map_err(map_err)
             }
-            _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor supports only simple numeric comparisons (column vs \
-                 literal/column); numeric arithmetic is a follow-on"
-                    .to_string(),
-            ))),
+            _ => {
+                // Numeric ARITHMETIC comparison (e.g. `price + tax > 100.00`, `100 < price - fee`):
+                // compile the arithmetic side(s) to i128 add/sub steps at the columns' common scale,
+                // then a terminal compare, and run the i128 VM. Same-scale add/sub only (this slice).
+                let scale = match (
+                    numeric_common_scale(lhs, table)?,
+                    numeric_common_scale(rhs, table)?,
+                ) {
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "numeric arithmetic over columns of different scales is not supported yet"
+                                .to_string(),
+                        )));
+                    }
+                    (Some(a), _) | (_, Some(a)) => a,
+                    (None, None) => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "the general GPU executor cannot evaluate a numeric predicate with no \
+                             numeric column"
+                                .to_string(),
+                        )));
+                    }
+                };
+                let needle = |literal: Decimal128| -> Result<i32, ExecuteError> {
+                    let mantissa = rescale_numeric_literal(literal, scale)?;
+                    i32::try_from(mantissa).map_err(|_| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "numeric comparison literal is too large for the fast path yet".to_string(),
+                        ))
+                    })
+                };
+                let mut program = Vec::new();
+                match (numeric_literal_value(lhs), numeric_literal_value(rhs)) {
+                    (Some(literal), None) => {
+                        compile_numeric_arith(rhs, table, snapshot, scale, &mut program)?;
+                        program.push(ExprStep::CompareScalar {
+                            cmp,
+                            scalar: needle(literal)?,
+                            scalar_on_left: true,
+                        });
+                    }
+                    (None, Some(literal)) => {
+                        compile_numeric_arith(lhs, table, snapshot, scale, &mut program)?;
+                        program.push(ExprStep::CompareScalar {
+                            cmp,
+                            scalar: needle(literal)?,
+                            scalar_on_left: false,
+                        });
+                    }
+                    (None, None) => {
+                        compile_numeric_arith(lhs, table, snapshot, scale, &mut program)?;
+                        compile_numeric_arith(rhs, table, snapshot, scale, &mut program)?;
+                        program.push(ExprStep::CompareBuffers { cmp });
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "the general GPU executor does not evaluate literal-only numeric \
+                             comparisons"
+                                .to_string(),
+                        )));
+                    }
+                }
+                device_memory
+                    .run_expr_predicate_filter(&program, row_count, ResidentElemType::I128)
+                    .map(Some)
+                    .map_err(map_err)
+            }
         }
     }
 
