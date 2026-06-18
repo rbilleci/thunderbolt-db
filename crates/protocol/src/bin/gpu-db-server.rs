@@ -106,6 +106,11 @@ fn bool_column(name: &str) -> Column {
 /// `SqlType` to its wire OID/size via the per-type helpers above.
 fn column_for_sql_type(ty: gpu_db_protocol::SqlType, name: &str) -> Column {
     match ty {
+        gpu_db_protocol::SqlType::Int2 => Column {
+            name: name.to_string(),
+            oid: gpu_db_protocol::SqlType::Int2.postgres_oid(),
+            type_size: gpu_db_protocol::SqlType::Int2.type_size(),
+        },
         gpu_db_protocol::SqlType::Int4 => int4_column(name),
         gpu_db_protocol::SqlType::Int8 => int8_column(name),
         gpu_db_protocol::SqlType::Numeric { .. } => numeric_column(name),
@@ -155,6 +160,13 @@ fn column_default_matches_type(value: &ColumnDefault, ty: gpu_db_protocol::SqlTy
 fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
     use gpu_db_protocol::Decimal128;
     match (left, right) {
+        // smallint widens to int4 for every comparison (PG's numeric tower); recurse widened.
+        (SqlValue::Int2(left), right) => {
+            compare_sql_values(&SqlValue::Int4(i32::from(*left)), right)
+        }
+        (left, SqlValue::Int2(right)) => {
+            compare_sql_values(left, &SqlValue::Int4(i32::from(*right)))
+        }
         (SqlValue::Int4(left), SqlValue::Int4(right)) => left.cmp(right),
         (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
         (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
@@ -732,6 +744,10 @@ fn parse_bounded_sql_function_body(
         return Err(unsupported_function_body_error());
     }
     match return_type {
+        SqlType::Int2 => literal
+            .parse::<i16>()
+            .map(SqlValue::Int2)
+            .map_err(|_| unsupported_function_body_error()),
         SqlType::Int4 => literal
             .parse::<i32>()
             .map(SqlValue::Int4)
@@ -1492,7 +1508,8 @@ fn int4_value(value: &SqlValue) -> Result<i32, ErrorField> {
 fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result<i32, ErrorField> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int8(_)
+        SqlValue::Int2(_)
+        | SqlValue::Int8(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
@@ -1548,6 +1565,7 @@ fn compare_averages(
 
 fn format_sql_value(value: &SqlValue) -> String {
     match value {
+        SqlValue::Int2(value) => value.to_string(),
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
         SqlValue::Numeric(value) => value.to_decimal_string(),
@@ -1564,6 +1582,16 @@ fn parse_materialized_row_value(
     ty: gpu_db_protocol::SqlType,
 ) -> Result<SqlValue, ErrorField> {
     match ty {
+        gpu_db_protocol::SqlType::Int2 => {
+            value
+                .parse::<i16>()
+                .map(SqlValue::Int2)
+                .map_err(|_| ErrorField {
+                    code: "22P02",
+                    message: "invalid input syntax for type smallint",
+                    position: None,
+                })
+        }
         gpu_db_protocol::SqlType::Int4 => {
             value
                 .parse::<i32>()
@@ -2729,6 +2757,7 @@ fn add_unique_constraint_to_session(
 
 fn format_default_expr(value: &SqlValue) -> String {
     match value {
+        SqlValue::Int2(value) => format!("{value}::smallint"),
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Text(value) => format!("'{}'::text", value.replace('\'', "''")),
         SqlValue::Int8(value) => value.to_string(),
@@ -15059,6 +15088,7 @@ fn compat_table_heap_size_bytes(table: &Table) -> u64 {
 
 fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
     match value {
+        SqlValue::Int2(_) => 2,
         SqlValue::Int4(_) => 4,
         SqlValue::Text(value) => value.len() as u64,
         SqlValue::Int8(_) => 8,
@@ -16520,6 +16550,7 @@ fn pg_dump_default_acl_metadata_rows(session: &Session) -> Vec<Vec<Option<String
 
 fn sql_type_alignment_code(ty: SqlType) -> &'static str {
     match ty {
+        SqlType::Int2 => "s",
         SqlType::Int4 => "i",
         SqlType::Int8 => "d",
         SqlType::Numeric { .. } => "i",
@@ -17672,6 +17703,7 @@ fn catalog_describe_attribute_rows(session: &Session, oid: u32) -> Vec<Vec<Optio
 
 fn sql_type_storage_code(ty: SqlType) -> &'static str {
     match ty {
+        SqlType::Int2 => "p",
         SqlType::Int4 => "p",
         SqlType::Int8 => "p",
         SqlType::Numeric { .. } => "m",
@@ -17685,6 +17717,7 @@ fn sql_type_storage_code(ty: SqlType) -> &'static str {
 
 fn sql_type_display_name(ty: SqlType) -> &'static str {
     match ty {
+        SqlType::Int2 => "smallint",
         SqlType::Int4 => "integer",
         SqlType::Int8 => "bigint",
         SqlType::Numeric { .. } => "numeric",
@@ -18549,6 +18582,7 @@ fn information_schema_extended_column_rows_for_catalog_table(
 
 fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>, Option<i32>) {
     match ty {
+        SqlType::Int2 => (Some(16), Some(2), Some(0)),
         SqlType::Int4 => (Some(32), Some(2), Some(0)),
         SqlType::Int8 => (Some(64), Some(2), Some(0)),
         // For NUMERIC(p,s) PostgreSQL reports the declared precision/scale in radix 10.

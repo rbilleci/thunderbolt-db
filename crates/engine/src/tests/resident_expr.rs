@@ -1550,3 +1550,92 @@ fn gpu_execute_resident_expr_select_sql_runs_uuid_comparisons() {
         "invalid uuid literal => hard error"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_int2_comparisons() {
+    // smallint comparison on the general GPU executor (the type matrix, doc 19): a `smallint` is
+    // stored WIDENED to i32 in the int4 section, so it reuses the i32 compare VM. sz[i] = i - 10
+    // (so -10..9, exercising negatives + sign extension), peer = 0, label = i.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (sz SMALLINT, peer SMALLINT, label INT)")
+        .unwrap();
+    const N: i64 = 20;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({}, 0, {i})", i - 10));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (sz, peer, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let labels = |range: std::ops::Range<i64>| -> Vec<Vec<SqlValue>> {
+        range.map(|i| vec![SqlValue::Int4(i as i32)]).collect()
+    };
+
+    // = 0 -> i-10 = 0 -> row 10
+    let eq = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE sz = 0")
+        .expect("sz = 0 on GPU");
+    assert_eq!(eq.rows, vec![vec![SqlValue::Int4(10)]], "= 0 => row 10");
+    assert_eq!(eq.executed_target, DeviceTarget::Gpu(0));
+
+    // > 0 -> [11, 20)
+    let gt = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE sz > 0")
+        .expect("sz > 0 on GPU");
+    assert_eq!(gt.rows, labels(11..N), "> 0 => [11, 20)");
+
+    // < -5 -> i < 5 -> [0, 5) (NEGATIVE literal + values -> sign extension is correct)
+    let lt = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE sz < -5")
+        .expect("sz < -5 on GPU");
+    assert_eq!(lt.rows, labels(0..5), "< -5 => [0, 5)");
+
+    // literal on the LEFT
+    let lit_left = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE 0 < sz")
+        .expect("0 < sz on GPU");
+    assert_eq!(lit_left.rows, labels(11..N), "0 < sz => [11, 20)");
+
+    // col-vs-col: sz > peer (constant 0) -> [11, 20)
+    let col_col = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE sz > peer")
+        .expect("sz > peer on GPU");
+    assert_eq!(col_col.rows, labels(11..N), "sz > peer (0) => [11, 20)");
+
+    // An out-of-int16 literal is a VALID comparison (PG widens both to int4): sz < 30000 -> all rows.
+    let wide = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE sz < 30000")
+        .expect("sz < 30000 on GPU");
+    assert_eq!(wide.rows, labels(0..N), "< 30000 (> i16::MAX) => all rows");
+
+    // projecting the SMALLINT column yields SqlValue::Int2(i16)
+    let proj = e
+        .execute_resident_expr_select_sql("SELECT sz FROM t WHERE sz = 0")
+        .expect("project smallint on GPU");
+    assert_eq!(
+        proj.rows,
+        vec![vec![SqlValue::Int2(0)]],
+        "projecting sz returns the smallint value"
+    );
+
+    // REJECTIONS -- hard errors, never wrong rows:
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE sz = 'x'")
+            .is_err(),
+        "smallint compared to a text literal => hard error"
+    );
+    // INSERT out of the int16 range is rejected ("smallint out of range").
+    assert!(
+        e.execute_text(3, "INSERT INTO t (sz, peer, label) VALUES (40000, 0, 99)")
+            .is_err(),
+        "INSERT 40000 into smallint => out of range error"
+    );
+}

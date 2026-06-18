@@ -123,7 +123,17 @@ The executor is int4 end to end; each new type extends the same four layers:
    16 bytes at lowering (dispatched before text); projection reuses the i128 projector (the raw bytes
    are the i128's LE form, recovered via `to_le_bytes`). `id = '...'`, all six comparators, literal-
    on-left, `<>`, and col-vs-col run on the GPU. Uuid `AND`/`OR`, and uuid-vs-non-uuid, hard-error.
-7. **bool** (1-byte).
+7. **int2** (smallint) — **COMPARISON DONE**: a `smallint` is i16, stored WIDENED to i32 in the int4
+   section, so it REUSES the int4 residency layout + the i32 compare VM (no new kernel). `SqlType::
+   Int2` (oid 21) + `SqlValue::Int2(i16)`. The residency builder + `resident_device_int4_column_
+   offset` accept `Int4 | Date | Int2`; `try_lower_int2_predicate` takes the `Int4Literal` as the i32
+   scalar (an out-of-int16 literal is a VALID comparison that matches no rows -- PG widens both to
+   int4 -- NOT a range error); projection narrows i32 back to i16. INSERT range-checks int4->int2
+   ("smallint out of range"). `sz = 0`, `>/<` incl. negatives, literal-on-left, and col-vs-col run on
+   the GPU. Smallint arithmetic (int16-bounds overflow) stays a hard error -- the int4 ARITH compiler
+   does not pick up int2 -- a follow-on.
+8. **bool** (1-byte) -- the bool-predicate (`WHERE flag`) needs a bool residency section + a bool->mask
+   kernel (a bool column IS the mask).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

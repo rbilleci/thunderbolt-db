@@ -349,6 +349,46 @@ fn uuid_literal_bytes(expr: &ResidentExpr) -> Result<[u8; 16], ExecuteError> {
     }
 }
 
+/// The column index if `expr` is a `Column` of `smallint` (int2) type, else `None`.
+fn int2_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
+    match expr {
+        ResidentExpr::Column(idx)
+            if table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int2) =>
+        {
+            Some(*idx)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` mentions a smallint COLUMN anywhere.
+fn expr_mentions_int2(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int2)
+        }
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_int2(lhs, table) || expr_mentions_int2(rhs, table)
+        }
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => false,
+    }
+}
+
+/// The i32 scalar a smallint compares against: an `Int4Literal` (PG promotes both sides to int4, so
+/// an out-of-int16 literal is a valid comparison that simply matches no rows -- NOT a range error).
+/// A non-integer literal is a type error -- a smallint compares only to an integer literal or column.
+fn int2_literal_value(expr: &ResidentExpr) -> Result<i32, ExecuteError> {
+    match expr {
+        ResidentExpr::Int4Literal(value) => Ok(*value),
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a smallint column compares only to an integer literal or another smallint column"
+                .to_string(),
+        ))),
+    }
+}
+
 /// Compile a SQL `LIKE` pattern to the device kernel's u32 token array: one token per output position,
 /// `(op << 8) | literal_byte`, op 0 = literal byte, 1 = any-one (`_`), 2 = any-run (`%`). The default
 /// `\` escape is resolved here (`\%` / `\_` / `\\` -> a literal byte); a lone trailing `\` is an error
@@ -900,10 +940,11 @@ impl Engine {
                 && ty != SqlType::Date
                 && ty != SqlType::Timestamp
                 && ty != SqlType::Uuid
+                && ty != SqlType::Int2
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "resident Expr select currently materializes int4 / int8 / numeric / date / \
-                     timestamp / uuid projection columns only"
+                     timestamp / uuid / int2 projection columns only"
                         .to_string(),
                 )));
             }
@@ -967,6 +1008,8 @@ impl Engine {
             Timestamp(Vec<i64>),
             // Stored as the i128 the i128 projector returns; the raw 16 uuid bytes are its LE form.
             Uuid(Vec<i128>),
+            // Stored as the widened i32s the int4 projector returns; narrowed back to i16 per row.
+            Int2(Vec<i32>),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
@@ -999,6 +1042,16 @@ impl Engine {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                         })?;
                     ProjectedColumn::Date(values)
+                }
+                SqlType::Int2 => {
+                    // Smallint rides the i32 section widened; project as i32, narrow per row below.
+                    let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_i32_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Int2(values)
                 }
                 SqlType::Timestamp => {
                     // Timestamp rides the i64 section; project it as i64 then tag it as a timestamp.
@@ -1047,6 +1100,8 @@ impl Engine {
                         ProjectedColumn::Uuid(values) => {
                             SqlValue::Uuid(values[row].to_le_bytes())
                         }
+                        // The stored i32 is a widened i16, so the narrowing is exact.
+                        ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
                     })
                     .collect()
             })
@@ -1409,6 +1464,86 @@ impl Engine {
         }
     }
 
+    /// Try to lower a SIMPLE smallint comparison (`sz <cmp> 5`, either operand order, or `sz <cmp>
+    /// sz2`) to surviving row indices via the i32 compare path (the type matrix, doc 19): a `smallint`
+    /// is stored widened to i32 in the int4 section, so it REUSES the int4 compare VM with the literal
+    /// taken as an i32 scalar. Returns None for a non-smallint predicate. Smallint `AND`/`OR` /
+    /// arithmetic (int16-bounds overflow is a follow-on), and a smallint compared to a non-integer
+    /// value, are hard errors -- never a silent mis-answer.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_int2_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        if !(expr_mentions_int2(lhs, table) || expr_mentions_int2(rhs, table)) {
+            return Ok(None);
+        }
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only simple smallint comparisons (smallint \
+                 AND/OR and arithmetic are follow-ons)"
+                    .to_string(),
+            )));
+        };
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let run = |program: &[ExprStep]| {
+            device_memory
+                .run_expr_predicate_filter(program, row_count, ResidentElemType::I32)
+                .map(Some)
+                .map_err(map_err)
+        };
+        match (int2_column_index(lhs, table), int2_column_index(rhs, table)) {
+            (Some(col), None) => {
+                let scalar = int2_literal_value(rhs)?;
+                let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+                run(&[
+                    ExprStep::LoadColumn { byte_offset },
+                    ExprStep::CompareScalar {
+                        cmp,
+                        scalar,
+                        scalar_on_left: false,
+                    },
+                ])
+            }
+            (None, Some(col)) => {
+                let scalar = int2_literal_value(lhs)?;
+                let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+                run(&[
+                    ExprStep::LoadColumn { byte_offset },
+                    ExprStep::CompareScalar {
+                        cmp,
+                        scalar,
+                        scalar_on_left: true,
+                    },
+                ])
+            }
+            (Some(a), Some(b)) => {
+                let a_offset = resident_device_int4_column_offset(snapshot, table, a)?;
+                let b_offset = resident_device_int4_column_offset(snapshot, table, b)?;
+                run(&[
+                    ExprStep::LoadColumn {
+                        byte_offset: a_offset,
+                    },
+                    ExprStep::LoadColumn {
+                        byte_offset: b_offset,
+                    },
+                    ExprStep::CompareBuffers { cmp },
+                ])
+            }
+            (None, None) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a smallint predicate must involve a smallint column".to_string(),
+            ))),
+        }
+    }
+
     /// Try to lower a SIMPLE text comparison (`textcol = 'lit'` / `textcol <> 'lit'`, either operand
     /// order) to surviving row indices via the byte-wise text-equality kernel (the type matrix, doc
     /// 19). Equality is byte identity -- PG deterministic-collation semantics. Returns None for a
@@ -1759,6 +1894,21 @@ impl Engine {
         // BEFORE the text path (the literal is a string). None for a non-uuid predicate; errors on
         // uuid AND/OR / mixed.
         if let Some(indices) = self.try_lower_uuid_predicate(
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
+            return Ok(indices);
+        }
+
+        // int2 path (type matrix, doc 19): a SIMPLE smallint comparison via the i32 compare VM
+        // (a smallint is stored widened to i32). None for a non-smallint predicate; errors on
+        // smallint AND/OR / arithmetic / a non-integer comparand.
+        if let Some(indices) = self.try_lower_int2_predicate(
             *compare,
             lhs,
             rhs,

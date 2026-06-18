@@ -16,6 +16,7 @@ pub(crate) fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
             | (SqlValue::Date(_), SqlType::Date)
             | (SqlValue::Timestamp(_), SqlType::Timestamp)
             | (SqlValue::Uuid(_), SqlType::Uuid)
+            | (SqlValue::Int2(_), SqlType::Int2)
     )
 }
 
@@ -50,6 +51,14 @@ pub(crate) fn coerce_insert_value(
     ty: SqlType,
     column_name: &str,
 ) -> Result<SqlValue, EngineError> {
+    // A smallint column accepts an integer literal (parsed as int4) narrowed to int2, range-checked
+    // (PG raises "smallint out of range" on overflow). An already-typed Int2 passes the check below.
+    if let (SqlValue::Int4(v), SqlType::Int2) = (&value, ty) {
+        return i16::try_from(*v)
+            .map(SqlValue::Int2)
+            .map_err(|_| EngineError::ApplyFailed("smallint out of range".to_string()));
+    }
+
     // A string literal assigned to a date/timestamp column is parsed as that type (PG coerces an
     // unknown-type literal to the column type). An already-typed value passes through the check below.
     if let SqlValue::Text(text) = &value {
@@ -217,6 +226,7 @@ pub(crate) fn relational_key_prefix(table: &str) -> String {
 
 pub(crate) fn relational_index_value(value: &SqlValue) -> String {
     match value {
+        SqlValue::Int2(value) => format!("i2:{value}"),
         SqlValue::Int4(value) => format!("i:{value}"),
         SqlValue::Int8(value) => format!("n:{value}"),
         // The equality value-index keys on the CANONICAL decimal (trailing zeros stripped)
@@ -281,6 +291,7 @@ pub(crate) fn render_relational_insert(insert: &Insert) -> Result<String, Engine
 
 pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, EngineError> {
     match value {
+        SqlValue::Int2(value) => Ok(value.to_string()),
         SqlValue::Int4(value) => Ok(value.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
         SqlValue::Int8(_)
@@ -298,6 +309,8 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
 
 pub(crate) fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
     match value {
+        // int2 rides the int4 device section widened to 4 bytes.
+        SqlValue::Int2(_) => 4,
         SqlValue::Int4(_) => 4,
         SqlValue::Int8(_) => 8,
         // A NUMERIC is a fixed-width i128 mantissa + u8 scale.
@@ -374,6 +387,7 @@ pub(crate) fn catalog_relation_table(
 /// the SQL-standard names here, e.g. `integer`/`bigint`, not the `pg_type` names).
 pub(crate) fn information_schema_data_type(ty: SqlType) -> &'static str {
     match ty {
+        SqlType::Int2 => "smallint",
         SqlType::Int4 => "integer",
         SqlType::Int8 => "bigint",
         SqlType::Numeric { .. } => "numeric",
@@ -659,6 +673,7 @@ pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
     values
         .iter()
         .map(|value| match value {
+            SqlValue::Int2(value) => format!("i2:{value}"),
             SqlValue::Int4(value) => format!("i:{value}"),
             SqlValue::Int8(value) => format!("n:{value}"),
             // Storage preserves the value's declared scale (`d:<mantissa>:<scale>`); the
@@ -707,6 +722,14 @@ pub(crate) fn decode_relational_value(
         )))
     };
     match column.ty {
+        SqlType::Int2 => {
+            let value = part.strip_prefix("i2:").ok_or_else(wrong_type)?;
+            value.parse::<i16>().map(SqlValue::Int2).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored SMALLINT value is invalid".to_string(),
+                ))
+            })
+        }
         SqlType::Int4 => {
             let value = part.strip_prefix("i:").ok_or_else(wrong_type)?;
             value.parse::<i32>().map(SqlValue::Int4).map_err(|_| {
@@ -811,6 +834,14 @@ pub(crate) fn split_escaped_row(input: &str) -> Vec<String> {
 
 pub(crate) fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
     match (left, right) {
+        // smallint widens to int4 for every comparison (PG's numeric tower); recurse with it widened
+        // so the existing integer/numeric cross-type arms apply -- no per-pair int2 spread.
+        (SqlValue::Int2(left), right) => {
+            compare_sql_values(&SqlValue::Int4(i32::from(*left)), right)
+        }
+        (left, SqlValue::Int2(right)) => {
+            compare_sql_values(left, &SqlValue::Int4(i32::from(*right)))
+        }
         (SqlValue::Int4(left), SqlValue::Int4(right)) => left.cmp(right),
         (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
         (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
@@ -1607,7 +1638,8 @@ pub(crate) fn int4_aggregate_value(
 ) -> Result<i32, ExecuteError> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int8(_)
+        SqlValue::Int2(_)
+        | SqlValue::Int8(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)

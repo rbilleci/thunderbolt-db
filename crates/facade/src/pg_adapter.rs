@@ -10,6 +10,7 @@ use crate::{CommandTag, DbValue, ErrorCategory, LogicalType, QueryOutcome};
 /// PostgreSQL type OID for a neutral logical type.
 pub fn logical_type_oid(ty: LogicalType) -> u32 {
     match ty {
+        LogicalType::Int2 => 21,
         LogicalType::Int4 => 23,
         LogicalType::Int8 => 20,
         LogicalType::Numeric => 1700,
@@ -24,6 +25,7 @@ pub fn logical_type_oid(ty: LogicalType) -> u32 {
 /// PostgreSQL wire type size (negative for variable-length) for a logical type.
 pub fn logical_type_size(ty: LogicalType) -> i16 {
     match ty {
+        LogicalType::Int2 => 2,
         LogicalType::Int4 => 4,
         LogicalType::Int8 => 8,
         LogicalType::Numeric => -1,
@@ -40,6 +42,7 @@ pub fn logical_type_size(ty: LogicalType) -> i16 {
 /// PostgreSQL `t`/`f` text form.
 pub fn db_value_text(value: &DbValue) -> String {
     match value {
+        DbValue::Int2(value) => value.to_string(),
         DbValue::Int4(value) => value.to_string(),
         DbValue::Int8(value) => value.to_string(),
         DbValue::Numeric(value) => value.to_decimal_string(),

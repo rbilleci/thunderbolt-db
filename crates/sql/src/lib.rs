@@ -595,6 +595,9 @@ pub enum ColumnDefault {
 /// guards and by-value passes are unaffected by the widening).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlType {
+    /// PostgreSQL `smallint` (int2) — stored widened to i32 in the int4 device section (so it reuses
+    /// the int4 compare path); arithmetic (int16-bounds overflow) is a follow-on.
+    Int2,
     Int4,
     Int8,
     /// PostgreSQL `numeric(precision, scale)` — stored as a fixed-point [`Decimal128`].
@@ -621,7 +624,8 @@ pub enum SqlType {
 pub const NUMERIC_DEFAULT_PRECISION: u8 = 38;
 pub const NUMERIC_DEFAULT_SCALE: u8 = 0;
 
-pub const SUPPORTED_SQL_TYPES: [SqlType; 8] = [
+pub const SUPPORTED_SQL_TYPES: [SqlType; 9] = [
+    SqlType::Int2,
     SqlType::Int4,
     SqlType::Int8,
     SqlType::Numeric {
@@ -638,6 +642,7 @@ pub const SUPPORTED_SQL_TYPES: [SqlType; 8] = [
 impl SqlType {
     pub const fn postgres_oid(self) -> u32 {
         match self {
+            Self::Int2 => 21,
             Self::Int4 => 23,
             Self::Int8 => 20,
             Self::Numeric { .. } => 1700,
@@ -651,6 +656,7 @@ impl SqlType {
 
     pub const fn type_size(self) -> i16 {
         match self {
+            Self::Int2 => 2,
             Self::Int4 => 4,
             Self::Int8 => 8,
             Self::Numeric { .. } => -1,
@@ -664,6 +670,7 @@ impl SqlType {
 
     pub const fn catalog_name(self) -> &'static str {
         match self {
+            Self::Int2 => "int2",
             Self::Int4 => "int4",
             Self::Int8 => "int8",
             Self::Numeric { .. } => "numeric",
@@ -1000,6 +1007,8 @@ pub enum SqlValue {
     /// A `uuid` as its 16 raw bytes. Ordering is the byte-wise (unsigned) order of `[u8; 16]`, which
     /// is how PostgreSQL compares uuids.
     Uuid([u8; 16]),
+    /// A `smallint` (int2) as i16. Widens to int4 for comparison (PG's numeric tower).
+    Int2(i16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1068,6 +1077,8 @@ pub enum CopyParseError {
     InvalidUtf8,
     #[error("COPY NULL values are not supported by the compatibility endpoint")]
     NullNotSupported,
+    #[error("invalid input syntax for type smallint")]
+    InvalidInt2,
     #[error("invalid input syntax for type integer")]
     InvalidInt4,
     #[error("invalid input syntax for type bigint")]
@@ -1099,7 +1110,8 @@ impl CopyParseError {
         match self {
             Self::InvalidUtf8 => "22021",
             Self::NullNotSupported => "0A000",
-            Self::InvalidInt4
+            Self::InvalidInt2
+            | Self::InvalidInt4
             | Self::InvalidInt8
             | Self::InvalidNumeric
             | Self::InvalidBool
@@ -1120,6 +1132,7 @@ impl CopyParseError {
             Self::NullNotSupported => {
                 "COPY NULL values are not supported by the compatibility endpoint"
             }
+            Self::InvalidInt2 => "invalid input syntax for type smallint",
             Self::InvalidInt4 => "invalid input syntax for type integer",
             Self::InvalidInt8 => "invalid input syntax for type bigint",
             Self::InvalidNumeric => "invalid input syntax for type numeric",
@@ -1385,6 +1398,10 @@ fn parse_copy_text_value(input: &str, ty: SqlType) -> Result<SqlValue, CopyParse
 /// is decoded identically.
 fn parse_copy_typed_value(text: &str, ty: SqlType) -> Result<SqlValue, CopyParseError> {
     match ty {
+        SqlType::Int2 => text
+            .parse::<i16>()
+            .map(SqlValue::Int2)
+            .map_err(|_| CopyParseError::InvalidInt2),
         SqlType::Int4 => text
             .parse::<i32>()
             .map(SqlValue::Int4)
@@ -3318,6 +3335,7 @@ fn parse_typed_column_default(
 /// expects, so it can be re-parsed at the column's declared type.
 fn render_default_literal_for_coercion(value: &SqlValue) -> String {
     match value {
+        SqlValue::Int2(value) => value.to_string(),
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
         SqlValue::Numeric(value) => value.to_decimal_string(),
@@ -5555,6 +5573,8 @@ fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
         typmod.is_none().then_some(SqlType::Int4)
     } else if base.eq_ignore_ascii_case("INT8") || base.eq_ignore_ascii_case("BIGINT") {
         typmod.is_none().then_some(SqlType::Int8)
+    } else if base.eq_ignore_ascii_case("INT2") || base.eq_ignore_ascii_case("SMALLINT") {
+        typmod.is_none().then_some(SqlType::Int2)
     } else if base.eq_ignore_ascii_case("NUMERIC") || base.eq_ignore_ascii_case("DECIMAL") {
         parse_numeric_typmod(typmod)
     } else if base.eq_ignore_ascii_case("BOOL") || base.eq_ignore_ascii_case("BOOLEAN") {
@@ -5938,6 +5958,7 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
         SqlValue::Int8(_)
+        | SqlValue::Int2(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
@@ -5954,6 +5975,7 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeOffset),
         SqlValue::Int8(_)
+        | SqlValue::Int2(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Text(_)
@@ -6211,6 +6233,10 @@ fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
 /// for a quoted literal carrying a cast). The numeric arm rounds to the column scale.
 fn parse_typed_value_from_str(text: &str, ty: SqlType) -> Result<SqlValue, ParseError> {
     match ty {
+        SqlType::Int2 => text
+            .parse::<i16>()
+            .map(SqlValue::Int2)
+            .map_err(|_| ParseError::InvalidRelationalSql),
         SqlType::Int4 => text
             .parse::<i32>()
             .map(SqlValue::Int4)

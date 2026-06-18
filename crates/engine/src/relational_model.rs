@@ -453,6 +453,10 @@ pub(crate) fn parse_bounded_sql_function_body(
         return Err(unsupported_function_body_error());
     }
     match return_type {
+        SqlType::Int2 => literal
+            .parse::<i16>()
+            .map(SqlValue::Int2)
+            .map_err(|_| unsupported_function_body_error()),
         SqlType::Int4 => literal
             .parse::<i32>()
             .map(SqlValue::Int4)
@@ -581,17 +585,17 @@ pub(crate) fn resident_device_int4_column_offset(
             "resident device-memory predicate column is outside the catalog table".to_string(),
         ))
     })?;
-    // int4 and date share the i32 section (a date is i32 days), so resolve either here.
-    if !matches!(column.ty, SqlType::Int4 | SqlType::Date) {
+    // int4, date and int2 share the i32 section (a date is i32 days; a smallint widens to i32).
+    if !matches!(column.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident device-memory predicate column is not int4/date".to_string(),
+            "resident device-memory predicate column is not int4/date/int2".to_string(),
         )));
     }
     let int4_ordinal = table
         .columns
         .iter()
         .take(column_idx)
-        .filter(|candidate| matches!(candidate.ty, SqlType::Int4 | SqlType::Date))
+        .filter(|candidate| matches!(candidate.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
         .count();
     if snapshot
         .resident_device_int4_columns

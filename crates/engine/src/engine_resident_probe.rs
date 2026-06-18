@@ -3799,7 +3799,8 @@ impl Engine {
                 // Typed (int8/numeric/bool) columns never reach a GPU-resident projection route
                 // — `resident_route_shape` rejects them upstream so they take the CPU path. Guard
                 // defensively in case a future route admits them before the kernels support them.
-                SqlType::Int8
+                SqlType::Int2
+                | SqlType::Int8
                 | SqlType::Numeric { .. }
                 | SqlType::Bool
                 | SqlType::Date
@@ -4285,7 +4286,8 @@ impl Engine {
                     }
                     // See the multi-column route above: typed columns take the CPU path; this
                     // GPU projection only handles int4/text.
-                    SqlType::Int8
+                    SqlType::Int2
+                | SqlType::Int8
                 | SqlType::Numeric { .. }
                 | SqlType::Bool
                 | SqlType::Date

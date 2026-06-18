@@ -141,6 +141,7 @@ impl EngineBackedSession {
 
 fn sql_value_text(value: &SqlValue) -> String {
     match value {
+        SqlValue::Int2(value) => value.to_string(),
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
         SqlValue::Numeric(value) => value.to_decimal_string(),
