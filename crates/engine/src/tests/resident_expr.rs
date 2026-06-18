@@ -1182,20 +1182,80 @@ fn gpu_execute_resident_expr_select_sql_runs_text_equality() {
         .expect("name = 'zzz' on GPU");
     assert!(none.rows.is_empty(), "name = 'zzz' matches nothing");
 
-    // REJECTIONS -- hard errors, never wrong rows:
+    // REJECTIONS -- hard errors, never wrong rows (LIKE is now supported; see the text_like test):
     assert!(
         e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name < 'bob'")
             .is_err(),
         "text inequality => collation-sort-key follow-on"
     );
     assert!(
-        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE 'a%'")
-            .is_err(),
-        "text LIKE => Slice B follow-on"
-    );
-    assert!(
         e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name = label")
             .is_err(),
         "mixed text/int => hard error"
     );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_text_like() {
+    // Text LIKE on the general GPU executor (the type matrix, doc 19): general %/_ backtracking match.
+    // 7 rows (ODD) -> text offsets at a 4-mod-8 byte offset. Includes the `\_` escape vs a bare `_`.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)").unwrap();
+    // "a_b" stores a literal underscore; "axb" distinguishes the `_` wildcard from the `\_` escape.
+    let names = ["alice", "alicia", "bob", "alfred", "carol", "a_b", "axb"];
+    let mut values = String::new();
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("('{n}', {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (name, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let labels = |idx: &[i32]| -> Vec<Vec<SqlValue>> {
+        idx.iter().map(|i| vec![SqlValue::Int4(*i)]).collect()
+    };
+
+    // prefix: 'al%' -> alice, alicia, alfred
+    let prefix = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE 'al%'")
+        .expect("LIKE 'al%' on GPU");
+    assert_eq!(prefix.rows, labels(&[0, 1, 3]), "LIKE 'al%' => alice/alicia/alfred");
+    assert_eq!(prefix.executed_target, DeviceTarget::Gpu(0));
+
+    // contains: '%i%' -> alice, alicia
+    let contains = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE '%i%'")
+        .expect("LIKE '%i%' on GPU");
+    assert_eq!(contains.rows, labels(&[0, 1]), "LIKE '%i%' => alice/alicia");
+
+    // single-char wildcard: 'a_b' -> a_b AND axb (the `_` matches any one char)
+    let wild = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE 'a_b'")
+        .expect("LIKE 'a_b' on GPU");
+    assert_eq!(wild.rows, labels(&[5, 6]), "LIKE 'a_b' => a_b AND axb");
+
+    // ESCAPED underscore: 'a\\_b' -> only the literal "a_b" (NOT axb)
+    let escaped = e
+        .execute_resident_expr_select_sql(r"SELECT label FROM t WHERE name LIKE 'a\_b'")
+        .expect("LIKE 'a\\_b' on GPU");
+    assert_eq!(escaped.rows, labels(&[5]), "LIKE 'a\\_b' => only the literal a_b");
+
+    // exact (no wildcards) behaves like equality
+    let exact = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE 'bob'")
+        .expect("LIKE 'bob' on GPU");
+    assert_eq!(exact.rows, labels(&[2]), "LIKE 'bob' => bob");
+
+    // '%' matches every row
+    let all = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE '%'")
+        .expect("LIKE '%' on GPU");
+    assert_eq!(all.rows, labels(&[0, 1, 2, 3, 4, 5, 6]), "LIKE '%' => all rows");
 }

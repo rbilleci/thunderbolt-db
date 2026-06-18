@@ -1200,6 +1200,26 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Surviving row indices of `text[i] LIKE pattern` over a resident TEXT column (the type matrix,
+    /// doc 19). `tokens` is the pattern compiled to the kernel ABI -- one u32 per token,
+    /// `(op << 8) | literal_byte`, op 0 = literal byte, 1 = any-one (`_`), 2 = any-run (`%`), with `\`
+    /// escapes already resolved by the caller. Matches with full UTF-8 character semantics for `_`/`%`.
+    pub fn expr_text_like_scalar_filter(
+        &self,
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        tokens: &[u32],
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_text_like_scalar_filter(
+            self,
+            offsets_byte_offset,
+            bytes_byte_offset,
+            tokens,
+            row_count,
+        )
+    }
+
     /// Surviving row indices of `a <cmp> b` over two resident numeric (i128) columns of the SAME scale
     /// (the type matrix, doc 19).
     pub fn expr_i128_compare_columns_filter(
@@ -4185,6 +4205,116 @@ fn launch_cuda_resident_text_eq_scalar_filter(
         unsafe {
             cu_launch_kernel(
                 compare_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+/// Evaluate `text[i] LIKE pattern` over a resident TEXT column to surviving row indices (the type
+/// matrix, doc 19): copy the compiled u32 token array H2D into a leased buffer, run
+/// `gpu_db_resident_text_like_scalar_to_mask` to a mask, then the shared compactor. The `tokens` host
+/// slice outlives the stream's covering sync, so the async H2D source stays valid.
+fn launch_cuda_resident_text_like_scalar_filter(
+    resident: &CudaResidentDeviceMemory,
+    offsets_byte_offset: u64,
+    bytes_byte_offset: u64,
+    tokens: &[u32],
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let token_bytes = tokens
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(tokens.len()))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let match_fn = primary.cached_function(c"gpu_db_resident_text_like_scalar_to_mask", &ptx)?;
+
+    // Token array on device (lease >= 1 byte so the pointer is valid even for the empty pattern, which
+    // the kernel never dereferences since ntok == 0).
+    let tokens_lease = primary.lease_device_buffer(token_bytes.max(1))?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = offsets_byte_offset;
+    let mut a2 = bytes_byte_offset;
+    let mut a3 = tokens_lease.ptr;
+    let mut a4 = tokens.len() as u64;
+    let mut a5 = n;
+    let mut a6 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+        (&mut a6 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        if !tokens.is_empty() {
+            let rc = unsafe {
+                htod_async(
+                    tokens_lease.ptr,
+                    tokens.as_ptr().cast::<c_void>(),
+                    token_bytes,
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        unsafe {
+            cu_launch_kernel(
+                match_fn,
                 grid,
                 1,
                 1,
@@ -17156,6 +17286,105 @@ mod tests {
             .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apples", false, N)
             .expect("text = apples");
         assert!(longer.is_empty(), "text = 'apples' (longer) matches nothing");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_text_like_scalar_matches_rows() {
+        // LIKE over a resident TEXT column (the type matrix, doc 19): the host compiles a pattern to
+        // u32 tokens (op<<8 | byte; 0=literal, 1=`_`, 2=`%`); the kernel backtracks. Differential vs a
+        // Rust byte-wise oracle over many patterns. ASCII data, so byte-`_` == char-`_`. Offsets at a
+        // 4-mod-8 offset.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // test helper: pattern -> kernel tokens (no escapes here; the engine handles `\`)
+        fn like_tokens(pattern: &str) -> Vec<u32> {
+            pattern
+                .bytes()
+                .map(|b| match b {
+                    b'%' => 2u32 << 8,
+                    b'_' => 1u32 << 8,
+                    other => u32::from(other),
+                })
+                .collect()
+        }
+        // Rust oracle: iterative byte-wise `%`/`_` backtracking match.
+        fn like_match(text: &[u8], pat: &[u8]) -> bool {
+            let (n, m) = (text.len(), pat.len());
+            let (mut s, mut p) = (0usize, 0usize);
+            let (mut star, mut sstar) = (None::<usize>, 0usize);
+            while s < n {
+                if p < m && (pat[p] == b'_' || (pat[p] != b'%' && pat[p] == text[s])) {
+                    s += 1;
+                    p += 1;
+                } else if p < m && pat[p] == b'%' {
+                    star = Some(p);
+                    sstar = s;
+                    p += 1;
+                } else if let Some(sp) = star {
+                    p = sp + 1;
+                    sstar += 1;
+                    s = sstar;
+                } else {
+                    return false;
+                }
+            }
+            while p < m && pat[p] == b'%' {
+                p += 1;
+            }
+            p == m
+        }
+
+        let rows = ["apple", "apply", "banana", "grape", "applet", "ape", ""];
+        let n = rows.len() as u64;
+        let offsets_off: u64 = 12; // 4-mod-8
+        let bytes_off: u64 = offsets_off + (n + 1) * 8;
+        let mut header = Vec::new();
+        header.extend_from_slice(&n.to_le_bytes());
+        let mut offsets = Vec::new();
+        let mut blob = Vec::new();
+        offsets.extend_from_slice(&0u64.to_le_bytes());
+        for r in rows {
+            blob.extend_from_slice(r.as_bytes());
+            offsets.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                bytes_off + blob.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: offsets_off,
+                        bytes: &offsets,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: bytes_off,
+                        bytes: &blob,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        for pattern in [
+            "app%", "%e", "a_p%", "%an%", "_____", "%", "", "apple", "xyz%", "ap_le", "%a%a%",
+            "_", "%%", "apple%", "%apple",
+        ] {
+            let tokens = like_tokens(pattern);
+            let got = resident
+                .expr_text_like_scalar_filter(offsets_off, bytes_off, &tokens, n)
+                .unwrap_or_else(|e| panic!("LIKE '{pattern}': {e:?}"));
+            let expected: Vec<u32> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| like_match(r.as_bytes(), pattern.as_bytes()))
+                .map(|(i, _)| i as u32)
+                .collect();
+            assert_eq!(got, expected, "LIKE '{pattern}' mismatch vs oracle");
+        }
     }
 
     #[test]

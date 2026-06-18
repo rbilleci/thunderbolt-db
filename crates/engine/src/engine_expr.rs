@@ -39,8 +39,6 @@ pub(crate) enum ResidentBinaryOp {
     Or,
     /// SQL `LIKE`: the lhs is a text column, the rhs a [`ResidentExpr::TextLiteral`] pattern (`%` =
     /// any run, `_` = any one character). Byte-wise / UTF-8-char-aware (the type matrix, doc 19).
-    // Constructed by the SQL->Expr text mapper, landing in the next commit (the lowering).
-    #[allow(dead_code)]
     Like,
 }
 
@@ -216,6 +214,35 @@ fn expr_mentions_text(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table)
         }
     }
+}
+
+/// Compile a SQL `LIKE` pattern to the device kernel's u32 token array: one token per output position,
+/// `(op << 8) | literal_byte`, op 0 = literal byte, 1 = any-one (`_`), 2 = any-run (`%`). The default
+/// `\` escape is resolved here (`\%` / `\_` / `\\` -> a literal byte); a lone trailing `\` is an error
+/// (PG: "LIKE pattern must not end with escape character"). A multi-byte UTF-8 literal character
+/// becomes one literal token per byte (matched byte-by-byte against the same bytes in the text).
+fn compile_like_pattern(pattern: &str) -> Result<Vec<u32>, ExecuteError> {
+    let bytes = pattern.as_bytes();
+    let mut tokens = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                if i >= bytes.len() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "LIKE pattern must not end with escape character".to_string(),
+                    )));
+                }
+                tokens.push(u32::from(bytes[i])); // op 0 (literal), the escaped byte
+            }
+            b'%' => tokens.push(2u32 << 8),
+            b'_' => tokens.push(1u32 << 8),
+            other => tokens.push(u32::from(other)),
+        }
+        i += 1;
+    }
+    Ok(tokens)
 }
 
 /// The numeric value of a literal operand: a `NumericLiteral` as-is, or an `Int4Literal` coerced to
@@ -1031,6 +1058,32 @@ impl Engine {
                     .to_string(),
             )));
         }
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        // textcol LIKE 'pattern' (the pattern is on the right; LIKE is NOT symmetric). The host
+        // compiles the pattern (resolving `\` escapes) to the kernel's u32 token array.
+        if matches!(compare, ResidentBinaryOp::Like) {
+            let (col, pattern) = match (text_column_index(lhs, table), text_literal_value(rhs)) {
+                (Some(col), Some(pattern)) => (col, pattern),
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "LIKE must be a text column LIKE a literal pattern".to_string(),
+                    )));
+                }
+            };
+            let tokens = compile_like_pattern(pattern)?;
+            let layout = resident_device_text_column_layout(snapshot, table, col)?;
+            return device_memory
+                .expr_text_like_scalar_filter(
+                    layout.offsets_byte_offset,
+                    layout.bytes_byte_offset,
+                    &tokens,
+                    row_count,
+                )
+                .map(Some)
+                .map_err(map_err);
+        }
         let negate = match compare {
             ResidentBinaryOp::Eq => false,
             ResidentBinaryOp::Ne => true,
@@ -1081,9 +1134,7 @@ impl Engine {
                 row_count,
             )
             .map(Some)
-            .map_err(|err: gpu_db_execution::CudaRuntimeProbeError| {
-                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
-            })
+            .map_err(map_err)
     }
 
     /// Try to lower a SIMPLE numeric comparison to surviving row indices via the i128 compare kernels

@@ -276,9 +276,12 @@ fn map_a_expr(
     table: &RelationalTable,
     qualifier: &str,
 ) -> Result<ResidentExpr, ExecuteError> {
-    if a_expr.kind != AExprKind::AexprOp as i32 {
+    // AEXPR_OP is a normal operator (`+ - * = <> < <= > >=`); AEXPR_LIKE is `LIKE` (operator `~~`,
+    // `!~~` for NOT LIKE). Both carry the operator token in `name` and both operands; other kinds
+    // (`IN` / `BETWEEN` / ...) are rejected.
+    if a_expr.kind != AExprKind::AexprOp as i32 && a_expr.kind != AExprKind::AexprLike as i32 {
         return Err(sql_pg_error(
-            "only normal operator predicates are supported (no IN / LIKE / BETWEEN yet)".to_string(),
+            "only operator and LIKE predicates are supported (no IN / BETWEEN yet)".to_string(),
         ));
     }
     let op = map_operator(aexpr_op_token(a_expr)?)?;
@@ -312,6 +315,8 @@ fn map_operator(token: &str) -> Result<ResidentBinaryOp, ExecuteError> {
         "<=" => ResidentBinaryOp::Le,
         ">" => ResidentBinaryOp::Gt,
         ">=" => ResidentBinaryOp::Ge,
+        // PG's `LIKE` operator (`x LIKE y` parses as `x ~~ y`). `!~~` (NOT LIKE) is a follow-on.
+        "~~" => ResidentBinaryOp::Like,
         other => {
             return Err(sql_pg_error(format!(
                 "operator \"{other}\" is not supported by the general GPU executor yet"

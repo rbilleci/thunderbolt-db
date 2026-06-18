@@ -81,15 +81,18 @@ The executor is int4 end to end; each new type extends the same four layers:
    NOTE (gotcha): PTX comments must be PURE ASCII — the runtime JIT's ptxas rejects a non-ASCII byte
    ("Unexpected non-ASCII character", INVALID_PTX 218) that the LOCAL ptxas tolerates. A guard test
    (`expr_proto_ptx_is_pure_ascii`) enforces it.
-3. **text** (offsets + byte blob, already retained in residency) — **EQUALITY DONE** (Slice A):
-   byte-wise `=` / `<>` (`name = 'alice'`) on the general executor via a per-row text-compare
-   kernel (`gpu_db_resident_text_eq_scalar_to_mask`: one thread/row reads the offsets as 2x4-byte
-   loads, byte-compares its slice to a H2D'd needle -> mask -> shared compactor). Byte-wise equality
-   is PG-exact on the default deterministic collations. Engine `try_lower_text_predicate` + the
-   SQL->Expr `Sval` -> `TextLiteral` mapping. Inequalities (need **collation sort keys**: precompute
-   on CPU, byte-compare keys on GPU), `LIKE` (Slice B: a general `%`/`_` backtracking matcher),
-   text AND/OR, text col-vs-col, and mixed text/non-type are hard errors. NEXT for text = Slice B
-   (`LIKE`), then sort-key inequalities.
+3. **text** (offsets + byte blob, already retained in residency) — **EQUALITY (Slice A) + LIKE
+   (Slice B) DONE** on the general executor. Equality: byte-wise `=` / `<>` (`name = 'alice'`) via
+   `gpu_db_resident_text_eq_scalar_to_mask` (one thread/row reads the offsets as 2x4-byte loads,
+   byte-compares its slice to a H2D'd needle -> mask -> shared compactor); PG-exact on the default
+   deterministic collations. LIKE: `name LIKE 'al%'` via `gpu_db_resident_text_like_scalar_to_mask`,
+   a per-row iterative backtracking `%`/`_` matcher where `_`/`%` advance the text by a full UTF-8
+   character (PG-correct on multi-byte); the host compiles the pattern (resolving `\` escapes) to a
+   u32 token array (`(op<<8)|byte`) H2D'd to the kernel. Engine `try_lower_text_predicate` +
+   `compile_like_pattern`; SQL->Expr `Sval`->`TextLiteral`, `AEXPR_LIKE`/`~~`->`Like`. Inequalities
+   (need **collation sort keys**: precompute on CPU, byte-compare keys on GPU), `NOT LIKE` (`!~~`),
+   text AND/OR, text col-vs-col, and mixed text/non-text are hard errors. NEXT for text = sort-key
+   inequalities (or defer); the type is otherwise usable.
 4. **bool** (1-byte).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
