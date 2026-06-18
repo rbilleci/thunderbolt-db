@@ -1580,3 +1580,267 @@ loop_bcb64:
 done_bcb64:
     ret;
 }
+
+// ---- numeric (i128) compare primitives (the type matrix, doc 19) ----
+// A numeric column is a 16-byte signed i128 mantissa per row (low u64 @ +0, high s64 @ +8),
+// little-endian, at the column's catalog scale. Signed 128-bit compare: compare the high limbs as
+// s64; on a tie, the low limbs as u64. Comparison codes 0=eq 1=lt 2=le 3=gt 4=ge 5=ne. The decimal
+// scale is reconciled on the host (the literal is rescaled to the column scale before launch), so the
+// kernel is a pure mantissa compare.
+
+// out_mask[i] = ( scalar_on_left ? (s <cmp> col[i]) : (col[i] <cmp> s) ) ? 1 : 0  over an i128 column.
+.visible .entry gpu_db_resident_i128_compare_scalar_to_mask(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 scalar_lo,
+    .param .u64 scalar_hi,
+    .param .u32 scalar_on_left,
+    .param .u32 comparison,
+    .param .u64 n,
+    .param .u64 out_mask_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %p_left;
+    .reg .pred %hi_eq;
+    .reg .pred %hi_lt;
+    .reg .pred %hi_gt;
+    .reg .pred %lo_eq;
+    .reg .pred %lo_lt;
+    .reg .pred %lo_gt;
+    .reg .pred %p_eq;
+    .reg .pred %p_lt;
+    .reg .pred %p_le;
+    .reg .pred %p_gt;
+    .reg .pred %p_ge;
+    .reg .pred %p_ne;
+    .reg .pred %tmp;
+    .reg .pred %c_eq;
+    .reg .pred %c_lt;
+    .reg .pred %c_le;
+    .reg .pred %c_gt;
+    .reg .pred %c_ge;
+    .reg .pred %c_ne;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %cmp;
+    .reg .u32 %onleft;
+    .reg .b64 %s_lo;
+    .reg .b64 %s_hi;
+    .reg .b64 %col_lo;
+    .reg .b64 %col_hi;
+    .reg .b64 %lhs_lo;
+    .reg .b64 %lhs_hi;
+    .reg .b64 %rhs_lo;
+    .reg .b64 %rhs_hi;
+    .reg .b32 %mask;
+    .reg .u64 %src;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o16;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+
+    ld.param.u64 %src, [resident_ptr];
+    ld.param.u64 %addr, [byte_offset];
+    add.u64 %src, %src, %addr;
+    ld.param.u64 %s_lo, [scalar_lo];
+    ld.param.u64 %s_hi, [scalar_hi];
+    ld.param.u32 %onleft, [scalar_on_left];
+    ld.param.u32 %cmp, [comparison];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_mask_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_ncs:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_ncs;
+    mul.lo.u64 %o16, %i, 16;
+    add.u64 %addr, %src, %o16;
+    ld.global.u64 %col_lo, [%addr];
+    ld.global.u64 %col_hi, [%addr+8];
+    setp.ne.u32 %p_left, %onleft, 0;
+    mov.b64 %lhs_lo, %col_lo;
+    mov.b64 %lhs_hi, %col_hi;
+    mov.b64 %rhs_lo, %s_lo;
+    mov.b64 %rhs_hi, %s_hi;
+    @%p_left mov.b64 %lhs_lo, %s_lo;
+    @%p_left mov.b64 %lhs_hi, %s_hi;
+    @%p_left mov.b64 %rhs_lo, %col_lo;
+    @%p_left mov.b64 %rhs_hi, %col_hi;
+    setp.eq.s64 %hi_eq, %lhs_hi, %rhs_hi;
+    setp.lt.s64 %hi_lt, %lhs_hi, %rhs_hi;
+    setp.gt.s64 %hi_gt, %lhs_hi, %rhs_hi;
+    setp.eq.u64 %lo_eq, %lhs_lo, %rhs_lo;
+    setp.lt.u64 %lo_lt, %lhs_lo, %rhs_lo;
+    setp.gt.u64 %lo_gt, %lhs_lo, %rhs_lo;
+    and.pred %p_eq, %hi_eq, %lo_eq;
+    and.pred %tmp, %hi_eq, %lo_lt;
+    or.pred %p_lt, %hi_lt, %tmp;
+    and.pred %tmp, %hi_eq, %lo_gt;
+    or.pred %p_gt, %hi_gt, %tmp;
+    not.pred %p_le, %p_gt;
+    not.pred %p_ge, %p_lt;
+    not.pred %p_ne, %p_eq;
+    setp.eq.u32 %c_eq, %cmp, 0;
+    setp.eq.u32 %c_lt, %cmp, 1;
+    setp.eq.u32 %c_le, %cmp, 2;
+    setp.eq.u32 %c_gt, %cmp, 3;
+    setp.eq.u32 %c_ge, %cmp, 4;
+    setp.eq.u32 %c_ne, %cmp, 5;
+    mov.pred %match, 0;
+    and.pred %p_eq, %p_eq, %c_eq;
+    or.pred %match, %match, %p_eq;
+    and.pred %p_lt, %p_lt, %c_lt;
+    or.pred %match, %match, %p_lt;
+    and.pred %p_le, %p_le, %c_le;
+    or.pred %match, %match, %p_le;
+    and.pred %p_gt, %p_gt, %c_gt;
+    or.pred %match, %match, %p_gt;
+    and.pred %p_ge, %p_ge, %c_ge;
+    or.pred %match, %match, %p_ge;
+    and.pred %p_ne, %p_ne, %c_ne;
+    or.pred %match, %match, %p_ne;
+    selp.b32 %mask, 1, 0, %match;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %out, %o4;
+    st.global.b32 [%addr], %mask;
+    add.u64 %i, %i, %stride;
+    bra loop_ncs;
+done_ncs:
+    ret;
+}
+
+// out_mask[i] = (a[i] <cmp> b[i]) ? 1 : 0  over two i128 columns (each at resident_ptr + its offset).
+.visible .entry gpu_db_resident_i128_compare_columns_to_mask(
+    .param .u64 resident_ptr,
+    .param .u64 a_byte_offset,
+    .param .u64 b_byte_offset,
+    .param .u32 comparison,
+    .param .u64 n,
+    .param .u64 out_mask_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %hi_eq;
+    .reg .pred %hi_lt;
+    .reg .pred %hi_gt;
+    .reg .pred %lo_eq;
+    .reg .pred %lo_lt;
+    .reg .pred %lo_gt;
+    .reg .pred %p_eq;
+    .reg .pred %p_lt;
+    .reg .pred %p_le;
+    .reg .pred %p_gt;
+    .reg .pred %p_ge;
+    .reg .pred %p_ne;
+    .reg .pred %tmp;
+    .reg .pred %c_eq;
+    .reg .pred %c_lt;
+    .reg .pred %c_le;
+    .reg .pred %c_gt;
+    .reg .pred %c_ge;
+    .reg .pred %c_ne;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %cmp;
+    .reg .b64 %a_lo;
+    .reg .b64 %a_hi;
+    .reg .b64 %b_lo;
+    .reg .b64 %b_hi;
+    .reg .b32 %mask;
+    .reg .u64 %a_src;
+    .reg .u64 %b_src;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o16;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+
+    ld.param.u64 %a_src, [resident_ptr];
+    ld.param.u64 %b_src, [resident_ptr];
+    ld.param.u64 %addr, [a_byte_offset];
+    add.u64 %a_src, %a_src, %addr;
+    ld.param.u64 %addr, [b_byte_offset];
+    add.u64 %b_src, %b_src, %addr;
+    ld.param.u32 %cmp, [comparison];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_mask_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_ncc:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_ncc;
+    mul.lo.u64 %o16, %i, 16;
+    add.u64 %addr, %a_src, %o16;
+    ld.global.u64 %a_lo, [%addr];
+    ld.global.u64 %a_hi, [%addr+8];
+    add.u64 %addr, %b_src, %o16;
+    ld.global.u64 %b_lo, [%addr];
+    ld.global.u64 %b_hi, [%addr+8];
+    setp.eq.s64 %hi_eq, %a_hi, %b_hi;
+    setp.lt.s64 %hi_lt, %a_hi, %b_hi;
+    setp.gt.s64 %hi_gt, %a_hi, %b_hi;
+    setp.eq.u64 %lo_eq, %a_lo, %b_lo;
+    setp.lt.u64 %lo_lt, %a_lo, %b_lo;
+    setp.gt.u64 %lo_gt, %a_lo, %b_lo;
+    and.pred %p_eq, %hi_eq, %lo_eq;
+    and.pred %tmp, %hi_eq, %lo_lt;
+    or.pred %p_lt, %hi_lt, %tmp;
+    and.pred %tmp, %hi_eq, %lo_gt;
+    or.pred %p_gt, %hi_gt, %tmp;
+    not.pred %p_le, %p_gt;
+    not.pred %p_ge, %p_lt;
+    not.pred %p_ne, %p_eq;
+    setp.eq.u32 %c_eq, %cmp, 0;
+    setp.eq.u32 %c_lt, %cmp, 1;
+    setp.eq.u32 %c_le, %cmp, 2;
+    setp.eq.u32 %c_gt, %cmp, 3;
+    setp.eq.u32 %c_ge, %cmp, 4;
+    setp.eq.u32 %c_ne, %cmp, 5;
+    mov.pred %match, 0;
+    and.pred %p_eq, %p_eq, %c_eq;
+    or.pred %match, %match, %p_eq;
+    and.pred %p_lt, %p_lt, %c_lt;
+    or.pred %match, %match, %p_lt;
+    and.pred %p_le, %p_le, %c_le;
+    or.pred %match, %match, %p_le;
+    and.pred %p_gt, %p_gt, %c_gt;
+    or.pred %match, %match, %p_gt;
+    and.pred %p_ge, %p_ge, %c_ge;
+    or.pred %match, %match, %p_ge;
+    and.pred %p_ne, %p_ne, %c_ne;
+    or.pred %match, %match, %p_ne;
+    selp.b32 %mask, 1, 0, %match;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %out, %o4;
+    st.global.b32 [%addr], %mask;
+    add.u64 %i, %i, %stride;
+    bra loop_ncc;
+done_ncc:
+    ret;
+}
