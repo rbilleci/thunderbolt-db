@@ -40,10 +40,18 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// tolerated. Non-ISO styles and BC/negative years are not accepted yet (a follow-on).
 pub fn parse_date(text: &str) -> Option<i32> {
     let trimmed = text.trim();
+    // Each component is ASCII digits only -- reject the leading `+`/`-` and whitespace that Rust's
+    // integer parse would otherwise accept (PG rejects `+2024-01-15`, `2024-+01-15`).
+    let component = |s: &str| -> Option<i64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
     let mut parts = trimmed.splitn(3, '-');
-    let y: i64 = parts.next()?.parse().ok()?;
-    let m: i64 = parts.next()?.parse().ok()?;
-    let d: i64 = parts.next()?.parse().ok()?;
+    let y = component(parts.next()?)?;
+    let m = component(parts.next()?)?;
+    let d = component(parts.next()?)?;
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
@@ -106,5 +114,10 @@ mod tests {
         assert_eq!(parse_date("2024-01"), None, "missing day");
         assert_eq!(parse_date("2024-01-15-extra"), None, "trailing junk");
         assert_eq!(parse_date(""), None);
+        // PG rejects a leading sign on a component (Rust's int parse would otherwise accept it).
+        assert_eq!(parse_date("+2024-01-15"), None, "leading + on the year");
+        assert_eq!(parse_date("2024-+01-15"), None, "leading + on the month");
+        assert_eq!(parse_date("2024-01-+15"), None, "leading + on the day");
+        assert_eq!(parse_date("2024- 01-15"), None, "embedded space in a component");
     }
 }
