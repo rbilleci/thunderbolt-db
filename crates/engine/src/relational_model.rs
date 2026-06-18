@@ -472,6 +472,9 @@ pub(crate) fn parse_bounded_sql_function_body(
         SqlType::Text => parse_bounded_text_literal(literal)
             .map(SqlValue::Text)
             .ok_or_else(unsupported_function_body_error),
+        SqlType::Date => gpu_db_sql::datetime::parse_date(literal)
+            .map(SqlValue::Date)
+            .ok_or_else(unsupported_function_body_error),
     }
 }
 
@@ -572,16 +575,17 @@ pub(crate) fn resident_device_int4_column_offset(
             "resident device-memory predicate column is outside the catalog table".to_string(),
         ))
     })?;
-    if column.ty != SqlType::Int4 {
+    // int4 and date share the i32 section (a date is i32 days), so resolve either here.
+    if !matches!(column.ty, SqlType::Int4 | SqlType::Date) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident device-memory predicate column is not int4".to_string(),
+            "resident device-memory predicate column is not int4/date".to_string(),
         )));
     }
     let int4_ordinal = table
         .columns
         .iter()
         .take(column_idx)
-        .filter(|candidate| candidate.ty == SqlType::Int4)
+        .filter(|candidate| matches!(candidate.ty, SqlType::Int4 | SqlType::Date))
         .count();
     if snapshot
         .resident_device_int4_columns

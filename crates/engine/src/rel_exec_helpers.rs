@@ -13,6 +13,7 @@ pub(crate) fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
             | (SqlValue::Numeric(_), SqlType::Numeric { .. })
             | (SqlValue::Bool(_), SqlType::Bool)
             | (SqlValue::Text(_), SqlType::Text)
+            | (SqlValue::Date(_), SqlType::Date)
     )
 }
 
@@ -47,6 +48,17 @@ pub(crate) fn coerce_insert_value(
     ty: SqlType,
     column_name: &str,
 ) -> Result<SqlValue, EngineError> {
+    // A string literal assigned to a date column is parsed as a date (PG coerces an unknown-type
+    // literal to the column type). An already-typed `Date` value passes through the check below.
+    if let (SqlValue::Text(text), SqlType::Date) = (&value, ty) {
+        return gpu_db_sql::datetime::parse_date(text)
+            .map(SqlValue::Date)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "invalid input syntax for type date: \"{text}\""
+                ))
+            });
+    }
     let value = widen_value_to_column_type(value, ty);
     if !sql_value_matches_type(&value, ty) {
         return Err(EngineError::ApplyFailed(format!(
@@ -191,6 +203,7 @@ pub(crate) fn relational_index_value(value: &SqlValue) -> String {
         }
         SqlValue::Bool(value) => format!("b:{}", if *value { 't' } else { 'f' }),
         SqlValue::Text(value) => format!("t:{value}"),
+        SqlValue::Date(value) => format!("date:{value}"),
     }
 }
 
@@ -243,7 +256,7 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
     match value {
         SqlValue::Int4(value) => Ok(value.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) => {
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Date(_) => {
             Err(EngineError::ApplyFailed(
                 "COPY-to-engine ingestion supports int4/text rows only".to_string(),
             ))
@@ -259,6 +272,7 @@ pub(crate) fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
         SqlValue::Numeric(_) => (std::mem::size_of::<i128>() + std::mem::size_of::<u8>()) as u64,
         SqlValue::Bool(_) => 1,
         SqlValue::Text(value) => value.len() as u64,
+        SqlValue::Date(_) => 4,
     }
 }
 
@@ -331,6 +345,7 @@ pub(crate) fn information_schema_data_type(ty: SqlType) -> &'static str {
         SqlType::Numeric { .. } => "numeric",
         SqlType::Bool => "boolean",
         SqlType::Text => "text",
+        SqlType::Date => "date",
     }
 }
 
@@ -617,6 +632,7 @@ pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
             SqlValue::Text(value) => {
                 format!("t:{}", value.replace('\\', "\\\\").replace('|', "\\|"))
             }
+            SqlValue::Date(value) => format!("date:{value}"),
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -702,6 +718,14 @@ pub(crate) fn decode_relational_value(
             let value = part.strip_prefix("t:").ok_or_else(wrong_type)?;
             Ok(SqlValue::Text(value.to_string()))
         }
+        SqlType::Date => {
+            let value = part.strip_prefix("date:").ok_or_else(wrong_type)?;
+            value.parse::<i32>().map(SqlValue::Date).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "stored DATE value is invalid".to_string(),
+                ))
+            })
+        }
     }
 }
 
@@ -766,6 +790,25 @@ pub(crate) fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering 
         (
             SqlValue::Text(_),
             SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_),
+        ) => Ordering::Greater,
+        // Date is its own tier (sorts last); same-type dates compare by day count. Cross-type
+        // date comparisons are type errors the typed engine rejects upstream.
+        (SqlValue::Date(left), SqlValue::Date(right)) => left.cmp(right),
+        (
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_),
+            SqlValue::Date(_),
+        ) => Ordering::Less,
+        (
+            SqlValue::Date(_),
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_),
         ) => Ordering::Greater,
     }
 }
@@ -1466,7 +1509,11 @@ pub(crate) fn int4_aggregate_value(
 ) -> Result<i32, ExecuteError> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Text(_) => {
+        SqlValue::Int8(_)
+        | SqlValue::Numeric(_)
+        | SqlValue::Bool(_)
+        | SqlValue::Text(_)
+        | SqlValue::Date(_) => {
             Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 aggregate_int4_error_message(aggregate).to_string(),
             )))

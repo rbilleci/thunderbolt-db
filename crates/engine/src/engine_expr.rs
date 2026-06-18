@@ -216,6 +216,50 @@ fn expr_mentions_text(expr: &ResidentExpr, table: &RelationalTable) -> bool {
     }
 }
 
+/// The column index if `expr` is a `Column` of `date` type, else `None`.
+fn date_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
+    match expr {
+        ResidentExpr::Column(idx)
+            if table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Date) =>
+        {
+            Some(*idx)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` mentions a date COLUMN anywhere. A predicate is "date" when a date column is
+/// involved; a bare string literal is the date VALUE, resolved against the column at lowering.
+fn expr_mentions_date(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Date)
+        }
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_date(lhs, table) || expr_mentions_date(rhs, table)
+        }
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => false,
+    }
+}
+
+/// The i32 day count of a date literal: a `TextLiteral` parsed as ISO `YYYY-MM-DD` (PG coerces an
+/// unknown-type string literal to the column type). Anything else (an integer literal, a non-date
+/// column) is a type error -- a date column compares only to a date literal or another date column.
+fn date_literal_days(expr: &ResidentExpr) -> Result<i32, ExecuteError> {
+    match expr {
+        ResidentExpr::TextLiteral(text) => gpu_db_sql::datetime::parse_date(text).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "invalid input syntax for type date: \"{text}\""
+            )))
+        }),
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a date column compares only to a date literal or another date column".to_string(),
+        ))),
+    }
+}
+
 /// Compile a SQL `LIKE` pattern to the device kernel's u32 token array: one token per output position,
 /// `(op << 8) | literal_byte`, op 0 = literal byte, 1 = any-one (`_`), 2 = any-run (`%`). The default
 /// `\` escape is resolved here (`\%` / `\_` / `\\` -> a literal byte); a lone trailing `\` is an error
@@ -761,10 +805,14 @@ impl Engine {
         }
         for &col in &bound.selected_indexes {
             let ty = table.columns[col].ty;
-            if ty != SqlType::Int4 && ty != SqlType::Int8 && !matches!(ty, SqlType::Numeric { .. }) {
+            if ty != SqlType::Int4
+                && ty != SqlType::Int8
+                && !matches!(ty, SqlType::Numeric { .. })
+                && ty != SqlType::Date
+            {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident Expr select currently materializes int4 / int8 / numeric projection \
-                     columns only"
+                    "resident Expr select currently materializes int4 / int8 / numeric / date \
+                     projection columns only"
                         .to_string(),
                 )));
             }
@@ -824,6 +872,7 @@ impl Engine {
             Int4(Vec<i32>),
             Int8(Vec<i64>),
             Numeric(Vec<i128>, u8),
+            Date(Vec<i32>),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
@@ -847,6 +896,16 @@ impl Engine {
                         })?;
                     ProjectedColumn::Numeric(values, scale)
                 }
+                SqlType::Date => {
+                    // Date rides the i32 section; project it as i32 then tag it as a date.
+                    let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_i32_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Date(values)
+                }
                 _ => {
                     let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
                     let values = device_memory
@@ -869,6 +928,7 @@ impl Engine {
                         ProjectedColumn::Numeric(values, scale) => {
                             SqlValue::Numeric(Decimal128::new(values[row], *scale))
                         }
+                        ProjectedColumn::Date(values) => SqlValue::Date(values[row]),
                     })
                     .collect()
             })
@@ -1024,6 +1084,86 @@ impl Engine {
         device_memory
             .run_expr_predicate_filter(&program, row_count, ResidentElemType::I128)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
+    }
+
+    /// Try to lower a SIMPLE date comparison (`datecol <cmp> 'YYYY-MM-DD'`, either operand order, or
+    /// `datecol <cmp> datecol`) to surviving row indices via the i32 compare path (the type matrix,
+    /// doc 19): a `date` is i32 days since 2000-01-01, so it reuses the int4 residency section + the
+    /// I32 VM. The string literal is coerced to a day count (`parse_date`) at lowering, like PG. Returns
+    /// None for a non-date predicate. Date `AND`/`OR` / arithmetic, and a date compared to a non-date
+    /// value, are hard errors -- never a silent mis-answer.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_date_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        if !(expr_mentions_date(lhs, table) || expr_mentions_date(rhs, table)) {
+            return Ok(None);
+        }
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only simple date comparisons (date AND/OR and \
+                 arithmetic are follow-ons)"
+                    .to_string(),
+            )));
+        };
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let run = |program: &[ExprStep]| {
+            device_memory
+                .run_expr_predicate_filter(program, row_count, ResidentElemType::I32)
+                .map(Some)
+                .map_err(map_err)
+        };
+        match (date_column_index(lhs, table), date_column_index(rhs, table)) {
+            (Some(col), None) => {
+                let days = date_literal_days(rhs)?;
+                let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+                run(&[
+                    ExprStep::LoadColumn { byte_offset },
+                    ExprStep::CompareScalar {
+                        cmp,
+                        scalar: days,
+                        scalar_on_left: false,
+                    },
+                ])
+            }
+            (None, Some(col)) => {
+                let days = date_literal_days(lhs)?;
+                let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+                run(&[
+                    ExprStep::LoadColumn { byte_offset },
+                    ExprStep::CompareScalar {
+                        cmp,
+                        scalar: days,
+                        scalar_on_left: true,
+                    },
+                ])
+            }
+            (Some(a), Some(b)) => {
+                let a_offset = resident_device_int4_column_offset(snapshot, table, a)?;
+                let b_offset = resident_device_int4_column_offset(snapshot, table, b)?;
+                run(&[
+                    ExprStep::LoadColumn {
+                        byte_offset: a_offset,
+                    },
+                    ExprStep::LoadColumn {
+                        byte_offset: b_offset,
+                    },
+                    ExprStep::CompareBuffers { cmp },
+                ])
+            }
+            (None, None) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a date predicate must involve a date column".to_string(),
+            ))),
+        }
     }
 
     /// Try to lower a SIMPLE text comparison (`textcol = 'lit'` / `textcol <> 'lit'`, either operand
@@ -1330,6 +1470,22 @@ impl Engine {
         // kernels. Returns None for a non-numeric predicate (fall through to int4); errors on a numeric
         // shape not yet supported (numeric arithmetic / AND-OR / mixed) so it never mis-answers.
         if let Some(indices) = self.try_lower_numeric_predicate(
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
+            return Ok(indices);
+        }
+
+        // date path (type matrix, doc 19): a SIMPLE date comparison (`hire_date <cmp> '2024-01-15'`)
+        // evaluates via the i32 compare path (a date is i32 days). BEFORE the text path, because the
+        // date literal is a string literal the text path would otherwise grab. None for a non-date
+        // predicate; errors on date AND/OR / arithmetic / mixed.
+        if let Some(indices) = self.try_lower_date_predicate(
             *compare,
             lhs,
             rhs,

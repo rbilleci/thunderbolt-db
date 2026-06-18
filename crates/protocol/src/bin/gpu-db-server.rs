@@ -111,6 +111,11 @@ fn column_for_sql_type(ty: gpu_db_protocol::SqlType, name: &str) -> Column {
         gpu_db_protocol::SqlType::Numeric { .. } => numeric_column(name),
         gpu_db_protocol::SqlType::Bool => bool_column(name),
         gpu_db_protocol::SqlType::Text => text_column(name),
+        gpu_db_protocol::SqlType::Date => Column {
+            name: name.to_string(),
+            oid: gpu_db_protocol::SqlType::Date.postgres_oid(),
+            type_size: gpu_db_protocol::SqlType::Date.type_size(),
+        },
     }
 }
 
@@ -172,6 +177,25 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
         (
             SqlValue::Text(_),
             SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_),
+        ) => std::cmp::Ordering::Greater,
+        // Date is its own ordering tier (it sorts after the other types); same-type dates compare by
+        // their day count. Cross-type date comparisons are type errors the engine rejects upstream.
+        (SqlValue::Date(left), SqlValue::Date(right)) => left.cmp(right),
+        (
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_),
+            SqlValue::Date(_),
+        ) => std::cmp::Ordering::Less,
+        (
+            SqlValue::Date(_),
+            SqlValue::Int4(_)
+            | SqlValue::Int8(_)
+            | SqlValue::Numeric(_)
+            | SqlValue::Bool(_)
+            | SqlValue::Text(_),
         ) => std::cmp::Ordering::Greater,
     }
 }
@@ -676,6 +700,9 @@ fn parse_bounded_sql_function_body(
         },
         SqlType::Text => parse_bounded_text_literal(literal)
             .map(SqlValue::Text)
+            .ok_or_else(unsupported_function_body_error),
+        SqlType::Date => gpu_db_protocol::datetime::parse_date(literal)
+            .map(SqlValue::Date)
             .ok_or_else(unsupported_function_body_error),
     }
 }
@@ -1407,7 +1434,11 @@ fn int4_value(value: &SqlValue) -> Result<i32, ErrorField> {
 fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result<i32, ErrorField> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Bool(_) | SqlValue::Text(_) => {
+        SqlValue::Int8(_)
+        | SqlValue::Numeric(_)
+        | SqlValue::Bool(_)
+        | SqlValue::Text(_)
+        | SqlValue::Date(_) => {
             Err(ErrorField {
                 code: "0A000",
                 message: aggregate_int4_error_message(aggregate),
@@ -1462,6 +1493,7 @@ fn format_sql_value(value: &SqlValue) -> String {
         SqlValue::Numeric(value) => value.to_decimal_string(),
         SqlValue::Bool(value) => bool_text(*value),
         SqlValue::Text(value) => value.clone(),
+        SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value),
     }
 }
 
@@ -1509,6 +1541,13 @@ fn parse_materialized_row_value(
             }),
         },
         gpu_db_protocol::SqlType::Text => Ok(SqlValue::Text(value.to_string())),
+        gpu_db_protocol::SqlType::Date => gpu_db_protocol::datetime::parse_date(value)
+            .map(SqlValue::Date)
+            .ok_or(ErrorField {
+                code: "22P02",
+                message: "invalid input syntax for type date",
+                position: None,
+            }),
     }
 }
 
@@ -2619,6 +2658,9 @@ fn format_default_expr(value: &SqlValue) -> String {
         SqlValue::Int8(value) => value.to_string(),
         SqlValue::Numeric(value) => value.to_decimal_string(),
         SqlValue::Bool(value) => bool_text(*value),
+        SqlValue::Date(value) => {
+            format!("'{}'::date", gpu_db_protocol::datetime::format_date(*value))
+        }
     }
 }
 
@@ -14942,6 +14984,8 @@ fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
         // Numeric is sent as text on this endpoint; report its rendered text length.
         SqlValue::Numeric(value) => value.to_decimal_string().len() as u64,
         SqlValue::Bool(_) => 1,
+        // Date is sent as its ISO text (YYYY-MM-DD) on this endpoint.
+        SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value).len() as u64,
     }
 }
 
@@ -16396,6 +16440,7 @@ fn sql_type_alignment_code(ty: SqlType) -> &'static str {
         SqlType::Numeric { .. } => "i",
         SqlType::Bool => "c",
         SqlType::Text => "i",
+        SqlType::Date => "i",
     }
 }
 
@@ -17545,6 +17590,7 @@ fn sql_type_storage_code(ty: SqlType) -> &'static str {
         SqlType::Numeric { .. } => "m",
         SqlType::Bool => "p",
         SqlType::Text => "x",
+        SqlType::Date => "p",
     }
 }
 
@@ -17555,6 +17601,7 @@ fn sql_type_display_name(ty: SqlType) -> &'static str {
         SqlType::Numeric { .. } => "numeric",
         SqlType::Bool => "boolean",
         SqlType::Text => "text",
+        SqlType::Date => "date",
     }
 }
 
@@ -18419,6 +18466,7 @@ fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>
         }
         SqlType::Bool => (None, None, None),
         SqlType::Text => (None, None, None),
+        SqlType::Date => (None, None, None),
     }
 }
 

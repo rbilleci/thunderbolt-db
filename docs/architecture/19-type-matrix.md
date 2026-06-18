@@ -93,7 +93,18 @@ The executor is int4 end to end; each new type extends the same four layers:
    (need **collation sort keys**: precompute on CPU, byte-compare keys on GPU), `NOT LIKE` (`!~~`),
    text AND/OR, text col-vs-col, and mixed text/non-text are hard errors. NEXT for text = sort-key
    inequalities (or defer); the type is otherwise usable.
-4. **bool** (1-byte).
+4. **date** — **COMPARISON DONE**: a `date` is i32 DAYS since 2000-01-01 (the PG epoch), so it
+   REUSES the int4 residency section + the I32 compare VM (no new kernel). `SqlType::Date` +
+   `SqlValue::Date(i32)`; a hand-rolled calendar module (`crates/sql/src/datetime.rs`, Howard
+   Hinnant `days_from_civil`/`civil_from_days`, no `chrono` dep) parses/formats ISO `YYYY-MM-DD`.
+   The residency builder + `resident_device_int4_column_offset` accept `Int4 | Date` (date columns
+   ride the i32 section in catalog order); `try_lower_date_predicate` coerces the string literal to
+   a day count (`parse_date`) at lowering and emits an I32 `CompareScalar`/`CompareBuffers`;
+   projection tags the i32 as `Date`. `hire_date = '2024-01-15'`, `> / < / <>`, literal-on-left, and
+   col-vs-col all run on the GPU. Date AND/OR / arithmetic, and date-vs-non-date, are hard errors.
+   NEXT: **timestamp** (i64 microseconds -> the int8 section + i64 VM, same pattern + time-of-day
+   parsing), then time/interval.
+5. **bool** (1-byte).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

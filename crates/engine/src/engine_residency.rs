@@ -68,10 +68,13 @@ impl Engine {
                 resident_rows.push(decoded);
             }
         }
+        // int4 AND date columns share the i32 section: a `date` is physically an i32 (days since
+        // 2000-01-01), so it rides the int4 residency layout + the i32 compare kernels (the type
+        // matrix, doc 19). The catalog type distinguishes them for lowering/projection.
         let resident_device_int4_columns = catalog_table
             .columns
             .iter()
-            .filter(|column| column.ty == SqlType::Int4)
+            .filter(|column| matches!(column.ty, SqlType::Int4 | SqlType::Date))
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let mut resident_device_int4_column_stats = resident_device_int4_columns
@@ -100,14 +103,16 @@ impl Engine {
             .columns
             .iter()
             .enumerate()
-            .filter(|(_idx, column)| column.ty == SqlType::Int4)
+            .filter(|(_idx, column)| matches!(column.ty, SqlType::Int4 | SqlType::Date))
             .map(|(idx, _column)| idx)
             .enumerate()
         {
             for row in &resident_rows {
-                let SqlValue::Int4(value) = row[column] else {
+                // A date column stores its i32 day count in this i32 section.
+                let (SqlValue::Int4(value) | SqlValue::Date(value)) = row[column] else {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident snapshot int4 payload encountered non-int4 value".to_string(),
+                        "resident snapshot int4/date payload encountered a non-i32 value"
+                            .to_string(),
                     )));
                 };
                 if let Some(stats) = resident_device_int4_column_stats.get_mut(int4_ordinal) {

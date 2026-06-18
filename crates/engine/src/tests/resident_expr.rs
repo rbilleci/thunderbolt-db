@@ -1259,3 +1259,80 @@ fn gpu_execute_resident_expr_select_sql_runs_text_like() {
         .expect("LIKE '%' on GPU");
     assert_eq!(all.rows, labels(&[0, 1, 2, 3, 4, 5, 6]), "LIKE '%' => all rows");
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_date_comparisons() {
+    // Date comparison on the general GPU executor (the type matrix, doc 19): a `date` is i32 days
+    // since 2000-01-01, reusing the int4 residency section + the I32 VM. hire_date[i] = 2024-01-(i+1),
+    // label = i. The string literal is coerced to a day count at lowering (like PG).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (hire_date DATE, label INT)")
+        .unwrap();
+    const N: i64 = 30; // 2024-01-01 .. 2024-01-30
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("('2024-01-{:02}', {i})", i + 1));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (hire_date, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let labels = |range: std::ops::Range<i64>| -> Vec<Vec<SqlValue>> {
+        range.map(|i| vec![SqlValue::Int4(i as i32)]).collect()
+    };
+
+    // = '2024-01-15' -> the day i+1 == 15 -> row 14
+    let eq = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE hire_date = '2024-01-15'")
+        .expect("hire_date = date on GPU");
+    assert_eq!(eq.rows, vec![vec![SqlValue::Int4(14)]], "= '2024-01-15' => row 14");
+    assert_eq!(eq.executed_target, DeviceTarget::Gpu(0));
+
+    // > '2024-01-15' -> [15, 30)
+    let gt = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE hire_date > '2024-01-15'")
+        .expect("hire_date > date on GPU");
+    assert_eq!(gt.rows, labels(15..N), "> '2024-01-15' => [15, 30)");
+
+    // < '2024-01-10' -> [0, 9)
+    let lt = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE hire_date < '2024-01-10'")
+        .expect("hire_date < date on GPU");
+    assert_eq!(lt.rows, labels(0..9), "< '2024-01-10' => [0, 9)");
+
+    // literal on the LEFT: '2024-01-15' < hire_date -> [15, 30)
+    let lit_left = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE '2024-01-15' < hire_date")
+        .expect("date < hire_date on GPU");
+    assert_eq!(lit_left.rows, labels(15..N), "'2024-01-15' < hire_date => [15, 30)");
+
+    // projecting the DATE column yields SqlValue::Date(days)
+    let proj = e
+        .execute_resident_expr_select_sql("SELECT hire_date FROM t WHERE hire_date = '2024-01-15'")
+        .expect("project date on GPU");
+    let days = gpu_db_sql::datetime::parse_date("2024-01-15").expect("valid date");
+    assert_eq!(
+        proj.rows,
+        vec![vec![SqlValue::Date(days)]],
+        "projecting hire_date returns the date value"
+    );
+
+    // REJECTIONS -- hard errors, never wrong rows:
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE hire_date = 5")
+            .is_err(),
+        "date compared to an integer => hard error"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE hire_date = 'not-a-date'")
+            .is_err(),
+        "invalid date literal => hard error"
+    );
+}

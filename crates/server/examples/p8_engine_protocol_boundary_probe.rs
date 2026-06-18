@@ -146,6 +146,7 @@ fn sql_value_text(value: &SqlValue) -> String {
         SqlValue::Numeric(value) => value.to_decimal_string(),
         SqlValue::Bool(value) => if *value { "t" } else { "f" }.to_string(),
         SqlValue::Text(value) => value.clone(),
+        SqlValue::Date(value) => gpu_db_protocol::datetime::format_date(*value),
     }
 }
 
