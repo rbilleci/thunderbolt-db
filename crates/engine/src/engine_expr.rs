@@ -448,71 +448,93 @@ impl Engine {
         device_memory: &CudaResidentDeviceMemory,
         row_count: u64,
     ) -> Result<Option<Vec<u32>>, ExecuteError> {
-        // Comparisons take the int8 path here; AND/OR (boolean combinators) over int8 are a later
-        // slice, so return None and let the caller decide (the int4 And/Or path or a reject).
-        let Some(cmp) = predicate_compare_code(compare) else {
-            return Ok(None);
-        };
         let lhs_int8 = int8_column_index(lhs, table);
         let rhs_int8 = int8_column_index(rhs, table);
-        // Surface the device error verbatim (e.g. int64 overflow -> "integer out of range"), matching
-        // the int4 path exactly — PG fidelity over a debugging prefix.
+        // Surface the device error verbatim (e.g. int64 overflow -> "bigint out of range"), matching
+        // the int4 path's mapping.
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
 
-        match (lhs, rhs) {
-            (ResidentExpr::Int4Literal(scalar), _) if rhs_int8.is_some() => {
-                let offset =
-                    resident_device_int8_column_offset(snapshot, table, rhs_int8.expect("checked"))?;
-                device_memory
-                    .expr_i64_compare_scalar_filter(offset, i64::from(*scalar), true, cmp, row_count)
-                    .map(Some)
-                    .map_err(map_err)
-            }
-            (_, ResidentExpr::Int4Literal(scalar)) if lhs_int8.is_some() => {
-                let offset =
-                    resident_device_int8_column_offset(snapshot, table, lhs_int8.expect("checked"))?;
-                device_memory
-                    .expr_i64_compare_scalar_filter(offset, i64::from(*scalar), false, cmp, row_count)
-                    .map(Some)
-                    .map_err(map_err)
-            }
-            _ if lhs_int8.is_some() && rhs_int8.is_some() => {
-                let a_offset =
-                    resident_device_int8_column_offset(snapshot, table, lhs_int8.expect("checked"))?;
-                let b_offset =
-                    resident_device_int8_column_offset(snapshot, table, rhs_int8.expect("checked"))?;
-                device_memory
-                    .expr_i64_compare_columns_filter(a_offset, b_offset, cmp, row_count)
-                    .map(Some)
-                    .map_err(map_err)
-            }
-            _ => {
-                // Not a simple int8 comparison. Either a pure-int4 predicate (None -> the int4 path),
-                // an int8 ARITHMETIC / deeper predicate (lower via the i64 buffer VM), or a MIXED
-                // int4/int8 expression (hard error — never silently mis-answer).
-                let mentions_int8 = expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table);
-                if !mentions_int8 {
-                    return Ok(None);
+        // The simple int8 comparison PEEPHOLE (resident-column compare kernels) — only for an actual
+        // comparison op. `predicate_compare_code` is None for AND/OR, so boolean combinators skip this
+        // and fall through to the general int8 path below (NOT the int4 path — that was the silent
+        // mis-answer the audit caught: int8 AND/OR read with the i32 4-byte stride).
+        if let Some(cmp) = predicate_compare_code(compare) {
+            match (lhs, rhs) {
+                (ResidentExpr::Int4Literal(scalar), _) if rhs_int8.is_some() => {
+                    let offset = resident_device_int8_column_offset(
+                        snapshot,
+                        table,
+                        rhs_int8.expect("checked"),
+                    )?;
+                    return device_memory
+                        .expr_i64_compare_scalar_filter(
+                            offset,
+                            i64::from(*scalar),
+                            true,
+                            cmp,
+                            row_count,
+                        )
+                        .map(Some)
+                        .map_err(map_err);
                 }
-                if expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table) {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "the general GPU executor does not support mixed int4/int8 expressions yet"
-                            .to_string(),
-                    )));
+                (_, ResidentExpr::Int4Literal(scalar)) if lhs_int8.is_some() => {
+                    let offset = resident_device_int8_column_offset(
+                        snapshot,
+                        table,
+                        lhs_int8.expect("checked"),
+                    )?;
+                    return device_memory
+                        .expr_i64_compare_scalar_filter(
+                            offset,
+                            i64::from(*scalar),
+                            false,
+                            cmp,
+                            row_count,
+                        )
+                        .map(Some)
+                        .map_err(map_err);
                 }
-                // All-int8 (int4 LITERALS are widened to i64 by the VM): compile the predicate to a
-                // mask program over i64 buffers (int8 column offsets + checked i64 arithmetic) and run
-                // the i64 VM.
-                let mut program = Vec::new();
-                compile_predicate_program(predicate, table, snapshot, &mut program)?;
-                device_memory
-                    .run_expr_predicate_filter(&program, row_count, ResidentElemType::I64)
-                    .map(Some)
-                    .map_err(map_err)
+                _ if lhs_int8.is_some() && rhs_int8.is_some() => {
+                    let a_offset = resident_device_int8_column_offset(
+                        snapshot,
+                        table,
+                        lhs_int8.expect("checked"),
+                    )?;
+                    let b_offset = resident_device_int8_column_offset(
+                        snapshot,
+                        table,
+                        rhs_int8.expect("checked"),
+                    )?;
+                    return device_memory
+                        .expr_i64_compare_columns_filter(a_offset, b_offset, cmp, row_count)
+                        .map(Some)
+                        .map_err(map_err);
+                }
+                _ => {}
             }
         }
+
+        // General int8 path: int8 ARITHMETIC / AND-OR / deeper predicates lower via the i64 buffer VM
+        // (int4 LITERALS are widened to i64). A pure-int4 predicate returns None (the int4 paths handle
+        // it); a MIXED int4/int8 expression is a hard error — never a silent mis-answer.
+        let mentions_int8 = expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table);
+        if !mentions_int8 {
+            return Ok(None);
+        }
+        if expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor does not support mixed int4/int8 expressions yet"
+                    .to_string(),
+            )));
+        }
+        let mut program = Vec::new();
+        compile_predicate_program(predicate, table, snapshot, &mut program)?;
+        device_memory
+            .run_expr_predicate_filter(&program, row_count, ResidentElemType::I64)
+            .map(Some)
+            .map_err(map_err)
     }
 
     /// Lower a predicate [`ResidentExpr`] to the surviving row indices, evaluated on the GPU.

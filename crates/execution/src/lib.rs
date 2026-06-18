@@ -2046,6 +2046,10 @@ pub enum CudaRuntimeProbeError {
     /// rule 2 PG-fidelity), never silently wrapping. GPU-native: detected on the device, no CPU
     /// fallback.
     IntegerOutOfRange,
+    /// On-device int8 arithmetic (`+`/`-`/`*`) overflowed the int64 range — same checked-on-device
+    /// model as [`Self::IntegerOutOfRange`], surfaced as PostgreSQL's `bigint out of range` (the type
+    /// matrix, doc 19; int8 differs from int4 only in the error type).
+    BigintOutOfRange,
 }
 
 impl fmt::Display for CudaRuntimeProbeError {
@@ -2063,8 +2067,9 @@ impl fmt::Display for CudaRuntimeProbeError {
                 write!(f, "unsupported comparison code for this primitive: {code}")
             }
             // Surfaced verbatim as the engine's error message, so it reads as PostgreSQL's
-            // `integer out of range` (SQLSTATE 22003) to a client.
+            // `integer out of range` / `bigint out of range` (SQLSTATE 22003) to a client.
             Self::IntegerOutOfRange => write!(f, "integer out of range"),
+            Self::BigintOutOfRange => write!(f, "bigint out of range"),
         }
     }
 }
@@ -9700,9 +9705,9 @@ fn run_resident_arith_program<'r>(
         }
     }
 
-    // Every arithmetic launch has synced; read the shared overflow flag once. Any int4-overflowing
-    // op set it, so the whole query must error like Postgres (`integer out of range`) rather than
-    // return rows computed from a silently-wrapped value.
+    // Every arithmetic launch has synced; read the shared overflow flag once. Any overflowing op set
+    // it, so the whole query must error like Postgres (int4 -> "integer out of range", int8 ->
+    // "bigint out of range") rather than return rows computed from a silently-wrapped value.
     let mut overflow = 0_u32;
     check_cuda(unsafe {
         cu_memcpy_dtoh(
@@ -9712,7 +9717,10 @@ fn run_resident_arith_program<'r>(
         )
     })?;
     if overflow != 0 {
-        return Err(CudaRuntimeProbeError::IntegerOutOfRange);
+        return Err(match elem {
+            ResidentElemType::I32 => CudaRuntimeProbeError::IntegerOutOfRange,
+            ResidentElemType::I64 => CudaRuntimeProbeError::BigintOutOfRange,
+        });
     }
 
     Ok(stack)

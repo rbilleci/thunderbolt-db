@@ -608,10 +608,10 @@ fn gpu_execute_resident_expr_select_sql_raises_int8_integer_out_of_range_on_over
     let overflow = run_int8_square_gt_zero(3_037_000_500);
     if let Some(result) = overflow {
         match result {
-            Ok(_) => panic!("a*a over a=3037000500 overflows int64 -> must raise integer out of range"),
+            Ok(_) => panic!("a*a over a=3037000500 overflows int64 -> must raise bigint out of range"),
             Err(err) => assert!(
-                err.to_string().contains("integer out of range"),
-                "expected `integer out of range`, got: {err}"
+                err.to_string().contains("bigint out of range"),
+                "int8 overflow must be PG's `bigint out of range` (not `integer`), got: {err}"
             ),
         }
     }
@@ -639,4 +639,64 @@ fn run_int8_square_gt_zero(
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     snapshot.device_memory_proof.as_ref()?;
     Some(e.execute_resident_expr_select_sql("SELECT a FROM t WHERE a * a > 0"))
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
+    // REGRESSION (the audit's P0): int8 AND/OR predicates must run on the i64 VM, NOT silently route
+    // to the i32 VM (which read int8 columns at the wrong 4-byte stride -> garbage rows). The same
+    // routing gap also bypassed the mixed-int4/int8 guard, so a mixed AND must still hard-error.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, small BIGINT, big BIGINT, big2 BIGINT)")
+        .unwrap();
+
+    const N: i64 = 600;
+    const BASE: i64 = 4_000_000_000; // > i32::MAX
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {i}, {}, {})", BASE + i, BASE + (N - 1 - i)));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, small, big, big2) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // int8 AND (i32-range literals over an int8 column): small > 200 AND small < 400 => [201, 400).
+    // The buggy i32-VM route read `small` at a 4-byte stride and returned a garbled set.
+    let and_rows = e
+        .execute_resident_expr_select_sql("SELECT small FROM t WHERE small > 200 AND small < 400")
+        .expect("int8 AND on GPU");
+    let and_expected: Vec<Vec<SqlValue>> = (201..400).map(|i| vec![SqlValue::Int8(i)]).collect();
+    assert_eq!(and_rows.rows, and_expected, "small>200 AND small<400 => [201, 400)");
+    assert_eq!(and_rows.executed_target, DeviceTarget::Gpu(0));
+
+    // int8 OR: small < 100 OR small > 500 => [0,100) U [501,600).
+    let or_rows = e
+        .execute_resident_expr_select_sql("SELECT small FROM t WHERE small < 100 OR small > 500")
+        .expect("int8 OR on GPU");
+    let mut or_expected: Vec<Vec<SqlValue>> = (0..100).map(|i| vec![SqlValue::Int8(i)]).collect();
+    or_expected.extend((501..N).map(|i| vec![SqlValue::Int8(i)]));
+    assert_eq!(or_rows.rows, or_expected, "small<100 OR small>500 => [0,100) U [501,600)");
+
+    // 64-bit AND over two int8 columns (values above i32::MAX): big > 100 AND big2 > 100 => all rows.
+    // An i32-stride read of big/big2 would NOT yield all rows, so this pins the genuine 64-bit read.
+    let big_and = e
+        .execute_resident_expr_select_sql("SELECT big FROM t WHERE big > 100 AND big2 > 100")
+        .expect("int8 64-bit AND on GPU");
+    let big_and_expected: Vec<Vec<SqlValue>> =
+        (0..N).map(|i| vec![SqlValue::Int8(BASE + i)]).collect();
+    assert_eq!(big_and.rows, big_and_expected, "big>100 AND big2>100 => all rows (64-bit)");
+
+    // MIXED int4/int8 inside AND must hard-error (the routing gap bypassed the mixed-type guard).
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT a FROM t WHERE big > 5 AND a < 3")
+            .is_err(),
+        "mixed int4/int8 AND -> hard error, not a wrong answer"
+    );
 }

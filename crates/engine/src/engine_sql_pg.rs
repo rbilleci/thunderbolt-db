@@ -4,9 +4,10 @@
 //! the engine's general `ResidentExpr` IR (`engine_expr.rs`) and executed by the general GPU executor.
 //! This is the "close the loop" path: SQL text -> general GPU execution. It deliberately does NOT
 //! extend the hand-rolled `gpu_db_sql` parser and is NOT a catalog of query shapes — coverage grows by
-//! node / type / operator (Charter rule 2). Today it binds a single-table int4 `SELECT ... WHERE`
-//! with an arithmetic/comparison/column-vs-column predicate; `AND`/`OR` and richer types/operators are
-//! the next slices. Anything the mapper cannot represent is a hard error — never a silent mis-answer.
+//! node / type / operator (Charter rule 2). Today it binds a single-table `SELECT ... WHERE` over int4
+//! and int8 columns with arithmetic (`+ - *`, checked overflow), comparisons (`= <> < <= > >=`),
+//! column-vs-column, and `AND`/`OR`; richer types (numeric/text/bool) and operators are the next
+//! slices. Anything the mapper cannot represent is a hard error — never a silent mis-answer.
 
 use super::*;
 
