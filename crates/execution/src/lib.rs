@@ -1102,6 +1102,54 @@ impl CudaResidentDeviceMemory {
         copy_cuda_resident_i32_rows(self, byte_offset, row_indices)
     }
 
+    /// int8 (s64) analog of [`Self::project_i32_rows_from_payload`] (the type matrix, doc 19): gather
+    /// the int8 column at `byte_offset` for the given row indices into host `i64` values.
+    pub fn project_i64_rows_from_payload(
+        &self,
+        byte_offset: u64,
+        row_indices: &[u64],
+    ) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+        copy_cuda_resident_i64_rows(self, byte_offset, row_indices)
+    }
+
+    /// Surviving row indices of `col <cmp> scalar` (`scalar_on_left` flips it to `scalar <cmp> col`,
+    /// for `K < big`) over a resident int8 column (the type matrix, doc 19). `comparison`
+    /// 0=eq/1=lt/2=le/3=gt/4=ge/5=ne.
+    pub fn expr_i64_compare_scalar_filter(
+        &self,
+        byte_offset: u64,
+        scalar: i64,
+        scalar_on_left: bool,
+        comparison: u32,
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i64_compare_scalar_filter(
+            self,
+            byte_offset,
+            scalar,
+            scalar_on_left,
+            comparison,
+            row_count,
+        )
+    }
+
+    /// Surviving row indices of `a <cmp> b` over two resident int8 columns (the type matrix, doc 19).
+    pub fn expr_i64_compare_columns_filter(
+        &self,
+        a_byte_offset: u64,
+        b_byte_offset: u64,
+        comparison: u32,
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i64_compare_columns_filter(
+            self,
+            a_byte_offset,
+            b_byte_offset,
+            comparison,
+            row_count,
+        )
+    }
+
     pub fn match_project_i32_equal_from_payload(
         &self,
         filters: &[(u64, i32)],
@@ -3621,6 +3669,218 @@ fn copy_cuda_resident_i32_rows(
         values.push(value);
     }
     Ok(values)
+}
+
+/// int8 (s64) analog of [`copy_cuda_resident_i32_rows`] (the type matrix, docs/architecture/19):
+/// gather the int8 column at `byte_offset` for the given device row indices into host `i64` values,
+/// 8 bytes per row. Used to materialize an int8 projection at the surviving rows.
+fn copy_cuda_resident_i64_rows(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_indices: &[u64],
+) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut values = Vec::with_capacity(row_indices.len());
+    for row_idx in row_indices {
+        let value_offset = row_idx
+            .checked_mul(std::mem::size_of::<i64>() as u64)
+            .and_then(|offset| byte_offset.checked_add(offset))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let value_end = value_offset
+            .checked_add(std::mem::size_of::<i64>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if value_end > resident.metadata().allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                value_end as usize,
+            ));
+        }
+        let mut value = 0_i64;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                (&mut value as *mut i64).cast::<c_void>(),
+                resident.device_ptr() + value_offset,
+                std::mem::size_of::<i64>(),
+            )
+        })?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// Evaluate `col <cmp> scalar` (or `scalar <cmp> col` when `scalar_on_left`) over a resident int8
+/// column to surviving row indices (the type matrix, doc 19): run
+/// `gpu_db_resident_i64_compare_scalar_to_mask` to a 0/1 mask, then compact it with the type-agnostic
+/// `gpu_db_mask_compact_to_indices`. `comparison` 0=eq/1=lt/2=le/3=gt/4=ge/5=ne; indices host-sorted.
+fn launch_cuda_resident_i64_compare_scalar_filter(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    scalar: i64,
+    scalar_on_left: bool,
+    comparison: u32,
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn =
+        primary.cached_function(c"gpu_db_resident_i64_compare_scalar_to_mask", &ptx)?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = byte_offset;
+    let mut a2 = scalar;
+    let mut a3 = u32::from(scalar_on_left);
+    let mut a4 = comparison;
+    let mut a5 = n;
+    let mut a6 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut i64).cast::<c_void>(),
+        (&mut a3 as *mut u32).cast::<c_void>(),
+        (&mut a4 as *mut u32).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+        (&mut a6 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            compare_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+/// Evaluate `a <cmp> b` over two resident int8 columns to surviving row indices (the type matrix, doc
+/// 19): `gpu_db_resident_i64_compare_columns_to_mask` to a mask, then the type-agnostic compactor.
+fn launch_cuda_resident_i64_compare_columns_filter(
+    resident: &CudaResidentDeviceMemory,
+    a_byte_offset: u64,
+    b_byte_offset: u64,
+    comparison: u32,
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn =
+        primary.cached_function(c"gpu_db_resident_i64_compare_columns_to_mask", &ptx)?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = a_byte_offset;
+    let mut a2 = b_byte_offset;
+    let mut a3 = comparison;
+    let mut a4 = n;
+    let mut a5 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u32).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            compare_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
 }
 
 fn launch_cuda_resident_i32_equal_project(
@@ -19600,5 +19860,82 @@ mod tests {
             };
             println!("| {rows} | {m} | {sum:.3} | {cnt:.3} | {min:.3} | {grp:.3} | {hav:.3} |");
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i64_compare_filters_and_projects_with_large_values() {
+        // int8 (s64) comparison + projection on the GPU (the type matrix, doc 19). All values are
+        // ABOVE i32::MAX, so a passing assert proves genuine 64-bit comparison (an int4 truncation
+        // would wrap and mis-answer). Closed-form oracle: big[i] = BASE + i, big2[i] = BASE + (n-1-i).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const ROW_COUNT: u64 = 5000;
+        const BASE: i64 = 4_000_000_000; // > i32::MAX (2_147_483_647)
+        let big_off = std::mem::size_of::<u64>() as u64;
+        let big2_off = big_off + ROW_COUNT * std::mem::size_of::<i64>() as u64;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&ROW_COUNT.to_le_bytes());
+        let mut big_bytes = Vec::new();
+        let mut big2_bytes = Vec::new();
+        for row in 0..ROW_COUNT as i64 {
+            big_bytes.extend_from_slice(&(BASE + row).to_le_bytes());
+            big2_bytes.extend_from_slice(&(BASE + (ROW_COUNT as i64 - 1 - row)).to_le_bytes());
+        }
+        let allocated_len = big2_off + big2_bytes.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: big_off,
+                        bytes: &big_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: big2_off,
+                        bytes: &big2_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // big > BASE+4000 (gt=3): BASE+i > BASE+4000 <=> i > 4000 => [4001, 5000).
+        let needle = BASE + 4000;
+        let gt = resident
+            .expr_i64_compare_scalar_filter(big_off, needle, false, 3, ROW_COUNT)
+            .expect("big > needle");
+        let gt_expected: Vec<u32> = (4001..ROW_COUNT).map(|i| i as u32).collect();
+        assert_eq!(gt, gt_expected, "big > BASE+4000 => [4001, 5000) (64-bit needle)");
+
+        // scalar_on_left: needle < big (lt=1) is the SAME set, exercising the left/right flag.
+        let flipped = resident
+            .expr_i64_compare_scalar_filter(big_off, needle, true, 1, ROW_COUNT)
+            .expect("needle < big");
+        assert_eq!(flipped, gt_expected, "needle < big == big > needle");
+
+        // col-vs-col big < big2 (lt=1): BASE+i < BASE+(4999-i) <=> 2i < 4999 => [0, 2500).
+        let lt_cols = resident
+            .expr_i64_compare_columns_filter(big_off, big2_off, 1, ROW_COUNT)
+            .expect("big < big2");
+        let lt_cols_expected: Vec<u32> = (0..2500).map(|i| i as u32).collect();
+        assert_eq!(lt_cols, lt_cols_expected, "big < big2 => [0, 2500)");
+
+        // Project big at the gt survivors: big[i] = BASE + i for i in [4001, 5000) — i64 values that
+        // do not fit i32, proving the projection is genuinely 8-byte.
+        let indices_u64: Vec<u64> = gt.iter().map(|&i| u64::from(i)).collect();
+        let projected = resident
+            .project_i64_rows_from_payload(big_off, &indices_u64)
+            .expect("project big at survivors");
+        let projected_expected: Vec<i64> = (4001..ROW_COUNT as i64).map(|i| BASE + i).collect();
+        assert_eq!(
+            projected, projected_expected,
+            "projected big == BASE + i for the survivors (i64, above i32::MAX)"
+        );
     }
 }
