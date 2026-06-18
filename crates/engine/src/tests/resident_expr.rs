@@ -911,14 +911,15 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
     let cols_expected: Vec<Vec<SqlValue>> = (10..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
     assert_eq!(cols.rows, cols_expected, "price*cost>100 => label in [10, 600)");
 
-    // REJECTIONS — hard errors, never wrong rows:
-    // a comparison whose two sides differ in scale (price*cost is scale 4, price is scale 2).
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > price")
-            .is_err(),
-        "cross-scale numeric comparison => follow-on, hard error"
-    );
-    // a mixed numeric * int4 column.
+    // cross-scale arith-vs-arith: price*cost (scale 4) > price (scale 2): rescale price up, then
+    // (100i+25) > 100 <=> i >= 1 => [1, N).
+    let cross = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > price")
+        .expect("price*cost>price (cross-scale) on GPU");
+    let cross_expected: Vec<Vec<SqlValue>> = (1..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(cross.rows, cross_expected, "price*cost > price (cross-scale) => [1, 600)");
+
+    // REJECTION — a mixed numeric * int4 column is a hard error, never wrong rows.
     assert!(
         e.execute_resident_expr_select_sql("SELECT label FROM t WHERE price * label > 100")
             .is_err(),
@@ -981,4 +982,52 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_comparisons() {
         .expect("p2>10.50 on GPU");
     let same_expected: Vec<Vec<SqlValue>> = (11..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
     assert_eq!(same.rows, same_expected, "p2>10.50 (same scale) => [11, 600)");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_add_sub() {
+    // CROSS-SCALE numeric ADD/SUB (the type matrix, doc 19): operands of different scales are rescaled
+    // UP to the common (max) scale before the buffer add/sub. p2 = i.50 (NUMERIC(10,2)), p4 = (2i).2500
+    // (NUMERIC(10,4)), label = i.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)")
+        .unwrap();
+
+    const N: i64 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}.50, {}.2500, {i})", 2 * i));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (p2, p4, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // cross-scale ADD (col+col): p2 + p4 = 3i + 0.75 (scale 4); > 100 => 3i > 99.25 => i >= 34.
+    let add = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 + p4 > 100")
+        .expect("p2+p4>100 on GPU");
+    let add_expected: Vec<Vec<SqlValue>> = (34..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(add.rows, add_expected, "p2+p4>100 (cross-scale add) => [34, 600)");
+    assert_eq!(add.executed_target, DeviceTarget::Gpu(0));
+
+    // cross-scale SUB (col-col): p4 - p2 = i - 0.25 (scale 4); > 100 => i >= 101.
+    let sub = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE p4 - p2 > 100")
+        .expect("p4-p2>100 on GPU");
+    let sub_expected: Vec<Vec<SqlValue>> = (101..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(sub.rows, sub_expected, "p4-p2>100 (cross-scale sub) => [101, 600)");
+
+    // cross-scale add with a FINER literal: p2 + 0.0001 = i.5001 (scale 4); > 50.5 => i >= 50.
+    let lit = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 + 0.0001 > 50.5")
+        .expect("p2+0.0001>50.5 on GPU");
+    let lit_expected: Vec<Vec<SqlValue>> = (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(lit.rows, lit_expected, "p2 + 0.0001 (finer literal) > 50.5 => [50, 600)");
 }

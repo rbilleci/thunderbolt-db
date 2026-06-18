@@ -244,13 +244,45 @@ fn push_numeric_rescale(from: u8, to: u8, program: &mut Vec<ExprStep>) -> Result
     Ok(())
 }
 
+/// The result scale a numeric arithmetic expression compiles to, computed WITHOUT emitting steps. The
+/// cross-scale add/sub/compare lowering needs each side's scale up front (to size the common = max
+/// scale) before the operands are pushed, since the rescale step acts on the top of the stack. Columns
+/// at their catalog scale; literals at their canonical scale; `+`/`-` -> max(operand scales); `*` ->
+/// the sum. Mirrors `compile_numeric_arith`'s scale arithmetic exactly.
+fn numeric_arith_scale(expr: &ResidentExpr, table: &RelationalTable) -> Result<u8, ExecuteError> {
+    match expr {
+        ResidentExpr::Column(col) => column_numeric_scale(table, *col).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "numeric arithmetic operand is not a numeric column".to_string(),
+            ))
+        }),
+        ResidentExpr::NumericLiteral(decimal) => Ok(decimal.canonical().scale),
+        ResidentExpr::Int4Literal(_) => Ok(0),
+        ResidentExpr::Binary { op, lhs, rhs } => {
+            let lhs_scale = numeric_arith_scale(lhs, table)?;
+            let rhs_scale = numeric_arith_scale(rhs, table)?;
+            match arith_op_code(*op) {
+                Some(2) => lhs_scale.checked_add(rhs_scale).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "numeric multiply result scale exceeds the supported range".to_string(),
+                    ))
+                }),
+                Some(0 | 1) => Ok(lhs_scale.max(rhs_scale)),
+                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "the general GPU executor supports numeric +, -, * arithmetic only".to_string(),
+                ))),
+            }
+        }
+    }
+}
+
 /// Compile a numeric ARITHMETIC subtree to i128 VM steps, RETURNING the result's scale (computed
-/// bottom-up). A `Column` loads from its device offset (scale = its catalog scale). `+`/`-` require
-/// both operands at the SAME scale (cross-scale rescaling is a follow-on) and keep it; `*` ADDS the
-/// operand scales (PG numeric multiply). A literal operand folds into a `ScalarBinary`: for `+`/`-`
-/// its mantissa rescales to the other operand's scale; for `*` its CANONICAL mantissa is the
-/// multiplier and its canonical scale adds to the result. Every scalar must fit i32 (the `ExprStep`
-/// bound; larger literals are a follow-on). Mirrors `compile_arith_program`.
+/// bottom-up). A `Column` loads from its device offset (scale = its catalog scale). `+`/`-` bring both
+/// operands to the common = max scale (rescaling the coarser UP) and keep it; `*` ADDS the operand
+/// scales (PG numeric multiply). A literal operand folds into a `ScalarBinary`: for `+`/`-` its
+/// mantissa rescales to the common scale; for `*` its CANONICAL mantissa is the multiplier and its
+/// canonical scale adds to the result. Every scalar must fit i32 (the `ExprStep` bound; larger literals
+/// are a follow-on). Mirrors `compile_arith_program`.
 fn compile_numeric_arith(
     expr: &ResidentExpr,
     table: &RelationalTable,
@@ -318,40 +350,44 @@ fn compile_numeric_arith(
                     (Some(_), Some(_)) => Err(literal_only()),
                 };
             }
-            // ADD / SUB: both operands at the same scale, which the result keeps.
+            // ADD / SUB: bring both operands to the common = max scale (rescale the COARSER side UP),
+            // then add/sub; the result keeps the common scale.
             match (lhs_lit, rhs_lit) {
                 (None, Some(literal)) => {
                     let value_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
-                    let mantissa = rescale_numeric_literal(literal, value_scale)?;
+                    let common = value_scale.max(literal.canonical().scale);
+                    push_numeric_rescale(value_scale, common, program)?;
+                    let mantissa = rescale_numeric_literal(literal, common)?;
                     program.push(ExprStep::ScalarBinary {
                         op: op_code,
                         scalar: scalar_i32(mantissa)?,
                         scalar_on_left: false,
                     });
-                    Ok(value_scale)
+                    Ok(common)
                 }
                 (Some(literal), None) => {
                     let value_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
-                    let mantissa = rescale_numeric_literal(literal, value_scale)?;
+                    let common = value_scale.max(literal.canonical().scale);
+                    push_numeric_rescale(value_scale, common, program)?;
+                    let mantissa = rescale_numeric_literal(literal, common)?;
                     program.push(ExprStep::ScalarBinary {
                         op: op_code,
                         scalar: scalar_i32(mantissa)?,
                         scalar_on_left: true,
                     });
-                    Ok(value_scale)
+                    Ok(common)
                 }
                 (None, None) => {
+                    // The common scale must be known BEFORE compiling either side (the rescale step
+                    // operates on the top of the stack), so predict each side's scale statically.
+                    let common =
+                        numeric_arith_scale(lhs, table)?.max(numeric_arith_scale(rhs, table)?);
                     let lhs_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
+                    push_numeric_rescale(lhs_scale, common, program)?;
                     let rhs_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
-                    if lhs_scale != rhs_scale {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "numeric add/sub over operands of different scales is not supported yet \
-                             (cross-scale rescaling is a follow-on)"
-                                .to_string(),
-                        )));
-                    }
+                    push_numeric_rescale(rhs_scale, common, program)?;
                     program.push(ExprStep::BufferBinary { op: op_code });
-                    Ok(lhs_scale)
+                    Ok(common)
                 }
                 (Some(_), Some(_)) => Err(literal_only()),
             }
@@ -956,31 +992,34 @@ impl Engine {
                 let mut program = Vec::new();
                 match (numeric_literal_value(lhs), numeric_literal_value(rhs)) {
                     (Some(literal), None) => {
-                        let scale = compile_numeric_arith(rhs, table, snapshot, &mut program)?;
+                        // literal <cmp> arith: bring both to the common = max scale.
+                        let arith_scale = compile_numeric_arith(rhs, table, snapshot, &mut program)?;
+                        let common = arith_scale.max(literal.canonical().scale);
+                        push_numeric_rescale(arith_scale, common, &mut program)?;
                         program.push(ExprStep::CompareScalar {
                             cmp,
-                            scalar: needle(literal, scale)?,
+                            scalar: needle(literal, common)?,
                             scalar_on_left: true,
                         });
                     }
                     (None, Some(literal)) => {
-                        let scale = compile_numeric_arith(lhs, table, snapshot, &mut program)?;
+                        let arith_scale = compile_numeric_arith(lhs, table, snapshot, &mut program)?;
+                        let common = arith_scale.max(literal.canonical().scale);
+                        push_numeric_rescale(arith_scale, common, &mut program)?;
                         program.push(ExprStep::CompareScalar {
                             cmp,
-                            scalar: needle(literal, scale)?,
+                            scalar: needle(literal, common)?,
                             scalar_on_left: false,
                         });
                     }
                     (None, None) => {
+                        // arith <cmp> arith: bring both sides to the common = max scale.
+                        let common =
+                            numeric_arith_scale(lhs, table)?.max(numeric_arith_scale(rhs, table)?);
                         let lhs_scale = compile_numeric_arith(lhs, table, snapshot, &mut program)?;
+                        push_numeric_rescale(lhs_scale, common, &mut program)?;
                         let rhs_scale = compile_numeric_arith(rhs, table, snapshot, &mut program)?;
-                        if lhs_scale != rhs_scale {
-                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                "numeric comparison requires both sides at the same scale (cross-scale \
-                                 comparison is a follow-on)"
-                                    .to_string(),
-                            )));
-                        }
+                        push_numeric_rescale(rhs_scale, common, &mut program)?;
                         program.push(ExprStep::CompareBuffers { cmp });
                     }
                     (Some(_), Some(_)) => {

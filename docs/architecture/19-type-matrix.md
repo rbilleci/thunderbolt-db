@@ -65,14 +65,15 @@ The executor is int4 end to end; each new type extends the same four layers:
    each subexpression's RESULT SCALE bottom-up: `+`/`-` keep the (equal) operand scale, `*` ADDS the
    operand scales (literal `*` adds its canonical scale); the terminal compare rescales the literal to
    that scale, and arith-vs-arith requires equal scales. The i32 `ExprStep` scalar bounds in-arith
-   literals. **CROSS-SCALE COMPARISON also DONE** (`p2 > p4`, `price > 1.555`): when the operands'
-   scales differ, load to i128 buffers and rescale the coarser side UP to the common = max scale
-   (mantissa * 10^k via the mul kernel, k <= 9; engine-only, no new kernel) before comparing; same-scale
-   stays on the resident peephole. Mixed numeric/integer, cross-scale ADD/SUB (needs static scale
-   analysis for stack order), numeric `AND`/`OR`, large in-arith literals, and >9-digit / overflowing
-   rescales are hard errors. **FIVE audits all SHIP** (compare found the alignment P0; add/sub 19k-fuzz;
-   scalar-mul 310k-fuzz; col*col-mul 45k-fuzz + scale fault-injection). NEXT: cross-scale add/sub, then
-   numeric `AND`/`OR`.
+   literals. **CROSS-SCALE is CLOSED** -- comparison AND add/sub (`p2 > p4`, `p2 + p4 > 100`,
+   `price > 1.555`): when scales differ, load to i128 buffers and rescale the coarser side UP to the
+   common = max scale (mantissa * 10^k via the mul kernel, k <= 9; engine-only, no new kernel) before
+   the op; same-scale stays on the resident peephole. `numeric_arith_scale` predicts each side's scale
+   statically (so cross-scale add/sub can rescale operands in the right stack order). Mixed
+   numeric/integer, numeric `AND`/`OR`, large in-arith literals, and >9-digit / overflowing rescales are
+   hard errors. **SIX audits all SHIP** (compare found the alignment P0; add/sub 19k-fuzz; scalar-mul
+   310k-fuzz; col*col-mul 45k-fuzz; cross-scale-compare 4.6k-fuzz + max->min fault-injection). NEXT:
+   numeric `AND`/`OR` (route numeric boolean combinators through the i128 mask VM).
 
    NOTE (gotcha): PTX comments must be PURE ASCII — the runtime JIT's ptxas rejects a non-ASCII byte
    ("Unexpected non-ASCII character", INVALID_PTX 218) that the LOCAL ptxas tolerates. A guard test
