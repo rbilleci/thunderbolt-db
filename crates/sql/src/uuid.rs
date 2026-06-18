@@ -3,39 +3,44 @@
 //! `memcmp`), which is the natural `Ord` of `[u8; 16]`. We hand-roll the hex parsing (no `uuid` crate).
 
 /// Parse a `uuid` literal to its 16 raw bytes. Accepts the canonical hyphenated form
-/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`), the bare 32-hex form, and an optional `{...}` wrapper;
-/// hyphens anywhere are ignored. Requires EXACTLY 32 hex digits. `None` otherwise -- the caller raises
-/// PG's "invalid input syntax for type uuid".
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hyphens ONLY at the 8/4/4/4/12 group boundaries), the
+/// bare 32-hex form, and an optional `{...}` wrapper. `None` otherwise -- the caller raises PG's
+/// "invalid input syntax for type uuid". Hyphens at non-canonical positions are rejected (PG rejects
+/// them too), so accepted text always corresponds to a uuid PostgreSQL would also accept.
 pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
     let trimmed = text.trim();
     let body = trimmed
         .strip_prefix('{')
         .and_then(|inner| inner.strip_suffix('}'))
         .unwrap_or(trimmed);
-    let mut bytes = [0u8; 16];
-    let mut idx = 0usize;
-    let mut high: Option<u8> = None;
-    for ch in body.chars() {
-        if ch == '-' {
-            continue;
-        }
-        let nibble = u8::try_from(ch.to_digit(16)?).ok()?;
-        match high.take() {
-            None => high = Some(nibble),
-            Some(hi) => {
-                if idx >= 16 {
-                    return None; // more than 32 hex digits
-                }
-                bytes[idx] = (hi << 4) | nibble;
-                idx += 1;
+    let raw = body.as_bytes();
+    // Collect the 32 hex digits from either the bare form or the canonical hyphenated form.
+    let hex: [u8; 32] = match raw.len() {
+        32 => raw.try_into().ok()?,
+        36 => {
+            // Hyphens must be EXACTLY at the canonical group boundaries; the five groups are hex.
+            if raw[8] != b'-' || raw[13] != b'-' || raw[18] != b'-' || raw[23] != b'-' {
+                return None;
             }
+            let mut hex = [0u8; 32];
+            let mut k = 0;
+            for &(start, end) in &[(0, 8), (9, 13), (14, 18), (19, 23), (24, 36)] {
+                for &byte in &raw[start..end] {
+                    hex[k] = byte;
+                    k += 1;
+                }
+            }
+            hex
         }
+        _ => return None,
+    };
+    let mut bytes = [0u8; 16];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        let hi = u8::try_from(char::from(hex[2 * i]).to_digit(16)?).ok()?;
+        let lo = u8::try_from(char::from(hex[2 * i + 1]).to_digit(16)?).ok()?;
+        *slot = (hi << 4) | lo;
     }
-    if idx == 16 && high.is_none() {
-        Some(bytes)
-    } else {
-        None // too few hex digits, or an odd count
-    }
+    Some(bytes)
 }
 
 /// Format 16 raw bytes as the canonical lowercase hyphenated `uuid` text PostgreSQL emits.
@@ -116,6 +121,23 @@ mod tests {
             parse_uuid("550e8400-e29b-41d4-a716-44665544000"),
             None,
             "31 hex digits"
+        );
+        // Hyphens at NON-canonical positions are rejected (PG rejects them too) -- previously
+        // over-accepted because hyphens were stripped from anywhere (the uuid audit P2).
+        assert_eq!(
+            parse_uuid("5-50e8400e29b41d4a716446655440000"),
+            None,
+            "hyphen mid-byte in an otherwise-bare form"
+        );
+        assert_eq!(
+            parse_uuid("550e8400-e29b41d4-a716-4466-55440000"),
+            None,
+            "hyphens at non-canonical group boundaries"
+        );
+        assert_eq!(
+            parse_uuid("----550e8400e29b41d4a716446655440000----"),
+            None,
+            "leading/trailing hyphens"
         );
     }
 }
