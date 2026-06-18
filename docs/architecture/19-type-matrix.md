@@ -132,8 +132,19 @@ The executor is int4 end to end; each new type extends the same four layers:
    ("smallint out of range"). `sz = 0`, `>/<` incl. negatives, literal-on-left, and col-vs-col run on
    the GPU. Smallint arithmetic (int16-bounds overflow) stays a hard error -- the int4 ARITH compiler
    does not pick up int2 -- a follow-on.
-8. **bool** (1-byte) -- the bool-predicate (`WHERE flag`) needs a bool residency section + a bool->mask
-   kernel (a bool column IS the mask).
+8. **bool** — **PREDICATE (`WHERE flag`) DONE, BIT-PACKED**: a bool column is retained as a 1-BIT-PER-ROW
+   bitmap (`ceil(N/32)` LE u32 words) — 32x denser than the i32 sections, and itself a near-ready
+   predicate mask. `gpu_db_resident_bool_to_mask` expands bit i -> the i32 row mask (with a `negate`
+   flag for the future `NOT flag` / `= false`), then the shared compactor; the word load is 4-byte
+   aligned so no fault. New self-describing residency section (`ResidentDeviceBoolColumnLayout`, stores
+   the bitmap byte offset like text) + `resident_device_bool_column_offset`. `lower_resident_predicate`
+   now accepts a BARE top-level `Column` (a bare non-bool column is invalid SQL — PG "argument of WHERE
+   must be type boolean" — so it hard-errors). NULLs are a separate validity bitmap deferred to M3
+   (the engine is non-null everywhere today), so only the value bit is stored; the layout is NULL-ready.
+   Gate: engine GPU 25/0, execution GPU 49/0 (shared-PTX no-regression). FOLLOW-ONS: bool projection
+   (`SELECT flag` — needs a bitmap-gather kernel, bits aren't byte-addressable like the other sections),
+   `flag = true`/`= false`/`NOT flag` (need a bool-literal map + NOT), and `COUNT(*) WHERE flag` via
+   popcount over the bitmap.
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

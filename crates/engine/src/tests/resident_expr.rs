@@ -1639,3 +1639,46 @@ fn gpu_execute_resident_expr_select_sql_runs_int2_comparisons() {
         "INSERT 40000 into smallint => out of range error"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_bool_predicate() {
+    // bool-predicate on the general GPU executor (the type matrix, doc 19): a bool column is a
+    // 1-bit-per-row BITMAP, so `WHERE flag` expands the bitmap straight to the row mask -- no compare.
+    // flag[i] = (i even), label = i.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, label INT)").unwrap();
+    const N: i64 = 20;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        let flag = if i % 2 == 0 { "true" } else { "false" };
+        values.push_str(&format!("({flag}, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (flag, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // WHERE flag -> the rows where flag is true (the even labels)
+    let r = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE flag")
+        .expect("WHERE flag on GPU");
+    let expected: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|i| i % 2 == 0)
+        .map(|i| vec![SqlValue::Int4(i as i32)])
+        .collect();
+    assert_eq!(r.rows, expected, "WHERE flag => the true (even) rows");
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+
+    // A bare NON-bool column predicate is invalid SQL -> hard error (never wrong rows).
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE label")
+            .is_err(),
+        "WHERE <int column> => argument-of-WHERE-must-be-boolean error"
+    );
+}

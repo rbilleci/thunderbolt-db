@@ -216,6 +216,9 @@ pub struct RelationalResidencySnapshot {
     /// per-column catalog constant (values are rescaled on insert), so only the mantissa is stored.
     /// Empty for partitioned / benchmark installs that have not adopted numeric retention yet.
     pub resident_device_numeric_columns: Vec<String>,
+    /// bool columns retained as 1-bit-per-row bitmaps (the type matrix, doc 19), in catalog order.
+    /// Self-describing: each carries its bitmap's byte offset. Empty for installs not retaining bool.
+    pub resident_device_bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
@@ -332,6 +335,17 @@ pub struct ResidentDeviceTextColumnLayout {
     pub offsets_byte_offset: u64,
     pub bytes_byte_offset: u64,
     pub bytes_len: u64,
+}
+
+/// A `bool` column retained in the device payload as a 1-bit-per-row BITMAP (the type matrix, doc 19):
+/// `ceil(row_count / 32)` little-endian u32 words, bit `i` (LSB-first within its word) = row `i`'s
+/// value. 1 bit/row -- 32x denser than the i32 sections, and a near-ready predicate mask. NULLs are a
+/// separate validity bitmap (the engine is non-null until M3), so this stores only the value bit.
+/// The section is self-describing (like text): the bitmap's byte offset is recorded at build time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentDeviceBoolColumnLayout {
+    pub name: String,
+    pub bitmap_byte_offset: u64,
 }
 
 pub struct BenchmarkRelationalResidencyChunkInstall<'a> {
@@ -628,6 +642,37 @@ pub(crate) fn resident_device_int4_column_offset(
             ))
         })?;
     Ok(offset)
+}
+
+/// Byte offset of bool column `column_idx`'s 1-bit-per-row bitmap within the retained device payload
+/// (the type matrix, doc 19). Self-describing like text: the offset was recorded at build time, so
+/// this is a lookup by column name (no section-size math). Validates the column is bool and present.
+pub(crate) fn resident_device_bool_column_offset(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    column_idx: usize,
+) -> Result<u64, ExecuteError> {
+    let column = table.columns.get(column_idx).ok_or_else(|| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is outside the catalog table".to_string(),
+        ))
+    })?;
+    if column.ty != SqlType::Bool {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is not bool".to_string(),
+        )));
+    }
+    snapshot
+        .resident_device_bool_columns
+        .iter()
+        .find(|layout| layout.name == column.name)
+        .map(|layout| layout.bitmap_byte_offset)
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident snapshot device payload has no bool column \"{}\"",
+                column.name
+            )))
+        })
 }
 
 /// Byte offset of int8 column `column_idx` within the retained device payload (the type matrix, doc

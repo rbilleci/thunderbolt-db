@@ -1260,6 +1260,19 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Surviving row indices of a `WHERE bool_col` predicate (the type matrix, doc 19): the bool
+    /// column's 1-bit-per-row bitmap at `bitmap_byte_offset` is expanded to an i32 0/1 mask (bit i ->
+    /// row i, XOR `negate` for `NOT flag` / `flag = false`), then the shared compactor selects the set
+    /// rows. The engine is non-null until M3, so this reads only the value bit (no validity bitmap).
+    pub fn expr_bool_to_mask_filter(
+        &self,
+        bitmap_byte_offset: u64,
+        negate: bool,
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_bool_to_mask_filter(self, bitmap_byte_offset, negate, row_count)
+    }
+
     /// Surviving row indices of `a <cmp> b` over two resident numeric (i128) columns of the SAME scale
     /// (the type matrix, doc 19).
     pub fn expr_i128_compare_columns_filter(
@@ -4430,6 +4443,83 @@ fn launch_cuda_resident_uuid_compare_columns_filter(
     launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
         cu_launch_kernel(
             compare_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+/// Expand a resident bool column's 1-bit-per-row bitmap to surviving row indices (the type matrix,
+/// doc 19): run the bitmap->i32-mask kernel (bit i -> row i, XOR `negate`), then the shared compactor.
+fn launch_cuda_resident_bool_to_mask_filter(
+    resident: &CudaResidentDeviceMemory,
+    bitmap_byte_offset: u64,
+    negate: bool,
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_resident_bool_to_mask", &ptx)?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = bitmap_byte_offset;
+    let mut a2 = u32::from(negate);
+    let mut a3 = n;
+    let mut a4 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u32).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            kernel_fn,
             grid,
             1,
             1,

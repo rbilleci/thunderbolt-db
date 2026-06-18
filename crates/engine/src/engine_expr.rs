@@ -1806,6 +1806,35 @@ impl Engine {
     /// intermediate device buffer, then compare-to-row-indices). Anything else is rejected with a
     /// pointer to the device bytecode VM that generalizes it — NOT by falling back to a shape method
     /// or to the CPU.
+    /// Lower a bare bool-column predicate (`WHERE flag`) to surviving row indices (the type matrix,
+    /// doc 19): the bool column's 1-bit-per-row bitmap expands directly to the row mask. A bare
+    /// non-bool column is invalid SQL (PG: "argument of WHERE must be type boolean") -> hard error.
+    fn lower_bool_column_predicate(
+        &self,
+        col: usize,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Vec<u32>, ExecuteError> {
+        let column = table.columns.get(col).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident Expr predicate column is outside the catalog table".to_string(),
+            ))
+        })?;
+        if column.ty != SqlType::Bool {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a bare column predicate is valid only for a bool column (argument of WHERE must be \
+                 type boolean)"
+                    .to_string(),
+            )));
+        }
+        let offset = resident_device_bool_column_offset(snapshot, table, col)?;
+        device_memory
+            .expr_bool_to_mask_filter(offset, false, row_count)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
+    }
+
     fn lower_resident_predicate(
         &self,
         predicate: &ResidentExpr,
@@ -1814,6 +1843,14 @@ impl Engine {
         device_memory: &CudaResidentDeviceMemory,
         row_count: u64,
     ) -> Result<Vec<u32>, ExecuteError> {
+        // bool-predicate (type matrix, doc 19): a bare `WHERE flag` is a bool COLUMN used directly as
+        // a predicate -- a bool column is a 1-bit-per-row bitmap, so it expands straight to the row
+        // mask (true rows). A bare NON-bool column is invalid SQL (PG: "argument of WHERE must be type
+        // boolean"), so it hard-errors rather than mis-answering.
+        if let ResidentExpr::Column(col) = predicate {
+            return self.lower_bool_column_predicate(*col, table, snapshot, device_memory, row_count);
+        }
+
         let ResidentExpr::Binary {
             op: compare,
             lhs,

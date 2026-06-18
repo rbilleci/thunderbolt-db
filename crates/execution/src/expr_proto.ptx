@@ -3256,3 +3256,71 @@ uuidc_after:
 done_uuidc:
     ret;
 }
+
+// out_mask[i] = (bit i of a 1-bit-per-row bool BITMAP) XOR negate, as an i32 0/1 mask (the type
+// matrix, doc 19). The bitmap is LE u32 words at resident_ptr + bitmap_byte_offset; bit i is bit
+// (i & 31) of word (i >> 5). negate flips it (for NOT flag / flag = false). The word load is 4-byte
+// aligned (the bool section starts 4-aligned and words are 4 bytes), so no misaligned-access fault.
+.visible .entry gpu_db_resident_bool_to_mask(
+    .param .u64 resident_ptr,
+    .param .u64 bitmap_byte_offset,
+    .param .u32 negate,
+    .param .u64 n,
+    .param .u64 out_mask_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %neg;
+    .reg .u32 %word;
+    .reg .u32 %bitpos;
+    .reg .u32 %bit;
+    .reg .u64 %base;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %widx;
+    .reg .u64 %woff;
+    .reg .u64 %addr;
+    .reg .u64 %o4;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %addr, [bitmap_byte_offset];
+    add.u64 %base, %base, %addr;
+    ld.param.u32 %neg, [negate];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_mask_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_bool:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_bool;
+    shr.u64 %widx, %i, 5;
+    mul.lo.u64 %woff, %widx, 4;
+    add.u64 %addr, %base, %woff;
+    ld.global.u32 %word, [%addr];
+    cvt.u32.u64 %t32, %i;
+    and.b32 %bitpos, %t32, 31;
+    shr.u32 %bit, %word, %bitpos;
+    and.b32 %bit, %bit, 1;
+    setp.ne.u32 %p, %neg, 0;
+    @%p xor.b32 %bit, %bit, 1;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %out, %o4;
+    st.global.b32 [%addr], %bit;
+    add.u64 %i, %i, %stride;
+    bra loop_bool;
+done_bool:
+    ret;
+}

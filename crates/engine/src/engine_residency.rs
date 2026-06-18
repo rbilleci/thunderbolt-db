@@ -105,6 +105,7 @@ impl Engine {
             .collect::<Vec<_>>();
         let mut device_payload = vec![0; std::mem::size_of::<u64>()];
         let mut resident_device_text_columns = Vec::new();
+        let mut resident_device_bool_columns = Vec::new();
         for (int4_ordinal, column) in catalog_table
             .columns
             .iter()
@@ -178,6 +179,36 @@ impl Engine {
                 }
             }
         }
+        // bool section (the type matrix, doc 19): each bool column packed as a 1-bit-per-row bitmap --
+        // ceil(row_count / 32) LE u32 words, bit i (LSB-first) = row i's value. Self-describing: the
+        // bitmap's byte offset is recorded per column. NULLs are a future validity bitmap (non-null
+        // until M3), so only the value bit is stored. Placed before the text section.
+        for (column_idx, column) in catalog_table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_idx, column)| column.ty == SqlType::Bool)
+        {
+            let bitmap_byte_offset = device_payload.len() as u64;
+            let mut words = vec![0u32; row_count.div_ceil(32)];
+            for (i, row) in resident_rows.iter().enumerate() {
+                let SqlValue::Bool(value) = row[column_idx] else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot bool payload encountered a non-bool value".to_string(),
+                    )));
+                };
+                if value {
+                    words[i / 32] |= 1u32 << (i % 32);
+                }
+            }
+            for word in &words {
+                device_payload.extend_from_slice(&word.to_le_bytes());
+            }
+            resident_device_bool_columns.push(ResidentDeviceBoolColumnLayout {
+                name: column.name.clone(),
+                bitmap_byte_offset,
+            });
+        }
         for (column_idx, column) in catalog_table
             .columns
             .iter()
@@ -239,6 +270,7 @@ impl Engine {
             resident_device_int4_column_stats,
             resident_device_int8_columns,
             resident_device_numeric_columns,
+            resident_device_bool_columns,
             resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
@@ -516,6 +548,7 @@ impl Engine {
             // general executor reads int8 only from the standard populate path).
             resident_device_int8_columns: Vec::new(),
             resident_device_numeric_columns: Vec::new(),
+            resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
@@ -636,6 +669,7 @@ impl Engine {
             // general executor reads int8 only from the standard populate path).
             resident_device_int8_columns: Vec::new(),
             resident_device_numeric_columns: Vec::new(),
+            resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
