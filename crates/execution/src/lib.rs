@@ -2097,6 +2097,9 @@ pub enum CudaRuntimeProbeError {
     /// model as [`Self::IntegerOutOfRange`], surfaced as PostgreSQL's `bigint out of range` (the type
     /// matrix, doc 19; int8 differs from int4 only in the error type).
     BigintOutOfRange,
+    /// On-device int128 (NUMERIC) arithmetic overflowed the i128 mantissa range — same checked model,
+    /// surfaced as PostgreSQL's `numeric field overflow` (the type matrix, doc 19).
+    NumericFieldOverflow,
 }
 
 impl fmt::Display for CudaRuntimeProbeError {
@@ -2117,6 +2120,7 @@ impl fmt::Display for CudaRuntimeProbeError {
             // `integer out of range` / `bigint out of range` (SQLSTATE 22003) to a client.
             Self::IntegerOutOfRange => write!(f, "integer out of range"),
             Self::BigintOutOfRange => write!(f, "bigint out of range"),
+            Self::NumericFieldOverflow => write!(f, "numeric field overflow"),
         }
     }
 }
@@ -9648,13 +9652,14 @@ fn compact_buffers_i32_compare_to_indices(
 /// returned leases borrow `resident`; the caller consumes the stack (one value for a scalar compare,
 /// two for a buffer-vs-buffer compare). Callers handle `n == 0` before calling.
 /// The element type of a resident arithmetic VM program (the type matrix, doc 19): int4 buffers
-/// (s32, 4 bytes) or int8 buffers (s64, 8 bytes). A program is mono-typed; the VM selects per-step
-/// kernels + intermediate-buffer sizes by this. The mask AND/OR + mask->indices compaction stages are
-/// type-agnostic (they operate on i32 0/1 masks) and are shared across element types.
+/// (s32, 4 bytes), int8 buffers (s64, 8 bytes), or numeric buffers (i128, 16 bytes). A program is
+/// mono-typed; the VM selects per-step kernels + intermediate-buffer sizes by this. The mask AND/OR +
+/// mask->indices compaction stages are type-agnostic (they operate on i32 0/1 masks) and are shared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidentElemType {
     I32,
     I64,
+    I128,
 }
 
 impl ResidentElemType {
@@ -9662,6 +9667,7 @@ impl ResidentElemType {
         match self {
             Self::I32 => std::mem::size_of::<i32>(),
             Self::I64 => std::mem::size_of::<i64>(),
+            Self::I128 => std::mem::size_of::<i128>(),
         }
     }
 }
@@ -9735,6 +9741,13 @@ fn run_resident_arith_program<'r>(
             c"gpu_db_buffer_i64_binary_scalar",
             c"gpu_db_buffer_i64_compare_scalar_to_mask",
             c"gpu_db_buffer_i64_compare_buffers_to_mask",
+        ),
+        ResidentElemType::I128 => (
+            c"gpu_db_resident_i128_load_column",
+            c"gpu_db_buffer_i128_binary",
+            c"gpu_db_buffer_i128_binary_scalar",
+            c"gpu_db_buffer_i128_compare_scalar_to_mask",
+            c"gpu_db_buffer_i128_compare_buffers_to_mask",
         ),
     };
     let load_fn = primary.cached_function(load_name, &ptx)?;
@@ -9840,8 +9853,9 @@ fn run_resident_arith_program<'r>(
                 let mut a4 = n;
                 let mut a5 = out.ptr;
                 let mut a6 = overflow_buf.ptr;
-                // The scalar param is s32 (int4 kernel) or s64 (int8 kernel); the i32 ExprStep literal
-                // widens to i64 for int8 (PG's int4->int8 coercion).
+                // The scalar param is s32 (int4 kernel), s64 (int8 kernel), or two u64 limbs (the
+                // numeric i128 kernel). The i32 ExprStep literal widens to the element type (PG's
+                // int4->int8 / int4->numeric coercion).
                 match elem {
                     ResidentElemType::I32 => {
                         let mut a1 = scalar;
@@ -9861,6 +9875,22 @@ fn run_resident_arith_program<'r>(
                         let mut args = [
                             (&mut a0 as *mut u64).cast::<c_void>(),
                             (&mut a1 as *mut i64).cast::<c_void>(),
+                            (&mut a2 as *mut u32).cast::<c_void>(),
+                            (&mut a3 as *mut u32).cast::<c_void>(),
+                            (&mut a4 as *mut u64).cast::<c_void>(),
+                            (&mut a5 as *mut u64).cast::<c_void>(),
+                            (&mut a6 as *mut u64).cast::<c_void>(),
+                        ];
+                        launch(scalar_binary_fn, &mut args)?;
+                    }
+                    ResidentElemType::I128 => {
+                        let s = i128::from(scalar);
+                        let mut s_lo = s as u64;
+                        let mut s_hi = (s >> 64) as u64;
+                        let mut args = [
+                            (&mut a0 as *mut u64).cast::<c_void>(),
+                            (&mut s_lo as *mut u64).cast::<c_void>(),
+                            (&mut s_hi as *mut u64).cast::<c_void>(),
                             (&mut a2 as *mut u32).cast::<c_void>(),
                             (&mut a3 as *mut u32).cast::<c_void>(),
                             (&mut a4 as *mut u64).cast::<c_void>(),
@@ -9904,6 +9934,21 @@ fn run_resident_arith_program<'r>(
                         let mut args = [
                             (&mut a0 as *mut u64).cast::<c_void>(),
                             (&mut a1 as *mut i64).cast::<c_void>(),
+                            (&mut a2 as *mut u32).cast::<c_void>(),
+                            (&mut a3 as *mut u32).cast::<c_void>(),
+                            (&mut a4 as *mut u64).cast::<c_void>(),
+                            (&mut a5 as *mut u64).cast::<c_void>(),
+                        ];
+                        launch(compare_scalar_mask_fn, &mut args)?;
+                    }
+                    ResidentElemType::I128 => {
+                        let s = i128::from(scalar);
+                        let mut s_lo = s as u64;
+                        let mut s_hi = (s >> 64) as u64;
+                        let mut args = [
+                            (&mut a0 as *mut u64).cast::<c_void>(),
+                            (&mut s_lo as *mut u64).cast::<c_void>(),
+                            (&mut s_hi as *mut u64).cast::<c_void>(),
                             (&mut a2 as *mut u32).cast::<c_void>(),
                             (&mut a3 as *mut u32).cast::<c_void>(),
                             (&mut a4 as *mut u64).cast::<c_void>(),
@@ -9978,6 +10023,7 @@ fn run_resident_arith_program<'r>(
         return Err(match elem {
             ResidentElemType::I32 => CudaRuntimeProbeError::IntegerOutOfRange,
             ResidentElemType::I64 => CudaRuntimeProbeError::BigintOutOfRange,
+            ResidentElemType::I128 => CudaRuntimeProbeError::NumericFieldOverflow,
         });
     }
 
@@ -20460,5 +20506,130 @@ mod tests {
             .expr_i128_compare_scalar_filter(i128_off, i128_base + 1, false, 3, ROWS)
             .expect("i128 compare at a 4-byte-aligned offset must not fault (misalignment regression)");
         assert_eq!(i128_gt, vec![2u32, 3, 4], "i128 num > base+1 => [2, 5)");
+    }
+
+    #[test]
+    fn expr_proto_ptx_is_pure_ascii() {
+        // The runtime JIT's ptxas rejects a non-ASCII byte ("Unexpected non-ASCII character") even
+        // though the LOCAL ptxas tolerates it — so a stray em-dash / smart-quote in a comment fails
+        // every GPU launch with INVALID_PTX (218). This non-GPU test keeps the PTX pure ASCII.
+        const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+        if let Some(pos) = PTX.iter().position(|&byte| !byte.is_ascii()) {
+            let line = PTX[..pos].iter().filter(|&&byte| byte == b'\n').count() + 1;
+            panic!("expr_proto.ptx has a non-ASCII byte at offset {pos} (line {line})");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_buffer_i128_arith_adds_subtracts_with_numeric_overflow() {
+        // numeric (i128) CHECKED add/sub via the buffer VM with ElemType::I128 (the type matrix, doc
+        // 19). Values beyond i64 range; closed-form oracles + an i128 overflow boundary -> PG `numeric
+        // field overflow`. Hand-built programs over the run_expr_predicate_filter (mask) terminal.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const N: u64 = 600;
+        let base: i128 = 1i128 << 70; // 2*base ~ 2^71, well within i128
+        let elem = std::mem::size_of::<i128>() as u64;
+        let a_off = std::mem::size_of::<u64>() as u64;
+        let b_off = a_off + N * elem;
+        let c_off = b_off + N * elem;
+        let big_off = c_off + N * elem;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&N.to_le_bytes());
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut c = Vec::new();
+        let mut big = Vec::new();
+        for i in 0..N as i128 {
+            a.extend_from_slice(&(base + i).to_le_bytes());
+            b.extend_from_slice(&base.to_le_bytes());
+            c.extend_from_slice(&(2 * base + 300).to_le_bytes());
+            big.extend_from_slice(&i128::MAX.to_le_bytes());
+        }
+        let allocated_len = big_off + big.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: a_off,
+                        bytes: &a,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: b_off,
+                        bytes: &b,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: c_off,
+                        bytes: &c,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: big_off,
+                        bytes: &big,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // (a + b) > c : (2*base+i) > (2*base+300) => i > 300 => [301, 600). col-vs-col compare.
+        let add_prog = [
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::LoadColumn { byte_offset: b_off },
+            ExprStep::BufferBinary { op: 0 },
+            ExprStep::LoadColumn { byte_offset: c_off },
+            ExprStep::CompareBuffers { cmp: 3 },
+        ];
+        let added = resident
+            .run_expr_predicate_filter(&add_prog, N, ResidentElemType::I128)
+            .expect("(a+b)>c on GPU");
+        let add_expected: Vec<u32> = (301..N as u32).collect();
+        assert_eq!(added, add_expected, "(a+b) > c => [301, 600)");
+
+        // (a - b) > 200 : i > 200 => [201, 600). scalar compare (200 fits the i32 ExprStep literal).
+        let sub_prog = [
+            ExprStep::LoadColumn { byte_offset: a_off },
+            ExprStep::LoadColumn { byte_offset: b_off },
+            ExprStep::BufferBinary { op: 1 },
+            ExprStep::CompareScalar {
+                cmp: 3,
+                scalar: 200,
+                scalar_on_left: false,
+            },
+        ];
+        let subbed = resident
+            .run_expr_predicate_filter(&sub_prog, N, ResidentElemType::I128)
+            .expect("(a-b)>200 on GPU");
+        let sub_expected: Vec<u32> = (201..N as u32).collect();
+        assert_eq!(subbed, sub_expected, "(a-b) > 200 => [201, 600)");
+
+        // big + big with big = i128::MAX overflows i128 -> numeric field overflow (never wraps).
+        let ovf_prog = [
+            ExprStep::LoadColumn {
+                byte_offset: big_off,
+            },
+            ExprStep::LoadColumn {
+                byte_offset: big_off,
+            },
+            ExprStep::BufferBinary { op: 0 },
+            ExprStep::CompareScalar {
+                cmp: 3,
+                scalar: 0,
+                scalar_on_left: false,
+            },
+        ];
+        let err = resident
+            .run_expr_predicate_filter(&ovf_prog, N, ResidentElemType::I128)
+            .expect_err("i128::MAX + i128::MAX must overflow");
+        assert!(
+            err.to_string().contains("numeric field overflow"),
+            "i128 overflow must raise `numeric field overflow`, got: {err}"
+        );
     }
 }
