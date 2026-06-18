@@ -40,10 +40,14 @@ The executor is int4 end to end; each new type extends the same four layers:
 
 ## Sequence
 
-1. **int8** — smallest delta from int4 (s64 vs s32), common in OLTP + the catalog:
-   - residency retention + offset resolver — **DONE**,
-   - comparison + projection on GPU (i64 load / compare kernels, `Int8Literal`, executor),
-   - checked arithmetic (int64-bounds overflow).
+1. **int8** — **DONE** (the proof that the type matrix is additive): residency retention + offset
+   resolver; comparison + projection (i64 resident-column compare peephole + projection); and checked
+   arithmetic (the i64 buffer VM, int64-bounds overflow — add/sub sign-XOR, mul via `mul.hi.s64` vs
+   the sign-extension of `mul.lo`). The arith VM is now **type-parameterized** (`ResidentElemType`,
+   the per-type model this doc set out): one VM, the element type selects kernels + buffer sizes; the
+   mask/compact stages are shared. int4 literals coerce to i64 (PG int4->int8); mixed int4/int8
+   expressions are a hard error (promotion is a follow-on). int8 `AND`/`OR` and a fused i64
+   compact-buffer fast-path are the remaining int8 follow-ons.
 2. **numeric** (engine M1 binary i128, fixed 16-byte) — i128 compare, then checked arith
    via 64-bit limbs.
 3. **text** (already retained in residency) — equality / inequality + `LIKE`-prefix over

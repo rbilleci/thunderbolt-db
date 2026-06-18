@@ -537,16 +537,106 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_predicates() {
         "small <> 300 => all rows but i=300, projecting int4 a"
     );
 
-    // (4) Unsupported int8 shapes are HARD errors (never a silent mis-answer): int8 arithmetic and a
-    // mixed int4/int8 comparison.
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT big FROM t WHERE big + 1 > big2")
-            .is_err(),
-        "int8 arithmetic is not supported yet -> hard error, not a wrong answer"
-    );
+    // (4) A MIXED int4/int8 comparison is a HARD error (never a silent mis-answer). int8 arithmetic
+    // is now supported — see gpu_execute_resident_expr_select_sql_runs_int8_arithmetic.
     assert!(
         e.execute_resident_expr_select_sql("SELECT big FROM t WHERE a < big")
             .is_err(),
         "mixed int4/int8 comparison -> hard error"
     );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_int8_arithmetic() {
+    // int8 (BIGINT) ARITHMETIC on the general GPU executor (the type matrix, doc 19): the i64 buffer
+    // VM evaluates int8 arith trees (add/sub/mul, col-vs-col + scalar) with values ABOVE i32::MAX.
+    // Closed-form oracle: a[i]=BASE+i, b[i]=BASE, c[i]=2*BASE+300, small[i]=i.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, small BIGINT)")
+        .unwrap();
+
+    const N: i64 = 600;
+    const BASE: i64 = 4_000_000_000; // > i32::MAX
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({}, {BASE}, {}, {i})", BASE + i, 2 * BASE + 300));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b, c, small) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // col-vs-col ADD: a + b > c <=> (2*BASE+i) > (2*BASE+300) <=> i > 300 => [301, 600). 64-bit, no
+    // overflow (2*BASE ~ 8e9 < i64::MAX). Projects a = BASE+i.
+    let added = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE a + b > c")
+        .expect("int8 a+b>c on GPU");
+    let added_expected: Vec<Vec<SqlValue>> =
+        (301..N).map(|i| vec![SqlValue::Int8(BASE + i)]).collect();
+    assert_eq!(added.rows, added_expected, "a+b>c => a=BASE+i for i in [301, 600)");
+    assert_eq!(added.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(added.fallback_reason, None);
+
+    // SUB then scalar compare: a - b > 200 <=> i > 200 => [201, 600). Projects small = i.
+    let subbed = e
+        .execute_resident_expr_select_sql("SELECT small FROM t WHERE a - b > 200")
+        .expect("int8 a-b>200 on GPU");
+    let subbed_expected: Vec<Vec<SqlValue>> = (201..N).map(|i| vec![SqlValue::Int8(i)]).collect();
+    assert_eq!(subbed.rows, subbed_expected, "a-b>200 => small=i for i in [201, 600)");
+
+    // scalar MUL: small * 2 > 800 <=> i > 400 => [401, 600). Projects small = i.
+    let scaled = e
+        .execute_resident_expr_select_sql("SELECT small FROM t WHERE small * 2 > 800")
+        .expect("int8 small*2>800 on GPU");
+    let scaled_expected: Vec<Vec<SqlValue>> = (401..N).map(|i| vec![SqlValue::Int8(i)]).collect();
+    assert_eq!(scaled.rows, scaled_expected, "small*2>800 => small=i for i in [401, 600)");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_raises_int8_integer_out_of_range_on_overflow() {
+    // int8 arithmetic overflow raises Postgres `integer out of range` (the i64 buffer VM's checked mul
+    // via mul.hi vs the sign-extension of mul.lo). Construction oracle (the int64 boundary):
+    // 3037000500^2 = 9223372037000250000 > i64::MAX (9223372036854775807); 3037000499^2 =
+    // 9223372030926249001 is in range.
+    let overflow = run_int8_square_gt_zero(3_037_000_500);
+    if let Some(result) = overflow {
+        match result {
+            Ok(_) => panic!("a*a over a=3037000500 overflows int64 -> must raise integer out of range"),
+            Err(err) => assert!(
+                err.to_string().contains("integer out of range"),
+                "expected `integer out of range`, got: {err}"
+            ),
+        }
+    }
+
+    // The largest in-range square does NOT error and returns the rows (a*a > 0 for both rows).
+    if let Some(result) = run_int8_square_gt_zero(3_037_000_499) {
+        let rows = result.expect("a*a at the int64 boundary 3037000499 is in range, must not error");
+        assert_eq!(
+            rows.rows,
+            vec![vec![SqlValue::Int8(2)], vec![SqlValue::Int8(3_037_000_499)]],
+            "a*a>0 in range -> both rows"
+        );
+    }
+}
+
+/// Build a single-BIGINT-column table `t(a) = [2, boundary]`, push a GPU snapshot, and run
+/// `SELECT a FROM t WHERE a * a > 0` on the general executor. Returns `None` off-GPU.
+fn run_int8_square_gt_zero(
+    boundary: i64,
+) -> Option<Result<RelationalSelectResult, ExecuteError>> {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT)").unwrap();
+    e.execute_text(2, &format!("INSERT INTO t (a) VALUES (2), ({boundary})"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    snapshot.device_memory_proof.as_ref()?;
+    Some(e.execute_resident_expr_select_sql("SELECT a FROM t WHERE a * a > 0"))
 }

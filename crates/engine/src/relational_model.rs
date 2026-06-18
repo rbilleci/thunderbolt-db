@@ -671,6 +671,22 @@ pub(crate) fn resident_device_int8_column_offset(
         .ok_or_else(payload_offset_overflow)
 }
 
+/// Resolve the device payload byte offset of an int4 OR int8 column by its catalog type (the type
+/// matrix, doc 19) — the type-dispatching resolver the arith VM lowering uses for `Column` leaves.
+pub(crate) fn resident_device_int_column_offset(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    column_idx: usize,
+) -> Result<u64, ExecuteError> {
+    match table.columns.get(column_idx).map(|column| column.ty) {
+        Some(SqlType::Int4) => resident_device_int4_column_offset(snapshot, table, column_idx),
+        Some(SqlType::Int8) => resident_device_int8_column_offset(snapshot, table, column_idx),
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory column is neither int4 nor int8".to_string(),
+        ))),
+    }
+}
+
 pub(crate) fn resident_device_int4_column_stats<'a>(
     snapshot: &'a RelationalResidencySnapshot,
     table: &RelationalTable,

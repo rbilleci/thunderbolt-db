@@ -121,6 +121,20 @@ fn expr_mentions_int8(expr: &ResidentExpr, table: &RelationalTable) -> bool {
     }
 }
 
+/// Whether any `Column` referenced anywhere in `expr` is int4 — used to reject a mixed int4/int8
+/// expression. An `Int4Literal` is NOT an int4 column (it is coercible to int8), so it does not count.
+fn expr_mentions_int4_column(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int4)
+        }
+        ResidentExpr::Int4Literal(_) => false,
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table)
+        }
+    }
+}
+
 /// Compile an int4 arithmetic value expression into postfix [`ExprStep`] bytecode for the device
 /// VM. Recurses: a `Column` loads to a buffer; a `Binary{arith}` emits its operands then a buffer x
 /// buffer op, or folds an immediate literal operand into a buffer x scalar op (preserving operand
@@ -134,7 +148,9 @@ fn compile_arith_program(
 ) -> Result<(), ExecuteError> {
     match expr {
         ResidentExpr::Column(col) => {
-            let byte_offset = resident_device_int4_column_offset(snapshot, table, *col)?;
+            // Resolve int4 OR int8 offset by the column's catalog type; a program is mono-typed (the
+            // engine rejects mixed int4/int8), and the VM is run with the matching element type.
+            let byte_offset = resident_device_int_column_offset(snapshot, table, *col)?;
             program.push(ExprStep::LoadColumn { byte_offset });
             Ok(())
         }
@@ -421,8 +437,9 @@ impl Engine {
     /// `Err` when int8 appears in a shape not yet supported (int8 arithmetic, or a mixed int4/int8
     /// expression) — never a silent fall-through that would mis-answer.
     #[allow(clippy::too_many_arguments)]
-    fn try_lower_int8_comparison(
+    fn try_lower_int8_predicate(
         &self,
+        predicate: &ResidentExpr,
         compare: ResidentBinaryOp,
         lhs: &ResidentExpr,
         rhs: &ResidentExpr,
@@ -431,15 +448,18 @@ impl Engine {
         device_memory: &CudaResidentDeviceMemory,
         row_count: u64,
     ) -> Result<Option<Vec<u32>>, ExecuteError> {
-        // Only comparisons take the int8 simple path; AND/OR (boolean combinators) are not handled
-        // here even over int8 columns (a later slice), so return None and let the caller decide.
+        // Comparisons take the int8 path here; AND/OR (boolean combinators) over int8 are a later
+        // slice, so return None and let the caller decide (the int4 And/Or path or a reject).
         let Some(cmp) = predicate_compare_code(compare) else {
             return Ok(None);
         };
         let lhs_int8 = int8_column_index(lhs, table);
         let rhs_int8 = int8_column_index(rhs, table);
-        let map_err =
-            |err| ExecuteError::Engine(EngineError::ApplyFailed(format!("int8 compare: {err}")));
+        // Surface the device error verbatim (e.g. int64 overflow -> "integer out of range"), matching
+        // the int4 path exactly — PG fidelity over a debugging prefix.
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
 
         match (lhs, rhs) {
             (ResidentExpr::Int4Literal(scalar), _) if rhs_int8.is_some() => {
@@ -469,17 +489,28 @@ impl Engine {
                     .map_err(map_err)
             }
             _ => {
-                // Not a simple int8 comparison. If int8 appears anywhere, the shape is unsupported
-                // (int8 arithmetic / mixed int4-int8) -> hard error; otherwise pure int4 -> None.
-                if expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table) {
-                    Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "the general GPU executor supports only simple int8 comparisons (no int8 \
-                         arithmetic or mixed int4/int8 expressions yet)"
-                            .to_string(),
-                    )))
-                } else {
-                    Ok(None)
+                // Not a simple int8 comparison. Either a pure-int4 predicate (None -> the int4 path),
+                // an int8 ARITHMETIC / deeper predicate (lower via the i64 buffer VM), or a MIXED
+                // int4/int8 expression (hard error — never silently mis-answer).
+                let mentions_int8 = expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table);
+                if !mentions_int8 {
+                    return Ok(None);
                 }
+                if expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table) {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "the general GPU executor does not support mixed int4/int8 expressions yet"
+                            .to_string(),
+                    )));
+                }
+                // All-int8 (int4 LITERALS are widened to i64 by the VM): compile the predicate to a
+                // mask program over i64 buffers (int8 column offsets + checked i64 arithmetic) and run
+                // the i64 VM.
+                let mut program = Vec::new();
+                compile_predicate_program(predicate, table, snapshot, &mut program)?;
+                device_memory
+                    .run_expr_predicate_filter(&program, row_count, ResidentElemType::I64)
+                    .map(Some)
+                    .map_err(map_err)
             }
         }
     }
@@ -516,7 +547,8 @@ impl Engine {
         // before the int4 paths below. `try_lower_int8_comparison` returns None for a pure-int4
         // predicate (fall through to the int4 path) and errors for an int8 shape not yet supported
         // (int8 arithmetic / mixed int4-int8) so the executor never silently mis-answers.
-        if let Some(indices) = self.try_lower_int8_comparison(
+        if let Some(indices) = self.try_lower_int8_predicate(
+            predicate,
             *compare,
             lhs,
             rhs,
@@ -538,7 +570,7 @@ impl Engine {
             let mut program = Vec::new();
             compile_predicate_program(predicate, table, snapshot, &mut program)?;
             return device_memory
-                .run_expr_predicate_filter(&program, row_count)
+                .run_expr_predicate_filter(&program, row_count, ResidentElemType::I32)
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
         }
 
