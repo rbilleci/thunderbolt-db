@@ -2048,6 +2048,11 @@ loop_bb128:
     @%p_sub mov.b64 %r_lo, %rsub_lo;
     @%p_sub mov.b64 %r_hi, %rsub_hi;
     @%p_sub mov.u32 %ovf_val, %o_sub;
+    // This kernel computes add/sub ONLY; op > 1 (e.g. a future miswired i128 multiply, which belongs
+    // in the dedicated mul kernel) must NOT silently return the add result -- trap it as overflow so
+    // it fails loudly (PG `numeric field overflow`) instead of a wrong answer.
+    setp.gt.u32 %pp, %op, 1;
+    @%pp red.global.or.b32 [%ovf], %one;
     setp.ne.u32 %p_ovf, %ovf_val, 0;
     @%p_ovf red.global.or.b32 [%ovf], %one;
     add.u64 %addr, %out, %o16;
@@ -2176,6 +2181,11 @@ loop_bs128:
     @%p_sub mov.b64 %r_lo, %rsub_lo;
     @%p_sub mov.b64 %r_hi, %rsub_hi;
     @%p_sub mov.u32 %ovf_val, %o_sub;
+    // This kernel computes add/sub ONLY; op > 1 (e.g. a future miswired i128 multiply, which belongs
+    // in the dedicated mul kernel) must NOT silently return the add result -- trap it as overflow so
+    // it fails loudly (PG `numeric field overflow`) instead of a wrong answer.
+    setp.gt.u32 %pp, %op, 1;
+    @%pp red.global.or.b32 [%ovf], %one;
     setp.ne.u32 %p_ovf, %ovf_val, 0;
     @%p_ovf red.global.or.b32 [%ovf], %one;
     add.u64 %addr, %out, %o16;
