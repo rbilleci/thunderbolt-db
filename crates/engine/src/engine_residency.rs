@@ -82,6 +82,12 @@ impl Engine {
                 max: i32::MIN,
             })
             .collect::<Vec<_>>();
+        let resident_device_int8_columns = catalog_table
+            .columns
+            .iter()
+            .filter(|column| column.ty == SqlType::Int8)
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
         let mut device_payload = vec![0; std::mem::size_of::<u64>()];
         let mut resident_device_text_columns = Vec::new();
         for (int4_ordinal, column) in catalog_table
@@ -102,6 +108,22 @@ impl Engine {
                     stats.min = stats.min.min(value);
                     stats.max = stats.max.max(value);
                 }
+                device_payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for column_idx in catalog_table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_idx, column)| column.ty == SqlType::Int8)
+            .map(|(idx, _column)| idx)
+        {
+            for row in &resident_rows {
+                let SqlValue::Int8(value) = row[column_idx] else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot int8 payload encountered non-int8 value".to_string(),
+                    )));
+                };
                 device_payload.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -164,6 +186,7 @@ impl Engine {
             resident_rows,
             resident_device_int4_columns,
             resident_device_int4_column_stats,
+            resident_device_int8_columns,
             resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
@@ -437,6 +460,9 @@ impl Engine {
             resident_rows: Vec::new(),
             resident_device_int4_columns: install.resident_device_int4_columns,
             resident_device_int4_column_stats: install.resident_device_int4_column_stats,
+            // Benchmark install path: int8 device retention is not wired here yet (doc 19 — the
+            // general executor reads int8 only from the standard populate path).
+            resident_device_int8_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
@@ -553,6 +579,9 @@ impl Engine {
             resident_rows: Vec::new(),
             resident_device_int4_columns: install.resident_device_int4_columns,
             resident_device_int4_column_stats: install.resident_device_int4_column_stats,
+            // Benchmark install path: int8 device retention is not wired here yet (doc 19 — the
+            // general executor reads int8 only from the standard populate path).
+            resident_device_int8_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,

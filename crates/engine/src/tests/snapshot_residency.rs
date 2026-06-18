@@ -242,3 +242,49 @@ fn residency_invalidation_scope_narrows_dml_and_falls_back_on_unknown() {
         None
     );
 }
+
+#[test]
+fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
+    // Type matrix (doc 19): the general GPU executor reads int8 predicates / projections from the
+    // device payload, so residency retains int8 columns as fixed 8-byte row-major data AFTER the int4
+    // section. Verify the bookkeeping (the column list + the offset resolver); the on-device read is
+    // exercised by the int8 VM slice. CPU-side bookkeeping, so this runs without a GPU.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, big BIGINT, b INT, big2 BIGINT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a, big, b, big2) VALUES (1, 100, 2, 7), (3, 200, 4, 8)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+
+    // int8 columns retained in catalog order (the int4 columns a, b are interspersed).
+    assert_eq!(
+        snapshot.resident_device_int8_columns,
+        vec!["big".to_string(), "big2".to_string()]
+    );
+
+    // Offsets match the payload layout: header(8) + int4 section + int8_ordinal * rows * 8.
+    let Command::Select(select) = parse_command("SELECT big FROM t").unwrap() else {
+        unreachable!()
+    };
+    let (table, _bound, _) = e.bind_relational_select_for_execution(&select).unwrap();
+    let row_count = snapshot.row_count as u64;
+    let int4_section = snapshot.resident_device_int4_columns.len() as u64 * row_count * 4;
+    let big_idx = relational_column_index(&table, "big").unwrap();
+    let big2_idx = relational_column_index(&table, "big2").unwrap();
+    assert_eq!(
+        resident_device_int8_column_offset(&snapshot, &table, big_idx).unwrap(),
+        8 + int4_section,
+        "big is the first int8 column (ordinal 0)"
+    );
+    assert_eq!(
+        resident_device_int8_column_offset(&snapshot, &table, big2_idx).unwrap(),
+        8 + int4_section + row_count * 8,
+        "big2 is the second int8 column (ordinal 1)"
+    );
+    // The type guard holds: the int8 resolver rejects an int4 column.
+    let a_idx = relational_column_index(&table, "a").unwrap();
+    assert!(resident_device_int8_column_offset(&snapshot, &table, a_idx).is_err());
+}
