@@ -48,8 +48,13 @@ The executor is int4 end to end; each new type extends the same four layers:
    mask/compact stages are shared. int4 literals coerce to i64 (PG int4->int8); mixed int4/int8
    expressions are a hard error (promotion is a follow-on). int8 `AND`/`OR` and a fused i64
    compact-buffer fast-path are the remaining int8 follow-ons.
-2. **numeric** (engine M1 binary i128, fixed 16-byte) — i128 compare, then checked arith
-   via 64-bit limbs.
+2. **numeric** (engine M1 binary i128, fixed 16-byte mantissa + per-column scale) — residency
+   retention **DONE** (16-byte mantissa section after the int8 section, offset resolver, bookkeeping
+   test). The decimal SCALE is a per-column catalog constant (values rescaled to it on insert), so the
+   snapshot stores only the i128 mantissa. NEXT: the i128 compare VM (signed hi/lo limbs: compare the
+   `s64` high limbs, tie-break on the `u64` low limbs) + a numeric-literal IR/mapper (the SQL literal
+   rescaled to the column scale, compared as an i128 mantissa); then checked arithmetic via 64-bit
+   limbs (add/sub with carry, mul via limb products) with PG `numeric field overflow`.
 3. **text** (already retained in residency) — equality / inequality + `LIKE`-prefix over
    offsets + bytes; folds the enumerated `text_prefix_like` route toward a general-path
    peephole.

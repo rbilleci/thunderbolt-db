@@ -288,3 +288,54 @@ fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
     let a_idx = relational_column_index(&table, "a").unwrap();
     assert!(resident_device_int8_column_offset(&snapshot, &table, a_idx).is_err());
 }
+
+#[test]
+fn residency_snapshot_retains_numeric_columns_at_the_layout_offset() {
+    // Type matrix (doc 19): the general GPU executor reads numeric predicates / projections from the
+    // device payload, so residency retains numeric columns as fixed 16-byte i128 mantissas AFTER the
+    // int4 AND int8 sections (before text). Verify the bookkeeping (the column list + the offset
+    // resolver); the on-device read is exercised by the numeric VM slice. CPU-side, no GPU needed.
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (a INT, big BIGINT, price NUMERIC(10,2), b INT, tax NUMERIC(10,2), label TEXT)",
+    )
+    .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a, big, price, b, tax, label) VALUES \
+         (1, 100, 1.50, 2, 0.25, 'x'), (3, 200, 9.99, 4, 1.00, 'y')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+
+    // numeric columns retained in catalog order (the int4 a,b and int8 big are interspersed).
+    assert_eq!(
+        snapshot.resident_device_numeric_columns,
+        vec!["price".to_string(), "tax".to_string()]
+    );
+
+    // Offsets: header(8) + the WHOLE int4 section + the WHOLE int8 section + numeric_ordinal*rows*16.
+    let Command::Select(select) = parse_command("SELECT price FROM t").unwrap() else {
+        unreachable!()
+    };
+    let (table, _bound, _) = e.bind_relational_select_for_execution(&select).unwrap();
+    let row_count = snapshot.row_count as u64;
+    let int4_section = snapshot.resident_device_int4_columns.len() as u64 * row_count * 4;
+    let int8_section = snapshot.resident_device_int8_columns.len() as u64 * row_count * 8;
+    let price_idx = relational_column_index(&table, "price").unwrap();
+    let tax_idx = relational_column_index(&table, "tax").unwrap();
+    assert_eq!(
+        resident_device_numeric_column_offset(&snapshot, &table, price_idx).unwrap(),
+        8 + int4_section + int8_section,
+        "price is the first numeric column (ordinal 0), after the int4 + int8 sections"
+    );
+    assert_eq!(
+        resident_device_numeric_column_offset(&snapshot, &table, tax_idx).unwrap(),
+        8 + int4_section + int8_section + row_count * 16,
+        "tax is the second numeric column (ordinal 1)"
+    );
+    // The type guard holds: the numeric resolver rejects a non-numeric (int8) column.
+    let big_idx = relational_column_index(&table, "big").unwrap();
+    assert!(resident_device_numeric_column_offset(&snapshot, &table, big_idx).is_err());
+}

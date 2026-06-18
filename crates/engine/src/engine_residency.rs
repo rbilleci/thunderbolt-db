@@ -88,6 +88,12 @@ impl Engine {
             .filter(|column| column.ty == SqlType::Int8)
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
+        let resident_device_numeric_columns = catalog_table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Numeric { .. }))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
         let mut device_payload = vec![0; std::mem::size_of::<u64>()];
         let mut resident_device_text_columns = Vec::new();
         for (int4_ordinal, column) in catalog_table
@@ -125,6 +131,25 @@ impl Engine {
                     )));
                 };
                 device_payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        // numeric section (the type matrix, doc 19): each numeric column's i128 mantissa, row-major,
+        // 16 bytes/row, after the int8 section and before the text section. The mantissa is at the
+        // column's catalog scale (rescaled on insert); the scale is not stored on-device.
+        for column_idx in catalog_table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_idx, column)| matches!(column.ty, SqlType::Numeric { .. }))
+            .map(|(idx, _column)| idx)
+        {
+            for row in &resident_rows {
+                let SqlValue::Numeric(value) = &row[column_idx] else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot numeric payload encountered non-numeric value".to_string(),
+                    )));
+                };
+                device_payload.extend_from_slice(&value.mantissa.to_le_bytes());
             }
         }
         for (column_idx, column) in catalog_table
@@ -187,6 +212,7 @@ impl Engine {
             resident_device_int4_columns,
             resident_device_int4_column_stats,
             resident_device_int8_columns,
+            resident_device_numeric_columns,
             resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
@@ -463,6 +489,7 @@ impl Engine {
             // Benchmark install path: int8 device retention is not wired here yet (doc 19 — the
             // general executor reads int8 only from the standard populate path).
             resident_device_int8_columns: Vec::new(),
+            resident_device_numeric_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
@@ -582,6 +609,7 @@ impl Engine {
             // Benchmark install path: int8 device retention is not wired here yet (doc 19 — the
             // general executor reads int8 only from the standard populate path).
             resident_device_int8_columns: Vec::new(),
+            resident_device_numeric_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,

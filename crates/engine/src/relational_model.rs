@@ -210,6 +210,12 @@ pub struct RelationalResidencySnapshot {
     /// projections from here (the type matrix, doc 19). Empty for partitioned / benchmark installs
     /// that have not adopted int8 retention yet.
     pub resident_device_int8_columns: Vec<String>,
+    /// numeric columns retained in the device payload (fixed 16-byte i128 mantissa, row-major, after
+    /// the int8 section, before the text section), in catalog order — the general GPU executor reads
+    /// numeric predicates / projections from here (the type matrix, doc 19). The decimal SCALE is a
+    /// per-column catalog constant (values are rescaled on insert), so only the mantissa is stored.
+    /// Empty for partitioned / benchmark installs that have not adopted numeric retention yet.
+    pub resident_device_numeric_columns: Vec<String>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
@@ -668,6 +674,77 @@ pub(crate) fn resident_device_int8_column_offset(
     (std::mem::size_of::<u64>() as u64)
         .checked_add(int4_section_bytes)
         .and_then(|after_int4| after_int4.checked_add(int8_prefix_bytes))
+        .ok_or_else(payload_offset_overflow)
+}
+
+/// Byte offset of numeric column `column_idx` within the retained device payload (the type matrix,
+/// doc 19). Layout: header (u64) + the WHOLE int4 section + the WHOLE int8 section + the numeric
+/// columns before this one (`numeric_ordinal * row_count * 16`). Validates the column is numeric and
+/// present in `snapshot.resident_device_numeric_columns`. A numeric mantissa is a fixed 16-byte i128;
+/// the decimal scale is the column's catalog scale (values are rescaled on insert), not stored here.
+// Not yet called — the numeric compare / projection lowering (the next slice) is the first caller.
+#[allow(dead_code)]
+pub(crate) fn resident_device_numeric_column_offset(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    column_idx: usize,
+) -> Result<u64, ExecuteError> {
+    let column = table.columns.get(column_idx).ok_or_else(|| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is outside the catalog table".to_string(),
+        ))
+    })?;
+    if !matches!(column.ty, SqlType::Numeric { .. }) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is not numeric".to_string(),
+        )));
+    }
+    let numeric_ordinal = table
+        .columns
+        .iter()
+        .take(column_idx)
+        .filter(|candidate| matches!(candidate.ty, SqlType::Numeric { .. }))
+        .count();
+    if snapshot
+        .resident_device_numeric_columns
+        .get(numeric_ordinal)
+        .is_none_or(|name| name != &column.name)
+    {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "resident snapshot device payload has no numeric column \"{}\"",
+            column.name
+        ))));
+    }
+    let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident snapshot row count exceeds retained device-memory proof range".to_string(),
+        ))
+    })?;
+    let payload_offset_overflow = || {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident snapshot numeric payload offset overflowed".to_string(),
+        ))
+    };
+    let int4_section_bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|int4_col_bytes| {
+            (snapshot.resident_device_int4_columns.len() as u64).checked_mul(int4_col_bytes)
+        })
+        .ok_or_else(payload_offset_overflow)?;
+    let int8_section_bytes = row_count
+        .checked_mul(std::mem::size_of::<i64>() as u64)
+        .and_then(|int8_col_bytes| {
+            (snapshot.resident_device_int8_columns.len() as u64).checked_mul(int8_col_bytes)
+        })
+        .ok_or_else(payload_offset_overflow)?;
+    let numeric_prefix_bytes = row_count
+        .checked_mul(std::mem::size_of::<i128>() as u64)
+        .and_then(|numeric_col_bytes| (numeric_ordinal as u64).checked_mul(numeric_col_bytes))
+        .ok_or_else(payload_offset_overflow)?;
+    (std::mem::size_of::<u64>() as u64)
+        .checked_add(int4_section_bytes)
+        .and_then(|after_int4| after_int4.checked_add(int8_section_bytes))
+        .and_then(|after_int8| after_int8.checked_add(numeric_prefix_bytes))
         .ok_or_else(payload_offset_overflow)
 }
 
