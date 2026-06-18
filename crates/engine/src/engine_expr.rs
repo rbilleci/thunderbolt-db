@@ -214,6 +214,36 @@ fn rescale_numeric_literal(literal: Decimal128, column_scale: u8) -> Result<i128
         })
 }
 
+/// 10^exp as i32 — the multiplier that rescales a numeric mantissa UP by `exp` decimal places (a
+/// scale gap). Errors if it does not fit i32 (exp > 9), since the in-VM scalar is i32-bounded; a wider
+/// cross-scale gap is a follow-on.
+fn pow10_i32(exp: u8) -> Result<i32, ExecuteError> {
+    let mut acc: i32 = 1;
+    for _ in 0..exp {
+        acc = acc.checked_mul(10).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "numeric cross-scale comparison spans more than 9 fractional digits (a follow-on)"
+                    .to_string(),
+            ))
+        })?;
+    }
+    Ok(acc)
+}
+
+/// Push a step rescaling the top-of-stack i128 buffer from scale `from` UP to `to` (mantissa *
+/// 10^(to-from), a checked multiply), or nothing if already equal. `to >= from` (the caller passes the
+/// common = max scale). Used to bring the operands of a cross-scale numeric comparison to one scale.
+fn push_numeric_rescale(from: u8, to: u8, program: &mut Vec<ExprStep>) -> Result<(), ExecuteError> {
+    if to > from {
+        program.push(ExprStep::ScalarBinary {
+            op: 2, // multiply by 10^(to-from)
+            scalar: pow10_i32(to - from)?,
+            scalar_on_left: false,
+        });
+    }
+    Ok(())
+}
+
 /// Compile a numeric ARITHMETIC subtree to i128 VM steps, RETURNING the result's scale (computed
 /// bottom-up). A `Column` loads from its device offset (scale = its catalog scale). `+`/`-` require
 /// both operands at the SAME scale (cross-scale rescaling is a follow-on) and keep it; `*` ADDS the
@@ -759,13 +789,47 @@ impl Engine {
             .map_err(map_err)
     }
 
+    /// Cross-scale `numcol <cmp> literal` (or flipped): the literal is FINER than the column, so load
+    /// the column, rescale it UP to the literal's scale (mantissa * 10^k, the buffer VM path), and
+    /// compare to the literal's mantissa. `scalar_on_left` is the literal's side of the comparison.
+    #[allow(clippy::too_many_arguments)]
+    fn numeric_cross_scale_scalar(
+        &self,
+        column_offset: u64,
+        column_scale: u8,
+        literal: Decimal128,
+        scalar_on_left: bool,
+        cmp: u32,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Vec<u32>, ExecuteError> {
+        let needle = i32::try_from(literal.mantissa).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "numeric comparison literal is too large for the fast path yet".to_string(),
+            ))
+        })?;
+        let mut program = vec![ExprStep::LoadColumn {
+            byte_offset: column_offset,
+        }];
+        push_numeric_rescale(column_scale, literal.scale, &mut program)?;
+        program.push(ExprStep::CompareScalar {
+            cmp,
+            scalar: needle,
+            scalar_on_left,
+        });
+        device_memory
+            .run_expr_predicate_filter(&program, row_count, ResidentElemType::I128)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
+    }
+
     /// Try to lower a SIMPLE numeric comparison to surviving row indices via the i128 compare kernels
-    /// (the type matrix, doc 19). Supported: `numcol <cmp> literal` / `literal <cmp> numcol` (the
-    /// literal — numeric or integer — is rescaled to the column's scale; a literal with MORE fractional
-    /// digits than the column is rejected, since rounding it would mis-answer) and `numcol <cmp> numcol`
-    /// of EQUAL scale. Returns None for a non-numeric predicate (the int4/int8 paths handle it). A
-    /// numeric value mixed with an int4/int8 COLUMN, numeric arithmetic, or numeric AND/OR is a hard
-    /// error — never a silent mis-answer.
+    /// (the type matrix, doc 19). Supported: `numcol <cmp> literal` / `literal <cmp> numcol` and
+    /// `numcol <cmp> numcol`, at ANY scale -- same-scale (and coarser-or-equal literal) use the
+    /// resident compare peephole; a SCALE MISMATCH (a finer literal, or two columns of different scale)
+    /// loads to i128 buffers, rescales the coarser side UP to the common = max scale (mantissa * 10^k,
+    /// k <= 9; a wider gap or a rescale overflow errors), then compares. Returns None for a non-numeric
+    /// predicate (the int4/int8 paths handle it). A numeric value mixed with an int4/int8 COLUMN,
+    /// numeric arithmetic, or numeric AND/OR is a hard error -- never a silent mis-answer.
     #[allow(clippy::too_many_arguments)]
     fn try_lower_numeric_predicate(
         &self,
@@ -805,41 +869,76 @@ impl Engine {
             numeric_column_index(rhs, table),
         ) {
             (Some(col), None) if numeric_literal_value(rhs).is_some() => {
-                let scale = column_numeric_scale(table, col).expect("numeric column has a scale");
-                let mantissa =
-                    rescale_numeric_literal(numeric_literal_value(rhs).expect("checked"), scale)?;
+                let col_scale = column_numeric_scale(table, col).expect("numeric column has a scale");
+                let literal = numeric_literal_value(rhs).expect("checked").canonical();
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
-                device_memory
-                    .expr_i128_compare_scalar_filter(offset, mantissa, false, cmp, row_count)
+                if literal.scale <= col_scale {
+                    // literal coarser-or-equal: rescale it UP to the column scale; resident peephole.
+                    let mantissa = rescale_numeric_literal(literal, col_scale)?;
+                    device_memory
+                        .expr_i128_compare_scalar_filter(offset, mantissa, false, cmp, row_count)
+                        .map(Some)
+                        .map_err(map_err)
+                } else {
+                    // CROSS-SCALE: the literal is FINER than the column -> rescale the column UP to the
+                    // literal's scale (buffer VM path) and compare to the literal's mantissa.
+                    self.numeric_cross_scale_scalar(
+                        offset,
+                        col_scale,
+                        literal,
+                        false,
+                        cmp,
+                        device_memory,
+                        row_count,
+                    )
                     .map(Some)
-                    .map_err(map_err)
+                }
             }
             (None, Some(col)) if numeric_literal_value(lhs).is_some() => {
-                let scale = column_numeric_scale(table, col).expect("numeric column has a scale");
-                let mantissa =
-                    rescale_numeric_literal(numeric_literal_value(lhs).expect("checked"), scale)?;
+                let col_scale = column_numeric_scale(table, col).expect("numeric column has a scale");
+                let literal = numeric_literal_value(lhs).expect("checked").canonical();
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
-                device_memory
-                    .expr_i128_compare_scalar_filter(offset, mantissa, true, cmp, row_count)
+                if literal.scale <= col_scale {
+                    let mantissa = rescale_numeric_literal(literal, col_scale)?;
+                    device_memory
+                        .expr_i128_compare_scalar_filter(offset, mantissa, true, cmp, row_count)
+                        .map(Some)
+                        .map_err(map_err)
+                } else {
+                    self.numeric_cross_scale_scalar(
+                        offset, col_scale, literal, true, cmp, device_memory, row_count,
+                    )
                     .map(Some)
-                    .map_err(map_err)
+                }
             }
             (Some(a), Some(b)) => {
                 let a_scale = column_numeric_scale(table, a).expect("numeric column has a scale");
                 let b_scale = column_numeric_scale(table, b).expect("numeric column has a scale");
-                if a_scale != b_scale {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "numeric column-vs-column comparison requires equal scales (cross-scale \
-                         rescaling on the GPU is a follow-on)"
-                            .to_string(),
-                    )));
-                }
                 let a_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
                 let b_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
-                device_memory
-                    .expr_i128_compare_columns_filter(a_offset, b_offset, cmp, row_count)
-                    .map(Some)
-                    .map_err(map_err)
+                if a_scale == b_scale {
+                    device_memory
+                        .expr_i128_compare_columns_filter(a_offset, b_offset, cmp, row_count)
+                        .map(Some)
+                        .map_err(map_err)
+                } else {
+                    // CROSS-SCALE: load both, rescale the coarser column UP to the common (max) scale,
+                    // then compare buffers (the buffer VM path).
+                    let common = a_scale.max(b_scale);
+                    let mut program = vec![ExprStep::LoadColumn {
+                        byte_offset: a_offset,
+                    }];
+                    push_numeric_rescale(a_scale, common, &mut program)?;
+                    program.push(ExprStep::LoadColumn {
+                        byte_offset: b_offset,
+                    });
+                    push_numeric_rescale(b_scale, common, &mut program)?;
+                    program.push(ExprStep::CompareBuffers { cmp });
+                    device_memory
+                        .run_expr_predicate_filter(&program, row_count, ResidentElemType::I128)
+                        .map(Some)
+                        .map_err(map_err)
+                }
             }
             _ => {
                 // Numeric ARITHMETIC comparison (`price * tax > 100`, `100 < price - fee`, ...):

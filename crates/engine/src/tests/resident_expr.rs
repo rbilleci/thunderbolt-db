@@ -769,14 +769,18 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
     let cols_expected: Vec<Vec<SqlValue>> = (0..300).map(|i| vec![num(i)]).collect();
     assert_eq!(cols.rows, cols_expected, "price < cost => [0, 300)");
 
-    // REJECTIONS — hard errors, never wrong rows:
-    // a literal with more fractional digits than the column would need rounding (PG compares exactly).
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.555")
-            .is_err(),
-        "literal scale > column scale => hard error"
+    // a literal FINER than the column now rescales the column UP (cross-scale): price > 10.555
+    // (scale 3) <=> i+0.50 > 10.555 <=> i >= 11 => [11, N).
+    let finer = e
+        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.555")
+        .expect("price > 10.555 (cross-scale) on GPU");
+    let finer_expected: Vec<Vec<SqlValue>> = (11..N).map(|i| vec![num(i)]).collect();
+    assert_eq!(
+        finer.rows, finer_expected,
+        "price > 10.555 (finer literal, cross-scale) => [11, N)"
     );
-    // mixed numeric vs an int4 column.
+
+    // REJECTION — a mixed numeric vs an int4 column is a hard error, never wrong rows.
     assert!(
         e.execute_resident_expr_select_sql("SELECT price FROM t WHERE price > label")
             .is_err(),
@@ -920,4 +924,61 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
             .is_err(),
         "mixed numeric * int4 column => hard error"
     );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_comparisons() {
+    // CROSS-SCALE numeric comparison (the type matrix, doc 19): operands of different scales are
+    // rescaled UP to the common (max) scale on-device (mantissa * 10^k) before comparing.
+    // p2 = i.50 (NUMERIC(10,2)), p4 = (2i).0000 (NUMERIC(10,4)), label = i.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)")
+        .unwrap();
+
+    const N: i64 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}.50, {}.0000, {i})", 2 * i));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (p2, p4, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // cross-scale column-vs-column: p2 > p4 <=> i+0.50 > 2i <=> i < 0.5 => only row 0.
+    let cols = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 > p4")
+        .expect("p2>p4 on GPU");
+    assert_eq!(
+        cols.rows,
+        vec![vec![SqlValue::Int4(0)]],
+        "p2>p4 (cross-scale col-vs-col) => row 0 only"
+    );
+    assert_eq!(cols.executed_target, DeviceTarget::Gpu(0));
+
+    // cross-scale column-vs-FINER-literal: p2 > 1.555 <=> i+0.50 > 1.555 <=> i >= 2 => [2, N).
+    let lit = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 > 1.555")
+        .expect("p2>1.555 on GPU");
+    let lit_expected: Vec<Vec<SqlValue>> = (2..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(lit.rows, lit_expected, "p2>1.555 (finer literal) => [2, 600)");
+
+    // literal on the left: 1.555 < p2 is the same set.
+    let lit_left = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE 1.555 < p2")
+        .expect("1.555<p2 on GPU");
+    assert_eq!(lit_left.rows, lit_expected, "1.555<p2 == p2>1.555");
+
+    // same-scale still uses the resident peephole (regression): p2 > 10.50 => [11, N).
+    let same = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 > 10.50")
+        .expect("p2>10.50 on GPU");
+    let same_expected: Vec<Vec<SqlValue>> = (11..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(same.rows, same_expected, "p2>10.50 (same scale) => [11, 600)");
 }
