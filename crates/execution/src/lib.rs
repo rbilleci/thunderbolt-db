@@ -20392,4 +20392,73 @@ mod tests {
             "negative i128 projection round-trips"
         );
     }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_compare_tolerates_4byte_aligned_int8_and_i128_sections() {
+        // REGRESSION (the numeric audit's P0): the resident int8 / i128 compare kernels read each
+        // 64-bit limb as two 4-byte loads, so a column section that is only 4-byte aligned (which
+        // happens when an int4 section of ODD length — n_int4*rows odd — precedes it) does NOT fault
+        // with cudaErrorMisalignedAddress (a sticky error that poisons the CUDA context). Every prior
+        // test used an even row count and missed it. Layout: header(8) + one int4 col (rows*4) + one
+        // int8 col + one i128 col, ROWS odd, so the int8 and i128 sections land at 4-mod-8 offsets.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        const ROWS: u64 = 5; // odd -> int4 section = 20 bytes
+        let i4_off = std::mem::size_of::<u64>() as u64; // 8
+        let i8_off = i4_off + ROWS * 4; // 28 == 4 (mod 8): 4-byte-aligned int8 section
+        let i128_off = i8_off + ROWS * 8; // 68 == 4 (mod 8): 4-byte-aligned i128 section
+        assert_eq!(i8_off % 8, 4, "int8 section must be 4-byte aligned to exercise the fix");
+        assert_eq!(i128_off % 8, 4, "i128 section must be 4-byte aligned to exercise the fix");
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&ROWS.to_le_bytes());
+        let mut i4 = Vec::new();
+        let mut i8 = Vec::new();
+        let mut i128v = Vec::new();
+        let i8_base: i64 = 4_000_000_000; // > i32::MAX
+        let i128_base: i128 = 1i128 << 70; // high limb set
+        for r in 0..ROWS as i64 {
+            i4.extend_from_slice(&(r as i32).to_le_bytes());
+            i8.extend_from_slice(&(i8_base + r).to_le_bytes());
+            i128v.extend_from_slice(&(i128_base + r as i128).to_le_bytes());
+        }
+        let allocated_len = i128_off + i128v.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: i4_off,
+                        bytes: &i4,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: i8_off,
+                        bytes: &i8,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: i128_off,
+                        bytes: &i128v,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // int8 at a 4-byte-aligned offset: big > base+1 (gt=3) => r > 1 => [2, 5). Must NOT fault.
+        let i8_gt = resident
+            .expr_i64_compare_scalar_filter(i8_off, i8_base + 1, false, 3, ROWS)
+            .expect("int8 compare at a 4-byte-aligned offset must not fault (misalignment regression)");
+        assert_eq!(i8_gt, vec![2u32, 3, 4], "int8 big > base+1 => [2, 5)");
+
+        // i128 at a 4-byte-aligned offset: num > base+1 (gt=3) => r > 1 => [2, 5). Must NOT fault.
+        let i128_gt = resident
+            .expr_i128_compare_scalar_filter(i128_off, i128_base + 1, false, 3, ROWS)
+            .expect("i128 compare at a 4-byte-aligned offset must not fault (misalignment regression)");
+        assert_eq!(i128_gt, vec![2u32, 3, 4], "i128 num > base+1 => [2, 5)");
+    }
 }
