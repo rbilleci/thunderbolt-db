@@ -217,8 +217,13 @@ fn map_predicate_node(
             Some(a_const::Val::Fval(float)) => Decimal128::parse(&float.fval)
                 .map(ResidentExpr::NumericLiteral)
                 .ok_or_else(|| sql_pg_error(format!("malformed numeric literal: {}", float.fval))),
+            // A quoted string literal -> a text comparison value (the type matrix, doc 19). Byte-wise
+            // (deterministic-collation equality is byte identity).
+            Some(a_const::Val::Sval(string)) => {
+                Ok(ResidentExpr::TextLiteral(string.sval.clone()))
+            }
             _ => Err(sql_pg_error(
-                "the general GPU executor supports int4 and numeric literals only".to_string(),
+                "the general GPU executor supports int4, numeric, and text literals only".to_string(),
             )),
         },
         NodeEnum::AExpr(a_expr) => map_a_expr(a_expr, table, qualifier),

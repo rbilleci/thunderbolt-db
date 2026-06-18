@@ -2702,3 +2702,115 @@ loop_mb128:
 done_mb128:
     ret;
 }
+
+// out_mask[i] = ((text[i] == needle) XOR negate) ? 1 : 0  over a resident TEXT column (the type
+// matrix, doc 19). The column is offsets[n+1] (u64 LE, at resident_ptr + offsets_byte_offset) plus a
+// byte blob (at resident_ptr + bytes_byte_offset); row i's bytes are blob[offsets[i] .. offsets[i+1]].
+// needle_ptr is a device copy of the literal bytes (needle_len long). Byte-wise equality -- PG
+// deterministic-collation equality is byte identity. negate=1 evaluates <> (NOT equal). The offsets
+// are read as 2x 4-byte loads: the text section can land 4-mod-8 aligned, where an 8-byte load faults
+// 716 (sticky) -- same constraint as the int8/i128 resident kernels.
+.visible .entry gpu_db_resident_text_eq_scalar_to_mask(
+    .param .u64 resident_ptr,
+    .param .u64 offsets_byte_offset,
+    .param .u64 bytes_byte_offset,
+    .param .u64 needle_ptr,
+    .param .u64 needle_len,
+    .param .u32 negate,
+    .param .u64 n,
+    .param .u64 out_mask_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %neg;
+    .reg .u32 %eqflag;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .b32 %mask;
+    .reg .u64 %off_base;
+    .reg .u64 %bytes_base;
+    .reg .u64 %needle;
+    .reg .u64 %nlen;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o8;
+    .reg .u64 %o4;
+    .reg .u64 %addr;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %len;
+    .reg .u64 %j;
+    .reg .u64 %taddr;
+    .reg .u64 %a_addr;
+    .reg .u64 %b_addr;
+
+    ld.param.u64 %off_base, [resident_ptr];
+    ld.param.u64 %addr, [offsets_byte_offset];
+    add.u64 %off_base, %off_base, %addr;
+    ld.param.u64 %bytes_base, [resident_ptr];
+    ld.param.u64 %addr, [bytes_byte_offset];
+    add.u64 %bytes_base, %bytes_base, %addr;
+    ld.param.u64 %needle, [needle_ptr];
+    ld.param.u64 %nlen, [needle_len];
+    ld.param.u32 %neg, [negate];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_mask_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_teq:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_teq;
+    mul.lo.u64 %o8, %i, 8;
+    add.u64 %addr, %off_base, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %start, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %end, {%w0, %w1};
+    sub.u64 %len, %end, %start;
+    mov.u32 %eqflag, 1;
+    setp.ne.u64 %p, %len, %nlen;
+    @%p bra teq_store_zero;
+    add.u64 %taddr, %bytes_base, %start;
+    mov.u64 %j, 0;
+teq_byte:
+    setp.ge.u64 %p, %j, %nlen;
+    @%p bra teq_after;
+    add.u64 %a_addr, %taddr, %j;
+    ld.global.u8 %abyte, [%a_addr];
+    add.u64 %b_addr, %needle, %j;
+    ld.global.u8 %bbyte, [%b_addr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra teq_store_zero;
+    add.u64 %j, %j, 1;
+    bra teq_byte;
+teq_store_zero:
+    mov.u32 %eqflag, 0;
+teq_after:
+    setp.ne.u32 %match, %eqflag, %neg;
+    selp.b32 %mask, 1, 0, %match;
+    mul.lo.u64 %o4, %i, 4;
+    add.u64 %addr, %out, %o4;
+    st.global.b32 [%addr], %mask;
+    add.u64 %i, %i, %stride;
+    bra loop_teq;
+done_teq:
+    ret;
+}

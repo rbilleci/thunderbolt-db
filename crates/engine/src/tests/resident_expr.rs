@@ -1112,3 +1112,90 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
         "(price>10.50 AND price<100.50) OR price>595.50 => [11,100) U [596,600)"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_text_equality() {
+    // Text equality on the general GPU executor (the type matrix, doc 19): byte-wise = / <>. The 7-row
+    // (ODD) count places the text offsets section at a 4-mod-8 byte offset (8 header + 7*4 int4 = 36),
+    // exercising the 2x 4-byte offset loads end to end through the real residency builder.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)").unwrap();
+    let names = ["alice", "bob", "alice", "carol", "bob", "alice", "dave"];
+    let mut values = String::new();
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("('{n}', {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (name, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // = 'alice' -> rows 0,2,5
+    let eq = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name = 'alice'")
+        .expect("name = 'alice' on GPU");
+    assert_eq!(
+        eq.rows,
+        vec![
+            vec![SqlValue::Int4(0)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(5)]
+        ],
+        "name = 'alice' => rows 0,2,5"
+    );
+    assert_eq!(eq.executed_target, DeviceTarget::Gpu(0));
+
+    // <> 'alice' -> rows 1,3,4,6
+    let ne = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name <> 'alice'")
+        .expect("name <> 'alice' on GPU");
+    assert_eq!(
+        ne.rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(4)],
+            vec![SqlValue::Int4(6)]
+        ],
+        "name <> 'alice' => rows 1,3,4,6"
+    );
+
+    // literal on the LEFT (equality is symmetric): 'bob' = name -> rows 1,4
+    let lit_left = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE 'bob' = name")
+        .expect("'bob' = name on GPU");
+    assert_eq!(
+        lit_left.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(4)]],
+        "'bob' = name => rows 1,4"
+    );
+
+    // no match
+    let none = e
+        .execute_resident_expr_select_sql("SELECT label FROM t WHERE name = 'zzz'")
+        .expect("name = 'zzz' on GPU");
+    assert!(none.rows.is_empty(), "name = 'zzz' matches nothing");
+
+    // REJECTIONS -- hard errors, never wrong rows:
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name < 'bob'")
+            .is_err(),
+        "text inequality => collation-sort-key follow-on"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE 'a%'")
+            .is_err(),
+        "text LIKE => Slice B follow-on"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE name = label")
+            .is_err(),
+        "mixed text/int => hard error"
+    );
+}

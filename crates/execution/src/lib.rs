@@ -1179,6 +1179,27 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Surviving row indices of `text[i] == needle` (or `<>` when `negate`) over a resident TEXT column
+    /// (the type matrix, doc 19). The column is its offsets-array + byte-blob device offsets; `needle`
+    /// is the literal's raw bytes (byte-wise = PG deterministic-collation equality).
+    pub fn expr_text_eq_scalar_filter(
+        &self,
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        needle: &[u8],
+        negate: bool,
+        row_count: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_text_eq_scalar_filter(
+            self,
+            offsets_byte_offset,
+            bytes_byte_offset,
+            needle,
+            negate,
+            row_count,
+        )
+    }
+
     /// Surviving row indices of `a <cmp> b` over two resident numeric (i128) columns of the SAME scale
     /// (the type matrix, doc 19).
     pub fn expr_i128_compare_columns_filter(
@@ -4067,6 +4088,115 @@ fn launch_cuda_resident_i128_compare_scalar_filter(
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
+    })?;
+    compact_mask_i32_to_indices(resident, mask.ptr, n)
+}
+
+/// Evaluate `text[i] == needle` (or `<>` when `negate`) over a resident TEXT column to surviving row
+/// indices (the type matrix, doc 19): copy the needle bytes H2D into a leased buffer, run
+/// `gpu_db_resident_text_eq_scalar_to_mask` to a mask, then the shared compactor. The needle host
+/// slice outlives the stream's covering sync, so the async H2D source stays valid.
+fn launch_cuda_resident_text_eq_scalar_filter(
+    resident: &CudaResidentDeviceMemory,
+    offsets_byte_offset: u64,
+    bytes_byte_offset: u64,
+    needle: &[u8],
+    negate: bool,
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let compare_fn = primary.cached_function(c"gpu_db_resident_text_eq_scalar_to_mask", &ptx)?;
+
+    // Needle on device (lease >= 1 byte so the pointer is valid even for the empty string, which the
+    // kernel never dereferences since needle_len == 0).
+    let needle_lease = primary.lease_device_buffer(needle.len().max(1))?;
+    let mask = primary.lease_device_buffer(mask_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = offsets_byte_offset;
+    let mut a2 = bytes_byte_offset;
+    let mut a3 = needle_lease.ptr;
+    let mut a4 = needle.len() as u64;
+    let mut a5 = u32::from(negate);
+    let mut a6 = n;
+    let mut a7 = mask.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u32).cast::<c_void>(),
+        (&mut a6 as *mut u64).cast::<c_void>(),
+        (&mut a7 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        if !needle.is_empty() {
+            let rc = unsafe {
+                htod_async(
+                    needle_lease.ptr,
+                    needle.as_ptr().cast::<c_void>(),
+                    needle.len(),
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        unsafe {
+            cu_launch_kernel(
+                compare_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
     })?;
     compact_mask_i32_to_indices(resident, mask.ptr, n)
 }
@@ -16951,6 +17081,81 @@ mod tests {
             .expect("vm 10-a > 0");
         let expected3: Vec<u32> = (0..10).collect();
         assert_eq!(got3, expected3, "10 - a > 0 <=> i < 10 (scalar_on_left)");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_text_eq_scalar_filters_rows() {
+        // Text equality over a resident TEXT column (the type matrix, doc 19): offsets[n+1] (u64 LE) +
+        // byte blob, where row i = blob[offsets[i]..offsets[i+1]]. The offsets are placed at a 4-mod-8
+        // byte offset to exercise the 2x 4-byte-load path (an 8-byte load there faults 716, sticky).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let rows: [&str; 6] = ["apple", "banana", "apple", "cherry", "banana", "apple"];
+        const N: u64 = 6;
+        let offsets_off: u64 = 12; // 4-mod-8 alignment: stress the 4-byte offset loads
+        let bytes_off: u64 = offsets_off + (N + 1) * 8;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&N.to_le_bytes()); // [0..8)
+        let mut offsets = Vec::new();
+        let mut blob = Vec::new();
+        offsets.extend_from_slice(&0u64.to_le_bytes());
+        for r in rows {
+            blob.extend_from_slice(r.as_bytes());
+            offsets.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        }
+
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                bytes_off + blob.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: offsets_off,
+                        bytes: &offsets,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: bytes_off,
+                        bytes: &blob,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        let eq = resident
+            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apple", false, N)
+            .expect("text = apple");
+        assert_eq!(eq, vec![0, 2, 5], "text = 'apple' => rows 0,2,5");
+
+        let ne = resident
+            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apple", true, N)
+            .expect("text <> apple");
+        assert_eq!(ne, vec![1, 3, 4], "text <> 'apple' => rows 1,3,4");
+
+        let banana = resident
+            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"banana", false, N)
+            .expect("text = banana");
+        assert_eq!(banana, vec![1, 4], "text = 'banana' => rows 1,4");
+
+        let none = resident
+            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"grape", false, N)
+            .expect("text = grape");
+        assert!(none.is_empty(), "text = 'grape' matches nothing");
+
+        // length mismatches are NOT equal (equality is full-string, not prefix/contains)
+        let prefix = resident
+            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"app", false, N)
+            .expect("text = app");
+        assert!(prefix.is_empty(), "text = 'app' (shorter) matches nothing");
+        let longer = resident
+            .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apples", false, N)
+            .expect("text = apples");
+        assert!(longer.is_empty(), "text = 'apples' (longer) matches nothing");
     }
 
     #[test]

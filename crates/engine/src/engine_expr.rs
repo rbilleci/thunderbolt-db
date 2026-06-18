@@ -37,6 +37,11 @@ pub(crate) enum ResidentBinaryOp {
     Ge,
     And,
     Or,
+    /// SQL `LIKE`: the lhs is a text column, the rhs a [`ResidentExpr::TextLiteral`] pattern (`%` =
+    /// any run, `_` = any one character). Byte-wise / UTF-8-char-aware (the type matrix, doc 19).
+    // Constructed by the SQL->Expr text mapper, landing in the next commit (the lowering).
+    #[allow(dead_code)]
+    Like,
 }
 
 /// The general scalar-expression IR the GPU interpreter evaluates. Column fields are table column
@@ -50,6 +55,9 @@ pub(crate) enum ResidentExpr {
     /// the target column's scale at lowering time (the type matrix, doc 19). An integer literal
     /// compared to a numeric column arrives as `Int4Literal` and is coerced to numeric on that path.
     NumericLiteral(Decimal128),
+    /// A text (`text`/`varchar`) literal -- the comparison/LIKE value for a text column. Compared
+    /// byte-wise (deterministic-collation equality is byte-identity; the type matrix, doc 19).
+    TextLiteral(String),
     Binary {
         op: ResidentBinaryOp,
         lhs: Box<ResidentExpr>,
@@ -118,7 +126,9 @@ fn expr_mentions_int8(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int8)
         }
-        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => false,
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table)
         }
@@ -132,7 +142,9 @@ fn expr_mentions_int4_column(expr: &ResidentExpr, table: &RelationalTable) -> bo
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int4)
         }
-        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => false,
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table)
         }
@@ -164,9 +176,44 @@ fn expr_mentions_numeric(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             Some(SqlType::Numeric { .. })
         ),
         ResidentExpr::NumericLiteral(_) => true,
-        ResidentExpr::Int4Literal(_) => false,
+        ResidentExpr::Int4Literal(_) | ResidentExpr::TextLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_numeric(lhs, table) || expr_mentions_numeric(rhs, table)
+        }
+    }
+}
+
+/// The column index if `expr` is a `Column` of text (`SqlType::Text`) type, else `None`.
+fn text_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
+    match expr {
+        ResidentExpr::Column(idx)
+            if table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Text) =>
+        {
+            Some(*idx)
+        }
+        _ => None,
+    }
+}
+
+/// The literal bytes if `expr` is a `TextLiteral`, else `None`.
+fn text_literal_value(expr: &ResidentExpr) -> Option<&str> {
+    match expr {
+        ResidentExpr::TextLiteral(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `expr` mentions text anywhere -- a text `Column` or a `TextLiteral`. Marks a predicate as
+/// text (the type matrix, doc 19).
+fn expr_mentions_text(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Text)
+        }
+        ResidentExpr::TextLiteral(_) => true,
+        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => false,
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table)
         }
     }
 }
@@ -258,6 +305,9 @@ fn numeric_arith_scale(expr: &ResidentExpr, table: &RelationalTable) -> Result<u
         }),
         ResidentExpr::NumericLiteral(decimal) => Ok(decimal.canonical().scale),
         ResidentExpr::Int4Literal(_) => Ok(0),
+        ResidentExpr::TextLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a text literal is not a numeric arithmetic operand".to_string(),
+        ))),
         ResidentExpr::Binary { op, lhs, rhs } => {
             let lhs_scale = numeric_arith_scale(lhs, table)?;
             let rhs_scale = numeric_arith_scale(rhs, table)?;
@@ -392,11 +442,11 @@ fn compile_numeric_arith(
                 (Some(_), Some(_)) => Err(literal_only()),
             }
         }
-        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => {
-            Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "a bare numeric literal cannot be an arithmetic value".to_string(),
-            )))
-        }
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a bare literal cannot be a numeric arithmetic value".to_string(),
+        ))),
     }
 }
 
@@ -551,12 +601,12 @@ fn compile_arith_program(
                 ))),
             }
         }
-        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => {
-            Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident Expr arithmetic value cannot be a bare literal (constant-folding pending)"
-                    .to_string(),
-            )))
-        }
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::TextLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident Expr arithmetic value cannot be a bare literal (constant-folding pending)"
+                .to_string(),
+        ))),
     }
 }
 
@@ -949,6 +999,93 @@ impl Engine {
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
     }
 
+    /// Try to lower a SIMPLE text comparison (`textcol = 'lit'` / `textcol <> 'lit'`, either operand
+    /// order) to surviving row indices via the byte-wise text-equality kernel (the type matrix, doc
+    /// 19). Equality is byte identity -- PG deterministic-collation semantics. Returns None for a
+    /// non-text predicate (the other type paths handle it). Text INEQUALITIES (need collation sort
+    /// keys), `LIKE`, text `AND`/`OR`, text column-vs-column, and text mixed with another type are hard
+    /// errors -- never a silent mis-answer.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_text_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        if !(expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table)) {
+            return Ok(None);
+        }
+        if expr_mentions_int4_column(lhs, table)
+            || expr_mentions_int4_column(rhs, table)
+            || expr_mentions_int8(lhs, table)
+            || expr_mentions_int8(rhs, table)
+            || expr_mentions_numeric(lhs, table)
+            || expr_mentions_numeric(rhs, table)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor does not support mixed text/non-text expressions"
+                    .to_string(),
+            )));
+        }
+        let negate = match compare {
+            ResidentBinaryOp::Eq => false,
+            ResidentBinaryOp::Ne => true,
+            ResidentBinaryOp::Lt
+            | ResidentBinaryOp::Le
+            | ResidentBinaryOp::Gt
+            | ResidentBinaryOp::Ge => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "text inequalities need collation sort keys (a follow-on); only = and <> run \
+                     on the GPU"
+                        .to_string(),
+                )));
+            }
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "the general GPU executor supports text = and <> only (LIKE and text AND/OR \
+                     are follow-ons)"
+                        .to_string(),
+                )));
+            }
+        };
+        // textcol <eq/ne> 'literal' -- equality is symmetric, so operand order does not matter.
+        let (col, literal) = match (text_column_index(lhs, table), text_column_index(rhs, table)) {
+            (Some(col), None) if text_literal_value(rhs).is_some() => {
+                (col, text_literal_value(rhs).expect("checked"))
+            }
+            (None, Some(col)) if text_literal_value(lhs).is_some() => {
+                (col, text_literal_value(lhs).expect("checked"))
+            }
+            (Some(_), Some(_)) => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "text column-vs-column comparison is a follow-on".to_string(),
+                )));
+            }
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "text comparison must be a column against a literal".to_string(),
+                )));
+            }
+        };
+        let layout = resident_device_text_column_layout(snapshot, table, col)?;
+        device_memory
+            .expr_text_eq_scalar_filter(
+                layout.offsets_byte_offset,
+                layout.bytes_byte_offset,
+                literal.as_bytes(),
+                negate,
+                row_count,
+            )
+            .map(Some)
+            .map_err(|err: gpu_db_execution::CudaRuntimeProbeError| {
+                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+            })
+    }
+
     /// Try to lower a SIMPLE numeric comparison to surviving row indices via the i128 compare kernels
     /// (the type matrix, doc 19). Supported: `numcol <cmp> literal` / `literal <cmp> numcol` and
     /// `numcol <cmp> numcol`, at ANY scale -- same-scale (and coarser-or-equal literal) use the
@@ -1142,6 +1279,22 @@ impl Engine {
         // kernels. Returns None for a non-numeric predicate (fall through to int4); errors on a numeric
         // shape not yet supported (numeric arithmetic / AND-OR / mixed) so it never mis-answers.
         if let Some(indices) = self.try_lower_numeric_predicate(
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
+            return Ok(indices);
+        }
+
+        // text path (type matrix, doc 19): a SIMPLE text comparison (`textcol = 'lit'` / `<>`)
+        // evaluates via the byte-wise text-equality kernel. Returns None for a non-text predicate
+        // (fall through to int4); errors on a text shape not yet supported (LIKE / inequalities /
+        // AND-OR / mixed) so it never silently mis-answers.
+        if let Some(indices) = self.try_lower_text_predicate(
             *compare,
             lhs,
             rhs,
