@@ -98,12 +98,18 @@ fn parse_time_of_day(text: &str) -> Option<i64> {
             if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
-            // Right-pad (or truncate) the fractional digits to exactly 6 -> microseconds.
+            // Right-pad the fractional digits to 6 -> microseconds, then round half-up on the 7th
+            // digit (PG rounds, not truncates). A rounded value of 1_000_000 carries into the seconds
+            // via the integer addition below (and, at end-of-day, into the next day in parse_timestamp).
             let mut micros = [b'0'; 6];
             for (slot, byte) in micros.iter_mut().zip(f.bytes()) {
                 *slot = byte;
             }
-            std::str::from_utf8(&micros).ok()?.parse::<i64>().ok()?
+            let mut value = std::str::from_utf8(&micros).ok()?.parse::<i64>().ok()?;
+            if f.as_bytes().get(6).is_some_and(|seventh| *seventh >= b'5') {
+                value += 1;
+            }
+            value
         }
     };
     Some(h * 3_600_000_000 + m * 60_000_000 + s * MICROS_PER_SEC + frac_micros)
@@ -218,6 +224,18 @@ mod tests {
         assert_eq!(parse_timestamp("2000-01-01 00:00:00.5"), Some(500_000), ".5 => 500000 us");
         assert_eq!(parse_timestamp("2000-01-01 00:00:00.000001"), Some(1), "one microsecond");
         assert_eq!(parse_timestamp("2000-01-01 00:00:00.123456"), Some(123_456));
+        // A 7th fractional digit rounds half-up (PG rounds, not truncates).
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00.1234564"), Some(123_456), "round down");
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00.1234565"), Some(123_457), "round half up");
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00.1234567"), Some(123_457), "round up");
+        // Rounding that carries: .9999995 -> 1_000_000 us = one second past the epoch.
+        assert_eq!(parse_timestamp("2000-01-01 00:00:00.9999995"), Some(1_000_000), "carry into seconds");
+        // Carry across the end of a day rolls into the next day's midnight.
+        assert_eq!(
+            parse_timestamp("2024-01-15 23:59:59.9999995"),
+            parse_timestamp("2024-01-16 00:00:00"),
+            "carry across the day boundary"
+        );
         // PG trims trailing zeros from the fractional part on output, omits it when zero.
         assert_eq!(format_timestamp(0), "2000-01-01 00:00:00");
         assert_eq!(format_timestamp(500_000), "2000-01-01 00:00:00.5");
