@@ -682,8 +682,6 @@ pub(crate) fn resident_device_int8_column_offset(
 /// columns before this one (`numeric_ordinal * row_count * 16`). Validates the column is numeric and
 /// present in `snapshot.resident_device_numeric_columns`. A numeric mantissa is a fixed 16-byte i128;
 /// the decimal scale is the column's catalog scale (values are rescaled on insert), not stored here.
-// Not yet called — the numeric compare / projection lowering (the next slice) is the first caller.
-#[allow(dead_code)]
 pub(crate) fn resident_device_numeric_column_offset(
     snapshot: &RelationalResidencySnapshot,
     table: &RelationalTable,

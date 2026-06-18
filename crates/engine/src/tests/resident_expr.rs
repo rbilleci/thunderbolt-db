@@ -700,3 +700,85 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
         "mixed int4/int8 AND -> hard error, not a wrong answer"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
+    // numeric (NUMERIC / i128) comparison + projection end-to-end from SQL (the type matrix, doc 19).
+    // price[i] = i.50 (NUMERIC(10,2)), cost[i] = (N-1-i).50. Closed-form oracles; the i128 signedness
+    // is proven separately in the execution-crate primitive test.
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,2), label INT)",
+    )
+    .unwrap();
+
+    const N: i64 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        // price = i.50, cost = (N-1-i).50, label = i
+        values.push_str(&format!("({i}.50, {}.50, {i})", N - 1 - i));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let num = |whole: i64| SqlValue::Numeric(Decimal128::new(i128::from(whole) * 100 + 50, 2)); // whole.50
+
+    // literal at the column scale: price > 10.50 => i+0.50 > 10.50 => i > 10 => [11, N). Project price.
+    let gt = e
+        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.50")
+        .expect("price > 10.50 on GPU");
+    let gt_expected: Vec<Vec<SqlValue>> = (11..N).map(|i| vec![num(i)]).collect();
+    assert_eq!(gt.rows, gt_expected, "price > 10.50 => i.50 for i in [11, 600)");
+    assert_eq!(gt.executed_target, DeviceTarget::Gpu(0));
+
+    // integer literal coerced to numeric: price < 5 => i+0.50 < 5 => i <= 4 => [0, 5).
+    let lt_int = e
+        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price < 5")
+        .expect("price < 5 on GPU");
+    let lt_int_expected: Vec<Vec<SqlValue>> = (0..5).map(|i| vec![num(i)]).collect();
+    assert_eq!(lt_int.rows, lt_int_expected, "price < 5 (int coerced) => [0, 5)");
+
+    // lower-scale literal rescales UP exactly: price > 10.5 (scale 1) == price > 10.50 => [11, N).
+    let gt_low = e
+        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.5")
+        .expect("price > 10.5 on GPU");
+    assert_eq!(gt_low.rows, gt_expected, "price > 10.5 (scale 1) == price > 10.50");
+
+    // col-vs-col, equal scale: price < cost => i+0.50 < (N-1-i)+0.50 => 2i < N-1 => [0, 300).
+    let cols = e
+        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price < cost")
+        .expect("price < cost on GPU");
+    let cols_expected: Vec<Vec<SqlValue>> = (0..300).map(|i| vec![num(i)]).collect();
+    assert_eq!(cols.rows, cols_expected, "price < cost => [0, 300)");
+
+    // REJECTIONS — hard errors, never wrong rows:
+    // a literal with more fractional digits than the column would need rounding (PG compares exactly).
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.555")
+            .is_err(),
+        "literal scale > column scale => hard error"
+    );
+    // mixed numeric vs an int4 column.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT price FROM t WHERE price > label")
+            .is_err(),
+        "mixed numeric/int4 column => hard error"
+    );
+    // numeric AND/OR is a follow-on.
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT price FROM t WHERE price > 1.00 AND price < 100.00"
+        )
+        .is_err(),
+        "numeric AND/OR => hard error (follow-on)"
+    );
+}

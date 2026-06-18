@@ -151,7 +151,7 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 0 ORDER BY a", "ORDER BY"); // ordering
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a / b > 1", "/"); // unsupported operator
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE NOT a > 1", "NOT"); // unary NOT (AND/OR are ok)
-    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 'x'", "int4 literals"); // non-int literal
+    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 'x'", "int4 and numeric literals only"); // string literal
     // A column qualifier that does not name the FROM relation is PG's "missing FROM-clause entry",
     // never silently resolved to t.a (load-bearing once joins make same-named columns ambiguous).
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE wrong.a > 0", "missing FROM-clause");

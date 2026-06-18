@@ -46,6 +46,10 @@ pub(crate) enum ResidentBinaryOp {
 pub(crate) enum ResidentExpr {
     Column(usize),
     Int4Literal(i32),
+    /// A numeric (DECIMAL) literal as its [`Decimal128`] (mantissa + scale). Compared by rescaling to
+    /// the target column's scale at lowering time (the type matrix, doc 19). An integer literal
+    /// compared to a numeric column arrives as `Int4Literal` and is coerced to numeric on that path.
+    NumericLiteral(Decimal128),
     Binary {
         op: ResidentBinaryOp,
         lhs: Box<ResidentExpr>,
@@ -114,7 +118,7 @@ fn expr_mentions_int8(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int8)
         }
-        ResidentExpr::Int4Literal(_) => false,
+        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table)
         }
@@ -128,11 +132,83 @@ fn expr_mentions_int4_column(expr: &ResidentExpr, table: &RelationalTable) -> bo
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int4)
         }
-        ResidentExpr::Int4Literal(_) => false,
+        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table)
         }
     }
+}
+
+/// The column index if `expr` is a `Column` of numeric (`SqlType::Numeric`) type, else `None`.
+fn numeric_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
+    match expr {
+        ResidentExpr::Column(idx)
+            if matches!(
+                table.columns.get(*idx).map(|column| column.ty),
+                Some(SqlType::Numeric { .. })
+            ) =>
+        {
+            Some(*idx)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` mentions numeric anywhere — a numeric `Column` or a `NumericLiteral`. Marks a
+/// predicate as numeric (the type matrix, doc 19); an `Int4Literal` is integer until it is coerced
+/// against a numeric column.
+fn expr_mentions_numeric(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => matches!(
+            table.columns.get(*idx).map(|column| column.ty),
+            Some(SqlType::Numeric { .. })
+        ),
+        ResidentExpr::NumericLiteral(_) => true,
+        ResidentExpr::Int4Literal(_) => false,
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_numeric(lhs, table) || expr_mentions_numeric(rhs, table)
+        }
+    }
+}
+
+/// The numeric value of a literal operand: a `NumericLiteral` as-is, or an `Int4Literal` coerced to
+/// `Decimal128` (scale 0) — PG's integer->numeric coercion. `None` for a non-literal.
+fn numeric_literal_value(expr: &ResidentExpr) -> Option<Decimal128> {
+    match expr {
+        ResidentExpr::NumericLiteral(value) => Some(*value),
+        ResidentExpr::Int4Literal(value) => Some(Decimal128::new(i128::from(*value), 0)),
+        _ => None,
+    }
+}
+
+/// The declared scale of a numeric column, or `None` if the column is not numeric.
+fn column_numeric_scale(table: &RelationalTable, column_idx: usize) -> Option<u8> {
+    match table.columns.get(column_idx).map(|column| column.ty) {
+        Some(SqlType::Numeric { scale, .. }) => Some(scale),
+        _ => None,
+    }
+}
+
+/// Rescale a numeric literal to a column's scale and return the comparable i128 mantissa. The literal
+/// rescales UP exactly (its scale <= the column scale). A literal with MORE fractional digits than the
+/// column is rejected: rescaling it down would round, and PG compares numerics exactly — rounding
+/// would yield wrong rows. Cross-scale comparison (rescaling the column on the GPU) is a follow-on.
+fn rescale_numeric_literal(literal: Decimal128, column_scale: u8) -> Result<i128, ExecuteError> {
+    if literal.scale > column_scale {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "numeric literal has more fractional digits than the column scale (exact cross-scale \
+             comparison is a follow-on)"
+                .to_string(),
+        )));
+    }
+    literal
+        .rescale(column_scale)
+        .map(|rescaled| rescaled.mantissa)
+        .map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "numeric literal out of range after rescaling to the column scale".to_string(),
+            ))
+        })
 }
 
 /// Compile an int4 arithmetic value expression into postfix [`ExprStep`] bytecode for the device
@@ -195,10 +271,12 @@ fn compile_arith_program(
                 ))),
             }
         }
-        ResidentExpr::Int4Literal(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident Expr arithmetic value cannot be a bare literal (constant-folding pending)"
-                .to_string(),
-        ))),
+        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => {
+            Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident Expr arithmetic value cannot be a bare literal (constant-folding pending)"
+                    .to_string(),
+            )))
+        }
     }
 }
 
@@ -326,9 +404,10 @@ impl Engine {
         }
         for &col in &bound.selected_indexes {
             let ty = table.columns[col].ty;
-            if ty != SqlType::Int4 && ty != SqlType::Int8 {
+            if ty != SqlType::Int4 && ty != SqlType::Int8 && !matches!(ty, SqlType::Numeric { .. }) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident Expr select currently materializes int4 / int8 projection columns only"
+                    "resident Expr select currently materializes int4 / int8 / numeric projection \
+                     columns only"
                         .to_string(),
                 )));
             }
@@ -387,22 +466,39 @@ impl Engine {
         enum ProjectedColumn {
             Int4(Vec<i32>),
             Int8(Vec<i64>),
+            Numeric(Vec<i128>, u8),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
         for &col in &bound.selected_indexes {
-            let column = if table.columns[col].ty == SqlType::Int8 {
-                let byte_offset = resident_device_int8_column_offset(&snapshot, table, col)?;
-                let values = device_memory
-                    .project_i64_rows_from_payload(byte_offset, &indices_u64)
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-                ProjectedColumn::Int8(values)
-            } else {
-                let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
-                let values = device_memory
-                    .project_i32_rows_from_payload(byte_offset, &indices_u64)
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-                ProjectedColumn::Int4(values)
+            let column = match table.columns[col].ty {
+                SqlType::Int8 => {
+                    let byte_offset = resident_device_int8_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_i64_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Int8(values)
+                }
+                SqlType::Numeric { scale, .. } => {
+                    let byte_offset = resident_device_numeric_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_i128_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Numeric(values, scale)
+                }
+                _ => {
+                    let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_i32_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Int4(values)
+                }
             };
             projected_columns.push(column);
         }
@@ -413,6 +509,9 @@ impl Engine {
                     .map(|column| match column {
                         ProjectedColumn::Int4(values) => SqlValue::Int4(values[row]),
                         ProjectedColumn::Int8(values) => SqlValue::Int8(values[row]),
+                        ProjectedColumn::Numeric(values, scale) => {
+                            SqlValue::Numeric(Decimal128::new(values[row], *scale))
+                        }
                     })
                     .collect()
             })
@@ -537,6 +636,96 @@ impl Engine {
             .map_err(map_err)
     }
 
+    /// Try to lower a SIMPLE numeric comparison to surviving row indices via the i128 compare kernels
+    /// (the type matrix, doc 19). Supported: `numcol <cmp> literal` / `literal <cmp> numcol` (the
+    /// literal — numeric or integer — is rescaled to the column's scale; a literal with MORE fractional
+    /// digits than the column is rejected, since rounding it would mis-answer) and `numcol <cmp> numcol`
+    /// of EQUAL scale. Returns None for a non-numeric predicate (the int4/int8 paths handle it). A
+    /// numeric value mixed with an int4/int8 COLUMN, numeric arithmetic, or numeric AND/OR is a hard
+    /// error — never a silent mis-answer.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_numeric_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        if !(expr_mentions_numeric(lhs, table) || expr_mentions_numeric(rhs, table)) {
+            return Ok(None);
+        }
+        if expr_mentions_int4_column(lhs, table)
+            || expr_mentions_int4_column(rhs, table)
+            || expr_mentions_int8(lhs, table)
+            || expr_mentions_int8(rhs, table)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor does not support mixed numeric/integer expressions yet"
+                    .to_string(),
+            )));
+        }
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only simple numeric comparisons (numeric AND/OR \
+                 and arithmetic are follow-ons)"
+                    .to_string(),
+            )));
+        };
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        match (
+            numeric_column_index(lhs, table),
+            numeric_column_index(rhs, table),
+        ) {
+            (Some(col), None) if numeric_literal_value(rhs).is_some() => {
+                let scale = column_numeric_scale(table, col).expect("numeric column has a scale");
+                let mantissa =
+                    rescale_numeric_literal(numeric_literal_value(rhs).expect("checked"), scale)?;
+                let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
+                device_memory
+                    .expr_i128_compare_scalar_filter(offset, mantissa, false, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (None, Some(col)) if numeric_literal_value(lhs).is_some() => {
+                let scale = column_numeric_scale(table, col).expect("numeric column has a scale");
+                let mantissa =
+                    rescale_numeric_literal(numeric_literal_value(lhs).expect("checked"), scale)?;
+                let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
+                device_memory
+                    .expr_i128_compare_scalar_filter(offset, mantissa, true, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (Some(a), Some(b)) => {
+                let a_scale = column_numeric_scale(table, a).expect("numeric column has a scale");
+                let b_scale = column_numeric_scale(table, b).expect("numeric column has a scale");
+                if a_scale != b_scale {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "numeric column-vs-column comparison requires equal scales (cross-scale \
+                         rescaling on the GPU is a follow-on)"
+                            .to_string(),
+                    )));
+                }
+                let a_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
+                let b_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
+                device_memory
+                    .expr_i128_compare_columns_filter(a_offset, b_offset, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only simple numeric comparisons (column vs \
+                 literal/column); numeric arithmetic is a follow-on"
+                    .to_string(),
+            ))),
+        }
+    }
+
     /// Lower a predicate [`ResidentExpr`] to the surviving row indices, evaluated on the GPU.
     ///
     /// Coverage (grows by extending this method, per the design): the prototype shape
@@ -571,6 +760,22 @@ impl Engine {
         // (int8 arithmetic / mixed int4-int8) so the executor never silently mis-answers.
         if let Some(indices) = self.try_lower_int8_predicate(
             predicate,
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
+            return Ok(indices);
+        }
+
+        // numeric path (type matrix, doc 19): a SIMPLE numeric comparison (`numcol <cmp> literal` /
+        // `literal <cmp> numcol` / equal-scale `numcol <cmp> numcol`) evaluates via the i128 compare
+        // kernels. Returns None for a non-numeric predicate (fall through to int4); errors on a numeric
+        // shape not yet supported (numeric arithmetic / AND-OR / mixed) so it never mis-answers.
+        if let Some(indices) = self.try_lower_numeric_predicate(
             *compare,
             lhs,
             rhs,

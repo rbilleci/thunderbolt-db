@@ -211,8 +211,14 @@ fn map_predicate_node(
         )?)),
         NodeEnum::AConst(constant) => match &constant.val {
             Some(a_const::Val::Ival(integer)) => Ok(ResidentExpr::Int4Literal(integer.ival)),
+            // A numeric literal (a decimal point / exponent) arrives as a Float whose `fval` is the
+            // source text; parse it to Decimal128 at its natural scale. The type matrix (doc 19)
+            // compares it by rescaling to the column scale at lowering time.
+            Some(a_const::Val::Fval(float)) => Decimal128::parse(&float.fval)
+                .map(ResidentExpr::NumericLiteral)
+                .ok_or_else(|| sql_pg_error(format!("malformed numeric literal: {}", float.fval))),
             _ => Err(sql_pg_error(
-                "the general GPU executor supports int4 literals only".to_string(),
+                "the general GPU executor supports int4 and numeric literals only".to_string(),
             )),
         },
         NodeEnum::AExpr(a_expr) => map_a_expr(a_expr, table, qualifier),
