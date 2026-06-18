@@ -473,3 +473,80 @@ fn gpu_resident_expr_checked_arithmetic_admits_the_largest_in_range_values() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_int8_predicates() {
+    // int8 (BIGINT) end to end on the general GPU executor from SQL text (the type matrix, doc 19):
+    // scalar comparison, column-vs-column with values ABOVE i32::MAX (proving genuine 64-bit), the Ne
+    // operator, and both int8 + int4 projection. Plus the unsupported-int8-shape hard errors.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, big BIGINT, big2 BIGINT, small BIGINT)")
+        .unwrap();
+
+    const N: i64 = 600;
+    const BASE: i64 = 4_000_000_000; // > i32::MAX (2_147_483_647)
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {}, {}, {i})", BASE + i, BASE + (N - 1 - i)));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, big, big2, small) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // (1) int8 scalar comparison + int8 projection: small[i]=i, small > 400 => [401, 600).
+    let scalar = e
+        .execute_resident_expr_select_sql("SELECT small FROM t WHERE small > 400")
+        .expect("int8 scalar comparison on GPU");
+    let scalar_expected: Vec<Vec<SqlValue>> = (401..N).map(|i| vec![SqlValue::Int8(i)]).collect();
+    assert_eq!(
+        scalar.rows, scalar_expected,
+        "small > 400 => small=i for i in [401, 600)"
+    );
+    assert_eq!(scalar.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(scalar.fallback_reason, None);
+
+    // (2) int8 column-vs-column + 64-bit + i64 projection: big[i]=BASE+i, big2[i]=BASE+(N-1-i);
+    // big < big2 <=> i < N-1-i <=> [0, 300). Projected big = BASE+i (values above i32::MAX).
+    let cols = e
+        .execute_resident_expr_select_sql("SELECT big FROM t WHERE big < big2")
+        .expect("int8 col-vs-col on GPU");
+    let cols_expected: Vec<Vec<SqlValue>> =
+        (0..300).map(|i| vec![SqlValue::Int8(BASE + i)]).collect();
+    assert_eq!(
+        cols.rows, cols_expected,
+        "big < big2 => big=BASE+i for i in [0, 300) (64-bit values)"
+    );
+
+    // (3) int8 Ne predicate + int4 projection (the projection type is independent of the predicate
+    // type): small <> 300 => every row but i=300, projecting the int4 column a.
+    let ne = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE small <> 300")
+        .expect("int8 Ne on GPU");
+    let mut ne_expected: Vec<Vec<SqlValue>> =
+        (0..300).map(|i| vec![SqlValue::Int4(i)]).collect();
+    ne_expected.extend((301..N as i32).map(|i| vec![SqlValue::Int4(i)]));
+    assert_eq!(
+        ne.rows, ne_expected,
+        "small <> 300 => all rows but i=300, projecting int4 a"
+    );
+
+    // (4) Unsupported int8 shapes are HARD errors (never a silent mis-answer): int8 arithmetic and a
+    // mixed int4/int8 comparison.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT big FROM t WHERE big + 1 > big2")
+            .is_err(),
+        "int8 arithmetic is not supported yet -> hard error, not a wrong answer"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT big FROM t WHERE a < big")
+            .is_err(),
+        "mixed int4/int8 comparison -> hard error"
+    );
+}

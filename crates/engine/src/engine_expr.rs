@@ -93,6 +93,34 @@ fn is_int4_literal(expr: &ResidentExpr) -> bool {
     matches!(expr, ResidentExpr::Int4Literal(_))
 }
 
+/// The column index if `expr` is a `Column` of int8 (`SqlType::Int8`) type, else `None` (the type
+/// matrix, doc 19).
+fn int8_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
+    match expr {
+        ResidentExpr::Column(idx)
+            if table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int8) =>
+        {
+            Some(*idx)
+        }
+        _ => None,
+    }
+}
+
+/// Whether any `Column` referenced anywhere in `expr` is int8 — used to reject an int8 shape the
+/// simple-comparison path does not yet support (int8 arithmetic, mixed int4/int8) rather than
+/// silently routing it to the int4 path.
+fn expr_mentions_int8(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int8)
+        }
+        ResidentExpr::Int4Literal(_) => false,
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table)
+        }
+    }
+}
+
 /// Compile an int4 arithmetic value expression into postfix [`ExprStep`] bytecode for the device
 /// VM. Recurses: a `Column` loads to a buffer; a `Binary{arith}` emits its operands then a buffer x
 /// buffer op, or folds an immediate literal operand into a buffer x scalar op (preserving operand
@@ -281,9 +309,10 @@ impl Engine {
             )));
         }
         for &col in &bound.selected_indexes {
-            if table.columns[col].ty != SqlType::Int4 {
+            let ty = table.columns[col].ty;
+            if ty != SqlType::Int4 && ty != SqlType::Int8 {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident Expr select currently materializes only int4 projection columns"
+                    "resident Expr select currently materializes int4 / int8 projection columns only"
                         .to_string(),
                 )));
             }
@@ -337,20 +366,38 @@ impl Engine {
         )?;
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
 
-        // Materialize: gather each projected int4 column at the surviving row indices on the GPU.
-        let mut projected_columns: Vec<Vec<i32>> = Vec::with_capacity(bound.selected_indexes.len());
+        // Materialize: gather each projected column at the surviving row indices on the GPU, by type
+        // (int4 -> i32 gather, int8 -> i64 gather; the type matrix, doc 19).
+        enum ProjectedColumn {
+            Int4(Vec<i32>),
+            Int8(Vec<i64>),
+        }
+        let mut projected_columns: Vec<ProjectedColumn> =
+            Vec::with_capacity(bound.selected_indexes.len());
         for &col in &bound.selected_indexes {
-            let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
-            let values = device_memory
-                .project_i32_rows_from_payload(byte_offset, &indices_u64)
-                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
-            projected_columns.push(values);
+            let column = if table.columns[col].ty == SqlType::Int8 {
+                let byte_offset = resident_device_int8_column_offset(&snapshot, table, col)?;
+                let values = device_memory
+                    .project_i64_rows_from_payload(byte_offset, &indices_u64)
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                ProjectedColumn::Int8(values)
+            } else {
+                let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
+                let values = device_memory
+                    .project_i32_rows_from_payload(byte_offset, &indices_u64)
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                ProjectedColumn::Int4(values)
+            };
+            projected_columns.push(column);
         }
         let rows: Vec<Vec<SqlValue>> = (0..indices_u64.len())
             .map(|row| {
                 projected_columns
                     .iter()
-                    .map(|column| SqlValue::Int4(column[row]))
+                    .map(|column| match column {
+                        ProjectedColumn::Int4(values) => SqlValue::Int4(values[row]),
+                        ProjectedColumn::Int8(values) => SqlValue::Int8(values[row]),
+                    })
                     .collect()
             })
             .collect();
@@ -363,6 +410,78 @@ impl Engine {
             fallback_reason: None,
             access_path,
         })
+    }
+
+    /// Try to lower a SIMPLE int8 comparison to surviving row indices via the i64 compare kernels
+    /// (the type matrix, doc 19). Supported shapes: `int8col <cmp> int4literal` (the int4 literal is
+    /// widened to int8 — PG's int4->int8 coercion), `int4literal <cmp> int8col` (operand order
+    /// preserved via `scalar_on_left`), and `int8col <cmp> int8col`.
+    ///
+    /// Returns `Ok(None)` for a pure-int4 predicate (the caller falls through to the int4 path) and
+    /// `Err` when int8 appears in a shape not yet supported (int8 arithmetic, or a mixed int4/int8
+    /// expression) — never a silent fall-through that would mis-answer.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_int8_comparison(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        // Only comparisons take the int8 simple path; AND/OR (boolean combinators) are not handled
+        // here even over int8 columns (a later slice), so return None and let the caller decide.
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Ok(None);
+        };
+        let lhs_int8 = int8_column_index(lhs, table);
+        let rhs_int8 = int8_column_index(rhs, table);
+        let map_err =
+            |err| ExecuteError::Engine(EngineError::ApplyFailed(format!("int8 compare: {err}")));
+
+        match (lhs, rhs) {
+            (ResidentExpr::Int4Literal(scalar), _) if rhs_int8.is_some() => {
+                let offset =
+                    resident_device_int8_column_offset(snapshot, table, rhs_int8.expect("checked"))?;
+                device_memory
+                    .expr_i64_compare_scalar_filter(offset, i64::from(*scalar), true, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            (_, ResidentExpr::Int4Literal(scalar)) if lhs_int8.is_some() => {
+                let offset =
+                    resident_device_int8_column_offset(snapshot, table, lhs_int8.expect("checked"))?;
+                device_memory
+                    .expr_i64_compare_scalar_filter(offset, i64::from(*scalar), false, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            _ if lhs_int8.is_some() && rhs_int8.is_some() => {
+                let a_offset =
+                    resident_device_int8_column_offset(snapshot, table, lhs_int8.expect("checked"))?;
+                let b_offset =
+                    resident_device_int8_column_offset(snapshot, table, rhs_int8.expect("checked"))?;
+                device_memory
+                    .expr_i64_compare_columns_filter(a_offset, b_offset, cmp, row_count)
+                    .map(Some)
+                    .map_err(map_err)
+            }
+            _ => {
+                // Not a simple int8 comparison. If int8 appears anywhere, the shape is unsupported
+                // (int8 arithmetic / mixed int4-int8) -> hard error; otherwise pure int4 -> None.
+                if expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table) {
+                    Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "the general GPU executor supports only simple int8 comparisons (no int8 \
+                         arithmetic or mixed int4/int8 expressions yet)"
+                            .to_string(),
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     /// Lower a predicate [`ResidentExpr`] to the surviving row indices, evaluated on the GPU.
@@ -391,6 +510,23 @@ impl Engine {
                 "resident Expr predicate must be a top-level comparison or AND/OR".to_string(),
             )));
         };
+
+        // int8 path (type matrix, doc 19): a SIMPLE int8 comparison (`int8col <cmp> literal` /
+        // `literal <cmp> int8col` / `int8col <cmp> int8col`) evaluates via the i64 compare kernels,
+        // before the int4 paths below. `try_lower_int8_comparison` returns None for a pure-int4
+        // predicate (fall through to the int4 path) and errors for an int8 shape not yet supported
+        // (int8 arithmetic / mixed int4-int8) so the executor never silently mis-answers.
+        if let Some(indices) = self.try_lower_int8_comparison(
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
+            return Ok(indices);
+        }
 
         // Boolean combinators (AND/OR) and `Ne` lower to the general mask-based predicate VM (each
         // comparison -> a mask, MaskBinary combines, the terminal compacts). The fused 2-col / arith

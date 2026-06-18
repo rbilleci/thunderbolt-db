@@ -614,9 +614,6 @@ pub(crate) fn resident_device_int4_column_offset(
 /// 19). Layout: header (u64) + the WHOLE int4 section (`int4_columns * row_count * 4`) + the int8
 /// columns before this one (`int8_ordinal * row_count * 8`). Validates the column is int8 and present
 /// in `snapshot.resident_device_int8_columns`. Mirrors [`resident_device_int4_column_offset`].
-// Forward API: the int8 VM slice (the general executor's int8 load/compare path) is the production
-// caller; today only the residency bookkeeping test reads it. Drop this allow when that slice lands.
-#[allow(dead_code)]
 pub(crate) fn resident_device_int8_column_offset(
     snapshot: &RelationalResidencySnapshot,
     table: &RelationalTable,
