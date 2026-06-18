@@ -69,11 +69,14 @@ The executor is int4 end to end; each new type extends the same four layers:
    `price > 1.555`): when scales differ, load to i128 buffers and rescale the coarser side UP to the
    common = max scale (mantissa * 10^k via the mul kernel, k <= 9; engine-only, no new kernel) before
    the op; same-scale stays on the resident peephole. `numeric_arith_scale` predicts each side's scale
-   statically (so cross-scale add/sub can rescale operands in the right stack order). Mixed
-   numeric/integer, numeric `AND`/`OR`, large in-arith literals, and >9-digit / overflowing rescales are
-   hard errors. **SIX audits all SHIP** (compare found the alignment P0; add/sub 19k-fuzz; scalar-mul
-   310k-fuzz; col*col-mul 45k-fuzz; cross-scale-compare 4.6k-fuzz + max->min fault-injection). NEXT:
-   numeric `AND`/`OR` (route numeric boolean combinators through the i128 mask VM).
+   statically (so cross-scale add/sub can rescale operands in the right stack order). **Numeric
+   `AND`/`OR` also DONE** (`price > 1 AND price < 100`, incl. cross-scale + nested): each comparison
+   compiles to a MASK via the shared `compile_numeric_compare`, `MaskBinary` combines, the i128 VM
+   compacts -- mirroring the int path's `compile_predicate_program`. Mixed numeric/integer predicates,
+   large in-arith literals, and >9-digit / overflowing rescales are hard errors. **SEVEN audits all
+   SHIP** (compare found the alignment P0; add/sub 19k-fuzz; scalar-mul 310k-fuzz; col*col-mul 45k-fuzz;
+   cross-scale-compare 4.6k-fuzz; cross-scale add/sub 60-iter fuzz + 4 fault-injections). NUMERIC is now
+   essentially complete on the general executor. NEXT: the **text** type (compare + `LIKE`).
 
    NOTE (gotcha): PTX comments must be PURE ASCII — the runtime JIT's ptxas rejects a non-ASCII byte
    ("Unexpected non-ASCII character", INVALID_PTX 218) that the LOCAL ptxas tolerates. A guard test

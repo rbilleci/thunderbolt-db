@@ -786,13 +786,15 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
             .is_err(),
         "mixed numeric/int4 column => hard error"
     );
-    // numeric AND/OR is a follow-on.
-    assert!(
-        e.execute_resident_expr_select_sql(
-            "SELECT price FROM t WHERE price > 1.00 AND price < 100.00"
-        )
-        .is_err(),
-        "numeric AND/OR => hard error (follow-on)"
+    // numeric AND/OR now lowers via the i128 mask VM: price > 1.00 AND price < 100.00 (price = i.50)
+    // <=> 0 < i < 100 => [1, 100). Project price.
+    let and = e
+        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 1.00 AND price < 100.00")
+        .expect("price>1.00 AND price<100.00 on GPU");
+    let and_expected: Vec<Vec<SqlValue>> = (1..100).map(|i| vec![num(i)]).collect();
+    assert_eq!(
+        and.rows, and_expected,
+        "price>1.00 AND price<100.00 => price for i in [1, 100)"
     );
 }
 
@@ -1030,4 +1032,83 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_add_sub() {
         .expect("p2+0.0001>50.5 on GPU");
     let lit_expected: Vec<Vec<SqlValue>> = (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
     assert_eq!(lit.rows, lit_expected, "p2 + 0.0001 (finer literal) > 50.5 => [50, 600)");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
+    // numeric AND/OR (the type matrix, doc 19): each comparison -> a mask via the i128 VM, MaskBinary
+    // combines, terminal compact. price = i.50 (NUMERIC(10,2)), cost = i.2500 (NUMERIC(10,4)).
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (price NUMERIC(10,2), cost NUMERIC(10,4), label INT)",
+    )
+    .unwrap();
+
+    const N: i64 = 600;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}.50, {i}.2500, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // AND: price > 10.50 AND price < 100.50 <=> 10 < i < 100 => [11, 100).
+    let and = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE price > 10.50 AND price < 100.50",
+        )
+        .expect("AND on GPU");
+    let and_expected: Vec<Vec<SqlValue>> =
+        (11i64..100).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(and.rows, and_expected, "price>10.50 AND price<100.50 => [11, 100)");
+    assert_eq!(and.executed_target, DeviceTarget::Gpu(0));
+
+    // OR: price < 5.50 OR price > 595.50 => [0,5) U [596, N).
+    let or = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE price < 5.50 OR price > 595.50",
+        )
+        .expect("OR on GPU");
+    let or_expected: Vec<Vec<SqlValue>> = (0..5)
+        .chain(596..N)
+        .map(|i| vec![SqlValue::Int4(i as i32)])
+        .collect();
+    assert_eq!(or.rows, or_expected, "price<5.50 OR price>595.50 => [0,5) U [596,600)");
+
+    // CROSS-SCALE AND (price scale 2, cost scale 4 -- each comparison rescales independently):
+    // price > 10.50 AND cost > 50.2500 <=> i>10 AND i>50 => [51, N).
+    let cross = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE price > 10.50 AND cost > 50.2500",
+        )
+        .expect("cross-scale AND on GPU");
+    let cross_expected: Vec<Vec<SqlValue>> = (51..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        cross.rows, cross_expected,
+        "price>10.50 AND cost>50.2500 (cross-scale) => [51, 600)"
+    );
+
+    // NESTED: (price > 10.50 AND price < 100.50) OR price > 595.50 => [11,100) U [596, N).
+    let nested = e
+        .execute_resident_expr_select_sql(
+            "SELECT label FROM t WHERE (price > 10.50 AND price < 100.50) OR price > 595.50",
+        )
+        .expect("nested AND/OR on GPU");
+    let nested_expected: Vec<Vec<SqlValue>> = (11..100)
+        .chain(596..N)
+        .map(|i| vec![SqlValue::Int4(i as i32)])
+        .collect();
+    assert_eq!(
+        nested.rows, nested_expected,
+        "(price>10.50 AND price<100.50) OR price>595.50 => [11,100) U [596,600)"
+    );
 }

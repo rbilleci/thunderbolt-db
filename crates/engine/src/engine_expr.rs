@@ -400,6 +400,97 @@ fn compile_numeric_arith(
     }
 }
 
+/// Compile a single numeric COMPARISON `lhs <cmp> rhs` to i128 VM steps that leave one MASK on the
+/// stack (the buffer path: compile each side via [`compile_numeric_arith`], rescale to the common =
+/// max scale, then a `CompareScalar`/`CompareBuffers` mask step). Each side may be a column, an
+/// arithmetic subtree, or a literal (folded into the scalar). This is the shared comparison core for
+/// both the single-predicate arithmetic arm and the numeric AND/OR mask program.
+fn compile_numeric_compare(
+    lhs: &ResidentExpr,
+    rhs: &ResidentExpr,
+    cmp: u32,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+) -> Result<(), ExecuteError> {
+    let needle = |literal: Decimal128, scale: u8| -> Result<i32, ExecuteError> {
+        let mantissa = rescale_numeric_literal(literal, scale)?;
+        i32::try_from(mantissa).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "numeric comparison literal is too large for the fast path yet".to_string(),
+            ))
+        })
+    };
+    match (numeric_literal_value(lhs), numeric_literal_value(rhs)) {
+        (Some(literal), None) => {
+            // literal <cmp> arith: bring both to the common = max scale.
+            let arith_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
+            let common = arith_scale.max(literal.canonical().scale);
+            push_numeric_rescale(arith_scale, common, program)?;
+            program.push(ExprStep::CompareScalar {
+                cmp,
+                scalar: needle(literal, common)?,
+                scalar_on_left: true,
+            });
+            Ok(())
+        }
+        (None, Some(literal)) => {
+            let arith_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
+            let common = arith_scale.max(literal.canonical().scale);
+            push_numeric_rescale(arith_scale, common, program)?;
+            program.push(ExprStep::CompareScalar {
+                cmp,
+                scalar: needle(literal, common)?,
+                scalar_on_left: false,
+            });
+            Ok(())
+        }
+        (None, None) => {
+            // arith <cmp> arith: bring both sides to the common = max scale.
+            let common = numeric_arith_scale(lhs, table)?.max(numeric_arith_scale(rhs, table)?);
+            let lhs_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
+            push_numeric_rescale(lhs_scale, common, program)?;
+            let rhs_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
+            push_numeric_rescale(rhs_scale, common, program)?;
+            program.push(ExprStep::CompareBuffers { cmp });
+            Ok(())
+        }
+        (Some(_), Some(_)) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "the general GPU executor does not evaluate literal-only numeric comparisons".to_string(),
+        ))),
+    }
+}
+
+/// Compile a numeric boolean predicate (comparisons combined by `AND`/`OR`) into a mask program for
+/// the i128 VM, mirroring [`compile_predicate_program`] (the int path) but scale-aware: `AND`/`OR`
+/// compile both operand predicates then a `MaskBinary`; a comparison leaf goes through
+/// [`compile_numeric_compare`]. The VM compacts the final mask to surviving row indices.
+fn compile_numeric_predicate_program(
+    predicate: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+) -> Result<(), ExecuteError> {
+    let ResidentExpr::Binary { op, lhs, rhs } = predicate else {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident numeric predicate must be a comparison or AND/OR combination".to_string(),
+        )));
+    };
+    if let Some(bool_op) = boolean_op_code(*op) {
+        compile_numeric_predicate_program(lhs, table, snapshot, program)?;
+        compile_numeric_predicate_program(rhs, table, snapshot, program)?;
+        program.push(ExprStep::MaskBinary { op: bool_op });
+        return Ok(());
+    }
+    let Some(cmp) = predicate_compare_code(*op) else {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident numeric predicate node must be a comparison (eq/ne/lt/le/gt/ge) or AND/OR"
+                .to_string(),
+        )));
+    };
+    compile_numeric_compare(lhs, rhs, cmp, table, snapshot, program)
+}
+
 /// Compile an int4 arithmetic value expression into postfix [`ExprStep`] bytecode for the device
 /// VM. Recurses: a `Column` loads to a buffer; a `Binary{arith}` emits its operands then a buffer x
 /// buffer op, or folds an immediate literal operand into a buffer x scalar op (preserving operand
@@ -863,9 +954,10 @@ impl Engine {
     /// `numcol <cmp> numcol`, at ANY scale -- same-scale (and coarser-or-equal literal) use the
     /// resident compare peephole; a SCALE MISMATCH (a finer literal, or two columns of different scale)
     /// loads to i128 buffers, rescales the coarser side UP to the common = max scale (mantissa * 10^k,
-    /// k <= 9; a wider gap or a rescale overflow errors), then compares. Returns None for a non-numeric
-    /// predicate (the int4/int8 paths handle it). A numeric value mixed with an int4/int8 COLUMN,
-    /// numeric arithmetic, or numeric AND/OR is a hard error -- never a silent mis-answer.
+    /// k <= 9; a wider gap or a rescale overflow errors), then compares. Numeric ARITHMETIC comparisons
+    /// and `AND`/`OR` of numeric comparisons also lower here (each comparison -> a mask via the i128
+    /// VM, MaskBinary combines). Returns None for a non-numeric predicate (the int4/int8 paths handle
+    /// it). A numeric value mixed with an int4/int8 COLUMN is a hard error -- never a silent mis-answer.
     #[allow(clippy::too_many_arguments)]
     fn try_lower_numeric_predicate(
         &self,
@@ -890,15 +982,25 @@ impl Engine {
                     .to_string(),
             )));
         }
-        let Some(cmp) = predicate_compare_code(compare) else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor supports only simple numeric comparisons (numeric AND/OR \
-                 and arithmetic are follow-ons)"
-                    .to_string(),
-            )));
-        };
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        // numeric AND/OR: compile each side's comparison(s) to a MASK (the buffer path), combine with
+        // MaskBinary, and compact -- the same i128 mask VM the single-comparison arithmetic path uses.
+        if let Some(bool_op) = boolean_op_code(compare) {
+            let mut program = Vec::new();
+            compile_numeric_predicate_program(lhs, table, snapshot, &mut program)?;
+            compile_numeric_predicate_program(rhs, table, snapshot, &mut program)?;
+            program.push(ExprStep::MaskBinary { op: bool_op });
+            return device_memory
+                .run_expr_predicate_filter(&program, row_count, ResidentElemType::I128)
+                .map(Some)
+                .map_err(map_err);
+        }
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only numeric comparisons and AND/OR".to_string(),
+            )));
         };
         match (
             numeric_column_index(lhs, table),
@@ -978,58 +1080,10 @@ impl Engine {
             }
             _ => {
                 // Numeric ARITHMETIC comparison (`price * tax > 100`, `100 < price - fee`, ...):
-                // compile the arithmetic side(s) to i128 VM steps -- compile_numeric_arith returns each
-                // side's RESULT scale (columns at their catalog scale; `+`/`-` keep the operand scale,
-                // `*` adds scales) -- then a terminal compare at that scale, and run the i128 VM.
-                let needle = |literal: Decimal128, scale: u8| -> Result<i32, ExecuteError> {
-                    let mantissa = rescale_numeric_literal(literal, scale)?;
-                    i32::try_from(mantissa).map_err(|_| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(
-                            "numeric comparison literal is too large for the fast path yet".to_string(),
-                        ))
-                    })
-                };
+                // compile both sides to a mask via the shared comparison core (each side's scale is
+                // computed bottom-up and the coarser brought up to the common scale), then run the VM.
                 let mut program = Vec::new();
-                match (numeric_literal_value(lhs), numeric_literal_value(rhs)) {
-                    (Some(literal), None) => {
-                        // literal <cmp> arith: bring both to the common = max scale.
-                        let arith_scale = compile_numeric_arith(rhs, table, snapshot, &mut program)?;
-                        let common = arith_scale.max(literal.canonical().scale);
-                        push_numeric_rescale(arith_scale, common, &mut program)?;
-                        program.push(ExprStep::CompareScalar {
-                            cmp,
-                            scalar: needle(literal, common)?,
-                            scalar_on_left: true,
-                        });
-                    }
-                    (None, Some(literal)) => {
-                        let arith_scale = compile_numeric_arith(lhs, table, snapshot, &mut program)?;
-                        let common = arith_scale.max(literal.canonical().scale);
-                        push_numeric_rescale(arith_scale, common, &mut program)?;
-                        program.push(ExprStep::CompareScalar {
-                            cmp,
-                            scalar: needle(literal, common)?,
-                            scalar_on_left: false,
-                        });
-                    }
-                    (None, None) => {
-                        // arith <cmp> arith: bring both sides to the common = max scale.
-                        let common =
-                            numeric_arith_scale(lhs, table)?.max(numeric_arith_scale(rhs, table)?);
-                        let lhs_scale = compile_numeric_arith(lhs, table, snapshot, &mut program)?;
-                        push_numeric_rescale(lhs_scale, common, &mut program)?;
-                        let rhs_scale = compile_numeric_arith(rhs, table, snapshot, &mut program)?;
-                        push_numeric_rescale(rhs_scale, common, &mut program)?;
-                        program.push(ExprStep::CompareBuffers { cmp });
-                    }
-                    (Some(_), Some(_)) => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "the general GPU executor does not evaluate literal-only numeric \
-                             comparisons"
-                                .to_string(),
-                        )));
-                    }
-                }
+                compile_numeric_compare(lhs, rhs, cmp, table, snapshot, &mut program)?;
                 device_memory
                     .run_expr_predicate_filter(&program, row_count, ResidentElemType::I128)
                     .map(Some)
