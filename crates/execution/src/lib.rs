@@ -1196,6 +1196,7 @@ impl CudaResidentDeviceMemory {
             indices,
             c"gpu_db_group_by_i32_count_sum_twolevel",
             false, // two-level path serves COUNT/SUM/AVG over an int4 value
+            false, // ...and an int4 key
         )
     }
 
@@ -1210,6 +1211,7 @@ impl CudaResidentDeviceMemory {
         sum_byte_offset: u64,
         indices: &[u32],
         value_is_int8: bool,
+        key_is_int8: bool,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1218,6 +1220,7 @@ impl CudaResidentDeviceMemory {
             indices,
             c"gpu_db_group_by_i32_count_sum",
             value_is_int8,
+            key_is_int8,
         )
     }
 
@@ -1243,6 +1246,7 @@ impl CudaResidentDeviceMemory {
             indices,
             kernel,
             false, // the bench aggregates an int4 value
+            false, // ...and groups by an int4 key
         )
     }
 
@@ -5575,7 +5579,9 @@ fn launch_cuda_resident_i128_sum_partials_at_indices(
 /// One GROUP BY output group: the int4 key, the row COUNT, and the SUM of the value column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupByI32Row {
-    pub key: i32,
+    /// Group key, widened to i64 (int4 keys are sign-extended; int8 keys are exact). The engine
+    /// narrows back to Int4 for an int4 GROUP BY column and keeps Int8 for an int8 one.
+    pub key: i64,
     pub count: u64,
     pub sum: i64,
     /// High 64 bits of the per-group SUM when the value is int8 (the sum is accumulated as i128:
@@ -5603,6 +5609,7 @@ fn launch_cuda_group_by_i32_count_sum(
     indices: &[u32],
     kernel: &'static CStr,
     value_is_int8: bool,
+    key_is_int8: bool,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5636,11 +5643,15 @@ fn launch_cuda_group_by_i32_count_sum(
         .and_then(usize::checked_next_power_of_two)
         .map(|n| n.max(16))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
-    let slot_bytes = nslots
+    // One extra slot beyond the power-of-two hash range, dedicated to the i64::MIN key (which
+    // collides with the EMPTY sentinel and so cannot live in the hash table). The single-level kernel
+    // routes that key to index nslots; for int4 keys (no i64::MIN) it stays empty. Always allocated.
+    let alloc_slots = nslots + 1;
+    let alloc_slots_u64 = alloc_slots as u64;
+    let slot_bytes = alloc_slots
         .checked_mul(std::mem::size_of::<i64>())
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(nslots))?;
     let mask = (nslots - 1) as u64;
-    let nslots_u64 = nslots as u64;
 
     let primary = resident.primary();
     primary.set_current()?;
@@ -5685,13 +5696,14 @@ fn launch_cuda_group_by_i32_count_sum(
     let slot_sum_hi = primary.lease_device_buffer(slot_bytes)?;
 
     const BLOCK: u32 = 256;
-    let fill_grid = nslots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    // Fills cover alloc_slots (nslots + the dedicated i64::MIN slot) so that slot is initialized too.
+    let fill_grid = alloc_slots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
     let group_grid = count_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
 
     // One fill-arg set, mutated between the 3 slot_keys / slot_min / slot_max fills (cuLaunchKernel
     // copies the arg values at call time, so re-launching after mutating f0/f2 is safe).
     let mut f0 = slot_keys.ptr;
-    let mut f1 = nslots_u64;
+    let mut f1 = alloc_slots_u64;
     let mut f2 = EMPTY as u64;
     let mut fill_args = [
         (&mut f0 as *mut u64).cast::<c_void>(),
@@ -5711,6 +5723,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a10 = slot_max.ptr;
     let mut a11 = u64::from(value_is_int8);
     let mut a12 = slot_sum_hi.ptr;
+    let mut a13 = u64::from(key_is_int8);
     let mut group_args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -5725,6 +5738,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a10 as *mut u64).cast::<c_void>(),
         (&mut a11 as *mut u64).cast::<c_void>(),
         (&mut a12 as *mut u64).cast::<c_void>(),
+        (&mut a13 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
@@ -5792,12 +5806,13 @@ fn launch_cuda_group_by_i32_count_sum(
         }
     })?;
 
-    let mut keys = vec![0i64; nslots];
-    let mut counts = vec![0u64; nslots];
-    let mut sums = vec![0i64; nslots];
-    let mut sum_his = vec![0i64; nslots];
-    let mut mins = vec![0i64; nslots];
-    let mut maxs = vec![0i64; nslots];
+    // Sized alloc_slots (= nslots + the dedicated i64::MIN slot) -- the D2H copies slot_bytes bytes.
+    let mut keys = vec![0i64; alloc_slots];
+    let mut counts = vec![0u64; alloc_slots];
+    let mut sums = vec![0i64; alloc_slots];
+    let mut sum_his = vec![0i64; alloc_slots];
+    let mut mins = vec![0i64; alloc_slots];
+    let mut maxs = vec![0i64; alloc_slots];
     check_cuda(unsafe {
         cu_memcpy_dtoh(keys.as_mut_ptr().cast::<c_void>(), slot_keys.ptr, slot_bytes)
     })?;
@@ -5824,7 +5839,7 @@ fn launch_cuda_group_by_i32_count_sum(
     for i in 0..nslots {
         if keys[i] != EMPTY {
             groups.push(GroupByI32Row {
-                key: keys[i] as i32,
+                key: keys[i],
                 count: counts[i],
                 sum: sums[i],
                 sum_hi: sum_his[i],
@@ -5832,6 +5847,18 @@ fn launch_cuda_group_by_i32_count_sum(
                 max: maxs[i],
             });
         }
+    }
+    // The dedicated slot (index nslots) holds the i64::MIN key (== EMPTY, so it can't be detected by
+    // the sentinel test above); it is occupied iff its count > 0. Empty for int4 keys.
+    if counts[nslots] > 0 {
+        groups.push(GroupByI32Row {
+            key: i64::MIN,
+            count: counts[nslots],
+            sum: sums[nslots],
+            sum_hi: sum_his[nslots],
+            min: mins[nslots],
+            max: maxs[nslots],
+        });
     }
     Ok(groups)
 }
@@ -5939,6 +5966,7 @@ fn launch_cuda_group_by_kernel_timed(
         slot_keys.ptr, slot_count.ptr, slot_sum.ptr, slot_min.ptr, slot_max.ptr,
         0, // value_is_int8 = false: the timed bench always aggregates an int4 value column
         slot_sum_hi.ptr,
+        0, // key_is_int8 = false: the timed bench always groups by an int4 key
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -5989,7 +6017,7 @@ fn launch_cuda_group_by_kernel_timed(
         if keys[i] != EMPTY {
             // min/max are placeholders here -- the timed bench only validates COUNT/SUM (the two
             // kernels intentionally differ on min/max: single-level computes them, two-level doesn't).
-            groups.push(GroupByI32Row { key: keys[i] as i32, count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0 });
+            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0 });
         }
     }
     Ok((groups, best))

@@ -2473,6 +2473,74 @@ fn gpu_grouped_int8_sum_survives_many_low_limb_wraps() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_by_int8_key() {
+    // GROUP BY an int8 (BIGINT) key -> the single-level kernel reads 64-bit keys. Covers keys beyond
+    // the i32 range AND the i64::MIN key, which collides with the EMPTY sentinel and so is routed to
+    // its dedicated slot (the crux). Constructed oracle:
+    //   g=1e10     -> v{10,20,30}  (count 3, sum 60, min 10)
+    //   g=-8e9     -> v{5,15}      (count 2, sum 20, min 5)
+    //   g=i64::MIN -> v{100,200}   (count 2, sum 300, min 100)  [dedicated-slot edge]
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g BIGINT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES \
+         (10000000000,10),(10000000000,20),(10000000000,30),\
+         (-8000000000,5),(-8000000000,15),\
+         (-9223372036854775808,100),(-9223372036854775808,200)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i8v = SqlValue::Int8;
+    let i4 = SqlValue::Int4;
+
+    // Keys sorted ascending: i64::MIN < -8e9 < 1e10. Result keys are Int8.
+    let c = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .expect("int8-key count");
+    assert_eq!(
+        c.rows,
+        vec![
+            vec![i8v(i64::MIN), i8v(2)],
+            vec![i8v(-8_000_000_000), i8v(2)],
+            vec![i8v(10_000_000_000), i8v(3)],
+        ],
+        "GROUP BY int8 key, COUNT (incl. i64::MIN dedicated slot)"
+    );
+    assert_eq!(c.executed_target, DeviceTarget::Gpu(0));
+
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("int8-key sum");
+    assert_eq!(
+        s.rows,
+        vec![
+            vec![i8v(i64::MIN), i8v(300)],
+            vec![i8v(-8_000_000_000), i8v(20)],
+            vec![i8v(10_000_000_000), i8v(60)],
+        ],
+        "GROUP BY int8 key, SUM(int4)"
+    );
+
+    let m = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v) FROM t GROUP BY g")
+        .expect("int8-key min");
+    assert_eq!(
+        m.rows,
+        vec![
+            vec![i8v(i64::MIN), i4(100)],
+            vec![i8v(-8_000_000_000), i4(5)],
+            vec![i8v(10_000_000_000), i4(10)],
+        ],
+        "GROUP BY int8 key, MIN(int4)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys

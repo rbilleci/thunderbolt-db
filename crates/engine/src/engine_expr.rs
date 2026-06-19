@@ -1186,11 +1186,17 @@ impl Engine {
                 ),
             };
             let group_idx = relational_column_index(table, group_name)?;
-            if table.columns[group_idx].ty != SqlType::Int4 {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "GROUP BY key must be an int4 column on the Expr path".to_string(),
-                )));
-            }
+            // GROUP BY key: int4 or int8. int8 keys force the single-level kernel (only it reads
+            // 64-bit keys + routes the i64::MIN key, which collides with EMPTY, to its dedicated slot).
+            let key_is_int8 = match table.columns[group_idx].ty {
+                SqlType::Int4 => false,
+                SqlType::Int8 => true,
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "GROUP BY key must be an int4 or int8 column on the Expr path".to_string(),
+                    )));
+                }
+            };
             let value_idx = relational_column_index(table, value_name)?;
             let value_ty = table.columns[value_idx].ty;
             // SUM/AVG/MIN/MAX accept an int4 or int8 value (`value_is_int8` selects the 8-byte vs
@@ -1213,7 +1219,11 @@ impl Engine {
                     }
                 },
             };
-            let key_offset = resident_device_int4_column_offset(&snapshot, table, group_idx)?;
+            let key_offset = if key_is_int8 {
+                resident_device_int8_column_offset(&snapshot, table, group_idx)?
+            } else {
+                resident_device_int4_column_offset(&snapshot, table, group_idx)?
+            };
             // COUNT(*) has no value column; the kernel ignores the summed value when value == key.
             let value_offset = if matches!(kind, GroupedAgg::Count) {
                 key_offset
@@ -1222,16 +1232,18 @@ impl Engine {
             } else {
                 resident_device_int4_column_offset(&snapshot, table, value_idx)?
             };
-            // The single-level kernel computes per-group MIN/MAX and (for int8) the i128 SUM, so route
-            // MIN/MAX and int8 SUM/AVG there; int4 COUNT/SUM/AVG use the two-level contention workhorse.
+            // The single-level kernel computes per-group MIN/MAX and (for int8) the i128 SUM, and is
+            // the only one that reads int8 KEYS, so route MIN/MAX, int8 SUM/AVG, and any int8-key query
+            // there; int4-key COUNT/SUM/AVG use the two-level contention workhorse.
             let use_single_level =
-                matches!(kind, GroupedAgg::Min | GroupedAgg::Max) || value_is_int8;
+                matches!(kind, GroupedAgg::Min | GroupedAgg::Max) || value_is_int8 || key_is_int8;
             let groups = if use_single_level {
                 device_memory.group_by_i32_count_sum_minmax_from_payload(
                     key_offset,
                     value_offset,
                     &indices,
                     value_is_int8,
+                    key_is_int8,
                 )
             } else {
                 device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
@@ -1259,12 +1271,19 @@ impl Engine {
                         GroupedAgg::Max if value_is_int8 => SqlValue::Int8(g.max),
                         GroupedAgg::Max => SqlValue::Int4(g.max as i32),
                     };
-                    vec![SqlValue::Int4(g.key), agg]
+                    // int8 GROUP BY key keeps the full i64; int4 narrows back to Int4.
+                    let key = if key_is_int8 {
+                        SqlValue::Int8(g.key)
+                    } else {
+                        SqlValue::Int4(g.key as i32)
+                    };
+                    vec![key, agg]
                 })
                 .collect();
             rows.sort_by_key(|row| match row[0] {
-                SqlValue::Int4(k) => k,
-                _ => i32::MIN,
+                SqlValue::Int4(k) => i64::from(k),
+                SqlValue::Int8(k) => k,
+                _ => i64::MIN,
             });
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
