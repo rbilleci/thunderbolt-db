@@ -1880,3 +1880,33 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         "AVG over empty => NULL/M3 hard error"
     );
 }
+
+#[test]
+fn average_sql_value_matches_postgres_dynamic_scale_and_rounding() {
+    // AVG = sum/count must match PostgreSQL's numeric division EXACTLY: a dynamic result scale
+    // (PG select_div_scale, ~16 significant digits) + round half-away-from-zero. The hardcoded
+    // expectations are PostgreSQL 18's text output (NOT computed via average_sql_value -- the prior
+    // self-referential tests could not catch the fixed-scale-16 / truncation P0 the AVG audit found).
+    let avg_str = |sum: i128, count: usize| -> String {
+        match average_sql_value(sum, count) {
+            SqlValue::Numeric(d) => d.to_decimal_string(),
+            other => panic!("AVG must be numeric, got {other:?}"),
+        }
+    };
+    // 1-4 integer digits -> scale 16.
+    assert_eq!(avg_str(3, 1), "3.0000000000000000", "exact integer, scale 16");
+    assert_eq!(avg_str(7, 2), "3.5000000000000000", "3.5, scale 16");
+    // sub-1 quotient -> scale 20; repeating, ROUNDS the last digit up.
+    assert_eq!(avg_str(2, 3), "0.66666666666666666667", "2/3 rounds, scale 20");
+    assert_eq!(avg_str(1, 2), "0.50000000000000000000", "1/2, scale 20");
+    // 5-digit integer part -> scale 12 (even exact integers carry the dynamic scale).
+    assert_eq!(avg_str(234_000, 4), "58500.000000000000", "58500, scale 12");
+    // 11-digit integer part -> scale 8.
+    assert_eq!(
+        avg_str(100_000_000_000, 7),
+        "14285714285.71428571",
+        "5-digit-group scale 8"
+    );
+    // Negative: magnitude + sign both correct (round away from zero).
+    assert_eq!(avg_str(-2, 3), "-0.66666666666666666667", "negative rounds away");
+}

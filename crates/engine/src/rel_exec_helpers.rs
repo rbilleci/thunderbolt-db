@@ -1653,33 +1653,74 @@ pub(crate) fn int4_aggregate_value(
     }
 }
 
-/// The scale AVG results carry: 16 fractional digits, matching PostgreSQL's default
-/// `numeric` AVG and the engine's historical text output (so `24.5` prints as
-/// `24.5000000000000000`).
+/// PostgreSQL's `numeric` AVG (division) targets ~16 SIGNIFICANT digits (NUMERIC_MIN_SIG_DIGITS), so
+/// the RESULT SCALE is dynamic (keyed to the quotient magnitude), not fixed. We keep 16 as the
+/// significant-digit base + the AVG result COLUMN's display-scale hint (PG reports AVG as unconstrained
+/// `numeric`, so the column scale is cosmetic; the value carries its own scale). See
+/// [`average_sql_value`].
 pub(crate) const AVG_RESULT_SCALE: u8 = 16;
 
+/// Decimal digit count of a non-negative i128 (`n >= 1` -> `>= 1`).
+fn decimal_digit_count(mut n: i128) -> i32 {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// `AVG = sum / count` as a `numeric`, matching PostgreSQL exactly: a DYNAMIC result scale (PG's
+/// `select_div_scale`) plus the final digit ROUNDED half-away-from-zero. PG picks a scale giving ~16
+/// significant digits: `rscale = max(0, 16 - 4*floor(dw/4))` where `dw = floor(log10(|sum/count|))` --
+/// so a 1-4-digit integer part -> scale 16, 5-8 -> 12, 9-12 -> 8, ...; a sub-1 quotient -> 20, 24, ...
+/// (The earlier fixed-scale-16 FLOOR diverged from PG on most fractional + large averages -- an AVG
+/// audit P0, shared with the enumerated path.) The long division is interleaved digit-by-digit to
+/// avoid an `abs_sum * 10^rscale` i128 overflow; `rscale` shrinks as the quotient grows, so the
+/// mantissa stays well within i128. `count == 0` is the empty-aggregate sentinel (callers needing SQL
+/// NULL guard it upstream).
 pub(crate) fn average_sql_value(sum: i128, count: usize) -> SqlValue {
     if count == 0 {
-        // AVG over zero matched rows. Historically rendered as an empty numeric; we keep a
-        // canonical zero sentinel (the no-match case never reaches a real money computation).
         return SqlValue::Numeric(Decimal128::ZERO);
     }
     let count = count as i128;
     let negative = sum.is_negative();
     let abs_sum = sum.abs();
-    // Build the scale-16 mantissa = floor(abs_sum * 10^16 / count) digit-by-digit (matching the
-    // prior text formatter exactly, and avoiding an `abs_sum * 10^16` i128 overflow for large sums).
-    let mut mantissa = abs_sum / count;
+    if abs_sum == 0 {
+        // AVG of all-zero values: the quotient is 0; render at the base significant-digit scale.
+        return SqlValue::Numeric(Decimal128::new(0, AVG_RESULT_SCALE));
+    }
+    let sig_digits = i32::from(AVG_RESULT_SCALE);
+    // dw = floor(log10(|sum/count|)): the integer part's digit count - 1 when |quotient| >= 1, else
+    // the negative leading-zero position (smallest k with abs_sum*10^k >= count) when |quotient| < 1.
+    let q_int = abs_sum / count;
+    let dw: i32 = if q_int >= 1 {
+        decimal_digit_count(q_int) - 1
+    } else {
+        let mut scaled = abs_sum;
+        let mut k = 0;
+        while scaled < count {
+            scaled *= 10;
+            k += 1;
+        }
+        -k
+    };
+    let rscale = (sig_digits - 4 * dw.div_euclid(4)).clamp(0, i32::from(u8::MAX)) as u8;
+    let mut mantissa = q_int;
     let mut remainder = abs_sum % count;
-    for _ in 0..AVG_RESULT_SCALE {
+    for _ in 0..rscale {
         remainder *= 10;
         mantissa = mantissa * 10 + remainder / count;
         remainder %= count;
     }
+    // Round half-away-from-zero on the magnitude (PG's rounding); apply the sign after.
+    if 2 * remainder >= count {
+        mantissa += 1;
+    }
     if negative {
         mantissa = -mantissa;
     }
-    SqlValue::Numeric(Decimal128::new(mantissa, AVG_RESULT_SCALE))
+    SqlValue::Numeric(Decimal128::new(mantissa, rscale))
 }
 
 pub(crate) fn current_timestamp_micros() -> u64 {
