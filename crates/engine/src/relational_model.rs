@@ -696,6 +696,10 @@ pub(crate) fn resident_device_bool_column_offset(
 /// 19). Layout: header (u64) + the WHOLE int4 section (`int4_columns * row_count * 4`) + the int8
 /// columns before this one (`int8_ordinal * row_count * 8`). Validates the column is int8 and present
 /// in `snapshot.resident_device_int8_columns`. Mirrors [`resident_device_int4_column_offset`].
+// ALIGNMENT INVARIANT: this offset is 4-mod-8 (NOT 8-aligned) exactly when `(#int4 columns ×
+// row_count)` is odd, because the int8 section follows the int4 section. Any device kernel that reads
+// a 64-bit value here MUST do it as two 4-byte loads, never a single `ld.u64` -- a misaligned 64-bit
+// load faults (CUDA 716 / illegal address) and poisons the context. This is reachable, not theoretical.
 pub(crate) fn resident_device_int8_column_offset(
     snapshot: &RelationalResidencySnapshot,
     table: &RelationalTable,

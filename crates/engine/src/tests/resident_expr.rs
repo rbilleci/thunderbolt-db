@@ -2541,6 +2541,50 @@ fn gpu_grouped_by_int8_key() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_by_int8_key_i64min_heavy_contention_and_misaligned() {
+    // Permanent regression guard for the two scariest int8-key failure modes (the prior audit
+    // verified both via probes, since reverted):
+    //  1. SENTINEL CONTENTION: N rows all keyed i64::MIN hammer the single dedicated slot
+    //     concurrently -- the atomicAdds must serialize (count == N), and a lost sentinel route
+    //     would drop the group entirely.
+    //  2. MISALIGNED int8 KEY column: `(b INT, g BIGINT)` with an ODD row count puts the int8 key
+    //     section at offset 4-mod-8, so the kernel's 2x4-byte key read is exercised (a single ld.u64
+    //     would fault). We assert the offset is genuinely 4-mod-8 before trusting the result.
+    const N: usize = 500;
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (b INT, g BIGINT)").unwrap();
+    // N i64::MIN-key rows + 1 normal-key row => N+1 (odd) rows => one int4 col (b) * odd rows is odd
+    // => the int8 `g` section lands at 4-mod-8.
+    let sentinel = vec!["(7,-9223372036854775808)"; N].join(",");
+    e.execute_text(2, &format!("INSERT INTO t (b,g) VALUES {sentinel},(7,42)"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // Confirm we actually exercised a 4-mod-8 int8 key column (else the misalignment axis is untested).
+    let table = e.relational_catalog_table("t").unwrap();
+    let g_idx = table.columns.iter().position(|c| c.name == "g").unwrap();
+    let snap = e.relational_residency_snapshot_ref("t").unwrap();
+    let g_off =
+        crate::relational_model::resident_device_int8_column_offset(&snap, &table, g_idx).unwrap();
+    assert_eq!(g_off % 8, 4, "int8 key column must be 4-mod-8 to exercise the misaligned read");
+
+    let c = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .expect("sentinel-contention count");
+    assert_eq!(
+        c.rows,
+        vec![
+            vec![SqlValue::Int8(i64::MIN), SqlValue::Int8(N as i64)],
+            vec![SqlValue::Int8(42), SqlValue::Int8(1)],
+        ],
+        "i64::MIN key under heavy contention (count == N), misaligned 4-mod-8 key column"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys
