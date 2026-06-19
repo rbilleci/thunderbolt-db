@@ -1189,7 +1189,57 @@ impl CudaResidentDeviceMemory {
         sum_byte_offset: u64,
         indices: &[u32],
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
-        launch_cuda_group_by_i32_count_sum(self, key_byte_offset, sum_byte_offset, indices)
+        launch_cuda_group_by_i32_count_sum(
+            self,
+            key_byte_offset,
+            sum_byte_offset,
+            indices,
+            c"gpu_db_group_by_i32_count_sum_twolevel",
+        )
+    }
+
+    /// Benchmark entry: run GROUP BY with the chosen kernel (`two_level` selects the shared-mem
+    /// two-level kernel vs the single-level global-atomic one). For perf comparison only; the engine
+    /// always uses the two-level kernel via [`Self::group_by_i32_count_sum_from_payload`].
+    pub fn group_by_i32_count_sum_bench(
+        &self,
+        key_byte_offset: u64,
+        sum_byte_offset: u64,
+        indices: &[u32],
+        two_level: bool,
+    ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
+        let kernel = if two_level {
+            c"gpu_db_group_by_i32_count_sum_twolevel"
+        } else {
+            c"gpu_db_group_by_i32_count_sum"
+        };
+        launch_cuda_group_by_i32_count_sum(self, key_byte_offset, sum_byte_offset, indices, kernel)
+    }
+
+    /// Benchmark entry: time JUST the GROUP BY kernel (CUDA events, min of `runs`), returning the
+    /// per-group rows + the min kernel milliseconds. Isolates the kernel from the alloc/H2D/D2H/compact
+    /// overhead, so the two-level vs single-level difference is visible. Perf comparison only.
+    pub fn group_by_i32_count_sum_kernel_timed(
+        &self,
+        key_byte_offset: u64,
+        sum_byte_offset: u64,
+        indices: &[u32],
+        two_level: bool,
+        runs: u32,
+    ) -> Result<(Vec<GroupByI32Row>, f32), CudaRuntimeProbeError> {
+        let kernel = if two_level {
+            c"gpu_db_group_by_i32_count_sum_twolevel"
+        } else {
+            c"gpu_db_group_by_i32_count_sum"
+        };
+        launch_cuda_group_by_kernel_timed(
+            self,
+            key_byte_offset,
+            sum_byte_offset,
+            indices,
+            kernel,
+            runs,
+        )
     }
 
     pub fn project_i32_from_payload(
@@ -5512,6 +5562,7 @@ fn launch_cuda_group_by_i32_count_sum(
     key_byte_offset: u64,
     sum_byte_offset: u64,
     indices: &[u32],
+    kernel: &'static CStr,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5581,7 +5632,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &ptx)?;
     // Two-level (shared-mem local aggregation -> global merge): far less global-atomic contention at
     // low cardinality. The single-level `gpu_db_group_by_i32_count_sum` stays as the reference kernel.
-    let group_fn = primary.cached_function(c"gpu_db_group_by_i32_count_sum_twolevel", &ptx)?;
+    let group_fn = primary.cached_function(kernel, &ptx)?;
     let indices_dev = primary.lease_device_buffer(idx_bytes)?;
     let slot_keys = primary.lease_device_buffer(slot_bytes)?;
     let slot_count = primary.lease_device_buffer(slot_bytes)?;
@@ -5680,6 +5731,141 @@ fn launch_cuda_group_by_i32_count_sum(
         }
     }
     Ok(groups)
+}
+
+/// Benchmark-only: time JUST the GROUP BY KERNEL (excluding the per-call alloc / H2D / D2H / host
+/// compaction that dominate the end-to-end latency) via CUDA events, returning the MIN over `runs`
+/// kernel launches plus the result rows (for a correctness check). Sets up once; per run resets the
+/// global table (fill + memset) UNTIMED, then events bracket only the group kernel. Null stream.
+fn launch_cuda_group_by_kernel_timed(
+    resident: &CudaResidentDeviceMemory,
+    key_byte_offset: u64,
+    sum_byte_offset: u64,
+    indices: &[u32],
+    kernel: &'static CStr,
+    runs: u32,
+) -> Result<(Vec<GroupByI32Row>, f32), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void, *mut *mut c_void, *mut *mut c_void,
+    ) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuStreamSync = unsafe extern "C" fn(*mut c_void) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const EMPTY: i64 = i64::MIN;
+
+    if indices.is_empty() {
+        return Ok((Vec::new(), 0.0));
+    }
+    let count = indices.len();
+    let idx_bytes = std::mem::size_of_val(indices);
+    let count_u64 = count as u64;
+    let nslots = (count * 2).next_power_of_two().max(16);
+    let slot_bytes = nslots * std::mem::size_of::<i64>();
+    let mask = (nslots - 1) as u64;
+    let nslots_u64 = nslots as u64;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch = unsafe {
+        *resident.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0").map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset = unsafe {
+        *resident
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_htod = unsafe {
+        *resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_dtoh = unsafe {
+        *resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_stream_sync = unsafe {
+        *resident.lib().get::<CuStreamSync>(b"cuStreamSynchronize\0").map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &ptx)?;
+    let group_fn = primary.cached_function(kernel, &ptx)?;
+    let indices_dev = primary.lease_device_buffer(idx_bytes)?;
+    let slot_keys = primary.lease_device_buffer(slot_bytes)?;
+    let slot_count = primary.lease_device_buffer(slot_bytes)?;
+    let slot_sum = primary.lease_device_buffer(slot_bytes)?;
+    check_cuda(unsafe { cu_htod(indices_dev.ptr, indices.as_ptr().cast::<c_void>(), idx_bytes) })?;
+
+    let null = std::ptr::null_mut::<c_void>();
+    let mut start = std::ptr::null_mut::<c_void>();
+    let mut stop = std::ptr::null_mut::<c_void>();
+    check_cuda(unsafe { (primary.cu_event_create)(&mut start, 0) })?;
+    check_cuda(unsafe { (primary.cu_event_create)(&mut stop, 0) })?;
+
+    const BLOCK: u32 = 256;
+    let fill_grid = nslots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let group_grid = count_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut f0 = slot_keys.ptr;
+    let mut f1 = nslots_u64;
+    let mut f2 = EMPTY as u64;
+    let mut fill_args = [
+        (&mut f0 as *mut u64).cast::<c_void>(),
+        (&mut f1 as *mut u64).cast::<c_void>(),
+        (&mut f2 as *mut u64).cast::<c_void>(),
+    ];
+    let mut a = [
+        resident.device_ptr(), key_byte_offset, sum_byte_offset, indices_dev.ptr, count_u64, mask,
+        slot_keys.ptr, slot_count.ptr, slot_sum.ptr,
+    ];
+    let mut group_args: Vec<*mut c_void> =
+        a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
+
+    let mut best = f32::MAX;
+    for _ in 0..runs {
+        check_cuda(unsafe { cu_memset(slot_count.ptr, 0, slot_bytes) })?;
+        check_cuda(unsafe { cu_memset(slot_sum.ptr, 0, slot_bytes) })?;
+        check_cuda(unsafe {
+            cu_launch(fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, null, fill_args.as_mut_ptr(), null.cast())
+        })?;
+        check_cuda(unsafe { (primary.cu_event_record)(start, null) })?;
+        check_cuda(unsafe {
+            cu_launch(group_fn, group_grid, 1, 1, BLOCK, 1, 1, 0, null, group_args.as_mut_ptr(), null.cast())
+        })?;
+        check_cuda(unsafe { (primary.cu_event_record)(stop, null) })?;
+        check_cuda(unsafe { cu_stream_sync(null) })?;
+        let mut ms = 0f32;
+        check_cuda(unsafe { (primary.cu_event_elapsed_time)(&mut ms, start, stop) })?;
+        best = best.min(ms);
+    }
+
+    let mut keys = vec![0i64; nslots];
+    let mut counts = vec![0u64; nslots];
+    let mut sums = vec![0i64; nslots];
+    check_cuda(unsafe { cu_dtoh(keys.as_mut_ptr().cast::<c_void>(), slot_keys.ptr, slot_bytes) })?;
+    check_cuda(unsafe { cu_dtoh(counts.as_mut_ptr().cast::<c_void>(), slot_count.ptr, slot_bytes) })?;
+    check_cuda(unsafe { cu_dtoh(sums.as_mut_ptr().cast::<c_void>(), slot_sum.ptr, slot_bytes) })?;
+    unsafe {
+        (primary.cu_event_destroy)(start);
+        (primary.cu_event_destroy)(stop);
+    }
+    let mut groups = Vec::new();
+    for i in 0..nslots {
+        if keys[i] != EMPTY {
+            groups.push(GroupByI32Row { key: keys[i] as i32, count: counts[i], sum: sums[i] });
+        }
+    }
+    Ok((groups, best))
 }
 
 

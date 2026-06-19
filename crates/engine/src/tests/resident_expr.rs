@@ -2322,3 +2322,55 @@ fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
         .collect();
     assert_eq!(hc.rows, exp_hi, "high-card SUM per distinct key");
 }
+
+#[test]
+#[ignore = "GPU benchmark (run with --nocapture): two-level vs single-level GROUP BY"]
+fn gpu_group_by_two_level_vs_single_level_bench() {
+    use std::time::Instant;
+    let mut e = Engine::new_local();
+    // One table, four key columns of different cardinality over the same rows -> one residency, four
+    // GROUP BY cardinalities. g4/g64/g4k cycle; gall is all-distinct (high cardinality).
+    e.execute_text(1, "CREATE TABLE t (g4 INT, g64 INT, g4k INT, gall INT, v INT)").unwrap();
+    let n = 200_000usize;
+    let chunk = 20_000usize;
+    let mut txid = 2u64;
+    let mut i = 0;
+    while i < n {
+        let end = (i + chunk).min(n);
+        let mut vals = String::with_capacity(chunk * 28);
+        for j in i..end {
+            if j > i {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({},{},{},{},{})", j % 4, j % 64, j % 4096, j, j % 100));
+        }
+        e.execute_text(txid, &format!("INSERT INTO t (g4,g64,g4k,gall,v) VALUES {vals}")).unwrap();
+        txid += 1;
+        i = end;
+    }
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        eprintln!("no GPU residency; skipping benchmark");
+        return;
+    }
+
+    let _ = Instant::now(); // (full-call latency is alloc/D2H-bound; we time the kernel via events)
+    eprintln!(
+        "\n=== GROUP BY g, SUM(v): two-level shared-mem vs single-level global-atomic ===\n\
+         {n} rows; KERNEL-only time (CUDA events, min of 200 launches), the alloc/H2D/D2H/compact\n\
+         overhead excluded; speedup = single-level / two-level kernel time"
+    );
+    eprintln!("{:>8}  {:>13}  {:>13}  {:>9}", "groups", "single ms", "two-lvl ms", "speedup");
+    for key in ["g4", "g64", "g4k", "gall"] {
+        // Correctness: both kernels must produce identical groups before we trust the timings.
+        let mut a = e.group_by_i32_bench("t", key, "v", false).unwrap();
+        let mut b = e.group_by_i32_bench("t", key, "v", true).unwrap();
+        a.sort_by_key(|r| r.key);
+        b.sort_by_key(|r| r.key);
+        assert_eq!(a, b, "single-level and two-level disagree for {key}");
+        let single = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200).unwrap();
+        let two = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200).unwrap();
+        eprintln!("{:>8}  {:>13.4}  {:>13.4}  {:>8.2}x", a.len(), single, two, single / two);
+    }
+    eprintln!();
+}
