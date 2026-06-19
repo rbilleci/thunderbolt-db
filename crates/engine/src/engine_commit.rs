@@ -250,7 +250,9 @@ impl Engine {
         // on the concurrent commit path — that uses `invalidate_relational_residency_tables_concurrent`
         // which only tombstones the device-memory cells via `&self`).
         self.read_state.residency.with_snapshots_mut(|snapshots| {
-            if let Some(snapshot) = snapshots.get_mut(table) {
+            if let Some(entry) = snapshots.get_mut(table) {
+                // make_mut COWs the shared descriptor into a fresh version (host_rows stays shared).
+                let snapshot = std::sync::Arc::make_mut(&mut entry.descriptor);
                 if snapshot.invalidated_by_txn_id.is_none() {
                     snapshot.invalidated_by_txn_id = Some(txn_id);
                     snapshot.invalidated_at_index = Some(index);
@@ -370,8 +372,10 @@ impl Engine {
         // is `&self`, done outside the COW closure on the collected tables).
         let pressured_snapshot_tables = self.read_state.residency.with_snapshots_mut(|snapshots| {
             let mut tables = Vec::new();
-            for (table, snapshot) in snapshots.iter_mut() {
-                if snapshot.gpu_id == gpu_id {
+            for (table, entry) in snapshots.iter_mut() {
+                if entry.descriptor.gpu_id == gpu_id {
+                    // COW only the pressured tables' descriptors (host_rows stays shared).
+                    let snapshot = std::sync::Arc::make_mut(&mut entry.descriptor);
                     snapshot.invalidated_by_memory_pressure = true;
                     snapshot.memory_pressure_active = true;
                     if let Some(proof) = snapshot.device_memory_proof.as_mut() {

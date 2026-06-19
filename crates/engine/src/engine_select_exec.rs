@@ -247,14 +247,17 @@ impl Engine {
         let pin = self.pin_relational_read_at(&select.table, copin_s);
         let (_query, access_path) =
             self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
-        let snapshot = self
-            .relational_residency_snapshot_ref(&table.name)
+        // Fetch the descriptor + host rows as ONE atomic entry (a single `load()`), so the metadata
+        // checked here and the rows materialized below come from the same residency generation.
+        let entry = self
+            .relational_residency_entry(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
                     table.name
                 )))
             })?;
+        let snapshot = &entry.descriptor;
         if snapshot.schema != table.schema || snapshot.table != table.name {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot no longer matches catalog table identity".to_string(),
@@ -267,12 +270,14 @@ impl Engine {
             ))));
         }
 
+        // The host-row materialization is the other (Arc-shared) half of the SAME entry fetched above
+        // -- one consistent generation, no second load.
         let result = MvccReadResult {
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
-            rows: snapshot
-                .resident_rows
+            rows: entry
+                .host_rows
                 .iter()
                 .map(|row| MvccReadRow {
                     source_key: None,

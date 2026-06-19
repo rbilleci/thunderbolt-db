@@ -27,7 +27,7 @@ impl Engine {
             .snapshots
             .load()
             .get(table)
-            .cloned();
+            .map(|entry| entry.descriptor.clone());
         let catalog_table = self
             .ddl_catalog_mut()
             .relational_catalog
@@ -261,11 +261,10 @@ impl Engine {
             gpu_id,
             schema: catalog_table.schema,
             table: catalog_table.name.clone(),
-            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_ref()),
+            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_deref()),
             row_count,
             column_count: catalog_table.columns.len(),
             resident_bytes,
-            resident_rows,
             resident_device_int4_columns,
             resident_device_int4_column_stats,
             resident_device_int8_columns,
@@ -303,6 +302,7 @@ impl Engine {
             .install_snapshot(
                 catalog_table.name,
                 snapshot.clone(),
+                resident_rows,
                 device_memory,
                 &read_state.residency,
             );
@@ -381,13 +381,13 @@ impl Engine {
             .snapshots
             .load()
             .iter()
-            .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
-            .map(|(name, snapshot)| {
+            .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
+            .map(|(name, entry)| {
                 (
-                    snapshot.valid_through_index,
-                    snapshot.table.clone(),
+                    entry.descriptor.valid_through_index,
+                    entry.descriptor.table.clone(),
                     name.clone(),
-                    snapshot.resident_bytes,
+                    entry.descriptor.resident_bytes,
                 )
             })
             .collect::<Vec<_>>();
@@ -514,7 +514,7 @@ impl Engine {
             .snapshots
             .load()
             .get(table)
-            .cloned();
+            .map(|entry| entry.descriptor.clone());
         let memory_pressure_active = self
             .router
             .runtime()
@@ -537,11 +537,10 @@ impl Engine {
             gpu_id,
             schema: catalog_table.schema,
             table: catalog_table.name.clone(),
-            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_ref()),
+            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_deref()),
             row_count,
             column_count: catalog_table.columns.len(),
             resident_bytes,
-            resident_rows: Vec::new(),
             resident_device_int4_columns: install.resident_device_int4_columns,
             resident_device_int4_column_stats: install.resident_device_int4_column_stats,
             // Benchmark install path: int8 device retention is not wired here yet (doc 19 — the
@@ -581,6 +580,7 @@ impl Engine {
             .install_snapshot(
                 catalog_table.name,
                 snapshot.clone(),
+                Vec::new(), // benchmark install path: no host-row materialization
                 Some(device_memory),
                 &read_state.residency,
             );
@@ -635,7 +635,7 @@ impl Engine {
             .snapshots
             .load()
             .get(table)
-            .cloned();
+            .map(|entry| entry.descriptor.clone());
         let memory_pressure_active = self
             .router
             .runtime()
@@ -658,11 +658,10 @@ impl Engine {
             gpu_id,
             schema: catalog_table.schema,
             table: catalog_table.name.clone(),
-            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_ref()),
+            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_deref()),
             row_count,
             column_count: catalog_table.columns.len(),
             resident_bytes,
-            resident_rows: Vec::new(),
             resident_device_int4_columns: install.resident_device_int4_columns,
             resident_device_int4_column_stats: install.resident_device_int4_column_stats,
             // Benchmark install path: int8 device retention is not wired here yet (doc 19 — the
@@ -702,6 +701,7 @@ impl Engine {
             .install_snapshot(
                 catalog_table.name,
                 snapshot.clone(),
+                Vec::new(), // benchmark install path: no host-row materialization
                 Some(device_memory),
                 &read_state.residency,
             );
@@ -926,8 +926,8 @@ impl Engine {
             .snapshots
             .load()
             .iter()
-            .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
-            .map(|(_name, snapshot)| snapshot.resident_bytes)
+            .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
+            .map(|(_name, entry)| entry.descriptor.resident_bytes)
             .sum();
         let partition_bytes: u64 = self
             .read_state
@@ -952,8 +952,8 @@ impl Engine {
             .snapshots
             .load()
             .get(table)
-            .map(|snapshot| {
-                let mut snapshot = snapshot.clone();
+            .map(|entry| {
+                let mut snapshot = (*entry.descriptor).clone();
                 snapshot.memory_pressure_active = self
                     .router
                     .runtime()
@@ -973,7 +973,8 @@ impl Engine {
             .snapshots
             .load()
             .get(table)
-            .map(|snapshot| {
+            .map(|entry| {
+                let snapshot = &entry.descriptor;
                 let memory_pressure_active = self
                     .router
                     .runtime()
@@ -1026,10 +1027,29 @@ impl Engine {
     /// consumers only read scalar fields + column layouts off it before submitting — so an owned clone
     /// is a drop-in for the former borrow with no lifetime entanglement. Cloning a single snapshot's
     /// metadata once per resident-route statement is negligible against the GPU kernel it precedes.
+    /// The lightweight, Arc-shared GPU/catalog DESCRIPTOR for a resident table (no host rows). Readers
+    /// clone the `Arc` -- a refcount bump, never the row data. (Was an owned deep-clone that copied the
+    /// table's host rows on every general-executor query; the split moved those to `host_rows`.)
     pub(crate) fn relational_residency_snapshot_ref(
         &self,
         table: &str,
-    ) -> Option<RelationalResidencySnapshot> {
+    ) -> Option<Arc<RelationalResidencySnapshot>> {
+        self.read_state
+            .residency
+            .snapshots
+            .load()
+            .get(table)
+            .map(|entry| entry.descriptor.clone())
+    }
+
+    /// The WHOLE residency entry (descriptor + host rows) from ONE atomic `load()`, so a reader that
+    /// needs BOTH halves sees a single consistent generation. Use this instead of calling
+    /// `relational_residency_snapshot_ref` + `relational_residency_host_rows` separately -- two
+    /// `load()`s could straddle a concurrent publish and pair a descriptor with mismatched rows.
+    pub(crate) fn relational_residency_entry(
+        &self,
+        table: &str,
+    ) -> Option<RelationalResidencyEntry> {
         self.read_state
             .residency
             .snapshots
@@ -1390,13 +1410,14 @@ impl Engine {
             );
         }
 
-        let Some(snapshot) = snapshots_guard.get(&table.name) else {
+        let Some(entry) = snapshots_guard.get(&table.name) else {
             return Self::resident_route_reject(
                 &table.name,
                 "relation has no resident snapshot",
                 query_shape,
             );
         };
+        let snapshot = &entry.descriptor;
         let memory_pressure_active = self
             .router
             .runtime()
@@ -1767,7 +1788,8 @@ impl Engine {
         let snapshots_guard = self.read_state.residency.snapshots.load();
         let mut tables = snapshots_guard
             .values()
-            .map(|snapshot| {
+            .map(|entry| {
+                let snapshot = &entry.descriptor;
                 let memory_pressure_active = self
                     .router
                     .runtime()

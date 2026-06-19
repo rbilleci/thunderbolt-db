@@ -406,8 +406,8 @@ impl Engine {
             .snapshots
             .load()
             .values()
-            .filter(|snapshot| snapshot.gpu_id == gpu_id)
-            .map(|snapshot| snapshot.resident_bytes)
+            .filter(|entry| entry.descriptor.gpu_id == gpu_id)
+            .map(|entry| entry.descriptor.resident_bytes)
             .sum();
         let partition_bytes: u64 = self
             .read_state

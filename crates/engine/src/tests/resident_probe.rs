@@ -19,7 +19,8 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
 
     let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
     assert!(snapshot.is_valid());
-    assert_eq!(snapshot.resident_rows.len(), 2);
+    // Host rows now live in the separate `host_rows` half of the residency entry (Option C split).
+    assert_eq!(e.relational_residency_entry("events").unwrap().host_rows.len(), 2);
 
     let before = e.metrics().snapshot();
     let resident = e

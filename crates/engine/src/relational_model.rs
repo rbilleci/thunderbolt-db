@@ -202,7 +202,10 @@ pub struct RelationalResidencySnapshot {
     pub row_count: usize,
     pub column_count: usize,
     pub resident_bytes: u64,
-    pub resident_rows: Vec<Vec<SqlValue>>,
+    // NOTE: the heavy host-side row materialization (`resident_rows`) is NOT here -- it lives in the
+    // separate, Arc-shared `RelationalResidencyEntry.host_rows`, so this GPU/catalog DESCRIPTOR stays
+    // lightweight and is never deep-copied on the GPU read path (it is the device executor's contract;
+    // only the CPU / enumerated paths read host rows). See `RelationalResidencyEntry`.
     pub resident_device_int4_columns: Vec<String>,
     pub resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     /// int8 columns retained in the device payload (fixed 8-byte row-major, after the int4 section,
@@ -230,6 +233,20 @@ pub struct RelationalResidencySnapshot {
     pub resident_bytes_after_admission: u64,
     pub evicted_tables_on_admission: Vec<String>,
     pub device_memory_proof: Option<CudaDeviceMemoryProof>,
+}
+
+/// A published, immutable per-table residency entry (the value stored in the residency snapshot map).
+/// Splits the lightweight GPU/catalog DESCRIPTOR ([`RelationalResidencySnapshot`]) from the heavy
+/// host-side row materialization, each `Arc`-shared so a reader -- or a `with_snapshots_mut` map clone
+/// (every invalidation / DDL) -- bumps a refcount instead of deep-copying the rows. The GPU executor
+/// reads only `descriptor`; the CPU / enumerated paths read `host_rows`. Keeping the host copy (the
+/// charter's "CPU materialization = debt") off the device read path AND independently shareable is the
+/// architectural point: `relational_residency_snapshot_ref` returns the descriptor;
+/// `relational_residency_host_rows` returns the rows.
+#[derive(Debug, Clone)]
+pub struct RelationalResidencyEntry {
+    pub descriptor: std::sync::Arc<RelationalResidencySnapshot>,
+    pub host_rows: std::sync::Arc<Vec<Vec<SqlValue>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

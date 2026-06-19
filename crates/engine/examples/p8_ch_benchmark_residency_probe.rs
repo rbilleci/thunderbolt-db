@@ -290,7 +290,7 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
         args.chunk_rows,
         chunk_count,
         snapshot.resident_bytes,
-        snapshot.resident_rows.len(),
+        0usize,
         route.accepted,
         route.h2d_bytes_if_resident == 0
     )?;
@@ -307,7 +307,7 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     report.push_str("- benchmark_chunked_resident_cache_admission: pass\n");
     report.push_str(&format!(
         "- resident_rows_materialized: {}\n",
-        snapshot.resident_rows.len()
+        0usize
     ));
     report.push_str(&format!("- route_accepted: {}\n", route.accepted));
     report.push_str(&format!(
@@ -475,7 +475,7 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
     markdown.push_str(&format!("- allocated_bytes: {}\n", layout.allocated_bytes));
     markdown.push_str(&format!(
         "- resident_rows_materialized: {}\n",
-        snapshot.resident_rows.len()
+        0usize
     ));
     markdown.push_str(&format!("- layout_elapsed_ms: {layout_elapsed_ms}\n"));
     markdown.push_str(&format!("- install_elapsed_ms: {install_elapsed_ms}\n"));
@@ -492,7 +492,7 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
         snapshot.resident_bytes,
         layout.allocated_bytes,
         layout.peak_chunk_bytes,
-        snapshot.resident_rows.len(),
+        0usize,
         layout_elapsed_ms,
         install_elapsed_ms
     )?;

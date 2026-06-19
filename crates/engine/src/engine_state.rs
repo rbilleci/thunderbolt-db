@@ -506,7 +506,7 @@ pub(crate) struct ResidencyReadState {
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
     // memory-pressure.
-    pub(crate) snapshots: ArcSwap<BTreeMap<String, RelationalResidencySnapshot>>,
+    pub(crate) snapshots: ArcSwap<BTreeMap<String, RelationalResidencyEntry>>,
     pub(crate) partitions: ArcSwap<BTreeMap<String, Vec<RelationalResidentPartition>>>,
 }
 
@@ -516,7 +516,7 @@ impl ResidencyReadState {
     /// loaded. One publisher (the catalog-latch path), so the load→clone→store is race-free.
     pub(crate) fn with_snapshots_mut<R>(
         &self,
-        mutate: impl FnOnce(&mut BTreeMap<String, RelationalResidencySnapshot>) -> R,
+        mutate: impl FnOnce(&mut BTreeMap<String, RelationalResidencyEntry>) -> R,
     ) -> R {
         let mut next = (**self.snapshots.load()).clone();
         let result = mutate(&mut next);

@@ -673,7 +673,8 @@ impl RelationalResidentCache {
     pub(crate) fn install_snapshot(
         &self,
         table: String,
-        snapshot: RelationalResidencySnapshot,
+        descriptor: RelationalResidencySnapshot,
+        host_rows: Vec<Vec<SqlValue>>,
         device_memory: Option<CudaResidentDeviceMemory>,
         residency: &ResidencyReadState,
     ) {
@@ -684,7 +685,13 @@ impl RelationalResidentCache {
             // in-flight reader of a prior resident generation keeps it.
             residency.device_memory.invalidate(&table);
         }
-        residency.with_snapshots_mut(|snapshots| snapshots.insert(table, snapshot));
+        // Co-publish the lightweight descriptor + the heavy host rows as one Arc-shared entry, so
+        // the COW map clone (every reader + every invalidation) bumps refcounts, not row data.
+        let entry = RelationalResidencyEntry {
+            descriptor: Arc::new(descriptor),
+            host_rows: Arc::new(host_rows),
+        };
+        residency.with_snapshots_mut(|snapshots| snapshots.insert(table, entry));
     }
 
     pub(crate) fn install_partitions(
