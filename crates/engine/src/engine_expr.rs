@@ -963,7 +963,15 @@ impl Engine {
                 | SelectProjection::Max { .. }
                 | SelectProjection::Avg { .. }
         );
-        if !is_aggregate {
+        // Grouped aggregates (GROUP BY) emit one row per group from a GPU hash aggregation; they are
+        // handled separately below (not via the scalar-aggregate or the plain-projection paths).
+        let is_grouped = matches!(
+            select.projection,
+            SelectProjection::GroupedCount { .. }
+                | SelectProjection::GroupedSum { .. }
+                | SelectProjection::GroupedAvg { .. }
+        );
+        if !is_aggregate && !is_grouped {
             if bound.selected_indexes.is_empty() {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "resident Expr select requires at least one projected column".to_string(),
@@ -1048,6 +1056,80 @@ impl Engine {
             }
         };
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
+
+        // Grouped aggregate (GROUP BY <int4 key>): GPU hash aggregation over the filtered rows -> one
+        // row per distinct key. COUNT/SUM/AVG share the count+sum kernel; grouped MIN/MAX is a
+        // follow-on. PG does not order GROUP BY without ORDER BY; sort by key for determinism.
+        if is_grouped {
+            #[derive(Clone, Copy)]
+            enum GroupedAgg {
+                Count,
+                Sum,
+                Avg,
+            }
+            let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+            };
+            let (group_name, value_name, kind) = match &select.projection {
+                SelectProjection::GroupedCount { column } => (column, column, GroupedAgg::Count),
+                SelectProjection::GroupedSum {
+                    group_column,
+                    sum_column,
+                } => (group_column, sum_column, GroupedAgg::Sum),
+                SelectProjection::GroupedAvg {
+                    group_column,
+                    avg_column,
+                } => (group_column, avg_column, GroupedAgg::Avg),
+                _ => unreachable!("is_grouped gates on GroupedCount | GroupedSum | GroupedAvg"),
+            };
+            let group_idx = relational_column_index(table, group_name)?;
+            if table.columns[group_idx].ty != SqlType::Int4 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "GROUP BY key must be an int4 column on the Expr path".to_string(),
+                )));
+            }
+            let value_idx = relational_column_index(table, value_name)?;
+            if matches!(kind, GroupedAgg::Sum | GroupedAgg::Avg)
+                && table.columns[value_idx].ty != SqlType::Int4
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "grouped SUM / AVG support an int4 value column on the Expr path".to_string(),
+                )));
+            }
+            let key_offset = resident_device_int4_column_offset(&snapshot, table, group_idx)?;
+            // COUNT(*) has no value column; the kernel ignores the summed value when value == key.
+            let value_offset = if matches!(kind, GroupedAgg::Count) {
+                key_offset
+            } else {
+                resident_device_int4_column_offset(&snapshot, table, value_idx)?
+            };
+            let groups = device_memory
+                .group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
+                .map_err(map_err)?;
+            let mut rows: Vec<Vec<SqlValue>> = groups
+                .iter()
+                .map(|g| {
+                    let agg = match kind {
+                        GroupedAgg::Count => SqlValue::Int8(g.count as i64),
+                        GroupedAgg::Sum => SqlValue::Int8(g.sum),
+                        GroupedAgg::Avg => average_sql_value(i128::from(g.sum), g.count as usize),
+                    };
+                    vec![SqlValue::Int4(g.key), agg]
+                })
+                .collect();
+            rows.sort_by_key(|row| match row[0] {
+                SqlValue::Int4(k) => k,
+                _ => i32::MIN,
+            });
+            return Ok(RelationalSelectResult {
+                columns: bound.selected_columns,
+                rows,
+                planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                fallback_reason: None,
+                access_path,
+            });
+        }
 
         // Scalar aggregate? Compute it from the filtered indices and return a single row.
         if is_aggregate {

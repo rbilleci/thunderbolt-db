@@ -212,8 +212,22 @@ enumerated legacy path still owns.
   `SELECT col FROM t` (whole-table projection) all run on the general path (the aggregate + projection
   paths are index-driven, so only the index source changed). Follow-on: full-scan reduce kernels that
   take `row_count` directly instead of synthesizing the `0..n` index array (avoids the O(n) H2D).
-- NEXT operators: `GROUP BY` (GPU hashing), then joins (M5). All scalar aggregates are NULL-gated on
-  the empty case (M3).
+- **`GROUP BY` (int4 key) — FIRST SLICE DONE**: `SELECT g, COUNT(*)/SUM(v)/AVG(v) FROM t [WHERE ...]
+  GROUP BY g` runs on the general path via **GPU hash aggregation** (the enumerated path groups on the
+  host with a `BTreeMap` -- the charter anti-pattern). Kernel `gpu_db_group_by_i32_count_sum`:
+  open-addressing table, murmur3-64 hash, `atom.cas.b64` slot claim (EMPTY = i64::MIN), `atom.add` the
+  per-group count + sum; `gpu_db_fill_i64` inits slot_keys. The parser lifts `g, <agg>` to
+  `Grouped{Count,Sum,Avg}` + sets `group_by`; bind gives the 2-col schema [key, agg]; the executor runs
+  the kernel + host-compacts the slots, sorted by key for determinism. COUNT/SUM/AVG share the
+  count+sum kernel (AVG = `average_sql_value(sum,count)` per group). This is the CORRECT BASELINE.
+- ADAPTIVE GROUP BY TARGET (lean, NOT a heavy cardinality estimator): a **two-level shared-mem hash**
+  (block-local table -> global merge) as the workhorse -- kills the global-atomic CONTENTION the
+  baseline suffers at LOW cardinality (the common analytics case); plus a **sort-based** path (reusing
+  the radix sort that ORDER BY / sort-merge joins need anyway) for HIGH cardinality / sorted output;
+  routed on cheap query signals (ORDER-BY-on-key), no sampling estimator. Build order: baseline (done)
+  -> two-level shared-mem -> radix sort + sort-based + routing. Other follow-ons: grouped MIN/MAX
+  (atom.min/max per slot), int8/numeric/text group keys, GPU stream-compaction of the slots.
+- NEXT operators after GROUP BY: joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

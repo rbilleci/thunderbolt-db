@@ -2193,3 +2193,69 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
         .collect();
     assert_eq!(got, a.to_vec(), "SELECT a FROM t projects all rows in order");
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_group_by() {
+    // GROUP BY an int4 key on the general GPU executor (hash aggregation): COUNT/SUM/AVG per group,
+    // results sorted by key for determinism. Groups: g=1 -> v{10,20,30}, g=2 -> v{5,15}, g=3 -> v{100}.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g,v) VALUES (1,10),(2,5),(1,20),(3,100),(2,15),(1,30)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+    let i8 = SqlValue::Int8;
+
+    // GROUP BY g, COUNT(*): g=1->3, g=2->2, g=3->1.
+    let c = e.execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g").expect("grouped count");
+    assert_eq!(
+        c.rows,
+        vec![vec![i4(1), i8(3)], vec![i4(2), i8(2)], vec![i4(3), i8(1)]],
+        "GROUP BY count"
+    );
+    assert_eq!(c.executed_target, DeviceTarget::Gpu(0));
+
+    // GROUP BY g, SUM(v): g=1->60, g=2->20, g=3->100.
+    let s = e.execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g").expect("grouped sum");
+    assert_eq!(
+        s.rows,
+        vec![vec![i4(1), i8(60)], vec![i4(2), i8(20)], vec![i4(3), i8(100)]],
+        "GROUP BY sum"
+    );
+
+    // GROUP BY g, AVG(v): 60/3=20, 20/2=10, 100/1=100 -> numeric scale 16 (PG select_div_scale).
+    let a = e.execute_resident_expr_select_sql("SELECT g, AVG(v) FROM t GROUP BY g").expect("grouped avg");
+    let avg_strs: Vec<String> = a
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            SqlValue::Numeric(d) => d.to_decimal_string(),
+            other => panic!("AVG must be numeric, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(a.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), vec![i4(1), i4(2), i4(3)], "AVG keys");
+    assert_eq!(
+        avg_strs,
+        vec!["20.0000000000000000", "10.0000000000000000", "100.0000000000000000"],
+        "GROUP BY avg"
+    );
+
+    // GROUP BY with a WHERE: group only the surviving rows. v > 10 -> (1,20),(3,100),(2,15),(1,30):
+    // g=1 -> 2 (20,30), g=2 -> 1 (15), g=3 -> 1 (100).
+    let w = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t WHERE v > 10 GROUP BY g")
+        .expect("grouped count + where");
+    assert_eq!(
+        w.rows,
+        vec![vec![i4(1), i8(2)], vec![i4(2), i8(1)], vec![i4(3), i8(1)]],
+        "GROUP BY count + WHERE"
+    );
+
+    // The result schema is [group key, aggregate]: 2 columns named g + the aggregate.
+    assert_eq!(c.columns.len(), 2, "grouped result has key + aggregate columns");
+    assert_eq!(c.columns[0].name, "g", "first result column is the group key");
+}

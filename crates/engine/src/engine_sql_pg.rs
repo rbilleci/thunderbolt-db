@@ -107,7 +107,6 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
 
     let unsupported = [
         (!stmt.distinct_clause.is_empty(), "DISTINCT"),
-        (!stmt.group_clause.is_empty(), "GROUP BY"),
         (stmt.having_clause.is_some(), "HAVING"),
         (!stmt.window_clause.is_empty(), "window functions"),
         (!stmt.sort_clause.is_empty(), "ORDER BY"),
@@ -131,12 +130,18 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         )));
     }
 
-    let projection = build_projection(&stmt.target_list, &qualifier)?;
+    // GROUP BY a single column -> a grouped aggregate projection (group key + one aggregate); no
+    // GROUP BY -> the scalar projection. The grouped EXECUTION is GPU hash aggregation (doc 19).
+    let group_by = parse_group_by(&stmt.group_clause, &qualifier)?;
+    let projection = match &group_by {
+        Some(group_column) => build_grouped_projection(&stmt.target_list, group_column, &qualifier)?,
+        None => build_projection(&stmt.target_list, &qualifier)?,
+    };
     let select = Select {
         table,
         distinct: false,
         projection,
-        group_by: None,
+        group_by,
         having_groups: Vec::new(),
         filter: None,
         filters: Vec::new(),
@@ -146,6 +151,87 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         offset: None,
     };
     Ok((select, qualifier))
+}
+
+/// Resolve the GROUP BY clause to a single grouped column name (the Expr path groups by one column
+/// for now). Empty -> `None`. More than one grouping term is a clear follow-on error.
+fn parse_group_by(group_clause: &[Node], qualifier: &str) -> Result<Option<String>, ExecuteError> {
+    match group_clause {
+        [] => Ok(None),
+        [one] => {
+            let NodeEnum::ColumnRef(column_ref) = node_enum(one)? else {
+                return Err(sql_pg_error(
+                    "GROUP BY must be a single base column on the Expr path".to_string(),
+                ));
+            };
+            Ok(Some(resolve_column_name(column_ref, qualifier)?.to_string()))
+        }
+        _ => Err(sql_pg_error(
+            "GROUP BY supports a single column on the Expr path yet".to_string(),
+        )),
+    }
+}
+
+/// Map a grouped SELECT's target list to a `Grouped*` projection: exactly `<group_column>, <aggregate>`
+/// (the group key first, then COUNT(*)/SUM/MIN/MAX/AVG). The projected group column must be the GROUP
+/// BY column. MIN/MAX grouping is a follow-on (the count+sum kernel does not cover it yet).
+fn build_grouped_projection(
+    target_list: &[Node],
+    group_column: &str,
+    qualifier: &str,
+) -> Result<SelectProjection, ExecuteError> {
+    let [group_target, aggregate_target] = target_list else {
+        return Err(sql_pg_error(
+            "a grouped SELECT must project exactly the GROUP BY column and one aggregate".to_string(),
+        ));
+    };
+    // Target 0 must be the group column itself.
+    let NodeEnum::ResTarget(group_res) = node_enum(group_target)? else {
+        return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
+    };
+    let group_val = group_res
+        .val
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("grouped SELECT group target has no value".to_string()))?;
+    let NodeEnum::ColumnRef(group_ref) = node_enum(group_val)? else {
+        return Err(sql_pg_error(
+            "the first grouped projection must be the GROUP BY column".to_string(),
+        ));
+    };
+    if resolve_column_name(group_ref, qualifier)? != group_column {
+        return Err(sql_pg_error(
+            "the projected column must be the GROUP BY column".to_string(),
+        ));
+    }
+    // Target 1 must be a scalar aggregate; lift it to its grouped form keyed by the group column.
+    let NodeEnum::ResTarget(agg_res) = node_enum(aggregate_target)? else {
+        return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
+    };
+    let Some(aggregate) = try_parse_scalar_aggregate(agg_res, qualifier)? else {
+        return Err(sql_pg_error(
+            "a grouped SELECT's second projection must be an aggregate (COUNT(*) / SUM / AVG)"
+                .to_string(),
+        ));
+    };
+    let group_column = group_column.to_string();
+    match aggregate {
+        SelectProjection::CountAll => Ok(SelectProjection::GroupedCount {
+            column: group_column,
+        }),
+        SelectProjection::Sum { column } => Ok(SelectProjection::GroupedSum {
+            group_column,
+            sum_column: column,
+        }),
+        SelectProjection::Avg { column } => Ok(SelectProjection::GroupedAvg {
+            group_column,
+            avg_column: column,
+        }),
+        SelectProjection::Min { .. } | SelectProjection::Max { .. } => Err(sql_pg_error(
+            "grouped MIN / MAX are not on the general GPU executor yet (COUNT / SUM / AVG are)"
+                .to_string(),
+        )),
+        _ => Err(sql_pg_error("unsupported grouped aggregate".to_string())),
+    }
 }
 
 /// Map the SELECT target list to a projection: a lone `*` -> `All`, otherwise a list of plain column
