@@ -174,9 +174,13 @@ enumerated legacy path still owns.
   minmax_at_indices` (op 0=min/1=max; the accumulator's identity i32::MAX/MIN is H2D'd since it isn't
   a memset byte pattern; local reduce + one predicated `atom.min/max.s32`). Same parse/execute branch
   as SUM; empty set hard-errors (M3). Gate: engine GPU 26/0, execution GPU 49/0.
-- NEXT operators: `AVG` (numeric = sum/count), int8/numeric `SUM`/`MIN`/`MAX`, no-WHERE `COUNT(*)`,
-  then `GROUP BY` (hashing), then joins (M5). All scalar aggregates are NULL-gated on the empty case
-  (M3).
+- **`AVG(int4)` — DONE**: `SELECT AVG(col) FROM t WHERE <pred>` = the GPU SUM / the count, as numeric
+  (PG). NO new kernel -- reuses the SUM gather-reduce; the final scalar `sum/count` reuses the existing
+  `average_sql_value` (scale-16 Decimal128, matching the enumerated path). Empty -> hard error (M3).
+  **ALL 5 SCALAR AGGREGATES (COUNT/SUM/MIN/MAX/AVG) now run on the general executor.** Gate: engine
+  GPU 26/0.
+- NEXT operators: int8/numeric `SUM`/`MIN`/`MAX`/`AVG`, no-WHERE `COUNT(*)` (full-table), then
+  `GROUP BY` (hashing), then joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

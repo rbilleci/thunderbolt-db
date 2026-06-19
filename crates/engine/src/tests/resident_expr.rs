@@ -1832,17 +1832,51 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     // answer). FILTER / OVER live INSIDE the FuncCall: they must reject, not silently drop (audit P0).
     for sql in [
         "SELECT COUNT(a) FROM t WHERE a > 0",
-        "SELECT AVG(a) FROM t WHERE a > 0",
         "SELECT COUNT(*) FILTER (WHERE a > 90) FROM t WHERE a >= 0",
         "SELECT COUNT(*) OVER () FROM t WHERE a >= 0",
         "SELECT COUNT(*) OVER (ORDER BY a) FROM t WHERE a >= 0",
         "SELECT COUNT(*) AS c FROM t WHERE a > 0",
         "SELECT SUM(*) FROM t WHERE a > 0",
         "SELECT MIN(*) FROM t WHERE a > 0",
+        "SELECT AVG(*) FROM t WHERE a > 0",
     ] {
         assert!(
             e.execute_resident_expr_select_sql(sql).is_err(),
             "{sql} => aggregate follow-on error (no silent FILTER/OVER drop)"
         );
     }
+
+    // AVG(int4) = the GPU sum / the count, as numeric (PG, scale 16). The reduction is on the GPU;
+    // the scalar divide reuses average_sql_value (so this checks the pipeline picks the right
+    // sum + count). a > 10 -> 1170/39 = 30 exactly; a >= 0 -> 1225/50 = 24.5.
+    let avg_expected = |keep: &dyn Fn(i64) -> bool| -> Vec<Vec<SqlValue>> {
+        let sum: i128 = (0..N).filter(|&i| keep(i)).map(i128::from).sum();
+        let count = (0..N).filter(|&i| keep(i)).count();
+        vec![vec![average_sql_value(sum, count)]]
+    };
+    let a1 = e
+        .execute_resident_expr_select_sql("SELECT AVG(a) FROM t WHERE a > 10")
+        .expect("avg on GPU");
+    assert_eq!(a1.rows, avg_expected(&|a| a > 10), "AVG(a) WHERE a > 10 => 30");
+    assert_eq!(a1.executed_target, DeviceTarget::Gpu(0));
+    // 30 exactly, at scale 16.
+    assert_eq!(
+        a1.rows,
+        vec![vec![SqlValue::Numeric(Decimal128::new(30 * 10_i128.pow(16), 16))]],
+        "AVG = 30.0000000000000000"
+    );
+    let a2 = e
+        .execute_resident_expr_select_sql("SELECT AVG(a) FROM t WHERE a >= 0")
+        .expect("avg all on GPU");
+    assert_eq!(a2.rows, avg_expected(&|_| true), "AVG(a) all => 24.5");
+    let a3 = e
+        .execute_resident_expr_select_sql("SELECT AVG(a) FROM t WHERE flag")
+        .expect("avg where flag on GPU");
+    assert_eq!(a3.rows, avg_expected(&|a| a % 3 == 0), "AVG(a) WHERE flag");
+    // AVG over an EMPTY set is NULL (M3) -> hard error.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT AVG(a) FROM t WHERE a > 1000")
+            .is_err(),
+        "AVG over empty => NULL/M3 hard error"
+    );
 }

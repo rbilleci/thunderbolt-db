@@ -954,6 +954,7 @@ impl Engine {
                 | SelectProjection::Sum { .. }
                 | SelectProjection::Min { .. }
                 | SelectProjection::Max { .. }
+                | SelectProjection::Avg { .. }
         );
         if !is_aggregate {
             if bound.selected_indexes.is_empty() {
@@ -1086,7 +1087,28 @@ impl Engine {
                     .map_err(map_err)?;
                     SqlValue::Int4(value)
                 }
-                _ => unreachable!("is_aggregate gates on CountAll | Sum | Min | Max"),
+                // AVG(int4) = the GPU SUM / the count, as numeric (PG). The reduction is on the GPU;
+                // the final scalar divide reuses `average_sql_value` (scale-16, matching the enumerated
+                // path). Empty set is NULL -> hard error (M3), like the others.
+                SelectProjection::Avg { column } => {
+                    let avg_idx = validate_avg_column(table, column)?;
+                    if indices.is_empty() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "AVG over an empty set is NULL, which the engine cannot represent yet \
+                             (NULL support is M3)"
+                                .to_string(),
+                        )));
+                    }
+                    let byte_offset =
+                        resident_device_int4_column_offset(&snapshot, table, avg_idx)?;
+                    let sum = device_memory
+                        .sum_i32_at_indices_from_payload(byte_offset, &indices)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    average_sql_value(i128::from(sum), indices.len())
+                }
+                _ => unreachable!("is_aggregate gates on CountAll | Sum | Min | Max | Avg"),
             };
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
