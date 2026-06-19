@@ -2315,6 +2315,53 @@ fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_min_max_over_int8_value() {
+    // GROUP BY an int4 key, MIN/MAX of an int8 (BIGINT) value -> exercises the 8-byte-stride
+    // 2x4-byte value read + values WAY beyond the i32 range. Constructed oracle:
+    //   g=1 -> {1e10, -5e9, 3e10}      (min -5e9, max 3e10)
+    //   g=2 -> {i64::MAX, -9e18}        (min -9e18, max i64::MAX)
+    // The i64::MAX value also probes that the min-identity (i64::MAX) collision is benign (the slot
+    // is occupied, so the real value is read even when it equals the fill identity).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES \
+         (1,10000000000),(2,9223372036854775807),(1,-5000000000),(1,30000000000),(2,-9000000000000000000)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+    let i8 = SqlValue::Int8;
+
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v) FROM t GROUP BY g")
+        .expect("int8 grouped min");
+    assert_eq!(
+        mn.rows,
+        vec![
+            vec![i4(1), i8(-5_000_000_000)],
+            vec![i4(2), i8(-9_000_000_000_000_000_000)],
+        ],
+        "int8 GROUP BY min"
+    );
+    assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
+
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(v) FROM t GROUP BY g")
+        .expect("int8 grouped max");
+    assert_eq!(
+        mx.rows,
+        vec![vec![i4(1), i8(30_000_000_000)], vec![i4(2), i8(i64::MAX)]],
+        "int8 GROUP BY max"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys

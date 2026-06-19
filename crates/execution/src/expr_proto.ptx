@@ -3936,11 +3936,16 @@ fill_done:
     .param .u64 slot_count_ptr,
     .param .u64 slot_sum_ptr,
     .param .u64 slot_min_ptr,
-    .param .u64 slot_max_ptr
+    .param .u64 slot_max_ptr,
+    .param .u64 value_is_int8
 )
 {
     .reg .pred %p;
     .reg .pred %claimed;
+    .reg .u64 %v8;
+    .reg .u64 %voff;
+    .reg .u32 %vlo;
+    .reg .u32 %vhi;
     .reg .pred %mine;
     .reg .pred %hit;
     .reg .u32 %lane;
@@ -3985,6 +3990,7 @@ fill_done:
     ld.param.u64 %sptr, [slot_sum_ptr];
     ld.param.u64 %mnptr, [slot_min_ptr];
     ld.param.u64 %mxptr, [slot_max_ptr];
+    ld.param.u64 %v8, [value_is_int8];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4007,9 +4013,22 @@ row_loop:
     ld.global.s32 %k32, [%addr];
     cvt.s64.s32 %key, %k32;
     add.u64 %addr, %base, %soff;
+    setp.ne.u64 %p, %v8, 0;
+    @%p bra gb_vi64;
+    // int4 value: 4-byte stride, sign-extend to s64.
     add.u64 %addr, %addr, %off;
     ld.global.s32 %v32, [%addr];
     cvt.s64.s32 %val, %v32;
+    bra gb_vdone;
+gb_vi64:
+    // int8 value: 8-byte stride, read as 2x4-byte (section may be 4-mod-8 aligned), pack to s64.
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 8;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %val, {%vlo, %vhi};
+gb_vdone:
     mov.b64 %mix, %key;
     shr.u64 %tmp, %mix, 33;
     xor.b64 %mix, %mix, %tmp;

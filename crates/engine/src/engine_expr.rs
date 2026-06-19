@@ -1192,20 +1192,38 @@ impl Engine {
                 )));
             }
             let value_idx = relational_column_index(table, value_name)?;
-            if matches!(
-                kind,
-                GroupedAgg::Sum | GroupedAgg::Avg | GroupedAgg::Min | GroupedAgg::Max
-            ) && table.columns[value_idx].ty != SqlType::Int4
-            {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "grouped SUM / AVG / MIN / MAX support an int4 value column on the Expr path"
-                        .to_string(),
-                )));
-            }
+            let value_ty = table.columns[value_idx].ty;
+            // SUM/AVG: int4 value only (int8/numeric grouped sums are a follow-on). MIN/MAX: int4 or
+            // int8 (the single-level kernel's signed atom.min/max.s64 covers both; `value_is_int8`
+            // selects the 8-byte vs 4-byte value read).
+            let value_is_int8 = match kind {
+                GroupedAgg::Count => false,
+                GroupedAgg::Sum | GroupedAgg::Avg => {
+                    if value_ty != SqlType::Int4 {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "grouped SUM / AVG support an int4 value column on the Expr path"
+                                .to_string(),
+                        )));
+                    }
+                    false
+                }
+                GroupedAgg::Min | GroupedAgg::Max => match value_ty {
+                    SqlType::Int4 => false,
+                    SqlType::Int8 => true,
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "grouped MIN / MAX support an int4 or int8 value column on the Expr path"
+                                .to_string(),
+                        )));
+                    }
+                },
+            };
             let key_offset = resident_device_int4_column_offset(&snapshot, table, group_idx)?;
             // COUNT(*) has no value column; the kernel ignores the summed value when value == key.
             let value_offset = if matches!(kind, GroupedAgg::Count) {
                 key_offset
+            } else if value_is_int8 {
+                resident_device_int8_column_offset(&snapshot, table, value_idx)?
             } else {
                 resident_device_int4_column_offset(&snapshot, table, value_idx)?
             };
@@ -1216,6 +1234,7 @@ impl Engine {
                     key_offset,
                     value_offset,
                     &indices,
+                    value_is_int8,
                 )
             } else {
                 device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
@@ -1228,7 +1247,9 @@ impl Engine {
                         GroupedAgg::Count => SqlValue::Int8(g.count as i64),
                         GroupedAgg::Sum => SqlValue::Int8(g.sum),
                         GroupedAgg::Avg => average_sql_value(i128::from(g.sum), g.count as usize),
+                        GroupedAgg::Min if value_is_int8 => SqlValue::Int8(g.min),
                         GroupedAgg::Min => SqlValue::Int4(g.min as i32),
+                        GroupedAgg::Max if value_is_int8 => SqlValue::Int8(g.max),
                         GroupedAgg::Max => SqlValue::Int4(g.max as i32),
                     };
                     vec![SqlValue::Int4(g.key), agg]

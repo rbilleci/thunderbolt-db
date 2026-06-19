@@ -1195,18 +1195,21 @@ impl CudaResidentDeviceMemory {
             sum_byte_offset,
             indices,
             c"gpu_db_group_by_i32_count_sum_twolevel",
+            false, // two-level path serves COUNT/SUM/AVG over an int4 value
         )
     }
 
-    /// GROUP BY with per-group MIN/MAX of the int4 value (the returned [`GroupByI32Row`] carries
+    /// GROUP BY with per-group MIN/MAX of the value (the returned [`GroupByI32Row`] carries
     /// `min`/`max`). Uses the SINGLE-LEVEL kernel, which computes min/max (the two-level kernel does
     /// not); count/sum are also valid. A two-level min/max kernel is a perf follow-on for low
-    /// cardinality. `sum_byte_offset` = the value column (= key column for shapes that ignore it).
+    /// cardinality. `value_is_int8` selects the int8 (8-byte) vs int4 (4-byte) value read;
+    /// `sum_byte_offset` = the value column (= key column for shapes that ignore it).
     pub fn group_by_i32_count_sum_minmax_from_payload(
         &self,
         key_byte_offset: u64,
         sum_byte_offset: u64,
         indices: &[u32],
+        value_is_int8: bool,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1214,6 +1217,7 @@ impl CudaResidentDeviceMemory {
             sum_byte_offset,
             indices,
             c"gpu_db_group_by_i32_count_sum",
+            value_is_int8,
         )
     }
 
@@ -1232,7 +1236,14 @@ impl CudaResidentDeviceMemory {
         } else {
             c"gpu_db_group_by_i32_count_sum"
         };
-        launch_cuda_group_by_i32_count_sum(self, key_byte_offset, sum_byte_offset, indices, kernel)
+        launch_cuda_group_by_i32_count_sum(
+            self,
+            key_byte_offset,
+            sum_byte_offset,
+            indices,
+            kernel,
+            false, // the bench aggregates an int4 value
+        )
     }
 
     /// Benchmark entry: time JUST the GROUP BY kernel (CUDA events, min of `runs`), returning the
@@ -5587,6 +5598,7 @@ fn launch_cuda_group_by_i32_count_sum(
     sum_byte_offset: u64,
     indices: &[u32],
     kernel: &'static CStr,
+    value_is_int8: bool,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5691,6 +5703,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a8 = slot_sum.ptr;
     let mut a9 = slot_min.ptr;
     let mut a10 = slot_max.ptr;
+    let mut a11 = u64::from(value_is_int8);
     let mut group_args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -5703,6 +5716,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a8 as *mut u64).cast::<c_void>(),
         (&mut a9 as *mut u64).cast::<c_void>(),
         (&mut a10 as *mut u64).cast::<c_void>(),
+        (&mut a11 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
@@ -5903,6 +5917,7 @@ fn launch_cuda_group_by_kernel_timed(
     let mut a = [
         resident.device_ptr(), key_byte_offset, sum_byte_offset, indices_dev.ptr, count_u64, mask,
         slot_keys.ptr, slot_count.ptr, slot_sum.ptr, slot_min.ptr, slot_max.ptr,
+        0, // value_is_int8 = false: the timed bench always aggregates an int4 value column
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
