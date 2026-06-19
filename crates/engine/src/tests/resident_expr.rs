@@ -2418,6 +2418,163 @@ fn gpu_grouped_min_max_over_uuid_value() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_by_numeric_key() {
+    // GROUP BY a NUMERIC (i128) key -- the 128-bit key is claimed via the native atom.cas.b128 into
+    // slot_keys_i128 (single-level kernel). Covers a NEGATIVE key + a key whose mantissa exceeds 2^64
+    // (non-zero HIGH limb), and reconstructs the mantissa @ the column scale. EMPTY128 = i128::MIN is
+    // outside the +/-10^38 numeric range, so no real numeric key ever collides with the sentinel.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g NUMERIC(30,4), v INT)").unwrap();
+    let rows: &[(&str, i32)] = &[
+        ("12.5000", 10),
+        ("12.5000", 5),
+        ("-7.2500", 100),
+        ("-7.2500", 3),
+        ("1234567890123456789.0000", 1), // mantissa 1.23e22 > 2^64 -> exercises the high limb
+        ("1234567890123456789.0000", 2),
+    ];
+    let values = rows
+        .iter()
+        .map(|(g, v)| format!("({g}, {v})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let num = |m: i128| SqlValue::Numeric(Decimal128::new(m, 4));
+    let big: i128 = 1_234_567_890_123_456_789_i128 * 10_000;
+
+    // Output sorts by numeric VALUE: -7.25 < 12.5 < 1.23e18.
+    let count = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .expect("numeric-key COUNT");
+    assert_eq!(count.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        count.rows,
+        vec![
+            vec![num(-72_500), SqlValue::Int8(2)],
+            vec![num(125_000), SqlValue::Int8(2)],
+            vec![num(big), SqlValue::Int8(2)],
+        ],
+        "GROUP BY numeric key, COUNT"
+    );
+
+    let sum = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("numeric-key SUM");
+    assert_eq!(
+        sum.rows,
+        vec![
+            vec![num(-72_500), SqlValue::Int8(103)],
+            vec![num(125_000), SqlValue::Int8(15)],
+            vec![num(big), SqlValue::Int8(3)],
+        ],
+        "GROUP BY numeric key, SUM(int4)->bigint"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_by_uuid_key() {
+    // GROUP BY a UUID (i128) key via atom.cas.b128; output sorts by canonical/memcmp byte order. Uses
+    // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and
+    // INCLUDES the uuid whose LE i128 == EMPTY128 (i128::MIN) -> the DEDICATED slot path for i128 keys.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE u (id UUID, v INT)").unwrap();
+    let rows: &[(&str, i32)] = &[
+        ("00000000-0000-0000-0000-000000000001", 10),
+        ("00000000-0000-0000-0000-000000000001", 20),
+        ("00000000-0000-0000-0000-000000000080", 9), // LE i128 == i128::MIN -> dedicated slot
+        ("00000000-0000-0000-0000-0000000000ff", 7),
+        ("ff000000-0000-0000-0000-000000000000", 5), // early-byte difference
+    ];
+    let values = rows
+        .iter()
+        .map(|(id, v)| format!("('{id}', {v})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO u (id, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("u").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let uuid = |s: &str| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(s).expect("valid uuid"));
+    // memcmp order: ..0001 < ..0080 < ..00ff < ff00..
+    let count = e
+        .execute_resident_expr_select_sql("SELECT id, COUNT(*) FROM u GROUP BY id")
+        .expect("uuid-key COUNT");
+    assert_eq!(count.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        count.rows,
+        vec![
+            vec![uuid("00000000-0000-0000-0000-000000000001"), SqlValue::Int8(2)],
+            vec![uuid("00000000-0000-0000-0000-000000000080"), SqlValue::Int8(1)],
+            vec![uuid("00000000-0000-0000-0000-0000000000ff"), SqlValue::Int8(1)],
+            vec![uuid("ff000000-0000-0000-0000-000000000000"), SqlValue::Int8(1)],
+        ],
+        "GROUP BY uuid key, COUNT, sorted by memcmp (incl. the i128::MIN-valued dedicated-slot uuid)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_uuid_key_and_uuid_value_min() {
+    // Compose both b128 paths in one query: GROUP BY a uuid KEY (atom.cas.b128 claim) while taking MIN
+    // of a uuid VALUE (the b128 CAS loop).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE w (k UUID, val UUID)").unwrap();
+    let rows: &[(&str, &str)] = &[
+        (
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            "00000000-0000-0000-0000-000000000005",
+        ),
+        (
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            "00000000-0000-0000-0000-000000000002",
+        ),
+        (
+            "bbbbbbbb-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ),
+    ];
+    let values = rows
+        .iter()
+        .map(|(k, val)| format!("('{k}', '{val}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO w (k, val) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("w").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let uuid = |s: &str| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(s).expect("valid uuid"));
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k, MIN(val) FROM w GROUP BY k")
+        .expect("uuid key + uuid value MIN");
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![
+                uuid("aaaaaaaa-0000-0000-0000-000000000000"),
+                uuid("00000000-0000-0000-0000-000000000002"),
+            ],
+            vec![
+                uuid("bbbbbbbb-0000-0000-0000-000000000000"),
+                uuid("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            ],
+        ],
+        "GROUP BY uuid key, MIN(uuid value)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_min_max_over_int8_value() {
     // GROUP BY an int4 key, MIN/MAX of an int8 (BIGINT) value -> exercises the 8-byte-stride
     // 2x4-byte value read + values WAY beyond the i32 range. Constructed oracle:

@@ -1199,6 +1199,7 @@ impl CudaResidentDeviceMemory {
             false, // ...and an int4 key
             false, // ...not numeric
             false, // ...not uuid
+            false, // ...not an i128 key (i128 keys force the single-level kernel)
         )
     }
 
@@ -1217,6 +1218,7 @@ impl CudaResidentDeviceMemory {
         key_is_int8: bool,
         value_is_numeric: bool,
         value_is_uuid: bool,
+        key_is_i128: bool,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1228,6 +1230,7 @@ impl CudaResidentDeviceMemory {
             key_is_int8,
             value_is_numeric,
             value_is_uuid,
+            key_is_i128,
         )
     }
 
@@ -1256,6 +1259,7 @@ impl CudaResidentDeviceMemory {
             false, // ...and groups by an int4 key
             false, // ...not numeric
             false, // ...not uuid
+            false, // ...not an i128 key
         )
     }
 
@@ -5610,6 +5614,10 @@ pub struct GroupByI32Row {
     /// value (the b128 CAS-loop kernel); `[0; 16]` for every other aggregate/type.
     pub min_uuid: [u8; 16],
     pub max_uuid: [u8; 16],
+    /// GROUP BY key when the key column is i128-wide (NUMERIC mantissa or UUID bytes, claimed via
+    /// `atom.cas.b128`). The engine reconstructs `SqlValue::Numeric` (mantissa = this) or
+    /// `SqlValue::Uuid` (`this.to_le_bytes()` = canonical bytes). `0` for i64-key paths.
+    pub key_i128: i128,
 }
 
 /// GROUP BY an int4 `key` column, aggregating COUNT(*) and SUM(int4 `sum`) over a filtered set of row
@@ -5631,6 +5639,7 @@ fn launch_cuda_group_by_i32_count_sum(
     key_is_int8: bool,
     value_is_numeric: bool,
     value_is_uuid: bool,
+    key_is_i128: bool,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5736,6 +5745,15 @@ fn launch_cuda_group_by_i32_count_sum(
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(alloc_slots))?;
     let slot_min_uuid = primary.lease_device_buffer(uuid_slot_bytes)?;
     let slot_max_uuid = primary.lease_device_buffer(uuid_slot_bytes)?;
+    // i128 GROUP BY key slots: one b128 (16 bytes) per slot, claimed via atom.cas.b128. Only the
+    // numeric/uuid-key path reads/writes these (filled to EMPTY128 = i128::MIN then); leased always for
+    // a uniform launch signature. Shares the alloc_slots*16 size with the uuid value slots.
+    let slot_keys_i128 = primary.lease_device_buffer(uuid_slot_bytes)?;
+    let fill_i128_fn = if key_is_i128 {
+        Some(primary.cached_function(c"gpu_db_fill_i128", &ptx)?)
+    } else {
+        None
+    };
 
     const BLOCK: u32 = 256;
     // Fills cover alloc_slots (nslots + the dedicated i64::MIN slot) so that slot is initialized too.
@@ -5786,6 +5804,19 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a19 = u64::from(value_is_uuid);
     let mut a20 = slot_min_uuid.ptr;
     let mut a21 = slot_max_uuid.ptr;
+    let mut a22 = u64::from(key_is_i128);
+    let mut a23 = slot_keys_i128.ptr;
+    // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
+    let mut g0 = slot_keys_i128.ptr;
+    let mut g1 = alloc_slots_u64;
+    let mut g2 = 0u64;
+    let mut g3 = i64::MIN as u64;
+    let mut fill128_args = [
+        (&mut g0 as *mut u64).cast::<c_void>(),
+        (&mut g1 as *mut u64).cast::<c_void>(),
+        (&mut g2 as *mut u64).cast::<c_void>(),
+        (&mut g3 as *mut u64).cast::<c_void>(),
+    ];
     let mut group_args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -5809,6 +5840,8 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a19 as *mut u64).cast::<c_void>(),
         (&mut a20 as *mut u64).cast::<c_void>(),
         (&mut a21 as *mut u64).cast::<c_void>(),
+        (&mut a22 as *mut u64).cast::<c_void>(),
+        (&mut a23 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -5878,6 +5911,18 @@ fn launch_cuda_group_by_i32_count_sum(
             }
             let rc =
                 unsafe { cu_memset_d8_async(slot_max_uuid.ptr, 0x00, uuid_slot_bytes, stream) };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        // i128 GROUP BY keys: fill slot_keys_i128 = EMPTY128 (i128::MIN) before the claim runs.
+        if let Some(f) = fill_i128_fn {
+            let rc = unsafe {
+                cu_launch_kernel(
+                    f, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                    fill128_args.as_mut_ptr(), std::ptr::null_mut(),
+                )
+            };
             if rc != 0 {
                 return rc;
             }
@@ -6009,6 +6054,17 @@ fn launch_cuda_group_by_i32_count_sum(
     } else {
         (Vec::new(), Vec::new())
     };
+    // i128 GROUP BY keys: copy the b128 key slots back only on that path. Each slot's 16 LE bytes are
+    // the i128 key (numeric mantissa or uuid bytes) the kernel claimed via atom.cas.b128.
+    let keys_i128: Vec<i128> = if key_is_i128 {
+        let mut k = vec![0i128; alloc_slots];
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(k.as_mut_ptr().cast::<c_void>(), slot_keys_i128.ptr, uuid_slot_bytes)
+        })?;
+        k
+    } else {
+        Vec::new()
+    };
     // Rebuild a canonical-order uuid from a slot's 16 device bytes. The kernel stored the b128 as
     // `(uhi << 64) | ulo` with uhi = uuid bytes 0-7 big-endian and ulo = bytes 8-15 big-endian; in LE
     // device memory that is the uuid fully byte-reversed. from_le_bytes recovers ulo/uhi and to_be_bytes
@@ -6031,7 +6087,14 @@ fn launch_cuda_group_by_i32_count_sum(
     // i128 high limb for int8 sums (0 for int4).
     let mut groups = Vec::new();
     for i in 0..nslots {
-        if keys[i] != EMPTY {
+        // Occupancy: i128 keys live in slot_keys_i128 (EMPTY128 = i128::MIN); i64 keys in slot_keys
+        // (EMPTY = i64::MIN). The i128 path never writes the i64 slot_keys, so it must test its own.
+        let occupied = if key_is_i128 {
+            keys_i128[i] != i128::MIN
+        } else {
+            keys[i] != EMPTY
+        };
+        if occupied {
             groups.push(GroupByI32Row {
                 key: keys[i],
                 count: counts[i],
@@ -6043,6 +6106,7 @@ fn launch_cuda_group_by_i32_count_sum(
                 max_hi: max_his[i],
                 min_uuid: uuid_at(&mins_uuid, i),
                 max_uuid: uuid_at(&maxs_uuid, i),
+                key_i128: if key_is_i128 { keys_i128[i] } else { 0 },
             });
         }
     }
@@ -6060,6 +6124,9 @@ fn launch_cuda_group_by_i32_count_sum(
             max_hi: max_his[nslots],
             min_uuid: uuid_at(&mins_uuid, nslots),
             max_uuid: uuid_at(&maxs_uuid, nslots),
+            // The dedicated slot's i128 key (when key_is_i128) is EMPTY128 itself = i128::MIN (the
+            // kernel routes that key here without writing slot_keys_i128). 0 for the i64-key paths.
+            key_i128: if key_is_i128 { i128::MIN } else { 0 },
         });
     }
     // A numeric SUM that overflowed i128 in any group/thread set this flag on-device -> PG numeric
@@ -6166,6 +6233,9 @@ fn launch_cuda_group_by_kernel_timed(
     // The int4 bench never takes the uuid branch (value_is_uuid = 0), so they are never dereferenced.
     let slot_min_uuid = primary.lease_device_buffer(nslots * 16)?;
     let slot_max_uuid = primary.lease_device_buffer(nslots * 16)?;
+    // i128 GROUP BY key slots (b128): a valid pointer so the 24-param kernel has no stray arg. The int4
+    // bench never takes the i128-key branch (key_is_i128 = 0), so it is never dereferenced.
+    let slot_keys_i128 = primary.lease_device_buffer(nslots * 16)?;
     check_cuda(unsafe { cu_htod(indices_dev.ptr, indices.as_ptr().cast::<c_void>(), idx_bytes) })?;
 
     let null = std::ptr::null_mut::<c_void>();
@@ -6199,6 +6269,8 @@ fn launch_cuda_group_by_kernel_timed(
         0, // value_is_uuid = false: the timed bench never aggregates a uuid value
         slot_min_uuid.ptr,
         slot_max_uuid.ptr,
+        0, // key_is_i128 = false: the timed bench always groups by an int4 key
+        slot_keys_i128.ptr,
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -6249,7 +6321,7 @@ fn launch_cuda_group_by_kernel_timed(
         if keys[i] != EMPTY {
             // min/max are placeholders here -- the timed bench only validates COUNT/SUM (the two
             // kernels intentionally differ on min/max: single-level computes them, two-level doesn't).
-            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0, min_hi: 0, max_hi: 0, min_uuid: [0u8; 16], max_uuid: [0u8; 16] });
+            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0, min_hi: 0, max_hi: 0, min_uuid: [0u8; 16], max_uuid: [0u8; 16], key_i128: 0 });
         }
     }
     Ok((groups, best))

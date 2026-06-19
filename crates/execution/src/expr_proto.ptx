@@ -3917,6 +3917,56 @@ fill_done:
     ret;
 }
 
+// Fill a [b128; n] array with the 128-bit value (vhi:vlo) -- used to init slot_keys_i128 to EMPTY128
+// (i128::MIN = vlo=0, vhi=i64::MIN), since that bit pattern is not a uniform-byte memset.
+.visible .entry gpu_db_fill_i128(
+    .param .u64 ptr,
+    .param .u64 n,
+    .param .u64 vlo,
+    .param .u64 vhi
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u64 %base;
+    .reg .u64 %n;
+    .reg .u64 %vlo;
+    .reg .u64 %vhi;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .b128 %v128;
+
+    ld.param.u64 %base, [ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %vlo, [vlo];
+    ld.param.u64 %vhi, [vhi];
+    mov.b128 %v128, {%vlo, %vhi};
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+fill128_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra fill128_done;
+    mul.lo.u64 %off, %i, 16;
+    add.u64 %addr, %base, %off;
+    st.global.b128 [%addr], %v128;
+    add.u64 %i, %i, %stride;
+    bra fill128_loop;
+fill128_done:
+    ret;
+}
+
 // GROUP BY an int4 key, aggregating COUNT(*) and SUM(int4 value) into an open-addressing hash table
 // (the operator axis, doc 19; the general path -- the enumerated GROUP BY is a host BTreeMap).
 //   slot_keys : [s64; NSLOTS] host-init to EMPTY (i64::MIN) via gpu_db_fill_i64.
@@ -3947,9 +3997,18 @@ fill_done:
     .param .u64 row_slots_ptr,
     .param .u64 value_is_uuid,
     .param .u64 slot_min_uuid_ptr,
-    .param .u64 slot_max_uuid_ptr
+    .param .u64 slot_max_uuid_ptr,
+    .param .u64 key_is_i128,
+    .param .u64 slot_keys_i128_ptr
 )
 {
+    .reg .pred %pki;
+    .reg .u64 %ki128;
+    .reg .u64 %ski128;
+    .reg .u64 %keylo;
+    .reg .u64 %keyhi;
+    .reg .b128 %key128;
+    .reg .b128 %empty128;
     .reg .pred %p;
     .reg .pred %pe;
     .reg .pred %pf;
@@ -4069,6 +4128,8 @@ fill_done:
     ld.param.u64 %vuu, [value_is_uuid];
     ld.param.u64 %mnuptr, [slot_min_uuid_ptr];
     ld.param.u64 %mxuptr, [slot_max_uuid_ptr];
+    ld.param.u64 %ki128, [key_is_i128];
+    ld.param.u64 %ski128, [slot_keys_i128_ptr];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4087,6 +4148,8 @@ row_loop:
     cvt.u64.u32 %off, %idx;
     mul.lo.u64 %off, %off, 4;
     add.u64 %addr, %base, %koff;
+    setp.ne.u64 %pki, %ki128, 0;
+    @%pki bra gb_ki128;
     setp.ne.u64 %pk, %k8, 0;
     @%pk bra gb_ki64;
     // int4 key: 4-byte stride, sign-extend to s64.
@@ -4102,6 +4165,19 @@ gb_ki64:
     ld.global.u32 %klo, [%addr];
     ld.global.u32 %khi, [%addr+4];
     mov.b64 %key, {%klo, %khi};
+    bra gb_kdone;
+gb_ki128:
+    // i128 key (numeric mantissa OR uuid bytes): 16-byte stride, read 4x4-byte -> keylo (bytes 0-7),
+    // keyhi (bytes 8-15). Equality key (no ordering) -> raw LE limbs, identical read for numeric+uuid.
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %koff2, %koff2, 16;
+    add.u64 %addr, %addr, %koff2;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %keylo, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %keyhi, {%klo, %khi};
 gb_kdone:
     add.u64 %addr, %base, %soff;
     setp.ne.u64 %puu, %vuu, 0;
@@ -4155,6 +4231,7 @@ gb_vuuid:
     mov.b64 %ulo, {%bw3, %bw2};
     mov.b128 %val128, {%ulo, %uhi};
 gb_vdone:
+    @%pki bra gb_ki128claim;
     // The key i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table. Route
     // it to a dedicated slot at index nslots (= mask+1, outside the hash range) -- no hash, no claim.
     setp.eq.s64 %pmin, %key, %empty;
@@ -4182,6 +4259,44 @@ probe_loop:
     bra probe_loop;
 gb_minkey:
     add.u64 %h, %mask, 1;
+    bra do_agg;
+gb_ki128claim:
+    // i128 key (numeric mantissa OR uuid bytes): claim via native 128-bit CAS. EMPTY128 = i128::MIN =
+    // (lo=0, hi=i64::MIN). A key == i128::MIN (only a uuid byte-pattern can be that; no numeric mantissa
+    // reaches it -- it's outside the +/-10^38 range) routes to the SAME dedicated slot as the i64 path.
+    setp.eq.u64 %pe, %keylo, 0;
+    setp.eq.u64 %pf, %keyhi, %empty;
+    and.pred %pmin, %pe, %pf;
+    @%pmin bra gb_minkey;
+    xor.b64 %mix, %keylo, %keyhi;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    mov.u64 %clo, 0;
+    mov.b128 %empty128, {%clo, %empty};
+    mov.b128 %key128, {%keylo, %keyhi};
+probe_loop128:
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %ski128, %off16;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, 0;
+    setp.eq.u64 %pf, %ohi, %empty;
+    and.pred %claimed, %pe, %pf;
+    setp.eq.u64 %pe, %olo, %keylo;
+    setp.eq.u64 %pf, %ohi, %keyhi;
+    and.pred %mine, %pe, %pf;
+    or.pred %hit, %claimed, %mine;
+    @%hit bra do_agg;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra probe_loop128;
 do_agg:
     mul.lo.u64 %off, %h, 8;
     add.u64 %addr, %cptr, %off;

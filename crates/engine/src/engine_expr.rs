@@ -1210,12 +1210,21 @@ impl Engine {
             let key_is_int8 = match key_ty {
                 SqlType::Int4 | SqlType::Int2 | SqlType::Date => false,
                 SqlType::Int8 | SqlType::Timestamp => true,
+                SqlType::Numeric { .. } | SqlType::Uuid => false,
                 _ => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "GROUP BY key must be int2/int4/int8/date/timestamp on the Expr path"
+                        "GROUP BY key must be int2/int4/int8/date/timestamp/numeric/uuid on the Expr \
+                         path"
                             .to_string(),
                     )));
                 }
+            };
+            // numeric / uuid GROUP BY keys are 128-bit -- claimed via atom.cas.b128 into slot_keys_i128
+            // (the single-level kernel). key_scale carries the numeric column scale onto the result key.
+            let key_is_i128 = matches!(key_ty, SqlType::Numeric { .. } | SqlType::Uuid);
+            let key_scale: u8 = match key_ty {
+                SqlType::Numeric { scale, .. } => scale,
+                _ => 0,
             };
             let value_idx = relational_column_index(table, value_name)?;
             let value_ty = table.columns[value_idx].ty;
@@ -1263,7 +1272,9 @@ impl Engine {
                     }
                 },
             };
-            let key_offset = if key_is_int8 {
+            let key_offset = if key_is_i128 {
+                resident_device_numeric_column_offset(&snapshot, table, group_idx)?
+            } else if key_is_int8 {
                 resident_device_int8_column_offset(&snapshot, table, group_idx)?
             } else {
                 resident_device_int4_column_offset(&snapshot, table, group_idx)?
@@ -1286,7 +1297,8 @@ impl Engine {
                 || value_is_int8
                 || value_is_numeric
                 || value_is_uuid
-                || key_is_int8;
+                || key_is_int8
+                || key_is_i128;
             let groups = if use_single_level {
                 device_memory.group_by_i32_count_sum_minmax_from_payload(
                     key_offset,
@@ -1296,6 +1308,7 @@ impl Engine {
                     key_is_int8,
                     value_is_numeric,
                     value_is_uuid,
+                    key_is_i128,
                 )
             } else {
                 device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
@@ -1334,16 +1347,37 @@ impl Engine {
                         GroupedAgg::Min => narrow_ordered_value(value_ty, g.min, g.min_hi, value_scale),
                         GroupedAgg::Max => narrow_ordered_value(value_ty, g.max, g.max_hi, value_scale),
                     };
-                    // The GROUP BY key narrows back to its own type (int8/timestamp keep the full i64).
-                    let key = narrow_ordered_value(key_ty, g.key, 0, 0);
+                    // The GROUP BY key narrows back to its own type. i128 keys (numeric/uuid) come from
+                    // slot_keys_i128: numeric mantissa -> Numeric@scale; uuid's LE i128 bytes == the
+                    // canonical uuid bytes. int8/timestamp keep the full i64; others narrow from i64.
+                    let key = if key_is_i128 {
+                        match key_ty {
+                            SqlType::Numeric { .. } => {
+                                SqlValue::Numeric(Decimal128::new(g.key_i128, key_scale))
+                            }
+                            SqlType::Uuid => SqlValue::Uuid(g.key_i128.to_le_bytes()),
+                            _ => unreachable!("key_is_i128 is only numeric/uuid"),
+                        }
+                    } else {
+                        narrow_ordered_value(key_ty, g.key, 0, 0)
+                    };
                     vec![key, agg]
                 })
                 .collect();
-            rows.sort_by_key(|row| match row[0] {
-                SqlValue::Int4(k) | SqlValue::Date(k) => i64::from(k),
-                SqlValue::Int2(k) => i64::from(k),
-                SqlValue::Int8(k) | SqlValue::Timestamp(k) => k,
-                _ => i64::MIN,
+            // Deterministic output order by the group key. numeric sorts by value (Decimal128: Ord),
+            // uuid by canonical/memcmp bytes ([u8;16]: Ord), the integer/temporal types by their i64.
+            rows.sort_by(|a, b| {
+                let i64_key = |v: &SqlValue| match v {
+                    SqlValue::Int4(k) | SqlValue::Date(k) => i64::from(*k),
+                    SqlValue::Int2(k) => i64::from(*k),
+                    SqlValue::Int8(k) | SqlValue::Timestamp(k) => *k,
+                    _ => i64::MIN,
+                };
+                match (&a[0], &b[0]) {
+                    (SqlValue::Numeric(x), SqlValue::Numeric(y)) => x.cmp(y),
+                    (SqlValue::Uuid(x), SqlValue::Uuid(y)) => x.cmp(y),
+                    _ => i64_key(&a[0]).cmp(&i64_key(&b[0])),
+                }
             });
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
