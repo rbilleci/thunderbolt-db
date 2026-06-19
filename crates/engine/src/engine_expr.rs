@@ -1061,11 +1061,6 @@ impl Engine {
                 // Empty set is NULL -> hard error (M3), like SUM.
                 SelectProjection::Min { column } | SelectProjection::Max { column } => {
                     let col_idx = relational_column_index(table, column)?;
-                    if table.columns[col_idx].ty != SqlType::Int4 {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "MIN / MAX currently support int4 columns on the Expr path".to_string(),
-                        )));
-                    }
                     if indices.is_empty() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "MIN / MAX over an empty set is NULL, which the engine cannot represent \
@@ -1073,19 +1068,45 @@ impl Engine {
                                 .to_string(),
                         )));
                     }
-                    let byte_offset =
-                        resident_device_int4_column_offset(&snapshot, table, col_idx)?;
                     let is_max = matches!(select.projection, SelectProjection::Max { .. });
                     let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                     };
-                    let value = if is_max {
-                        device_memory.max_i32_at_indices_from_payload(byte_offset, &indices)
-                    } else {
-                        device_memory.min_i32_at_indices_from_payload(byte_offset, &indices)
+                    // MIN/MAX preserve the column type (PG): int4 -> int4 (i32 reduce), int8 -> int8
+                    // (i64 reduce). Other types are follow-ons.
+                    match table.columns[col_idx].ty {
+                        SqlType::Int4 => {
+                            let byte_offset =
+                                resident_device_int4_column_offset(&snapshot, table, col_idx)?;
+                            let value = if is_max {
+                                device_memory
+                                    .max_i32_at_indices_from_payload(byte_offset, &indices)
+                            } else {
+                                device_memory
+                                    .min_i32_at_indices_from_payload(byte_offset, &indices)
+                            }
+                            .map_err(map_err)?;
+                            SqlValue::Int4(value)
+                        }
+                        SqlType::Int8 => {
+                            let byte_offset =
+                                resident_device_int8_column_offset(&snapshot, table, col_idx)?;
+                            let value = if is_max {
+                                device_memory
+                                    .max_i64_at_indices_from_payload(byte_offset, &indices)
+                            } else {
+                                device_memory
+                                    .min_i64_at_indices_from_payload(byte_offset, &indices)
+                            }
+                            .map_err(map_err)?;
+                            SqlValue::Int8(value)
+                        }
+                        _ => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "MIN / MAX support int4 / int8 columns on the Expr path".to_string(),
+                            )));
+                        }
                     }
-                    .map_err(map_err)?;
-                    SqlValue::Int4(value)
                 }
                 // AVG(int4) = the GPU SUM / the count, as numeric (PG). The reduction is on the GPU;
                 // the final scalar divide reuses `average_sql_value` (scale-16, matching the enumerated

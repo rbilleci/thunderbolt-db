@@ -1119,6 +1119,25 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_minmax_at_indices(self, byte_offset, indices, true)
     }
 
+    /// `MIN`/`MAX` of a resident INT8 column over a FILTERED set of row indices (the operator axis,
+    /// doc 19); a GPU reduction (each thread reads its i64 as 2x4-byte loads, local min/max, then one
+    /// `atom.min/max.s64`). `indices` must be non-empty (empty MIN/MAX is NULL, hard-errored upstream).
+    pub fn min_i64_at_indices_from_payload(
+        &self,
+        byte_offset: u64,
+        indices: &[u32],
+    ) -> Result<i64, CudaRuntimeProbeError> {
+        launch_cuda_resident_i64_minmax_at_indices(self, byte_offset, indices, false)
+    }
+
+    pub fn max_i64_at_indices_from_payload(
+        &self,
+        byte_offset: u64,
+        indices: &[u32],
+    ) -> Result<i64, CudaRuntimeProbeError> {
+        launch_cuda_resident_i64_minmax_at_indices(self, byte_offset, indices, true)
+    }
+
     pub fn project_i32_from_payload(
         &self,
         byte_offset: u64,
@@ -4872,6 +4891,135 @@ fn launch_cuda_resident_i32_minmax_at_indices(
             (&mut result as *mut i32).cast::<c_void>(),
             out.ptr,
             std::mem::size_of::<i32>(),
+        )
+    })?;
+    Ok(result)
+}
+
+/// MIN (`is_max=false`) / MAX (`is_max=true`) of a resident INT8 column over a filtered set of row
+/// indices (the operator axis, doc 19): H2D the surviving u32 indices, H2D the i64 identity (i64::MAX
+/// for min / i64::MIN for max), run the reduction kernel (2x4-byte i64 loads + predicated
+/// `atom.min/max.s64`), D2H the i64. `indices` must be non-empty.
+fn launch_cuda_resident_i64_minmax_at_indices(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    indices: &[u32],
+    is_max: bool,
+) -> Result<i64, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if indices.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let count = indices.len();
+    let idx_bytes = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let count_u64 = count as u64;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_resident_i64_minmax_at_indices", &ptx)?;
+    let indices_dev = primary.lease_device_buffer(idx_bytes)?;
+    let out = primary.lease_device_buffer(std::mem::size_of::<i64>())?;
+
+    let init: i64 = if is_max { i64::MIN } else { i64::MAX };
+    let op: u32 = u32::from(is_max);
+
+    const BLOCK: u32 = 256;
+    let grid = count_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = byte_offset;
+    let mut a2 = indices_dev.ptr;
+    let mut a3 = count_u64;
+    let mut a4 = op;
+    let mut a5 = out.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u32).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                indices_dev.ptr,
+                indices.as_ptr().cast::<c_void>(),
+                idx_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
+            htod_async(
+                out.ptr,
+                (&init as *const i64).cast::<c_void>(),
+                std::mem::size_of::<i64>(),
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        unsafe {
+            cu_launch_kernel(
+                kernel_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    let mut result = 0_i64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut result as *mut i64).cast::<c_void>(),
+            out.ptr,
+            std::mem::size_of::<i64>(),
         )
     })?;
     Ok(result)
