@@ -2585,6 +2585,146 @@ fn gpu_grouped_by_int8_key_i64min_heavy_contention_and_misaligned() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_sum_avg_over_numeric_value() {
+    // GROUP BY an int4 key, SUM/AVG over a NUMERIC(20,2) value -> the single-level kernel reads the
+    // i128 mantissa (16-byte stride) and accumulates i128 per slot; the result carries the column
+    // scale (2). Constructed oracle:
+    //   g=1 -> {10.50, 20.25, -3.75}  sum 27.00
+    //   g=2 -> {100.00, -50.50}        sum 49.50
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(20,2))").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES (1,10.50),(1,20.25),(1,-3.75),(2,100.00),(2,-50.50)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("numeric grouped sum");
+    let sum_strs: Vec<(SqlValue, String)> = s
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].clone(),
+                match &r[1] {
+                    SqlValue::Numeric(d) => d.to_decimal_string(),
+                    other => panic!("SUM(numeric) must be numeric, got {other:?}"),
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        sum_strs,
+        vec![
+            (i4(1), "27.00".to_string()),
+            (i4(2), "49.50".to_string()),
+        ],
+        "numeric GROUP BY sum (scale preserved)"
+    );
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+
+    // AVG(numeric): expected = the engine's own avg_numeric_sql_value over the per-group i128 sum
+    // mantissa / count / column scale, so the assertion tracks PG's numeric div-scale exactly.
+    let avg = crate::rel_exec_helpers::avg_numeric_sql_value;
+    let a = e
+        .execute_resident_expr_select_sql("SELECT g, AVG(v) FROM t GROUP BY g")
+        .expect("numeric grouped avg");
+    assert_eq!(
+        a.rows,
+        vec![vec![i4(1), avg(2700, 3, 2)], vec![i4(2), avg(4950, 2, 2)]],
+        "numeric GROUP BY avg"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_numeric_sum_overflow_errors() {
+    // A per-group numeric SUM that exceeds the i128 mantissa range must ERROR (PG numeric field
+    // overflow), never silently wrap. Two values ~9e37 in one group -> ~1.8e38 > i128::MAX (~1.7e38);
+    // the kernel's on-device per-add overflow check sets the flag and the host surfaces it.
+    let mut e = Engine::new_local();
+    // NUMERIC(38,19) value 9e18 -> mantissa 9e18 * 10^19 = 9e37 (the literal 9e18 fits the parser's
+    // i64 range; the scale lifts the mantissa to 9e37). Two in one group sum to 1.8e38 > i128::MAX.
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
+    let big = "9000000000000000000"; // 9e18
+    e.execute_text(2, &format!("INSERT INTO t (g,v) VALUES (1,{big}),(1,{big})"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let mantissa = 9_000_000_000_000_000_000_i128 * 10_i128.pow(19); // 9e37
+    assert!(
+        mantissa.checked_add(mantissa).is_none(),
+        "sanity: 2 * 9e37 must overflow i128"
+    );
+    let r = e.execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g");
+    assert!(r.is_err(), "numeric SUM overflow must error, got {r:?}");
+    let msg = format!("{:?}", r.unwrap_err()).to_lowercase();
+    assert!(
+        msg.contains("overflow"),
+        "expected a numeric-overflow error, got: {msg}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_numeric_sum_large_high_limb_no_overflow() {
+    // Coverage for the numeric i128 carry's HIGH limb on a NON-overflowing sum -- the gap between the
+    // fractional test (mantissas fit i64, so val_hi == 0) and the overflow test (errors before a
+    // result). NUMERIC(38,19) value 5.0 has mantissa 5*10^19 > i64::MAX, so val_hi != 0; the per-group
+    // sums stay within i128. A wrong high-limb carry would corrupt the result by multiples of 2^64.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES (1,5.0),(1,5.0),(1,5.0),(2,-5.0),(2,-5.0)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let unit = 10_i128.pow(19); // mantissa units per 1.0 at scale 19
+    assert!(
+        5 * unit > i128::from(i64::MAX),
+        "the value mantissa must exceed i64 to genuinely exercise the i128 high limb"
+    );
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("numeric sum large");
+    let strs: Vec<(SqlValue, String)> = s
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].clone(),
+                match &r[1] {
+                    SqlValue::Numeric(d) => d.to_decimal_string(),
+                    other => panic!("SUM(numeric) must be numeric, got {other:?}"),
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        strs,
+        vec![
+            (SqlValue::Int4(1), Decimal128::new(15 * unit, 19).to_decimal_string()), // 3 * 5.0
+            (SqlValue::Int4(2), Decimal128::new(-10 * unit, 19).to_decimal_string()), // 2 * -5.0
+        ],
+        "numeric SUM with a non-zero i128 high limb (no overflow)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys

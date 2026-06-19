@@ -1202,18 +1202,40 @@ impl Engine {
             // SUM/AVG/MIN/MAX accept an int4 or int8 value (`value_is_int8` selects the 8-byte vs
             // 4-byte value read; the single-level kernel accumulates int8 SUM as i128 and does signed
             // atom.min/max.s64). numeric values are a follow-on. COUNT(*) has no value.
-            let value_is_int8 = match kind {
-                GroupedAgg::Count => false,
-                GroupedAgg::Sum
-                | GroupedAgg::Avg
-                | GroupedAgg::Min
-                | GroupedAgg::Max => match value_ty {
-                    SqlType::Int4 => false,
-                    SqlType::Int8 => true,
+            // SUM/AVG accept int4 / int8 / numeric; MIN/MAX accept int4 / int8 only (numeric MIN/MAX
+            // -- an i128 compare with no native 128-bit atomic -- is a follow-on). value_scale carries
+            // the numeric column scale onto the SUM/AVG result (0 for the integer paths).
+            let value_scale: u8 = match value_ty {
+                SqlType::Numeric { scale, .. } => scale,
+                _ => 0,
+            };
+            let (value_is_int8, value_is_numeric) = match kind {
+                GroupedAgg::Count => (false, false),
+                GroupedAgg::Sum | GroupedAgg::Avg => match value_ty {
+                    SqlType::Int4 => (false, false),
+                    SqlType::Int8 => (true, false),
+                    SqlType::Numeric { .. } => (false, true),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped SUM / AVG / MIN / MAX support an int4 or int8 value column on \
-                             the Expr path"
+                            "grouped SUM / AVG support int4 / int8 / numeric value columns on the \
+                             Expr path"
+                                .to_string(),
+                        )));
+                    }
+                },
+                GroupedAgg::Min | GroupedAgg::Max => match value_ty {
+                    SqlType::Int4 => (false, false),
+                    SqlType::Int8 => (true, false),
+                    SqlType::Numeric { .. } => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "grouped MIN / MAX over numeric is not yet on the Expr path (int4 / \
+                             int8 are)"
+                                .to_string(),
+                        )));
+                    }
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "grouped MIN / MAX support int4 / int8 value columns on the Expr path"
                                 .to_string(),
                         )));
                     }
@@ -1227,6 +1249,8 @@ impl Engine {
             // COUNT(*) has no value column; the kernel ignores the summed value when value == key.
             let value_offset = if matches!(kind, GroupedAgg::Count) {
                 key_offset
+            } else if value_is_numeric {
+                resident_device_numeric_column_offset(&snapshot, table, value_idx)?
             } else if value_is_int8 {
                 resident_device_int8_column_offset(&snapshot, table, value_idx)?
             } else {
@@ -1235,8 +1259,10 @@ impl Engine {
             // The single-level kernel computes per-group MIN/MAX and (for int8) the i128 SUM, and is
             // the only one that reads int8 KEYS, so route MIN/MAX, int8 SUM/AVG, and any int8-key query
             // there; int4-key COUNT/SUM/AVG use the two-level contention workhorse.
-            let use_single_level =
-                matches!(kind, GroupedAgg::Min | GroupedAgg::Max) || value_is_int8 || key_is_int8;
+            let use_single_level = matches!(kind, GroupedAgg::Min | GroupedAgg::Max)
+                || value_is_int8
+                || value_is_numeric
+                || key_is_int8;
             let groups = if use_single_level {
                 device_memory.group_by_i32_count_sum_minmax_from_payload(
                     key_offset,
@@ -1244,6 +1270,7 @@ impl Engine {
                     &indices,
                     value_is_int8,
                     key_is_int8,
+                    value_is_numeric,
                 )
             } else {
                 device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
@@ -1253,18 +1280,26 @@ impl Engine {
                 .iter()
                 .map(|g| {
                     // For int8 the SUM is the i128 (sum_hi:sum); for int4 sign-extend the i64 sum.
-                    let sum_i128 = if value_is_int8 {
+                    let sum_i128 = if value_is_int8 || value_is_numeric {
                         (i128::from(g.sum_hi) << 64) | i128::from(g.sum as u64)
                     } else {
                         i128::from(g.sum)
                     };
                     let agg = match kind {
                         GroupedAgg::Count => SqlValue::Int8(g.count as i64),
-                        // PG: SUM(int4) -> bigint; SUM(int8) -> numeric (scale 0).
+                        // PG: SUM(int4)->bigint; SUM(int8)->numeric scale 0; SUM(numeric)->numeric @scale.
+                        GroupedAgg::Sum if value_is_numeric => {
+                            SqlValue::Numeric(Decimal128::new(sum_i128, value_scale))
+                        }
                         GroupedAgg::Sum if value_is_int8 => {
                             SqlValue::Numeric(Decimal128::new(sum_i128, 0))
                         }
                         GroupedAgg::Sum => SqlValue::Int8(g.sum),
+                        // AVG(numeric) divides via the scalar numeric div (PG div-scale from the column
+                        // scale); int4/int8 AVG use the integer div (scale 16).
+                        GroupedAgg::Avg if value_is_numeric => {
+                            avg_numeric_sql_value(sum_i128, g.count as usize, value_scale)
+                        }
                         GroupedAgg::Avg => average_sql_value(sum_i128, g.count as usize),
                         GroupedAgg::Min if value_is_int8 => SqlValue::Int8(g.min),
                         GroupedAgg::Min => SqlValue::Int4(g.min as i32),

@@ -1197,6 +1197,7 @@ impl CudaResidentDeviceMemory {
             c"gpu_db_group_by_i32_count_sum_twolevel",
             false, // two-level path serves COUNT/SUM/AVG over an int4 value
             false, // ...and an int4 key
+            false, // ...not numeric
         )
     }
 
@@ -1212,6 +1213,7 @@ impl CudaResidentDeviceMemory {
         indices: &[u32],
         value_is_int8: bool,
         key_is_int8: bool,
+        value_is_numeric: bool,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1221,6 +1223,7 @@ impl CudaResidentDeviceMemory {
             c"gpu_db_group_by_i32_count_sum",
             value_is_int8,
             key_is_int8,
+            value_is_numeric,
         )
     }
 
@@ -1247,6 +1250,7 @@ impl CudaResidentDeviceMemory {
             kernel,
             false, // the bench aggregates an int4 value
             false, // ...and groups by an int4 key
+            false, // ...not numeric
         )
     }
 
@@ -5602,6 +5606,7 @@ pub struct GroupByI32Row {
 /// `indices` may be empty (-> no groups). NB: this is the correct baseline; a shared-memory two-level
 /// kernel (far less atomic contention at low cardinality) and a GPU slot-compaction are follow-ons.
 #[allow(unused_assignments)] // f0/f2 are re-read via the raw fill-arg pointers
+#[allow(clippy::too_many_arguments)] // kernel launcher: offsets + per-column-type layout flags
 fn launch_cuda_group_by_i32_count_sum(
     resident: &CudaResidentDeviceMemory,
     key_byte_offset: u64,
@@ -5610,6 +5615,7 @@ fn launch_cuda_group_by_i32_count_sum(
     kernel: &'static CStr,
     value_is_int8: bool,
     key_is_int8: bool,
+    value_is_numeric: bool,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5694,6 +5700,9 @@ fn launch_cuda_group_by_i32_count_sum(
     let slot_max = primary.lease_device_buffer(slot_bytes)?;
     // High 64 bits of the i128 per-group SUM for int8 values (zeroed; the int4 path leaves it 0).
     let slot_sum_hi = primary.lease_device_buffer(slot_bytes)?;
+    // A single global flag the kernel `red.global.or`s when a numeric SUM overflows i128 (PG numeric
+    // field overflow). Zeroed before launch; only the numeric path ever writes it.
+    let overflow_flag = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
 
     const BLOCK: u32 = 256;
     // Fills cover alloc_slots (nslots + the dedicated i64::MIN slot) so that slot is initialized too.
@@ -5724,6 +5733,8 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a11 = u64::from(value_is_int8);
     let mut a12 = slot_sum_hi.ptr;
     let mut a13 = u64::from(key_is_int8);
+    let mut a14 = u64::from(value_is_numeric);
+    let mut a15 = overflow_flag.ptr;
     let mut group_args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -5739,6 +5750,8 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a11 as *mut u64).cast::<c_void>(),
         (&mut a12 as *mut u64).cast::<c_void>(),
         (&mut a13 as *mut u64).cast::<c_void>(),
+        (&mut a14 as *mut u64).cast::<c_void>(),
+        (&mut a15 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
@@ -5761,6 +5774,12 @@ fn launch_cuda_group_by_i32_count_sum(
             return rc;
         }
         let rc = unsafe { cu_memset_d8_async(slot_sum_hi.ptr, 0, slot_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
+            cu_memset_d8_async(overflow_flag.ptr, 0, std::mem::size_of::<u64>(), stream)
+        };
         if rc != 0 {
             return rc;
         }
@@ -5860,6 +5879,19 @@ fn launch_cuda_group_by_i32_count_sum(
             max: maxs[nslots],
         });
     }
+    // A numeric SUM that overflowed i128 in any group/thread set this flag on-device -> PG numeric
+    // field overflow (never silently wrapped). Checked after the kernel like the scalar numeric SUM.
+    let mut overflow = 0u64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut overflow as *mut u64).cast::<c_void>(),
+            overflow_flag.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+    if overflow != 0 {
+        return Err(CudaRuntimeProbeError::NumericFieldOverflow);
+    }
     Ok(groups)
 }
 
@@ -5940,8 +5972,10 @@ fn launch_cuda_group_by_kernel_timed(
     // ignores them. Real buffers required so the single-level kernel does not write to a stray pointer.
     let slot_min = primary.lease_device_buffer(slot_bytes)?;
     let slot_max = primary.lease_device_buffer(slot_bytes)?;
-    // slot_sum_hi: required so the 13-param kernel has a valid pointer; unused by the int4 bench.
+    // slot_sum_hi + overflow_flag: required so the 16-param kernel has valid pointers; unused by the
+    // int4 bench (it never writes them).
     let slot_sum_hi = primary.lease_device_buffer(slot_bytes)?;
+    let overflow_flag = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
     check_cuda(unsafe { cu_htod(indices_dev.ptr, indices.as_ptr().cast::<c_void>(), idx_bytes) })?;
 
     let null = std::ptr::null_mut::<c_void>();
@@ -5967,6 +6001,8 @@ fn launch_cuda_group_by_kernel_timed(
         0, // value_is_int8 = false: the timed bench always aggregates an int4 value column
         slot_sum_hi.ptr,
         0, // key_is_int8 = false: the timed bench always groups by an int4 key
+        0, // value_is_numeric = false
+        overflow_flag.ptr,
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();

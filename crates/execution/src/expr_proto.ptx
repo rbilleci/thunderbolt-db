@@ -3939,7 +3939,9 @@ fill_done:
     .param .u64 slot_max_ptr,
     .param .u64 value_is_int8,
     .param .u64 slot_sum_hi_ptr,
-    .param .u64 key_is_int8
+    .param .u64 key_is_int8,
+    .param .u64 value_is_numeric,
+    .param .u64 overflow_flag_ptr
 )
 {
     .reg .pred %p;
@@ -3947,19 +3949,31 @@ fill_done:
     .reg .pred %pc;
     .reg .pred %pk;
     .reg .pred %pmin;
+    .reg .pred %pvn;
+    .reg .pred %pov;
     .reg .u64 %v8;
     .reg .u64 %k8;
+    .reg .u64 %vn;
     .reg .u64 %voff;
     .reg .u64 %koff2;
     .reg .u32 %vlo;
     .reg .u32 %vhi;
+    .reg .u32 %vlo2;
+    .reg .u32 %vhi2;
     .reg .u32 %klo;
     .reg .u32 %khi;
     .reg .u64 %shptr;
+    .reg .u64 %ovptr;
     .reg .u64 %oldlo;
     .reg .u64 %newlo;
     .reg .s64 %carry;
     .reg .s64 %hi;
+    .reg .s64 %valhi;
+    .reg .s64 %oldhi;
+    .reg .s64 %newhi;
+    .reg .s64 %addend;
+    .reg .b64 %t1;
+    .reg .b64 %t2;
     .reg .pred %mine;
     .reg .pred %hit;
     .reg .u32 %lane;
@@ -4007,6 +4021,8 @@ fill_done:
     ld.param.u64 %v8, [value_is_int8];
     ld.param.u64 %shptr, [slot_sum_hi_ptr];
     ld.param.u64 %k8, [key_is_int8];
+    ld.param.u64 %vn, [value_is_numeric];
+    ld.param.u64 %ovptr, [overflow_flag_ptr];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4042,6 +4058,8 @@ gb_ki64:
     mov.b64 %key, {%klo, %khi};
 gb_kdone:
     add.u64 %addr, %base, %soff;
+    setp.ne.u64 %pvn, %vn, 0;
+    @%pvn bra gb_vnum;
     setp.ne.u64 %p, %v8, 0;
     @%p bra gb_vi64;
     // int4 value: 4-byte stride, sign-extend to s64.
@@ -4057,6 +4075,18 @@ gb_vi64:
     ld.global.u32 %vlo, [%addr];
     ld.global.u32 %vhi, [%addr+4];
     mov.b64 %val, {%vlo, %vhi};
+    bra gb_vdone;
+gb_vnum:
+    // numeric value: i128 mantissa, 16-byte stride, read as 4x4-byte. low i64 -> %val, high i64 -> %valhi.
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %val, {%vlo, %vhi};
+    ld.global.u32 %vlo2, [%addr+8];
+    ld.global.u32 %vhi2, [%addr+12];
+    mov.b64 %valhi, {%vlo2, %vhi2};
 gb_vdone:
     // The key i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table. Route
     // it to a dedicated slot at index nslots (= mask+1, outside the hash range) -- no hash, no claim.
@@ -4089,6 +4119,8 @@ do_agg:
     mul.lo.u64 %off, %h, 8;
     add.u64 %addr, %cptr, %off;
     atom.global.add.u64 %tmp, [%addr], 1;
+    setp.ne.u64 %pvn, %vn, 0;
+    @%pvn bra gb_sumnum;
     setp.ne.u64 %p, %v8, 0;
     @%p bra gb_sum8;
     // int4 sum: single i64 atomic add.
@@ -4107,6 +4139,27 @@ gb_sum8:
     add.s64 %hi, %hi, %carry;
     add.u64 %addr, %shptr, %off;
     atom.global.add.u64 %tmp, [%addr], %hi;
+    bra gb_sumd;
+gb_sumnum:
+    // numeric sum: i128 += i128 (low %val, high %valhi -- the REAL high limb, not a sign-extension),
+    // same lock-free carry, plus per-add SIGNED-OVERFLOW detection on the high limb -> set the global
+    // overflow flag (PG errors on numeric overflow; we never silently wrap).
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %oldlo, [%addr], %val;
+    add.u64 %newlo, %oldlo, %val;
+    setp.lt.u64 %pc, %newlo, %oldlo;
+    selp.s64 %carry, 1, 0, %pc;
+    add.s64 %addend, %valhi, %carry;
+    add.u64 %addr, %shptr, %off;
+    atom.global.add.u64 %oldhi, [%addr], %addend;
+    add.s64 %newhi, %oldhi, %addend;
+    // overflow iff (oldhi,addend same sign) && (newhi differs): (~(oldhi^addend) & (oldhi^newhi)) < 0
+    xor.b64 %t1, %oldhi, %addend;
+    xor.b64 %t2, %oldhi, %newhi;
+    not.b64 %t1, %t1;
+    and.b64 %t1, %t1, %t2;
+    setp.lt.s64 %pov, %t1, 0;
+    @%pov red.global.or.b32 [%ovptr], 1;
 gb_sumd:
     add.u64 %addr, %mnptr, %off;
     atom.global.min.s64 %cur, [%addr], %val;
