@@ -1052,8 +1052,25 @@ pub(crate) fn bind_relational_select(
             SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => {
                 (SqlType::Int8, 20, 8)
             }
-            // SUM/MIN/MAX inherit the source column's wire type (SUM's value widens to int8,
-            // but its declared result type tracks the source as before).
+            // SUM: PG SUM(int8) -> numeric (the bigint sum can exceed int8); SUM(int4) keeps the
+            // source-tracking declaration (value widened to int8 -- a pre-existing choice).
+            SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => {
+                match aggregate_source_column(table, select)? {
+                    Some(column) if column.ty == SqlType::Int8 => (
+                        // SUM(int8) is an integer sum -> numeric scale 0 (PG reports unconstrained
+                        // numeric; the value carries scale 0).
+                        SqlType::Numeric {
+                            precision: NUMERIC_DEFAULT_PRECISION,
+                            scale: 0,
+                        },
+                        1700,
+                        -1,
+                    ),
+                    Some(column) => (column.ty, column.type_oid, column.type_size),
+                    None => (SqlType::Int4, 20, 8),
+                }
+            }
+            // MIN/MAX inherit the source column's wire type (PG preserves the type).
             _ => match aggregate_source_column(table, select)? {
                 Some(column) => (column.ty, column.type_oid, column.type_size),
                 None => (SqlType::Int4, 20, 8),
@@ -1617,7 +1634,10 @@ pub(crate) fn validate_int4_aggregate_column(
     aggregate: &'static str,
 ) -> Result<usize, ExecuteError> {
     let idx = relational_column_index(table, column)?;
-    if !matches!(table.columns[idx].ty, SqlType::Int4) {
+    // SUM/AVG accept int4 OR int8 on the general GPU executor (int8 reduces to i128). The enumerated
+    // path (int4-only) rejects int8 later at execution -- so this is still a hard error there, just
+    // not at validation; the general path handles int8.
+    if !matches!(table.columns[idx].ty, SqlType::Int4 | SqlType::Int8) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
             aggregate_int4_error_message(aggregate).to_string(),
         )));
@@ -1627,8 +1647,8 @@ pub(crate) fn validate_int4_aggregate_column(
 
 pub(crate) fn aggregate_int4_error_message(aggregate: &str) -> &'static str {
     match aggregate {
-        "AVG" => "AVG only supports int4 columns",
-        _ => "SUM only supports int4 columns",
+        "AVG" => "AVG supports int4 / int8 columns",
+        _ => "SUM supports int4 / int8 columns",
     }
 }
 

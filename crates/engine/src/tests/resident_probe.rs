@@ -1372,7 +1372,7 @@ fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results()
         .execute_resident_plan(&unsupported)
         .unwrap_err()
         .to_string()
-        .contains("AVG only supports int4 columns"));
+        .contains("AVG supports int4 / int8 columns"));
 
     e.mark_gpu_memory_pressured(0);
     let Command::Select(select) = parse_command("SELECT MAX(amount) FROM events").unwrap() else {

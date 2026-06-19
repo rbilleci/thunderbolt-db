@@ -1040,7 +1040,7 @@ impl Engine {
                 // PG returns bigint. An EMPTY filtered set is SQL NULL, which the engine cannot
                 // represent until M3 -- so it hard-errors rather than returning a wrong 0.
                 SelectProjection::Sum { column } => {
-                    let sum_idx = validate_sum_column(table, column)?;
+                    let col_idx = relational_column_index(table, column)?;
                     if indices.is_empty() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "SUM over an empty set is NULL, which the engine cannot represent yet \
@@ -1048,14 +1048,34 @@ impl Engine {
                                 .to_string(),
                         )));
                     }
-                    let byte_offset =
-                        resident_device_int4_column_offset(&snapshot, table, sum_idx)?;
-                    let sum = device_memory
-                        .sum_i32_at_indices_from_payload(byte_offset, &indices)
-                        .map_err(|err| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
-                        })?;
-                    SqlValue::Int8(sum)
+                    let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    };
+                    // PG: SUM(int4) -> bigint; SUM(int8) -> numeric (the sum can exceed i64, so it
+                    // reduces into i128 via the two-atomic carry kernel).
+                    match table.columns[col_idx].ty {
+                        SqlType::Int4 => {
+                            let byte_offset =
+                                resident_device_int4_column_offset(&snapshot, table, col_idx)?;
+                            let sum = device_memory
+                                .sum_i32_at_indices_from_payload(byte_offset, &indices)
+                                .map_err(map_err)?;
+                            SqlValue::Int8(sum)
+                        }
+                        SqlType::Int8 => {
+                            let byte_offset =
+                                resident_device_int8_column_offset(&snapshot, table, col_idx)?;
+                            let sum = device_memory
+                                .sum_i64_at_indices_i128_from_payload(byte_offset, &indices)
+                                .map_err(map_err)?;
+                            SqlValue::Numeric(Decimal128::new(sum, 0))
+                        }
+                        _ => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "SUM supports int4 / int8 columns on the Expr path".to_string(),
+                            )));
+                        }
+                    }
                 }
                 // MIN/MAX(int4): a GPU reduction; PG MIN/MAX preserve the column type (int4 -> int4).
                 // Empty set is NULL -> hard error (M3), like SUM.
@@ -1112,7 +1132,7 @@ impl Engine {
                 // the final scalar divide reuses `average_sql_value` (scale-16, matching the enumerated
                 // path). Empty set is NULL -> hard error (M3), like the others.
                 SelectProjection::Avg { column } => {
-                    let avg_idx = validate_avg_column(table, column)?;
+                    let col_idx = relational_column_index(table, column)?;
                     if indices.is_empty() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "AVG over an empty set is NULL, which the engine cannot represent yet \
@@ -1120,14 +1140,35 @@ impl Engine {
                                 .to_string(),
                         )));
                     }
-                    let byte_offset =
-                        resident_device_int4_column_offset(&snapshot, table, avg_idx)?;
-                    let sum = device_memory
-                        .sum_i32_at_indices_from_payload(byte_offset, &indices)
-                        .map_err(|err| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
-                        })?;
-                    average_sql_value(i128::from(sum), indices.len())
+                    let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    };
+                    // AVG(int4)/AVG(int8) -> numeric = the GPU sum (i128) / the count. int4 reduces to
+                    // i64 (widened), int8 to i128 (the two-atomic carry kernel).
+                    let sum_i128: i128 = match table.columns[col_idx].ty {
+                        SqlType::Int4 => {
+                            let byte_offset =
+                                resident_device_int4_column_offset(&snapshot, table, col_idx)?;
+                            i128::from(
+                                device_memory
+                                    .sum_i32_at_indices_from_payload(byte_offset, &indices)
+                                    .map_err(map_err)?,
+                            )
+                        }
+                        SqlType::Int8 => {
+                            let byte_offset =
+                                resident_device_int8_column_offset(&snapshot, table, col_idx)?;
+                            device_memory
+                                .sum_i64_at_indices_i128_from_payload(byte_offset, &indices)
+                                .map_err(map_err)?
+                        }
+                        _ => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "AVG supports int4 / int8 columns on the Expr path".to_string(),
+                            )));
+                        }
+                    };
+                    average_sql_value(sum_i128, indices.len())
                 }
                 _ => unreachable!("is_aggregate gates on CountAll | Sum | Min | Max | Avg"),
             };

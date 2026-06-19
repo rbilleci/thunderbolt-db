@@ -3550,3 +3550,95 @@ done_mm64:
     @!%is_min atom.global.max.s64 %old, [%optr], %acc;
     ret;
 }
+
+// out = a single i128 (two LE u64 limbs: [out]=low, [out+8]=high), host-zeroed. SUM(int8) over the
+// filtered set -> i128 (a sum of i64 can exceed i64). Each thread sums its strided slice into a local
+// i128 (2-limb, with the i64 value sign-extended), then commits via a TWO-64-bit-ATOMIC carry add:
+// atomicAdd the low limb (detect unsigned wrap -> carry), atomicAdd the high limb by (sum_hi + carry).
+// i64 values read as 2x4-byte loads (alignment). count >= 1 (empty SUM is NULL, hard-errored upstream).
+.visible .entry gpu_db_resident_i64_sum_at_indices_i128(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %carry_p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %idx;
+    .reg .b32 %w0;
+    .reg .b32 %w1;
+    .reg .s64 %val;
+    .reg .s64 %vhi_s;
+    .reg .u64 %vlo;
+    .reg .u64 %vhi;
+    .reg .u64 %sum_lo;
+    .reg .u64 %sum_hi;
+    .reg .u64 %old_lo;
+    .reg .u64 %new_lo;
+    .reg .u64 %carry;
+    .reg .u64 %hi_add;
+    .reg .u64 %old_hi;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %optr;
+    .reg .u64 %ohi;
+    .reg .u64 %count;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %ioff;
+    .reg .u64 %iaddr;
+    .reg .u64 %voff;
+    .reg .u64 %vaddr;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %voff, [byte_offset];
+    add.u64 %base, %base, %voff;
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %optr, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+    mov.u64 %sum_lo, 0;
+    mov.u64 %sum_hi, 0;
+loop_s128:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra done_s128;
+    mul.lo.u64 %ioff, %i, 4;
+    add.u64 %iaddr, %iptr, %ioff;
+    ld.global.u32 %idx, [%iaddr];
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 8;
+    add.u64 %vaddr, %base, %voff;
+    ld.global.u32 %w0, [%vaddr];
+    ld.global.u32 %w1, [%vaddr+4];
+    mov.b64 %val, {%w0, %w1};
+    shr.s64 %vhi_s, %val, 63;
+    mov.b64 %vhi, %vhi_s;
+    mov.b64 %vlo, %val;
+    add.cc.u64 %sum_lo, %sum_lo, %vlo;
+    addc.u64 %sum_hi, %sum_hi, %vhi;
+    add.u64 %i, %i, %stride;
+    bra loop_s128;
+done_s128:
+    atom.global.add.u64 %old_lo, [%optr], %sum_lo;
+    add.u64 %new_lo, %old_lo, %sum_lo;
+    setp.lt.u64 %carry_p, %new_lo, %old_lo;
+    selp.u64 %carry, 1, 0, %carry_p;
+    add.u64 %hi_add, %sum_hi, %carry;
+    add.u64 %ohi, %optr, 8;
+    atom.global.add.u64 %old_hi, [%ohi], %hi_add;
+    ret;
+}

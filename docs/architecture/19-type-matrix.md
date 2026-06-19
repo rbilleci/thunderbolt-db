@@ -183,7 +183,14 @@ enumerated legacy path still owns.
   preserves the type). One kernel `gpu_db_resident_i64_minmax_at_indices` -- mirrors the i32 minmax but
   reads each i64 as TWO 4-byte loads (the i64 section may be 4-mod-8 aligned) + `atom.min/max.s64`.
   The Min/Max execute branch dispatches int4 (i32 reduce) vs int8 (i64 reduce); other types error.
-- NEXT operators: SUM/AVG(int8) (i128 reduction), numeric SUM/MIN/MAX/AVG, no-WHERE `COUNT(*)`, then
+- **`SUM(int8)`/`AVG(int8)` — DONE**: SUM(int8) -> **numeric** (a sum of i64 can exceed i64), via a
+  new i128 gather-reduce kernel `gpu_db_resident_i64_sum_at_indices_i128` -- each thread reduces its
+  slice into a local i128, then a TWO-64-bit-ATOMIC CARRY add (atomicAdd the low limb, detect unsigned
+  wrap, atomicAdd the high limb by sum_hi+carry) into a single i128 (no native 128-bit atomic). The
+  SUM/AVG execute branches dispatch int4 (i64 reduce) vs int8 (i128 reduce); AVG(int8) = the i128 sum /
+  count via `average_sql_value`. SUM(int8) result column is numeric (oid 1700). **ALL int8 scalar
+  aggregates done.** Gate: engine GPU 28/0, execution GPU 49/0.
+- NEXT operators: numeric SUM/MIN/MAX/AVG (i128 mantissa reductions), no-WHERE `COUNT(*)`, then
   `GROUP BY` (hashing), joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc

@@ -1913,18 +1913,19 @@ fn average_sql_value_matches_postgres_dynamic_scale_and_rounding() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_execute_resident_expr_select_sql_runs_int8_minmax() {
-    // MIN/MAX(int8) over a filtered set -> int8 (PG preserves the type). Values span > i32::MAX and
-    // negatives, read as 2x4-byte loads from the i64 section. label = row index (the int4 filter col).
+fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
+    // int8 aggregates: MIN/MAX -> int8, SUM/AVG -> numeric (a sum of int8 can exceed i64, so SUM
+    // reduces to i128 via the two-atomic carry kernel). Values span > i32::MAX, negatives, and a
+    // subset (rows 0,1) whose SUM EXCEEDS i64::MAX. label = row index (the int4 filter column).
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (b BIGINT, label INT)").unwrap();
     let vals: [i64; 6] = [
+        9_000_000_000_000_000_000,
+        8_000_000_000_000_000_000,
+        0,
         5_000_000_000,
         -7_000_000_000,
-        0,
-        9_000_000_000_000_000_000,
         -9_000_000_000_000_000_000,
-        42,
     ];
     let mut values = String::new();
     for (i, v) in vals.iter().enumerate() {
@@ -1939,35 +1940,53 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_minmax() {
     if snapshot.device_memory_proof.is_none() {
         return;
     }
+    let keep_all = |_: usize| true;
+    let keep_lt2 = |i: usize| i < 2;
+    let min_of = |k: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| k(*i)).map(|(_, v)| *v).min().unwrap();
+    let max_of = |k: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| k(*i)).map(|(_, v)| *v).max().unwrap();
+    let sum_of = |k: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| k(*i)).map(|(_, v)| i128::from(*v)).sum::<i128>();
 
-    let min_of = |keep: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| keep(*i)).map(|(_, v)| *v).min().unwrap();
-    let max_of = |keep: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| keep(*i)).map(|(_, v)| *v).max().unwrap();
-
-    // All rows: MIN = -9e18, MAX = 9e18.
-    let mn = e
-        .execute_resident_expr_select_sql("SELECT MIN(b) FROM t WHERE label >= 0")
-        .expect("min i64 on GPU");
-    assert_eq!(mn.rows, vec![vec![SqlValue::Int8(min_of(&|_| true))]], "MIN(b) all => -9e18");
+    // MIN/MAX(int8) -> int8.
+    let mn = e.execute_resident_expr_select_sql("SELECT MIN(b) FROM t WHERE label >= 0").expect("min");
+    assert_eq!(mn.rows, vec![vec![SqlValue::Int8(min_of(&keep_all))]], "MIN(b) all");
     assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
-    let mx = e
-        .execute_resident_expr_select_sql("SELECT MAX(b) FROM t WHERE label >= 0")
-        .expect("max i64 on GPU");
-    assert_eq!(mx.rows, vec![vec![SqlValue::Int8(max_of(&|_| true))]], "MAX(b) all => 9e18");
+    let mx = e.execute_resident_expr_select_sql("SELECT MAX(b) FROM t WHERE label < 2").expect("max subset");
+    assert_eq!(mx.rows, vec![vec![SqlValue::Int8(max_of(&keep_lt2))]], "MAX(b) subset => 9e18");
 
-    // Subset (label < 3 -> rows 0,1,2 = 5e9, -7e9, 0): MIN = -7e9, MAX = 5e9 (genuine > i32::MAX).
-    let mn2 = e
-        .execute_resident_expr_select_sql("SELECT MIN(b) FROM t WHERE label < 3")
-        .expect("min subset on GPU");
-    assert_eq!(mn2.rows, vec![vec![SqlValue::Int8(min_of(&|i| i < 3))]], "MIN subset => -7e9");
-    let mx2 = e
-        .execute_resident_expr_select_sql("SELECT MAX(b) FROM t WHERE label < 3")
-        .expect("max subset on GPU");
-    assert_eq!(mx2.rows, vec![vec![SqlValue::Int8(max_of(&|i| i < 3))]], "MAX subset => 5e9");
-
-    // Empty -> hard error (M3).
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT MIN(b) FROM t WHERE label > 1000")
-            .is_err(),
-        "MIN(int8) over empty => NULL/M3 hard error"
+    // SUM(int8) -> numeric (scale 0). The subset {9e18, 8e18} sums to 17e18 -- EXCEEDS i64::MAX, so
+    // the i128 two-atomic carry must be correct.
+    let s_sub = e.execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label < 2").expect("sum subset");
+    assert_eq!(
+        s_sub.rows,
+        vec![vec![SqlValue::Numeric(Decimal128::new(sum_of(&keep_lt2), 0))]],
+        "SUM subset => 17e18 (> i64::MAX, i128 carry)"
     );
+    assert!(sum_of(&keep_lt2) > i128::from(i64::MAX), "test really exceeds i64");
+    let s_all = e.execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label >= 0").expect("sum all");
+    assert_eq!(
+        s_all.rows,
+        vec![vec![SqlValue::Numeric(Decimal128::new(sum_of(&keep_all), 0))]],
+        "SUM all (incl. negatives)"
+    );
+
+    // AVG(int8) -> numeric. 17e18 / 2 = 8.5e18 (scale 0 at this magnitude).
+    let av = e.execute_resident_expr_select_sql("SELECT AVG(b) FROM t WHERE label < 2").expect("avg subset");
+    assert_eq!(
+        av.rows,
+        vec![vec![average_sql_value(sum_of(&keep_lt2), 2)]],
+        "AVG subset"
+    );
+    match &av.rows[0][0] {
+        SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "8500000000000000000", "AVG = 8.5e18"),
+        other => panic!("AVG must be numeric, got {other:?}"),
+    }
+
+    // Empty SUM/MIN/AVG -> hard error (M3).
+    for sql in [
+        "SELECT MIN(b) FROM t WHERE label > 1000",
+        "SELECT SUM(b) FROM t WHERE label > 1000",
+        "SELECT AVG(b) FROM t WHERE label > 1000",
+    ] {
+        assert!(e.execute_resident_expr_select_sql(sql).is_err(), "{sql} => empty NULL/M3 error");
+    }
 }
