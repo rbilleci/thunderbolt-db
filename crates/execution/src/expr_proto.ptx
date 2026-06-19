@@ -3937,15 +3937,22 @@ fill_done:
     .param .u64 slot_sum_ptr,
     .param .u64 slot_min_ptr,
     .param .u64 slot_max_ptr,
-    .param .u64 value_is_int8
+    .param .u64 value_is_int8,
+    .param .u64 slot_sum_hi_ptr
 )
 {
     .reg .pred %p;
     .reg .pred %claimed;
+    .reg .pred %pc;
     .reg .u64 %v8;
     .reg .u64 %voff;
     .reg .u32 %vlo;
     .reg .u32 %vhi;
+    .reg .u64 %shptr;
+    .reg .u64 %oldlo;
+    .reg .u64 %newlo;
+    .reg .s64 %carry;
+    .reg .s64 %hi;
     .reg .pred %mine;
     .reg .pred %hit;
     .reg .u32 %lane;
@@ -3991,6 +3998,7 @@ fill_done:
     ld.param.u64 %mnptr, [slot_min_ptr];
     ld.param.u64 %mxptr, [slot_max_ptr];
     ld.param.u64 %v8, [value_is_int8];
+    ld.param.u64 %shptr, [slot_sum_hi_ptr];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4054,8 +4062,25 @@ do_agg:
     mul.lo.u64 %off, %h, 8;
     add.u64 %addr, %cptr, %off;
     atom.global.add.u64 %tmp, [%addr], 1;
+    setp.ne.u64 %p, %v8, 0;
+    @%p bra gb_sum8;
+    // int4 sum: single i64 atomic add.
     add.u64 %addr, %sptr, %off;
     atom.global.add.u64 %tmp, [%addr], %val;
+    bra gb_sumd;
+gb_sum8:
+    // int8 sum: i128 two-atomic carry (lo into slot_sum, hi into slot_sum_hi). Lock-free: each
+    // thread's carry comes from its own low-limb atomicAdd return, so sum(hi)=sum(signext+carry).
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %oldlo, [%addr], %val;
+    add.u64 %newlo, %oldlo, %val;
+    setp.lt.u64 %pc, %newlo, %oldlo;
+    selp.s64 %carry, 1, 0, %pc;
+    shr.s64 %hi, %val, 63;
+    add.s64 %hi, %hi, %carry;
+    add.u64 %addr, %shptr, %off;
+    atom.global.add.u64 %tmp, [%addr], %hi;
+gb_sumd:
     add.u64 %addr, %mnptr, %off;
     atom.global.min.s64 %cur, [%addr], %val;
     add.u64 %addr, %mxptr, %off;

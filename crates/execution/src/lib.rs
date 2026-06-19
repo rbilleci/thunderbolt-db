@@ -5578,8 +5578,12 @@ pub struct GroupByI32Row {
     pub key: i32,
     pub count: u64,
     pub sum: i64,
-    /// MIN / MAX of the int4 value column per group (sign-extended into i64 slots; the engine narrows
-    /// back to i32). For COUNT(*) (value == key) they are ignored.
+    /// High 64 bits of the per-group SUM when the value is int8 (the sum is accumulated as i128:
+    /// `sum_hi:sum`). Zero for int4 sums (which fit `sum` alone). The engine combines them into an
+    /// i128 -> numeric for `SUM(bigint)` / `AVG(bigint)`.
+    pub sum_hi: i64,
+    /// MIN / MAX of the value column per group (sign-extended into i64 slots; the engine narrows back
+    /// to int4 / keeps int8). For COUNT(*) (value == key) they are ignored.
     pub min: i64,
     pub max: i64,
 }
@@ -5677,6 +5681,8 @@ fn launch_cuda_group_by_i32_count_sum(
     // (they stay at the i64::MAX/MIN identity). Always allocated so the launch signature is uniform.
     let slot_min = primary.lease_device_buffer(slot_bytes)?;
     let slot_max = primary.lease_device_buffer(slot_bytes)?;
+    // High 64 bits of the i128 per-group SUM for int8 values (zeroed; the int4 path leaves it 0).
+    let slot_sum_hi = primary.lease_device_buffer(slot_bytes)?;
 
     const BLOCK: u32 = 256;
     let fill_grid = nslots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -5704,6 +5710,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a9 = slot_min.ptr;
     let mut a10 = slot_max.ptr;
     let mut a11 = u64::from(value_is_int8);
+    let mut a12 = slot_sum_hi.ptr;
     let mut group_args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -5717,6 +5724,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a9 as *mut u64).cast::<c_void>(),
         (&mut a10 as *mut u64).cast::<c_void>(),
         (&mut a11 as *mut u64).cast::<c_void>(),
+        (&mut a12 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
@@ -5735,6 +5743,10 @@ fn launch_cuda_group_by_i32_count_sum(
             return rc;
         }
         let rc = unsafe { cu_memset_d8_async(slot_sum.ptr, 0, slot_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe { cu_memset_d8_async(slot_sum_hi.ptr, 0, slot_bytes, stream) };
         if rc != 0 {
             return rc;
         }
@@ -5783,6 +5795,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut keys = vec![0i64; nslots];
     let mut counts = vec![0u64; nslots];
     let mut sums = vec![0i64; nslots];
+    let mut sum_his = vec![0i64; nslots];
     let mut mins = vec![0i64; nslots];
     let mut maxs = vec![0i64; nslots];
     check_cuda(unsafe {
@@ -5795,6 +5808,9 @@ fn launch_cuda_group_by_i32_count_sum(
         cu_memcpy_dtoh(sums.as_mut_ptr().cast::<c_void>(), slot_sum.ptr, slot_bytes)
     })?;
     check_cuda(unsafe {
+        cu_memcpy_dtoh(sum_his.as_mut_ptr().cast::<c_void>(), slot_sum_hi.ptr, slot_bytes)
+    })?;
+    check_cuda(unsafe {
         cu_memcpy_dtoh(mins.as_mut_ptr().cast::<c_void>(), slot_min.ptr, slot_bytes)
     })?;
     check_cuda(unsafe {
@@ -5802,7 +5818,8 @@ fn launch_cuda_group_by_i32_count_sum(
     })?;
     // Host-compact the occupied slots (slot_keys != EMPTY). A GPU stream-compaction is a follow-on.
     // min/max are the per-group values from the single-level kernel; for the two-level kernel (COUNT/
-    // SUM/AVG only) they stay at the i64::MAX/MIN identity and the engine ignores them.
+    // SUM/AVG only) they stay at the i64::MAX/MIN identity and the engine ignores them. sum_hi is the
+    // i128 high limb for int8 sums (0 for int4).
     let mut groups = Vec::new();
     for i in 0..nslots {
         if keys[i] != EMPTY {
@@ -5810,6 +5827,7 @@ fn launch_cuda_group_by_i32_count_sum(
                 key: keys[i] as i32,
                 count: counts[i],
                 sum: sums[i],
+                sum_hi: sum_his[i],
                 min: mins[i],
                 max: maxs[i],
             });
@@ -5895,6 +5913,8 @@ fn launch_cuda_group_by_kernel_timed(
     // ignores them. Real buffers required so the single-level kernel does not write to a stray pointer.
     let slot_min = primary.lease_device_buffer(slot_bytes)?;
     let slot_max = primary.lease_device_buffer(slot_bytes)?;
+    // slot_sum_hi: required so the 13-param kernel has a valid pointer; unused by the int4 bench.
+    let slot_sum_hi = primary.lease_device_buffer(slot_bytes)?;
     check_cuda(unsafe { cu_htod(indices_dev.ptr, indices.as_ptr().cast::<c_void>(), idx_bytes) })?;
 
     let null = std::ptr::null_mut::<c_void>();
@@ -5918,6 +5938,7 @@ fn launch_cuda_group_by_kernel_timed(
         resident.device_ptr(), key_byte_offset, sum_byte_offset, indices_dev.ptr, count_u64, mask,
         slot_keys.ptr, slot_count.ptr, slot_sum.ptr, slot_min.ptr, slot_max.ptr,
         0, // value_is_int8 = false: the timed bench always aggregates an int4 value column
+        slot_sum_hi.ptr,
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -5968,7 +5989,7 @@ fn launch_cuda_group_by_kernel_timed(
         if keys[i] != EMPTY {
             // min/max are placeholders here -- the timed bench only validates COUNT/SUM (the two
             // kernels intentionally differ on min/max: single-level computes them, two-level doesn't).
-            groups.push(GroupByI32Row { key: keys[i] as i32, count: counts[i], sum: sums[i], min: 0, max: 0 });
+            groups.push(GroupByI32Row { key: keys[i] as i32, count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0 });
         }
     }
     Ok((groups, best))

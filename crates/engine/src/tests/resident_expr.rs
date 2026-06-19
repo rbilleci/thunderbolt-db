@@ -2362,6 +2362,77 @@ fn gpu_grouped_min_max_over_int8_value() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_sum_avg_over_int8_value() {
+    // GROUP BY int4 key, SUM/AVG of an int8 (BIGINT) value. The per-group SUM is accumulated as i128
+    // (the two-atomic carry, now per hash slot), so it can EXCEED i64 in both directions. PG:
+    // SUM(bigint) -> numeric (scale 0). Constructed oracle:
+    //   g=1 -> {5e18, 5e18}     sum  1.0e19  (> i64::MAX)
+    //   g=2 -> {-6e18, -6e18}   sum -1.2e19  (< i64::MIN)
+    //   g=3 -> {100, 200, 300}  sum  600     (fits i64)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES \
+         (1,5000000000000000000),(1,5000000000000000000),\
+         (2,-6000000000000000000),(2,-6000000000000000000),\
+         (3,100),(3,200),(3,300)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+
+    // SUM(int8) -> numeric (scale 0), exceeding i64 in both directions via the i128 carry.
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("int8 grouped sum");
+    let sum_strs: Vec<(SqlValue, String)> = s
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].clone(),
+                match &r[1] {
+                    SqlValue::Numeric(d) => d.to_decimal_string(),
+                    other => panic!("SUM(int8) must be numeric, got {other:?}"),
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        sum_strs,
+        vec![
+            (i4(1), "10000000000000000000".to_string()),
+            (i4(2), "-12000000000000000000".to_string()),
+            (i4(3), "600".to_string()),
+        ],
+        "int8 GROUP BY sum (i128 carry)"
+    );
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+
+    // AVG(int8) -> numeric, computed from the i128 sum. Expected = the engine's own average_sql_value
+    // over the constructed i128 sum / count, so the assertion tracks PG's div-scale exactly without
+    // hardcoding a scale that varies with magnitude.
+    let avg = crate::rel_exec_helpers::average_sql_value;
+    let a = e
+        .execute_resident_expr_select_sql("SELECT g, AVG(v) FROM t GROUP BY g")
+        .expect("int8 grouped avg");
+    assert_eq!(
+        a.rows,
+        vec![
+            vec![i4(1), avg(10_000_000_000_000_000_000_i128, 2)],
+            vec![i4(2), avg(-12_000_000_000_000_000_000_i128, 2)],
+            vec![i4(3), avg(600_i128, 3)],
+        ],
+        "int8 GROUP BY avg"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys
