@@ -1053,21 +1053,26 @@ pub(crate) fn bind_relational_select(
                 (SqlType::Int8, 20, 8)
             }
             // SUM: PG SUM(int8) -> numeric (the bigint sum can exceed int8); SUM(int4) keeps the
-            // source-tracking declaration (value widened to int8 -- a pre-existing choice).
-            SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => {
-                match aggregate_source_column(table, select)? {
-                    Some(column) if column.ty == SqlType::Int8 => (
-                        // SUM(int8) is an integer sum -> numeric scale 0 (PG reports unconstrained
-                        // numeric; the value carries scale 0).
+            // pre-existing (Int4 ty, oid 20, size 8) declaration (value widened to int8). NB:
+            // aggregate_source_column intentionally returns None for SUM, so look the source column
+            // up directly here -- relying on it silently fell through to the int4 default for int8.
+            SelectProjection::Sum { column }
+            | SelectProjection::GroupedSum {
+                sum_column: column, ..
+            } => {
+                let idx = relational_column_index(table, column)?;
+                if table.columns[idx].ty == SqlType::Int8 {
+                    // SUM(int8) is an integer sum -> numeric scale 0 (OID 1700).
+                    (
                         SqlType::Numeric {
                             precision: NUMERIC_DEFAULT_PRECISION,
                             scale: 0,
                         },
                         1700,
                         -1,
-                    ),
-                    Some(column) => (column.ty, column.type_oid, column.type_size),
-                    None => (SqlType::Int4, 20, 8),
+                    )
+                } else {
+                    (SqlType::Int4, 20, 8)
                 }
             }
             // MIN/MAX inherit the source column's wire type (PG preserves the type).
