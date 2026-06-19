@@ -3934,7 +3934,9 @@ fill_done:
     .param .u64 mask,
     .param .u64 slot_keys_ptr,
     .param .u64 slot_count_ptr,
-    .param .u64 slot_sum_ptr
+    .param .u64 slot_sum_ptr,
+    .param .u64 slot_min_ptr,
+    .param .u64 slot_max_ptr
 )
 {
     .reg .pred %p;
@@ -3960,6 +3962,8 @@ fill_done:
     .reg .u64 %kptr;
     .reg .u64 %cptr;
     .reg .u64 %sptr;
+    .reg .u64 %mnptr;
+    .reg .u64 %mxptr;
     .reg .u64 %count;
     .reg .u64 %mask;
     .reg .u64 %i;
@@ -3979,6 +3983,8 @@ fill_done:
     ld.param.u64 %kptr, [slot_keys_ptr];
     ld.param.u64 %cptr, [slot_count_ptr];
     ld.param.u64 %sptr, [slot_sum_ptr];
+    ld.param.u64 %mnptr, [slot_min_ptr];
+    ld.param.u64 %mxptr, [slot_max_ptr];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4031,6 +4037,10 @@ do_agg:
     atom.global.add.u64 %tmp, [%addr], 1;
     add.u64 %addr, %sptr, %off;
     atom.global.add.u64 %tmp, [%addr], %val;
+    add.u64 %addr, %mnptr, %off;
+    atom.global.min.s64 %cur, [%addr], %val;
+    add.u64 %addr, %mxptr, %off;
+    atom.global.max.s64 %cur, [%addr], %val;
     add.u64 %i, %i, %stride;
     bra row_loop;
 row_done:
@@ -4051,9 +4061,13 @@ row_done:
     .param .u64 mask,
     .param .u64 slot_keys_ptr,
     .param .u64 slot_count_ptr,
-    .param .u64 slot_sum_ptr
+    .param .u64 slot_sum_ptr,
+    .param .u64 slot_min_ptr,
+    .param .u64 slot_max_ptr
 )
 {
+    // slot_min_ptr / slot_max_ptr are accepted for a uniform launch signature but UNUSED here: the
+    // two-level kernel serves COUNT/SUM/AVG; grouped MIN/MAX routes to the single-level kernel.
     .shared .align 8 .b64 s_keys[1024];
     .shared .align 8 .b64 s_count[1024];
     .shared .align 8 .b64 s_sum[1024];

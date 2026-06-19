@@ -1198,6 +1198,25 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// GROUP BY with per-group MIN/MAX of the int4 value (the returned [`GroupByI32Row`] carries
+    /// `min`/`max`). Uses the SINGLE-LEVEL kernel, which computes min/max (the two-level kernel does
+    /// not); count/sum are also valid. A two-level min/max kernel is a perf follow-on for low
+    /// cardinality. `sum_byte_offset` = the value column (= key column for shapes that ignore it).
+    pub fn group_by_i32_count_sum_minmax_from_payload(
+        &self,
+        key_byte_offset: u64,
+        sum_byte_offset: u64,
+        indices: &[u32],
+    ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
+        launch_cuda_group_by_i32_count_sum(
+            self,
+            key_byte_offset,
+            sum_byte_offset,
+            indices,
+            c"gpu_db_group_by_i32_count_sum",
+        )
+    }
+
     /// Benchmark entry: run GROUP BY with the chosen kernel (`two_level` selects the shared-mem
     /// two-level kernel vs the single-level global-atomic one). For perf comparison only; the engine
     /// always uses the two-level kernel via [`Self::group_by_i32_count_sum_from_payload`].
@@ -5548,6 +5567,10 @@ pub struct GroupByI32Row {
     pub key: i32,
     pub count: u64,
     pub sum: i64,
+    /// MIN / MAX of the int4 value column per group (sign-extended into i64 slots; the engine narrows
+    /// back to i32). For COUNT(*) (value == key) they are ignored.
+    pub min: i64,
+    pub max: i64,
 }
 
 /// GROUP BY an int4 `key` column, aggregating COUNT(*) and SUM(int4 `sum`) over a filtered set of row
@@ -5557,6 +5580,7 @@ pub struct GroupByI32Row {
 /// For COUNT(*) pass `sum_byte_offset = key_byte_offset` (the summed value is then ignored).
 /// `indices` may be empty (-> no groups). NB: this is the correct baseline; a shared-memory two-level
 /// kernel (far less atomic contention at low cardinality) and a GPU slot-compaction are follow-ons.
+#[allow(unused_assignments)] // f0/f2 are re-read via the raw fill-arg pointers
 fn launch_cuda_group_by_i32_count_sum(
     resident: &CudaResidentDeviceMemory,
     key_byte_offset: u64,
@@ -5637,11 +5661,17 @@ fn launch_cuda_group_by_i32_count_sum(
     let slot_keys = primary.lease_device_buffer(slot_bytes)?;
     let slot_count = primary.lease_device_buffer(slot_bytes)?;
     let slot_sum = primary.lease_device_buffer(slot_bytes)?;
+    // MIN/MAX slots: the single-level kernel fills these per group; the two-level kernel ignores them
+    // (they stay at the i64::MAX/MIN identity). Always allocated so the launch signature is uniform.
+    let slot_min = primary.lease_device_buffer(slot_bytes)?;
+    let slot_max = primary.lease_device_buffer(slot_bytes)?;
 
     const BLOCK: u32 = 256;
     let fill_grid = nslots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
     let group_grid = count_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
 
+    // One fill-arg set, mutated between the 3 slot_keys / slot_min / slot_max fills (cuLaunchKernel
+    // copies the arg values at call time, so re-launching after mutating f0/f2 is safe).
     let mut f0 = slot_keys.ptr;
     let mut f1 = nslots_u64;
     let mut f2 = EMPTY as u64;
@@ -5659,6 +5689,8 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a6 = slot_keys.ptr;
     let mut a7 = slot_count.ptr;
     let mut a8 = slot_sum.ptr;
+    let mut a9 = slot_min.ptr;
+    let mut a10 = slot_max.ptr;
     let mut group_args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -5669,6 +5701,8 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a6 as *mut u64).cast::<c_void>(),
         (&mut a7 as *mut u64).cast::<c_void>(),
         (&mut a8 as *mut u64).cast::<c_void>(),
+        (&mut a9 as *mut u64).cast::<c_void>(),
+        (&mut a10 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
@@ -5690,6 +5724,31 @@ fn launch_cuda_group_by_i32_count_sum(
         if rc != 0 {
             return rc;
         }
+        // fill slot_keys = EMPTY
+        let rc = unsafe {
+            cu_launch_kernel(
+                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        // fill slot_min = i64::MAX (the MIN identity)
+        f0 = slot_min.ptr;
+        f2 = i64::MAX as u64;
+        let rc = unsafe {
+            cu_launch_kernel(
+                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        // fill slot_max = i64::MIN (the MAX identity)
+        f0 = slot_max.ptr;
+        f2 = i64::MIN as u64;
         let rc = unsafe {
             cu_launch_kernel(
                 fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
@@ -5710,6 +5769,8 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut keys = vec![0i64; nslots];
     let mut counts = vec![0u64; nslots];
     let mut sums = vec![0i64; nslots];
+    let mut mins = vec![0i64; nslots];
+    let mut maxs = vec![0i64; nslots];
     check_cuda(unsafe {
         cu_memcpy_dtoh(keys.as_mut_ptr().cast::<c_void>(), slot_keys.ptr, slot_bytes)
     })?;
@@ -5719,7 +5780,15 @@ fn launch_cuda_group_by_i32_count_sum(
     check_cuda(unsafe {
         cu_memcpy_dtoh(sums.as_mut_ptr().cast::<c_void>(), slot_sum.ptr, slot_bytes)
     })?;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(mins.as_mut_ptr().cast::<c_void>(), slot_min.ptr, slot_bytes)
+    })?;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(maxs.as_mut_ptr().cast::<c_void>(), slot_max.ptr, slot_bytes)
+    })?;
     // Host-compact the occupied slots (slot_keys != EMPTY). A GPU stream-compaction is a follow-on.
+    // min/max are the per-group values from the single-level kernel; for the two-level kernel (COUNT/
+    // SUM/AVG only) they stay at the i64::MAX/MIN identity and the engine ignores them.
     let mut groups = Vec::new();
     for i in 0..nslots {
         if keys[i] != EMPTY {
@@ -5727,6 +5796,8 @@ fn launch_cuda_group_by_i32_count_sum(
                 key: keys[i] as i32,
                 count: counts[i],
                 sum: sums[i],
+                min: mins[i],
+                max: maxs[i],
             });
         }
     }
@@ -5737,6 +5808,7 @@ fn launch_cuda_group_by_i32_count_sum(
 /// compaction that dominate the end-to-end latency) via CUDA events, returning the MIN over `runs`
 /// kernel launches plus the result rows (for a correctness check). Sets up once; per run resets the
 /// global table (fill + memset) UNTIMED, then events bracket only the group kernel. Null stream.
+#[allow(unused_assignments)] // f0/f2 are re-read via the raw fill-arg pointers
 fn launch_cuda_group_by_kernel_timed(
     resident: &CudaResidentDeviceMemory,
     key_byte_offset: u64,
@@ -5805,6 +5877,10 @@ fn launch_cuda_group_by_kernel_timed(
     let slot_keys = primary.lease_device_buffer(slot_bytes)?;
     let slot_count = primary.lease_device_buffer(slot_bytes)?;
     let slot_sum = primary.lease_device_buffer(slot_bytes)?;
+    // min/max slots: the single-level kernel writes them (it dereferences the params); the two-level
+    // ignores them. Real buffers required so the single-level kernel does not write to a stray pointer.
+    let slot_min = primary.lease_device_buffer(slot_bytes)?;
+    let slot_max = primary.lease_device_buffer(slot_bytes)?;
     check_cuda(unsafe { cu_htod(indices_dev.ptr, indices.as_ptr().cast::<c_void>(), idx_bytes) })?;
 
     let null = std::ptr::null_mut::<c_void>();
@@ -5826,7 +5902,7 @@ fn launch_cuda_group_by_kernel_timed(
     ];
     let mut a = [
         resident.device_ptr(), key_byte_offset, sum_byte_offset, indices_dev.ptr, count_u64, mask,
-        slot_keys.ptr, slot_count.ptr, slot_sum.ptr,
+        slot_keys.ptr, slot_count.ptr, slot_sum.ptr, slot_min.ptr, slot_max.ptr,
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -5835,6 +5911,19 @@ fn launch_cuda_group_by_kernel_timed(
     for _ in 0..runs {
         check_cuda(unsafe { cu_memset(slot_count.ptr, 0, slot_bytes) })?;
         check_cuda(unsafe { cu_memset(slot_sum.ptr, 0, slot_bytes) })?;
+        // fill keys=EMPTY, min=i64::MAX, max=i64::MIN (reset f0/f2 each iteration).
+        f0 = slot_keys.ptr;
+        f2 = EMPTY as u64;
+        check_cuda(unsafe {
+            cu_launch(fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, null, fill_args.as_mut_ptr(), null.cast())
+        })?;
+        f0 = slot_min.ptr;
+        f2 = i64::MAX as u64;
+        check_cuda(unsafe {
+            cu_launch(fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, null, fill_args.as_mut_ptr(), null.cast())
+        })?;
+        f0 = slot_max.ptr;
+        f2 = i64::MIN as u64;
         check_cuda(unsafe {
             cu_launch(fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, null, fill_args.as_mut_ptr(), null.cast())
         })?;
@@ -5862,7 +5951,9 @@ fn launch_cuda_group_by_kernel_timed(
     let mut groups = Vec::new();
     for i in 0..nslots {
         if keys[i] != EMPTY {
-            groups.push(GroupByI32Row { key: keys[i] as i32, count: counts[i], sum: sums[i] });
+            // min/max are placeholders here -- the timed bench only validates COUNT/SUM (the two
+            // kernels intentionally differ on min/max: single-level computes them, two-level doesn't).
+            groups.push(GroupByI32Row { key: keys[i] as i32, count: counts[i], sum: sums[i], min: 0, max: 0 });
         }
     }
     Ok((groups, best))

@@ -2262,6 +2262,59 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
+    // GROUP BY with per-group MIN/MAX on the general GPU executor (single-level kernel; signed s64
+    // atom.min/max). Expected values are CONSTRUCTED from the inserted rows (a GPU-native oracle, not
+    // a CPU re-fold): g=1 -> v{10,30,20}; g=2 -> v{5,15,-7}; g=3 -> v{100}. A NEGATIVE value exercises
+    // the signed min.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES (1,10),(2,5),(1,30),(3,100),(2,15),(1,20),(2,-7)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+
+    // g=1 -> min 10; g=2 -> min -7 (signed); g=3 -> min 100.
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v) FROM t GROUP BY g")
+        .expect("grouped min");
+    assert_eq!(
+        mn.rows,
+        vec![vec![i4(1), i4(10)], vec![i4(2), i4(-7)], vec![i4(3), i4(100)]],
+        "GROUP BY min"
+    );
+    assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
+
+    // g=1 -> max 30; g=2 -> max 15; g=3 -> max 100.
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(v) FROM t GROUP BY g")
+        .expect("grouped max");
+    assert_eq!(
+        mx.rows,
+        vec![vec![i4(1), i4(30)], vec![i4(2), i4(15)], vec![i4(3), i4(100)]],
+        "GROUP BY max"
+    );
+
+    // MIN with a WHERE: the predicate-filtered indices feed the same kernel. v > 0 drops (2,-7), so
+    // g=2's min becomes 5.
+    let mw = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v) FROM t WHERE v > 0 GROUP BY g")
+        .expect("grouped min + where");
+    assert_eq!(
+        mw.rows,
+        vec![vec![i4(1), i4(10)], vec![i4(2), i4(5)], vec![i4(3), i4(100)]],
+        "GROUP BY min + WHERE"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys
@@ -2362,12 +2415,17 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
     );
     eprintln!("{:>8}  {:>13}  {:>13}  {:>9}", "groups", "single ms", "two-lvl ms", "speedup");
     for key in ["g4", "g64", "g4k", "gall"] {
-        // Correctness: both kernels must produce identical groups before we trust the timings.
+        // Correctness: both kernels must agree on (key, count, sum) before we trust the timings.
+        // (min/max intentionally differ: the single-level kernel computes them, the two-level does
+        // not -- so compare the COUNT/SUM aggregates both kernels produce, not the whole row.)
         let mut a = e.group_by_i32_bench("t", key, "v", false).unwrap();
         let mut b = e.group_by_i32_bench("t", key, "v", true).unwrap();
         a.sort_by_key(|r| r.key);
         b.sort_by_key(|r| r.key);
-        assert_eq!(a, b, "single-level and two-level disagree for {key}");
+        let proj = |rows: &[gpu_db_execution::GroupByI32Row]| {
+            rows.iter().map(|r| (r.key, r.count, r.sum)).collect::<Vec<_>>()
+        };
+        assert_eq!(proj(&a), proj(&b), "single-level and two-level disagree for {key}");
         let single = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0).unwrap();
         let two = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0).unwrap();
         eprintln!("{:>8}  {:>13.4}  {:>13.4}  {:>8.2}x", a.len(), single, two, single / two);

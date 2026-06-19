@@ -226,10 +226,14 @@ fn build_grouped_projection(
             group_column,
             avg_column: column,
         }),
-        SelectProjection::Min { .. } | SelectProjection::Max { .. } => Err(sql_pg_error(
-            "grouped MIN / MAX are not on the general GPU executor yet (COUNT / SUM / AVG are)"
-                .to_string(),
-        )),
+        SelectProjection::Min { column } => Ok(SelectProjection::GroupedMin {
+            group_column,
+            min_column: column,
+        }),
+        SelectProjection::Max { column } => Ok(SelectProjection::GroupedMax {
+            group_column,
+            max_column: column,
+        }),
         _ => Err(sql_pg_error("unsupported grouped aggregate".to_string())),
     }
 }

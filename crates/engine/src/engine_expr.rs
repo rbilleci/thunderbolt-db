@@ -1059,6 +1059,8 @@ impl Engine {
             SelectProjection::GroupedCount { .. }
                 | SelectProjection::GroupedSum { .. }
                 | SelectProjection::GroupedAvg { .. }
+                | SelectProjection::GroupedMin { .. }
+                | SelectProjection::GroupedMax { .. }
         );
         if !is_aggregate && !is_grouped {
             if bound.selected_indexes.is_empty() {
@@ -1155,6 +1157,8 @@ impl Engine {
                 Count,
                 Sum,
                 Avg,
+                Min,
+                Max,
             }
             let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                 ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
@@ -1169,7 +1173,17 @@ impl Engine {
                     group_column,
                     avg_column,
                 } => (group_column, avg_column, GroupedAgg::Avg),
-                _ => unreachable!("is_grouped gates on GroupedCount | GroupedSum | GroupedAvg"),
+                SelectProjection::GroupedMin {
+                    group_column,
+                    min_column,
+                } => (group_column, min_column, GroupedAgg::Min),
+                SelectProjection::GroupedMax {
+                    group_column,
+                    max_column,
+                } => (group_column, max_column, GroupedAgg::Max),
+                _ => unreachable!(
+                    "is_grouped gates on GroupedCount | GroupedSum | GroupedAvg | GroupedMin | GroupedMax"
+                ),
             };
             let group_idx = relational_column_index(table, group_name)?;
             if table.columns[group_idx].ty != SqlType::Int4 {
@@ -1178,11 +1192,14 @@ impl Engine {
                 )));
             }
             let value_idx = relational_column_index(table, value_name)?;
-            if matches!(kind, GroupedAgg::Sum | GroupedAgg::Avg)
-                && table.columns[value_idx].ty != SqlType::Int4
+            if matches!(
+                kind,
+                GroupedAgg::Sum | GroupedAgg::Avg | GroupedAgg::Min | GroupedAgg::Max
+            ) && table.columns[value_idx].ty != SqlType::Int4
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "grouped SUM / AVG support an int4 value column on the Expr path".to_string(),
+                    "grouped SUM / AVG / MIN / MAX support an int4 value column on the Expr path"
+                        .to_string(),
                 )));
             }
             let key_offset = resident_device_int4_column_offset(&snapshot, table, group_idx)?;
@@ -1192,9 +1209,18 @@ impl Engine {
             } else {
                 resident_device_int4_column_offset(&snapshot, table, value_idx)?
             };
-            let groups = device_memory
-                .group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
-                .map_err(map_err)?;
+            // MIN/MAX need the single-level kernel (which computes per-group min/max); COUNT/SUM/AVG
+            // use the two-level kernel (the low-cardinality-contention workhorse).
+            let groups = if matches!(kind, GroupedAgg::Min | GroupedAgg::Max) {
+                device_memory.group_by_i32_count_sum_minmax_from_payload(
+                    key_offset,
+                    value_offset,
+                    &indices,
+                )
+            } else {
+                device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
+            }
+            .map_err(map_err)?;
             let mut rows: Vec<Vec<SqlValue>> = groups
                 .iter()
                 .map(|g| {
@@ -1202,6 +1228,8 @@ impl Engine {
                         GroupedAgg::Count => SqlValue::Int8(g.count as i64),
                         GroupedAgg::Sum => SqlValue::Int8(g.sum),
                         GroupedAgg::Avg => average_sql_value(i128::from(g.sum), g.count as usize),
+                        GroupedAgg::Min => SqlValue::Int4(g.min as i32),
+                        GroupedAgg::Max => SqlValue::Int4(g.max as i32),
                     };
                     vec![SqlValue::Int4(g.key), agg]
                 })
