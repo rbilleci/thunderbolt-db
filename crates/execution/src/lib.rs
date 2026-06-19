@@ -5579,7 +5579,9 @@ fn launch_cuda_group_by_i32_count_sum(
     ptx.extend_from_slice(PTX);
     ptx.push(0);
     let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &ptx)?;
-    let group_fn = primary.cached_function(c"gpu_db_group_by_i32_count_sum", &ptx)?;
+    // Two-level (shared-mem local aggregation -> global merge): far less global-atomic contention at
+    // low cardinality. The single-level `gpu_db_group_by_i32_count_sum` stays as the reference kernel.
+    let group_fn = primary.cached_function(c"gpu_db_group_by_i32_count_sum_twolevel", &ptx)?;
     let indices_dev = primary.lease_device_buffer(idx_bytes)?;
     let slot_keys = primary.lease_device_buffer(slot_bytes)?;
     let slot_count = primary.lease_device_buffer(slot_bytes)?;

@@ -4036,3 +4036,224 @@ do_agg:
 row_done:
     ret;
 }
+// Two-level GROUP BY: each block aggregates its rows into a SHARED-MEMORY local hash table (fast, no
+// global contention), then merges the local table into the global table (one set of global atomics
+// per local group, not per row). Kills the global-atomic contention the single-level kernel suffers
+// at low cardinality. Local table NLOCAL=1024 (LMASK=1023). On local-table overflow a row spills
+// directly to the global table (correctness for high cardinality; both contributions land in the
+// same global slot for a key). Same params + same global table as the single-level kernel.
+.visible .entry gpu_db_group_by_i32_count_sum_twolevel(
+    .param .u64 resident_ptr,
+    .param .u64 key_byte_offset,
+    .param .u64 sum_byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 mask,
+    .param .u64 slot_keys_ptr,
+    .param .u64 slot_count_ptr,
+    .param .u64 slot_sum_ptr
+)
+{
+    .shared .align 8 .b64 s_keys[1024];
+    .shared .align 8 .b64 s_count[1024];
+    .shared .align 8 .b64 s_sum[1024];
+
+    .reg .pred %p;
+    .reg .pred %hit;
+    .reg .pred %full;
+    .reg .pred %empty_slot;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %j;
+    .reg .u32 %probe;
+    .reg .u32 %idx;
+    .reg .u32 %sa;
+    .reg .s32 %k32;
+    .reg .s32 %v32;
+    .reg .s64 %key;
+    .reg .s64 %val;
+    .reg .s64 %empty;
+    .reg .s64 %cur;
+    .reg .s64 %lkey;
+    .reg .u64 %lcount;
+    .reg .s64 %lsum;
+    .reg .b64 %mix;
+    .reg .b64 %tmp;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %kptr;
+    .reg .u64 %cptr;
+    .reg .u64 %sptr;
+    .reg .u64 %count;
+    .reg .u64 %mask;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %h;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %koff;
+    .reg .u64 %soff;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %koff, [key_byte_offset];
+    ld.param.u64 %soff, [sum_byte_offset];
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %kptr, [slot_keys_ptr];
+    ld.param.u64 %cptr, [slot_count_ptr];
+    ld.param.u64 %sptr, [slot_sum_ptr];
+    mov.s64 %empty, -9223372036854775808;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+
+    // Phase 0: init the shared local table (strided by blockDim).
+    mov.u32 %j, %lane;
+init_loop:
+    setp.ge.u32 %p, %j, 1024;
+    @%p bra init_done;
+    mov.u32 %sa, s_keys;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    st.shared.b64 [%sa], %empty;
+    mov.u32 %sa, s_count;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    st.shared.u64 [%sa], 0;
+    mov.u32 %sa, s_sum;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    st.shared.u64 [%sa], 0;
+    add.u32 %j, %j, %bdim;
+    bra init_loop;
+init_done:
+    bar.sync 0;
+
+    // Phase 1: aggregate this block's rows into the shared local table (grid-stride).
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+row_loop:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra phase2;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %iptr, %off;
+    ld.global.u32 %idx, [%addr];
+    cvt.u64.u32 %off, %idx;
+    mul.lo.u64 %off, %off, 4;
+    add.u64 %addr, %base, %koff;
+    add.u64 %addr, %addr, %off;
+    ld.global.s32 %k32, [%addr];
+    cvt.s64.s32 %key, %k32;
+    add.u64 %addr, %base, %soff;
+    add.u64 %addr, %addr, %off;
+    ld.global.s32 %v32, [%addr];
+    cvt.s64.s32 %val, %v32;
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, 1023;
+    mov.u32 %probe, 0;
+local_probe:
+    cvt.u32.u64 %j, %h;
+    mov.u32 %sa, s_keys;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    atom.shared.cas.b64 %cur, [%sa], %empty, %key;
+    setp.eq.s64 %empty_slot, %cur, %empty;
+    setp.eq.s64 %p, %cur, %key;
+    or.pred %hit, %empty_slot, %p;
+    @%hit bra local_hit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, 1023;
+    add.u32 %probe, %probe, 1;
+    setp.ge.u32 %full, %probe, 1024;
+    @%full bra overflow;
+    bra local_probe;
+local_hit:
+    mov.u32 %sa, s_count;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    atom.shared.add.u64 %lcount, [%sa], 1;
+    mov.u32 %sa, s_sum;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    atom.shared.add.u64 %lcount, [%sa], %val;
+    bra row_next;
+overflow:
+    and.b64 %h, %mix, %mask;
+ov_probe:
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    atom.global.cas.b64 %cur, [%addr], %empty, %key;
+    setp.eq.s64 %empty_slot, %cur, %empty;
+    setp.eq.s64 %p, %cur, %key;
+    or.pred %hit, %empty_slot, %p;
+    @%hit bra ov_hit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra ov_probe;
+ov_hit:
+    add.u64 %addr, %cptr, %off;
+    atom.global.add.u64 %lcount, [%addr], 1;
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %lcount, [%addr], %val;
+row_next:
+    add.u64 %i, %i, %stride;
+    bra row_loop;
+phase2:
+    bar.sync 0;
+    // Phase 2: merge the shared local table into the global table (strided by blockDim).
+    mov.u32 %j, %lane;
+merge_loop:
+    setp.ge.u32 %p, %j, 1024;
+    @%p bra merge_done;
+    mov.u32 %sa, s_keys;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    ld.shared.b64 %lkey, [%sa];
+    setp.eq.s64 %p, %lkey, %empty;
+    @%p bra merge_next;
+    mov.u32 %sa, s_count;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    ld.shared.u64 %lcount, [%sa];
+    mov.u32 %sa, s_sum;
+    mad.lo.u32 %sa, %j, 8, %sa;
+    ld.shared.u64 %lsum, [%sa];
+    mov.b64 %mix, %lkey;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+merge_probe:
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    atom.global.cas.b64 %cur, [%addr], %empty, %lkey;
+    setp.eq.s64 %empty_slot, %cur, %empty;
+    setp.eq.s64 %p, %cur, %lkey;
+    or.pred %hit, %empty_slot, %p;
+    @%hit bra merge_hit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra merge_probe;
+merge_hit:
+    add.u64 %addr, %cptr, %off;
+    atom.global.add.u64 %lkey, [%addr], %lcount;
+    add.u64 %addr, %sptr, %off;
+    atom.global.add.u64 %lkey, [%addr], %lsum;
+merge_next:
+    add.u32 %j, %j, %bdim;
+    bra merge_loop;
+merge_done:
+    ret;
+}

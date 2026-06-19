@@ -2259,3 +2259,66 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
     assert_eq!(c.columns.len(), 2, "grouped result has key + aggregate columns");
     assert_eq!(c.columns[0].name, "g", "first result column is the group key");
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
+    // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
+    // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys
+    // across many blocks). Both assert against host oracles -- a wrong merge would surface here.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE lo (g INT, v INT)").unwrap();
+    let n = 10_000usize;
+    let ngroups = 7usize;
+    let mut counts = vec![0i64; ngroups];
+    let mut sums = vec![0i64; ngroups];
+    let mut values = String::with_capacity(n * 8);
+    for i in 0..n {
+        let g = i % ngroups;
+        let v = (i % 13) as i64;
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({g},{v})"));
+        counts[g] += 1;
+        sums[g] += v;
+    }
+    e.execute_text(2, &format!("INSERT INTO lo (g,v) VALUES {values}")).unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("lo").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let c = e.execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM lo GROUP BY g").expect("lo count");
+    let exp_c: Vec<Vec<SqlValue>> = (0..ngroups)
+        .map(|g| vec![SqlValue::Int4(g as i32), SqlValue::Int8(counts[g])])
+        .collect();
+    assert_eq!(c.rows, exp_c, "low-card COUNT at scale (two-level merge)");
+    let s = e.execute_resident_expr_select_sql("SELECT g, SUM(v) FROM lo GROUP BY g").expect("lo sum");
+    let exp_s: Vec<Vec<SqlValue>> = (0..ngroups)
+        .map(|g| vec![SqlValue::Int4(g as i32), SqlValue::Int8(sums[g])])
+        .collect();
+    assert_eq!(s.rows, exp_s, "low-card SUM at scale");
+
+    // HIGH cardinality: every key distinct -> one group per row, merged across many blocks.
+    let mut e2 = Engine::new_local();
+    e2.execute_text(1, "CREATE TABLE hi (g INT, v INT)").unwrap();
+    let h = 3000usize;
+    let mut hv = String::with_capacity(h * 10);
+    for i in 0..h {
+        if i > 0 {
+            hv.push(',');
+        }
+        hv.push_str(&format!("({},{})", i as i64, (i * 2) as i64));
+    }
+    e2.execute_text(2, &format!("INSERT INTO hi (g,v) VALUES {hv}")).unwrap();
+    if e2.populate_relational_residency_snapshot("hi").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let hc = e2.execute_resident_expr_select_sql("SELECT g, SUM(v) FROM hi GROUP BY g").expect("hi sum");
+    assert_eq!(hc.rows.len(), h, "high-card: one group per distinct key");
+    // Each key i -> single row, sum = 2*i; sorted by key.
+    let exp_hi: Vec<Vec<SqlValue>> = (0..h)
+        .map(|i| vec![SqlValue::Int4(i as i32), SqlValue::Int8((i * 2) as i64)])
+        .collect();
+    assert_eq!(hc.rows, exp_hi, "high-card SUM per distinct key");
+}

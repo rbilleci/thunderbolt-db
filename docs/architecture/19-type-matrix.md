@@ -225,8 +225,16 @@ enumerated legacy path still owns.
   baseline suffers at LOW cardinality (the common analytics case); plus a **sort-based** path (reusing
   the radix sort that ORDER BY / sort-merge joins need anyway) for HIGH cardinality / sorted output;
   routed on cheap query signals (ORDER-BY-on-key), no sampling estimator. Build order: baseline (done)
-  -> two-level shared-mem -> radix sort + sort-based + routing. Other follow-ons: grouped MIN/MAX
-  (atom.min/max per slot), int8/numeric/text group keys, GPU stream-compaction of the slots.
+  -> **two-level shared-mem (DONE)** -> radix sort + sort-based + routing. Other follow-ons: grouped
+  MIN/MAX (atom.min/max per slot), int8/numeric/text group keys, GPU stream-compaction of the slots.
+- **Two-level shared-mem GROUP BY — DONE** (now the default kernel `gpu_db_group_by_i32_count_sum_twolevel`;
+  the single-level kernel stays as reference): each block aggregates its rows into a SHARED-MEMORY
+  local hash table (NLOCAL=1024, atom.shared.cas/add -- ~100x faster than global + contention stays
+  in-block), then `bar.sync` + merges the local table into the global table (one set of global atomics
+  per local group, NOT per row). On local-table overflow a row spills directly to global (correctness
+  for huge per-block cardinality; both contributions land in the same global slot). Kills the
+  baseline's global-atomic contention at LOW cardinality. Verified at scale (10k rows/7 groups +
+  3000 distinct keys).
 - NEXT operators after GROUP BY: joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
