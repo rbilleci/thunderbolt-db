@@ -1202,9 +1202,10 @@ impl Engine {
             // SUM/AVG/MIN/MAX accept an int4 or int8 value (`value_is_int8` selects the 8-byte vs
             // 4-byte value read; the single-level kernel accumulates int8 SUM as i128 and does signed
             // atom.min/max.s64). numeric values are a follow-on. COUNT(*) has no value.
-            // SUM/AVG and MIN/MAX accept int4 / int8 / numeric (numeric MIN/MAX uses a per-slot spin
-            // lock on the i128, there being no native 128-bit atomic). value_scale carries the numeric
-            // column scale onto the result (0 for the integer paths).
+            // SUM/AVG and MIN/MAX accept int4 / int8 / numeric (numeric MIN/MAX resolves the i128 via
+            // a LOCK-FREE two-pass kernel -- high limb, then low limb among ties -- since there is no
+            // native 128-bit atomic). value_scale carries the numeric column scale onto the result
+            // (0 for the integer paths).
             let value_scale: u8 = match value_ty {
                 SqlType::Numeric { scale, .. } => scale,
                 _ => 0,

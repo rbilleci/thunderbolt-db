@@ -2848,6 +2848,60 @@ fn gpu_grouped_numeric_min_max_large_high_limb() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_numeric_min_max_same_high_limb_tie() {
+    // Pass 2's REASON TO EXIST: when several values in a group share the same i128 HIGH limb, the
+    // min/max is decided by the LOW limb (unsigned). The other numeric MIN/MAX tests all use distinct
+    // high limbs (pass 2 trivial) -- this exercises the tie + the decoy guard (a higher-high-limb
+    // value must NOT corrupt the low-limb min). NUMERIC(38,19): 4.000...00NN all share high limb 2
+    // (4e19 / 2^64 ~ 2.17); 13.0 has high limb 7. g=2 ties on a NEGATIVE high limb.
+    let unit = 10_i128.pow(19);
+    // sanity: the ties genuinely share a high limb (else this doesn't test pass 2).
+    assert_eq!((4 * unit + 10) >> 64, (4 * unit + 200) >> 64, "positive ties must share high limb");
+    assert_eq!((-(4 * unit + 10)) >> 64, (-(4 * unit + 200)) >> 64, "negative ties must share high limb");
+    assert_ne!((4 * unit + 10) >> 64, (13 * unit) >> 64, "the decoy must have a DIFFERENT high limb");
+
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES \
+         (1,4.0000000000000000010),(1,4.0000000000000000200),(1,4.0000000000000000050),(1,13.0),\
+         (2,-4.0000000000000000010),(2,-4.0000000000000000200),(2,-4.0000000000000000050)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // Construction oracle: per-group min/max of the i128 mantissas.
+    let g1 = [4 * unit + 10, 4 * unit + 200, 4 * unit + 50, 13 * unit];
+    let g2 = [-(4 * unit + 10), -(4 * unit + 200), -(4 * unit + 50)];
+    let ds = |m: i128| Decimal128::new(m, 19).to_decimal_string();
+    let got = |sql: &str| -> Vec<String> {
+        e.execute_resident_expr_select_sql(sql)
+            .expect("tie query")
+            .rows
+            .iter()
+            .map(|r| match &r[1] {
+                SqlValue::Numeric(d) => d.to_decimal_string(),
+                other => panic!("numeric MIN/MAX must be numeric, got {other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        got("SELECT g, MIN(v) FROM t GROUP BY g"),
+        vec![ds(*g1.iter().min().unwrap()), ds(*g2.iter().min().unwrap())],
+        "MIN decided by the unsigned low limb among high-limb ties (decoy must not leak)"
+    );
+    assert_eq!(
+        got("SELECT g, MAX(v) FROM t GROUP BY g"),
+        vec![ds(*g1.iter().max().unwrap()), ds(*g2.iter().max().unwrap())],
+        "MAX decided by the unsigned low limb among high-limb ties"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys
