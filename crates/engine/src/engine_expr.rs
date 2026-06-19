@@ -67,6 +67,23 @@ pub(crate) enum ResidentExpr {
     },
 }
 
+/// Narrow a grouped MIN/MAX or GROUP BY key, which the GPU kernel computes as an i64 (or, for
+/// numeric, an i128 split into `lo`/`hi`), back to the column's own `SqlType`. int2/int4/date ride the
+/// 4-byte read; int8/timestamp the 8-byte read; numeric reconstructs `hi:lo` at `scale`. `hi`/`scale`
+/// are ignored for the non-numeric types.
+fn narrow_ordered_value(ty: SqlType, lo: i64, hi: i64, scale: u8) -> SqlValue {
+    match ty {
+        SqlType::Numeric { .. } => {
+            SqlValue::Numeric(Decimal128::new((i128::from(hi) << 64) | i128::from(lo as u64), scale))
+        }
+        SqlType::Int8 => SqlValue::Int8(lo),
+        SqlType::Timestamp => SqlValue::Timestamp(lo),
+        SqlType::Int2 => SqlValue::Int2(lo as i16),
+        SqlType::Date => SqlValue::Date(lo as i32),
+        _ => SqlValue::Int4(lo as i32),
+    }
+}
+
 /// Device op-code for an arithmetic binary op (matches `expr_proto.ptx`: 0=add, 1=sub, 2=mul), or
 /// `None` if `op` is not arithmetic.
 fn arith_op_code(op: ResidentBinaryOp) -> Option<u32> {
@@ -1186,14 +1203,17 @@ impl Engine {
                 ),
             };
             let group_idx = relational_column_index(table, group_name)?;
-            // GROUP BY key: int4 or int8. int8 keys force the single-level kernel (only it reads
-            // 64-bit keys + routes the i64::MIN key, which collides with EMPTY, to its dedicated slot).
-            let key_is_int8 = match table.columns[group_idx].ty {
-                SqlType::Int4 => false,
-                SqlType::Int8 => true,
+            let key_ty = table.columns[group_idx].ty;
+            // GROUP BY key: int2/int4/date ride the int4 (4-byte) section; int8/timestamp ride the int8
+            // (8-byte) section, which forces the single-level kernel (only it reads 64-bit keys + routes
+            // the i64::MIN key, which collides with EMPTY, to its dedicated slot).
+            let key_is_int8 = match key_ty {
+                SqlType::Int4 | SqlType::Int2 | SqlType::Date => false,
+                SqlType::Int8 | SqlType::Timestamp => true,
                 _ => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "GROUP BY key must be an int4 or int8 column on the Expr path".to_string(),
+                        "GROUP BY key must be int2/int4/int8/date/timestamp on the Expr path"
+                            .to_string(),
                     )));
                 }
             };
@@ -1213,25 +1233,29 @@ impl Engine {
             let (value_is_int8, value_is_numeric) = match kind {
                 GroupedAgg::Count => (false, false),
                 GroupedAgg::Sum | GroupedAgg::Avg => match value_ty {
-                    SqlType::Int4 => (false, false),
+                    // SUM/AVG are numeric aggregations: int2/int4 (int4 read), int8, numeric. Temporal
+                    // types (date/timestamp) have no SUM/AVG.
+                    SqlType::Int4 | SqlType::Int2 => (false, false),
                     SqlType::Int8 => (true, false),
                     SqlType::Numeric { .. } => (false, true),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped SUM / AVG support int4 / int8 / numeric value columns on the \
-                             Expr path"
+                            "grouped SUM / AVG support int2 / int4 / int8 / numeric value columns on \
+                             the Expr path"
                                 .to_string(),
                         )));
                     }
                 },
                 GroupedAgg::Min | GroupedAgg::Max => match value_ty {
-                    SqlType::Int4 => (false, false),
-                    SqlType::Int8 => (true, false),
+                    // MIN/MAX work for any ordered type: int2/int4/date ride the int4 read; int8/
+                    // timestamp ride the int8 read; numeric uses the two-pass i128.
+                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => (false, false),
+                    SqlType::Int8 | SqlType::Timestamp => (true, false),
                     SqlType::Numeric { .. } => (false, true),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped MIN / MAX support int4 / int8 / numeric value columns on the \
-                             Expr path"
+                            "grouped MIN / MAX support int2 / int4 / int8 / numeric / date / \
+                             timestamp value columns on the Expr path"
                                 .to_string(),
                         )));
                     }
@@ -1297,32 +1321,20 @@ impl Engine {
                             avg_numeric_sql_value(sum_i128, g.count as usize, value_scale)
                         }
                         GroupedAgg::Avg => average_sql_value(sum_i128, g.count as usize),
-                        // numeric MIN/MAX reconstruct the i128 from (min_hi:min) / (max_hi:max).
-                        GroupedAgg::Min if value_is_numeric => SqlValue::Numeric(Decimal128::new(
-                            (i128::from(g.min_hi) << 64) | i128::from(g.min as u64),
-                            value_scale,
-                        )),
-                        GroupedAgg::Min if value_is_int8 => SqlValue::Int8(g.min),
-                        GroupedAgg::Min => SqlValue::Int4(g.min as i32),
-                        GroupedAgg::Max if value_is_numeric => SqlValue::Numeric(Decimal128::new(
-                            (i128::from(g.max_hi) << 64) | i128::from(g.max as u64),
-                            value_scale,
-                        )),
-                        GroupedAgg::Max if value_is_int8 => SqlValue::Int8(g.max),
-                        GroupedAgg::Max => SqlValue::Int4(g.max as i32),
+                        // MIN/MAX narrow the kernel's i64 (or i128 for numeric) back to the value's
+                        // own type. numeric reconstructs the i128 from (min_hi:min) / (max_hi:max).
+                        GroupedAgg::Min => narrow_ordered_value(value_ty, g.min, g.min_hi, value_scale),
+                        GroupedAgg::Max => narrow_ordered_value(value_ty, g.max, g.max_hi, value_scale),
                     };
-                    // int8 GROUP BY key keeps the full i64; int4 narrows back to Int4.
-                    let key = if key_is_int8 {
-                        SqlValue::Int8(g.key)
-                    } else {
-                        SqlValue::Int4(g.key as i32)
-                    };
+                    // The GROUP BY key narrows back to its own type (int8/timestamp keep the full i64).
+                    let key = narrow_ordered_value(key_ty, g.key, 0, 0);
                     vec![key, agg]
                 })
                 .collect();
             rows.sort_by_key(|row| match row[0] {
-                SqlValue::Int4(k) => i64::from(k),
-                SqlValue::Int8(k) => k,
+                SqlValue::Int4(k) | SqlValue::Date(k) => i64::from(k),
+                SqlValue::Int2(k) => i64::from(k),
+                SqlValue::Int8(k) | SqlValue::Timestamp(k) => k,
                 _ => i64::MIN,
             });
             return Ok(RelationalSelectResult {

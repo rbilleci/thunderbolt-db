@@ -2902,6 +2902,71 @@ fn gpu_grouped_numeric_min_max_same_high_limb_tie() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_reuse_types_int2_date_timestamp() {
+    // Int2 + Date ride the int4 (4-byte) read; Timestamp rides the int8 (8-byte) read -- executor
+    // type-recognition only, no kernel change. Verify GROUP BY keys + MIN/MAX narrow back to the right
+    // SqlType, and int2 SUM (PG SUM(int2) -> int8).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, d DATE, ts TIMESTAMP, s SMALLINT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,d,ts,s) VALUES \
+         (1, '2024-01-10', '2024-01-10 08:00:00', 5), \
+         (1, '2024-03-20', '2024-02-01 12:00:00', 15), \
+         (2, '2023-12-01', '2023-12-01 00:00:00', -7)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+
+    // int2 MIN/MAX -> Int2; SUM -> Int8 (PG widening).
+    assert_eq!(
+        e.execute_resident_expr_select_sql("SELECT g, MIN(s) FROM t GROUP BY g").unwrap().rows,
+        vec![vec![i4(1), SqlValue::Int2(5)], vec![i4(2), SqlValue::Int2(-7)]],
+        "MIN(int2) -> Int2"
+    );
+    assert_eq!(
+        e.execute_resident_expr_select_sql("SELECT g, MAX(s) FROM t GROUP BY g").unwrap().rows,
+        vec![vec![i4(1), SqlValue::Int2(15)], vec![i4(2), SqlValue::Int2(-7)]],
+        "MAX(int2) -> Int2"
+    );
+    assert_eq!(
+        e.execute_resident_expr_select_sql("SELECT g, SUM(s) FROM t GROUP BY g").unwrap().rows,
+        vec![vec![i4(1), SqlValue::Int8(20)], vec![i4(2), SqlValue::Int8(-7)]],
+        "SUM(int2) -> Int8"
+    );
+
+    // date/timestamp MIN/MAX -> the right variant, correctly ordered (g=1 has two rows).
+    let md = e.execute_resident_expr_select_sql("SELECT g, MIN(d) FROM t GROUP BY g").unwrap();
+    let xd = e.execute_resident_expr_select_sql("SELECT g, MAX(d) FROM t GROUP BY g").unwrap();
+    match (&md.rows[0][1], &xd.rows[0][1]) {
+        (SqlValue::Date(a), SqlValue::Date(b)) => assert!(a < b, "g=1 MIN(date) < MAX(date)"),
+        o => panic!("MIN/MAX(date) must be Date, got {o:?}"),
+    }
+    let mt = e.execute_resident_expr_select_sql("SELECT g, MIN(ts) FROM t GROUP BY g").unwrap();
+    let xt = e.execute_resident_expr_select_sql("SELECT g, MAX(ts) FROM t GROUP BY g").unwrap();
+    match (&mt.rows[0][1], &xt.rows[0][1]) {
+        (SqlValue::Timestamp(a), SqlValue::Timestamp(b)) => {
+            assert!(a < b, "g=1 MIN(ts) < MAX(ts)")
+        }
+        o => panic!("MIN/MAX(timestamp) must be Timestamp, got {o:?}"),
+    }
+
+    // GROUP BY a DATE key -> Date key variant.
+    let cd = e.execute_resident_expr_select_sql("SELECT d, COUNT(*) FROM t GROUP BY d").unwrap();
+    assert_eq!(cd.rows.len(), 3, "3 distinct dates");
+    assert!(
+        cd.rows.iter().all(|r| matches!(r[0], SqlValue::Date(_))),
+        "GROUP BY date yields Date keys"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys

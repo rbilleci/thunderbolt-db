@@ -1642,12 +1642,12 @@ pub(crate) fn validate_int4_aggregate_column(
     aggregate: &'static str,
 ) -> Result<usize, ExecuteError> {
     let idx = relational_column_index(table, column)?;
-    // SUM/AVG accept int4 / int8 / numeric on the general GPU executor (int8 + numeric reduce to
-    // i128). The enumerated path (int4-only) rejects the wider types later at execution -- so this is
-    // still a hard error there, just not at validation; the general path handles them.
+    // SUM/AVG accept int2 / int4 / int8 / numeric on the general GPU executor (int2/int4 share the
+    // int4 read; int8 + numeric reduce to i128). The enumerated path (int4-only) rejects the wider
+    // types later at execution -- so this is still a hard error there, just not at validation.
     if !matches!(
         table.columns[idx].ty,
-        SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. }
+        SqlType::Int2 | SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. }
     ) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
             aggregate_int4_error_message(aggregate).to_string(),
@@ -1658,8 +1658,8 @@ pub(crate) fn validate_int4_aggregate_column(
 
 pub(crate) fn aggregate_int4_error_message(aggregate: &str) -> &'static str {
     match aggregate {
-        "AVG" => "AVG supports int4 / int8 / numeric columns",
-        _ => "SUM supports int4 / int8 / numeric columns",
+        "AVG" => "AVG supports int2 / int4 / int8 / numeric columns",
+        _ => "SUM supports int2 / int4 / int8 / numeric columns",
     }
 }
 
