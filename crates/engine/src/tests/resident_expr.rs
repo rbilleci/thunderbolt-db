@@ -2725,6 +2725,129 @@ fn gpu_grouped_numeric_sum_large_high_limb_no_overflow() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_numeric_min_max() {
+    // GROUP BY an int4 key, MIN/MAX over a NUMERIC(10,2) value (small mantissas, high limb 0). Exercises
+    // the per-slot i128 spin-lock compare-and-update + signed ordering (a negative is the min), and a
+    // duplicate max. Constructed oracle:
+    //   g=1 -> {10.50, -3.25, 7.00}        min -3.25   max 10.50
+    //   g=2 -> {100.00, -50.50, 100.00}    min -50.50  max 100.00 (duplicate max)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES (1,10.50),(1,-3.25),(1,7.00),(2,100.00),(2,-50.50),(2,100.00)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+    let numeric_strs = |rows: &[Vec<SqlValue>]| -> Vec<(SqlValue, String)> {
+        rows.iter()
+            .map(|r| {
+                (
+                    r[0].clone(),
+                    match &r[1] {
+                        SqlValue::Numeric(d) => d.to_decimal_string(),
+                        other => panic!("MIN/MAX(numeric) must be numeric, got {other:?}"),
+                    },
+                )
+            })
+            .collect()
+    };
+
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v) FROM t GROUP BY g")
+        .expect("numeric min");
+    assert_eq!(
+        numeric_strs(&mn.rows),
+        vec![(i4(1), "-3.25".to_string()), (i4(2), "-50.50".to_string())],
+        "numeric MIN"
+    );
+    assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
+
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(v) FROM t GROUP BY g")
+        .expect("numeric max");
+    assert_eq!(
+        numeric_strs(&mx.rows),
+        vec![(i4(1), "10.50".to_string()), (i4(2), "100.00".to_string())],
+        "numeric MAX"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_numeric_min_max_large_high_limb() {
+    // numeric MIN/MAX where the i128 mantissa EXCEEDS i64 (val_hi != 0), so the locked compare must
+    // order on the signed high limb then the unsigned low limb. NUMERIC(38,19): mantissa = v*10^19, so
+    // 5.0 -> 5e19 (val_hi=2), 1.0 -> 1e19 (val_hi=0 but low-limb bit63 set), negatives -> val_hi<0.
+    //   g=1 -> {5.0, 2.5, -5.0, 1.0}  min -5.0  max 5.0
+    //   g=2 -> {-2.0, -8.0, -1.0}     min -8.0  max -1.0  (ordering among negatives)
+    //   g=3 -> {0.0}                  min  0.0  max 0.0   (single row -> identity overwritten)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES \
+         (1,5.0),(1,2.5),(1,-5.0),(1,1.0),(2,-2.0),(2,-8.0),(2,-1.0),(3,0.0)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let unit = 10_i128.pow(19); // mantissa units per 1.0 at scale 19
+    assert!(
+        5 * unit > i128::from(i64::MAX),
+        "the value mantissa must exceed i64 to genuinely exercise the i128 high limb in the compare"
+    );
+    let i4 = SqlValue::Int4;
+    let dec = |m: i128| Decimal128::new(m, 19).to_decimal_string();
+    let numeric_strs = |rows: &[Vec<SqlValue>]| -> Vec<(SqlValue, String)> {
+        rows.iter()
+            .map(|r| {
+                (
+                    r[0].clone(),
+                    match &r[1] {
+                        SqlValue::Numeric(d) => d.to_decimal_string(),
+                        other => panic!("MIN/MAX(numeric) must be numeric, got {other:?}"),
+                    },
+                )
+            })
+            .collect()
+    };
+
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v) FROM t GROUP BY g")
+        .expect("numeric min hi");
+    assert_eq!(
+        numeric_strs(&mn.rows),
+        vec![
+            (i4(1), dec(-5 * unit)),
+            (i4(2), dec(-8 * unit)),
+            (i4(3), dec(0)),
+        ],
+        "numeric MIN with non-zero high limb"
+    );
+
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(v) FROM t GROUP BY g")
+        .expect("numeric max hi");
+    assert_eq!(
+        numeric_strs(&mx.rows),
+        vec![
+            (i4(1), dec(5 * unit)),
+            (i4(2), dec(-unit)),
+            (i4(3), dec(0)),
+        ],
+        "numeric MAX with non-zero high limb"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys

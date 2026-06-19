@@ -1202,9 +1202,9 @@ impl Engine {
             // SUM/AVG/MIN/MAX accept an int4 or int8 value (`value_is_int8` selects the 8-byte vs
             // 4-byte value read; the single-level kernel accumulates int8 SUM as i128 and does signed
             // atom.min/max.s64). numeric values are a follow-on. COUNT(*) has no value.
-            // SUM/AVG accept int4 / int8 / numeric; MIN/MAX accept int4 / int8 only (numeric MIN/MAX
-            // -- an i128 compare with no native 128-bit atomic -- is a follow-on). value_scale carries
-            // the numeric column scale onto the SUM/AVG result (0 for the integer paths).
+            // SUM/AVG and MIN/MAX accept int4 / int8 / numeric (numeric MIN/MAX uses a per-slot spin
+            // lock on the i128, there being no native 128-bit atomic). value_scale carries the numeric
+            // column scale onto the result (0 for the integer paths).
             let value_scale: u8 = match value_ty {
                 SqlType::Numeric { scale, .. } => scale,
                 _ => 0,
@@ -1226,16 +1226,11 @@ impl Engine {
                 GroupedAgg::Min | GroupedAgg::Max => match value_ty {
                     SqlType::Int4 => (false, false),
                     SqlType::Int8 => (true, false),
-                    SqlType::Numeric { .. } => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped MIN / MAX over numeric is not yet on the Expr path (int4 / \
-                             int8 are)"
-                                .to_string(),
-                        )));
-                    }
+                    SqlType::Numeric { .. } => (false, true),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped MIN / MAX support int4 / int8 value columns on the Expr path"
+                            "grouped MIN / MAX support int4 / int8 / numeric value columns on the \
+                             Expr path"
                                 .to_string(),
                         )));
                     }
@@ -1301,8 +1296,17 @@ impl Engine {
                             avg_numeric_sql_value(sum_i128, g.count as usize, value_scale)
                         }
                         GroupedAgg::Avg => average_sql_value(sum_i128, g.count as usize),
+                        // numeric MIN/MAX reconstruct the i128 from (min_hi:min) / (max_hi:max).
+                        GroupedAgg::Min if value_is_numeric => SqlValue::Numeric(Decimal128::new(
+                            (i128::from(g.min_hi) << 64) | i128::from(g.min as u64),
+                            value_scale,
+                        )),
                         GroupedAgg::Min if value_is_int8 => SqlValue::Int8(g.min),
                         GroupedAgg::Min => SqlValue::Int4(g.min as i32),
+                        GroupedAgg::Max if value_is_numeric => SqlValue::Numeric(Decimal128::new(
+                            (i128::from(g.max_hi) << 64) | i128::from(g.max as u64),
+                            value_scale,
+                        )),
                         GroupedAgg::Max if value_is_int8 => SqlValue::Int8(g.max),
                         GroupedAgg::Max => SqlValue::Int4(g.max as i32),
                     };

@@ -5596,6 +5596,10 @@ pub struct GroupByI32Row {
     /// to int4 / keeps int8). For COUNT(*) (value == key) they are ignored.
     pub min: i64,
     pub max: i64,
+    /// High 64 bits of the per-group i128 MIN / MAX when the value is NUMERIC (stored as
+    /// `min_hi:min` / `max_hi:max`). Zero for int4 / int8 MIN/MAX (which use `min` / `max` alone).
+    pub min_hi: i64,
+    pub max_hi: i64,
 }
 
 /// GROUP BY an int4 `key` column, aggregating COUNT(*) and SUM(int4 `sum`) over a filtered set of row
@@ -5703,11 +5707,32 @@ fn launch_cuda_group_by_i32_count_sum(
     // A single global flag the kernel `red.global.or`s when a numeric SUM overflows i128 (PG numeric
     // field overflow). Zeroed before launch; only the numeric path ever writes it.
     let overflow_flag = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
+    // Numeric MIN/MAX i128 high limbs (pass 1) + a row_slots scratch: row_slots[i] = the slot the
+    // i-th row claimed, written by pass 1's numeric branch so the lock-free pass-2 kernel can resolve
+    // the i128 LOW limb among the high-limb ties. int4/int8/two-level paths leave these unused.
+    let slot_min_hi = primary.lease_device_buffer(slot_bytes)?;
+    let slot_max_hi = primary.lease_device_buffer(slot_bytes)?;
+    let row_slots_bytes = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let row_slots = primary.lease_device_buffer(row_slots_bytes)?;
 
     const BLOCK: u32 = 256;
     // Fills cover alloc_slots (nslots + the dedicated i64::MIN slot) so that slot is initialized too.
     let fill_grid = alloc_slots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
     let group_grid = count_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+
+    // Numeric MIN/MAX stores an i128, so its identities are the i128 extremes split into limbs:
+    // MIN = i128::MAX (hi i64::MAX, lo u64::MAX), MAX = i128::MIN (hi i64::MIN, lo 0). int4/int8 keep
+    // the s64 identities in the LOW limb (hi unused -> 0).
+    let min_lo_id: u64 = if value_is_numeric {
+        u64::MAX
+    } else {
+        i64::MAX as u64
+    };
+    let max_lo_id: u64 = if value_is_numeric { 0 } else { i64::MIN as u64 };
+    let min_hi_id: u64 = if value_is_numeric { i64::MAX as u64 } else { 0 };
+    let max_hi_id: u64 = if value_is_numeric { i64::MIN as u64 } else { 0 };
 
     // One fill-arg set, mutated between the 3 slot_keys / slot_min / slot_max fills (cuLaunchKernel
     // copies the arg values at call time, so re-launching after mutating f0/f2 is safe).
@@ -5735,6 +5760,9 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a13 = u64::from(key_is_int8);
     let mut a14 = u64::from(value_is_numeric);
     let mut a15 = overflow_flag.ptr;
+    let mut a16 = slot_min_hi.ptr;
+    let mut a17 = slot_max_hi.ptr;
+    let mut a18 = row_slots.ptr;
     let mut group_args = [
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
@@ -5752,6 +5780,36 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a13 as *mut u64).cast::<c_void>(),
         (&mut a14 as *mut u64).cast::<c_void>(),
         (&mut a15 as *mut u64).cast::<c_void>(),
+        (&mut a16 as *mut u64).cast::<c_void>(),
+        (&mut a17 as *mut u64).cast::<c_void>(),
+        (&mut a18 as *mut u64).cast::<c_void>(),
+    ];
+    // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
+    // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
+    let pass2_fn = if value_is_numeric {
+        Some(primary.cached_function(c"gpu_db_group_by_numeric_minmax_lo", &ptx)?)
+    } else {
+        None
+    };
+    let mut q0 = resident.device_ptr();
+    let mut q1 = sum_byte_offset;
+    let mut q2 = indices_dev.ptr;
+    let mut q3 = count_u64;
+    let mut q4 = row_slots.ptr;
+    let mut q5 = slot_min.ptr;
+    let mut q6 = slot_max.ptr;
+    let mut q7 = slot_min_hi.ptr;
+    let mut q8 = slot_max_hi.ptr;
+    let mut pass2_args = [
+        (&mut q0 as *mut u64).cast::<c_void>(),
+        (&mut q1 as *mut u64).cast::<c_void>(),
+        (&mut q2 as *mut u64).cast::<c_void>(),
+        (&mut q3 as *mut u64).cast::<c_void>(),
+        (&mut q4 as *mut u64).cast::<c_void>(),
+        (&mut q5 as *mut u64).cast::<c_void>(),
+        (&mut q6 as *mut u64).cast::<c_void>(),
+        (&mut q7 as *mut u64).cast::<c_void>(),
+        (&mut q8 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
@@ -5783,6 +5841,7 @@ fn launch_cuda_group_by_i32_count_sum(
         if rc != 0 {
             return rc;
         }
+        // (row_slots needs no init: pass 1 writes every row's slot before pass 2 reads it.)
         // fill slot_keys = EMPTY
         let rc = unsafe {
             cu_launch_kernel(
@@ -5793,9 +5852,9 @@ fn launch_cuda_group_by_i32_count_sum(
         if rc != 0 {
             return rc;
         }
-        // fill slot_min = i64::MAX (the MIN identity)
+        // fill slot_min (low limb) = the MIN identity (s64 i64::MAX, or numeric i128::MAX low = u64::MAX)
         f0 = slot_min.ptr;
-        f2 = i64::MAX as u64;
+        f2 = min_lo_id;
         let rc = unsafe {
             cu_launch_kernel(
                 fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
@@ -5805,9 +5864,9 @@ fn launch_cuda_group_by_i32_count_sum(
         if rc != 0 {
             return rc;
         }
-        // fill slot_max = i64::MIN (the MAX identity)
+        // fill slot_max (low limb) = the MAX identity (s64 i64::MIN, or numeric i128::MIN low = 0)
         f0 = slot_max.ptr;
-        f2 = i64::MIN as u64;
+        f2 = max_lo_id;
         let rc = unsafe {
             cu_launch_kernel(
                 fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
@@ -5817,12 +5876,48 @@ fn launch_cuda_group_by_i32_count_sum(
         if rc != 0 {
             return rc;
         }
-        unsafe {
+        // fill slot_min_hi / slot_max_hi (numeric MIN/MAX high limbs; 0 for int4/int8).
+        f0 = slot_min_hi.ptr;
+        f2 = min_hi_id;
+        let rc = unsafe {
+            cu_launch_kernel(
+                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        f0 = slot_max_hi.ptr;
+        f2 = max_hi_id;
+        let rc = unsafe {
+            cu_launch_kernel(
+                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
             cu_launch_kernel(
                 group_fn, group_grid, 1, 1, BLOCK, 1, 1, 0, stream,
                 group_args.as_mut_ptr(), std::ptr::null_mut(),
             )
+        };
+        if rc != 0 {
+            return rc;
         }
+        // Pass 2 (numeric MIN/MAX): resolve the i128 low limb lock-free, on the same stream.
+        if let Some(f) = pass2_fn {
+            return unsafe {
+                cu_launch_kernel(
+                    f, group_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                    pass2_args.as_mut_ptr(), std::ptr::null_mut(),
+                )
+            };
+        }
+        rc
     })?;
 
     // Sized alloc_slots (= nslots + the dedicated i64::MIN slot) -- the D2H copies slot_bytes bytes.
@@ -5832,6 +5927,8 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut sum_his = vec![0i64; alloc_slots];
     let mut mins = vec![0i64; alloc_slots];
     let mut maxs = vec![0i64; alloc_slots];
+    let mut min_his = vec![0i64; alloc_slots];
+    let mut max_his = vec![0i64; alloc_slots];
     check_cuda(unsafe {
         cu_memcpy_dtoh(keys.as_mut_ptr().cast::<c_void>(), slot_keys.ptr, slot_bytes)
     })?;
@@ -5850,6 +5947,12 @@ fn launch_cuda_group_by_i32_count_sum(
     check_cuda(unsafe {
         cu_memcpy_dtoh(maxs.as_mut_ptr().cast::<c_void>(), slot_max.ptr, slot_bytes)
     })?;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(min_his.as_mut_ptr().cast::<c_void>(), slot_min_hi.ptr, slot_bytes)
+    })?;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(max_his.as_mut_ptr().cast::<c_void>(), slot_max_hi.ptr, slot_bytes)
+    })?;
     // Host-compact the occupied slots (slot_keys != EMPTY). A GPU stream-compaction is a follow-on.
     // min/max are the per-group values from the single-level kernel; for the two-level kernel (COUNT/
     // SUM/AVG only) they stay at the i64::MAX/MIN identity and the engine ignores them. sum_hi is the
@@ -5864,6 +5967,8 @@ fn launch_cuda_group_by_i32_count_sum(
                 sum_hi: sum_his[i],
                 min: mins[i],
                 max: maxs[i],
+                min_hi: min_his[i],
+                max_hi: max_his[i],
             });
         }
     }
@@ -5877,6 +5982,8 @@ fn launch_cuda_group_by_i32_count_sum(
             sum_hi: sum_his[nslots],
             min: mins[nslots],
             max: maxs[nslots],
+            min_hi: min_his[nslots],
+            max_hi: max_his[nslots],
         });
     }
     // A numeric SUM that overflowed i128 in any group/thread set this flag on-device -> PG numeric
@@ -5972,10 +6079,13 @@ fn launch_cuda_group_by_kernel_timed(
     // ignores them. Real buffers required so the single-level kernel does not write to a stray pointer.
     let slot_min = primary.lease_device_buffer(slot_bytes)?;
     let slot_max = primary.lease_device_buffer(slot_bytes)?;
-    // slot_sum_hi + overflow_flag: required so the 16-param kernel has valid pointers; unused by the
-    // int4 bench (it never writes them).
+    // slot_sum_hi + overflow_flag + slot_min_hi/max_hi/row_slots: required so the 19-param kernel has
+    // valid pointers; unused by the int4 bench (it never takes the int8/numeric branches that write them).
     let slot_sum_hi = primary.lease_device_buffer(slot_bytes)?;
     let overflow_flag = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
+    let slot_min_hi = primary.lease_device_buffer(slot_bytes)?;
+    let slot_max_hi = primary.lease_device_buffer(slot_bytes)?;
+    let row_slots = primary.lease_device_buffer(count.max(1) * std::mem::size_of::<u32>())?;
     check_cuda(unsafe { cu_htod(indices_dev.ptr, indices.as_ptr().cast::<c_void>(), idx_bytes) })?;
 
     let null = std::ptr::null_mut::<c_void>();
@@ -6003,6 +6113,9 @@ fn launch_cuda_group_by_kernel_timed(
         0, // key_is_int8 = false: the timed bench always groups by an int4 key
         0, // value_is_numeric = false
         overflow_flag.ptr,
+        slot_min_hi.ptr,
+        slot_max_hi.ptr,
+        row_slots.ptr,
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -6053,7 +6166,7 @@ fn launch_cuda_group_by_kernel_timed(
         if keys[i] != EMPTY {
             // min/max are placeholders here -- the timed bench only validates COUNT/SUM (the two
             // kernels intentionally differ on min/max: single-level computes them, two-level doesn't).
-            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0 });
+            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0, min_hi: 0, max_hi: 0 });
         }
     }
     Ok((groups, best))

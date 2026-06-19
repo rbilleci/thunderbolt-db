@@ -3941,7 +3941,10 @@ fill_done:
     .param .u64 slot_sum_hi_ptr,
     .param .u64 key_is_int8,
     .param .u64 value_is_numeric,
-    .param .u64 overflow_flag_ptr
+    .param .u64 overflow_flag_ptr,
+    .param .u64 slot_min_hi_ptr,
+    .param .u64 slot_max_hi_ptr,
+    .param .u64 row_slots_ptr
 )
 {
     .reg .pred %p;
@@ -3951,6 +3954,20 @@ fill_done:
     .reg .pred %pmin;
     .reg .pred %pvn;
     .reg .pred %pov;
+    .reg .pred %plk;
+    .reg .pred %pa;
+    .reg .pred %pb;
+    .reg .pred %pupd;
+    .reg .u64 %mnhiptr;
+    .reg .u64 %mxhiptr;
+    .reg .u64 %rsptr;
+    .reg .u64 %loff;
+    .reg .u64 %laddr;
+    .reg .u64 %a1;
+    .reg .u64 %a2;
+    .reg .u64 %cmlo;
+    .reg .s64 %cmhi;
+    .reg .u32 %lockold;
     .reg .u64 %v8;
     .reg .u64 %k8;
     .reg .u64 %vn;
@@ -4023,6 +4040,9 @@ fill_done:
     ld.param.u64 %k8, [key_is_int8];
     ld.param.u64 %vn, [value_is_numeric];
     ld.param.u64 %ovptr, [overflow_flag_ptr];
+    ld.param.u64 %mnhiptr, [slot_min_hi_ptr];
+    ld.param.u64 %mxhiptr, [slot_max_hi_ptr];
+    ld.param.u64 %rsptr, [row_slots_ptr];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4161,13 +4181,131 @@ gb_sumnum:
     setp.lt.s64 %pov, %t1, 0;
     @%pov red.global.or.b32 [%ovptr], 1;
 gb_sumd:
+    @%pvn bra gb_numminmax;
     add.u64 %addr, %mnptr, %off;
     atom.global.min.s64 %cur, [%addr], %val;
     add.u64 %addr, %mxptr, %off;
     atom.global.max.s64 %cur, [%addr], %val;
+    bra gb_mmdone;
+gb_numminmax:
+    // Pass 1 (LOCK-FREE): per-group MIN/MAX of the HIGH limb via signed atomics, and record this
+    // row's claimed slot so pass 2 (a second kernel) can resolve the LOW limb among the high-limb
+    // ties. (The previous per-slot spin lock deadlocked the GPU under warp contention; this two-pass
+    // design uses ONLY lock-free atomics -- no lock, no deadlock.)
+    add.u64 %a1, %mnhiptr, %off;
+    atom.global.min.s64 %cmhi, [%a1], %valhi;
+    add.u64 %a1, %mxhiptr, %off;
+    atom.global.max.s64 %cmhi, [%a1], %valhi;
+    mul.lo.u64 %loff, %i, 4;
+    add.u64 %laddr, %rsptr, %loff;
+    cvt.u32.u64 %lockold, %h;
+    st.global.u32 [%laddr], %lockold;
+gb_mmdone:
     add.u64 %i, %i, %stride;
     bra row_loop;
 row_done:
+    ret;
+}
+// Pass 2 of numeric MIN/MAX (LOCK-FREE). Pass 1 (the single-level kernel above) finalized each
+// group's MIN/MAX HIGH limb in slot_min_hi/slot_max_hi and recorded each row's slot in row_slots.
+// Here, for each row, if its high limb TIES the group's min-hi, fold its low limb into slot_min via
+// atom.min.u64 (same for max). Result (hi:lo) = the exact signed-i128 min/max. No lock, no deadlock.
+.visible .entry gpu_db_group_by_numeric_minmax_lo(
+    .param .u64 resident_ptr,
+    .param .u64 sum_byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 row_slots_ptr,
+    .param .u64 slot_min_ptr,
+    .param .u64 slot_max_ptr,
+    .param .u64 slot_min_hi_ptr,
+    .param .u64 slot_max_hi_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %peq;
+    .reg .u32 %t32;
+    .reg .u32 %idx;
+    .reg .u32 %slot32;
+    .reg .u32 %vlo;
+    .reg .u32 %vhi;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .s64 %val;
+    .reg .s64 %valhi;
+    .reg .s64 %cmhi;
+    .reg .u64 %cmlo;
+    .reg .u64 %base;
+    .reg .u64 %soff;
+    .reg .u64 %iptr;
+    .reg .u64 %rsptr;
+    .reg .u64 %mnptr;
+    .reg .u64 %mxptr;
+    .reg .u64 %mnhiptr;
+    .reg .u64 %mxhiptr;
+    .reg .u64 %count;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %h;
+    .reg .u64 %off;
+    .reg .u64 %voff;
+    .reg .u64 %addr;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %soff, [sum_byte_offset];
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %rsptr, [row_slots_ptr];
+    ld.param.u64 %mnptr, [slot_min_ptr];
+    ld.param.u64 %mxptr, [slot_max_ptr];
+    ld.param.u64 %mnhiptr, [slot_min_hi_ptr];
+    ld.param.u64 %mxhiptr, [slot_max_hi_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+lo_loop:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra lo_done;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %rsptr, %off;
+    ld.global.u32 %slot32, [%addr];
+    cvt.u64.u32 %h, %slot32;
+    add.u64 %addr, %iptr, %off;
+    ld.global.u32 %idx, [%addr];
+    // numeric value at base + soff + idx*16 (4x4-byte) -> %val (low), %valhi (high)
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %addr, %base, %soff;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %val, {%vlo, %vhi};
+    ld.global.u32 %vlo, [%addr+8];
+    ld.global.u32 %vhi, [%addr+12];
+    mov.b64 %valhi, {%vlo, %vhi};
+    mul.lo.u64 %off, %h, 8;
+    // if valhi == slot_min_hi[h]: slot_min[h] = min(slot_min[h], val_lo)
+    add.u64 %addr, %mnhiptr, %off;
+    ld.global.s64 %cmhi, [%addr];
+    setp.eq.s64 %peq, %valhi, %cmhi;
+    add.u64 %addr, %mnptr, %off;
+    @%peq atom.global.min.u64 %cmlo, [%addr], %val;
+    // if valhi == slot_max_hi[h]: slot_max[h] = max(slot_max[h], val_lo)
+    add.u64 %addr, %mxhiptr, %off;
+    ld.global.s64 %cmhi, [%addr];
+    setp.eq.s64 %peq, %valhi, %cmhi;
+    add.u64 %addr, %mxptr, %off;
+    @%peq atom.global.max.u64 %cmlo, [%addr], %val;
+    add.u64 %i, %i, %stride;
+    bra lo_loop;
+lo_done:
     ret;
 }
 // Two-level GROUP BY: each block aggregates its rows into a SHARED-MEMORY local hash table (fast, no
