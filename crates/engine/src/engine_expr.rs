@@ -945,27 +945,33 @@ impl Engine {
         copin_s: Index,
         predicate: &ResidentExpr,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        if bound.selected_indexes.is_empty() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident Expr select requires at least one projected column".to_string(),
-            )));
-        }
-        for &col in &bound.selected_indexes {
-            let ty = table.columns[col].ty;
-            if ty != SqlType::Int4
-                && ty != SqlType::Int8
-                && !matches!(ty, SqlType::Numeric { .. })
-                && ty != SqlType::Date
-                && ty != SqlType::Timestamp
-                && ty != SqlType::Uuid
-                && ty != SqlType::Int2
-                && ty != SqlType::Bool
-            {
+        // `COUNT(*)` is the first operator-axis aggregate (no projected columns -- the count of the
+        // surviving rows IS the result, GPU-determined by the compaction). It skips the projected-
+        // column checks below; other aggregates aren't on this path yet (parser rejects them).
+        let is_count_all = matches!(select.projection, SelectProjection::CountAll);
+        if !is_count_all {
+            if bound.selected_indexes.is_empty() {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident Expr select currently materializes int4 / int8 / numeric / date / \
-                     timestamp / uuid / int2 / bool projection columns only"
-                        .to_string(),
+                    "resident Expr select requires at least one projected column".to_string(),
                 )));
+            }
+            for &col in &bound.selected_indexes {
+                let ty = table.columns[col].ty;
+                if ty != SqlType::Int4
+                    && ty != SqlType::Int8
+                    && !matches!(ty, SqlType::Numeric { .. })
+                    && ty != SqlType::Date
+                    && ty != SqlType::Timestamp
+                    && ty != SqlType::Uuid
+                    && ty != SqlType::Int2
+                    && ty != SqlType::Bool
+                {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident Expr select currently materializes int4 / int8 / numeric / date / \
+                         timestamp / uuid / int2 / bool projection columns only"
+                            .to_string(),
+                    )));
+                }
             }
         }
 
@@ -1016,6 +1022,19 @@ impl Engine {
             row_count,
         )?;
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
+
+        // COUNT(*): the surviving row count IS the result (PG returns bigint). The GPU filter +
+        // compaction already produced the count; no per-row materialization.
+        if is_count_all {
+            return Ok(RelationalSelectResult {
+                columns: bound.selected_columns,
+                rows: vec![vec![SqlValue::Int8(indices.len() as i64)]],
+                planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                fallback_reason: None,
+                access_path,
+            });
+        }
 
         // Materialize: gather each projected column at the surviving row indices on the GPU, by type
         // (int4 -> i32 gather, int8 -> i64 gather; the type matrix, doc 19).

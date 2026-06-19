@@ -162,6 +162,10 @@ fn build_projection(
                     }
                 }
             }
+            // A lone scalar aggregate (`SELECT count(*) FROM t WHERE ...`); the operator axis.
+            if let Some(aggregate) = try_parse_scalar_aggregate(res_target)? {
+                return Ok(aggregate);
+            }
         }
     }
 
@@ -192,6 +196,46 @@ fn build_projection(
         return Err(sql_pg_error("SELECT has no projected columns".to_string()));
     }
     Ok(SelectProjection::Columns(columns))
+}
+
+/// Detect a scalar aggregate in a SELECT target: `count(*)` -> `CountAll`. Other aggregates
+/// (`count(col)`, `sum`/`min`/`max`/`avg`) are recognized but rejected as follow-ons (a clear error,
+/// not the generic "plain columns only" message). `None` if the target is not an aggregate call.
+fn try_parse_scalar_aggregate(
+    res_target: &pg_query::protobuf::ResTarget,
+) -> Result<Option<SelectProjection>, ExecuteError> {
+    let Some(val) = res_target.val.as_deref() else {
+        return Ok(None);
+    };
+    let NodeEnum::FuncCall(func) = node_enum(val)? else {
+        return Ok(None);
+    };
+    // The function name is the last element of `funcname` (a schema qualifier would prefix it).
+    let name = match func.funcname.last().map(node_enum).transpose()? {
+        Some(NodeEnum::String(string)) => string.sval.to_ascii_lowercase(),
+        _ => return Ok(None),
+    };
+    if !matches!(name.as_str(), "count" | "sum" | "min" | "max" | "avg") {
+        return Ok(None);
+    }
+    if !res_target.name.is_empty() {
+        return Err(sql_pg_error(
+            "aggregate column aliases are not on the Expr path yet".to_string(),
+        ));
+    }
+    if func.agg_distinct {
+        return Err(sql_pg_error(
+            "aggregate DISTINCT is not on the Expr path yet".to_string(),
+        ));
+    }
+    // count(*) only, for now -- the first operator-axis slice. count(col) / sum / min / max / avg
+    // (reductions over a gathered column) are the immediate follow-ons.
+    if name == "count" && func.agg_star && func.args.is_empty() {
+        return Ok(Some(SelectProjection::CountAll));
+    }
+    Err(sql_pg_error(
+        "only COUNT(*) is on the general GPU executor's aggregate path yet".to_string(),
+    ))
 }
 
 /// Map a WHERE / predicate parse node to the general `ResidentExpr` IR, resolving column names to

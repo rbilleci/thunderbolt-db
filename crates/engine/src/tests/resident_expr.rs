@@ -1727,3 +1727,68 @@ fn gpu_execute_resident_expr_select_sql_runs_bool_predicate() {
         "NOT <int column> => hard error"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_count_star() {
+    // First operator-axis aggregate: COUNT(*) WHERE <pred> on the general GPU executor. The count is
+    // the GPU filter's surviving-row count (the compaction result); PG returns bigint. a[i] = i,
+    // flag[i] = (i % 3 == 0).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, flag BOOL)").unwrap();
+    const N: i64 = 50;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        let flag = if i % 3 == 0 { "true" } else { "false" };
+        values.push_str(&format!("({i}, {flag})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, flag) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // COUNT(*) WHERE a > 10 -> a in [11, 50) = 39 rows.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT COUNT(*) FROM t WHERE a > 10")
+        .expect("count on GPU");
+    assert_eq!(r.rows, vec![vec![SqlValue::Int8(39)]], "COUNT(*) WHERE a > 10 => 39");
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+
+    // COUNT(*) WHERE flag -- a popcount over the bool bitmap. i%3==0 in [0,50) = 17 rows.
+    let flag_count = (0..N).filter(|i| i % 3 == 0).count() as i64;
+    let r2 = e
+        .execute_resident_expr_select_sql("SELECT COUNT(*) FROM t WHERE flag")
+        .expect("count flag on GPU");
+    assert_eq!(r2.rows, vec![vec![SqlValue::Int8(flag_count)]], "COUNT(*) WHERE flag");
+
+    // COUNT(*) of an empty result -> 0 (not an error / not NULL).
+    let r3 = e
+        .execute_resident_expr_select_sql("SELECT COUNT(*) FROM t WHERE a > 1000")
+        .expect("count empty on GPU");
+    assert_eq!(r3.rows, vec![vec![SqlValue::Int8(0)]], "COUNT(*) empty => 0");
+
+    // count(*) is case-insensitive.
+    let r4 = e
+        .execute_resident_expr_select_sql("SELECT count(*) FROM t WHERE a >= 0")
+        .expect("lowercase count on GPU");
+    assert_eq!(r4.rows, vec![vec![SqlValue::Int8(N)]], "count(*) WHERE a >= 0 => all");
+
+    // The other aggregates are follow-ons -> hard error (clear message, never a wrong/blank answer).
+    for sql in [
+        "SELECT SUM(a) FROM t WHERE a > 0",
+        "SELECT COUNT(a) FROM t WHERE a > 0",
+        "SELECT MIN(a) FROM t WHERE a > 0",
+        "SELECT MAX(a) FROM t WHERE a > 0",
+        "SELECT AVG(a) FROM t WHERE a > 0",
+    ] {
+        assert!(
+            e.execute_resident_expr_select_sql(sql).is_err(),
+            "{sql} => aggregate follow-on error"
+        );
+    }
+}

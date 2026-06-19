@@ -149,5 +149,21 @@ The executor is int4 end to end; each new type extends the same four layers:
    popcount over the bitmap (an aggregate / operator-axis item); general `NOT` (De Morgan over
    comparisons / AND-OR); bool in AND/OR (the bool path emits indices, not a composable mask).
 
+## Operator axis (started)
+
+The type axis above is broad (9 types). The other axis toward the routing flip is OPERATORS:
+the general executor did filter + projection only; aggregates / `GROUP BY` / joins are what the
+enumerated legacy path still owns.
+
+- **`COUNT(*)` — DONE** (the first operator-axis slice): `SELECT COUNT(*) FROM t WHERE <pred>` on the
+  general executor returns the surviving-row count as bigint. It is GPU-native by construction — the
+  count IS the GPU filter + compaction's output size, no per-row materialization, no new kernel. The
+  parser (`build_projection` -> `try_parse_scalar_aggregate`) maps `count(*)` -> `SelectProjection::
+  CountAll`; the executor branches on it after the filter (skipping the projected-column checks).
+  `COUNT(*) WHERE flag` is thus a popcount over the bool bitmap. `sum`/`min`/`max`/`avg`/`count(col)`
+  are recognized but rejected as follow-ons (a clear error). Gate: engine GPU 26/0.
+- NEXT operators: `SUM`/`MIN`/`MAX`/`AVG` over a filtered column (GPU reductions over the gathered
+  values), no-WHERE `COUNT(*)` (full-table), then `GROUP BY` (hashing), then joins (M5).
+
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).
