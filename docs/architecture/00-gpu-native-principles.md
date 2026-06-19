@@ -41,6 +41,21 @@ capability is designed for the GPU first.
 > (b) answers SQL by enumerating per-shape kernels instead of generally
 > evaluating an expression/operator tree, it is wrong by definition here. See
 > `docs/architecture/17-general-gpu-executor.md` for the executor design.
+>
+> **3 — Target the LATEST GPU standards; the hardware floor is compute
+> capability 12.0 (sm_120 / Blackwell).** The engine is built for the newest
+> hardware, not the broadest. The minimum supported GPU is **sm_120** (the dev /
+> reference box is an RTX PRO 6000 Blackwell, cc 12.0); pre-Hopper GPUs
+> (sm_60–sm_86 — Pascal/Volta/Turing/Ampere, incl. the A100) are explicitly **not
+> supported**. Kernels use the newest PTX ISA + primitives the toolchain exposes
+> — e.g. native **128-bit atomics (`atom.cas.b128`, sm_90+)** for i128 keys /
+> compare-and-swap — rather than lowest-common-denominator workarounds. PTX
+> `.target` tracks the highest the *build* toolchain supports (currently `sm_90`;
+> the runtime JITs it to sm_120). A tracked **modernization pass — before the
+> join (M5) work — raises the build toolchain to target sm_120 natively and
+> audits every kernel to the latest-and-greatest standards** (e.g. migrating the
+> numeric/uuid MIN/MAX lock-free two-pass to a `b128` CAS loop). Decided
+> 2026-06-19.
 
 ## What GPU-Native Means Here
 

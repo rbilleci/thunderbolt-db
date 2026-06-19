@@ -1,5 +1,5 @@
-.version 6.0
-.target sm_60
+.version 8.4
+.target sm_90
 .address_size 64
 
 // Prototype primitives for the GENERAL GPU executor (docs/architecture/17-general-gpu-executor.md).
