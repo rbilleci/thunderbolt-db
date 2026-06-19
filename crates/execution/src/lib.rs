@@ -1179,6 +1179,19 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i128_sum_partials_at_indices(self, byte_offset, indices)
     }
 
+    /// GROUP BY a resident int4 `key` column over a FILTERED set of row indices, aggregating COUNT(*)
+    /// and SUM(int4 `sum`) per group via GPU hash aggregation (the operator axis, doc 19). Returns one
+    /// [`GroupByI32Row`] per distinct key (unordered). For COUNT(*) pass `sum_byte_offset =
+    /// key_byte_offset`. `indices` may be empty (-> no groups).
+    pub fn group_by_i32_count_sum_from_payload(
+        &self,
+        key_byte_offset: u64,
+        sum_byte_offset: u64,
+        indices: &[u32],
+    ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
+        launch_cuda_group_by_i32_count_sum(self, key_byte_offset, sum_byte_offset, indices)
+    }
+
     pub fn project_i32_from_payload(
         &self,
         byte_offset: u64,
@@ -5477,6 +5490,194 @@ fn launch_cuda_resident_i128_sum_partials_at_indices(
             .ok_or(CudaRuntimeProbeError::NumericFieldOverflow)?;
     }
     Ok(sum)
+}
+
+/// One GROUP BY output group: the int4 key, the row COUNT, and the SUM of the value column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupByI32Row {
+    pub key: i32,
+    pub count: u64,
+    pub sum: i64,
+}
+
+/// GROUP BY an int4 `key` column, aggregating COUNT(*) and SUM(int4 `sum`) over a filtered set of row
+/// indices, via GPU hash aggregation (the operator axis, doc 19). Allocates an open-addressing hash
+/// table sized > the row count (so probing terminates), inits slot_keys to EMPTY and the count/sum
+/// accumulators to 0, runs the group-by kernel, D2Hs the slots, and host-compacts the occupied groups.
+/// For COUNT(*) pass `sum_byte_offset = key_byte_offset` (the summed value is then ignored).
+/// `indices` may be empty (-> no groups). NB: this is the correct baseline; a shared-memory two-level
+/// kernel (far less atomic contention at low cardinality) and a GPU slot-compaction are follow-ons.
+fn launch_cuda_group_by_i32_count_sum(
+    resident: &CudaResidentDeviceMemory,
+    key_byte_offset: u64,
+    sum_byte_offset: u64,
+    indices: &[u32],
+) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    const EMPTY: i64 = i64::MIN;
+
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let count = indices.len();
+    let idx_bytes = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let count_u64 = count as u64;
+    // Power-of-two table sized > 2x the rows so linear probing always finds a free slot / the key.
+    let nslots = count
+        .checked_mul(2)
+        .and_then(usize::checked_next_power_of_two)
+        .map(|n| n.max(16))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let slot_bytes = nslots
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(nslots))?;
+    let mask = (nslots - 1) as u64;
+    let nslots_u64 = nslots as u64;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_memset_d8_async = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8Async>(b"cuMemsetD8Async\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &ptx)?;
+    let group_fn = primary.cached_function(c"gpu_db_group_by_i32_count_sum", &ptx)?;
+    let indices_dev = primary.lease_device_buffer(idx_bytes)?;
+    let slot_keys = primary.lease_device_buffer(slot_bytes)?;
+    let slot_count = primary.lease_device_buffer(slot_bytes)?;
+    let slot_sum = primary.lease_device_buffer(slot_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let fill_grid = nslots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let group_grid = count_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+
+    let mut f0 = slot_keys.ptr;
+    let mut f1 = nslots_u64;
+    let mut f2 = EMPTY as u64;
+    let mut fill_args = [
+        (&mut f0 as *mut u64).cast::<c_void>(),
+        (&mut f1 as *mut u64).cast::<c_void>(),
+        (&mut f2 as *mut u64).cast::<c_void>(),
+    ];
+    let mut a0 = resident.device_ptr();
+    let mut a1 = key_byte_offset;
+    let mut a2 = sum_byte_offset;
+    let mut a3 = indices_dev.ptr;
+    let mut a4 = count_u64;
+    let mut a5 = mask;
+    let mut a6 = slot_keys.ptr;
+    let mut a7 = slot_count.ptr;
+    let mut a8 = slot_sum.ptr;
+    let mut group_args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+        (&mut a6 as *mut u64).cast::<c_void>(),
+        (&mut a7 as *mut u64).cast::<c_void>(),
+        (&mut a8 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                indices_dev.ptr,
+                indices.as_ptr().cast::<c_void>(),
+                idx_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe { cu_memset_d8_async(slot_count.ptr, 0, slot_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe { cu_memset_d8_async(slot_sum.ptr, 0, slot_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
+            cu_launch_kernel(
+                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        unsafe {
+            cu_launch_kernel(
+                group_fn, group_grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                group_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        }
+    })?;
+
+    let mut keys = vec![0i64; nslots];
+    let mut counts = vec![0u64; nslots];
+    let mut sums = vec![0i64; nslots];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(keys.as_mut_ptr().cast::<c_void>(), slot_keys.ptr, slot_bytes)
+    })?;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(counts.as_mut_ptr().cast::<c_void>(), slot_count.ptr, slot_bytes)
+    })?;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(sums.as_mut_ptr().cast::<c_void>(), slot_sum.ptr, slot_bytes)
+    })?;
+    // Host-compact the occupied slots (slot_keys != EMPTY). A GPU stream-compaction is a follow-on.
+    let mut groups = Vec::new();
+    for i in 0..nslots {
+        if keys[i] != EMPTY {
+            groups.push(GroupByI32Row {
+                key: keys[i] as i32,
+                count: counts[i],
+                sum: sums[i],
+            });
+        }
+    }
+    Ok(groups)
 }
 
 
