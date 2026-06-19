@@ -945,11 +945,14 @@ impl Engine {
         copin_s: Index,
         predicate: &ResidentExpr,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        // `COUNT(*)` is the first operator-axis aggregate (no projected columns -- the count of the
-        // surviving rows IS the result, GPU-determined by the compaction). It skips the projected-
-        // column checks below; other aggregates aren't on this path yet (parser rejects them).
-        let is_count_all = matches!(select.projection, SelectProjection::CountAll);
-        if !is_count_all {
+        // Scalar aggregates (operator axis): COUNT(*) -> the surviving-row count; SUM(col) -> a GPU
+        // reduction over the filtered column. They have no projected columns to materialize, so they
+        // skip the projected-column checks and are computed from the filtered indices below.
+        let is_aggregate = matches!(
+            select.projection,
+            SelectProjection::CountAll | SelectProjection::Sum { .. }
+        );
+        if !is_aggregate {
             if bound.selected_indexes.is_empty() {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "resident Expr select requires at least one projected column".to_string(),
@@ -1023,12 +1026,38 @@ impl Engine {
         )?;
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
 
-        // COUNT(*): the surviving row count IS the result (PG returns bigint). The GPU filter +
-        // compaction already produced the count; no per-row materialization.
-        if is_count_all {
+        // Scalar aggregate? Compute it from the filtered indices and return a single row.
+        if is_aggregate {
+            let value = match &select.projection {
+                // COUNT(*): the surviving row count IS the result (PG returns bigint). The GPU filter
+                // + compaction already produced the count; no per-row materialization.
+                SelectProjection::CountAll => SqlValue::Int8(indices.len() as i64),
+                // SUM(int4): a GPU reduction over the filtered column (gather col[indices] + reduce);
+                // PG returns bigint. An EMPTY filtered set is SQL NULL, which the engine cannot
+                // represent until M3 -- so it hard-errors rather than returning a wrong 0.
+                SelectProjection::Sum { column } => {
+                    let sum_idx = validate_sum_column(table, column)?;
+                    if indices.is_empty() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "SUM over an empty set is NULL, which the engine cannot represent yet \
+                             (NULL support is M3)"
+                                .to_string(),
+                        )));
+                    }
+                    let byte_offset =
+                        resident_device_int4_column_offset(&snapshot, table, sum_idx)?;
+                    let sum = device_memory
+                        .sum_i32_at_indices_from_payload(byte_offset, &indices)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    SqlValue::Int8(sum)
+                }
+                _ => unreachable!("is_aggregate gates on CountAll | Sum"),
+            };
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
-                rows: vec![vec![SqlValue::Int8(indices.len() as i64)]],
+                rows: vec![vec![value]],
                 planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 fallback_reason: None,

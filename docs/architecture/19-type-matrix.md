@@ -162,8 +162,15 @@ enumerated legacy path still owns.
   CountAll`; the executor branches on it after the filter (skipping the projected-column checks).
   `COUNT(*) WHERE flag` is thus a popcount over the bool bitmap. `sum`/`min`/`max`/`avg`/`count(col)`
   are recognized but rejected as follow-ons (a clear error). Gate: engine GPU 26/0.
-- NEXT operators: `SUM`/`MIN`/`MAX`/`AVG` over a filtered column (GPU reductions over the gathered
-  values), no-WHERE `COUNT(*)` (full-table), then `GROUP BY` (hashing), then joins (M5).
+- **`SUM(int4)` — DONE** (the first REDUCTION aggregate): `SELECT SUM(col) FROM t WHERE <pred>` reduces
+  the filtered int4 column ON the GPU and returns bigint. New gather-reduce kernel `gpu_db_resident_
+  i32_sum_at_indices` (H2D the filter's surviving u32 indices, each thread sums its strided slice of
+  `col[indices[k]]` locally, then one `atom.add.u64` -> a single i64). `try_parse_scalar_aggregate`
+  maps `sum(col)` -> `SelectProjection::Sum`; the executor validates int4, reduces, returns Int8.
+  **An EMPTY filtered set is SQL NULL** -- not representable until M3 -- so it HARD-ERRORS (never a
+  wrong 0); user-confirmed policy. Gate: engine GPU 26/0, execution GPU 49/0.
+- NEXT operators: `MIN`/`MAX`/`AVG`(+int8/numeric `SUM`), no-WHERE `COUNT(*)` (full-table), then
+  `GROUP BY` (hashing), then joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

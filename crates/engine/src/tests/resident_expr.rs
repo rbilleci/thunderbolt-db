@@ -1778,11 +1778,31 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         .expect("lowercase count on GPU");
     assert_eq!(r4.rows, vec![vec![SqlValue::Int8(N)]], "count(*) WHERE a >= 0 => all");
 
-    // The other aggregates are follow-ons -> hard error (clear message, never a wrong/blank answer).
-    // FILTER / OVER live INSIDE the FuncCall: they must reject, not silently drop (audit P0 -- e.g.
-    // `COUNT(*) FILTER (WHERE a > 90)` must NOT count every outer-WHERE-passing row).
+    // SUM(int4) over a filtered set -- a GPU reduction over the gathered column; PG returns bigint.
+    let sum_of = |keep: &dyn Fn(i64) -> bool| -> i64 { (0..N).filter(|&i| keep(i)).sum() };
+    let s1 = e
+        .execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a > 10")
+        .expect("sum on GPU");
+    assert_eq!(s1.rows, vec![vec![SqlValue::Int8(sum_of(&|a| a > 10))]], "SUM(a) WHERE a > 10");
+    assert_eq!(s1.executed_target, DeviceTarget::Gpu(0));
+    let s2 = e
+        .execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE flag")
+        .expect("sum where flag on GPU");
+    assert_eq!(s2.rows, vec![vec![SqlValue::Int8(sum_of(&|a| a % 3 == 0))]], "SUM(a) WHERE flag");
+    let s3 = e
+        .execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a >= 0")
+        .expect("sum all on GPU");
+    assert_eq!(s3.rows, vec![vec![SqlValue::Int8(sum_of(&|_| true))]], "SUM(a) WHERE a >= 0 => total");
+    // SUM over an EMPTY set is NULL (M3) -> hard error, NOT a wrong 0.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a > 1000")
+            .is_err(),
+        "SUM over empty => NULL/M3 hard error (not 0)"
+    );
+
+    // The remaining aggregates are follow-ons -> hard error (clear message, never a wrong/blank
+    // answer). FILTER / OVER live INSIDE the FuncCall: they must reject, not silently drop (audit P0).
     for sql in [
-        "SELECT SUM(a) FROM t WHERE a > 0",
         "SELECT COUNT(a) FROM t WHERE a > 0",
         "SELECT MIN(a) FROM t WHERE a > 0",
         "SELECT MAX(a) FROM t WHERE a > 0",
@@ -1791,6 +1811,7 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         "SELECT COUNT(*) OVER () FROM t WHERE a >= 0",
         "SELECT COUNT(*) OVER (ORDER BY a) FROM t WHERE a >= 0",
         "SELECT COUNT(*) AS c FROM t WHERE a > 0",
+        "SELECT SUM(*) FROM t WHERE a > 0",
     ] {
         assert!(
             e.execute_resident_expr_select_sql(sql).is_err(),

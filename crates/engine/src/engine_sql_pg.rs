@@ -163,7 +163,7 @@ fn build_projection(
                 }
             }
             // A lone scalar aggregate (`SELECT count(*) FROM t WHERE ...`); the operator axis.
-            if let Some(aggregate) = try_parse_scalar_aggregate(res_target)? {
+            if let Some(aggregate) = try_parse_scalar_aggregate(res_target, qualifier)? {
                 return Ok(aggregate);
             }
         }
@@ -203,6 +203,7 @@ fn build_projection(
 /// not the generic "plain columns only" message). `None` if the target is not an aggregate call.
 fn try_parse_scalar_aggregate(
     res_target: &pg_query::protobuf::ResTarget,
+    qualifier: &str,
 ) -> Result<Option<SelectProjection>, ExecuteError> {
     let Some(val) = res_target.val.as_deref() else {
         return Ok(None);
@@ -247,13 +248,24 @@ fn try_parse_scalar_aggregate(
             "ordered-set / WITHIN GROUP aggregates are not on the Expr path yet".to_string(),
         ));
     }
-    // count(*) only, for now -- the first operator-axis slice. count(col) / sum / min / max / avg
-    // (reductions over a gathered column) are the immediate follow-ons.
     if name == "count" && func.agg_star && func.args.is_empty() {
         return Ok(Some(SelectProjection::CountAll));
     }
+    // SUM(col): the first reduction aggregate. The argument is a single column reference; the executor
+    // validates it is int4 and reduces on the GPU. (count(col) / min / max / avg are follow-ons.)
+    if name == "sum" {
+        if let [arg] = func.args.as_slice() {
+            if let NodeEnum::ColumnRef(column_ref) = node_enum(arg)? {
+                let column = resolve_column_name(column_ref, qualifier)?.to_string();
+                return Ok(Some(SelectProjection::Sum { column }));
+            }
+        }
+        return Err(sql_pg_error(
+            "SUM supports a single column argument on the Expr path".to_string(),
+        ));
+    }
     Err(sql_pg_error(
-        "only COUNT(*) is on the general GPU executor's aggregate path yet".to_string(),
+        "only COUNT(*) and SUM(col) are on the general GPU executor's aggregate path yet".to_string(),
     ))
 }
 

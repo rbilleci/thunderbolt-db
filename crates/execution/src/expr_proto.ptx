@@ -3324,3 +3324,75 @@ loop_bool:
 done_bool:
     ret;
 }
+
+// out[0] += sum over k<count of the i32 column value at row indices[k], sign-extended to i64 (the
+// operator axis, doc 19). `out_ptr` is a single i64 the host initialized to 0; `indices_ptr` is the
+// filter's surviving u32 row indices. SUM(int4) over a filtered set -> bigint; the i64 atomic add is
+// two's-complement so signed accumulation is correct. (Caller guarantees count >= 1: an empty
+// aggregate is NULL, which the engine cannot represent until M3, so it hard-errors before this runs.)
+.visible .entry gpu_db_resident_i32_sum_at_indices(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %idx;
+    .reg .s32 %val32;
+    .reg .s64 %val64;
+    .reg .s64 %sum;
+    .reg .u64 %sumbits;
+    .reg .u64 %old;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %optr;
+    .reg .u64 %count;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %ioff;
+    .reg .u64 %iaddr;
+    .reg .u64 %voff;
+    .reg .u64 %vaddr;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %voff, [byte_offset];
+    add.u64 %base, %base, %voff;
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %optr, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+    mov.s64 %sum, 0;
+loop_sumidx:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra done_sumidx;
+    mul.lo.u64 %ioff, %i, 4;
+    add.u64 %iaddr, %iptr, %ioff;
+    ld.global.u32 %idx, [%iaddr];
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 4;
+    add.u64 %vaddr, %base, %voff;
+    ld.global.s32 %val32, [%vaddr];
+    cvt.s64.s32 %val64, %val32;
+    add.s64 %sum, %sum, %val64;
+    add.u64 %i, %i, %stride;
+    bra loop_sumidx;
+done_sumidx:
+    // one atomic per thread (each thread reduced its strided slice locally).
+    cvt.u64.s64 %sumbits, %sum;
+    atom.global.add.u64 %old, [%optr], %sumbits;
+    ret;
+}
