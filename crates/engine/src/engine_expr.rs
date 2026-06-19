@@ -1121,9 +1121,26 @@ impl Engine {
                             .map_err(map_err)?;
                             SqlValue::Int8(value)
                         }
+                        // MIN/MAX(numeric) -> numeric: reduce the i128 mantissas (no native 128-bit
+                        // atomic, so a partials + host-combine reduction); the result carries the
+                        // column scale.
+                        SqlType::Numeric { scale, .. } => {
+                            let byte_offset =
+                                resident_device_numeric_column_offset(&snapshot, table, col_idx)?;
+                            let mantissa = if is_max {
+                                device_memory
+                                    .max_i128_at_indices_from_payload(byte_offset, &indices)
+                            } else {
+                                device_memory
+                                    .min_i128_at_indices_from_payload(byte_offset, &indices)
+                            }
+                            .map_err(map_err)?;
+                            SqlValue::Numeric(Decimal128::new(mantissa, scale))
+                        }
                         _ => {
                             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                "MIN / MAX support int4 / int8 columns on the Expr path".to_string(),
+                                "MIN / MAX support int4 / int8 / numeric columns on the Expr path"
+                                    .to_string(),
                             )));
                         }
                     }

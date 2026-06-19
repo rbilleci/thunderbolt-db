@@ -3642,3 +3642,122 @@ done_s128:
     atom.global.add.u64 %old_hi, [%ohi], %hi_add;
     ret;
 }
+
+// MIN (op==0) / MAX (op!=0) over k<count of the NUMERIC (i128 mantissa) column at row indices[k] (the
+// operator axis, doc 19). No native 128-bit atomic min/max, so each thread reduces its strided slice
+// into a LOCAL i128 and writes one PARTIAL to partials[global_tid] (16 bytes, lo then hi, LE); the host
+// combines the (bounded) partials. i128 read as 4x4-byte loads (alignment); signed compare = signed
+// high limb, unsigned low tie-break. Idle threads write the identity (i128::MAX for min / MIN for max),
+// which the host combine ignores. NB: %gtid is the global thread id -- a register named %tid would
+// shadow the special %tid.x and break ptxas with "Unknown field '.x'".
+.visible .entry gpu_db_resident_i128_minmax_partials_at_indices(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u32 op,
+    .param .u64 partials_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %is_min;
+    .reg .pred %not_min;
+    .reg .pred %hi_lt;
+    .reg .pred %hi_gt;
+    .reg .pred %hi_eq;
+    .reg .pred %lo_lt;
+    .reg .pred %lo_gt;
+    .reg .pred %col_lt;
+    .reg .pred %col_gt;
+    .reg .pred %take;
+    .reg .pred %tmp;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %opv;
+    .reg .u32 %idx;
+    .reg .b32 %w0;
+    .reg .b32 %w1;
+    .reg .b64 %acc_lo;
+    .reg .b64 %acc_hi;
+    .reg .b64 %col_lo;
+    .reg .b64 %col_hi;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %pptr;
+    .reg .u64 %count;
+    .reg .u64 %gtid;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %ioff;
+    .reg .u64 %iaddr;
+    .reg .u64 %voff;
+    .reg .u64 %vaddr;
+    .reg .u64 %po;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %voff, [byte_offset];
+    add.u64 %base, %base, %voff;
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u32 %opv, [op];
+    ld.param.u64 %pptr, [partials_ptr];
+    setp.eq.u32 %is_min, %opv, 0;
+    not.pred %not_min, %is_min;
+    mov.b64 %acc_hi, 0x8000000000000000;
+    mov.b64 %acc_lo, 0;
+    @%is_min mov.b64 %acc_hi, 0x7fffffffffffffff;
+    @%is_min mov.b64 %acc_lo, 0xffffffffffffffff;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %gtid, %t32;
+    mov.u64 %i, %gtid;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_mmp:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra done_mmp;
+    mul.lo.u64 %ioff, %i, 4;
+    add.u64 %iaddr, %iptr, %ioff;
+    ld.global.u32 %idx, [%iaddr];
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %vaddr, %base, %voff;
+    ld.global.u32 %w0, [%vaddr];
+    ld.global.u32 %w1, [%vaddr+4];
+    mov.b64 %col_lo, {%w0, %w1};
+    ld.global.u32 %w0, [%vaddr+8];
+    ld.global.u32 %w1, [%vaddr+12];
+    mov.b64 %col_hi, {%w0, %w1};
+    setp.lt.s64 %hi_lt, %col_hi, %acc_hi;
+    setp.gt.s64 %hi_gt, %col_hi, %acc_hi;
+    setp.eq.s64 %hi_eq, %col_hi, %acc_hi;
+    setp.lt.u64 %lo_lt, %col_lo, %acc_lo;
+    setp.gt.u64 %lo_gt, %col_lo, %acc_lo;
+    and.pred %tmp, %hi_eq, %lo_lt;
+    or.pred %col_lt, %hi_lt, %tmp;
+    and.pred %tmp, %hi_eq, %lo_gt;
+    or.pred %col_gt, %hi_gt, %tmp;
+    and.pred %take, %is_min, %col_lt;
+    and.pred %tmp, %not_min, %col_gt;
+    or.pred %take, %take, %tmp;
+    @%take mov.b64 %acc_lo, %col_lo;
+    @%take mov.b64 %acc_hi, %col_hi;
+    add.u64 %i, %i, %stride;
+    bra loop_mmp;
+done_mmp:
+    mul.lo.u64 %po, %gtid, 16;
+    add.u64 %vaddr, %pptr, %po;
+    mov.b64 {%w0, %w1}, %acc_lo;
+    st.global.u32 [%vaddr], %w0;
+    st.global.u32 [%vaddr+4], %w1;
+    mov.b64 {%w0, %w1}, %acc_hi;
+    st.global.u32 [%vaddr+8], %w0;
+    st.global.u32 [%vaddr+12], %w1;
+    ret;
+}

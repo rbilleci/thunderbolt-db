@@ -190,8 +190,16 @@ enumerated legacy path still owns.
   SUM/AVG execute branches dispatch int4 (i64 reduce) vs int8 (i128 reduce); AVG(int8) = the i128 sum /
   count via `average_sql_value`. SUM(int8) result column is numeric (oid 1700). **ALL int8 scalar
   aggregates done.** Gate: engine GPU 28/0, execution GPU 49/0.
-- NEXT operators: numeric SUM/MIN/MAX/AVG (i128 mantissa reductions), no-WHERE `COUNT(*)`, then
-  `GROUP BY` (hashing), joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
+- **`MIN(numeric)`/`MAX(numeric)` — DONE**: `SELECT MIN/MAX(numericcol) FROM t WHERE <pred>` -> numeric
+  (carries the column scale). No native 128-bit atomic min/max, so a PARTIALS reduction: kernel
+  `gpu_db_resident_i128_minmax_partials_at_indices` runs a bounded grid where each thread reduces its
+  strided slice to a local i128 min/max (i128 read as 4x4-byte loads; signed-high / unsigned-low
+  compare) and writes one partial; the host combines the (<= 16384) partials. Idle threads write the
+  i128 identity (MAX for min / MIN for max), which the combine ignores. The Min/Max execute branch
+  gains a `Numeric{scale}` arm -> `Decimal128::new(mantissa, scale)`.
+- NEXT operators: SUM/AVG(numeric) (i128 mantissa sum with CHECKED i128 overflow -> `numeric field
+  overflow`; per-thread partial sums + host checked-combine), no-WHERE `COUNT(*)`, then `GROUP BY`
+  (hashing), joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

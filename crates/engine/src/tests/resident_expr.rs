@@ -1962,6 +1962,14 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
         "SUM subset => 17e18 (> i64::MAX, i128 carry)"
     );
     assert!(sum_of(&keep_lt2) > i128::from(i64::MAX), "test really exceeds i64");
+    // The result COLUMN descriptor must match the numeric value (the int8-agg audit caught SUM(int8)
+    // declaring Int4/oid 23 -- a wire-decode mismatch). PG SUM(int8) -> numeric (oid 1700).
+    assert!(
+        matches!(s_sub.columns[0].ty, SqlType::Numeric { .. }),
+        "SUM(int8) result column must be numeric, got {:?}",
+        s_sub.columns[0].ty
+    );
+    assert_eq!(s_sub.columns[0].type_oid, 1700, "SUM(int8) wire oid = numeric 1700");
     let s_all = e.execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label >= 0").expect("sum all");
     assert_eq!(
         s_all.rows,
@@ -1989,4 +1997,48 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     ] {
         assert!(e.execute_resident_expr_select_sql(sql).is_err(), "{sql} => empty NULL/M3 error");
     }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_numeric_minmax() {
+    // MIN/MAX(numeric) over a filtered set -> numeric (PG preserves the type). Reduces the i128
+    // mantissas via the partials + host-combine reduction. label = row index (int4 filter col).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)").unwrap();
+    let prices = ["12.50", "-3.75", "100.00", "0.01", "-99.99", "42.42"];
+    let mut values = String::new();
+    for (i, p) in prices.iter().enumerate() {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({p}, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (p, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // mantissas at scale 2.
+    let num = |m: i128| SqlValue::Numeric(Decimal128::new(m, 2));
+
+    // All rows: MIN = -99.99, MAX = 100.00.
+    let mn = e.execute_resident_expr_select_sql("SELECT MIN(p) FROM t WHERE label >= 0").expect("min num");
+    assert_eq!(mn.rows, vec![vec![num(-9999)]], "MIN(p) all => -99.99");
+    assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
+    let mx = e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label >= 0").expect("max num");
+    assert_eq!(mx.rows, vec![vec![num(10000)]], "MAX(p) all => 100.00");
+
+    // Subset (label < 3 -> 12.50, -3.75, 100.00): MIN = -3.75, MAX = 100.00.
+    let mn2 = e.execute_resident_expr_select_sql("SELECT MIN(p) FROM t WHERE label < 3").expect("min subset");
+    assert_eq!(mn2.rows, vec![vec![num(-375)]], "MIN subset => -3.75");
+    let mx2 = e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label < 3").expect("max subset");
+    assert_eq!(mx2.rows, vec![vec![num(10000)]], "MAX subset => 100.00");
+
+    // Empty -> hard error (M3).
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label > 1000").is_err(),
+        "MAX(numeric) over empty => NULL/M3 hard error"
+    );
 }
