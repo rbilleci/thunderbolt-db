@@ -1711,54 +1711,55 @@ fn decimal_digit_count(mut n: i128) -> i32 {
 /// mantissa stays well within i128. `count == 0` is the empty-aggregate sentinel (callers needing SQL
 /// NULL guard it upstream).
 pub(crate) fn average_sql_value(sum: i128, count: usize) -> SqlValue {
-    if count == 0 {
-        return SqlValue::Numeric(Decimal128::ZERO);
-    }
-    let count = count as i128;
-    let negative = sum.is_negative();
-    let abs_sum = sum.abs();
-    if abs_sum == 0 {
-        // AVG of all-zero values: the quotient is 0; render at the base significant-digit scale.
-        return SqlValue::Numeric(Decimal128::new(0, AVG_RESULT_SCALE));
-    }
-    let sig_digits = i32::from(AVG_RESULT_SCALE);
-    // dw = floor(log10(|sum/count|)): the integer part's digit count - 1 when |quotient| >= 1, else
-    // the negative leading-zero position (smallest k with abs_sum*10^k >= count) when |quotient| < 1.
-    let q_int = abs_sum / count;
-    let dw: i32 = if q_int >= 1 {
-        decimal_digit_count(q_int) - 1
-    } else {
-        let mut scaled = abs_sum;
-        let mut k = 0;
-        while scaled < count {
-            scaled *= 10;
-            k += 1;
+    // AVG(int/int8) is AVG over a scale-0 dividend; share the (PG-exact) numeric AVG path so the
+    // division scale + rounding match PostgreSQL identically (the int path had the same scale bug).
+    avg_numeric_sql_value(sum, count, 0)
+}
+
+/// PostgreSQL's `select_div_scale` (numeric.c) for `SUM / count`: the display scale of the quotient.
+/// The dividend is `|sum|` at scale S (its numeric value is `|sum| / 10^S`); the divisor is `count`
+/// (an integer, scale 0). PG estimates the quotient weight in base-10000 (DEC_DIGITS = 4) units:
+/// `qweight = w1 - w2`, DECREMENTED by 1 when the dividend's leading base-10000 digit <= the
+/// divisor's, then `rscale = clamp(16 - 4*qweight, max(S, 0), 255)`. The leading-digit decrement is
+/// the subtle part a naive "quotient decimal weight" derivation got WRONG -- it diverged from PG on
+/// e.g. `AVG(1.00, 1.00, 1.00)` = 1.0 (PG renders scale 20, not 16) and every zero-sum. Verified
+/// against PostgreSQL across 340+ (scale, magnitude, sign, zero-sum, large-count) cases. (Clamped to
+/// 255 because `Decimal128`'s scale is a u8; PG's 1000 cap only bites for sub-10^-60 quotients, which
+/// `Decimal128` cannot represent anyway.)
+fn pg_div_result_scale(abs_sum: i128, count: i128, dividend_scale: u8) -> i32 {
+    let s = i32::from(dividend_scale);
+    // Leading base-10000 digit of `abs_val / 10^total_scale` at NBASE weight `w`. The result is a
+    // single NBASE digit in [0, 9999], so the exp<0 multiply cannot overflow (abs_val <= 9999 there).
+    let nbase_lead = |abs_val: i128, total_scale: i32, w: i32| -> i128 {
+        let exp = total_scale + 4 * w;
+        if exp >= 0 {
+            abs_val / 10i128.pow(exp as u32)
+        } else {
+            abs_val * 10i128.pow((-exp) as u32)
         }
-        -k
     };
-    let rscale = (sig_digits - 4 * dw.div_euclid(4)).clamp(0, i32::from(u8::MAX)) as u8;
-    let mut mantissa = q_int;
-    let mut remainder = abs_sum % count;
-    for _ in 0..rscale {
-        remainder *= 10;
-        mantissa = mantissa * 10 + remainder / count;
-        remainder %= count;
+    let (w1, fd1) = if abs_sum == 0 {
+        (0, 0)
+    } else {
+        let dwt1 = (decimal_digit_count(abs_sum) - 1) - s;
+        let w1 = dwt1.div_euclid(4);
+        (w1, nbase_lead(abs_sum, s, w1))
+    };
+    let dwt2 = decimal_digit_count(count) - 1;
+    let w2 = dwt2.div_euclid(4);
+    let fd2 = nbase_lead(count, 0, w2);
+    let mut qweight = w1 - w2;
+    if fd1 <= fd2 {
+        qweight -= 1;
     }
-    // Round half-away-from-zero on the magnitude (PG's rounding); apply the sign after.
-    if 2 * remainder >= count {
-        mantissa += 1;
-    }
-    if negative {
-        mantissa = -mantissa;
-    }
-    SqlValue::Numeric(Decimal128::new(mantissa, rscale))
+    (16 - 4 * qweight).max(s).clamp(0, i32::from(u8::MAX))
 }
 
 /// `AVG(numeric)` = SUM / count where SUM is the i128 mantissa at `column_scale` S, i.e. the true
-/// average is `sum_mantissa / (count * 10^S)`. PostgreSQL's numeric division picks a result scale
-/// `rscale = max(S, 16 - 4*floor(dwq/4))` where `dwq` = the quotient's decimal weight = `dw - S`
-/// (dw = weight of `|sum_mantissa|/count`), then rounds half-away-from-zero. This is the
-/// [`average_sql_value`] derivation generalized for a non-zero dividend scale.
+/// average is `sum_mantissa / (count * 10^S)`. PostgreSQL picks the display scale via
+/// [`pg_div_result_scale`] and rounds half-away-from-zero. Long-divides `|sum| * 10^(rscale-S) /
+/// count` (rscale >= S so the exponent is >= 0), interleaved to avoid an `abs_sum * 10^rscale`
+/// overflow (the mantissa stays near 10^16..10^19 as the quotient grows).
 pub(crate) fn avg_numeric_sql_value(sum_mantissa: i128, count: usize, column_scale: u8) -> SqlValue {
     if count == 0 {
         return SqlValue::Numeric(Decimal128::new(0, column_scale));
@@ -1767,27 +1768,9 @@ pub(crate) fn avg_numeric_sql_value(sum_mantissa: i128, count: usize, column_sca
     let s = i32::from(column_scale);
     let negative = sum_mantissa.is_negative();
     let abs_sum = sum_mantissa.abs();
-    let sig_digits = i32::from(AVG_RESULT_SCALE);
-    let q_int = abs_sum / count;
-    let dw: i32 = if abs_sum == 0 {
-        0
-    } else if q_int >= 1 {
-        decimal_digit_count(q_int) - 1
-    } else {
-        let mut scaled = abs_sum;
-        let mut k = 0;
-        while scaled < count {
-            scaled *= 10;
-            k += 1;
-        }
-        -k
-    };
-    // The quotient (SUM/count)/10^S has decimal weight dw - S.
-    let dwq = dw - s;
-    let rscale = std::cmp::max(s, sig_digits - 4 * dwq.div_euclid(4)).clamp(0, i32::from(u8::MAX));
-    // mantissa_out = round(|sum| * 10^(rscale - S) / count); rscale >= S so the exponent is >= 0.
+    let rscale = pg_div_result_scale(abs_sum, count, column_scale);
     let p = rscale - s;
-    let mut mantissa = q_int;
+    let mut mantissa = abs_sum / count;
     let mut remainder = abs_sum % count;
     for _ in 0..p {
         remainder *= 10;

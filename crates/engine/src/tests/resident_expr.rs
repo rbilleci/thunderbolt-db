@@ -1909,6 +1909,15 @@ fn average_sql_value_matches_postgres_dynamic_scale_and_rounding() {
     );
     // Negative: magnitude + sign both correct (round away from zero).
     assert_eq!(avg_str(-2, 3), "-0.66666666666666666667", "negative rounds away");
+    // PG select_div_scale decrements the quotient weight when the dividend's leading base-10000 digit
+    // <= the divisor's -- so an exact 1.0 from sum==count renders at scale 20, NOT 16. The naive
+    // "quotient decimal weight" formula shipped scale 16 here; these lock the fix (verified vs PG 18).
+    assert_eq!(avg_str(3, 3), "1.00000000000000000000", "sum==count -> scale 20 (firstdigit decr)");
+    assert_eq!(avg_str(5, 5), "1.00000000000000000000", "leading-digit-equal -> scale 20");
+    assert_eq!(avg_str(9, 3), "3.0000000000000000", "fd1(9) > fd2(3) -> no decr, scale 16");
+    // Zero sum (e.g. AVG over cancelling rows): PG renders 0 at scale max(S, 20), not 16.
+    assert_eq!(avg_str(0, 2), "0.00000000000000000000", "zero sum -> scale 20");
+    assert_eq!(avg_str(0, 5), "0.00000000000000000000", "zero sum, count 5 -> scale 20");
 }
 
 #[test]
