@@ -1061,18 +1061,21 @@ pub(crate) fn bind_relational_select(
                 sum_column: column, ..
             } => {
                 let idx = relational_column_index(table, column)?;
-                if table.columns[idx].ty == SqlType::Int8 {
+                match table.columns[idx].ty {
                     // SUM(int8) is an integer sum -> numeric scale 0 (OID 1700).
-                    (
+                    SqlType::Int8 => (
                         SqlType::Numeric {
                             precision: NUMERIC_DEFAULT_PRECISION,
                             scale: 0,
                         },
                         1700,
                         -1,
-                    )
-                } else {
-                    (SqlType::Int4, 20, 8)
+                    ),
+                    // SUM(numeric) -> numeric at the column scale (the mantissas share that scale).
+                    SqlType::Numeric { precision, scale } => {
+                        (SqlType::Numeric { precision, scale }, 1700, -1)
+                    }
+                    _ => (SqlType::Int4, 20, 8),
                 }
             }
             // MIN/MAX inherit the source column's wire type (PG preserves the type).
@@ -1639,10 +1642,13 @@ pub(crate) fn validate_int4_aggregate_column(
     aggregate: &'static str,
 ) -> Result<usize, ExecuteError> {
     let idx = relational_column_index(table, column)?;
-    // SUM/AVG accept int4 OR int8 on the general GPU executor (int8 reduces to i128). The enumerated
-    // path (int4-only) rejects int8 later at execution -- so this is still a hard error there, just
-    // not at validation; the general path handles int8.
-    if !matches!(table.columns[idx].ty, SqlType::Int4 | SqlType::Int8) {
+    // SUM/AVG accept int4 / int8 / numeric on the general GPU executor (int8 + numeric reduce to
+    // i128). The enumerated path (int4-only) rejects the wider types later at execution -- so this is
+    // still a hard error there, just not at validation; the general path handles them.
+    if !matches!(
+        table.columns[idx].ty,
+        SqlType::Int4 | SqlType::Int8 | SqlType::Numeric { .. }
+    ) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
             aggregate_int4_error_message(aggregate).to_string(),
         )));
@@ -1652,8 +1658,8 @@ pub(crate) fn validate_int4_aggregate_column(
 
 pub(crate) fn aggregate_int4_error_message(aggregate: &str) -> &'static str {
     match aggregate {
-        "AVG" => "AVG supports int4 / int8 columns",
-        _ => "SUM supports int4 / int8 columns",
+        "AVG" => "AVG supports int4 / int8 / numeric columns",
+        _ => "SUM supports int4 / int8 / numeric columns",
     }
 }
 
@@ -1746,6 +1752,55 @@ pub(crate) fn average_sql_value(sum: i128, count: usize) -> SqlValue {
         mantissa = -mantissa;
     }
     SqlValue::Numeric(Decimal128::new(mantissa, rscale))
+}
+
+/// `AVG(numeric)` = SUM / count where SUM is the i128 mantissa at `column_scale` S, i.e. the true
+/// average is `sum_mantissa / (count * 10^S)`. PostgreSQL's numeric division picks a result scale
+/// `rscale = max(S, 16 - 4*floor(dwq/4))` where `dwq` = the quotient's decimal weight = `dw - S`
+/// (dw = weight of `|sum_mantissa|/count`), then rounds half-away-from-zero. This is the
+/// [`average_sql_value`] derivation generalized for a non-zero dividend scale.
+pub(crate) fn avg_numeric_sql_value(sum_mantissa: i128, count: usize, column_scale: u8) -> SqlValue {
+    if count == 0 {
+        return SqlValue::Numeric(Decimal128::new(0, column_scale));
+    }
+    let count = count as i128;
+    let s = i32::from(column_scale);
+    let negative = sum_mantissa.is_negative();
+    let abs_sum = sum_mantissa.abs();
+    let sig_digits = i32::from(AVG_RESULT_SCALE);
+    let q_int = abs_sum / count;
+    let dw: i32 = if abs_sum == 0 {
+        0
+    } else if q_int >= 1 {
+        decimal_digit_count(q_int) - 1
+    } else {
+        let mut scaled = abs_sum;
+        let mut k = 0;
+        while scaled < count {
+            scaled *= 10;
+            k += 1;
+        }
+        -k
+    };
+    // The quotient (SUM/count)/10^S has decimal weight dw - S.
+    let dwq = dw - s;
+    let rscale = std::cmp::max(s, sig_digits - 4 * dwq.div_euclid(4)).clamp(0, i32::from(u8::MAX));
+    // mantissa_out = round(|sum| * 10^(rscale - S) / count); rscale >= S so the exponent is >= 0.
+    let p = rscale - s;
+    let mut mantissa = q_int;
+    let mut remainder = abs_sum % count;
+    for _ in 0..p {
+        remainder *= 10;
+        mantissa = mantissa * 10 + remainder / count;
+        remainder %= count;
+    }
+    if 2 * remainder >= count {
+        mantissa += 1;
+    }
+    if negative {
+        mantissa = -mantissa;
+    }
+    SqlValue::Numeric(Decimal128::new(mantissa, rscale as u8))
 }
 
 pub(crate) fn current_timestamp_micros() -> u64 {

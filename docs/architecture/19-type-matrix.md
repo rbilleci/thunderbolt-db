@@ -197,9 +197,18 @@ enumerated legacy path still owns.
   compare) and writes one partial; the host combines the (<= 16384) partials. Idle threads write the
   i128 identity (MAX for min / MIN for max), which the combine ignores. The Min/Max execute branch
   gains a `Numeric{scale}` arm -> `Decimal128::new(mantissa, scale)`.
-- NEXT operators: SUM/AVG(numeric) (i128 mantissa sum with CHECKED i128 overflow -> `numeric field
-  overflow`; per-thread partial sums + host checked-combine), no-WHERE `COUNT(*)`, then `GROUP BY`
-  (hashing), joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
+- **`SUM(numeric)`/`AVG(numeric)` — DONE**: SUM(numeric) -> numeric at the column scale; the i128
+  mantissa sum is CHECKED for i128 overflow -> PG `numeric field overflow` (matching the engine's
+  numeric a+b model -- the engine's numeric is i128, not arbitrary precision). Kernel
+  `gpu_db_resident_i128_sum_partials_at_indices`: each thread sums its slice into a local i128 and
+  sets a device overflow flag if any per-add overflows i128 (signed: same-sign operands, result sign
+  flips); the host checked-combines the partials (a combine overflow is the same error). AVG(numeric)
+  -> numeric via `avg_numeric_sql_value` = the AVG-int derivation generalized for a non-zero dividend
+  scale: `rscale = max(S, 16 - 4*floor((dw - S)/4))`, long-divide `|sum| * 10^(rscale-S) / count`,
+  round half-away. **ALL numeric scalar aggregates done; the full int4/int8/numeric SUM/MIN/MAX/AVG
+  set is on the general GPU executor.**
+- NEXT operators: no-WHERE `COUNT(*)` (full-table), then `GROUP BY` (hashing), joins (M5). All scalar
+  aggregates are NULL-gated on the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

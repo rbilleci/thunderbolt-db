@@ -3761,3 +3761,112 @@ done_mmp:
     st.global.u32 [%vaddr+12], %w1;
     ret;
 }
+
+// SUM over k<count of the NUMERIC (i128 mantissa) column at row indices[k] (the operator axis, doc
+// 19), as a partials reduction with CHECKED i128 overflow. Each thread sums its strided slice into a
+// local i128 (2-limb add.cc/addc) and writes one PARTIAL to partials[global_tid]; the host
+// checked-combines the (bounded) partials. If ANY per-thread add overflows i128 (signed: operands
+// same sign, result sign flips), the thread sets *overflow_flag (the host then errors -- a wrapped
+// partial is unusable). i128 read as 4x4-byte loads (alignment). overflow_flag host-init 0; partials
+// host-zeroed is unnecessary (every slot is written). NB: %gtid (not %tid -- shadows %tid.x).
+.visible .entry gpu_db_resident_i128_sum_partials_at_indices(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u64 partials_ptr,
+    .param .u64 overflow_flag_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %same_sign;
+    .reg .pred %diff_res;
+    .reg .pred %ovf;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %idx;
+    .reg .b32 %w0;
+    .reg .b32 %w1;
+    .reg .b64 %acc_lo;
+    .reg .b64 %acc_hi;
+    .reg .b64 %col_lo;
+    .reg .b64 %col_hi;
+    .reg .b64 %res_lo;
+    .reg .b64 %res_hi;
+    .reg .s64 %as;
+    .reg .s64 %bs;
+    .reg .s64 %rs;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %pptr;
+    .reg .u64 %fptr;
+    .reg .u64 %count;
+    .reg .u64 %gtid;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %ioff;
+    .reg .u64 %iaddr;
+    .reg .u64 %voff;
+    .reg .u64 %vaddr;
+    .reg .u64 %po;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %voff, [byte_offset];
+    add.u64 %base, %base, %voff;
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u64 %pptr, [partials_ptr];
+    ld.param.u64 %fptr, [overflow_flag_ptr];
+    mov.b64 %acc_lo, 0;
+    mov.b64 %acc_hi, 0;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %gtid, %t32;
+    mov.u64 %i, %gtid;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_smp:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra done_smp;
+    mul.lo.u64 %ioff, %i, 4;
+    add.u64 %iaddr, %iptr, %ioff;
+    ld.global.u32 %idx, [%iaddr];
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %vaddr, %base, %voff;
+    ld.global.u32 %w0, [%vaddr];
+    ld.global.u32 %w1, [%vaddr+4];
+    mov.b64 %col_lo, {%w0, %w1};
+    ld.global.u32 %w0, [%vaddr+8];
+    ld.global.u32 %w1, [%vaddr+12];
+    mov.b64 %col_hi, {%w0, %w1};
+    add.cc.u64 %res_lo, %acc_lo, %col_lo;
+    addc.u64 %res_hi, %acc_hi, %col_hi;
+    shr.s64 %as, %acc_hi, 63;
+    shr.s64 %bs, %col_hi, 63;
+    shr.s64 %rs, %res_hi, 63;
+    setp.eq.s64 %same_sign, %as, %bs;
+    setp.ne.s64 %diff_res, %rs, %as;
+    and.pred %ovf, %same_sign, %diff_res;
+    @%ovf red.global.or.b32 [%fptr], 1;
+    mov.b64 %acc_lo, %res_lo;
+    mov.b64 %acc_hi, %res_hi;
+    add.u64 %i, %i, %stride;
+    bra loop_smp;
+done_smp:
+    mul.lo.u64 %po, %gtid, 16;
+    add.u64 %vaddr, %pptr, %po;
+    mov.b64 {%w0, %w1}, %acc_lo;
+    st.global.u32 [%vaddr], %w0;
+    st.global.u32 [%vaddr+4], %w1;
+    mov.b64 {%w0, %w1}, %acc_hi;
+    st.global.u32 [%vaddr+8], %w0;
+    st.global.u32 [%vaddr+12], %w1;
+    ret;
+}

@@ -1070,9 +1070,20 @@ impl Engine {
                                 .map_err(map_err)?;
                             SqlValue::Numeric(Decimal128::new(sum, 0))
                         }
+                        // SUM(numeric) -> numeric at the column scale: sum the i128 mantissas (the
+                        // partials kernel with CHECKED i128 overflow -> numeric field overflow).
+                        SqlType::Numeric { scale, .. } => {
+                            let byte_offset =
+                                resident_device_numeric_column_offset(&snapshot, table, col_idx)?;
+                            let mantissa = device_memory
+                                .sum_i128_at_indices_from_payload(byte_offset, &indices)
+                                .map_err(map_err)?;
+                            SqlValue::Numeric(Decimal128::new(mantissa, scale))
+                        }
                         _ => {
                             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                "SUM supports int4 / int8 columns on the Expr path".to_string(),
+                                "SUM supports int4 / int8 / numeric columns on the Expr path"
+                                    .to_string(),
                             )));
                         }
                     }
@@ -1160,32 +1171,44 @@ impl Engine {
                     let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                     };
-                    // AVG(int4)/AVG(int8) -> numeric = the GPU sum (i128) / the count. int4 reduces to
-                    // i64 (widened), int8 to i128 (the two-atomic carry kernel).
-                    let sum_i128: i128 = match table.columns[col_idx].ty {
+                    // AVG -> numeric = the GPU sum / the count. int4 reduces to i64 (widened), int8 to
+                    // i128 (the two-atomic carry); both divide via average_sql_value (integer sum).
+                    // numeric sums the i128 mantissas and divides via avg_numeric_sql_value, which
+                    // carries the column scale into PG's division-scale derivation.
+                    match table.columns[col_idx].ty {
                         SqlType::Int4 => {
                             let byte_offset =
                                 resident_device_int4_column_offset(&snapshot, table, col_idx)?;
-                            i128::from(
+                            let sum = i128::from(
                                 device_memory
                                     .sum_i32_at_indices_from_payload(byte_offset, &indices)
                                     .map_err(map_err)?,
-                            )
+                            );
+                            average_sql_value(sum, indices.len())
                         }
                         SqlType::Int8 => {
                             let byte_offset =
                                 resident_device_int8_column_offset(&snapshot, table, col_idx)?;
-                            device_memory
+                            let sum = device_memory
                                 .sum_i64_at_indices_i128_from_payload(byte_offset, &indices)
-                                .map_err(map_err)?
+                                .map_err(map_err)?;
+                            average_sql_value(sum, indices.len())
+                        }
+                        SqlType::Numeric { scale, .. } => {
+                            let byte_offset =
+                                resident_device_numeric_column_offset(&snapshot, table, col_idx)?;
+                            let mantissa = device_memory
+                                .sum_i128_at_indices_from_payload(byte_offset, &indices)
+                                .map_err(map_err)?;
+                            avg_numeric_sql_value(mantissa, indices.len(), scale)
                         }
                         _ => {
                             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                "AVG supports int4 / int8 columns on the Expr path".to_string(),
+                                "AVG supports int4 / int8 / numeric columns on the Expr path"
+                                    .to_string(),
                             )));
                         }
-                    };
-                    average_sql_value(sum_i128, indices.len())
+                    }
                 }
                 _ => unreachable!("is_aggregate gates on CountAll | Sum | Min | Max | Avg"),
             };

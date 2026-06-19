@@ -2042,3 +2042,97 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_minmax() {
         "MAX(numeric) over empty => NULL/M3 hard error"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_runs_numeric_sum_avg() {
+    // SUM(numeric) -> numeric at the column scale (i128 mantissa sum); AVG(numeric) -> numeric at PG's
+    // division scale. Expected values derived from PG's numeric semantics (SUM keeps scale 2; AVG of a
+    // weight-0 quotient over a scale-2 dividend has rscale max(2, 16) = 16).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)").unwrap();
+    let prices = ["12.50", "-3.75", "100.00", "0.01", "-99.99", "42.42"];
+    let mut values = String::new();
+    for (i, p) in prices.iter().enumerate() {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({p}, {i})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (p, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // SUM all = 12.50 - 3.75 + 100.00 + 0.01 - 99.99 + 42.42 = 51.19 (mantissa 5119, scale 2).
+    let s_all = e.execute_resident_expr_select_sql("SELECT SUM(p) FROM t WHERE label >= 0").expect("sum all");
+    assert_eq!(s_all.rows, vec![vec![SqlValue::Numeric(Decimal128::new(5119, 2))]], "SUM all = 51.19");
+    assert_eq!(s_all.executed_target, DeviceTarget::Gpu(0));
+    assert!(matches!(s_all.columns[0].ty, SqlType::Numeric { .. }), "SUM(numeric) col numeric");
+    assert_eq!(s_all.columns[0].type_oid, 1700, "SUM(numeric) oid 1700");
+    // SUM subset (12.50, -3.75) = 8.75.
+    let s_sub = e.execute_resident_expr_select_sql("SELECT SUM(p) FROM t WHERE label < 2").expect("sum subset");
+    assert_eq!(s_sub.rows, vec![vec![SqlValue::Numeric(Decimal128::new(875, 2))]], "SUM subset = 8.75");
+
+    // AVG all = 51.19 / 6 = 8.5316666... -> scale 16, round half-away.
+    let a_all = e.execute_resident_expr_select_sql("SELECT AVG(p) FROM t WHERE label >= 0").expect("avg all");
+    match &a_all.rows[0][0] {
+        SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "8.5316666666666667", "AVG all"),
+        other => panic!("AVG numeric, got {other:?}"),
+    }
+    assert!(matches!(a_all.columns[0].ty, SqlType::Numeric { .. }), "AVG(numeric) col numeric");
+    // AVG subset = 8.75 / 2 = 4.375 -> scale 16.
+    let a_sub = e.execute_resident_expr_select_sql("SELECT AVG(p) FROM t WHERE label < 2").expect("avg subset");
+    match &a_sub.rows[0][0] {
+        SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "4.3750000000000000", "AVG subset"),
+        other => panic!("AVG numeric, got {other:?}"),
+    }
+
+    // Empty SUM/AVG -> hard error (M3).
+    for sql in [
+        "SELECT SUM(p) FROM t WHERE label > 1000",
+        "SELECT AVG(p) FROM t WHERE label > 1000",
+    ] {
+        assert!(e.execute_resident_expr_select_sql(sql).is_err(), "{sql} => empty error");
+    }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_numeric_sum_overflow_errors() {
+    // SUM(numeric) is CHECKED: a mantissa sum exceeding i128 is PG `numeric field overflow`, NEVER a
+    // silent wrap. Each mantissa is 9e18 * 10^19 = 9e37 (column NUMERIC(38,19), integer part 9e18 fits
+    // the legacy parser's i64 literal range); two sum to 1.8e38 > i128::MAX (~1.7e38).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE big (v NUMERIC(38,19), label INT)").unwrap();
+    let big = "9000000000000000000"; // 9e18, fits i64
+    e.execute_text(2, &format!("INSERT INTO big (v, label) VALUES ({big}, 0), ({big}, 1)"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("big").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let mantissa = 9_000_000_000_000_000_000_i128 * 10_i128.pow(19); // 9e37
+    assert!(
+        mantissa.checked_add(mantissa).is_none(),
+        "sanity: 2 * 9e37 must overflow i128 (else the test does not exercise overflow)"
+    );
+    let err = e
+        .execute_resident_expr_select_sql("SELECT SUM(v) FROM big WHERE label >= 0")
+        .expect_err("SUM overflow must error");
+    assert!(
+        err.to_string().contains("numeric field overflow"),
+        "expected numeric field overflow, got: {err}"
+    );
+    // A single value (no overflow) still sums correctly to its mantissa at scale 19.
+    let ok = e
+        .execute_resident_expr_select_sql("SELECT SUM(v) FROM big WHERE label < 1")
+        .expect("single value sums");
+    assert_eq!(
+        ok.rows,
+        vec![vec![SqlValue::Numeric(Decimal128::new(mantissa, 19))]],
+        "SUM of one 9e37-mantissa value"
+    );
+}

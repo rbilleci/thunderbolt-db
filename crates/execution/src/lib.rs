@@ -1168,6 +1168,17 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i128_minmax_partials_at_indices(self, byte_offset, indices, true)
     }
 
+    /// `SUM` of a resident NUMERIC column over a FILTERED set of row indices, as the i128 mantissa with
+    /// CHECKED i128 overflow (the operator axis, doc 19); a bounded-grid partials reduction + host
+    /// checked-combine. Overflow -> `NumericFieldOverflow`. `indices` must be non-empty.
+    pub fn sum_i128_at_indices_from_payload(
+        &self,
+        byte_offset: u64,
+        indices: &[u32],
+    ) -> Result<i128, CudaRuntimeProbeError> {
+        launch_cuda_resident_i128_sum_partials_at_indices(self, byte_offset, indices)
+    }
+
     pub fn project_i32_from_payload(
         &self,
         byte_offset: u64,
@@ -5312,6 +5323,162 @@ fn launch_cuda_resident_i128_minmax_partials_at_indices(
     }
     result.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))
 }
+
+/// SUM of a resident NUMERIC (i128 mantissa) column over a filtered set of row indices, as the i128
+/// mantissa with CHECKED i128 overflow (the operator axis, doc 19). Bounded-grid partials reduction:
+/// each thread sums its strided slice into a local i128 (and sets a device overflow flag if any of
+/// its adds overflows i128); the host checked-combines the partials. Either the device flag OR a
+/// host-combine overflow yields `NumericFieldOverflow` (PG `numeric field overflow`). `indices`
+/// must be non-empty.
+fn launch_cuda_resident_i128_sum_partials_at_indices(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    indices: &[u32],
+) -> Result<i128, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    if indices.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let count = indices.len();
+    let idx_bytes = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
+    let count_u64 = count as u64;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_memset_d8_async = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8Async>(b"cuMemsetD8Async\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn =
+        primary.cached_function(c"gpu_db_resident_i128_sum_partials_at_indices", &ptx)?;
+
+    const BLOCK: u32 = 256;
+    const MAX_GRID: u32 = 64;
+    let grid = (count_u64.div_ceil(u64::from(BLOCK)).clamp(1, u64::from(MAX_GRID))) as u32;
+    let num_threads = (grid * BLOCK) as usize;
+    let partials_bytes = num_threads
+        .checked_mul(std::mem::size_of::<i128>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(num_threads))?;
+    let indices_dev = primary.lease_device_buffer(idx_bytes)?;
+    let partials = primary.lease_device_buffer(partials_bytes)?;
+    let flag = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
+
+    let mut a0 = resident.device_ptr();
+    let mut a1 = byte_offset;
+    let mut a2 = indices_dev.ptr;
+    let mut a3 = count_u64;
+    let mut a4 = partials.ptr;
+    let mut a5 = flag.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                indices_dev.ptr,
+                indices.as_ptr().cast::<c_void>(),
+                idx_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe { cu_memset_d8_async(flag.ptr, 0, std::mem::size_of::<u32>(), stream) };
+        if rc != 0 {
+            return rc;
+        }
+        unsafe {
+            cu_launch_kernel(
+                kernel_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    let mut flag_host = 0u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut flag_host as *mut u32).cast::<c_void>(),
+            flag.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    if flag_host != 0 {
+        return Err(CudaRuntimeProbeError::NumericFieldOverflow);
+    }
+    let mut bytes = vec![0u8; partials_bytes];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            bytes.as_mut_ptr().cast::<c_void>(),
+            partials.ptr,
+            partials_bytes,
+        )
+    })?;
+    // Host checked-combine of the bounded partials (idle threads wrote 0). A combine overflow is the
+    // same PG `numeric field overflow` as a per-thread overflow.
+    let mut sum: i128 = 0;
+    for chunk in bytes.chunks_exact(std::mem::size_of::<i128>()) {
+        let value = i128::from_le_bytes(chunk.try_into().expect("16-byte chunk"));
+        sum = sum
+            .checked_add(value)
+            .ok_or(CudaRuntimeProbeError::NumericFieldOverflow)?;
+    }
+    Ok(sum)
+}
+
 
 /// Evaluate `text[i] LIKE pattern` over a resident TEXT column to surviving row indices (the type
 /// matrix, doc 19): copy the compiled u32 token array H2D into a leased buffer, run
