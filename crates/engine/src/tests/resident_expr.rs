@@ -2368,9 +2368,22 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
         a.sort_by_key(|r| r.key);
         b.sort_by_key(|r| r.key);
         assert_eq!(a, b, "single-level and two-level disagree for {key}");
-        let single = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200).unwrap();
-        let two = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200).unwrap();
+        let single = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0).unwrap();
+        let two = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0).unwrap();
         eprintln!("{:>8}  {:>13.4}  {:>13.4}  {:>8.2}x", a.len(), single, two, single / two);
+    }
+
+    // SCALE AXIS: fixed LOW cardinality (g4 = 4 groups), growing row count. This is the axis that
+    // answers "does it scale" -- the two-level win should GROW with rows (more single-level global
+    // contention to avoid), unlike the cardinality table above (fixed rows, varying group count).
+    eprintln!(
+        "\n=== SCALE: GROUP BY g4 (4 groups fixed), growing rows (kernel-only, min of 200) ==="
+    );
+    eprintln!("{:>9}  {:>13}  {:>13}  {:>9}", "rows", "single ms", "two-lvl ms", "speedup");
+    for rows in [25_000usize, 50_000, 100_000, 200_000] {
+        let single = e.group_by_i32_bench_kernel_ms("t", "g4", "v", false, 200, rows).unwrap();
+        let two = e.group_by_i32_bench_kernel_ms("t", "g4", "v", true, 200, rows).unwrap();
+        eprintln!("{:>9}  {:>13.4}  {:>13.4}  {:>8.2}x", rows, single, two, single / two);
     }
     eprintln!();
 }

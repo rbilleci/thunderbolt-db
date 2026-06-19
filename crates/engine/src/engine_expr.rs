@@ -988,6 +988,7 @@ impl Engine {
         value_col: &str,
         two_level: bool,
         runs: u32,
+        rows_limit: usize,
     ) -> Result<f32, ExecuteError> {
         let table = self.relational_catalog_table(table_name).ok_or_else(|| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!("no table {table_name}")))
@@ -1012,7 +1013,14 @@ impl Engine {
         let n = u32::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed("rows exceed u32".to_string()))
         })?;
-        let indices: Vec<u32> = (0..n).collect();
+        // rows_limit == 0 means the whole table; otherwise group only the first `rows_limit` rows (to
+        // sweep data size at fixed cardinality from one residency).
+        let m = if rows_limit == 0 {
+            n
+        } else {
+            (rows_limit as u32).min(n)
+        };
+        let indices: Vec<u32> = (0..m).collect();
         device_memory
             .group_by_i32_count_sum_kernel_timed(key_off, val_off, &indices, two_level, runs)
             .map(|(_, ms)| ms)
