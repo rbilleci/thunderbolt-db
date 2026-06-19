@@ -207,8 +207,13 @@ enumerated legacy path still owns.
   scale: `rscale = max(S, 16 - 4*floor((dw - S)/4))`, long-divide `|sum| * 10^(rscale-S) / count`,
   round half-away. **ALL numeric scalar aggregates done; the full int4/int8/numeric SUM/MIN/MAX/AVG
   set is on the general GPU executor.**
-- NEXT operators: no-WHERE `COUNT(*)` (full-table), then `GROUP BY` (hashing), joins (M5). All scalar
-  aggregates are NULL-gated on the empty case (M3).
+- **No-WHERE (full-table) — DONE**: the general executor's predicate is now `Option` -- no WHERE clause
+  is a full-table scan (indices = `0..row_count`), so `SELECT COUNT(*)/SUM/MIN/MAX/AVG(col) FROM t` and
+  `SELECT col FROM t` (whole-table projection) all run on the general path (the aggregate + projection
+  paths are index-driven, so only the index source changed). Follow-on: full-scan reduce kernels that
+  take `row_count` directly instead of synthesizing the `0..n` index array (avoids the O(n) H2D).
+- NEXT operators: `GROUP BY` (GPU hashing), then joins (M5). All scalar aggregates are NULL-gated on
+  the empty case (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

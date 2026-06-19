@@ -2145,3 +2145,51 @@ fn gpu_execute_resident_expr_select_sql_numeric_sum_overflow_errors() {
         "SUM of one 9e37-mantissa value"
     );
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
+    // No WHERE clause = a full-table scan (indices 0..row_count): aggregates reduce over every row and
+    // projection materializes every row, all on the general GPU executor.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a, b) VALUES (5,10),(3,20),(8,30),(1,40),(9,50)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let a = [5_i32, 3, 8, 1, 9];
+
+    // COUNT(*) over the whole table.
+    let c = e.execute_resident_expr_select_sql("SELECT COUNT(*) FROM t").expect("count *");
+    assert_eq!(c.rows, vec![vec![SqlValue::Int8(a.len() as i64)]], "COUNT(*) no WHERE = 5");
+    assert_eq!(c.executed_target, DeviceTarget::Gpu(0));
+
+    // SUM/MIN/MAX over the whole column.
+    let s = e.execute_resident_expr_select_sql("SELECT SUM(a) FROM t").expect("sum");
+    assert_eq!(s.rows, vec![vec![SqlValue::Int8(a.iter().map(|&v| i64::from(v)).sum())]], "SUM(a)=26");
+    let mn = e.execute_resident_expr_select_sql("SELECT MIN(a) FROM t").expect("min");
+    assert_eq!(mn.rows, vec![vec![SqlValue::Int4(*a.iter().min().unwrap())]], "MIN(a)=1");
+    let mx = e.execute_resident_expr_select_sql("SELECT MAX(a) FROM t").expect("max");
+    assert_eq!(mx.rows, vec![vec![SqlValue::Int4(*a.iter().max().unwrap())]], "MAX(a)=9");
+
+    // AVG(a) = 26/5 = 5.2 -> numeric scale 16 (fd1=26 > fd2=5, no leading-digit decrement).
+    let av = e.execute_resident_expr_select_sql("SELECT AVG(a) FROM t").expect("avg");
+    match &av.rows[0][0] {
+        SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "5.2000000000000000", "AVG no WHERE"),
+        other => panic!("AVG numeric, got {other:?}"),
+    }
+
+    // Full-table projection: every row, in residency (insertion) order.
+    let p = e.execute_resident_expr_select_sql("SELECT a FROM t").expect("project a");
+    let got: Vec<i32> = p
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            SqlValue::Int4(v) => v,
+            ref other => panic!("expected int4, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, a.to_vec(), "SELECT a FROM t projects all rows in order");
+}

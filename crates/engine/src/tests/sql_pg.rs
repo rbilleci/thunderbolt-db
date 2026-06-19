@@ -145,7 +145,8 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     let e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
-    assert_sql_err_contains(&e, "SELECT a FROM t", "WHERE"); // a filter needs a predicate
+    // NB: `SELECT a FROM t` (no WHERE) is NOT rejected any more -- it is a supported full-table scan
+    // (covered by gpu_execute_resident_expr_select_sql_full_table_no_where).
     assert_sql_err_contains(&e, "SELECT a FROM t x, t y WHERE a > 0", "one FROM relation"); // join
     // count(*) / sum / min / max / avg are supported now (operator axis, GPU-tested); count(col) and
     // other functions are follow-ons, still rejected at the parser.

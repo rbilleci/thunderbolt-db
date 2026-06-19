@@ -929,7 +929,13 @@ impl Engine {
         predicate: &ResidentExpr,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        self.execute_resident_expr_select_with_binding(select, &table, bound, copin_s, predicate)
+        self.execute_resident_expr_select_with_binding(
+            select,
+            &table,
+            bound,
+            copin_s,
+            Some(predicate),
+        )
     }
 
     /// As [`Engine::execute_resident_expr_select`] but over an ALREADY-BOUND table/projection: the
@@ -943,7 +949,8 @@ impl Engine {
         table: &RelationalTable,
         bound: BoundRelationalSelect,
         copin_s: Index,
-        predicate: &ResidentExpr,
+        // `None` = no WHERE clause: a full-table scan (every row survives).
+        predicate: Option<&ResidentExpr>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Scalar aggregates (operator axis): COUNT(*) -> the surviving-row count; SUM(col) -> a GPU
         // reduction over the filtered column. They have no projected columns to materialize, so they
@@ -1020,14 +1027,26 @@ impl Engine {
             ))
         })?;
 
-        // Evaluate the predicate on the GPU -> surviving row indices (ascending).
-        let indices = self.lower_resident_predicate(
-            predicate,
-            table,
-            &snapshot,
-            &device_memory,
-            row_count,
-        )?;
+        // Evaluate the predicate on the GPU -> surviving row indices (ascending). With no WHERE clause
+        // every row survives, so the indices are the full 0..row_count scan (the aggregate + projection
+        // paths below are index-driven and need no other change).
+        let indices = match predicate {
+            Some(predicate) => self.lower_resident_predicate(
+                predicate,
+                table,
+                &snapshot,
+                &device_memory,
+                row_count,
+            )?,
+            None => {
+                let n = u32::try_from(row_count).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "full-table scan row count exceeds the u32 row-index range".to_string(),
+                    ))
+                })?;
+                (0..n).collect()
+            }
+        };
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
 
         // Scalar aggregate? Compute it from the filtered indices and return a single row.

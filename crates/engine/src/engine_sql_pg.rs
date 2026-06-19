@@ -33,17 +33,21 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let stmt = parse_single_select(sql)?;
         let (select, qualifier) = build_select_from_select_stmt(&stmt)?;
-        let where_node = stmt.where_clause.as_deref().ok_or_else(|| {
-            sql_pg_error(
-                "the general GPU executor requires a WHERE predicate (a full-table SELECT is not an \
-                 expression filter)"
-                    .to_string(),
-            )
-        })?;
-        // Bind once; map the predicate against that SAME bound table; execute against that binding.
+        // Bind once; map the predicate (if any) against that SAME bound table; execute against that
+        // binding. No WHERE clause is a full-table scan (the executor takes `None` for the predicate).
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(&select)?;
-        let predicate = map_predicate_node(where_node, &table, &qualifier)?;
-        self.execute_resident_expr_select_with_binding(&select, &table, bound, copin_s, &predicate)
+        let predicate = stmt
+            .where_clause
+            .as_deref()
+            .map(|where_node| map_predicate_node(where_node, &table, &qualifier))
+            .transpose()?;
+        self.execute_resident_expr_select_with_binding(
+            &select,
+            &table,
+            bound,
+            copin_s,
+            predicate.as_ref(),
+        )
     }
 }
 
