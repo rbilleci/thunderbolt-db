@@ -1779,16 +1779,22 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     assert_eq!(r4.rows, vec![vec![SqlValue::Int8(N)]], "count(*) WHERE a >= 0 => all");
 
     // The other aggregates are follow-ons -> hard error (clear message, never a wrong/blank answer).
+    // FILTER / OVER live INSIDE the FuncCall: they must reject, not silently drop (audit P0 -- e.g.
+    // `COUNT(*) FILTER (WHERE a > 90)` must NOT count every outer-WHERE-passing row).
     for sql in [
         "SELECT SUM(a) FROM t WHERE a > 0",
         "SELECT COUNT(a) FROM t WHERE a > 0",
         "SELECT MIN(a) FROM t WHERE a > 0",
         "SELECT MAX(a) FROM t WHERE a > 0",
         "SELECT AVG(a) FROM t WHERE a > 0",
+        "SELECT COUNT(*) FILTER (WHERE a > 90) FROM t WHERE a >= 0",
+        "SELECT COUNT(*) OVER () FROM t WHERE a >= 0",
+        "SELECT COUNT(*) OVER (ORDER BY a) FROM t WHERE a >= 0",
+        "SELECT COUNT(*) AS c FROM t WHERE a > 0",
     ] {
         assert!(
             e.execute_resident_expr_select_sql(sql).is_err(),
-            "{sql} => aggregate follow-on error"
+            "{sql} => aggregate follow-on error (no silent FILTER/OVER drop)"
         );
     }
 }

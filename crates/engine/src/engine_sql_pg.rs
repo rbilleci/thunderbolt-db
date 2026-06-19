@@ -228,6 +228,25 @@ fn try_parse_scalar_aggregate(
             "aggregate DISTINCT is not on the Expr path yet".to_string(),
         ));
     }
+    // FILTER / OVER / WITHIN GROUP / ordered-set modifiers live INSIDE the FuncCall, so the SELECT-
+    // level guards (window_clause, ...) cannot see them. Reject them here, or `COUNT(*) FILTER (WHERE
+    // p)` / `COUNT(*) OVER ()` would be silently treated as a plain COUNT(*) -- a WRONG answer (the
+    // FILTER/window dropped). [audit P0]
+    if func.agg_filter.is_some() {
+        return Err(sql_pg_error(
+            "aggregate FILTER is not on the Expr path yet".to_string(),
+        ));
+    }
+    if func.over.is_some() {
+        return Err(sql_pg_error(
+            "window functions (OVER) are not on the Expr path yet".to_string(),
+        ));
+    }
+    if !func.agg_order.is_empty() || func.agg_within_group {
+        return Err(sql_pg_error(
+            "ordered-set / WITHIN GROUP aggregates are not on the Expr path yet".to_string(),
+        ));
+    }
     // count(*) only, for now -- the first operator-axis slice. count(col) / sum / min / max / avg
     // (reductions over a gathered column) are the immediate follow-ons.
     if name == "count" && func.agg_star && func.args.is_empty() {
