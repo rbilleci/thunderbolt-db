@@ -3396,3 +3396,78 @@ done_sumidx:
     atom.global.add.u64 %old, [%optr], %sumbits;
     ret;
 }
+
+// out[0] = MIN (op==0) or MAX (op!=0) over k<count of the i32 column value at row indices[k] (the
+// operator axis, doc 19). `out` is a single i32 the host initialized to i32::MAX (min) or i32::MIN
+// (max); `indices_ptr` is the filter's surviving u32 rows. Each thread reduces its strided slice into
+// a signed local, then one predicated atom.min/max.s32. Caller guarantees count >= 1 (an empty
+// MIN/MAX is NULL, not representable until M3, so it hard-errors before this runs).
+.visible .entry gpu_db_resident_i32_minmax_at_indices(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 count,
+    .param .u32 op,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .pred %is_min;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %opv;
+    .reg .u32 %idx;
+    .reg .s32 %val32;
+    .reg .s32 %acc;
+    .reg .s32 %old;
+    .reg .u64 %base;
+    .reg .u64 %iptr;
+    .reg .u64 %optr;
+    .reg .u64 %count;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %ioff;
+    .reg .u64 %iaddr;
+    .reg .u64 %voff;
+    .reg .u64 %vaddr;
+
+    ld.param.u64 %base, [resident_ptr];
+    ld.param.u64 %voff, [byte_offset];
+    add.u64 %base, %base, %voff;
+    ld.param.u64 %iptr, [indices_ptr];
+    ld.param.u64 %count, [count];
+    ld.param.u32 %opv, [op];
+    ld.param.u64 %optr, [out_ptr];
+    setp.eq.u32 %is_min, %opv, 0;
+    mov.s32 %acc, -2147483648;
+    @%is_min mov.s32 %acc, 2147483647;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_mm:
+    setp.ge.u64 %p, %i, %count;
+    @%p bra done_mm;
+    mul.lo.u64 %ioff, %i, 4;
+    add.u64 %iaddr, %iptr, %ioff;
+    ld.global.u32 %idx, [%iaddr];
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 4;
+    add.u64 %vaddr, %base, %voff;
+    ld.global.s32 %val32, [%vaddr];
+    @%is_min min.s32 %acc, %acc, %val32;
+    @!%is_min max.s32 %acc, %acc, %val32;
+    add.u64 %i, %i, %stride;
+    bra loop_mm;
+done_mm:
+    @%is_min atom.global.min.s32 %old, [%optr], %acc;
+    @!%is_min atom.global.max.s32 %old, [%optr], %acc;
+    ret;
+}

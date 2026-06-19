@@ -169,8 +169,14 @@ enumerated legacy path still owns.
   maps `sum(col)` -> `SelectProjection::Sum`; the executor validates int4, reduces, returns Int8.
   **An EMPTY filtered set is SQL NULL** -- not representable until M3 -- so it HARD-ERRORS (never a
   wrong 0); user-confirmed policy. Gate: engine GPU 26/0, execution GPU 49/0.
-- NEXT operators: `MIN`/`MAX`/`AVG`(+int8/numeric `SUM`), no-WHERE `COUNT(*)` (full-table), then
-  `GROUP BY` (hashing), then joins (M5). All scalar aggregates are NULL-gated on the empty case (M3).
+- **`MIN(int4)` / `MAX(int4)` — DONE**: `SELECT MIN(col)/MAX(col) FROM t WHERE <pred>` reduces the
+  filtered int4 column on the GPU (PG preserves the type -> int4). One kernel `gpu_db_resident_i32_
+  minmax_at_indices` (op 0=min/1=max; the accumulator's identity i32::MAX/MIN is H2D'd since it isn't
+  a memset byte pattern; local reduce + one predicated `atom.min/max.s32`). Same parse/execute branch
+  as SUM; empty set hard-errors (M3). Gate: engine GPU 26/0, execution GPU 49/0.
+- NEXT operators: `AVG` (numeric = sum/count), int8/numeric `SUM`/`MIN`/`MAX`, no-WHERE `COUNT(*)`,
+  then `GROUP BY` (hashing), then joins (M5). All scalar aggregates are NULL-gated on the empty case
+  (M3).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

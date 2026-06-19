@@ -251,21 +251,26 @@ fn try_parse_scalar_aggregate(
     if name == "count" && func.agg_star && func.args.is_empty() {
         return Ok(Some(SelectProjection::CountAll));
     }
-    // SUM(col): the first reduction aggregate. The argument is a single column reference; the executor
-    // validates it is int4 and reduces on the GPU. (count(col) / min / max / avg are follow-ons.)
-    if name == "sum" {
+    // SUM/MIN/MAX(col): reduction aggregates over a single column reference; the executor validates
+    // int4 and reduces on the GPU. (count(col) / avg / int8 / numeric are follow-ons.)
+    if matches!(name.as_str(), "sum" | "min" | "max") {
         if let [arg] = func.args.as_slice() {
             if let NodeEnum::ColumnRef(column_ref) = node_enum(arg)? {
                 let column = resolve_column_name(column_ref, qualifier)?.to_string();
-                return Ok(Some(SelectProjection::Sum { column }));
+                return Ok(Some(match name.as_str() {
+                    "sum" => SelectProjection::Sum { column },
+                    "min" => SelectProjection::Min { column },
+                    _ => SelectProjection::Max { column },
+                }));
             }
         }
         return Err(sql_pg_error(
-            "SUM supports a single column argument on the Expr path".to_string(),
+            "SUM / MIN / MAX support a single column argument on the Expr path".to_string(),
         ));
     }
     Err(sql_pg_error(
-        "only COUNT(*) and SUM(col) are on the general GPU executor's aggregate path yet".to_string(),
+        "only COUNT(*) / SUM / MIN / MAX(col) are on the general GPU executor's aggregate path yet"
+            .to_string(),
     ))
 }
 

@@ -147,9 +147,9 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
 
     assert_sql_err_contains(&e, "SELECT a FROM t", "WHERE"); // a filter needs a predicate
     assert_sql_err_contains(&e, "SELECT a FROM t x, t y WHERE a > 0", "one FROM relation"); // join
-    // count(*) and sum(col) are supported now (operator axis, GPU-tested); min/max/avg/count(col)
+    // count(*) / sum / min / max are supported now (operator axis, GPU-tested); avg / count(col)
     // are follow-ons and still rejected at the parser.
-    assert_sql_err_contains(&e, "SELECT avg(a) FROM t WHERE a > 0", "COUNT(*) and SUM(col)");
+    assert_sql_err_contains(&e, "SELECT avg(a) FROM t WHERE a > 0", "COUNT(*) / SUM / MIN / MAX");
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 0 ORDER BY a", "ORDER BY"); // ordering
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a / b > 1", "/"); // unsupported operator
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE NOT a > 1", "NOT"); // unary NOT (AND/OR are ok)

@@ -950,7 +950,10 @@ impl Engine {
         // skip the projected-column checks and are computed from the filtered indices below.
         let is_aggregate = matches!(
             select.projection,
-            SelectProjection::CountAll | SelectProjection::Sum { .. }
+            SelectProjection::CountAll
+                | SelectProjection::Sum { .. }
+                | SelectProjection::Min { .. }
+                | SelectProjection::Max { .. }
         );
         if !is_aggregate {
             if bound.selected_indexes.is_empty() {
@@ -1053,7 +1056,37 @@ impl Engine {
                         })?;
                     SqlValue::Int8(sum)
                 }
-                _ => unreachable!("is_aggregate gates on CountAll | Sum"),
+                // MIN/MAX(int4): a GPU reduction; PG MIN/MAX preserve the column type (int4 -> int4).
+                // Empty set is NULL -> hard error (M3), like SUM.
+                SelectProjection::Min { column } | SelectProjection::Max { column } => {
+                    let col_idx = relational_column_index(table, column)?;
+                    if table.columns[col_idx].ty != SqlType::Int4 {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "MIN / MAX currently support int4 columns on the Expr path".to_string(),
+                        )));
+                    }
+                    if indices.is_empty() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "MIN / MAX over an empty set is NULL, which the engine cannot represent \
+                             yet (NULL support is M3)"
+                                .to_string(),
+                        )));
+                    }
+                    let byte_offset =
+                        resident_device_int4_column_offset(&snapshot, table, col_idx)?;
+                    let is_max = matches!(select.projection, SelectProjection::Max { .. });
+                    let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    };
+                    let value = if is_max {
+                        device_memory.max_i32_at_indices_from_payload(byte_offset, &indices)
+                    } else {
+                        device_memory.min_i32_at_indices_from_payload(byte_offset, &indices)
+                    }
+                    .map_err(map_err)?;
+                    SqlValue::Int4(value)
+                }
+                _ => unreachable!("is_aggregate gates on CountAll | Sum | Min | Max"),
             };
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,

@@ -1800,18 +1800,45 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         "SUM over empty => NULL/M3 hard error (not 0)"
     );
 
+    // MIN / MAX(int4) over a filtered set -- GPU reductions; PG preserves the type (int4 -> int4).
+    let min_of = |keep: &dyn Fn(i64) -> bool| (0..N).filter(|&i| keep(i)).min().unwrap() as i32;
+    let max_of = |keep: &dyn Fn(i64) -> bool| (0..N).filter(|&i| keep(i)).max().unwrap() as i32;
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a > 10")
+        .expect("min on GPU");
+    assert_eq!(mn.rows, vec![vec![SqlValue::Int4(min_of(&|a| a > 10))]], "MIN(a) WHERE a > 10 => 11");
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT MAX(a) FROM t WHERE flag")
+        .expect("max where flag on GPU");
+    assert_eq!(mx.rows, vec![vec![SqlValue::Int4(max_of(&|a| a % 3 == 0))]], "MAX(a) WHERE flag");
+    let mx2 = e
+        .execute_resident_expr_select_sql("SELECT MAX(a) FROM t WHERE a >= 0")
+        .expect("max all on GPU");
+    assert_eq!(mx2.rows, vec![vec![SqlValue::Int4((N - 1) as i32)]], "MAX(a) WHERE a >= 0 => N-1");
+    let mn2 = e
+        .execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a >= 0")
+        .expect("min all on GPU");
+    assert_eq!(mn2.rows, vec![vec![SqlValue::Int4(0)]], "MIN(a) WHERE a >= 0 => 0");
+    // MIN/MAX over an EMPTY set is NULL (M3) -> hard error.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a > 1000")
+            .is_err()
+            && e.execute_resident_expr_select_sql("SELECT MAX(a) FROM t WHERE a > 1000")
+                .is_err(),
+        "MIN/MAX over empty => NULL/M3 hard error"
+    );
+
     // The remaining aggregates are follow-ons -> hard error (clear message, never a wrong/blank
     // answer). FILTER / OVER live INSIDE the FuncCall: they must reject, not silently drop (audit P0).
     for sql in [
         "SELECT COUNT(a) FROM t WHERE a > 0",
-        "SELECT MIN(a) FROM t WHERE a > 0",
-        "SELECT MAX(a) FROM t WHERE a > 0",
         "SELECT AVG(a) FROM t WHERE a > 0",
         "SELECT COUNT(*) FILTER (WHERE a > 90) FROM t WHERE a >= 0",
         "SELECT COUNT(*) OVER () FROM t WHERE a >= 0",
         "SELECT COUNT(*) OVER (ORDER BY a) FROM t WHERE a >= 0",
         "SELECT COUNT(*) AS c FROM t WHERE a > 0",
         "SELECT SUM(*) FROM t WHERE a > 0",
+        "SELECT MIN(*) FROM t WHERE a > 0",
     ] {
         assert!(
             e.execute_resident_expr_select_sql(sql).is_err(),
