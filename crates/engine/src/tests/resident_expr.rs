@@ -2433,6 +2433,46 @@ fn gpu_grouped_sum_avg_over_int8_value() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_int8_sum_survives_many_low_limb_wraps() {
+    // Permanent regression guard for the LOCK-FREE per-slot i128 carry. One group of N rows all =
+    // i64::MAX makes the slot's low limb wrap ~N/2 times under concurrent atomicAdds; a dropped or
+    // double-counted carry shows up as the high limb (sum_hi) off by the wrap count. A second group
+    // of N x i64::MIN stresses the negative path. Oracle = N * value as i128 (computed, not hardcoded).
+    const N: usize = 1000;
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    let pos = vec!["(1,9223372036854775807)"; N].join(",");
+    let neg = vec!["(2,-9223372036854775808)"; N].join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g,v) VALUES {pos},{neg}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("many-wraps sum");
+    let strs: Vec<String> = s
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            SqlValue::Numeric(d) => d.to_decimal_string(),
+            other => panic!("SUM(int8) must be numeric, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        strs,
+        vec![
+            (i128::from(N as i64) * i128::from(i64::MAX)).to_string(),
+            (i128::from(N as i64) * i128::from(i64::MIN)).to_string(),
+        ],
+        "int8 SUM under many concurrent low-limb wraps"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
     // The two-level shared-mem GROUP BY at scale: LOW cardinality (many rows per group, exercising the
     // block-local aggregation + cross-block merge) and HIGH cardinality (thousands of distinct keys
