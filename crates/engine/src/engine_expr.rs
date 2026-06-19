@@ -1230,14 +1230,14 @@ impl Engine {
                 SqlType::Numeric { scale, .. } => scale,
                 _ => 0,
             };
-            let (value_is_int8, value_is_numeric) = match kind {
-                GroupedAgg::Count => (false, false),
+            let (value_is_int8, value_is_numeric, value_is_uuid) = match kind {
+                GroupedAgg::Count => (false, false, false),
                 GroupedAgg::Sum | GroupedAgg::Avg => match value_ty {
                     // SUM/AVG are numeric aggregations: int2/int4 (int4 read), int8, numeric. Temporal
-                    // types (date/timestamp) have no SUM/AVG.
-                    SqlType::Int4 | SqlType::Int2 => (false, false),
-                    SqlType::Int8 => (true, false),
-                    SqlType::Numeric { .. } => (false, true),
+                    // types (date/timestamp) and uuid have no SUM/AVG.
+                    SqlType::Int4 | SqlType::Int2 => (false, false, false),
+                    SqlType::Int8 => (true, false, false),
+                    SqlType::Numeric { .. } => (false, true, false),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "grouped SUM / AVG support int2 / int4 / int8 / numeric value columns on \
@@ -1248,13 +1248,15 @@ impl Engine {
                 },
                 GroupedAgg::Min | GroupedAgg::Max => match value_ty {
                     // MIN/MAX work for any ordered type: int2/int4/date ride the int4 read; int8/
-                    // timestamp ride the int8 read; numeric uses the two-pass i128.
-                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => (false, false),
-                    SqlType::Int8 | SqlType::Timestamp => (true, false),
-                    SqlType::Numeric { .. } => (false, true),
+                    // timestamp ride the int8 read; numeric uses the two-pass i128; uuid uses the
+                    // b128 CAS-loop (unsigned big-endian / memcmp order).
+                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => (false, false, false),
+                    SqlType::Int8 | SqlType::Timestamp => (true, false, false),
+                    SqlType::Numeric { .. } => (false, true, false),
+                    SqlType::Uuid => (false, false, true),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped MIN / MAX support int2 / int4 / int8 / numeric / date / \
+                            "grouped MIN / MAX support int2 / int4 / int8 / numeric / uuid / date / \
                              timestamp value columns on the Expr path"
                                 .to_string(),
                         )));
@@ -1267,9 +1269,10 @@ impl Engine {
                 resident_device_int4_column_offset(&snapshot, table, group_idx)?
             };
             // COUNT(*) has no value column; the kernel ignores the summed value when value == key.
+            // uuid shares the 16-byte numeric section, so it uses the same offset resolver.
             let value_offset = if matches!(kind, GroupedAgg::Count) {
                 key_offset
-            } else if value_is_numeric {
+            } else if value_is_numeric || value_is_uuid {
                 resident_device_numeric_column_offset(&snapshot, table, value_idx)?
             } else if value_is_int8 {
                 resident_device_int8_column_offset(&snapshot, table, value_idx)?
@@ -1282,6 +1285,7 @@ impl Engine {
             let use_single_level = matches!(kind, GroupedAgg::Min | GroupedAgg::Max)
                 || value_is_int8
                 || value_is_numeric
+                || value_is_uuid
                 || key_is_int8;
             let groups = if use_single_level {
                 device_memory.group_by_i32_count_sum_minmax_from_payload(
@@ -1291,6 +1295,7 @@ impl Engine {
                     value_is_int8,
                     key_is_int8,
                     value_is_numeric,
+                    value_is_uuid,
                 )
             } else {
                 device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
@@ -1322,7 +1327,10 @@ impl Engine {
                         }
                         GroupedAgg::Avg => average_sql_value(sum_i128, g.count as usize),
                         // MIN/MAX narrow the kernel's i64 (or i128 for numeric) back to the value's
-                        // own type. numeric reconstructs the i128 from (min_hi:min) / (max_hi:max).
+                        // own type. numeric reconstructs the i128 from (min_hi:min) / (max_hi:max);
+                        // uuid carries the b128 result in min_uuid/max_uuid (already canonical order).
+                        GroupedAgg::Min if value_is_uuid => SqlValue::Uuid(g.min_uuid),
+                        GroupedAgg::Max if value_is_uuid => SqlValue::Uuid(g.max_uuid),
                         GroupedAgg::Min => narrow_ordered_value(value_ty, g.min, g.min_hi, value_scale),
                         GroupedAgg::Max => narrow_ordered_value(value_ty, g.max, g.max_hi, value_scale),
                     };

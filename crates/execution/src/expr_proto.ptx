@@ -3944,10 +3944,33 @@ fill_done:
     .param .u64 overflow_flag_ptr,
     .param .u64 slot_min_hi_ptr,
     .param .u64 slot_max_hi_ptr,
-    .param .u64 row_slots_ptr
+    .param .u64 row_slots_ptr,
+    .param .u64 value_is_uuid,
+    .param .u64 slot_min_uuid_ptr,
+    .param .u64 slot_max_uuid_ptr
 )
 {
     .reg .pred %p;
+    .reg .pred %pe;
+    .reg .pred %pf;
+    .reg .pred %puu;
+    .reg .u64 %vuu;
+    .reg .u64 %mnuptr;
+    .reg .u64 %mxuptr;
+    .reg .u64 %off16;
+    .reg .b128 %val128;
+    .reg .b128 %cur128;
+    .reg .b128 %old128;
+    .reg .u64 %ulo;
+    .reg .u64 %uhi;
+    .reg .u64 %clo;
+    .reg .u64 %chi;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .u32 %bw0;
+    .reg .u32 %bw1;
+    .reg .u32 %bw2;
+    .reg .u32 %bw3;
     .reg .pred %claimed;
     .reg .pred %pc;
     .reg .pred %pk;
@@ -4043,6 +4066,9 @@ fill_done:
     ld.param.u64 %mnhiptr, [slot_min_hi_ptr];
     ld.param.u64 %mxhiptr, [slot_max_hi_ptr];
     ld.param.u64 %rsptr, [row_slots_ptr];
+    ld.param.u64 %vuu, [value_is_uuid];
+    ld.param.u64 %mnuptr, [slot_min_uuid_ptr];
+    ld.param.u64 %mxuptr, [slot_max_uuid_ptr];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4078,6 +4104,8 @@ gb_ki64:
     mov.b64 %key, {%klo, %khi};
 gb_kdone:
     add.u64 %addr, %base, %soff;
+    setp.ne.u64 %puu, %vuu, 0;
+    @%puu bra gb_vuuid;
     setp.ne.u64 %pvn, %vn, 0;
     @%pvn bra gb_vnum;
     setp.ne.u64 %p, %v8, 0;
@@ -4107,6 +4135,25 @@ gb_vnum:
     ld.global.u32 %vlo2, [%addr+8];
     ld.global.u32 %vhi2, [%addr+12];
     mov.b64 %valhi, {%vlo2, %vhi2};
+    bra gb_vdone;
+gb_vuuid:
+    // uuid: 16 raw bytes, UNSIGNED BIG-ENDIAN order. Read 4x4-byte, byte-reverse each word (prmt) and
+    // assemble two BE u64 limbs (%uhi = bytes 0-7 big-endian, %ulo = bytes 8-15), then pack the b128
+    // (uhi:ulo) so an unsigned 128-bit compare == the uuid memcmp order.
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 16;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %bw0, [%addr];
+    ld.global.u32 %bw1, [%addr+4];
+    ld.global.u32 %bw2, [%addr+8];
+    ld.global.u32 %bw3, [%addr+12];
+    prmt.b32 %bw0, %bw0, 0, 0x0123;
+    prmt.b32 %bw1, %bw1, 0, 0x0123;
+    prmt.b32 %bw2, %bw2, 0, 0x0123;
+    prmt.b32 %bw3, %bw3, 0, 0x0123;
+    mov.b64 %uhi, {%bw1, %bw0};
+    mov.b64 %ulo, {%bw3, %bw2};
+    mov.b128 %val128, {%ulo, %uhi};
 gb_vdone:
     // The key i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table. Route
     // it to a dedicated slot at index nslots (= mask+1, outside the hash range) -- no hash, no claim.
@@ -4181,6 +4228,7 @@ gb_sumnum:
     setp.lt.s64 %pov, %t1, 0;
     @%pov red.global.or.b32 [%ovptr], 1;
 gb_sumd:
+    @%puu bra gb_uuidminmax;
     @%pvn bra gb_numminmax;
     add.u64 %addr, %mnptr, %off;
     atom.global.min.s64 %cur, [%addr], %val;
@@ -4200,6 +4248,44 @@ gb_numminmax:
     add.u64 %laddr, %rsptr, %loff;
     cvt.u32.u64 %lockold, %h;
     st.global.u32 [%laddr], %lockold;
+    bra gb_mmdone;
+gb_uuidminmax:
+    // uuid MIN/MAX: lock-free b128 CAS loop (native 128-bit CAS, sm_90+). %val128 = the BE uuid;
+    // compare via the two UNSIGNED 64-bit halves (%uhi:%ulo). slot_min_uuid/slot_max_uuid are b128.
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %mnuptr, %off16;
+uuid_min_loop:
+    ld.global.b128 %cur128, [%addr];
+    mov.b128 {%clo, %chi}, %cur128;
+    setp.lt.u64 %pa, %uhi, %chi;
+    setp.eq.u64 %pb, %uhi, %chi;
+    setp.lt.u64 %pc, %ulo, %clo;
+    and.pred %pb, %pb, %pc;
+    or.pred %pupd, %pa, %pb;
+    @!%pupd bra uuid_do_max;
+    atom.global.cas.b128 %old128, [%addr], %cur128, %val128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, %clo;
+    setp.eq.u64 %pf, %ohi, %chi;
+    and.pred %pe, %pe, %pf;
+    @!%pe bra uuid_min_loop;
+uuid_do_max:
+    add.u64 %addr, %mxuptr, %off16;
+uuid_max_loop:
+    ld.global.b128 %cur128, [%addr];
+    mov.b128 {%clo, %chi}, %cur128;
+    setp.gt.u64 %pa, %uhi, %chi;
+    setp.eq.u64 %pb, %uhi, %chi;
+    setp.gt.u64 %pc, %ulo, %clo;
+    and.pred %pb, %pb, %pc;
+    or.pred %pupd, %pa, %pb;
+    @!%pupd bra gb_mmdone;
+    atom.global.cas.b128 %old128, [%addr], %cur128, %val128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, %clo;
+    setp.eq.u64 %pf, %ohi, %chi;
+    and.pred %pe, %pe, %pf;
+    @!%pe bra uuid_max_loop;
 gb_mmdone:
     add.u64 %i, %i, %stride;
     bra row_loop;

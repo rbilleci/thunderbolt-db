@@ -2315,6 +2315,109 @@ fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_min_max_over_uuid_value() {
+    // GROUP BY an int4 key, MIN/MAX of a UUID value on the general GPU executor. uuid MIN/MAX runs the
+    // LOCK-FREE b128 CAS-loop kernel (native 128-bit atomic, sm_90+), comparing the two UNSIGNED 64-bit
+    // halves = PG's unsigned big-endian memcmp order. Constructed oracle: each group's min/max is the
+    // byte-wise (memcmp) min/max of its uuids -- and SqlValue::Uuid bytes ARE in memcmp order, so the
+    // lexicographic min/max of the parsed byte arrays is the definitional answer (not a CPU re-fold of
+    // the kernel's logic).
+    //
+    //   g=1  HIGH limb (bytes 0-7) all tie -> the LOW limb (bytes 8-15) decides, and 0x80.. must
+    //        compare UNSIGNED (a signed low-limb compare would mis-rank it as negative):
+    //          ..-0100-..   byte 8 = 0x01   low limb 0x0100000000000000
+    //          ..-8000-..   byte 8 = 0x80   low limb 0x8000000000000000   <- MAX
+    //          ..-..00ff    byte 15 = 0xff  low limb 0x00000000000000ff   <- MIN
+    //   g=2  the HIGH limb (bytes 0-7) decides; 0xff.. must compare UNSIGNED and DOMINATE a huge low
+    //        limb (the min has the LARGEST possible low limb but the smallest high limb):
+    //          00000000-..-ffff-ffffffffffff   uhi 0, ulo max              <- MIN
+    //          01000000-..                      uhi 0x0100000000000000
+    //          ff000000-..                      uhi 0xff00000000000000      <- MAX
+    //   g=3  single row -> min == max == the value.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, u UUID)").unwrap();
+    let rows: &[(i32, &str)] = &[
+        (1, "00000000-0000-0000-0100-000000000000"),
+        (1, "00000000-0000-0000-8000-000000000000"),
+        (1, "00000000-0000-0000-0000-0000000000ff"),
+        (2, "00000000-0000-0000-ffff-ffffffffffff"),
+        (2, "01000000-0000-0000-0000-000000000000"),
+        (2, "ff000000-0000-0000-0000-000000000000"),
+        (3, "12345678-9abc-def0-1234-56789abcdef0"),
+    ];
+    let values = rows
+        .iter()
+        .map(|(g, u)| format!("({g}, '{u}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g, u) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+    let uuid = |s: &str| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(s).expect("valid uuid"));
+
+    // Construction oracle: byte-wise (memcmp) min/max per group, built by sorting the parsed bytes.
+    let mut expected_min: Vec<Vec<SqlValue>> = Vec::new();
+    let mut expected_max: Vec<Vec<SqlValue>> = Vec::new();
+    for g in [1i32, 2, 3] {
+        let mut bytes: Vec<[u8; 16]> = rows
+            .iter()
+            .filter(|(rg, _)| *rg == g)
+            .map(|(_, u)| gpu_db_sql::uuid::parse_uuid(u).expect("valid uuid"))
+            .collect();
+        bytes.sort();
+        expected_min.push(vec![i4(g), SqlValue::Uuid(*bytes.first().unwrap())]);
+        expected_max.push(vec![i4(g), SqlValue::Uuid(*bytes.last().unwrap())]);
+    }
+
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(u) FROM t GROUP BY g")
+        .expect("uuid grouped min");
+    assert_eq!(mn.rows, expected_min, "GROUP BY uuid MIN");
+    assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
+
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(u) FROM t GROUP BY g")
+        .expect("uuid grouped max");
+    assert_eq!(mx.rows, expected_max, "GROUP BY uuid MAX");
+
+    // Spell the discriminating cases out so a regression names itself.
+    // g=1: LOW-limb decides; the 0x80.. value is the MAX only under an UNSIGNED compare.
+    assert_eq!(
+        mn.rows[0],
+        vec![i4(1), uuid("00000000-0000-0000-0000-0000000000ff")],
+        "g=1 MIN -- late byte (low limb)"
+    );
+    assert_eq!(
+        mx.rows[0],
+        vec![i4(1), uuid("00000000-0000-0000-8000-000000000000")],
+        "g=1 MAX -- low-limb high bit set, must be unsigned"
+    );
+    // g=2: HIGH-limb decides and dominates the low limb; ff.. is the MAX only under an UNSIGNED compare.
+    assert_eq!(
+        mn.rows[1],
+        vec![i4(2), uuid("00000000-0000-0000-ffff-ffffffffffff")],
+        "g=2 MIN -- smallest high limb despite a huge low limb"
+    );
+    assert_eq!(
+        mx.rows[1],
+        vec![i4(2), uuid("ff000000-0000-0000-0000-000000000000")],
+        "g=2 MAX -- early byte (high limb), must be unsigned"
+    );
+
+    // SUM/AVG over a uuid have no meaning -> hard error, never a wrong row.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT g, SUM(u) FROM t GROUP BY g")
+            .is_err(),
+        "SUM(uuid) => hard error"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_min_max_over_int8_value() {
     // GROUP BY an int4 key, MIN/MAX of an int8 (BIGINT) value -> exercises the 8-byte-stride
     // 2x4-byte value read + values WAY beyond the i32 range. Constructed oracle:
