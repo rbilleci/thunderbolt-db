@@ -1675,10 +1675,55 @@ fn gpu_execute_resident_expr_select_sql_runs_bool_predicate() {
     assert_eq!(r.rows, expected, "WHERE flag => the true (even) rows");
     assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
 
+    let even: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|i| i % 2 == 0)
+        .map(|i| vec![SqlValue::Int4(i as i32)])
+        .collect();
+    let odd: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|i| i % 2 != 0)
+        .map(|i| vec![SqlValue::Int4(i as i32)])
+        .collect();
+
+    // flag = true / = false / <> (bool literal compares lower to the bitmap->mask kernel via negate).
+    for (sql, expected, label) in [
+        ("SELECT label FROM t WHERE flag = true", &even, "= true => even"),
+        ("SELECT label FROM t WHERE flag = false", &odd, "= false => odd"),
+        ("SELECT label FROM t WHERE true = flag", &even, "true = flag => even"),
+        ("SELECT label FROM t WHERE flag <> true", &odd, "<> true => odd"),
+        ("SELECT label FROM t WHERE flag <> false", &even, "<> false => even"),
+        // NOT flag === flag = false (the mapper rewrites it).
+        ("SELECT label FROM t WHERE NOT flag", &odd, "NOT flag => odd"),
+    ] {
+        let got = e.execute_resident_expr_select_sql(sql).expect(label);
+        assert_eq!(&got.rows, expected, "{label}");
+        assert_eq!(got.executed_target, DeviceTarget::Gpu(0), "{label} on GPU");
+    }
+
+    // PROJECT the bool column (gathered straight from the bitmap): flag for rows 0..4 = T,F,T,F.
+    let proj = e
+        .execute_resident_expr_select_sql("SELECT flag FROM t WHERE label < 4")
+        .expect("project bool on GPU");
+    assert_eq!(
+        proj.rows,
+        vec![
+            vec![SqlValue::Bool(true)],
+            vec![SqlValue::Bool(false)],
+            vec![SqlValue::Bool(true)],
+            vec![SqlValue::Bool(false)],
+        ],
+        "SELECT flag => the bitmap bits gathered as bools"
+    );
+
     // A bare NON-bool column predicate is invalid SQL -> hard error (never wrong rows).
     assert!(
         e.execute_resident_expr_select_sql("SELECT label FROM t WHERE label")
             .is_err(),
         "WHERE <int column> => argument-of-WHERE-must-be-boolean error"
+    );
+    // NOT over a non-bool column is also invalid.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT label FROM t WHERE NOT label")
+            .is_err(),
+        "NOT <int column> => hard error"
     );
 }

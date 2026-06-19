@@ -222,8 +222,12 @@ fn map_predicate_node(
             Some(a_const::Val::Sval(string)) => {
                 Ok(ResidentExpr::TextLiteral(string.sval.clone()))
             }
+            // A `true` / `false` literal -> the comparison value for `flag = true` / `flag = false`
+            // (the type matrix, doc 19).
+            Some(a_const::Val::Boolval(boolean)) => Ok(ResidentExpr::BoolLiteral(boolean.boolval)),
             _ => Err(sql_pg_error(
-                "the general GPU executor supports int4, numeric, and text literals only".to_string(),
+                "the general GPU executor supports int4, numeric, text, and bool literals only"
+                    .to_string(),
             )),
         },
         NodeEnum::AExpr(a_expr) => map_a_expr(a_expr, table, qualifier),
@@ -248,9 +252,28 @@ fn map_bool_expr(
     } else if bool_expr.boolop == BoolExprType::OrExpr as i32 {
         ResidentBinaryOp::Or
     } else {
-        // NOT_EXPR (or an unexpected/Undefined boolop): unary NOT is not on the Expr path yet.
+        // NOT_EXPR: support `NOT flag` over a bare bool column -- it is equivalent to `flag = false`,
+        // which the bool-predicate path lowers via the bitmap->mask kernel (negate). General NOT (over
+        // comparisons / AND-OR, needing De Morgan) is still a follow-on.
+        let mut args = bool_expr.args.iter();
+        let only = args
+            .next()
+            .ok_or_else(|| sql_pg_error("NOT has no operand".to_string()))?;
+        if args.next().is_some() {
+            return Err(sql_pg_error(
+                "NOT predicates are not on the Expr path yet".to_string(),
+            ));
+        }
+        let inner = map_predicate_node(only, table, qualifier)?;
+        if matches!(inner, ResidentExpr::Column(_)) {
+            return Ok(ResidentExpr::Binary {
+                op: ResidentBinaryOp::Eq,
+                lhs: Box::new(inner),
+                rhs: Box::new(ResidentExpr::BoolLiteral(false)),
+            });
+        }
         return Err(sql_pg_error(
-            "NOT predicates are not on the Expr path yet".to_string(),
+            "NOT predicates are not on the Expr path yet (only NOT <bool column>)".to_string(),
         ));
     };
     let mut args = bool_expr.args.iter();

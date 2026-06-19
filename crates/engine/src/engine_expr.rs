@@ -56,6 +56,10 @@ pub(crate) enum ResidentExpr {
     /// A text (`text`/`varchar`) literal -- the comparison/LIKE value for a text column. Compared
     /// byte-wise (deterministic-collation equality is byte-identity; the type matrix, doc 19).
     TextLiteral(String),
+    /// A boolean literal (`true`/`false`) -- the comparison value for `flag = true` / `flag = false`
+    /// (the type matrix, doc 19). A bool column is a bitmap, so the comparison lowers to the
+    /// bitmap->mask kernel with the appropriate `negate`.
+    BoolLiteral(bool),
     Binary {
         op: ResidentBinaryOp,
         lhs: Box<ResidentExpr>,
@@ -126,7 +130,8 @@ fn expr_mentions_int8(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => false,
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table)
         }
@@ -142,7 +147,8 @@ fn expr_mentions_int4_column(expr: &ResidentExpr, table: &RelationalTable) -> bo
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => false,
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table)
         }
@@ -174,7 +180,9 @@ fn expr_mentions_numeric(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             Some(SqlType::Numeric { .. })
         ),
         ResidentExpr::NumericLiteral(_) => true,
-        ResidentExpr::Int4Literal(_) | ResidentExpr::TextLiteral(_) => false,
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_numeric(lhs, table) || expr_mentions_numeric(rhs, table)
         }
@@ -209,7 +217,9 @@ fn expr_mentions_text(expr: &ResidentExpr, table: &RelationalTable) -> bool {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Text)
         }
         ResidentExpr::TextLiteral(_) => true,
-        ResidentExpr::Int4Literal(_) | ResidentExpr::NumericLiteral(_) => false,
+        ResidentExpr::Int4Literal(_)
+        | ResidentExpr::NumericLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table)
         }
@@ -240,7 +250,8 @@ fn expr_mentions_date(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => false,
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
     }
 }
 
@@ -284,7 +295,8 @@ fn expr_mentions_timestamp(expr: &ResidentExpr, table: &RelationalTable) -> bool
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => false,
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
     }
 }
 
@@ -330,7 +342,8 @@ fn expr_mentions_uuid(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => false,
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
     }
 }
 
@@ -372,7 +385,8 @@ fn expr_mentions_int2(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => false,
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => false,
     }
 }
 
@@ -505,9 +519,11 @@ fn numeric_arith_scale(expr: &ResidentExpr, table: &RelationalTable) -> Result<u
         }),
         ResidentExpr::NumericLiteral(decimal) => Ok(decimal.canonical().scale),
         ResidentExpr::Int4Literal(_) => Ok(0),
-        ResidentExpr::TextLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "a text literal is not a numeric arithmetic operand".to_string(),
-        ))),
+        ResidentExpr::TextLiteral(_) | ResidentExpr::BoolLiteral(_) => {
+            Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a text/bool literal is not a numeric arithmetic operand".to_string(),
+            )))
+        }
         ResidentExpr::Binary { op, lhs, rhs } => {
             let lhs_scale = numeric_arith_scale(lhs, table)?;
             let rhs_scale = numeric_arith_scale(rhs, table)?;
@@ -644,7 +660,8 @@ fn compile_numeric_arith(
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "a bare literal cannot be a numeric arithmetic value".to_string(),
         ))),
     }
@@ -803,7 +820,8 @@ fn compile_arith_program(
         }
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
-        | ResidentExpr::TextLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+        | ResidentExpr::TextLiteral(_)
+        | ResidentExpr::BoolLiteral(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "resident Expr arithmetic value cannot be a bare literal (constant-folding pending)"
                 .to_string(),
         ))),
@@ -941,10 +959,11 @@ impl Engine {
                 && ty != SqlType::Timestamp
                 && ty != SqlType::Uuid
                 && ty != SqlType::Int2
+                && ty != SqlType::Bool
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "resident Expr select currently materializes int4 / int8 / numeric / date / \
-                     timestamp / uuid / int2 projection columns only"
+                     timestamp / uuid / int2 / bool projection columns only"
                         .to_string(),
                 )));
             }
@@ -1010,6 +1029,8 @@ impl Engine {
             Uuid(Vec<i128>),
             // Stored as the widened i32s the int4 projector returns; narrowed back to i16 per row.
             Int2(Vec<i32>),
+            // Gathered straight from the 1-bit-per-row bool bitmap.
+            Bool(Vec<bool>),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
@@ -1052,6 +1073,16 @@ impl Engine {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                         })?;
                     ProjectedColumn::Int2(values)
+                }
+                SqlType::Bool => {
+                    // Bool is a 1-bit-per-row bitmap; gather the selected rows' bits.
+                    let byte_offset = resident_device_bool_column_offset(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_bool_rows_from_payload(byte_offset, &indices_u64)
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
+                    ProjectedColumn::Bool(values)
                 }
                 SqlType::Timestamp => {
                     // Timestamp rides the i64 section; project it as i64 then tag it as a timestamp.
@@ -1102,6 +1133,7 @@ impl Engine {
                         }
                         // The stored i32 is a widened i16, so the narrowing is exact.
                         ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
+                        ProjectedColumn::Bool(values) => SqlValue::Bool(values[row]),
                     })
                     .collect()
             })
@@ -1835,6 +1867,52 @@ impl Engine {
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
     }
 
+    /// Try to lower `bool_col = true` / `bool_col = false` (and `<>`, either operand order) to
+    /// surviving row indices via the bitmap->mask kernel (the type matrix, doc 19): `= true` selects
+    /// the set bits, `= false` (and `NOT flag`, which the mapper rewrites to `= false`) the clear bits
+    /// (negate). Returns None if not a `bool_col <op> bool_literal` shape. Ordering ops (`< > ...`) and
+    /// bool in AND/OR are hard errors (follow-ons) so the executor never mis-answers.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_bool_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        let is_bool_col = |idx: usize| {
+            table.columns.get(idx).map(|column| column.ty) == Some(SqlType::Bool)
+        };
+        let (col, literal) = match (lhs, rhs) {
+            (ResidentExpr::Column(col), ResidentExpr::BoolLiteral(b)) if is_bool_col(*col) => {
+                (*col, *b)
+            }
+            (ResidentExpr::BoolLiteral(b), ResidentExpr::Column(col)) if is_bool_col(*col) => {
+                (*col, *b)
+            }
+            _ => return Ok(None),
+        };
+        // `flag = true` -> set bits (negate=false); `flag = false` -> clear bits (negate=true).
+        // `<>` is the complement.
+        let negate = match compare {
+            ResidentBinaryOp::Eq => !literal,
+            ResidentBinaryOp::Ne => literal,
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "the general GPU executor supports only = / <> against a bool literal".to_string(),
+                )));
+            }
+        };
+        let offset = resident_device_bool_column_offset(snapshot, table, col)?;
+        device_memory
+            .expr_bool_to_mask_filter(offset, negate, row_count)
+            .map(Some)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
+    }
+
     fn lower_resident_predicate(
         &self,
         predicate: &ResidentExpr,
@@ -1861,6 +1939,15 @@ impl Engine {
                 "resident Expr predicate must be a top-level comparison or AND/OR".to_string(),
             )));
         };
+
+        // bool path (type matrix, doc 19): `flag = true` / `flag = false` / `<>` (and `NOT flag`,
+        // which the mapper rewrites to `flag = false`) expand the bool bitmap to the mask via negate.
+        // None for a non-bool-literal predicate; checked first since a BoolLiteral has no other home.
+        if let Some(indices) =
+            self.try_lower_bool_predicate(*compare, lhs, rhs, table, snapshot, device_memory, row_count)?
+        {
+            return Ok(indices);
+        }
 
         // int8 path (type matrix, doc 19): a SIMPLE int8 comparison (`int8col <cmp> literal` /
         // `literal <cmp> int8col` / `int8col <cmp> int8col`) evaluates via the i64 compare kernels,

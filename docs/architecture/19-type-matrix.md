@@ -141,10 +141,13 @@ The executor is int4 end to end; each new type extends the same four layers:
    now accepts a BARE top-level `Column` (a bare non-bool column is invalid SQL — PG "argument of WHERE
    must be type boolean" — so it hard-errors). NULLs are a separate validity bitmap deferred to M3
    (the engine is non-null everywhere today), so only the value bit is stored; the layout is NULL-ready.
-   Gate: engine GPU 25/0, execution GPU 49/0 (shared-PTX no-regression). FOLLOW-ONS: bool projection
-   (`SELECT flag` — needs a bitmap-gather kernel, bits aren't byte-addressable like the other sections),
-   `flag = true`/`= false`/`NOT flag` (need a bool-literal map + NOT), and `COUNT(*) WHERE flag` via
-   popcount over the bitmap.
+   Gate: engine GPU 25/0, execution GPU 49/0 (shared-PTX no-regression). **FOLLOW-ONS DONE**: `flag =
+   true`/`= false`/`<>` (a `ResidentExpr::BoolLiteral` from the `Boolval` AST node lowers to the
+   bitmap->mask kernel via `negate`), `NOT flag` (the mapper rewrites `NOT <bool col>` to `flag =
+   false`), and `SELECT flag` PROJECTION (a host-side bitmap GATHER -- read each surviving row's word,
+   extract its bit -- no kernel, mirroring the i32/i64 gather). Remaining: `COUNT(*) WHERE flag` via
+   popcount over the bitmap (an aggregate / operator-axis item); general `NOT` (De Morgan over
+   comparisons / AND-OR); bool in AND/OR (the bool path emits indices, not a composable mask).
 
 Then: mixed-type promotion (the PG numeric tower) and the general-first routing flip (doc
 17 §3.4, the charter end state).

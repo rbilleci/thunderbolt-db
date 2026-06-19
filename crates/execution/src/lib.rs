@@ -1102,6 +1102,18 @@ impl CudaResidentDeviceMemory {
         copy_cuda_resident_i32_rows(self, byte_offset, row_indices)
     }
 
+    /// Gather a resident BOOL column's bits at `row_indices` into host `bool` values (the type matrix,
+    /// doc 19): the column is a 1-bit-per-row bitmap at `bitmap_byte_offset`; for each row index read
+    /// the u32 word holding its bit and extract bit `idx & 31`. Like the i32/i64 gather, this is a
+    /// host-side D2H read per row (no kernel). Used to materialize a `SELECT flag` projection.
+    pub fn project_bool_rows_from_payload(
+        &self,
+        bitmap_byte_offset: u64,
+        row_indices: &[u64],
+    ) -> Result<Vec<bool>, CudaRuntimeProbeError> {
+        copy_cuda_resident_bool_rows(self, bitmap_byte_offset, row_indices)
+    }
+
     /// int8 (s64) analog of [`Self::project_i32_rows_from_payload`] (the type matrix, doc 19): gather
     /// the int8 column at `byte_offset` for the given row indices into host `i64` values.
     pub fn project_i64_rows_from_payload(
@@ -3819,6 +3831,49 @@ fn copy_cuda_resident_i32_rows(
             )
         })?;
         values.push(value);
+    }
+    Ok(values)
+}
+
+/// bool analog of [`copy_cuda_resident_i32_rows`] (the type matrix, doc 19): gather a 1-bit-per-row
+/// bool BITMAP at `row_indices`. For each row index, read the u32 word holding its bit (at
+/// `bitmap_byte_offset + (idx >> 5) * 4`) and extract bit `idx & 31`. Host-side D2H read per row.
+fn copy_cuda_resident_bool_rows(
+    resident: &CudaResidentDeviceMemory,
+    bitmap_byte_offset: u64,
+    row_indices: &[u64],
+) -> Result<Vec<bool>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut values = Vec::with_capacity(row_indices.len());
+    for row_idx in row_indices {
+        let word_offset = (row_idx >> 5)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .and_then(|offset| bitmap_byte_offset.checked_add(offset))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let word_end = word_offset
+            .checked_add(std::mem::size_of::<u32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if word_end > resident.metadata().allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(word_end as usize));
+        }
+        let mut word = 0_u32;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                (&mut word as *mut u32).cast::<c_void>(),
+                resident.device_ptr() + word_offset,
+                std::mem::size_of::<u32>(),
+            )
+        })?;
+        values.push((word >> (row_idx & 31)) & 1 == 1);
     }
     Ok(values)
 }
