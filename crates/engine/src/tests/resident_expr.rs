@@ -2478,6 +2478,73 @@ fn gpu_grouped_by_numeric_key() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_by_text_key() {
+    // GROUP BY a TEXT (varlen) key -- the kernel FNV-1a-hashes the bytes, claims a b128
+    // (representative_row_idx, hash) in slot_keys_i128 via atom.cas.b128 with a full-text
+    // VERIFY-ON-LOST-CAS, so same-text rows COLLAPSE into one group and hash collisions never merge.
+    // Covers duplicates (apple x3), an EMPTY string, different lengths, and a SHARED PREFIX (app vs
+    // apple) to exercise the length-check + byte-compare in the verify. Result key is read host-side
+    // from the representative row.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g TEXT, v INT)").unwrap();
+    let rows: &[(&str, i32)] = &[
+        ("apple", 10),
+        ("apple", 20),
+        ("apple", 30),
+        ("banana", 5),
+        ("banana", 15),
+        ("cherry", 100),
+        ("", 7),
+        ("app", 1),
+    ];
+    let values = rows
+        .iter()
+        .map(|(g, v)| format!("('{g}', {v})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let txt = |s: &str| SqlValue::Text(s.to_string());
+
+    // Output sorts lexicographically: "" < "app" < "apple" < "banana" < "cherry".
+    let count = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .expect("text-key COUNT");
+    assert_eq!(count.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        count.rows,
+        vec![
+            vec![txt(""), SqlValue::Int8(1)],
+            vec![txt("app"), SqlValue::Int8(1)],
+            vec![txt("apple"), SqlValue::Int8(3)], // x3 collapsed into ONE group
+            vec![txt("banana"), SqlValue::Int8(2)],
+            vec![txt("cherry"), SqlValue::Int8(1)],
+        ],
+        "GROUP BY text key COUNT -- same-text rows collapse; app/apple stay separate"
+    );
+
+    let sum = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("text-key SUM");
+    assert_eq!(
+        sum.rows,
+        vec![
+            vec![txt(""), SqlValue::Int8(7)],
+            vec![txt("app"), SqlValue::Int8(1)],
+            vec![txt("apple"), SqlValue::Int8(60)],
+            vec![txt("banana"), SqlValue::Int8(20)],
+            vec![txt("cherry"), SqlValue::Int8(100)],
+        ],
+        "GROUP BY text key, SUM(int4)->bigint"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_uuid_key() {
     // GROUP BY a UUID (i128) key via atom.cas.b128; output sorts by canonical/memcmp byte order. Uses
     // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and

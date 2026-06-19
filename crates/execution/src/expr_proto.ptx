@@ -3999,9 +3999,32 @@ fill128_done:
     .param .u64 slot_min_uuid_ptr,
     .param .u64 slot_max_uuid_ptr,
     .param .u64 key_is_i128,
-    .param .u64 slot_keys_i128_ptr
+    .param .u64 slot_keys_i128_ptr,
+    .param .u64 key_is_text,
+    .param .u64 key_offsets_off,
+    .param .u64 key_bytes_off
 )
 {
+    .reg .pred %pkt;
+    .reg .u64 %ktext;
+    .reg .u64 %koffoff;
+    .reg .u64 %kbytesoff;
+    .reg .u64 %thash;
+    .reg .u64 %tstart;
+    .reg .u64 %tend;
+    .reg .u64 %tlen;
+    .reg .u64 %taddr;
+    .reg .u64 %sstart;
+    .reg .u64 %send;
+    .reg .u64 %slen;
+    .reg .u64 %vaddr;
+    .reg .u64 %babase;
+    .reg .u64 %aaddr;
+    .reg .u64 %baddr;
+    .reg .u64 %jt;
+    .reg .u64 %o8;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
     .reg .pred %pki;
     .reg .u64 %ki128;
     .reg .u64 %ski128;
@@ -4130,6 +4153,9 @@ fill128_done:
     ld.param.u64 %mxuptr, [slot_max_uuid_ptr];
     ld.param.u64 %ki128, [key_is_i128];
     ld.param.u64 %ski128, [slot_keys_i128_ptr];
+    ld.param.u64 %ktext, [key_is_text];
+    ld.param.u64 %koffoff, [key_offsets_off];
+    ld.param.u64 %kbytesoff, [key_bytes_off];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4148,6 +4174,8 @@ row_loop:
     cvt.u64.u32 %off, %idx;
     mul.lo.u64 %off, %off, 4;
     add.u64 %addr, %base, %koff;
+    setp.ne.u64 %pkt, %ktext, 0;
+    @%pkt bra gb_ktext;
     setp.ne.u64 %pki, %ki128, 0;
     @%pki bra gb_ki128;
     setp.ne.u64 %pk, %k8, 0;
@@ -4178,6 +4206,42 @@ gb_ki128:
     ld.global.u32 %klo, [%addr+8];
     ld.global.u32 %khi, [%addr+12];
     mov.b64 %keyhi, {%klo, %khi};
+    bra gb_kdone;
+gb_ktext:
+    // text key: read offsets[idx] (8-byte entries, 2x4-byte load -- section may be 4-mod-8 aligned),
+    // FNV-1a-64 hash the bytes -> %thash; key128 = (lo=idx, hi=thash). %tstart/%tlen/%taddr are kept
+    // for the verify in the claim step. Remap thash==i64::MIN->0 so (idx,thash) never aliases EMPTY128.
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %o8, %koff2, 8;
+    add.u64 %addr, %base, %koffoff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %tstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %tend, {%klo, %khi};
+    sub.u64 %tlen, %tend, %tstart;
+    add.u64 %taddr, %base, %kbytesoff;
+    add.u64 %taddr, %taddr, %tstart;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %jt, 0;
+ktext_hash:
+    setp.ge.u64 %p, %jt, %tlen;
+    @%p bra ktext_hash_done;
+    add.u64 %aaddr, %taddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    cvt.u64.u32 %tmp, %abyte;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %jt, %jt, 1;
+    bra ktext_hash;
+ktext_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    cvt.u64.u32 %keylo, %idx;
+    mov.u64 %keyhi, %thash;
+    mov.b128 %key128, {%keylo, %keyhi};
 gb_kdone:
     add.u64 %addr, %base, %soff;
     setp.ne.u64 %puu, %vuu, 0;
@@ -4231,6 +4295,7 @@ gb_vuuid:
     mov.b64 %ulo, {%bw3, %bw2};
     mov.b128 %val128, {%ulo, %uhi};
 gb_vdone:
+    @%pkt bra gb_ktextclaim;
     @%pki bra gb_ki128claim;
     // The key i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table. Route
     // it to a dedicated slot at index nslots (= mask+1, outside the hash range) -- no hash, no claim.
@@ -4297,6 +4362,65 @@ probe_loop128:
     add.u64 %h, %h, 1;
     and.b64 %h, %h, %mask;
     bra probe_loop128;
+gb_ktextclaim:
+    // Text key: the b128 slot holds (lo=representative row idx, hi=text hash). The CAS claims the slot
+    // for the FIRST row of a text; a LOST cas means the slot is occupied -- if its hash matches AND a
+    // full byte-compare of this row's text vs the representative's confirms equality, it's the same
+    // group (hit); otherwise (hash collision, different text) probe on. So same-text rows collapse to
+    // one group and hash collisions never merge. The representative is immutable once claimed.
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    mov.u64 %clo, 0;
+    mov.b128 %empty128, {%clo, %empty};
+probe_loop_text:
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %ski128, %off16;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, 0;
+    setp.eq.u64 %pf, %ohi, %empty;
+    and.pred %claimed, %pe, %pf;
+    @%claimed bra do_agg;
+    setp.ne.u64 %pf, %ohi, %thash;
+    @%pf bra ktext_probe_next;
+    mul.lo.u64 %o8, %olo, 8;
+    add.u64 %vaddr, %base, %koffoff;
+    add.u64 %vaddr, %vaddr, %o8;
+    ld.global.u32 %klo, [%vaddr];
+    ld.global.u32 %khi, [%vaddr+4];
+    mov.b64 %sstart, {%klo, %khi};
+    ld.global.u32 %klo, [%vaddr+8];
+    ld.global.u32 %khi, [%vaddr+12];
+    mov.b64 %send, {%klo, %khi};
+    sub.u64 %slen, %send, %sstart;
+    setp.ne.u64 %pf, %slen, %tlen;
+    @%pf bra ktext_probe_next;
+    add.u64 %babase, %base, %kbytesoff;
+    add.u64 %babase, %babase, %sstart;
+    mov.u64 %jt, 0;
+ktext_vbyte:
+    setp.ge.u64 %p, %jt, %tlen;
+    @%p bra do_agg;
+    add.u64 %aaddr, %taddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    add.u64 %baddr, %babase, %jt;
+    ld.global.u8 %bbyte, [%baddr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra ktext_probe_next;
+    add.u64 %jt, %jt, 1;
+    bra ktext_vbyte;
+ktext_probe_next:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra probe_loop_text;
 do_agg:
     mul.lo.u64 %off, %h, 8;
     add.u64 %addr, %cptr, %off;

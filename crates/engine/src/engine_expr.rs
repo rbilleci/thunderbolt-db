@@ -1107,14 +1107,18 @@ impl Engine {
 
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, table, &bound, copin_s)?;
-        let snapshot = self
-            .relational_residency_snapshot_ref(&table.name)
+        // Load the WHOLE residency entry (descriptor + host rows) from ONE atomic load() so a text
+        // GROUP BY key -- whose result string is read from host_rows[representative_row] -- sees host
+        // rows from the SAME generation as the descriptor / device memory the GPU grouped over.
+        let residency_entry = self
+            .relational_residency_entry(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
                     table.name
                 )))
             })?;
+        let snapshot = residency_entry.descriptor.clone();
         if snapshot.schema != table.schema || snapshot.table != table.name {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot no longer matches catalog table identity".to_string(),
@@ -1211,10 +1215,11 @@ impl Engine {
                 SqlType::Int4 | SqlType::Int2 | SqlType::Date => false,
                 SqlType::Int8 | SqlType::Timestamp => true,
                 SqlType::Numeric { .. } | SqlType::Uuid => false,
+                SqlType::Text => false,
                 _ => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "GROUP BY key must be int2/int4/int8/date/timestamp/numeric/uuid on the Expr \
-                         path"
+                        "GROUP BY key must be int2/int4/int8/date/timestamp/numeric/uuid/text on the \
+                         Expr path"
                             .to_string(),
                     )));
                 }
@@ -1222,6 +1227,16 @@ impl Engine {
             // numeric / uuid GROUP BY keys are 128-bit -- claimed via atom.cas.b128 into slot_keys_i128
             // (the single-level kernel). key_scale carries the numeric column scale onto the result key.
             let key_is_i128 = matches!(key_ty, SqlType::Numeric { .. } | SqlType::Uuid);
+            // A TEXT key is varlen: the kernel hashes the bytes, claims a b128 (rep_row_idx, hash) in
+            // slot_keys_i128 with a full-text verify-on-lost-CAS, and the result key is read host-side
+            // from the representative row. key_offsets_off/key_bytes_off locate the Arrow varlen column.
+            let key_is_text = matches!(key_ty, SqlType::Text);
+            let (key_offsets_off, key_bytes_off) = if key_is_text {
+                let layout = resident_device_text_column_layout(&snapshot, table, group_idx)?;
+                (layout.offsets_byte_offset, layout.bytes_byte_offset)
+            } else {
+                (0, 0)
+            };
             let key_scale: u8 = match key_ty {
                 SqlType::Numeric { scale, .. } => scale,
                 _ => 0,
@@ -1272,7 +1287,10 @@ impl Engine {
                     }
                 },
             };
-            let key_offset = if key_is_i128 {
+            let key_offset = if key_is_text {
+                // text keys are read via key_offsets_off/key_bytes_off; key_byte_offset is unused.
+                0
+            } else if key_is_i128 {
                 resident_device_numeric_column_offset(&snapshot, table, group_idx)?
             } else if key_is_int8 {
                 resident_device_int8_column_offset(&snapshot, table, group_idx)?
@@ -1298,7 +1316,8 @@ impl Engine {
                 || value_is_numeric
                 || value_is_uuid
                 || key_is_int8
-                || key_is_i128;
+                || key_is_i128
+                || key_is_text;
             let groups = if use_single_level {
                 device_memory.group_by_i32_count_sum_minmax_from_payload(
                     key_offset,
@@ -1309,11 +1328,22 @@ impl Engine {
                     value_is_numeric,
                     value_is_uuid,
                     key_is_i128,
+                    key_is_text,
+                    key_offsets_off,
+                    key_bytes_off,
                 )
             } else {
                 device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
             }
             .map_err(map_err)?;
+            // A TEXT key's string lives host-side: the kernel stored each group's representative
+            // ABSOLUTE row index in key_i128's low 64 bits; the key is that row's group column. Read
+            // from the same residency_entry generation loaded above (consistent with the GPU result).
+            let text_host_rows = if key_is_text {
+                Some(residency_entry.host_rows.clone())
+            } else {
+                None
+            };
             let mut rows: Vec<Vec<SqlValue>> = groups
                 .iter()
                 .map(|g| {
@@ -1350,7 +1380,15 @@ impl Engine {
                     // The GROUP BY key narrows back to its own type. i128 keys (numeric/uuid) come from
                     // slot_keys_i128: numeric mantissa -> Numeric@scale; uuid's LE i128 bytes == the
                     // canonical uuid bytes. int8/timestamp keep the full i64; others narrow from i64.
-                    let key = if key_is_i128 {
+                    let key = if key_is_text {
+                        // rep_idx = key_i128 low 64 bits = the representative row; clone its group column
+                        // (the actual text). The kernel only ever stores a valid absolute row index.
+                        let rep_idx = g.key_i128 as u64 as usize;
+                        text_host_rows
+                            .as_ref()
+                            .expect("text_host_rows is Some when key_is_text")[rep_idx][group_idx]
+                            .clone()
+                    } else if key_is_i128 {
                         match key_ty {
                             SqlType::Numeric { .. } => {
                                 SqlValue::Numeric(Decimal128::new(g.key_i128, key_scale))
@@ -1376,6 +1414,7 @@ impl Engine {
                 match (&a[0], &b[0]) {
                     (SqlValue::Numeric(x), SqlValue::Numeric(y)) => x.cmp(y),
                     (SqlValue::Uuid(x), SqlValue::Uuid(y)) => x.cmp(y),
+                    (SqlValue::Text(x), SqlValue::Text(y)) => x.cmp(y),
                     _ => i64_key(&a[0]).cmp(&i64_key(&b[0])),
                 }
             });
