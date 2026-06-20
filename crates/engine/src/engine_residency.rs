@@ -7,6 +7,175 @@
 
 use super::*;
 
+/// Build the GPU device payload for typed columns + their row values -- the columnar
+/// `[8-byte row_count header][int4/date/int2 i32][int8/timestamp i64][numeric/uuid 16B][bool bitmap]
+/// [text 8-aligned offsets + bytes]` layout (type-grouped, catalog order within each type; varlen text
+/// offsets 8-aligned per the CUDA-716 lesson). Returns the payload (row_count header filled, NO MVCC
+/// tail) + the text/bool column layouts + per-int4-column min/max -- the SAME bytes/offsets the
+/// resident-table builder produces, so a non-table caller (e.g. the grouped-sort) can build a
+/// resident-like buffer without re-implementing the byte mappings. `column_names` / `column_types` /
+/// each row in `rows` are parallel by column index.
+#[allow(clippy::type_complexity)]
+fn build_relational_device_payload(
+    column_names: &[String],
+    column_types: &[SqlType],
+    rows: &[Vec<SqlValue>],
+) -> Result<
+    (
+        Vec<u8>,
+        Vec<ResidentDeviceTextColumnLayout>,
+        Vec<ResidentDeviceBoolColumnLayout>,
+        Vec<ResidentDeviceInt4ColumnStats>,
+    ),
+    ExecuteError,
+> {
+    let row_count = rows.len();
+    let mut device_payload = vec![0u8; std::mem::size_of::<u64>()];
+    let mut resident_device_text_columns = Vec::new();
+    let mut resident_device_bool_columns = Vec::new();
+    let mut resident_device_int4_column_stats = Vec::new();
+
+    // int4 / date / int2 share the i32 section (a date is i32 days; a smallint widens to i32).
+    for col_idx in column_types
+        .iter()
+        .enumerate()
+        .filter(|&(_i, ty)| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
+        .map(|(i, _)| i)
+    {
+        let mut min = i32::MAX;
+        let mut max = i32::MIN;
+        for row in rows {
+            let value: i32 = match row[col_idx] {
+                SqlValue::Int4(value) | SqlValue::Date(value) => value,
+                SqlValue::Int2(value) => i32::from(value),
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot int4/date/int2 payload encountered a non-i32 value"
+                            .to_string(),
+                    )));
+                }
+            };
+            min = min.min(value);
+            max = max.max(value);
+            device_payload.extend_from_slice(&value.to_le_bytes());
+        }
+        resident_device_int4_column_stats.push(ResidentDeviceInt4ColumnStats {
+            name: column_names[col_idx].clone(),
+            min,
+            max,
+        });
+    }
+    // int8 / timestamp share the i64 section (a timestamp is i64 microseconds).
+    for col_idx in column_types
+        .iter()
+        .enumerate()
+        .filter(|&(_i, ty)| matches!(ty, SqlType::Int8 | SqlType::Timestamp))
+        .map(|(i, _)| i)
+    {
+        for row in rows {
+            let (SqlValue::Int8(value) | SqlValue::Timestamp(value)) = row[col_idx] else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident snapshot int8/timestamp payload encountered a non-i64 value"
+                        .to_string(),
+                )));
+            };
+            device_payload.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    // numeric / uuid share the 16-byte section (numeric = i128 mantissa LE; uuid = raw 16 bytes).
+    for col_idx in column_types
+        .iter()
+        .enumerate()
+        .filter(|&(_i, ty)| matches!(ty, SqlType::Numeric { .. } | SqlType::Uuid))
+        .map(|(i, _)| i)
+    {
+        for row in rows {
+            match &row[col_idx] {
+                SqlValue::Numeric(value) => {
+                    device_payload.extend_from_slice(&value.mantissa.to_le_bytes());
+                }
+                SqlValue::Uuid(bytes) => device_payload.extend_from_slice(bytes),
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot numeric/uuid payload encountered a wrong-typed value"
+                            .to_string(),
+                    )));
+                }
+            }
+        }
+    }
+    // bool -> a 1-bit-per-row bitmap (ceil(row_count/32) LE u32 words, bit i = row i, LSB-first).
+    for col_idx in column_types
+        .iter()
+        .enumerate()
+        .filter(|&(_i, ty)| matches!(ty, SqlType::Bool))
+        .map(|(i, _)| i)
+    {
+        let bitmap_byte_offset = device_payload.len() as u64;
+        let mut words = vec![0u32; row_count.div_ceil(32)];
+        for (i, row) in rows.iter().enumerate() {
+            let SqlValue::Bool(value) = row[col_idx] else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident snapshot bool payload encountered a non-bool value".to_string(),
+                )));
+            };
+            if value {
+                words[i / 32] |= 1u32 << (i % 32);
+            }
+        }
+        for word in &words {
+            device_payload.extend_from_slice(&word.to_le_bytes());
+        }
+        resident_device_bool_columns.push(ResidentDeviceBoolColumnLayout {
+            name: column_names[col_idx].clone(),
+            bitmap_byte_offset,
+        });
+    }
+    // text -> an 8-ALIGNED offsets section (n+1 i64 LE; read as 2x ld.u32 -> 716-safe) + a bytes blob.
+    for col_idx in column_types
+        .iter()
+        .enumerate()
+        .filter(|&(_i, ty)| matches!(ty, SqlType::Text))
+        .map(|(i, _)| i)
+    {
+        while !device_payload.len().is_multiple_of(8) {
+            device_payload.push(0);
+        }
+        let offsets_byte_offset = device_payload.len() as u64;
+        let mut text_offsets = Vec::with_capacity(row_count + 1);
+        let mut text_bytes = Vec::new();
+        text_offsets.push(0_u64);
+        for row in rows {
+            let SqlValue::Text(value) = &row[col_idx] else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident snapshot text payload encountered non-text value".to_string(),
+                )));
+            };
+            text_bytes.extend_from_slice(value.as_bytes());
+            text_offsets.push(text_bytes.len() as u64);
+        }
+        for offset in &text_offsets {
+            device_payload.extend_from_slice(&offset.to_le_bytes());
+        }
+        let bytes_byte_offset = device_payload.len() as u64;
+        device_payload.extend_from_slice(&text_bytes);
+        resident_device_text_columns.push(ResidentDeviceTextColumnLayout {
+            name: column_names[col_idx].clone(),
+            offsets_byte_offset,
+            bytes_byte_offset,
+            bytes_len: text_bytes.len() as u64,
+        });
+    }
+    device_payload[..std::mem::size_of::<u64>()]
+        .copy_from_slice(&(row_count as u64).to_le_bytes());
+    Ok((
+        device_payload,
+        resident_device_text_columns,
+        resident_device_bool_columns,
+        resident_device_int4_column_stats,
+    ))
+}
+
 impl Engine {
     pub fn populate_relational_residency_snapshot(
         &mut self,
@@ -79,14 +248,6 @@ impl Engine {
             .filter(|column| matches!(column.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
-        let mut resident_device_int4_column_stats = resident_device_int4_columns
-            .iter()
-            .map(|name| ResidentDeviceInt4ColumnStats {
-                name: name.clone(),
-                min: i32::MAX,
-                max: i32::MIN,
-            })
-            .collect::<Vec<_>>();
         // int8 AND timestamp columns share the i64 section: a `timestamp` is i64 microseconds, so it
         // rides the int8 residency layout + the i64 compare kernels (the type matrix, doc 19).
         let resident_device_int8_columns = catalog_table
@@ -103,155 +264,21 @@ impl Engine {
             .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
-        let mut device_payload = vec![0; std::mem::size_of::<u64>()];
-        let mut resident_device_text_columns = Vec::new();
-        let mut resident_device_bool_columns = Vec::new();
-        for (int4_ordinal, column) in catalog_table
+        let column_names: Vec<String> = catalog_table
             .columns
             .iter()
-            .enumerate()
-            .filter(|(_idx, column)| {
-                matches!(column.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2)
-            })
-            .map(|(idx, _column)| idx)
-            .enumerate()
-        {
-            for row in &resident_rows {
-                // A date column stores its i32 day count, and a smallint widens to i32, in this section.
-                let value: i32 = match row[column] {
-                    SqlValue::Int4(value) | SqlValue::Date(value) => value,
-                    SqlValue::Int2(value) => i32::from(value),
-                    _ => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "resident snapshot int4/date/int2 payload encountered a non-i32 value"
-                                .to_string(),
-                        )));
-                    }
-                };
-                if let Some(stats) = resident_device_int4_column_stats.get_mut(int4_ordinal) {
-                    stats.min = stats.min.min(value);
-                    stats.max = stats.max.max(value);
-                }
-                device_payload.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        for column_idx in catalog_table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_idx, column)| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
-            .map(|(idx, _column)| idx)
-        {
-            for row in &resident_rows {
-                // A timestamp column stores its i64 microsecond count in this i64 section.
-                let (SqlValue::Int8(value) | SqlValue::Timestamp(value)) = row[column_idx] else {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident snapshot int8/timestamp payload encountered a non-i64 value"
-                            .to_string(),
-                    )));
-                };
-                device_payload.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        // numeric section (the type matrix, doc 19): each numeric column's i128 mantissa, row-major,
-        // 16 bytes/row, after the int8 section and before the text section. The mantissa is at the
-        // column's catalog scale (rescaled on insert); the scale is not stored on-device.
-        for column_idx in catalog_table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_idx, column)| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
-            .map(|(idx, _column)| idx)
-        {
-            for row in &resident_rows {
-                // numeric -> its i128 mantissa (16 bytes LE); uuid -> its 16 raw bytes.
-                match &row[column_idx] {
-                    SqlValue::Numeric(value) => {
-                        device_payload.extend_from_slice(&value.mantissa.to_le_bytes());
-                    }
-                    SqlValue::Uuid(bytes) => device_payload.extend_from_slice(bytes),
-                    _ => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "resident snapshot numeric/uuid payload encountered a wrong-typed value"
-                                .to_string(),
-                        )));
-                    }
-                }
-            }
-        }
-        // bool section (the type matrix, doc 19): each bool column packed as a 1-bit-per-row bitmap --
-        // ceil(row_count / 32) LE u32 words, bit i (LSB-first) = row i's value. Self-describing: the
-        // bitmap's byte offset is recorded per column. NULLs are a future validity bitmap (non-null
-        // until M3), so only the value bit is stored. Placed before the text section.
-        for (column_idx, column) in catalog_table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_idx, column)| column.ty == SqlType::Bool)
-        {
-            let bitmap_byte_offset = device_payload.len() as u64;
-            let mut words = vec![0u32; row_count.div_ceil(32)];
-            for (i, row) in resident_rows.iter().enumerate() {
-                let SqlValue::Bool(value) = row[column_idx] else {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident snapshot bool payload encountered a non-bool value".to_string(),
-                    )));
-                };
-                if value {
-                    words[i / 32] |= 1u32 << (i % 32);
-                }
-            }
-            for word in &words {
-                device_payload.extend_from_slice(&word.to_le_bytes());
-            }
-            resident_device_bool_columns.push(ResidentDeviceBoolColumnLayout {
-                name: column.name.clone(),
-                bitmap_byte_offset,
-            });
-        }
-        for (column_idx, column) in catalog_table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_idx, column)| column.ty == SqlType::Text)
-        {
-            // Align every varlen offsets section to 8 bytes. The device kernels read each 8-byte offset
-            // entry as 2x `ld.global.u32` (4-byte alignment required); a byte-tight section that follows
-            // a data-dependent text-bytes blob (e.g. a text VALUE after a text KEY, or two text columns)
-            // can otherwise land at a non-4-aligned offset and fault CUDA 716 -- which also pins the GPU
-            // for ~20s while the runtime recovers the context. Padding the offsets to 8 keeps every
-            // text consumer (group-by key/value, text-eq, LIKE) safe.
-            while !device_payload.len().is_multiple_of(8) {
-                device_payload.push(0);
-            }
-            let offsets_byte_offset = device_payload.len() as u64;
-            let mut text_offsets = Vec::with_capacity(row_count + 1);
-            let mut text_bytes = Vec::new();
-            text_offsets.push(0_u64);
-            for row in &resident_rows {
-                let SqlValue::Text(value) = &row[column_idx] else {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident snapshot text payload encountered non-text value".to_string(),
-                    )));
-                };
-                text_bytes.extend_from_slice(value.as_bytes());
-                text_offsets.push(text_bytes.len() as u64);
-            }
-            for offset in &text_offsets {
-                device_payload.extend_from_slice(&offset.to_le_bytes());
-            }
-            let bytes_byte_offset = device_payload.len() as u64;
-            device_payload.extend_from_slice(&text_bytes);
-            resident_device_text_columns.push(ResidentDeviceTextColumnLayout {
-                name: column.name.clone(),
-                offsets_byte_offset,
-                bytes_byte_offset,
-                bytes_len: text_bytes.len() as u64,
-            });
-        }
+            .map(|column| column.name.clone())
+            .collect();
+        let column_types: Vec<SqlType> =
+            catalog_table.columns.iter().map(|column| column.ty).collect();
+        let (
+            mut device_payload,
+            resident_device_text_columns,
+            resident_device_bool_columns,
+            resident_device_int4_column_stats,
+        ) = build_relational_device_payload(&column_names, &column_types, &resident_rows)?;
+        // The MVCC tuple bytes (key + value per row) ride after the columnar sections (unchanged).
         device_payload.extend_from_slice(&raw_device_tail);
-        device_payload[..std::mem::size_of::<u64>()]
-            .copy_from_slice(&(row_count as u64).to_le_bytes());
 
         let memory_pressure_active = self
             .router
