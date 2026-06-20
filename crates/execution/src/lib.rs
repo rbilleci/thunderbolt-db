@@ -1004,6 +1004,24 @@ impl CudaResidentDeviceMemory {
         launch_cuda_bitonic_sort_i64(self, keys, descending)
     }
 
+    /// Sort `keys[0..n]` on the GPU for ORDER BY, dispatching by size at the adaptive crossover:
+    /// BITONIC (`bitonic_sort_i64`, O(n log^2 n)) below it, the proven resident LSD-RADIX argsort
+    /// (O(n), signed->unsigned transform + direction handling) at/above it. Returns the row positions
+    /// in ascending (or, with `descending`, descending) key order. Both arms produce a correct ordering
+    /// (equal keys' relative order is unspecified, as for SQL ORDER BY without a tie-breaker). The radix
+    /// arm uploads `keys` synchronously to a device buffer + reuses `launch_cuda_resident_i64_argsort_radix`.
+    pub fn order_by_sort_i64(
+        &self,
+        keys: &[i64],
+        descending: bool,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        if keys.len() as u64 >= ADAPTIVE_SORT_CROSSOVER_ROWS {
+            launch_cuda_order_by_sort_i64_radix(self, keys, descending)
+        } else {
+            launch_cuda_bitonic_sort_i64(self, keys, descending)
+        }
+    }
+
     /// Sort the surviving rows `indices` on the GPU by a resident TEXT column (lexicographic, unsigned
     /// bytes, a prefix sorts smaller), returning positions into `indices` in ascending (or, with
     /// `descending`, descending) text order. `offsets_byte_offset`/`bytes_byte_offset` locate the
@@ -3259,6 +3277,40 @@ fn launch_cuda_bitonic_sort_i64(
         .into_iter()
         .filter(|&p| (p as usize) < n)
         .collect())
+}
+
+/// The RADIX arm of `order_by_sort_i64` (n >= the adaptive crossover): upload the host `keys` to a
+/// device buffer with a SYNCHRONOUS HtoD (so the radix reads valid keys regardless of which stream it
+/// runs on), then reuse the proven resident LSD-radix argsort. The lease `keys_dev` MUST outlive the
+/// radix call -- the explicit `drop` AFTER it stops NLL from returning the buffer to the pool (where the
+/// radix could re-lease it as scratch) while the radix still reads it.
+fn launch_cuda_order_by_sort_i64_radix(
+    resident: &CudaResidentDeviceMemory,
+    keys: &[i64],
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    let n = keys.len();
+    if n <= 1 {
+        return Ok((0..n as u32).collect());
+    }
+    let primary = resident.primary();
+    primary.set_current()?;
+    let keys_bytes = n
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    let keys_dev = primary.lease_device_buffer(keys_bytes)?;
+    let cu_memcpy_htod = unsafe {
+        *primary
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_memcpy_htod(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes) })?;
+    let result = launch_cuda_resident_i64_argsort_radix(resident, keys_dev.ptr, n as u64, descending);
+    drop(keys_dev);
+    result
 }
 
 /// GPU bitonic sort keyed by a resident TEXT column (lexicographic, unsigned bytes, a prefix sorts
@@ -19400,6 +19452,103 @@ mod tests {
         // n<=1 is the already-sorted fast path.
         assert_eq!(resident.bitonic_sort_i64(&[], false).unwrap(), Vec::<u32>::new());
         assert_eq!(resident.bitonic_sort_i64(&[7], true).unwrap(), vec![0]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_order_by_sort_i64_dispatches_radix_and_matches_bitonic() {
+        // order_by_sort_i64 dispatches BITONIC below ADAPTIVE_SORT_CROSSOVER_ROWS (10_000) and RADIX
+        // at/above it. Across the crossover (and at the boundary +/-1) it must produce a CORRECT sort:
+        // a valid permutation of 0..n with monotonic keys. For UNIQUE keys we additionally cross-check
+        // byte-equality vs the proven bitonic_sort_i64 (identical perm); for duplicates both arms are
+        // valid sorts so we assert monotonic keys, not the exact perm. Covers signs, i64::MIN/MAX, dups.
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let resident = runtime
+            .retain_device_memory_copy(0, &0_u64.to_le_bytes())
+            .expect("resident device memory");
+        let assert_sorted = |keys: &[i64], perm: &[u32], descending: bool, label: &str| {
+            let n = keys.len();
+            assert_eq!(perm.len(), n, "{label}: perm length");
+            let mut bij = perm.to_vec();
+            bij.sort_unstable();
+            assert!(bij.iter().copied().eq(0..n as u32), "{label}: valid permutation 0..n");
+            for w in perm.windows(2) {
+                let (a, b) = (keys[w[0] as usize], keys[w[1] as usize]);
+                if descending {
+                    assert!(a >= b, "{label}: descending monotonic ({a} >= {b})");
+                } else {
+                    assert!(a <= b, "{label}: ascending monotonic ({a} <= {b})");
+                }
+            }
+        };
+        for &n in &[100usize, 9_999, 10_000, 10_001, 50_000] {
+            // Dense duplicates (value range << n at large n) + planted extremes stress the signed
+            // transform + tie handling.
+            let mut dup: Vec<i64> = (0..n)
+                .map(|i| ((((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 8_000) as i64) - 4_000)
+                .collect();
+            if n >= 4 {
+                dup[0] = i64::MIN;
+                dup[1] = i64::MAX;
+                dup[2] = -1;
+                dup[3] = 0;
+            }
+            for &desc in &[false, true] {
+                let perm = resident.order_by_sort_i64(&dup, desc).expect("order_by_sort dup");
+                assert_sorted(&dup, &perm, desc, &format!("dup n={n} desc={desc}"));
+            }
+            // UNIQUE keys (distinct, signed, shuffled): the radix/bitonic dispatch must equal bitonic.
+            let mut uniq: Vec<i64> = (0..n).map(|i| i as i64 - (n as i64) / 2).collect();
+            for i in (1..n).rev() {
+                let j = (((i as u64).wrapping_mul(2_654_435_761)) % (i as u64 + 1)) as usize;
+                uniq.swap(i, j);
+            }
+            for &desc in &[false, true] {
+                let dispatched = resident.order_by_sort_i64(&uniq, desc).expect("order_by_sort uniq");
+                let bitonic = resident.bitonic_sort_i64(&uniq, desc).expect("bitonic uniq");
+                assert_eq!(
+                    dispatched, bitonic,
+                    "unique-key n={n} desc={desc}: order_by_sort_i64 (radix>=10k) must equal bitonic"
+                );
+                assert_sorted(&uniq, &dispatched, desc, &format!("uniq n={n} desc={desc}"));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark; requires a local NVIDIA driver and GPU"]
+    fn bench_order_by_sort_i64_radix_vs_bitonic() {
+        // Confirms the ORDER BY single-i64-key radix fast-path beats bitonic above the 10k crossover.
+        // order_by_sort_i64 = bitonic <10k / radix >=10k; bitonic_sort_i64 = always bitonic. Both upload
+        // the keys, so the delta is the algorithm. Run with --nocapture to see the numbers.
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let resident = runtime
+            .retain_device_memory_copy(0, &0_u64.to_le_bytes())
+            .expect("resident device memory");
+        for &n in &[1_000usize, 10_000, 100_000, 1_000_000] {
+            let keys: Vec<i64> = (0..n)
+                .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as i64)
+                .collect();
+            let _ = resident.order_by_sort_i64(&keys, false).unwrap(); // warm
+            let _ = resident.bitonic_sort_i64(&keys, false).unwrap();
+            let runs = 5u32;
+            let t0 = std::time::Instant::now();
+            for _ in 0..runs {
+                let _ = resident.order_by_sort_i64(&keys, false).unwrap();
+            }
+            let adaptive_us = t0.elapsed().as_micros() / u128::from(runs);
+            let t1 = std::time::Instant::now();
+            for _ in 0..runs {
+                let _ = resident.bitonic_sort_i64(&keys, false).unwrap();
+            }
+            let bitonic_us = t1.elapsed().as_micros() / u128::from(runs);
+            let arm = if n >= 10_000 { "radix" } else { "bitonic" };
+            println!(
+                "n={n:>9}  order_by({arm})={adaptive_us:>7}us  bitonic={bitonic_us:>7}us  \
+                 speedup={:.2}x",
+                bitonic_us as f64 / adaptive_us.max(1) as f64
+            );
+        }
     }
 
     #[test]

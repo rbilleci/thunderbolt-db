@@ -3535,6 +3535,48 @@ fn gpu_nongrouped_order_by_500_rows() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_radix_above_crossover() {
+    // 11_000 rows (> the 10_000 adaptive crossover) -> the single-int-key ORDER BY takes the GPU RADIX
+    // arm (engine_expr order_by_sort_i64), end to end. A coprime-stride (137, gcd(137,11000)=1)
+    // permutation of 0..11000 must sort back to 0..11000 (ASC) / its reverse (DESC), on the GPU.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE big (a INT)").unwrap();
+    const N: i32 = 11_000;
+    let vals = (0..N)
+        .map(|i| format!("({})", (i * 137 + 11).rem_euclid(N)))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO big (a) VALUES {vals}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("big").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let col = |sql: &str| -> Vec<i32> {
+        let res = e.execute_relational_select_text(sql).unwrap();
+        assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+        res.rows
+            .iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(v) => v,
+                ref other => panic!("expected Int4, got {other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        col("SELECT a FROM big ORDER BY a"),
+        (0..N).collect::<Vec<i32>>(),
+        "11k-row GPU radix ORDER BY a"
+    );
+    assert_eq!(
+        col("SELECT a FROM big ORDER BY a DESC"),
+        (0..N).rev().collect::<Vec<i32>>(),
+        "11k-row GPU radix ORDER BY a DESC"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_nongrouped_order_by_text() {
     // A non-grouped ORDER BY over a TEXT column sorts on the GENERAL GPU Expr executor via the byte-wise
     // text bitonic comparator (lexicographic, UNSIGNED bytes, a prefix sorts smaller) -- NOT a CPU sort.

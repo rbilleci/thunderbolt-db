@@ -2120,10 +2120,11 @@ impl Engine {
                     key_matrix[i * k + kk] = v;
                 }
             }
-            // Single-key stays on the proven slice-2 kernel; multi-key uses the row-major comparator.
+            // Single-key dispatches by size -- bitonic for small n, radix (O(n)) for large n -- via
+            // order_by_sort_i64; multi-key uses the row-major bitonic comparator.
             let perm = if k == 1 {
                 device_memory
-                    .bitonic_sort_i64(&key_matrix, (desc_mask & 1) != 0)
+                    .order_by_sort_i64(&key_matrix, (desc_mask & 1) != 0)
                     .map_err(map_err)?
             } else {
                 device_memory
