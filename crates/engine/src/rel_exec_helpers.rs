@@ -1207,6 +1207,10 @@ pub(crate) fn bind_relational_select(
     let order = select
         .order_by
         .first()
+        // An ORDER BY EXPRESSION (`a+b`) carries an empty placeholder column and has no pushed CPU
+        // order -- the general GPU executor evaluates + sorts it. Skip the column lookup here (else it
+        // resolves "" -> "column \"\" does not exist").
+        .filter(|order| !order.column.is_empty())
         .map(|order| {
             if select_is_aggregate_result_column(select, &order.column) {
                 Ok((usize::MAX, order.descending))

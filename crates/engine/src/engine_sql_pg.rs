@@ -43,12 +43,32 @@ impl Engine {
             .as_deref()
             .map(|where_node| map_predicate_node(where_node, &table, &qualifier))
             .transpose()?;
+        // Build the ORDER BY sort-expression list parallel to `select.order_by`: a bare ColumnRef ->
+        // None (a plain column key); any other expression (`a+b`, `a*2`) -> a `ResidentExpr` via the
+        // SAME mapper the WHERE uses, which the executor evaluates on-device into an i64 key column.
+        let mut order_by_exprs: Vec<Option<ResidentExpr>> =
+            Vec::with_capacity(stmt.sort_clause.len());
+        for item in &stmt.sort_clause {
+            let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
+                return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
+            };
+            let node = sort_by
+                .node
+                .as_deref()
+                .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
+            if result_column_name(node, &qualifier).is_ok() {
+                order_by_exprs.push(None);
+            } else {
+                order_by_exprs.push(Some(map_predicate_node(node, &table, &qualifier)?));
+            }
+        }
         self.execute_resident_expr_select_with_binding(
             &select,
             &table,
             bound,
             copin_s,
             predicate.as_ref(),
+            &order_by_exprs,
         )
     }
 }
@@ -158,6 +178,14 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         return Err(sql_pg_error(
             "multi-key ORDER BY on a grouped result is not yet supported (single-key only)"
                 .to_string(),
+        ));
+    }
+    // The grouped result is sorted host-side by a column key only; an expression ORDER BY (empty
+    // placeholder column) on a grouped result has no GPU sort yet (the grouped-sort migration lands
+    // that). Reject cleanly rather than mis-sorting.
+    if group_by.is_some() && order_by.iter().any(|key| key.column.is_empty()) {
+        return Err(sql_pg_error(
+            "ORDER BY an expression on a grouped result is not yet supported".to_string(),
         ));
     }
     let select = Select {
@@ -772,8 +800,12 @@ fn parse_order_by(
             .node
             .as_deref()
             .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
-        let column = result_column_name(node, qualifier)?;
         let descending = sort_by.sortby_dir == SortByDir::SortbyDesc as i32;
+        // A column reference OR an aggregate (`g`, `COUNT(*)`) resolves to a result-column name. An
+        // arithmetic SORT EXPRESSION (`a+b`, `a*2`) does NOT -- emit a placeholder (empty column; a real
+        // name is never empty) and let the general executor evaluate it (order_by_exprs, built parallel
+        // to these keys in execute_resident_expr_select_sql).
+        let column = result_column_name(node, qualifier).unwrap_or_default();
         keys.push(SelectOrder { column, descending });
     }
     Ok(keys)

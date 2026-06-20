@@ -952,6 +952,7 @@ impl Engine {
             bound,
             copin_s,
             Some(predicate),
+            &[],
         )
     }
 
@@ -1057,6 +1058,9 @@ impl Engine {
         copin_s: Index,
         // `None` = no WHERE clause: a full-table scan (every row survives).
         predicate: Option<&ResidentExpr>,
+        // Parallel to `select.order_by`: `Some(expr)` = a SORT EXPRESSION key (`ORDER BY a+b`),
+        // evaluated on-device into an i64 key column; `None` = a plain column key. Empty = no ORDER BY.
+        order_by_exprs: &[Option<ResidentExpr>],
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Scalar aggregates (operator axis): COUNT(*) -> the surviving-row count; SUM(col) -> a GPU
         // reduction over the filtered column. They have no projected columns to materialize, so they
@@ -1109,9 +1113,14 @@ impl Engine {
 
         // We discard `_query` and keep only `access_path` (metadata). Computing it for an ORDER BY /
         // LIMIT select would run a full CPU ordered table sort (relational_ordered_table_keys) whose
-        // result we throw away -- a charter violation (the GPU does the sort here) + 2x work. Compute
-        // the path as if UNORDERED/UNLIMITED so no CPU sort fires; the GPU sort + the host OFFSET/LIMIT
-        // below own the ordering and windowing.
+        // result we throw away -- a charter violation (the GPU does the sort here) + 2x work. The CPU
+        // sort keys off `bound.order` (set at bind from order_by.first()), which the planner below reads
+        // -- NOT `ap_select.order_by` -- so clearing ap_select alone is INEFFECTIVE. Clear bound.order:
+        // that alone stops the CPU sort. bound.order is read nowhere else on this path (the GPU/grouped
+        // sort uses select.order_by + order_by_exprs), so this is safe. The ap_select clear keeps the
+        // synthesized path unordered/unlimited; the GPU sort + host OFFSET/LIMIT own ordering+windowing.
+        let mut bound = bound;
+        bound.order = None;
         let mut ap_select = select.clone();
         ap_select.order_by.clear();
         ap_select.limit = None;
@@ -1794,8 +1803,58 @@ impl Engine {
         // other routed keys are i64-sortable ints and go through the key-matrix path below.
         // Classify the ORDER BY keys: k==1 text -> the varlen text sort; k>1 with ANY text key -> the
         // heterogeneous mixed (int+text) sort; all-int -> the i64 key matrix.
+        // Materialize an INT-bearing ORDER BY key's i64 values for `indices`. A sort EXPRESSION
+        // (`ORDER BY a+b`) is evaluated on-device into an i64 column (checked int4 overflow -> PG error,
+        // never CPU); a plain int column is projected. Both sort arms below use this; an expression key
+        // always counts as an int key. `indices` is a param (the else arm below moves `indices_u64`).
+        let materialize_int_key_column = |ki: usize, indices: &[u64]| -> Result<Vec<i64>, ExecuteError> {
+            let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+            };
+            if let Some(Some(expr)) = order_by_exprs.get(ki) {
+                let mut program = Vec::new();
+                compile_arith_program(expr, table, &snapshot, &mut program)?;
+                let idx32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+                // int8 operands -> the i64 arith VM + i64 value width; else int4/I32. Reading an int8
+                // expr as I32 would stride a BIGINT column by 4 bytes -> silently garbage sort keys.
+                let elem = if expr_mentions_int8(expr, table) {
+                    ResidentElemType::I64
+                } else {
+                    ResidentElemType::I32
+                };
+                return device_memory
+                    .arith_value_column_at_indices(&program, row_count, &idx32, elem)
+                    .map_err(map_err);
+            }
+            let order = &select.order_by[ki];
+            let order_idx = relational_column_index(table, &order.column)?;
+            match table.columns[order_idx].ty {
+                SqlType::Int4 | SqlType::Int2 | SqlType::Date => Ok(device_memory
+                    .project_i32_rows_from_payload(
+                        resident_device_int4_column_offset(&snapshot, table, order_idx)?,
+                        indices,
+                    )
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(i64::from)
+                    .collect()),
+                SqlType::Int8 | SqlType::Timestamp => device_memory
+                    .project_i64_rows_from_payload(
+                        resident_device_int8_column_offset(&snapshot, table, order_idx)?,
+                        indices,
+                    )
+                    .map_err(map_err),
+                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "ORDER BY key is not an i64-sortable int column".to_string(),
+                ))),
+            }
+        };
+        // A sort EXPRESSION is int-valued (never text); only a TEXT COLUMN key sets has_text_key.
         let mut has_text_key = false;
-        for order in &select.order_by {
+        for (ki, order) in select.order_by.iter().enumerate() {
+            if order_by_exprs.get(ki).is_some_and(|e| e.is_some()) {
+                continue;
+            }
             if table.columns[relational_column_index(table, &order.column)?].ty == SqlType::Text {
                 has_text_key = true;
                 break;
@@ -1841,10 +1900,18 @@ impl Engine {
             let mut text_cols: Vec<(u64, u64)> = Vec::new();
             let mut key_plan: Vec<u32> = Vec::with_capacity(k);
             let mut desc_mask: u64 = 0;
-            let mut int_key_cols: Vec<(usize, usize)> = Vec::new();
+            let mut int_key_slots: Vec<(usize, usize)> = Vec::new();
             for (ki, order) in select.order_by.iter().enumerate() {
                 if order.descending {
                     desc_mask |= 1u64 << ki;
+                }
+                // A sort EXPRESSION is an int-valued key -> the next int slot (materialized below).
+                if order_by_exprs.get(ki).is_some_and(|e| e.is_some()) {
+                    let int_slot = num_int;
+                    num_int += 1;
+                    key_plan.push(int_slot as u32);
+                    int_key_slots.push((ki, int_slot));
+                    continue;
                 }
                 let order_idx = relational_column_index(table, &order.column)?;
                 match table.columns[order_idx].ty {
@@ -1863,7 +1930,7 @@ impl Engine {
                         let int_slot = num_int;
                         num_int += 1;
                         key_plan.push(int_slot as u32);
-                        int_key_cols.push((order_idx, int_slot));
+                        int_key_slots.push((ki, int_slot));
                     }
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1877,25 +1944,8 @@ impl Engine {
             // Materialize the int keys into a row-major n*num_int matrix by position (matching the
             // multikey kernel's layout; the text keys read in place via the indices indirection).
             let mut int_keys = vec![0i64; n * num_int];
-            for (order_idx, int_slot) in int_key_cols {
-                let col_keys: Vec<i64> = match table.columns[order_idx].ty {
-                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
-                        let off = resident_device_int4_column_offset(&snapshot, table, order_idx)?;
-                        device_memory
-                            .project_i32_rows_from_payload(off, &indices_u64)
-                            .map_err(map_err)?
-                            .into_iter()
-                            .map(i64::from)
-                            .collect()
-                    }
-                    SqlType::Int8 | SqlType::Timestamp => {
-                        let off = resident_device_int8_column_offset(&snapshot, table, order_idx)?;
-                        device_memory
-                            .project_i64_rows_from_payload(off, &indices_u64)
-                            .map_err(map_err)?
-                    }
-                    _ => unreachable!("classified as an int key above"),
-                };
+            for (ki, int_slot) in int_key_slots {
+                let col_keys = materialize_int_key_column(ki, &indices_u64)?;
                 for (i, v) in col_keys.into_iter().enumerate() {
                     int_keys[i * num_int + int_slot] = v;
                 }
@@ -1932,31 +1982,9 @@ impl Engine {
                 if order.descending {
                     desc_mask |= 1u64 << kk;
                 }
-                let order_idx = relational_column_index(table, &order.column)?;
-                let col_keys: Vec<i64> = match table.columns[order_idx].ty {
-                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
-                        let off = resident_device_int4_column_offset(&snapshot, table, order_idx)?;
-                        device_memory
-                            .project_i32_rows_from_payload(off, &indices_u64)
-                            .map_err(map_err)?
-                            .into_iter()
-                            .map(i64::from)
-                            .collect()
-                    }
-                    SqlType::Int8 | SqlType::Timestamp => {
-                        let off = resident_device_int8_column_offset(&snapshot, table, order_idx)?;
-                        device_memory
-                            .project_i64_rows_from_payload(off, &indices_u64)
-                            .map_err(map_err)?
-                    }
-                    _ => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "non-grouped ORDER BY on the Expr path supports int2 / int4 / int8 / \
-                             date / timestamp columns (the GPU sort); other types are a follow-on"
-                                .to_string(),
-                        )));
-                    }
-                };
+                // Each key is a plain int column OR a sort expression (`a+b`); the helper materializes
+                // the i64 value column either way (expression -> on-device eval with checked overflow).
+                let col_keys = materialize_int_key_column(kk, &indices_u64)?;
                 for (i, v) in col_keys.into_iter().enumerate() {
                     key_matrix[i * k + kk] = v;
                 }

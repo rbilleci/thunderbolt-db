@@ -465,6 +465,24 @@ fn grouped_multikey_order_by_is_rejected_not_silently_first_key() {
 }
 
 #[test]
+fn grouped_order_by_expression_is_rejected() {
+    // ORDER BY an EXPRESSION on a GROUPED result has no GPU sort yet (the grouped-sort migration lands
+    // that) -> a clean reject, not a silent host first-key sort. Multi-aggregate forces the general path.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE g (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO g (a) VALUES (1), (1), (2)")
+        .unwrap();
+    let err = e
+        .execute_relational_select_text("SELECT a, COUNT(*), SUM(a) FROM g GROUP BY a ORDER BY a + a")
+        .expect_err("grouped ORDER BY expression must be rejected");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("expression") && msg.contains("grouped"),
+        "expected a grouped-expression rejection, got: {err:?}"
+    );
+}
+
+#[test]
 fn select_text_multikey_order_by_non_resident_rejects() {
     // Multi-key ORDER BY is GPU-only: it sorts on the general Expr executor's bitonic-sort path, routed
     // ONLY when every key is an i64-sortable base column on a GPU-RESIDENT table. On a non-resident

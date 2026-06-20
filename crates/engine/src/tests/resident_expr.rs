@@ -3088,6 +3088,145 @@ fn gpu_grouped_duplicate_aggregate_name_is_ambiguous() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_expression() {
+    // ORDER BY an EXPRESSION (`a+b`, `a*2`) on the general GPU path: the device Expr interpreter
+    // evaluates it into an i64 key column feeding the GPU bitonic sort -- single key, multi-key
+    // (expr + column), expr + a text key (hetero), WHERE, LIMIT. executed_target==Gpu throughout.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT, name TEXT)")
+        .unwrap();
+    let rows: &[(i32, i32, i32, &str)] = &[
+        (5, 1, 1, "bob"),  // a+b=6
+        (2, 9, 2, "amy"),  // a+b=11
+        (8, 0, 3, "cara"), // a+b=8
+        (1, 1, 4, "dan"),  // a+b=2
+        (3, 5, 5, "amy"),  // a+b=8 (ties c=3 on the sum; "amy" ties c=2 on the name)
+        (4, 3, 6, "bob"),  // a+b=7 ("bob" ties c=1 on the name)
+    ];
+    let values = rows
+        .iter()
+        .map(|(a, b, c, n)| format!("({a}, {b}, {c}, '{n}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (a, b, c, name) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = |res: &RelationalSelectResult, col: usize| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[col] {
+                SqlValue::Int4(v) => v,
+                ref other => panic!("expected Int4, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // (a) ORDER BY a+b ASC -- the sum ties (c=3,c=5 both 8; bitonic is unstable), so assert the SUM
+    // sequence (computed from the projected a,b) is monotonic, not the exact rows.
+    let s = e
+        .execute_relational_select_text("SELECT a, b FROM t ORDER BY a + b")
+        .unwrap();
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0), "ORDER BY a+b on GPU");
+    let sums: Vec<i32> = i4(&s, 0)
+        .iter()
+        .zip(i4(&s, 1))
+        .map(|(a, b)| a + b)
+        .collect();
+    assert_eq!(sums, vec![2, 6, 7, 8, 8, 11], "ORDER BY a+b ASC monotonic");
+
+    // (b) ORDER BY a*2 DESC -- monotonic in a, no ties -> exact (c identifies rows).
+    let s = e
+        .execute_relational_select_text("SELECT c FROM t ORDER BY a * 2 DESC")
+        .unwrap();
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(i4(&s, 0), vec![3, 1, 6, 5, 2, 4], "ORDER BY a*2 DESC");
+
+    // (c) multi-key expr-primary: ORDER BY a+b, c -- the (sum,c) tuple is distinct -> deterministic.
+    let s = e
+        .execute_relational_select_text("SELECT c FROM t ORDER BY a + b, c")
+        .unwrap();
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(i4(&s, 0), vec![4, 1, 6, 3, 5, 2], "ORDER BY a+b, c");
+
+    // (d) hetero (text + expr): ORDER BY name, a+b -- (name,sum) distinct -> deterministic.
+    let s = e
+        .execute_relational_select_text("SELECT c FROM t ORDER BY name, a + b")
+        .unwrap();
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(i4(&s, 0), vec![5, 2, 1, 6, 3, 4], "ORDER BY name, a+b (hetero)");
+
+    // (e) WHERE + expr ORDER BY + LIMIT. a>2: c1(sum6),c3(sum8),c5(sum8),c6(sum7) -> sorted 6,7,8,8;
+    // LIMIT 2 -> c1, c6.
+    let s = e
+        .execute_relational_select_text("SELECT c FROM t WHERE a > 2 ORDER BY a + b LIMIT 2")
+        .unwrap();
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(i4(&s, 0), vec![1, 6], "WHERE a>2 ORDER BY a+b LIMIT 2");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_int8_expression_sorts_at_i64_width() {
+    // ORDER BY a BIGINT expression must read the arith value buffer at i64 width. Reading it as i32
+    // (the pre-fix bug) would stride the 8-byte BIGINT column by 4 bytes -> garbage keys. A value
+    // beyond i32::MAX also exercises the i64 range (an i32 read could not even represent it).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b BIGINT, id INT)")
+        .unwrap();
+    // a+b: id1->15, id2->2, id3->5000000001 (> i32::MAX), id4->7. asc by a+b: 2,7,15,5e9 -> ids 2,4,1,3.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a, b, id) VALUES (10,5,1),(1,1,2),(5000000000,1,3),(3,4,4)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let s = e
+        .execute_relational_select_text("SELECT id FROM t ORDER BY a + b")
+        .expect("int8 expression ORDER BY runs on the GPU");
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        s.rows,
+        vec![
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(4)],
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(3)],
+        ],
+        "BIGINT a+b sorted at i64 width"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_expression_overflow_is_pg_error() {
+    // ORDER BY a+b where a+b overflows int4 -> a clean PG "integer out of range" error (checked
+    // arithmetic on-device), NOT a wrapped value, NOT a CPU re-execution.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a, b) VALUES (2147483647, 1), (1, 1)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let err = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a + b")
+        .expect_err("a+b overflow must surface as a PG error, not wrap or CPU-fallback");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("out of range") || msg.contains("overflow"),
+        "expected integer out of range, got: {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_nongrouped_order_by_via_gpu_sort() {
     // A non-grouped ORDER BY over an int column runs on the GENERAL GPU Expr executor + the GPU bitonic
     // sort (NOT the enumerated ordered-projection shape, NOT the CPU path). executed_target==Gpu proves

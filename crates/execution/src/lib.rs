@@ -1058,6 +1058,20 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Evaluate an arithmetic ORDER BY expression (`a+b`, `a*2`, ...) over all `n_rows` on the GPU via
+    /// the device Expr interpreter, then GATHER the result (i32, sign-extended to i64) at the survivor
+    /// `indices` -- an ORDER BY-expression key column that feeds the GPU sort like any materialized int
+    /// key. Checked int4 overflow surfaces as PG `IntegerOutOfRange` (no wrap, no CPU re-execution).
+    pub fn arith_value_column_at_indices(
+        &self,
+        program: &[ExprStep],
+        n_rows: u64,
+        indices: &[u32],
+        elem: ResidentElemType,
+    ) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+        launch_cuda_arith_value_column_at_indices(self, program, n_rows, indices, elem)
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -13294,6 +13308,88 @@ fn launch_cuda_resident_expr_arith_filter(
         return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
     }
     compact_buffer_i32_compare_to_indices(resident, value.ptr, n, needle, compare_code)
+}
+
+/// Evaluate an arithmetic `program` over all `n_rows`, then GATHER the resulting i32 value column at
+/// the survivor `indices` (sign-extended to i64). The ORDER BY-expression key column: the device Expr
+/// interpreter computes `a+b` etc. with CHECKED int4 arithmetic (overflow -> `IntegerOutOfRange`,
+/// inherited from `run_resident_arith_program` -- no wrap, no CPU), and the result feeds the GPU sort
+/// exactly like a materialized int key.
+fn launch_cuda_arith_value_column_at_indices(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    n_rows: u64,
+    indices: &[u32],
+    elem: ResidentElemType,
+) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = usize::try_from(n_rows).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if n == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    // Run over ALL rows at the program's element width (I32 for int4 exprs, I64 for int8 -- the arith
+    // VM checks the matching overflow bounds internally -> PG error, no wrap); the value buffer (lease)
+    // is the single result + must stay alive through the D2H. Read it at that width, gather at the
+    // survivor indices, widen to i64 (the universal sort-key width).
+    let mut stack = run_resident_arith_program(resident, program, n_rows, elem)?;
+    let value = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        // A well-formed arithmetic program leaves exactly one value on the stack.
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    let mut out = Vec::with_capacity(indices.len());
+    match elem {
+        ResidentElemType::I32 => {
+            let byte_len = n
+                .checked_mul(std::mem::size_of::<i32>())
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+            let mut host = vec![0i32; n];
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(host.as_mut_ptr().cast::<c_void>(), value.ptr, byte_len)
+            })?;
+            drop(value);
+            for &i in indices {
+                let v = *host
+                    .get(i as usize)
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(i as usize))?;
+                out.push(i64::from(v));
+            }
+        }
+        ResidentElemType::I64 => {
+            let byte_len = n
+                .checked_mul(std::mem::size_of::<i64>())
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+            let mut host = vec![0i64; n];
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(host.as_mut_ptr().cast::<c_void>(), value.ptr, byte_len)
+            })?;
+            drop(value);
+            for &i in indices {
+                let v = *host
+                    .get(i as usize)
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(i as usize))?;
+                out.push(v);
+            }
+        }
+        // i128 (numeric) sort expressions are not yet supported here.
+        ResidentElemType::I128 => {
+            drop(value);
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+    }
+    Ok(out)
 }
 
 /// Evaluate a `program` that leaves TWO value buffers (the compiled lhs then rhs of a comparison),
