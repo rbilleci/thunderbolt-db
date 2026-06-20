@@ -107,18 +107,14 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         .map(|alias| alias.aliasname.clone())
         .unwrap_or_else(|| table.clone());
 
-    // HAVING / ORDER BY / LIMIT / OFFSET are supported on the GROUPED Expr path (applied host-side to
-    // the materialized group rows below); still rejected for non-grouped selects.
+    // HAVING is GROUPED-only. ORDER BY / LIMIT / OFFSET are supported for BOTH grouped (host-side over
+    // the materialized group rows) and non-grouped (the projection sorts the surviving indices on the
+    // GPU bitonic sort, then gathers + slices) -- parsed unconditionally below.
     let has_group_by = !stmt.group_clause.is_empty();
     let unsupported = [
         (!stmt.distinct_clause.is_empty(), "DISTINCT"),
         (stmt.having_clause.is_some() && !has_group_by, "HAVING without GROUP BY"),
         (!stmt.window_clause.is_empty(), "window functions"),
-        (!stmt.sort_clause.is_empty() && !has_group_by, "ORDER BY"),
-        (
-            (stmt.limit_count.is_some() || stmt.limit_offset.is_some()) && !has_group_by,
-            "LIMIT / OFFSET",
-        ),
         (!stmt.locking_clause.is_empty(), "row locking (FOR UPDATE/SHARE)"),
         (stmt.with_clause.is_some(), "WITH / CTEs"),
         // A plain SELECT is SETOP_NONE (= 1; proto enums prefix Undefined = 0). UNION/INTERSECT/EXCEPT
@@ -145,17 +141,15 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         Some(group_column) => build_grouped_projection(&stmt.target_list, group_column, &qualifier)?,
         None => build_projection(&stmt.target_list, &qualifier)?,
     };
-    // Grouped queries may carry ORDER BY / LIMIT / OFFSET / HAVING (applied host-side after the GPU
-    // grouping in the executor); non-grouped queries rejected them above, so these stay empty there.
-    let (order_by, limit, offset, having_groups) = if group_by.is_some() {
-        (
-            parse_order_by(&stmt.sort_clause, &qualifier)?,
-            parse_limit(&stmt.limit_count)?,
-            parse_limit(&stmt.limit_offset)?,
-            parse_having(stmt.having_clause.as_deref(), &qualifier)?,
-        )
+    // ORDER BY / LIMIT / OFFSET apply to grouped (host-side) AND non-grouped (GPU-sorted projection)
+    // queries. HAVING is grouped-only (HAVING-without-GROUP-BY was rejected above).
+    let order_by = parse_order_by(&stmt.sort_clause, &qualifier)?;
+    let limit = parse_limit(&stmt.limit_count)?;
+    let offset = parse_limit(&stmt.limit_offset)?;
+    let having_groups = if group_by.is_some() {
+        parse_having(stmt.having_clause.as_deref(), &qualifier)?
     } else {
-        (None, None, None, Vec::new())
+        Vec::new()
     };
     let select = Select {
         table,

@@ -3088,6 +3088,124 @@ fn gpu_grouped_duplicate_aggregate_name_is_ambiguous() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_via_gpu_sort() {
+    // A non-grouped ORDER BY over an int column runs on the GENERAL GPU Expr executor + the GPU bitonic
+    // sort (NOT the enumerated ordered-projection shape, NOT the CPU path). executed_target==Gpu proves
+    // it took the general GPU path through the routing gate (`execute_relational_select_text`).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c BIGINT)")
+        .unwrap();
+    let rows: &[(i32, i32, i64)] = &[
+        (5, 50, 500),
+        (2, 20, 200),
+        (8, 80, 800),
+        (1, 10, 100),
+        (9, 90, 900),
+        (3, 30, 300),
+    ];
+    let values = rows
+        .iter()
+        .map(|(a, b, c)| format!("({a}, {b}, {c})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (a, b, c) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let int4_col = |res: &RelationalSelectResult, col: usize| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[col] {
+                SqlValue::Int4(v) => v,
+                ref other => panic!("expected Int4, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // (a) ORDER BY a ASC -- and confirm it took the general GPU path.
+    let asc = e
+        .execute_relational_select_text("SELECT a, b FROM t ORDER BY a")
+        .unwrap();
+    assert_eq!(
+        asc.executed_target,
+        DeviceTarget::Gpu(0),
+        "non-grouped ORDER BY must run on the general GPU path"
+    );
+    assert_eq!(int4_col(&asc, 0), vec![1, 2, 3, 5, 8, 9], "ORDER BY a ASC");
+
+    // (b) ORDER BY a DESC.
+    let desc = e
+        .execute_relational_select_text("SELECT a, b FROM t ORDER BY a DESC")
+        .unwrap();
+    assert_eq!(desc.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(int4_col(&desc, 0), vec![9, 8, 5, 3, 2, 1], "ORDER BY a DESC");
+
+    // (c) WHERE b > 25 ORDER BY a -> a in {3,5,8,9} (their b are 30/50/80/90).
+    let filtered = e
+        .execute_relational_select_text("SELECT a FROM t WHERE b > 25 ORDER BY a")
+        .unwrap();
+    assert_eq!(filtered.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(int4_col(&filtered, 0), vec![3, 5, 8, 9], "WHERE + ORDER BY");
+
+    // (d) ORDER BY c DESC (an int8 key).
+    let by_c = e
+        .execute_relational_select_text("SELECT a, c FROM t ORDER BY c DESC")
+        .unwrap();
+    assert_eq!(by_c.executed_target, DeviceTarget::Gpu(0));
+    let c_col: Vec<i64> = by_c
+        .rows
+        .iter()
+        .map(|r| match r[1] {
+            SqlValue::Int8(v) => v,
+            ref other => panic!("expected Int8, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(c_col, vec![900, 800, 500, 300, 200, 100], "ORDER BY c DESC");
+
+    // (e) ORDER BY a LIMIT 3 OFFSET 1 -> [2, 3, 5].
+    let limited = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 3 OFFSET 1")
+        .unwrap();
+    assert_eq!(limited.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(int4_col(&limited, 0), vec![2, 3, 5], "ORDER BY a LIMIT 3 OFFSET 1");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_500_rows() {
+    // 500 rows (not a power of two -> padding) shuffled via a coprime stride (a permutation of 0..500),
+    // sorted on the GPU. Exercises the bitonic sort at scale on the projection path.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE big (a INT)").unwrap();
+    let vals = (0..500i32)
+        .map(|i| format!("({})", (i * 137 + 11).rem_euclid(500)))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO big (a) VALUES {vals}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("big").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_relational_select_text("SELECT a FROM big ORDER BY a")
+        .unwrap();
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let a_col: Vec<i32> = res
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            SqlValue::Int4(v) => v,
+            ref other => panic!("expected Int4, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(a_col, (0..500).collect::<Vec<i32>>(), "500-row GPU ORDER BY a");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_uuid_key() {
     // GROUP BY a UUID (i128) key via atom.cas.b128; output sorts by canonical/memcmp byte order. Uses
     // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and

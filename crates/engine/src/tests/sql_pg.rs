@@ -139,9 +139,9 @@ fn assert_sql_err_contains(engine: &Engine, sql: &str, needle: &str) {
 #[test]
 fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     // Every shape the mapper cannot represent is a HARD error (deterministic, no GPU needed): build-
-    // stage rejections (multiple FROM relations, aggregate projection, ORDER BY) fire before the
-    // residency check; mapper-stage rejections (unsupported operator, AND/OR, non-int literal) fire
-    // after the single bind. None silently mis-answer.
+    // stage rejections (multiple FROM relations, aggregate projection) fire before the residency check;
+    // mapper-stage rejections (unsupported operator, AND/OR, non-int literal) fire after the single
+    // bind. None silently mis-answer.
     let e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
 
@@ -151,7 +151,8 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     // count(*) / sum / min / max / avg are supported now (operator axis, GPU-tested); count(col) and
     // other functions are follow-ons, still rejected at the parser.
     assert_sql_err_contains(&e, "SELECT count(a) FROM t WHERE a > 0", "COUNT(*) / SUM / MIN / MAX");
-    assert_sql_err_contains(&e, "SELECT a FROM t WHERE a > 0 ORDER BY a", "ORDER BY"); // ordering
+    // NB: a non-grouped ORDER BY over an int column is SUPPORTED now -- routed to the general GPU Expr
+    // executor + the bitonic sort (covered by gpu_nongrouped_order_by_via_gpu_sort), no longer rejected.
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a / b > 1", "/"); // unsupported operator
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE NOT a > 1", "NOT"); // unary NOT (AND/OR are ok)
     // int4 / numeric / text / bool literals all map now (bool literals + `flag = true` / `NOT flag`
@@ -384,6 +385,32 @@ fn select_text_keeps_simple_predicates_on_the_existing_path() {
         result.rows,
         vec![vec![SqlValue::Int4(6)]],
         "a = 6 -> the single matching row, via the existing path"
+    );
+}
+
+#[test]
+fn select_text_non_resident_order_by_falls_through_to_existing_path() {
+    // A non-grouped int ORDER BY routes to the general GPU (bitonic-sort) path -- but ONLY when the
+    // table is GPU-RESIDENT (that path has no CPU fallback). On a NON-resident table the routing gate
+    // falls through to the existing path, which sorts correctly rather than hard-erroring with "no
+    // resident snapshot". Guards the residency condition on the GPU-sort routing.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (5), (2), (8), (1)")
+        .unwrap();
+    // Deliberately do NOT populate residency -> t is not GPU-resident.
+    let result = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a DESC")
+        .expect("non-resident ORDER BY falls through to the existing path, not a hard error");
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Int4(8)],
+            vec![SqlValue::Int4(5)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(1)],
+        ],
+        "non-resident ORDER BY DESC sorted via the existing path"
     );
 }
 

@@ -1106,8 +1106,17 @@ impl Engine {
             }
         }
 
+        // We discard `_query` and keep only `access_path` (metadata). Computing it for an ORDER BY /
+        // LIMIT select would run a full CPU ordered table sort (relational_ordered_table_keys) whose
+        // result we throw away -- a charter violation (the GPU does the sort here) + 2x work. Compute
+        // the path as if UNORDERED/UNLIMITED so no CPU sort fires; the GPU sort + the host OFFSET/LIMIT
+        // below own the ordering and windowing.
+        let mut ap_select = select.clone();
+        ap_select.order_by = None;
+        ap_select.limit = None;
+        ap_select.offset = None;
         let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, table, &bound, copin_s)?;
+            self.relational_select_mvcc_query_pinned(&ap_select, table, &bound, copin_s)?;
         // Load the WHOLE residency entry (descriptor + host rows) from ONE atomic load() so a text
         // GROUP BY key -- whose result string is read from host_rows[representative_row] -- sees host
         // rows from the SAME generation as the descriptor / device memory the GPU grouped over.
@@ -1767,6 +1776,45 @@ impl Engine {
             });
         }
 
+        // Non-grouped ORDER BY: reorder the surviving indices by the order key on the GPU (bitonic
+        // sort) BEFORE gathering, so the projected rows come out sorted -- a charter-native GPU sort,
+        // not a host/CPU sort. The routing only sends int-keyed (i64-sortable) sorts to this path.
+        let indices_u64 = if let Some(order) = &select.order_by {
+            let order_idx = relational_column_index(table, &order.column)?;
+            let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+            };
+            let keys: Vec<i64> = match table.columns[order_idx].ty {
+                SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
+                    let off = resident_device_int4_column_offset(&snapshot, table, order_idx)?;
+                    device_memory
+                        .project_i32_rows_from_payload(off, &indices_u64)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect()
+                }
+                SqlType::Int8 | SqlType::Timestamp => {
+                    let off = resident_device_int8_column_offset(&snapshot, table, order_idx)?;
+                    device_memory
+                        .project_i64_rows_from_payload(off, &indices_u64)
+                        .map_err(map_err)?
+                }
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "non-grouped ORDER BY on the Expr path supports int2 / int4 / int8 / date / \
+                         timestamp columns (the GPU sort); other types are a follow-on"
+                            .to_string(),
+                    )));
+                }
+            };
+            let perm = device_memory
+                .bitonic_sort_i64(&keys, order.descending)
+                .map_err(map_err)?;
+            perm.iter().map(|&p| indices_u64[p as usize]).collect()
+        } else {
+            indices_u64
+        };
         // Materialize: gather each projected column at the surviving row indices on the GPU, by type
         // (int4 -> i32 gather, int8 -> i64 gather; the type matrix, doc 19).
         enum ProjectedColumn {
@@ -1866,7 +1914,7 @@ impl Engine {
             };
             projected_columns.push(column);
         }
-        let rows: Vec<Vec<SqlValue>> = (0..indices_u64.len())
+        let mut rows: Vec<Vec<SqlValue>> = (0..indices_u64.len())
             .map(|row| {
                 projected_columns
                     .iter()
@@ -1888,6 +1936,14 @@ impl Engine {
                     .collect()
             })
             .collect();
+        // OFFSET then LIMIT, applied after the GPU sort (SQL clause order: ORDER BY -> OFFSET -> LIMIT).
+        if select.offset.is_some() || select.limit.is_some() {
+            let start = select.offset.unwrap_or(0).min(rows.len());
+            rows.drain(..start);
+            if let Some(limit) = select.limit {
+                rows.truncate(limit);
+            }
+        }
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,

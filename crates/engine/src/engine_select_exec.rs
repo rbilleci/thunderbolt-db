@@ -7,6 +7,36 @@
 
 use super::*;
 
+/// A non-grouped projection (no aggregate / GROUP BY / HAVING) with an ORDER BY whose key is an
+/// i64-sortable int column (int2/int4/int8/date/timestamp). Such a query is routed to the general GPU
+/// Expr executor, which sorts the surviving rows on the GPU (bitonic) -- the charter-native path,
+/// retiring the enumerated ordered-projection shape for this case. Other ORDER BY shapes (text/numeric/
+/// uuid keys, expressions, multi-key) stay on the existing path transitionally.
+fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -> bool {
+    if select.group_by.is_some() || !select.having_groups.is_empty() {
+        return false;
+    }
+    let Some(order) = &select.order_by else {
+        return false;
+    };
+    if !matches!(
+        select.projection,
+        SelectProjection::All | SelectProjection::Columns(_)
+    ) {
+        return false;
+    }
+    table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&order.column))
+        .is_some_and(|c| {
+            matches!(
+                c.ty,
+                SqlType::Int4 | SqlType::Int8 | SqlType::Int2 | SqlType::Date | SqlType::Timestamp
+            )
+        })
+}
+
 impl Engine {
     pub fn execute_relational_select(
         &self,
@@ -36,7 +66,24 @@ impl Engine {
         text: &str,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         match parse_command_allowing_catalog(text) {
-            Ok(Command::Select(select)) => self.execute_relational_select(&select),
+            Ok(Command::Select(select)) => {
+                // A non-grouped ORDER BY over an i64-sortable int key is a charter-native GPU sort: run
+                // it through the general Expr executor (which sorts on the GPU via the bitonic sort),
+                // NOT the enumerated ordered-projection shape (Charter rule 2) or the CPU path.
+                if let Some(table) = self.relational_catalog_table(&select.table) {
+                    // Only route to the general GPU path when the table is GPU-resident: that path has
+                    // no CPU fallback, so for a non-resident table it would hard-error -- whereas the
+                    // strict/CPU-pinned path below serves non-resident tables correctly. (The general
+                    // path is the GPU-native one; this gate just preserves the entry's contract for
+                    // tables not yet resident.)
+                    if select_is_gpu_sortable_projection(&select, &table)
+                        && self.relational_residency_snapshot(&select.table).is_some()
+                    {
+                        return self.execute_resident_expr_select_sql(text);
+                    }
+                }
+                self.execute_relational_select(&select)
+            }
             Ok(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "expected a SELECT statement".to_string(),
             ))),
