@@ -2545,6 +2545,137 @@ fn gpu_grouped_by_text_key() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_min_max_over_text_value() {
+    // Grouped MIN/MAX over a TEXT VALUE -- the kernel keeps each group's min/max value text's ROW INDEX
+    // in slot_min/slot_max (EMPTY = u64::MAX) via a lock-free CAS loop with a LEXICOGRAPHIC byte compare
+    // (first differing byte unsigned; a strict prefix is smaller). Exercises a shared PREFIX (app<apple),
+    // an EMPTY string (the MIN of its group), different lengths, a last-byte-only difference, and a
+    // single-row group (MIN == MAX). Result text is read host-side from the winning row.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, s TEXT)").unwrap();
+    let rows: &[(i32, &str)] = &[
+        (1, "apple"),
+        (1, "app"), // prefix of "apple" -> "app" < "apple"
+        (1, "apricot"), // "apple" < "apricot"
+        (2, "z"),
+        (2, ""), // empty string is the MIN of group 2
+        (2, "a"),
+        (3, "xy1"),
+        (3, "xy2"), // last-byte-only difference
+        (3, "xy0"),
+        (4, "solo"), // single row: MIN == MAX
+    ];
+    let values = rows
+        .iter()
+        .map(|(g, s)| format!("({g}, '{s}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g, s) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let txt = |s: &str| SqlValue::Text(s.to_string());
+
+    let min = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(s) FROM t GROUP BY g")
+        .expect("text-value MIN");
+    assert_eq!(min.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        min.rows,
+        vec![
+            vec![SqlValue::Int4(1), txt("app")], // app < apple < apricot
+            vec![SqlValue::Int4(2), txt("")],    // empty string is smallest
+            vec![SqlValue::Int4(3), txt("xy0")],
+            vec![SqlValue::Int4(4), txt("solo")],
+        ],
+        "grouped MIN(text): prefix app<apple, empty string is the min"
+    );
+
+    let max = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(s) FROM t GROUP BY g")
+        .expect("text-value MAX");
+    assert_eq!(
+        max.rows,
+        vec![
+            vec![SqlValue::Int4(1), txt("apricot")],
+            vec![SqlValue::Int4(2), txt("z")],
+            vec![SqlValue::Int4(3), txt("xy2")],
+            vec![SqlValue::Int4(4), txt("solo")],
+        ],
+        "grouped MAX(text)"
+    );
+
+    // SUM over a text value must hard-error (text is MIN/MAX/COUNT only).
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT g, SUM(s) FROM t GROUP BY g")
+            .is_err(),
+        "SUM(text) must error"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_text_value_after_text_key_offset_alignment() {
+    // Regression: a text VALUE placed after a text KEY whose bytes are NOT a 4-multiple lands the
+    // value-text offsets at a non-4-aligned device offset. The kernels read each 8-byte offset entry as
+    // 2x `ld.global.u32` (4-byte alignment required), so the unaligned section faulted CUDA 716 (and
+    // pinned the GPU ~20s) until engine_residency aligned every varlen offsets section to 8 bytes. The
+    // key bytes here sum to 11 ('app'x2 + 'be'x2 + 'c' -- a non-4-multiple), which previously misaligned
+    // the value offsets. GROUP BY a text key with MIN/MAX over a text value must now run cleanly.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE w (k TEXT, v TEXT)").unwrap();
+    let rows: &[(&str, &str)] = &[
+        ("app", "banana"),
+        ("app", "apple"),
+        ("be", "cherry"),
+        ("be", "date"),
+        ("c", "fig"),
+    ];
+    let values = rows
+        .iter()
+        .map(|(k, v)| format!("('{k}', '{v}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO w (k, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("w").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let txt = |s: &str| SqlValue::Text(s.to_string());
+
+    let min = e
+        .execute_resident_expr_select_sql("SELECT k, MIN(v) FROM w GROUP BY k")
+        .expect("text key + text value MIN must not fault on a non-4-multiple key-bytes layout");
+    assert_eq!(min.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        min.rows,
+        vec![
+            vec![txt("app"), txt("apple")],
+            vec![txt("be"), txt("cherry")],
+            vec![txt("c"), txt("fig")],
+        ],
+        "GROUP BY text key, MIN(text value) -- value offsets must be 8-aligned"
+    );
+
+    let max = e
+        .execute_resident_expr_select_sql("SELECT k, MAX(v) FROM w GROUP BY k")
+        .expect("text key + text value MAX");
+    assert_eq!(
+        max.rows,
+        vec![
+            vec![txt("app"), txt("banana")],
+            vec![txt("be"), txt("date")],
+            vec![txt("c"), txt("fig")],
+        ],
+        "GROUP BY text key, MAX(text value)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_uuid_key() {
     // GROUP BY a UUID (i128) key via atom.cas.b128; output sorts by canonical/memcmp byte order. Uses
     // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and

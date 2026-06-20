@@ -4002,9 +4002,31 @@ fill128_done:
     .param .u64 slot_keys_i128_ptr,
     .param .u64 key_is_text,
     .param .u64 key_offsets_off,
-    .param .u64 key_bytes_off
+    .param .u64 key_bytes_off,
+    .param .u64 value_is_text,
+    .param .u64 value_offsets_off,
+    .param .u64 value_bytes_off
 )
 {
+    .reg .pred %pvt;
+    .reg .pred %plt;
+    .reg .pred %pgt;
+    .reg .u64 %vtext;
+    .reg .u64 %voffoff;
+    .reg .u64 %vbytesoff;
+    .reg .u64 %vstart;
+    .reg .u64 %vend;
+    .reg .u64 %vlen;
+    .reg .u64 %vbaddr;
+    .reg .u64 %curidx;
+    .reg .u64 %thisidx;
+    .reg .u64 %cstart;
+    .reg .u64 %cend;
+    .reg .u64 %clen;
+    .reg .u64 %caddr;
+    .reg .u64 %minlen;
+    .reg .u64 %oldidx;
+    .reg .s64 %cmp;
     .reg .pred %pkt;
     .reg .u64 %ktext;
     .reg .u64 %koffoff;
@@ -4156,6 +4178,9 @@ fill128_done:
     ld.param.u64 %ktext, [key_is_text];
     ld.param.u64 %koffoff, [key_offsets_off];
     ld.param.u64 %kbytesoff, [key_bytes_off];
+    ld.param.u64 %vtext, [value_is_text];
+    ld.param.u64 %voffoff, [value_offsets_off];
+    ld.param.u64 %vbytesoff, [value_bytes_off];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4244,6 +4269,8 @@ ktext_hash_done:
     mov.b128 %key128, {%keylo, %keyhi};
 gb_kdone:
     add.u64 %addr, %base, %soff;
+    setp.ne.u64 %pvt, %vtext, 0;
+    @%pvt bra gb_vtext;
     setp.ne.u64 %puu, %vuu, 0;
     @%puu bra gb_vuuid;
     setp.ne.u64 %pvn, %vn, 0;
@@ -4254,6 +4281,24 @@ gb_kdone:
     add.u64 %addr, %addr, %off;
     ld.global.s32 %v32, [%addr];
     cvt.s64.s32 %val, %v32;
+    bra gb_vdone;
+gb_vtext:
+    // text value: offsets[idx]/offsets[idx+1] from base+voffoff, bytes at base+vbytesoff+start. No SUM
+    // (val=0); MIN/MAX uses %vstart/%vlen/%vaddr in gb_textminmax (lexicographic CAS on the row index).
+    cvt.u64.u32 %voff, %idx;
+    mul.lo.u64 %voff, %voff, 8;
+    add.u64 %addr, %base, %voffoff;
+    add.u64 %addr, %addr, %voff;
+    ld.global.u32 %vlo, [%addr];
+    ld.global.u32 %vhi, [%addr+4];
+    mov.b64 %vstart, {%vlo, %vhi};
+    ld.global.u32 %vlo, [%addr+8];
+    ld.global.u32 %vhi, [%addr+12];
+    mov.b64 %vend, {%vlo, %vhi};
+    sub.u64 %vlen, %vend, %vstart;
+    add.u64 %vbaddr, %base, %vbytesoff;
+    add.u64 %vbaddr, %vbaddr, %vstart;
+    mov.u64 %val, 0;
     bra gb_vdone;
 gb_vi64:
     // int8 value: 8-byte stride, read as 2x4-byte (section may be 4-mod-8 aligned), pack to s64.
@@ -4467,6 +4512,7 @@ gb_sumnum:
     setp.lt.s64 %pov, %t1, 0;
     @%pov red.global.or.b32 [%ovptr], 1;
 gb_sumd:
+    @%pvt bra gb_textminmax;
     @%puu bra gb_uuidminmax;
     @%pvn bra gb_numminmax;
     add.u64 %addr, %mnptr, %off;
@@ -4525,6 +4571,97 @@ uuid_max_loop:
     setp.eq.u64 %pf, %ohi, %chi;
     and.pred %pe, %pe, %pf;
     @!%pe bra uuid_max_loop;
+    bra gb_mmdone;
+gb_textminmax:
+    // text MIN/MAX: slot_min/slot_max hold the ROW INDEX of the group's min/max text value (EMPTY =
+    // u64::MAX = -1). Lock-free CAS loop on that i64 row index; comparator = lexicographic byte compare
+    // of this row's value text (%vstart/%vlen/%vaddr) vs the slot winner's text (re-read each retry).
+    cvt.u64.u32 %thisidx, %idx;
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %mnptr, %off;
+tmin_loop:
+    ld.global.u64 %curidx, [%addr];
+    setp.eq.u64 %p, %curidx, -1;
+    @%p bra tmin_cas;
+    mul.lo.u64 %o8, %curidx, 8;
+    add.u64 %caddr, %base, %voffoff;
+    add.u64 %caddr, %caddr, %o8;
+    ld.global.u32 %klo, [%caddr];
+    ld.global.u32 %khi, [%caddr+4];
+    mov.b64 %cstart, {%klo, %khi};
+    ld.global.u32 %klo, [%caddr+8];
+    ld.global.u32 %khi, [%caddr+12];
+    mov.b64 %cend, {%klo, %khi};
+    sub.u64 %clen, %cend, %cstart;
+    add.u64 %caddr, %base, %vbytesoff;
+    add.u64 %caddr, %caddr, %cstart;
+    min.u64 %minlen, %vlen, %clen;
+    mov.u64 %jt, 0;
+tmin_byte:
+    setp.ge.u64 %p, %jt, %minlen;
+    @%p bra tmin_lendiff;
+    add.u64 %aaddr, %vbaddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    add.u64 %baddr, %caddr, %jt;
+    ld.global.u8 %bbyte, [%baddr];
+    setp.lt.u32 %plt, %abyte, %bbyte;
+    @%plt bra tmin_cas;
+    setp.gt.u32 %pgt, %abyte, %bbyte;
+    @%pgt bra tmin_next_max;
+    add.u64 %jt, %jt, 1;
+    bra tmin_byte;
+tmin_lendiff:
+    setp.lt.u64 %plt, %vlen, %clen;
+    @%plt bra tmin_cas;
+    bra tmin_next_max;
+tmin_cas:
+    atom.global.cas.b64 %oldidx, [%addr], %curidx, %thisidx;
+    setp.eq.u64 %p, %oldidx, %curidx;
+    @%p bra tmin_next_max;
+    bra tmin_loop;
+tmin_next_max:
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %mxptr, %off;
+tmax_loop:
+    ld.global.u64 %curidx, [%addr];
+    setp.eq.u64 %p, %curidx, -1;
+    @%p bra tmax_cas;
+    mul.lo.u64 %o8, %curidx, 8;
+    add.u64 %caddr, %base, %voffoff;
+    add.u64 %caddr, %caddr, %o8;
+    ld.global.u32 %klo, [%caddr];
+    ld.global.u32 %khi, [%caddr+4];
+    mov.b64 %cstart, {%klo, %khi};
+    ld.global.u32 %klo, [%caddr+8];
+    ld.global.u32 %khi, [%caddr+12];
+    mov.b64 %cend, {%klo, %khi};
+    sub.u64 %clen, %cend, %cstart;
+    add.u64 %caddr, %base, %vbytesoff;
+    add.u64 %caddr, %caddr, %cstart;
+    min.u64 %minlen, %vlen, %clen;
+    mov.u64 %jt, 0;
+tmax_byte:
+    setp.ge.u64 %p, %jt, %minlen;
+    @%p bra tmax_lendiff;
+    add.u64 %aaddr, %vbaddr, %jt;
+    ld.global.u8 %abyte, [%aaddr];
+    add.u64 %baddr, %caddr, %jt;
+    ld.global.u8 %bbyte, [%baddr];
+    setp.gt.u32 %pgt, %abyte, %bbyte;
+    @%pgt bra tmax_cas;
+    setp.lt.u32 %plt, %abyte, %bbyte;
+    @%plt bra gb_mmdone;
+    add.u64 %jt, %jt, 1;
+    bra tmax_byte;
+tmax_lendiff:
+    setp.gt.u64 %pgt, %vlen, %clen;
+    @%pgt bra tmax_cas;
+    bra gb_mmdone;
+tmax_cas:
+    atom.global.cas.b64 %oldidx, [%addr], %curidx, %thisidx;
+    setp.eq.u64 %p, %oldidx, %curidx;
+    @%p bra gb_mmdone;
+    bra tmax_loop;
 gb_mmdone:
     add.u64 %i, %i, %stride;
     bra row_loop;

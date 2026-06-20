@@ -215,6 +215,15 @@ impl Engine {
             .enumerate()
             .filter(|(_idx, column)| column.ty == SqlType::Text)
         {
+            // Align every varlen offsets section to 8 bytes. The device kernels read each 8-byte offset
+            // entry as 2x `ld.global.u32` (4-byte alignment required); a byte-tight section that follows
+            // a data-dependent text-bytes blob (e.g. a text VALUE after a text KEY, or two text columns)
+            // can otherwise land at a non-4-aligned offset and fault CUDA 716 -- which also pins the GPU
+            // for ~20s while the runtime recovers the context. Padding the offsets to 8 keeps every
+            // text consumer (group-by key/value, text-eq, LIKE) safe.
+            while !device_payload.len().is_multiple_of(8) {
+                device_payload.push(0);
+            }
             let offsets_byte_offset = device_payload.len() as u64;
             let mut text_offsets = Vec::with_capacity(row_count + 1);
             let mut text_bytes = Vec::new();

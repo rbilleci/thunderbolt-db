@@ -1203,6 +1203,9 @@ impl CudaResidentDeviceMemory {
             false, // ...not a text key
             0,     // key_offsets_off (unused off the text-key path)
             0,     // key_bytes_off
+            false, // ...not a text value
+            0,     // value_offsets_off
+            0,     // value_bytes_off
         )
     }
 
@@ -1225,6 +1228,9 @@ impl CudaResidentDeviceMemory {
         key_is_text: bool,
         key_offsets_off: u64,
         key_bytes_off: u64,
+        value_is_text: bool,
+        value_offsets_off: u64,
+        value_bytes_off: u64,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1240,6 +1246,9 @@ impl CudaResidentDeviceMemory {
             key_is_text,
             key_offsets_off,
             key_bytes_off,
+            value_is_text,
+            value_offsets_off,
+            value_bytes_off,
         )
     }
 
@@ -1270,6 +1279,9 @@ impl CudaResidentDeviceMemory {
             false, // ...not uuid
             false, // ...not an i128 key
             false, // ...not a text key
+            0,
+            0,
+            false, // ...not a text value
             0,
             0,
         )
@@ -5655,6 +5667,9 @@ fn launch_cuda_group_by_i32_count_sum(
     key_is_text: bool,
     key_offsets_off: u64,
     key_bytes_off: u64,
+    value_is_text: bool,
+    value_offsets_off: u64,
+    value_bytes_off: u64,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5780,12 +5795,20 @@ fn launch_cuda_group_by_i32_count_sum(
     // Numeric MIN/MAX stores an i128, so its identities are the i128 extremes split into limbs:
     // MIN = i128::MAX (hi i64::MAX, lo u64::MAX), MAX = i128::MIN (hi i64::MIN, lo 0). int4/int8 keep
     // the s64 identities in the LOW limb (hi unused -> 0).
-    let min_lo_id: u64 = if value_is_numeric {
+    // Text MIN/MAX stores a ROW INDEX (not a value); both slots start at the EMPTY sentinel u64::MAX
+    // (-1) so the first row of each group claims via CAS and later rows compare lexicographically.
+    let min_lo_id: u64 = if value_is_text || value_is_numeric {
         u64::MAX
     } else {
         i64::MAX as u64
     };
-    let max_lo_id: u64 = if value_is_numeric { 0 } else { i64::MIN as u64 };
+    let max_lo_id: u64 = if value_is_text {
+        u64::MAX
+    } else if value_is_numeric {
+        0
+    } else {
+        i64::MIN as u64
+    };
     let min_hi_id: u64 = if value_is_numeric { i64::MAX as u64 } else { 0 };
     let max_hi_id: u64 = if value_is_numeric { i64::MIN as u64 } else { 0 };
 
@@ -5826,6 +5849,9 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a24 = u64::from(key_is_text);
     let mut a25 = key_offsets_off;
     let mut a26 = key_bytes_off;
+    let mut a27 = u64::from(value_is_text);
+    let mut a28 = value_offsets_off;
+    let mut a29 = value_bytes_off;
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -5865,6 +5891,9 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a24 as *mut u64).cast::<c_void>(),
         (&mut a25 as *mut u64).cast::<c_void>(),
         (&mut a26 as *mut u64).cast::<c_void>(),
+        (&mut a27 as *mut u64).cast::<c_void>(),
+        (&mut a28 as *mut u64).cast::<c_void>(),
+        (&mut a29 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -6304,6 +6333,9 @@ fn launch_cuda_group_by_kernel_timed(
         0, // key_is_text = false: the timed bench always groups by an int4 key
         0, // key_offsets_off (unused)
         0, // key_bytes_off (unused)
+        0, // value_is_text = false: the timed bench always aggregates an int4 value
+        0, // value_offsets_off (unused)
+        0, // value_bytes_off (unused)
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();

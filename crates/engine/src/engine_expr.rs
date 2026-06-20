@@ -1254,14 +1254,14 @@ impl Engine {
                 SqlType::Numeric { scale, .. } => scale,
                 _ => 0,
             };
-            let (value_is_int8, value_is_numeric, value_is_uuid) = match kind {
-                GroupedAgg::Count => (false, false, false),
+            let (value_is_int8, value_is_numeric, value_is_uuid, value_is_text) = match kind {
+                GroupedAgg::Count => (false, false, false, false),
                 GroupedAgg::Sum | GroupedAgg::Avg => match value_ty {
                     // SUM/AVG are numeric aggregations: int2/int4 (int4 read), int8, numeric. Temporal
-                    // types (date/timestamp) and uuid have no SUM/AVG.
-                    SqlType::Int4 | SqlType::Int2 => (false, false, false),
-                    SqlType::Int8 => (true, false, false),
-                    SqlType::Numeric { .. } => (false, true, false),
+                    // types (date/timestamp), uuid, and text have no SUM/AVG.
+                    SqlType::Int4 | SqlType::Int2 => (false, false, false, false),
+                    SqlType::Int8 => (true, false, false, false),
+                    SqlType::Numeric { .. } => (false, true, false, false),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "grouped SUM / AVG support int2 / int4 / int8 / numeric value columns on \
@@ -1273,15 +1273,17 @@ impl Engine {
                 GroupedAgg::Min | GroupedAgg::Max => match value_ty {
                     // MIN/MAX work for any ordered type: int2/int4/date ride the int4 read; int8/
                     // timestamp ride the int8 read; numeric uses the two-pass i128; uuid uses the
-                    // b128 CAS-loop (unsigned big-endian / memcmp order).
-                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => (false, false, false),
-                    SqlType::Int8 | SqlType::Timestamp => (true, false, false),
-                    SqlType::Numeric { .. } => (false, true, false),
-                    SqlType::Uuid => (false, false, true),
+                    // b128 CAS-loop (unsigned big-endian / memcmp order); text uses a lexicographic
+                    // CAS loop on the winning row index.
+                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => (false, false, false, false),
+                    SqlType::Int8 | SqlType::Timestamp => (true, false, false, false),
+                    SqlType::Numeric { .. } => (false, true, false, false),
+                    SqlType::Uuid => (false, false, true, false),
+                    SqlType::Text => (false, false, false, true),
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped MIN / MAX support int2 / int4 / int8 / numeric / uuid / date / \
-                             timestamp value columns on the Expr path"
+                            "grouped MIN / MAX support int2 / int4 / int8 / numeric / uuid / text / \
+                             date / timestamp value columns on the Expr path"
                                 .to_string(),
                         )));
                     }
@@ -1299,7 +1301,8 @@ impl Engine {
             };
             // COUNT(*) has no value column; the kernel ignores the summed value when value == key.
             // uuid shares the 16-byte numeric section, so it uses the same offset resolver.
-            let value_offset = if matches!(kind, GroupedAgg::Count) {
+            let value_offset = if matches!(kind, GroupedAgg::Count) || value_is_text {
+                // text values are read via value_offsets_off/value_bytes_off; COUNT has no value column.
                 key_offset
             } else if value_is_numeric || value_is_uuid {
                 resident_device_numeric_column_offset(&snapshot, table, value_idx)?
@@ -1308,6 +1311,13 @@ impl Engine {
             } else {
                 resident_device_int4_column_offset(&snapshot, table, value_idx)?
             };
+            // text-value MIN/MAX reads the value column's varlen offsets/bytes (like the text-key path).
+            let (value_offsets_off, value_bytes_off) = if value_is_text {
+                let layout = resident_device_text_column_layout(&snapshot, table, value_idx)?;
+                (layout.offsets_byte_offset, layout.bytes_byte_offset)
+            } else {
+                (0, 0)
+            };
             // The single-level kernel computes per-group MIN/MAX and (for int8) the i128 SUM, and is
             // the only one that reads int8 KEYS, so route MIN/MAX, int8 SUM/AVG, and any int8-key query
             // there; int4-key COUNT/SUM/AVG use the two-level contention workhorse.
@@ -1315,6 +1325,7 @@ impl Engine {
                 || value_is_int8
                 || value_is_numeric
                 || value_is_uuid
+                || value_is_text
                 || key_is_int8
                 || key_is_i128
                 || key_is_text;
@@ -1331,6 +1342,9 @@ impl Engine {
                     key_is_text,
                     key_offsets_off,
                     key_bytes_off,
+                    value_is_text,
+                    value_offsets_off,
+                    value_bytes_off,
                 )
             } else {
                 device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
@@ -1339,7 +1353,7 @@ impl Engine {
             // A TEXT key's string lives host-side: the kernel stored each group's representative
             // ABSOLUTE row index in key_i128's low 64 bits; the key is that row's group column. Read
             // from the same residency_entry generation loaded above (consistent with the GPU result).
-            let text_host_rows = if key_is_text {
+            let text_host_rows = if key_is_text || value_is_text {
                 Some(residency_entry.host_rows.clone())
             } else {
                 None
@@ -1374,6 +1388,18 @@ impl Engine {
                         // uuid carries the b128 result in min_uuid/max_uuid (already canonical order).
                         GroupedAgg::Min if value_is_uuid => SqlValue::Uuid(g.min_uuid),
                         GroupedAgg::Max if value_is_uuid => SqlValue::Uuid(g.max_uuid),
+                        // text MIN/MAX: g.min/g.max hold the ABSOLUTE row index of the lexicographically
+                        // smallest/largest value text in the group; read that row's value column.
+                        GroupedAgg::Min if value_is_text => text_host_rows
+                            .as_ref()
+                            .expect("text_host_rows is Some when value_is_text")
+                            [g.min as u64 as usize][value_idx]
+                            .clone(),
+                        GroupedAgg::Max if value_is_text => text_host_rows
+                            .as_ref()
+                            .expect("text_host_rows is Some when value_is_text")
+                            [g.max as u64 as usize][value_idx]
+                            .clone(),
                         GroupedAgg::Min => narrow_ordered_value(value_ty, g.min, g.min_hi, value_scale),
                         GroupedAgg::Max => narrow_ordered_value(value_ty, g.max, g.max_hi, value_scale),
                     };
