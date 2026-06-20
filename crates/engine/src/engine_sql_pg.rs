@@ -180,11 +180,17 @@ fn build_grouped_projection(
     group_column: &str,
     qualifier: &str,
 ) -> Result<SelectProjection, ExecuteError> {
-    let [group_target, aggregate_target] = target_list else {
+    let [group_target, aggregate_targets @ ..] = target_list else {
         return Err(sql_pg_error(
-            "a grouped SELECT must project exactly the GROUP BY column and one aggregate".to_string(),
+            "a grouped SELECT must project the GROUP BY column and at least one aggregate".to_string(),
         ));
     };
+    if aggregate_targets.is_empty() {
+        return Err(sql_pg_error(
+            "a grouped SELECT must project at least one aggregate after the GROUP BY column"
+                .to_string(),
+        ));
+    }
     // Target 0 must be the group column itself.
     let NodeEnum::ResTarget(group_res) = node_enum(group_target)? else {
         return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
@@ -203,39 +209,49 @@ fn build_grouped_projection(
             "the projected column must be the GROUP BY column".to_string(),
         ));
     }
-    // Target 1 must be a scalar aggregate; lift it to its grouped form keyed by the group column.
-    let NodeEnum::ResTarget(agg_res) = node_enum(aggregate_target)? else {
-        return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
-    };
-    let Some(aggregate) = try_parse_scalar_aggregate(agg_res, qualifier)? else {
-        return Err(sql_pg_error(
-            "a grouped SELECT's second projection must be an aggregate (COUNT(*) / SUM / AVG)"
-                .to_string(),
-        ));
-    };
-    let group_column = group_column.to_string();
-    match aggregate {
-        SelectProjection::CountAll => Ok(SelectProjection::GroupedCount {
-            column: group_column,
-        }),
-        SelectProjection::Sum { column } => Ok(SelectProjection::GroupedSum {
-            group_column,
-            sum_column: column,
-        }),
-        SelectProjection::Avg { column } => Ok(SelectProjection::GroupedAvg {
-            group_column,
-            avg_column: column,
-        }),
-        SelectProjection::Min { column } => Ok(SelectProjection::GroupedMin {
-            group_column,
-            min_column: column,
-        }),
-        SelectProjection::Max { column } => Ok(SelectProjection::GroupedMax {
-            group_column,
-            max_column: column,
-        }),
-        _ => Err(sql_pg_error("unsupported grouped aggregate".to_string())),
+    // Targets 1..=N must each be a scalar aggregate; lift each to a GroupedAggregate keyed by the
+    // group column. A single aggregate yields a 1-element vec (same behavior as the old 1-agg form).
+    let mut aggregates = Vec::with_capacity(aggregate_targets.len());
+    for aggregate_target in aggregate_targets {
+        let NodeEnum::ResTarget(agg_res) = node_enum(aggregate_target)? else {
+            return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
+        };
+        let Some(aggregate) = try_parse_scalar_aggregate(agg_res, qualifier)? else {
+            return Err(sql_pg_error(
+                "every grouped projection after the GROUP BY column must be an aggregate \
+                 (COUNT(*) / SUM / AVG / MIN / MAX)"
+                    .to_string(),
+            ));
+        };
+        let grouped = match aggregate {
+            SelectProjection::CountAll => GroupedAggregate {
+                kind: GroupedAggKind::Count,
+                value_column: None,
+            },
+            SelectProjection::Sum { column } => GroupedAggregate {
+                kind: GroupedAggKind::Sum,
+                value_column: Some(column),
+            },
+            SelectProjection::Avg { column } => GroupedAggregate {
+                kind: GroupedAggKind::Avg,
+                value_column: Some(column),
+            },
+            SelectProjection::Min { column } => GroupedAggregate {
+                kind: GroupedAggKind::Min,
+                value_column: Some(column),
+            },
+            SelectProjection::Max { column } => GroupedAggregate {
+                kind: GroupedAggKind::Max,
+                value_column: Some(column),
+            },
+            _ => return Err(sql_pg_error("unsupported grouped aggregate".to_string())),
+        };
+        aggregates.push(grouped);
     }
+    Ok(SelectProjection::GroupedAggregates {
+        group_column: group_column.to_string(),
+        aggregates,
+    })
 }
 
 /// Map the SELECT target list to a projection: a lone `*` -> `All`, otherwise a list of plain column

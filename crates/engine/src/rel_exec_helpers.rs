@@ -1012,6 +1012,9 @@ pub(crate) fn bind_relational_select(
         | SelectProjection::GroupedMax { group_column, .. } => {
             vec![relational_column_index(table, group_column)?]
         }
+        SelectProjection::GroupedAggregates { group_column, .. } => {
+            vec![relational_column_index(table, group_column)?]
+        }
     };
     let mut selected_columns = selected_indexes
         .iter()
@@ -1036,7 +1039,9 @@ pub(crate) fn bind_relational_select(
             SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => "avg",
             SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => "min",
             SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => "max",
-            SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
+            SelectProjection::All
+            | SelectProjection::Columns(_)
+            | SelectProjection::GroupedAggregates { .. } => unreachable!(),
         };
         let (aggregate_ty, aggregate_type_oid, aggregate_type_size) = match &select.projection {
             // AVG yields a fixed-point numeric at scale 16 (numeric OID 1700).
@@ -1096,6 +1101,75 @@ pub(crate) fn bind_relational_select(
             type_oid: aggregate_type_oid,
             type_size: aggregate_type_size,
         });
+    }
+    // The general grouped form projects the group column (already in selected_columns) plus one result
+    // column per aggregate. Each aggregate's wire type follows PG: COUNT->int8, AVG->numeric@16,
+    // SUM(int8/numeric)->numeric, SUM(int*)->int4(bigint oid), MIN/MAX-> the source column's type.
+    if let SelectProjection::GroupedAggregates { aggregates, .. } = &select.projection {
+        for aggregate in aggregates {
+            let (name, ty, type_oid, type_size) = match aggregate.kind {
+                GroupedAggKind::Count => ("count", SqlType::Int8, 20, 8),
+                GroupedAggKind::Avg => (
+                    "avg",
+                    SqlType::Numeric {
+                        precision: NUMERIC_DEFAULT_PRECISION,
+                        scale: AVG_RESULT_SCALE,
+                    },
+                    1700,
+                    -1,
+                ),
+                GroupedAggKind::Sum => {
+                    let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "grouped SUM requires a value column".to_string(),
+                        ))
+                    })?;
+                    let idx = relational_column_index(table, column)?;
+                    match table.columns[idx].ty {
+                        SqlType::Int8 => (
+                            "sum",
+                            SqlType::Numeric {
+                                precision: NUMERIC_DEFAULT_PRECISION,
+                                scale: 0,
+                            },
+                            1700,
+                            -1,
+                        ),
+                        SqlType::Numeric { precision, scale } => {
+                            ("sum", SqlType::Numeric { precision, scale }, 1700, -1)
+                        }
+                        _ => ("sum", SqlType::Int4, 20, 8),
+                    }
+                }
+                GroupedAggKind::Min | GroupedAggKind::Max => {
+                    let name = if matches!(aggregate.kind, GroupedAggKind::Min) {
+                        "min"
+                    } else {
+                        "max"
+                    };
+                    let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "grouped MIN/MAX requires a value column".to_string(),
+                        ))
+                    })?;
+                    let idx = relational_column_index(table, column)?;
+                    let col = &table.columns[idx];
+                    (name, col.ty, col.type_oid, col.type_size)
+                }
+            };
+            let attnum = selected_columns.len() as i16 + 1;
+            selected_columns.push(RelationalColumn {
+                id: 0,
+                table_oid: table.oid,
+                attnum,
+                name: name.to_string(),
+                ty,
+                domain: None,
+                default: None,
+                type_oid,
+                type_size,
+            });
+        }
     }
     let raw_filter_groups = if select.filter_groups.is_empty() {
         let filter_refs = if select.filters.is_empty() {
@@ -1166,7 +1240,8 @@ pub(crate) fn bind_relational_select(
             | SelectProjection::Min { .. }
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
-            | SelectProjection::GroupedMax { .. } => unreachable!(),
+            | SelectProjection::GroupedMax { .. }
+            | SelectProjection::GroupedAggregates { .. } => unreachable!(),
         }
     }
     let group_by_index = if let Some(group_by) = &select.group_by {
@@ -1326,6 +1401,56 @@ pub(crate) fn bind_relational_select(
         (SelectProjection::GroupedMin { .. } | SelectProjection::GroupedMax { .. }, None) => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "grouped MIN/MAX requires GROUP BY".to_string(),
+            )));
+        }
+        (
+            SelectProjection::GroupedAggregates {
+                group_column,
+                aggregates,
+            },
+            Some(idx),
+        ) => {
+            let projected_idx = relational_column_index(table, group_column)?;
+            if projected_idx != idx {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "GROUP BY column must match the grouped projection".to_string(),
+                )));
+            }
+            for aggregate in aggregates {
+                match aggregate.kind {
+                    GroupedAggKind::Count => {}
+                    GroupedAggKind::Sum => {
+                        let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "grouped SUM requires a value column".to_string(),
+                            ))
+                        })?;
+                        validate_sum_column(table, column)?;
+                    }
+                    GroupedAggKind::Avg => {
+                        let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "grouped AVG requires a value column".to_string(),
+                            ))
+                        })?;
+                        validate_avg_column(table, column)?;
+                    }
+                    GroupedAggKind::Min | GroupedAggKind::Max => {
+                        // The device value-type classification rejects unsupported MIN/MAX types; here
+                        // just confirm the value column exists.
+                        let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "grouped MIN/MAX requires a value column".to_string(),
+                            ))
+                        })?;
+                        relational_column_index(table, column)?;
+                    }
+                }
+            }
+        }
+        (SelectProjection::GroupedAggregates { .. }, None) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "grouped aggregates require GROUP BY".to_string(),
             )));
         }
         (SelectProjection::All | SelectProjection::Columns(_), Some(_)) => {
@@ -1522,7 +1647,11 @@ pub(crate) fn select_is_aggregate_result_column(select: &Select, column: &str) -
         SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => {
             column.eq_ignore_ascii_case("max")
         }
-        SelectProjection::All | SelectProjection::Columns(_) => false,
+        // GroupedAggregates is produced only on the Expr path, which does not route through this
+        // CPU-path HAVING/ORDER-BY helper; never reached for it.
+        SelectProjection::All
+        | SelectProjection::Columns(_)
+        | SelectProjection::GroupedAggregates { .. } => false,
     }
 }
 
@@ -1533,7 +1662,10 @@ pub(crate) fn select_aggregate_result_column_name(select: &Select) -> Option<&'s
         SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => Some("avg"),
         SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => Some("min"),
         SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => Some("max"),
-        SelectProjection::All | SelectProjection::Columns(_) => None,
+        // GroupedAggregates has N aggregates (no single result-column name); Expr-path only.
+        SelectProjection::All
+        | SelectProjection::Columns(_)
+        | SelectProjection::GroupedAggregates { .. } => None,
     }
 }
 
@@ -1588,7 +1720,8 @@ pub(crate) fn aggregate_source_column<'a>(
         | SelectProjection::Avg { .. }
         | SelectProjection::GroupedAvg { .. }
         | SelectProjection::All
-        | SelectProjection::Columns(_) => None,
+        | SelectProjection::Columns(_)
+        | SelectProjection::GroupedAggregates { .. } => None,
     };
     let Some(column_name) = column_name else {
         return Ok(None);

@@ -558,7 +558,8 @@ fn execute_select_result_inner(
         | SelectProjection::Min { .. }
         | SelectProjection::GroupedMin { .. }
         | SelectProjection::Max { .. }
-        | SelectProjection::GroupedMax { .. } => unreachable!(),
+        | SelectProjection::GroupedMax { .. }
+        | SelectProjection::GroupedAggregates { .. } => unreachable!(),
     };
     if select.distinct {
         match &select.projection {
@@ -589,7 +590,8 @@ fn execute_select_result_inner(
             | SelectProjection::Min { .. }
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
-            | SelectProjection::GroupedMax { .. } => unreachable!(),
+            | SelectProjection::GroupedMax { .. }
+            | SelectProjection::GroupedAggregates { .. } => unreachable!(),
         }
     }
     let selected_indexes = selected_columns
@@ -931,6 +933,9 @@ fn execute_aggregate_select_result(
     }
 
     match &select.projection {
+        // GroupedAggregates (N aggregates per group) is produced only by the engine Expr parser, not
+        // the wire-protocol parser that feeds this handler.
+        SelectProjection::GroupedAggregates { .. } => unreachable!(),
         SelectProjection::CountAll => {
             if select.group_by.is_some() {
                 return Err(ErrorField {
@@ -16050,7 +16055,8 @@ fn pg_dump_attribute_metadata_rows(
                 | SelectProjection::Min { .. }
                 | SelectProjection::GroupedMin { .. }
                 | SelectProjection::Max { .. }
-                | SelectProjection::GroupedMax { .. } => Vec::new(),
+                | SelectProjection::GroupedMax { .. }
+                | SelectProjection::GroupedAggregates { .. } => Vec::new(),
             };
             for (idx, column) in columns.into_iter().enumerate() {
                 let Ok(attnum) = i16::try_from(idx + 1) else {
@@ -20670,6 +20676,8 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
     };
     let table = session.tables.get(&table_name)?;
     match projection {
+        // GroupedAggregates is produced only by the engine Expr parser, not the wire-protocol parser.
+        SelectProjection::GroupedAggregates { .. } => None,
         SelectProjection::All => Some(
             table
                 .columns

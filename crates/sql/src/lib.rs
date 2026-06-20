@@ -1759,6 +1759,31 @@ pub enum SelectProjection {
         group_column: String,
         max_column: String,
     },
+    /// A grouped SELECT projecting N aggregates over one GROUP BY key (the general grouped form on the
+    /// Expr path). Each aggregate carries its own function + value column (None for COUNT(*)). The
+    /// single Grouped{Count,Sum,Avg,Min,Max} variants above remain the legacy 1-aggregate shapes used
+    /// by the hand-rolled CPU path.
+    GroupedAggregates {
+        group_column: String,
+        aggregates: Vec<GroupedAggregate>,
+    },
+}
+
+/// One aggregate within a `GroupedAggregates` projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedAggregate {
+    pub kind: GroupedAggKind,
+    /// The aggregated value column, or `None` for COUNT(*).
+    pub value_column: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedAggKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

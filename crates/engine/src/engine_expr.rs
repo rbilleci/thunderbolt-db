@@ -1078,6 +1078,7 @@ impl Engine {
                 | SelectProjection::GroupedAvg { .. }
                 | SelectProjection::GroupedMin { .. }
                 | SelectProjection::GroupedMax { .. }
+                | SelectProjection::GroupedAggregates { .. }
         );
         if !is_aggregate && !is_grouped {
             if bound.selected_indexes.is_empty() {
@@ -1173,39 +1174,34 @@ impl Engine {
         // row per distinct key. COUNT/SUM/AVG share the count+sum kernel; grouped MIN/MAX is a
         // follow-on. PG does not order GROUP BY without ORDER BY; sort by key for determinism.
         if is_grouped {
-            #[derive(Clone, Copy)]
-            enum GroupedAgg {
-                Count,
-                Sum,
-                Avg,
-                Min,
-                Max,
-            }
             let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                 ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
             };
-            let (group_name, value_name, kind) = match &select.projection {
-                SelectProjection::GroupedCount { column } => (column, column, GroupedAgg::Count),
-                SelectProjection::GroupedSum {
-                    group_column,
-                    sum_column,
-                } => (group_column, sum_column, GroupedAgg::Sum),
-                SelectProjection::GroupedAvg {
-                    group_column,
-                    avg_column,
-                } => (group_column, avg_column, GroupedAgg::Avg),
-                SelectProjection::GroupedMin {
-                    group_column,
-                    min_column,
-                } => (group_column, min_column, GroupedAgg::Min),
-                SelectProjection::GroupedMax {
-                    group_column,
-                    max_column,
-                } => (group_column, max_column, GroupedAgg::Max),
-                _ => unreachable!(
-                    "is_grouped gates on GroupedCount | GroupedSum | GroupedAvg | GroupedMin | GroupedMax"
-                ),
+            let SelectProjection::GroupedAggregates {
+                group_column: group_name,
+                aggregates,
+            } = &select.projection
+            else {
+                unreachable!("is_grouped gates on GroupedAggregates on the Expr path");
             };
+            // Resolve each aggregate's value column to an index (None for COUNT(*)), and the distinct
+            // value columns in first-seen order -- one grouping pass per distinct value column, since
+            // the kernel yields count+sum+min+max for one value column.
+            let agg_value_indices: Vec<Option<usize>> = aggregates
+                .iter()
+                .map(|a| {
+                    a.value_column
+                        .as_deref()
+                        .map(|c| relational_column_index(table, c))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut value_indices: Vec<usize> = Vec::new();
+            for value_idx in agg_value_indices.iter().flatten() {
+                if !value_indices.contains(value_idx) {
+                    value_indices.push(*value_idx);
+                }
+            }
             let group_idx = relational_column_index(table, group_name)?;
             let key_ty = table.columns[group_idx].ty;
             // GROUP BY key: int2/int4/date ride the int4 (4-byte) section; int8/timestamp ride the int8
@@ -1241,54 +1237,6 @@ impl Engine {
                 SqlType::Numeric { scale, .. } => scale,
                 _ => 0,
             };
-            let value_idx = relational_column_index(table, value_name)?;
-            let value_ty = table.columns[value_idx].ty;
-            // SUM/AVG/MIN/MAX accept an int4 or int8 value (`value_is_int8` selects the 8-byte vs
-            // 4-byte value read; the single-level kernel accumulates int8 SUM as i128 and does signed
-            // atom.min/max.s64). numeric values are a follow-on. COUNT(*) has no value.
-            // SUM/AVG and MIN/MAX accept int4 / int8 / numeric (numeric MIN/MAX resolves the i128 via
-            // a LOCK-FREE two-pass kernel -- high limb, then low limb among ties -- since there is no
-            // native 128-bit atomic). value_scale carries the numeric column scale onto the result
-            // (0 for the integer paths).
-            let value_scale: u8 = match value_ty {
-                SqlType::Numeric { scale, .. } => scale,
-                _ => 0,
-            };
-            let (value_is_int8, value_is_numeric, value_is_uuid, value_is_text) = match kind {
-                GroupedAgg::Count => (false, false, false, false),
-                GroupedAgg::Sum | GroupedAgg::Avg => match value_ty {
-                    // SUM/AVG are numeric aggregations: int2/int4 (int4 read), int8, numeric. Temporal
-                    // types (date/timestamp), uuid, and text have no SUM/AVG.
-                    SqlType::Int4 | SqlType::Int2 => (false, false, false, false),
-                    SqlType::Int8 => (true, false, false, false),
-                    SqlType::Numeric { .. } => (false, true, false, false),
-                    _ => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped SUM / AVG support int2 / int4 / int8 / numeric value columns on \
-                             the Expr path"
-                                .to_string(),
-                        )));
-                    }
-                },
-                GroupedAgg::Min | GroupedAgg::Max => match value_ty {
-                    // MIN/MAX work for any ordered type: int2/int4/date ride the int4 read; int8/
-                    // timestamp ride the int8 read; numeric uses the two-pass i128; uuid uses the
-                    // b128 CAS-loop (unsigned big-endian / memcmp order); text uses a lexicographic
-                    // CAS loop on the winning row index.
-                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => (false, false, false, false),
-                    SqlType::Int8 | SqlType::Timestamp => (true, false, false, false),
-                    SqlType::Numeric { .. } => (false, true, false, false),
-                    SqlType::Uuid => (false, false, true, false),
-                    SqlType::Text => (false, false, false, true),
-                    _ => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "grouped MIN / MAX support int2 / int4 / int8 / numeric / uuid / text / \
-                             date / timestamp value columns on the Expr path"
-                                .to_string(),
-                        )));
-                    }
-                },
-            };
             let key_offset = if key_is_text {
                 // text keys are read via key_offsets_off/key_bytes_off; key_byte_offset is unused.
                 0
@@ -1299,151 +1247,262 @@ impl Engine {
             } else {
                 resident_device_int4_column_offset(&snapshot, table, group_idx)?
             };
-            // COUNT(*) has no value column; the kernel ignores the summed value when value == key.
-            // uuid shares the 16-byte numeric section, so it uses the same offset resolver.
-            let value_offset = if matches!(kind, GroupedAgg::Count) || value_is_text {
-                // text values are read via value_offsets_off/value_bytes_off; COUNT has no value column.
-                key_offset
-            } else if value_is_numeric || value_is_uuid {
-                resident_device_numeric_column_offset(&snapshot, table, value_idx)?
-            } else if value_is_int8 {
-                resident_device_int8_column_offset(&snapshot, table, value_idx)?
-            } else {
-                resident_device_int4_column_offset(&snapshot, table, value_idx)?
-            };
-            // text-value MIN/MAX reads the value column's varlen offsets/bytes (like the text-key path).
-            let (value_offsets_off, value_bytes_off) = if value_is_text {
-                let layout = resident_device_text_column_layout(&snapshot, table, value_idx)?;
-                (layout.offsets_byte_offset, layout.bytes_byte_offset)
-            } else {
-                (0, 0)
-            };
-            // The single-level kernel computes per-group MIN/MAX and (for int8) the i128 SUM, and is
-            // the only one that reads int8 KEYS, so route MIN/MAX, int8 SUM/AVG, and any int8-key query
-            // there; int4-key COUNT/SUM/AVG use the two-level contention workhorse.
-            let use_single_level = matches!(kind, GroupedAgg::Min | GroupedAgg::Max)
-                || value_is_int8
-                || value_is_numeric
-                || value_is_uuid
-                || value_is_text
-                || key_is_int8
-                || key_is_i128
-                || key_is_text;
-            let groups = if use_single_level {
-                device_memory.group_by_i32_count_sum_minmax_from_payload(
-                    key_offset,
-                    value_offset,
-                    &indices,
-                    value_is_int8,
-                    key_is_int8,
-                    value_is_numeric,
-                    value_is_uuid,
-                    key_is_i128,
-                    key_is_text,
-                    key_offsets_off,
-                    key_bytes_off,
-                    value_is_text,
-                    value_offsets_off,
-                    value_bytes_off,
-                )
-            } else {
-                device_memory.group_by_i32_count_sum_from_payload(key_offset, value_offset, &indices)
+            // One grouping PASS per distinct value column. The kernel yields count+sum+min+max for one
+            // value column; each aggregate projects from its column's pass. Every pass groups the SAME
+            // key column over the SAME rows, so the i-th group of every pass is the same key (single
+            // level is forced when there are >=2 passes so the passes share one compaction order) ->
+            // the result merges the passes by group index.
+            struct Pass {
+                value_idx: usize,
+                groups: Vec<gpu_db_execution::GroupByI32Row>,
+                value_ty: SqlType,
+                value_scale: u8,
+                value_is_int8: bool,
+                value_is_numeric: bool,
+                value_is_uuid: bool,
+                value_is_text: bool,
             }
-            .map_err(map_err)?;
-            // A TEXT key's string lives host-side: the kernel stored each group's representative
-            // ABSOLUTE row index in key_i128's low 64 bits; the key is that row's group column. Read
-            // from the same residency_entry generation loaded above (consistent with the GPU result).
-            let text_host_rows = if key_is_text || value_is_text {
+            let force_single = value_indices.len() > 1;
+            let run_pass =
+                |value_idx_opt: Option<usize>, has_minmax: bool| -> Result<Pass, ExecuteError> {
+                    // A None value column is the COUNT(*)-only pass: group over the key, read .count.
+                    let value_idx = value_idx_opt.unwrap_or(group_idx);
+                    let value_ty = table.columns[value_idx].ty;
+                    let value_scale: u8 = match value_ty {
+                        SqlType::Numeric { scale, .. } => scale,
+                        _ => 0,
+                    };
+                    // Classify by the value TYPE (the device read width). MIN/MAX accept every ordered
+                    // type; SUM/AVG over an unsupported type is rejected at bind. COUNT reads no value.
+                    let (value_is_int8, value_is_numeric, value_is_uuid, value_is_text) =
+                        if value_idx_opt.is_none() {
+                            (false, false, false, false)
+                        } else {
+                            match value_ty {
+                                SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
+                                    (false, false, false, false)
+                                }
+                                SqlType::Int8 | SqlType::Timestamp => (true, false, false, false),
+                                SqlType::Numeric { .. } => (false, true, false, false),
+                                SqlType::Uuid => (false, false, true, false),
+                                SqlType::Text => (false, false, false, true),
+                                _ => {
+                                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                        "grouped aggregate value columns must be int2 / int4 / int8 \
+                                         / numeric / uuid / text / date / timestamp on the Expr path"
+                                            .to_string(),
+                                    )));
+                                }
+                            }
+                        };
+                    let value_offset = if value_idx_opt.is_none() || value_is_text {
+                        key_offset
+                    } else if value_is_numeric || value_is_uuid {
+                        resident_device_numeric_column_offset(&snapshot, table, value_idx)?
+                    } else if value_is_int8 {
+                        resident_device_int8_column_offset(&snapshot, table, value_idx)?
+                    } else {
+                        resident_device_int4_column_offset(&snapshot, table, value_idx)?
+                    };
+                    let (value_offsets_off, value_bytes_off) = if value_is_text {
+                        let layout =
+                            resident_device_text_column_layout(&snapshot, table, value_idx)?;
+                        (layout.offsets_byte_offset, layout.bytes_byte_offset)
+                    } else {
+                        (0, 0)
+                    };
+                    let use_single_level = has_minmax
+                        || value_is_int8
+                        || value_is_numeric
+                        || value_is_uuid
+                        || value_is_text
+                        || key_is_int8
+                        || key_is_i128
+                        || key_is_text
+                        || force_single;
+                    let groups = if use_single_level {
+                        device_memory.group_by_i32_count_sum_minmax_from_payload(
+                            key_offset,
+                            value_offset,
+                            &indices,
+                            value_is_int8,
+                            key_is_int8,
+                            value_is_numeric,
+                            value_is_uuid,
+                            key_is_i128,
+                            key_is_text,
+                            key_offsets_off,
+                            key_bytes_off,
+                            value_is_text,
+                            value_offsets_off,
+                            value_bytes_off,
+                        )
+                    } else {
+                        device_memory.group_by_i32_count_sum_from_payload(
+                            key_offset,
+                            value_offset,
+                            &indices,
+                        )
+                    }
+                    .map_err(map_err)?;
+                    Ok(Pass {
+                        value_idx,
+                        groups,
+                        value_ty,
+                        value_scale,
+                        value_is_int8,
+                        value_is_numeric,
+                        value_is_uuid,
+                        value_is_text,
+                    })
+                };
+            let mut passes: Vec<Pass> = if value_indices.is_empty() {
+                // COUNT(*) only: a single pass over the key column.
+                vec![run_pass(None, false)?]
+            } else {
+                let mut passes = Vec::with_capacity(value_indices.len());
+                for &value_idx in &value_indices {
+                    let has_minmax = aggregates.iter().zip(&agg_value_indices).any(|(a, vi)| {
+                        *vi == Some(value_idx)
+                            && matches!(a.kind, GroupedAggKind::Min | GroupedAggKind::Max)
+                    });
+                    passes.push(run_pass(Some(value_idx), has_minmax)?);
+                }
+                passes
+            };
+            // A TEXT key/value's string lives host-side: the kernel stored each group's representative
+            // ABSOLUTE row index; read it from the same residency_entry generation as the GPU result.
+            let any_text_value = passes.iter().any(|p| p.value_is_text);
+            let text_host_rows = if key_is_text || any_text_value {
                 Some(residency_entry.host_rows.clone())
             } else {
                 None
             };
-            let mut rows: Vec<Vec<SqlValue>> = groups
-                .iter()
-                .map(|g| {
-                    // For int8 the SUM is the i128 (sum_hi:sum); for int4 sign-extend the i64 sum.
-                    let sum_i128 = if value_is_int8 || value_is_numeric {
-                        (i128::from(g.sum_hi) << 64) | i128::from(g.sum as u64)
-                    } else {
-                        i128::from(g.sum)
-                    };
-                    let agg = match kind {
-                        GroupedAgg::Count => SqlValue::Int8(g.count as i64),
-                        // PG: SUM(int4)->bigint; SUM(int8)->numeric scale 0; SUM(numeric)->numeric @scale.
-                        GroupedAgg::Sum if value_is_numeric => {
-                            SqlValue::Numeric(Decimal128::new(sum_i128, value_scale))
+            // The kernel's hash-slot / compaction order is RACE-dependent: the cas.b64 linear-probe
+            // resolves bucket ownership differently per launch, so two passes do NOT share a group
+            // order (proven: an int8 i64::MIN-key query misaligned only on the 6th launch). Re-sort
+            // every pass by the MATERIALIZED group key so pass[k][i] is the same group across all
+            // passes (and the merged output ends up key-ordered). A TEXT key must sort by the
+            // materialized string -- there key_i128 is a per-pass representative row index, not the key.
+            let materialize_key = |gk: &gpu_db_execution::GroupByI32Row| -> SqlValue {
+                if key_is_text {
+                    let rep_idx = gk.key_i128 as u64 as usize;
+                    text_host_rows
+                        .as_ref()
+                        .expect("text_host_rows is Some when key_is_text")[rep_idx][group_idx]
+                        .clone()
+                } else if key_is_i128 {
+                    match key_ty {
+                        SqlType::Numeric { .. } => {
+                            SqlValue::Numeric(Decimal128::new(gk.key_i128, key_scale))
                         }
-                        GroupedAgg::Sum if value_is_int8 => {
-                            SqlValue::Numeric(Decimal128::new(sum_i128, 0))
-                        }
-                        GroupedAgg::Sum => SqlValue::Int8(g.sum),
-                        // AVG(numeric) divides via the scalar numeric div (PG div-scale from the column
-                        // scale); int4/int8 AVG use the integer div (scale 16).
-                        GroupedAgg::Avg if value_is_numeric => {
-                            avg_numeric_sql_value(sum_i128, g.count as usize, value_scale)
-                        }
-                        GroupedAgg::Avg => average_sql_value(sum_i128, g.count as usize),
-                        // MIN/MAX narrow the kernel's i64 (or i128 for numeric) back to the value's
-                        // own type. numeric reconstructs the i128 from (min_hi:min) / (max_hi:max);
-                        // uuid carries the b128 result in min_uuid/max_uuid (already canonical order).
-                        GroupedAgg::Min if value_is_uuid => SqlValue::Uuid(g.min_uuid),
-                        GroupedAgg::Max if value_is_uuid => SqlValue::Uuid(g.max_uuid),
-                        // text MIN/MAX: g.min/g.max hold the ABSOLUTE row index of the lexicographically
-                        // smallest/largest value text in the group; read that row's value column.
-                        GroupedAgg::Min if value_is_text => text_host_rows
-                            .as_ref()
-                            .expect("text_host_rows is Some when value_is_text")
-                            [g.min as u64 as usize][value_idx]
-                            .clone(),
-                        GroupedAgg::Max if value_is_text => text_host_rows
-                            .as_ref()
-                            .expect("text_host_rows is Some when value_is_text")
-                            [g.max as u64 as usize][value_idx]
-                            .clone(),
-                        GroupedAgg::Min => narrow_ordered_value(value_ty, g.min, g.min_hi, value_scale),
-                        GroupedAgg::Max => narrow_ordered_value(value_ty, g.max, g.max_hi, value_scale),
-                    };
-                    // The GROUP BY key narrows back to its own type. i128 keys (numeric/uuid) come from
-                    // slot_keys_i128: numeric mantissa -> Numeric@scale; uuid's LE i128 bytes == the
-                    // canonical uuid bytes. int8/timestamp keep the full i64; others narrow from i64.
-                    let key = if key_is_text {
-                        // rep_idx = key_i128 low 64 bits = the representative row; clone its group column
-                        // (the actual text). The kernel only ever stores a valid absolute row index.
-                        let rep_idx = g.key_i128 as u64 as usize;
-                        text_host_rows
-                            .as_ref()
-                            .expect("text_host_rows is Some when key_is_text")[rep_idx][group_idx]
-                            .clone()
-                    } else if key_is_i128 {
-                        match key_ty {
-                            SqlType::Numeric { .. } => {
-                                SqlValue::Numeric(Decimal128::new(g.key_i128, key_scale))
-                            }
-                            SqlType::Uuid => SqlValue::Uuid(g.key_i128.to_le_bytes()),
-                            _ => unreachable!("key_is_i128 is only numeric/uuid"),
-                        }
-                    } else {
-                        narrow_ordered_value(key_ty, g.key, 0, 0)
-                    };
-                    vec![key, agg]
-                })
-                .collect();
-            // Deterministic output order by the group key. numeric sorts by value (Decimal128: Ord),
-            // uuid by canonical/memcmp bytes ([u8;16]: Ord), the integer/temporal types by their i64.
-            rows.sort_by(|a, b| {
+                        SqlType::Uuid => SqlValue::Uuid(gk.key_i128.to_le_bytes()),
+                        _ => unreachable!("key_is_i128 is only numeric/uuid"),
+                    }
+                } else {
+                    narrow_ordered_value(key_ty, gk.key, 0, 0)
+                }
+            };
+            let key_cmp = |a: &SqlValue, b: &SqlValue| -> std::cmp::Ordering {
                 let i64_key = |v: &SqlValue| match v {
                     SqlValue::Int4(k) | SqlValue::Date(k) => i64::from(*k),
                     SqlValue::Int2(k) => i64::from(*k),
                     SqlValue::Int8(k) | SqlValue::Timestamp(k) => *k,
                     _ => i64::MIN,
                 };
-                match (&a[0], &b[0]) {
+                match (a, b) {
                     (SqlValue::Numeric(x), SqlValue::Numeric(y)) => x.cmp(y),
                     (SqlValue::Uuid(x), SqlValue::Uuid(y)) => x.cmp(y),
                     (SqlValue::Text(x), SqlValue::Text(y)) => x.cmp(y),
-                    _ => i64_key(&a[0]).cmp(&i64_key(&b[0])),
+                    _ => i64_key(a).cmp(&i64_key(b)),
                 }
-            });
+            };
+            for pass in &mut passes {
+                pass.groups
+                    .sort_by(|a, b| key_cmp(&materialize_key(a), &materialize_key(b)));
+            }
+            // Merge the (now key-aligned) passes by group index into N+1 columns [key, agg_1, .., agg_N].
+            // COUNT reads the group's row count from the reference pass; each other aggregate projects
+            // from its value column's pass with the per-type narrowing (SUM/AVG widen, MIN/MAX narrow).
+            let reference = &passes[0];
+            let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(reference.groups.len());
+            for i in 0..reference.groups.len() {
+                let gk = &reference.groups[i];
+                // The GROUP BY key narrows back to its own type (same closure used for the sort above).
+                let key = materialize_key(gk);
+                let mut row: Vec<SqlValue> = Vec::with_capacity(aggregates.len() + 1);
+                row.push(key);
+                for (aggregate, value_idx_opt) in aggregates.iter().zip(&agg_value_indices) {
+                    let value = match aggregate.kind {
+                        GroupedAggKind::Count => SqlValue::Int8(reference.groups[i].count as i64),
+                        _ => {
+                            let value_idx =
+                                value_idx_opt.expect("non-count aggregate has a value column");
+                            let pass = passes
+                                .iter()
+                                .find(|p| p.value_idx == value_idx)
+                                .expect("a pass exists for every value column");
+                            let g = &pass.groups[i];
+                            // For int8/numeric the SUM is the i128 (sum_hi:sum); else sign-extend.
+                            let sum_i128 = if pass.value_is_int8 || pass.value_is_numeric {
+                                (i128::from(g.sum_hi) << 64) | i128::from(g.sum as u64)
+                            } else {
+                                i128::from(g.sum)
+                            };
+                            match aggregate.kind {
+                                GroupedAggKind::Sum if pass.value_is_numeric => {
+                                    SqlValue::Numeric(Decimal128::new(sum_i128, pass.value_scale))
+                                }
+                                GroupedAggKind::Sum if pass.value_is_int8 => {
+                                    SqlValue::Numeric(Decimal128::new(sum_i128, 0))
+                                }
+                                GroupedAggKind::Sum => SqlValue::Int8(g.sum),
+                                GroupedAggKind::Avg if pass.value_is_numeric => avg_numeric_sql_value(
+                                    sum_i128,
+                                    g.count as usize,
+                                    pass.value_scale,
+                                ),
+                                GroupedAggKind::Avg => {
+                                    average_sql_value(sum_i128, g.count as usize)
+                                }
+                                GroupedAggKind::Min if pass.value_is_uuid => {
+                                    SqlValue::Uuid(g.min_uuid)
+                                }
+                                GroupedAggKind::Max if pass.value_is_uuid => {
+                                    SqlValue::Uuid(g.max_uuid)
+                                }
+                                GroupedAggKind::Min if pass.value_is_text => text_host_rows
+                                    .as_ref()
+                                    .expect("text_host_rows is Some when value_is_text")
+                                    [g.min as u64 as usize][pass.value_idx]
+                                    .clone(),
+                                GroupedAggKind::Max if pass.value_is_text => text_host_rows
+                                    .as_ref()
+                                    .expect("text_host_rows is Some when value_is_text")
+                                    [g.max as u64 as usize][pass.value_idx]
+                                    .clone(),
+                                GroupedAggKind::Min => narrow_ordered_value(
+                                    pass.value_ty,
+                                    g.min,
+                                    g.min_hi,
+                                    pass.value_scale,
+                                ),
+                                GroupedAggKind::Max => narrow_ordered_value(
+                                    pass.value_ty,
+                                    g.max,
+                                    g.max_hi,
+                                    pass.value_scale,
+                                ),
+                                GroupedAggKind::Count => unreachable!("count handled above"),
+                            }
+                        }
+                    };
+                    row.push(value);
+                }
+                rows.push(row);
+            }
+            // Rows are already in key order (every pass was key-sorted above); this is a no-op guard.
+            rows.sort_by(|a, b| key_cmp(&a[0], &b[0]));
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
                 rows,

@@ -626,7 +626,10 @@ impl Engine {
                         .map(|(value, extreme)| vec![value, extreme])
                         .collect::<Vec<_>>()
                 }
-                SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
+                // GroupedAggregates (N aggregates) is produced only on the GPU Expr path, never here.
+                SelectProjection::All
+                | SelectProjection::Columns(_)
+                | SelectProjection::GroupedAggregates { .. } => unreachable!(),
             };
 
             if !select.having_groups.is_empty() {
