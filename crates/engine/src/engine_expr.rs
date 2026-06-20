@@ -953,6 +953,7 @@ impl Engine {
             copin_s,
             Some(predicate),
             &[],
+            None,
         )
     }
 
@@ -1050,6 +1051,7 @@ impl Engine {
     /// `table`. The SQL->Expr entry (`engine_sql_pg`) routes through here so the predicate's column
     /// indices, the projection, and the residency snapshot all derive from one catalog generation — a
     /// concurrent shape-changing DDL cannot split the column resolution from the execution.
+    #[allow(clippy::too_many_arguments)] // group_key_expr is threaded alongside the predicate/binding
     pub(crate) fn execute_resident_expr_select_with_binding(
         &self,
         select: &Select,
@@ -1061,6 +1063,10 @@ impl Engine {
         // Parallel to `select.order_by`: `Some(expr)` = a SORT EXPRESSION key (`ORDER BY a+b`),
         // evaluated on-device into an i64 key column; `None` = a plain column key. Empty = no ORDER BY.
         order_by_exprs: &[Option<ResidentExpr>],
+        // `Some(expr)` = GROUP BY an EXPRESSION (`GROUP BY a+b`): materialized on-device into a derived
+        // int key column the grouped kernel groups by (via key_base_override). `None` = a plain column
+        // GROUP BY (the matrix path) or no GROUP BY.
+        group_key_expr: Option<&ResidentExpr>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Scalar aggregates (operator axis): COUNT(*) -> the surviving-row count; SUM(col) -> a GPU
         // reduction over the filtered column. They have no projected columns to materialize, so they
@@ -1125,8 +1131,16 @@ impl Engine {
         ap_select.order_by.clear();
         ap_select.limit = None;
         ap_select.offset = None;
-        let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(&ap_select, table, &bound, copin_s)?;
+        // The access-path planner resolves the projection's group COLUMN; an expression GROUP BY has
+        // none (the placeholder "(expr)" is not a column), so synthesize a scan path for it. The query
+        // is discarded metadata anyway; the grouped GPU aggregation/sort owns execution.
+        let access_path = if group_key_expr.is_some() {
+            RelationalAccessPath::FullTableScan
+        } else {
+            let (_query, access_path) =
+                self.relational_select_mvcc_query_pinned(&ap_select, table, &bound, copin_s)?;
+            access_path
+        };
         // Load the WHOLE residency entry (descriptor + host rows) from ONE atomic load() so a text
         // GROUP BY key -- whose result string is read from host_rows[representative_row] -- sees host
         // rows from the SAME generation as the descriptor / device memory the GPU grouped over.
@@ -1221,31 +1235,58 @@ impl Engine {
                     value_indices.push(*value_idx);
                 }
             }
-            let group_idx = relational_column_index(table, group_name)?;
-            let key_ty = table.columns[group_idx].ty;
+            // GROUP BY <expression> (`a+b`): the key is a DERIVED int buffer materialized on-device
+            // below (grouped via key_base_override), NOT a column -- so group_idx is only a placeholder
+            // for the COUNT(*) pass (which reads no value), and key_ty is the expression result type.
+            let is_expr_key = group_key_expr.is_some();
+            let key_expr_is_int8 = match group_key_expr {
+                Some(expr) => expr_mentions_int8(expr, table),
+                None => false,
+            };
+            let group_idx = if is_expr_key {
+                0
+            } else {
+                relational_column_index(table, group_name)?
+            };
+            let key_ty = if is_expr_key {
+                if key_expr_is_int8 {
+                    SqlType::Int8
+                } else {
+                    SqlType::Int4
+                }
+            } else {
+                table.columns[group_idx].ty
+            };
             // GROUP BY key: int2/int4/date ride the int4 (4-byte) section; int8/timestamp ride the int8
             // (8-byte) section, which forces the single-level kernel (only it reads 64-bit keys + routes
-            // the i64::MIN key, which collides with EMPTY, to its dedicated slot).
-            let key_is_int8 = match key_ty {
-                SqlType::Int4 | SqlType::Int2 | SqlType::Date => false,
-                SqlType::Int8 | SqlType::Timestamp => true,
-                SqlType::Numeric { .. } | SqlType::Uuid => false,
-                SqlType::Text => false,
-                _ => {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "GROUP BY key must be int2/int4/int8/date/timestamp/numeric/uuid/text on the \
-                         Expr path"
-                            .to_string(),
-                    )));
+            // the i64::MIN key, which collides with EMPTY, to its dedicated slot). An expression key is
+            // int4/int8 by its result width.
+            let key_is_int8 = if is_expr_key {
+                key_expr_is_int8
+            } else {
+                match key_ty {
+                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => false,
+                    SqlType::Int8 | SqlType::Timestamp => true,
+                    SqlType::Numeric { .. } | SqlType::Uuid => false,
+                    SqlType::Text => false,
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "GROUP BY key must be int2/int4/int8/date/timestamp/numeric/uuid/text on \
+                             the Expr path"
+                                .to_string(),
+                        )));
+                    }
                 }
             };
             // numeric / uuid GROUP BY keys are 128-bit -- claimed via atom.cas.b128 into slot_keys_i128
-            // (the single-level kernel). key_scale carries the numeric column scale onto the result key.
-            let key_is_i128 = matches!(key_ty, SqlType::Numeric { .. } | SqlType::Uuid);
+            // (the single-level kernel). An expression key is never i128/text. key_scale carries the
+            // numeric column scale onto the result key.
+            let key_is_i128 =
+                !is_expr_key && matches!(key_ty, SqlType::Numeric { .. } | SqlType::Uuid);
             // A TEXT key is varlen: the kernel hashes the bytes, claims a b128 (rep_row_idx, hash) in
             // slot_keys_i128 with a full-text verify-on-lost-CAS, and the result key is read host-side
             // from the representative row. key_offsets_off/key_bytes_off locate the Arrow varlen column.
-            let key_is_text = matches!(key_ty, SqlType::Text);
+            let key_is_text = !is_expr_key && matches!(key_ty, SqlType::Text);
             let (key_offsets_off, key_bytes_off) = if key_is_text {
                 let layout = resident_device_text_column_layout(&snapshot, table, group_idx)?;
                 (layout.offsets_byte_offset, layout.bytes_byte_offset)
@@ -1256,8 +1297,9 @@ impl Engine {
                 SqlType::Numeric { scale, .. } => scale,
                 _ => 0,
             };
-            let key_offset = if key_is_text {
-                // text keys are read via key_offsets_off/key_bytes_off; key_byte_offset is unused.
+            // The key BYTE offset, unused when key_base_override is set (the kernel then reads the
+            // override base + idx*stride, not resident_base + key_offset).
+            let key_offset = if is_expr_key || key_is_text {
                 0
             } else if key_is_i128 {
                 resident_device_numeric_column_offset(&snapshot, table, group_idx)?
@@ -1265,6 +1307,37 @@ impl Engine {
                 resident_device_int8_column_offset(&snapshot, table, group_idx)?
             } else {
                 resident_device_int4_column_offset(&snapshot, table, group_idx)?
+            };
+            // GROUP BY <expression>: materialize the expr ONCE over all rows into a resident device key
+            // buffer (checked overflow -> PG error) + hold it alive across EVERY pass; key_base_override
+            // points the single-level kernel at it (it reads override + idx*stride, idx = the row id).
+            // A column key passes 0 -> the byte-identical column path.
+            let _derived_key_buf;
+            let key_base_override: u64 = if let Some(expr) = group_key_expr {
+                if row_count == 0 {
+                    // Empty input: the on-device arith materialize rejects n=0, and there are no rows to
+                    // group anyway. Skip it and group 0 rows -> 0 groups (PG returns no rows), matching
+                    // the plain-column path's empty-table behavior. The override is never read (no rows).
+                    _derived_key_buf = None;
+                    0
+                } else {
+                    let mut program = Vec::new();
+                    compile_arith_program(expr, table, &snapshot, &mut program)?;
+                    let elem = if key_expr_is_int8 {
+                        ResidentElemType::I64
+                    } else {
+                        ResidentElemType::I32
+                    };
+                    let buf = device_memory
+                        .arith_value_column_device(&program, row_count, elem)
+                        .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
+                    let ptr = buf.device_ptr();
+                    _derived_key_buf = Some(buf);
+                    ptr
+                }
+            } else {
+                _derived_key_buf = None;
+                0
             };
             // One grouping PASS per distinct value column. The kernel yields count+sum+min+max for one
             // value column; each aggregate projects from its column's pass. Every pass groups the SAME
@@ -1281,7 +1354,17 @@ impl Engine {
                 value_is_uuid: bool,
                 value_is_text: bool,
             }
-            let force_single = value_indices.len() > 1;
+            // The result group-key column for an expression GROUP BY is the DERIVED value (no source
+            // column); the binding placeholdered it as column 0, so set its name + type to the
+            // expression's int4/int8 result so the result schema is correct.
+            if is_expr_key {
+                if let Some(col) = bound.selected_columns.first_mut() {
+                    "?column?".clone_into(&mut col.name);
+                    col.ty = key_ty;
+                }
+            }
+            // An expression key is read via key_base_override, which only the single-level kernel honors.
+            let force_single = value_indices.len() > 1 || is_expr_key;
             let run_pass =
                 |value_idx_opt: Option<usize>, has_minmax: bool| -> Result<Pass, ExecuteError> {
                     // A None value column is the COUNT(*)-only pass: group over the key, read .count.
@@ -1355,6 +1438,7 @@ impl Engine {
                             value_is_text,
                             value_offsets_off,
                             value_bytes_off,
+                            key_base_override,
                         )
                     } else {
                         device_memory.group_by_i32_count_sum_from_payload(

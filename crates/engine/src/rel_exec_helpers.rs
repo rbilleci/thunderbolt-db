@@ -987,6 +987,46 @@ pub(crate) fn relational_column_index(
         })
 }
 
+/// Validate the value columns of grouped aggregates (SUM/AVG/MIN/MAX need an existing/typed column;
+/// COUNT(*) needs none). Shared by the column-key and expression-key grouped-projection paths.
+fn validate_grouped_aggregate_value_columns(
+    table: &RelationalTable,
+    aggregates: &[GroupedAggregate],
+) -> Result<(), ExecuteError> {
+    for aggregate in aggregates {
+        match aggregate.kind {
+            GroupedAggKind::Count => {}
+            GroupedAggKind::Sum => {
+                let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "grouped SUM requires a value column".to_string(),
+                    ))
+                })?;
+                validate_sum_column(table, column)?;
+            }
+            GroupedAggKind::Avg => {
+                let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "grouped AVG requires a value column".to_string(),
+                    ))
+                })?;
+                validate_avg_column(table, column)?;
+            }
+            GroupedAggKind::Min | GroupedAggKind::Max => {
+                // The device value-type classification rejects unsupported MIN/MAX types; here just
+                // confirm the value column exists.
+                let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "grouped MIN/MAX requires a value column".to_string(),
+                    ))
+                })?;
+                relational_column_index(table, column)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn bind_relational_select(
     table: &RelationalTable,
     select: &Select,
@@ -1013,7 +1053,14 @@ pub(crate) fn bind_relational_select(
             vec![relational_column_index(table, group_column)?]
         }
         SelectProjection::GroupedAggregates { group_column, .. } => {
-            vec![relational_column_index(table, group_column)?]
+            // An expression GROUP BY uses the placeholder name "(expr)": the group key is a DERIVED
+            // value, not a column, so bind column 0 as a placeholder (the executor overrides the result
+            // schema's group-key column with the expression's int4/int8 result type).
+            if group_column == "(expr)" {
+                vec![0]
+            } else {
+                vec![relational_column_index(table, group_column)?]
+            }
         }
     };
     let mut selected_columns = selected_indexes
@@ -1249,7 +1296,13 @@ pub(crate) fn bind_relational_select(
         }
     }
     let group_by_index = if let Some(group_by) = &select.group_by {
-        Some(relational_column_index(table, group_by)?)
+        // An expression GROUP BY ("(expr)" placeholder) has no source column index -- the key is a
+        // derived value the executor materializes; skip the column-key projection validation below.
+        if group_by == "(expr)" {
+            None
+        } else {
+            Some(relational_column_index(table, group_by)?)
+        }
     } else {
         None
     };
@@ -1420,42 +1473,20 @@ pub(crate) fn bind_relational_select(
                     "GROUP BY column must match the grouped projection".to_string(),
                 )));
             }
-            for aggregate in aggregates {
-                match aggregate.kind {
-                    GroupedAggKind::Count => {}
-                    GroupedAggKind::Sum => {
-                        let column = aggregate.value_column.as_ref().ok_or_else(|| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(
-                                "grouped SUM requires a value column".to_string(),
-                            ))
-                        })?;
-                        validate_sum_column(table, column)?;
-                    }
-                    GroupedAggKind::Avg => {
-                        let column = aggregate.value_column.as_ref().ok_or_else(|| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(
-                                "grouped AVG requires a value column".to_string(),
-                            ))
-                        })?;
-                        validate_avg_column(table, column)?;
-                    }
-                    GroupedAggKind::Min | GroupedAggKind::Max => {
-                        // The device value-type classification rejects unsupported MIN/MAX types; here
-                        // just confirm the value column exists.
-                        let column = aggregate.value_column.as_ref().ok_or_else(|| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(
-                                "grouped MIN/MAX requires a value column".to_string(),
-                            ))
-                        })?;
-                        relational_column_index(table, column)?;
-                    }
-                }
-            }
+            validate_grouped_aggregate_value_columns(table, aggregates)?;
         }
-        (SelectProjection::GroupedAggregates { .. }, None) => {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "grouped aggregates require GROUP BY".to_string(),
-            )));
+        (SelectProjection::GroupedAggregates { aggregates, .. }, None) => {
+            // An EXPRESSION GROUP BY ("(expr)" placeholder) has a derived group key with no source
+            // column index, so it legitimately reaches here with None (group_by_index was set None
+            // above for it). Validate the aggregate value columns + pass; the result group key is the
+            // derived value (result column-0). A genuinely absent GROUP BY is still the error.
+            if select.group_by.as_deref() == Some("(expr)") {
+                validate_grouped_aggregate_value_columns(table, aggregates)?;
+            } else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "grouped aggregates require GROUP BY".to_string(),
+                )));
+            }
         }
         (SelectProjection::All | SelectProjection::Columns(_), Some(_)) => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(

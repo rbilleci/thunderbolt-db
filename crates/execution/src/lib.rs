@@ -1121,6 +1121,21 @@ impl CudaResidentDeviceMemory {
         launch_cuda_arith_value_column_at_indices(self, program, n_rows, indices, elem)
     }
 
+    /// Like [`Self::arith_value_column_at_indices`] but keeps the arith result RESIDENT: runs the
+    /// program over all `n_rows`, returns the device value buffer (+ its pooled lease) instead of
+    /// D2H-gathering. cuCtxSynchronize'd so a LATER kernel launch (the GROUP BY group-key read via
+    /// `key_base_override`) sees valid keys, not a racing/stale buffer. The caller owns the returned
+    /// `DeviceArithBuffer`'s lifetime -- it MUST outlive every launch that reads `device_ptr()`.
+    /// Checked int4/int8 overflow -> PG error is inherited from the arith VM.
+    pub fn arith_value_column_device(
+        &self,
+        program: &[ExprStep],
+        n_rows: u64,
+        elem: ResidentElemType,
+    ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
+        launch_cuda_arith_value_column_device(self, program, n_rows, elem)
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -1333,6 +1348,7 @@ impl CudaResidentDeviceMemory {
             false, // ...not a text value
             0,     // value_offsets_off
             0,     // value_bytes_off
+            0,     // key_base_override (column key path -> no derived-buffer override)
         )
     }
 
@@ -1358,6 +1374,7 @@ impl CudaResidentDeviceMemory {
         value_is_text: bool,
         value_offsets_off: u64,
         value_bytes_off: u64,
+        key_base_override: u64,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1376,6 +1393,7 @@ impl CudaResidentDeviceMemory {
             value_is_text,
             value_offsets_off,
             value_bytes_off,
+            key_base_override,
         )
     }
 
@@ -1411,6 +1429,7 @@ impl CudaResidentDeviceMemory {
             false, // ...not a text value
             0,
             0,
+            0, // key_base_override (bench uses column keys)
         )
     }
 
@@ -6590,6 +6609,7 @@ fn launch_cuda_group_by_i32_count_sum(
     value_is_text: bool,
     value_offsets_off: u64,
     value_bytes_off: u64,
+    key_base_override: u64,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -6772,6 +6792,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a27 = u64::from(value_is_text);
     let mut a28 = value_offsets_off;
     let mut a29 = value_bytes_off;
+    let mut a30 = key_base_override;
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -6814,6 +6835,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a27 as *mut u64).cast::<c_void>(),
         (&mut a28 as *mut u64).cast::<c_void>(),
         (&mut a29 as *mut u64).cast::<c_void>(),
+        (&mut a30 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -7256,6 +7278,7 @@ fn launch_cuda_group_by_kernel_timed(
         0, // value_is_text = false: the timed bench always aggregates an int4 value
         0, // value_offsets_off (unused)
         0, // value_bytes_off (unused)
+        0, // key_base_override = 0: the timed bench uses column keys (no derived-buffer override)
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -13437,6 +13460,57 @@ fn launch_cuda_resident_expr_arith_filter(
 /// interpreter computes `a+b` etc. with CHECKED int4 arithmetic (overflow -> `IntegerOutOfRange`,
 /// inherited from `run_resident_arith_program` -- no wrap, no CPU), and the result feeds the GPU sort
 /// exactly like a materialized int key.
+/// A resident arith-program result kept ON-DEVICE (the value buffer, one element per row) + its pooled
+/// lease. Returned by [`CudaResidentDeviceMemory::arith_value_column_device`]; `device_ptr()` is read by
+/// a LATER kernel launch (the GROUP BY group-key via `key_base_override`), so this MUST be kept alive
+/// across every such launch -- dropping it returns the buffer to the pool (a UAF under reuse).
+pub struct DeviceArithBuffer<'a> {
+    _lease: PooledBufferLease<'a>,
+    ptr: u64,
+}
+
+impl DeviceArithBuffer<'_> {
+    /// Device address of the value buffer (one element per row; width = the program's element type).
+    pub fn device_ptr(&self) -> u64 {
+        self.ptr
+    }
+}
+
+/// Run an arith program over all `n_rows` and return the result value buffer RESIDENT (no D2H). See
+/// [`CudaResidentDeviceMemory::arith_value_column_device`]. cuCtxSynchronize'd so a later launch reads
+/// valid keys. Checked overflow -> PG error inherited from `run_resident_arith_program`.
+fn launch_cuda_arith_value_column_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    n_rows: u64,
+    elem: ResidentElemType,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    let n = usize::try_from(n_rows).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if n == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let mut stack = run_resident_arith_program(resident, program, n_rows, elem)?;
+    let value = stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !stack.is_empty() {
+        // A well-formed arithmetic program leaves exactly one value on the stack.
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    // Block until the arith program finishes, so the SEPARATE GROUP BY launch that reads this buffer
+    // sees the completed keys (not a racing/stale buffer).
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let ptr = value.ptr;
+    Ok(DeviceArithBuffer { _lease: value, ptr })
+}
+
 fn launch_cuda_arith_value_column_at_indices(
     resident: &CudaResidentDeviceMemory,
     program: &[ExprStep],

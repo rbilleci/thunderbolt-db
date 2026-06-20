@@ -2262,6 +2262,128 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_expression() {
+    // GROUP BY a+b: the expression is materialized ON-DEVICE into a derived int key column the kernel
+    // groups by (key_base_override); the result group VALUE is the distinct a+b (not raw a/b), and the
+    // SELECT projection of the same expression reads it. Result is key-sorted.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)").unwrap();
+    // a+b: (1,2)=3,(2,1)=3,(5,5)=10,(4,4)=8,(3,0)=3,(6,4)=10. groups 3{c:10,20,30}/8{c:40}/10{c:100,200}.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,c) VALUES (1,2,10),(2,1,20),(5,5,100),(4,4,40),(3,0,30),(6,4,200)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = SqlValue::Int4;
+    let i8 = SqlValue::Int8;
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a+b, COUNT(*), SUM(c) FROM t GROUP BY a+b")
+        .expect("GROUP BY a+b");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![i4(3), i8(3), i8(60)],
+            vec![i4(8), i8(1), i8(40)],
+            vec![i4(10), i8(2), i8(300)],
+        ],
+        "GROUP BY a+b -> derived group key + per-group count/sum"
+    );
+    // GROUP BY a*2 -> 6 distinct doubled keys, key-sorted.
+    let m = e
+        .execute_resident_expr_select_sql("SELECT a*2, COUNT(*) FROM t GROUP BY a*2")
+        .expect("GROUP BY a*2");
+    assert_eq!(
+        m.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec![i4(2), i4(4), i4(6), i4(8), i4(10), i4(12)],
+        "GROUP BY a*2 -> 6 doubled keys"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_expression_minmax() {
+    // MIN/MAX over a value column with an EXPRESSION group key -- orthogonal mechanisms (group by the
+    // derived a+b, MIN/MAX over the real column c). Closes the audit-flagged coverage gap.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
+        .unwrap();
+    // a+b groups: (1,2)->3{c=10,30}, (5,3)->8{c=40}, (5,5)->10{c=100}.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,c) VALUES (1,2,10),(2,1,30),(5,3,40),(5,5,100)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a+b, MIN(c), MAX(c) FROM t GROUP BY a+b")
+        .expect("GROUP BY a+b with MIN/MAX(c)");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int4(3), SqlValue::Int4(10), SqlValue::Int4(30)],
+            vec![SqlValue::Int4(8), SqlValue::Int4(40), SqlValue::Int4(40)],
+            vec![SqlValue::Int4(10), SqlValue::Int4(100), SqlValue::Int4(100)],
+        ],
+        "MIN/MAX(c) per derived a+b group"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_expression_empty_table() {
+    // GROUP BY <expr> on an EMPTY table -> 0 groups (PG returns no rows), matching the plain-column
+    // path. Guards the audit P1: the on-device arith materialize rejects n=0, so the grouped branch
+    // now skips it for 0 rows instead of erroring.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a+b, COUNT(*) FROM t GROUP BY a+b")
+        .expect("empty-table GROUP BY a+b -> 0 rows, not an error");
+    assert!(
+        g.rows.is_empty(),
+        "0 groups on empty input, got: {:?}",
+        g.rows
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_expression_overflow_is_pg_error() {
+    // GROUP BY a+b where a+b overflows int4 -> a clean PG "integer out of range" (checked on-device,
+    // no wrap, no CPU), inherited from the arith VM -- same as the WHERE/ORDER BY expression paths.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b) VALUES (2147483647, 1), (1, 1)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let err = e
+        .execute_resident_expr_select_sql("SELECT a+b, COUNT(*) FROM t GROUP BY a+b")
+        .expect_err("a+b overflows int4 -> error");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("out of range") || msg.contains("overflow"),
+        "checked overflow -> PG error, got: {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
     // GROUP BY with per-group MIN/MAX on the general GPU executor (single-level kernel; signed s64
     // atom.min/max). Expected values are CONSTRUCTED from the inserted rows (a GPU-native oracle, not

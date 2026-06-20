@@ -4766,7 +4766,8 @@ het_done:
     .param .u64 key_bytes_off,
     .param .u64 value_is_text,
     .param .u64 value_offsets_off,
-    .param .u64 value_bytes_off
+    .param .u64 value_bytes_off,
+    .param .u64 key_base_override
 )
 {
     .reg .pred %pvt;
@@ -4942,6 +4943,9 @@ het_done:
     ld.param.u64 %vtext, [value_is_text];
     ld.param.u64 %voffoff, [value_offsets_off];
     ld.param.u64 %vbytesoff, [value_bytes_off];
+    .reg .u64 %kbov;
+    .reg .pred %pkbov;
+    ld.param.u64 %kbov, [key_base_override];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4960,6 +4964,11 @@ row_loop:
     cvt.u64.u32 %off, %idx;
     mul.lo.u64 %off, %off, 4;
     add.u64 %addr, %base, %koff;
+    // Derived group key (GROUP BY <expr>): a non-zero key_base_override replaces base+koff with the
+    // materialized expr key buffer; the int4/int8 stride (idx*4 / idx*8) below then applies. Override
+    // 0 -> byte-identical to the column-key path. A derived key is always int (ktext/ki128/k128 = 0).
+    setp.ne.u64 %pkbov, %kbov, 0;
+    @%pkbov mov.u64 %addr, %kbov;
     setp.ne.u64 %pkt, %ktext, 0;
     @%pkt bra gb_ktext;
     setp.ne.u64 %pki, %ki128, 0;

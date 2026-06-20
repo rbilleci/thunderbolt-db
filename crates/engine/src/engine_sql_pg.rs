@@ -62,6 +62,19 @@ impl Engine {
                 order_by_exprs.push(Some(map_predicate_node(node, &table, &qualifier)?));
             }
         }
+        // GROUP BY <expression>: a bare ColumnRef -> None (the plain-column matrix path); any other
+        // expression (`a+b`, `a*2`) -> a ResidentExpr the executor materializes on-device into a derived
+        // int key column (grouped via key_base_override). Built post-bind, threaded like the predicate.
+        let group_key_expr: Option<ResidentExpr> = match stmt.group_clause.first() {
+            Some(node) => {
+                if matches!(node_enum(node)?, NodeEnum::ColumnRef(_)) {
+                    None
+                } else {
+                    Some(map_predicate_node(node, &table, &qualifier)?)
+                }
+            }
+            None => None,
+        };
         self.execute_resident_expr_select_with_binding(
             &select,
             &table,
@@ -69,6 +82,7 @@ impl Engine {
             copin_s,
             predicate.as_ref(),
             &order_by_exprs,
+            group_key_expr.as_ref(),
         )
     }
 }
@@ -158,7 +172,12 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
     // GROUP BY -> the scalar projection. The grouped EXECUTION is GPU hash aggregation (doc 19).
     let group_by = parse_group_by(&stmt.group_clause, &qualifier)?;
     let projection = match &group_by {
-        Some(group_column) => build_grouped_projection(&stmt.target_list, group_column, &qualifier)?,
+        Some(group_column) => build_grouped_projection(
+            &stmt.target_list,
+            group_column,
+            stmt.group_clause.first(),
+            &qualifier,
+        )?,
         None => build_projection(&stmt.target_list, &qualifier)?,
     };
     // ORDER BY / LIMIT / OFFSET apply to grouped (host-side) AND non-grouped (GPU-sorted projection)
@@ -201,16 +220,48 @@ fn parse_group_by(group_clause: &[Node], qualifier: &str) -> Result<Option<Strin
     match group_clause {
         [] => Ok(None),
         [one] => {
-            let NodeEnum::ColumnRef(column_ref) = node_enum(one)? else {
-                return Err(sql_pg_error(
-                    "GROUP BY must be a single base column on the Expr path".to_string(),
-                ));
-            };
-            Ok(Some(resolve_column_name(column_ref, qualifier)?.to_string()))
+            // A bare column -> the column name (the plain-column matrix path). Any other expression
+            // (`a+b`, `a*2`) -> the placeholder "(expr)"; the executor materializes it on-device into a
+            // derived int key column (via group_key_expr), and the SELECT projection of the SAME
+            // expression reads the resulting group key.
+            if let NodeEnum::ColumnRef(column_ref) = node_enum(one)? {
+                Ok(Some(resolve_column_name(column_ref, qualifier)?.to_string()))
+            } else {
+                Ok(Some("(expr)".to_string()))
+            }
         }
         _ => Err(sql_pg_error(
-            "GROUP BY supports a single column on the Expr path yet".to_string(),
+            "GROUP BY supports a single column or expression on the Expr path yet".to_string(),
         )),
+    }
+}
+
+/// Structural equality of two parse Nodes IGNORING location (parse positions), so a SELECT expression
+/// matches the SAME GROUP BY expression (`SELECT a+b ... GROUP BY a+b`) -- their derived PartialEq would
+/// differ only by parse position. Covers the arithmetic GROUP BY shapes (A_Expr over column / constant
+/// operands); the operator-name, column-name, and constant leaf nodes carry no location, so comparing
+/// them by value is already location-free.
+fn node_struct_eq(a: &Node, b: &Node) -> bool {
+    match (node_enum(a), node_enum(b)) {
+        (Ok(NodeEnum::AExpr(ea)), Ok(NodeEnum::AExpr(eb))) => {
+            ea.kind == eb.kind
+                && ea.name == eb.name
+                && opt_node_struct_eq(ea.lexpr.as_deref(), eb.lexpr.as_deref())
+                && opt_node_struct_eq(ea.rexpr.as_deref(), eb.rexpr.as_deref())
+        }
+        (Ok(NodeEnum::ColumnRef(ca)), Ok(NodeEnum::ColumnRef(cb))) => ca.fields == cb.fields,
+        (Ok(NodeEnum::AConst(ka)), Ok(NodeEnum::AConst(kb))) => {
+            ka.val == kb.val && ka.isnull == kb.isnull
+        }
+        _ => false,
+    }
+}
+
+fn opt_node_struct_eq(a: Option<&Node>, b: Option<&Node>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => node_struct_eq(x, y),
+        _ => false,
     }
 }
 
@@ -220,6 +271,7 @@ fn parse_group_by(group_clause: &[Node], qualifier: &str) -> Result<Option<Strin
 fn build_grouped_projection(
     target_list: &[Node],
     group_column: &str,
+    group_node: Option<&Node>,
     qualifier: &str,
 ) -> Result<SelectProjection, ExecuteError> {
     let [group_target, aggregate_targets @ ..] = target_list else {
@@ -241,15 +293,28 @@ fn build_grouped_projection(
         .val
         .as_deref()
         .ok_or_else(|| sql_pg_error("grouped SELECT group target has no value".to_string()))?;
-    let NodeEnum::ColumnRef(group_ref) = node_enum(group_val)? else {
-        return Err(sql_pg_error(
-            "the first grouped projection must be the GROUP BY column".to_string(),
-        ));
-    };
-    if resolve_column_name(group_ref, qualifier)? != group_column {
-        return Err(sql_pg_error(
-            "the projected column must be the GROUP BY column".to_string(),
-        ));
+    // Target 0 is the group key: either the GROUP BY COLUMN (matrix path) or, for an expression GROUP
+    // BY, the SAME expression (e.g. `SELECT a+b ... GROUP BY a+b`). The executor's result column-0 is
+    // the group key (a derived value for an expression), which this projected target reads.
+    match node_enum(group_val)? {
+        NodeEnum::ColumnRef(group_ref) => {
+            if resolve_column_name(group_ref, qualifier)? != group_column {
+                return Err(sql_pg_error(
+                    "the projected column must be the GROUP BY column".to_string(),
+                ));
+            }
+        }
+        _ => {
+            let group_node = group_node.ok_or_else(|| {
+                sql_pg_error("the first grouped projection must be the GROUP BY column".to_string())
+            })?;
+            if !node_struct_eq(group_val, group_node) {
+                return Err(sql_pg_error(
+                    "the first grouped projection must be the GROUP BY column or its expression"
+                        .to_string(),
+                ));
+            }
+        }
     }
     // Targets 1..=N must each be a scalar aggregate; lift each to a GroupedAggregate keyed by the
     // group column. A single aggregate yields a 1-element vec (same behavior as the old 1-agg form).
