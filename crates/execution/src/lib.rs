@@ -1136,6 +1136,20 @@ impl CudaResidentDeviceMemory {
         launch_cuda_arith_value_column_device(self, program, n_rows, elem)
     }
 
+    /// Materialize a BOOL column (1-bit-per-row bitmap) into a derived int4 (0/1) device column. The
+    /// GROUP BY kernel reads it via `key_base_override` (a bool GROUP BY key) or `value_base_override`
+    /// (MIN/MAX over a bool value) -- grouped/aggregated on the AUDITED int4 path, which avoids a bool
+    /// GROUP BY kernel and the shared-state concurrency hazard that blocked it. Reuses
+    /// `gpu_db_resident_bool_to_mask` (it already writes int4 0/1). The caller owns the returned buffer;
+    /// it MUST outlive every GROUP BY launch that reads `device_ptr()`.
+    pub fn bool_to_int4_column_device(
+        &self,
+        bitmap_byte_offset: u64,
+        n_rows: u64,
+    ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
+        launch_cuda_bool_to_int4_column_device(self, bitmap_byte_offset, n_rows)
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -1349,6 +1363,7 @@ impl CudaResidentDeviceMemory {
             0,     // value_offsets_off
             0,     // value_bytes_off
             0,     // key_base_override (column key path -> no derived-buffer override)
+            0,     // value_base_override (column value path)
         )
     }
 
@@ -1375,6 +1390,7 @@ impl CudaResidentDeviceMemory {
         value_offsets_off: u64,
         value_bytes_off: u64,
         key_base_override: u64,
+        value_base_override: u64,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1394,6 +1410,7 @@ impl CudaResidentDeviceMemory {
             value_offsets_off,
             value_bytes_off,
             key_base_override,
+            value_base_override,
         )
     }
 
@@ -1430,6 +1447,7 @@ impl CudaResidentDeviceMemory {
             0,
             0,
             0, // key_base_override (bench uses column keys)
+            0, // value_base_override
         )
     }
 
@@ -6610,6 +6628,7 @@ fn launch_cuda_group_by_i32_count_sum(
     value_offsets_off: u64,
     value_bytes_off: u64,
     key_base_override: u64,
+    value_base_override: u64,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -6793,6 +6812,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a28 = value_offsets_off;
     let mut a29 = value_bytes_off;
     let mut a30 = key_base_override;
+    let mut a31 = value_base_override;
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -6836,6 +6856,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a28 as *mut u64).cast::<c_void>(),
         (&mut a29 as *mut u64).cast::<c_void>(),
         (&mut a30 as *mut u64).cast::<c_void>(),
+        (&mut a31 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -7279,6 +7300,7 @@ fn launch_cuda_group_by_kernel_timed(
         0, // value_offsets_off (unused)
         0, // value_bytes_off (unused)
         0, // key_base_override = 0: the timed bench uses column keys (no derived-buffer override)
+        0, // value_base_override = 0: the timed bench uses column values
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -13509,6 +13531,90 @@ fn launch_cuda_arith_value_column_device<'r>(
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     let ptr = value.ptr;
     Ok(DeviceArithBuffer { _lease: value, ptr })
+}
+
+/// Run `gpu_db_resident_bool_to_mask` (negate=0) into a leased int4 buffer (it writes 0/1 per row) and
+/// return it as a `DeviceArithBuffer` -- the derived int4 column for a bool GROUP BY key / bool MIN/MAX
+/// value. Synchronizes so the SEPARATE GROUP BY launch (which reads it via key/value_base_override) sees
+/// the completed buffer, not a racing/stale one. The lease lives in the returned buffer (caller-owned).
+fn launch_cuda_bool_to_int4_column_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    bitmap_byte_offset: u64,
+    n: u64,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    if n == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let out_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_resident_bool_to_mask", &ptx)?;
+    let out = primary.lease_device_buffer(out_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = bitmap_byte_offset;
+    let mut a2 = 0u32; // negate = false: bool true -> int4 1, false -> 0
+    let mut a3 = n;
+    let mut a4 = out.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u32).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let ptr = out.ptr;
+    Ok(DeviceArithBuffer { _lease: out, ptr })
 }
 
 fn launch_cuda_arith_value_column_at_indices(

@@ -2600,6 +2600,80 @@ fn gpu_grouped_by_numeric_key() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_bool_key() {
+    // GROUP BY a BOOL column -- 2 groups (false<true) via the bool->int4 materialize + key_base_override
+    // (the audited int4 path; NO bool GROUP BY kernel -> no concurrency hazard).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, i INT)").unwrap();
+    // false: i={10,30} (count 2, sum 40); true: i={20,40,50} (count 3, sum 110).
+    e.execute_text(
+        2,
+        "INSERT INTO t (flag, i) VALUES (false,10),(true,20),(false,30),(true,40),(true,50)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT flag, COUNT(*), SUM(i) FROM t GROUP BY flag")
+        .expect("GROUP BY bool key");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Bool(false), SqlValue::Int8(2), SqlValue::Int8(40)],
+            vec![SqlValue::Bool(true), SqlValue::Int8(3), SqlValue::Int8(110)],
+        ],
+        "GROUP BY bool -> false then true, count + sum"
+    );
+    let m = e
+        .execute_resident_expr_select_sql("SELECT flag, MIN(i) FROM t GROUP BY flag")
+        .expect("bool key + MIN(int)");
+    assert_eq!(
+        m.rows,
+        vec![
+            vec![SqlValue::Bool(false), SqlValue::Int4(10)],
+            vec![SqlValue::Bool(true), SqlValue::Int4(20)],
+        ],
+        "bool key + MIN(int4)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_bool_minmax_value() {
+    // MIN/MAX over a BOOL VALUE (int key): group all-false -> min=max=false; all-true -> true; mixed ->
+    // min=false, max=true. Via bool->int4 materialize + value_base_override.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (k INT, flag BOOL)").unwrap();
+    // k=1: {false,false}; k=2: {true,true}; k=3: {false,true}.
+    e.execute_text(
+        2,
+        "INSERT INTO t (k, flag) VALUES (1,false),(1,false),(2,true),(2,true),(3,false),(3,true)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT k, MIN(flag), MAX(flag) FROM t GROUP BY k")
+        .expect("MIN/MAX over bool value");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Bool(false), SqlValue::Bool(false)],
+            vec![SqlValue::Int4(2), SqlValue::Bool(true), SqlValue::Bool(true)],
+            vec![SqlValue::Int4(3), SqlValue::Bool(false), SqlValue::Bool(true)],
+        ],
+        "MIN/MAX(bool) per int group"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_text_key() {
     // GROUP BY a TEXT (varlen) key -- the kernel FNV-1a-hashes the bytes, claims a b128
     // (representative_row_idx, hash) in slot_keys_i128 via atom.cas.b128 with a full-text

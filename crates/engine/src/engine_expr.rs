@@ -80,6 +80,8 @@ fn narrow_ordered_value(ty: SqlType, lo: i64, hi: i64, scale: u8) -> SqlValue {
         SqlType::Timestamp => SqlValue::Timestamp(lo),
         SqlType::Int2 => SqlValue::Int2(lo as i16),
         SqlType::Date => SqlValue::Date(lo as i32),
+        // bool key / bool MIN/MAX value: the derived int4 column is 0/1 -> Bool.
+        SqlType::Bool => SqlValue::Bool(lo != 0),
         _ => SqlValue::Int4(lo as i32),
     }
 }
@@ -1269,13 +1271,11 @@ impl Engine {
                     SqlType::Int8 | SqlType::Timestamp => true,
                     SqlType::Numeric { .. } | SqlType::Uuid => false,
                     SqlType::Text => false,
-                    _ => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "GROUP BY key must be int2/int4/int8/date/timestamp/numeric/uuid/text on \
-                             the Expr path"
-                                .to_string(),
-                        )));
-                    }
+                    // A bool key is materialized bool->int4 (0/1) into a derived buffer + grouped via
+                    // key_base_override on the int4 path -- avoids a bool GROUP BY kernel + its hazard.
+                    SqlType::Bool => false,
+                    // EXHAUSTIVE (the prior bool lesson): a NEW SqlType is a COMPILE error here, forcing
+                    // its GROUP-BY-key handling to be considered rather than silently mis-grouped.
                 }
             };
             // numeric / uuid GROUP BY keys are 128-bit -- claimed via atom.cas.b128 into slot_keys_i128
@@ -1287,6 +1287,9 @@ impl Engine {
             // slot_keys_i128 with a full-text verify-on-lost-CAS, and the result key is read host-side
             // from the representative row. key_offsets_off/key_bytes_off locate the Arrow varlen column.
             let key_is_text = !is_expr_key && matches!(key_ty, SqlType::Text);
+            // A bool key is materialized bool->int4 (0/1) into a derived buffer + grouped via
+            // key_base_override (like an expression key); int4-width, never i128/text.
+            let key_is_bool = !is_expr_key && matches!(key_ty, SqlType::Bool);
             let (key_offsets_off, key_bytes_off) = if key_is_text {
                 let layout = resident_device_text_column_layout(&snapshot, table, group_idx)?;
                 (layout.offsets_byte_offset, layout.bytes_byte_offset)
@@ -1299,7 +1302,7 @@ impl Engine {
             };
             // The key BYTE offset, unused when key_base_override is set (the kernel then reads the
             // override base + idx*stride, not resident_base + key_offset).
-            let key_offset = if is_expr_key || key_is_text {
+            let key_offset = if is_expr_key || key_is_text || key_is_bool {
                 0
             } else if key_is_i128 {
                 resident_device_numeric_column_offset(&snapshot, table, group_idx)?
@@ -1330,6 +1333,21 @@ impl Engine {
                     };
                     let buf = device_memory
                         .arith_value_column_device(&program, row_count, elem)
+                        .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
+                    let ptr = buf.device_ptr();
+                    _derived_key_buf = Some(buf);
+                    ptr
+                }
+            } else if key_is_bool {
+                if row_count == 0 {
+                    _derived_key_buf = None;
+                    0
+                } else {
+                    // GROUP BY a bool column: materialize bool->int4 (0/1) into a derived buffer + group
+                    // via key_base_override (the audited int4 path). No bool GROUP BY kernel -> no hazard.
+                    let offset = resident_device_bool_column_offset(&snapshot, table, group_idx)?;
+                    let buf = device_memory
+                        .bool_to_int4_column_device(offset, row_count)
                         .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
                     let ptr = buf.device_ptr();
                     _derived_key_buf = Some(buf);
@@ -1388,16 +1406,16 @@ impl Engine {
                                 SqlType::Numeric { .. } => (false, true, false, false),
                                 SqlType::Uuid => (false, false, true, false),
                                 SqlType::Text => (false, false, false, true),
-                                _ => {
-                                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                        "grouped aggregate value columns must be int2 / int4 / int8 \
-                                         / numeric / uuid / text / date / timestamp on the Expr path"
-                                            .to_string(),
-                                    )));
-                                }
+                                // bool value (MIN/MAX): materialized bool->int4, read via
+                                // value_base_override on the int4 value path.
+                                SqlType::Bool => (false, false, false, false),
                             }
                         };
-                    let value_offset = if value_idx_opt.is_none() || value_is_text {
+                    let value_is_bool =
+                        value_idx_opt.is_some() && matches!(value_ty, SqlType::Bool);
+                    let value_offset = if value_idx_opt.is_none() || value_is_text || value_is_bool {
+                        // bool: value_offset is unused (value_base_override is set); key_offset is a safe
+                        // placeholder (avoids resolving an int4 offset on a bitmap bool column).
                         key_offset
                     } else if value_is_numeric || value_is_uuid {
                         resident_device_numeric_column_offset(&snapshot, table, value_idx)?
@@ -1405,6 +1423,21 @@ impl Engine {
                         resident_device_int8_column_offset(&snapshot, table, value_idx)?
                     } else {
                         resident_device_int4_column_offset(&snapshot, table, value_idx)?
+                    };
+                    // MIN/MAX over a bool VALUE: materialize bool->int4 (0/1) into a derived buffer + read
+                    // it via value_base_override. Held alive across the kernel call (closure-local lease).
+                    let _derived_value_buf;
+                    let value_base_override: u64 = if value_is_bool && row_count > 0 {
+                        let offset = resident_device_bool_column_offset(&snapshot, table, value_idx)?;
+                        let buf = device_memory
+                            .bool_to_int4_column_device(offset, row_count)
+                            .map_err(map_err)?;
+                        let ptr = buf.device_ptr();
+                        _derived_value_buf = Some(buf);
+                        ptr
+                    } else {
+                        _derived_value_buf = None;
+                        0
                     };
                     let (value_offsets_off, value_bytes_off) = if value_is_text {
                         let layout =
@@ -1418,9 +1451,11 @@ impl Engine {
                         || value_is_numeric
                         || value_is_uuid
                         || value_is_text
+                        || value_is_bool
                         || key_is_int8
                         || key_is_i128
                         || key_is_text
+                        || key_is_bool
                         || force_single;
                     let groups = if use_single_level {
                         device_memory.group_by_i32_count_sum_minmax_from_payload(
@@ -1439,6 +1474,7 @@ impl Engine {
                             value_offsets_off,
                             value_bytes_off,
                             key_base_override,
+                            value_base_override,
                         )
                     } else {
                         device_memory.group_by_i32_count_sum_from_payload(
@@ -1511,6 +1547,7 @@ impl Engine {
                     SqlValue::Int4(k) | SqlValue::Date(k) => i64::from(*k),
                     SqlValue::Int2(k) => i64::from(*k),
                     SqlValue::Int8(k) | SqlValue::Timestamp(k) => *k,
+                    SqlValue::Bool(b) => i64::from(*b), // false(0) < true(1)
                     _ => i64::MIN,
                 };
                 match (a, b) {

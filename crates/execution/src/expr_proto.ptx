@@ -4767,7 +4767,8 @@ het_done:
     .param .u64 value_is_text,
     .param .u64 value_offsets_off,
     .param .u64 value_bytes_off,
-    .param .u64 key_base_override
+    .param .u64 key_base_override,
+    .param .u64 value_base_override
 )
 {
     .reg .pred %pvt;
@@ -4946,6 +4947,9 @@ het_done:
     .reg .u64 %kbov;
     .reg .pred %pkbov;
     ld.param.u64 %kbov, [key_base_override];
+    .reg .u64 %vbov;
+    .reg .pred %pvbov;
+    ld.param.u64 %vbov, [value_base_override];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -5039,6 +5043,11 @@ ktext_hash_done:
     mov.b128 %key128, {%keylo, %keyhi};
 gb_kdone:
     add.u64 %addr, %base, %soff;
+    // Derived value column (bool MIN/MAX materialized to int4): a non-zero value_base_override replaces
+    // base+soff with the derived buffer; the int4 idx*4 stride below applies. Override 0 -> byte-
+    // identical column-value path. A derived value is always int4 (vtext/vuu/vn/v8 = 0).
+    setp.ne.u64 %pvbov, %vbov, 0;
+    @%pvbov mov.u64 %addr, %vbov;
     setp.ne.u64 %pvt, %vtext, 0;
     @%pvt bra gb_vtext;
     setp.ne.u64 %puu, %vuu, 0;
