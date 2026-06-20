@@ -3154,6 +3154,122 @@ fn gpu_grouped_count_distinct_int8_negative_and_large() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_numeric_value() {
+    // COUNT(DISTINCT v) over a NUMERIC value -- the 16-byte i128 mantissa packs into the (g, v_hi,
+    // v_lo) k=3 multikey sort. Distinct counts KNOWN BY CONSTRUCTION; g=4 proves SCALE NORMALIZATION
+    // (8.4 and 8.40 rescale to the same column-scale mantissa 840 -> ONE distinct, PG-correct).
+    //   g=1: {1.50, 1.50, 2.50} -> 2 distinct (a duplicate)
+    //   g=2: {3.00, 4.00, 5.00} -> 3 distinct (all distinct)
+    //   g=3: {7.25}             -> 1 distinct (single)
+    //   g=4: {8.40, 8.4}        -> 1 distinct (equal numerics, different display scale)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES \
+         (1, 1.50),(1, 1.50),(1, 2.50),(2, 3.00),(2, 4.00),(2, 5.00),(3, 7.25),(4, 8.40),(4, 8.4)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT numeric) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(4), SqlValue::Int8(1)],
+        ],
+        "distinct numeric count, with display-scale-normalized equality"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_uuid_value() {
+    // COUNT(DISTINCT v) over a UUID value -- 16 raw bytes packed into the (g, v_hi, v_lo) k=3 sort;
+    // distinctness is byte-identity. Distinct counts KNOWN BY CONSTRUCTION (a, b, c, d, e are five
+    // distinct uuids):
+    //   g=1: {a, a, b} -> 2 distinct (a duplicated)
+    //   g=2: {c}       -> 1 distinct
+    //   g=3: {d, e, d} -> 2 distinct (d repeated non-adjacently before the sort)
+    let a = "11111111-1111-1111-1111-111111111111";
+    let b = "22222222-2222-2222-2222-222222222222";
+    let c = "33333333-3333-3333-3333-333333333333";
+    let d = "44444444-4444-4444-4444-444444444444";
+    let f = "55555555-5555-5555-5555-555555555555";
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v UUID)").unwrap();
+    e.execute_text(
+        2,
+        &format!(
+            "INSERT INTO t (g, v) VALUES \
+             (1, '{a}'),(1, '{a}'),(1, '{b}'),(2, '{c}'),(3, '{d}'),(3, '{f}'),(3, '{d}')"
+        ),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT uuid) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(2)],
+        ],
+        "distinct uuid count by byte-identity"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_numeric_combined_with_count_star() {
+    // SELECT g, COUNT(*), COUNT(DISTINCT v) over a NUMERIC value -- a direct COUNT(*) pass folded
+    // with the k=3 sort-based COUNT(DISTINCT) pass. The multi-aggregate merge re-sorts each pass by
+    // the MATERIALIZED group key, so the count and the distinct count align per group. count >= distinct.
+    //   g=1: {1.50, 1.50, 2.50} -> count 3, distinct 2
+    //   g=2: {3.00, 4.00, 5.00} -> count 3, distinct 3
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES (1, 1.50),(1, 1.50),(1, 2.50),(2, 3.00),(2, 4.00),(2, 5.00)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*), COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(*) + COUNT(DISTINCT numeric) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(3), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(3), SqlValue::Int8(3)],
+        ],
+        "COUNT(*) and COUNT(DISTINCT numeric) merged by group"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_multiple_aggregates_different_value_columns() {
     // SELECT g, SUM(v), MIN(w), MAX(w) FROM t GROUP BY g -- aggregates over TWO different value columns
     // (v int4, w int8) -> two grouping passes (single-level forced) merged by group index.

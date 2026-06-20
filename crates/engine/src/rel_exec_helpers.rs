@@ -1023,9 +1023,10 @@ fn validate_grouped_aggregate_value_columns(
                 relational_column_index(table, column)?;
             }
             GroupedAggKind::CountDistinct => {
-                // COUNT(DISTINCT v) sorts the (group, v) tuple as an i64 matrix, so v must be an
-                // i64-representable fixed-width type (int2/int4/int8/date/timestamp this slice;
-                // text/numeric/uuid distinct counts are clean follow-ups).
+                // COUNT(DISTINCT v) GPU-sorts the (group, value) tuple. A fixed-width value packs
+                // into i64 keys: int2/int4/int8/date/timestamp -> one i64 (g, v); numeric/uuid ->
+                // the raw 16-byte i128 split into two i64 limbs (g, v_hi, v_lo). text distinct counts
+                // (varlen, the hetero sort) are a clean follow-up.
                 let column = aggregate.value_column.as_ref().ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
                         "grouped COUNT(DISTINCT) requires a value column".to_string(),
@@ -1039,10 +1040,12 @@ fn validate_grouped_aggregate_value_columns(
                         | SqlType::Int8
                         | SqlType::Date
                         | SqlType::Timestamp
+                        | SqlType::Numeric { .. }
+                        | SqlType::Uuid
                 ) {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "grouped COUNT(DISTINCT) supports int2/int4/int8/date/timestamp value \
-                         columns on the GPU path (text/numeric/uuid are follow-ups)"
+                        "grouped COUNT(DISTINCT) supports int2/int4/int8/date/timestamp/numeric/uuid \
+                         value columns on the GPU path (text is a follow-up)"
                             .to_string(),
                     )));
                 }

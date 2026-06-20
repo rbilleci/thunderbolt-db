@@ -1653,20 +1653,57 @@ impl Engine {
                         Vec::new()
                     } else {
                         let g_vals = g_vals.as_ref().expect("g_vals materialized for n > 0");
-                        let v_vals = materialize_i64_col(value_idx, &idx_u64)?;
-                        // The (g, v) tuple matrix, row-major (2 keys/row) for the multikey sort.
-                        let mut matrix = Vec::with_capacity(n * 2);
-                        for i in 0..n {
-                            matrix.push(g_vals[i]);
-                            matrix.push(v_vals[i]);
-                        }
-                        // ASC sort by (g, v) (desc_mask = 0): orders rows by group then value.
+                        // The (g, value) tuple matrix, row-major (k i64/row) for the multikey sort.
+                        // An int value is one i64 (k=2 -> (g, v)); a numeric/uuid value is its raw
+                        // 16-byte i128 split into two i64 limbs (k=3 -> (g, v_hi, v_lo)). Distinctness
+                        // only needs equal values to sort ADJACENT, so the raw-bit i64 order of the
+                        // limbs suffices and a byte-identical i128 -- the engine's own numeric/uuid
+                        // equality (the GROUP BY b128 key) -- collapses to one distinct value.
+                        let value_ty = table.columns[value_idx].ty;
+                        let (matrix, k) = match value_ty {
+                            SqlType::Int2
+                            | SqlType::Int4
+                            | SqlType::Int8
+                            | SqlType::Date
+                            | SqlType::Timestamp => {
+                                let v_vals = materialize_i64_col(value_idx, &idx_u64)?;
+                                let mut m = Vec::with_capacity(n * 2);
+                                for i in 0..n {
+                                    m.push(g_vals[i]);
+                                    m.push(v_vals[i]);
+                                }
+                                (m, 2usize)
+                            }
+                            SqlType::Numeric { .. } | SqlType::Uuid => {
+                                let off = resident_device_numeric_column_offset(
+                                    &snapshot, table, value_idx,
+                                )?;
+                                let v128 = device_memory
+                                    .project_i128_rows_from_payload(off, &idx_u64)
+                                    .map_err(map_err)?;
+                                let mut m = Vec::with_capacity(n * 3);
+                                for i in 0..n {
+                                    m.push(g_vals[i]);
+                                    m.push((v128[i] >> 64) as i64);
+                                    m.push((v128[i] as u64) as i64);
+                                }
+                                (m, 3usize)
+                            }
+                            _ => {
+                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "COUNT(DISTINCT) value column must be int/numeric/uuid on the \
+                                     GPU path (text is a follow-up)"
+                                        .to_string(),
+                                )));
+                            }
+                        };
+                        // ASC sort by (g, value) (desc_mask = 0): orders rows by group then value.
                         let perm = device_memory
-                            .bitonic_sort_multikey(&matrix, n, 2, 0)
+                            .bitonic_sort_multikey(&matrix, n, k, 0)
                             .map_err(map_err)?;
-                        // Mark first-seen (g, v) tuples + gather the per-row group key (sorted order).
+                        // Mark first-seen (g, value) tuples + gather the per-row group key (sorted).
                         let (g_sorted, new_distinct) = device_memory
-                            .mark_new_distinct_device(&matrix, &perm, n as u64)
+                            .mark_new_distinct_device(&matrix, &perm, n as u64, k)
                             .map_err(map_err)?;
                         // SUM(new_distinct) grouped by g_sorted = the per-group distinct count. indices
                         // = 0..n (the sorted positions); the kernel reads g_sorted / new_distinct (both

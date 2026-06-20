@@ -1163,19 +1163,22 @@ impl CudaResidentDeviceMemory {
         launch_cuda_pack_two_int4_cols_device(self, off0, off1, n_rows)
     }
 
-    /// COUNT(DISTINCT v) mark pass: `keys` is the (g, v) i64 tuple matrix (row-major, 2 values/row)
-    /// ALREADY sorted by (g, v) via `perm` (from [`Self::bitonic_sort_multikey`]). Runs
-    /// `gpu_db_mark_new_distinct` and returns `(g_sorted, new_distinct)` RESIDENT
-    /// (cuCtxSynchronize'd) -- `g_sorted[i]` = the group key at sorted position i, `new_distinct[i]` =
-    /// 1 at each first-seen (g, v) tuple else 0. SUM(new_distinct) grouped by g_sorted (via the GROUP BY
-    /// kernel's key/value_base_override) = the per-group distinct count. Both leases live in the result.
+    /// COUNT(DISTINCT v) mark pass: `keys` is the (key0, key1, ..) i64 tuple matrix (row-major, `k`
+    /// values/row) ALREADY sorted via `perm` (from [`Self::bitonic_sort_multikey`]). key0 is the group
+    /// key; the remaining keys are the value's fixed-width i64 representation (`k`=2 for an int value
+    /// `(g, v)`, `k`=3 for a numeric/uuid value `(g, v_hi, v_lo)`). Runs `gpu_db_mark_new_distinct` and
+    /// returns `(g_sorted, new_distinct)` RESIDENT (cuCtxSynchronize'd) -- `g_sorted[i]` = key0 at
+    /// sorted position i, `new_distinct[i]` = 1 at each first-seen tuple else 0. SUM(new_distinct)
+    /// grouped by g_sorted (via the GROUP BY kernel's key/value_base_override) = the per-group distinct
+    /// count. Both leases live in the result.
     pub fn mark_new_distinct_device(
         &self,
         keys: &[i64],
         perm: &[u32],
         n: u64,
+        k: usize,
     ) -> Result<(DeviceArithBuffer<'_>, DeviceArithBuffer<'_>), CudaRuntimeProbeError> {
-        launch_cuda_mark_new_distinct_device(self, keys, perm, n)
+        launch_cuda_mark_new_distinct_device(self, keys, perm, n, k)
     }
 
     pub fn count_i32_equal_from_payload(
@@ -13730,7 +13733,8 @@ fn launch_cuda_pack_two_int4_cols_device<'r>(
 }
 
 /// COUNT(DISTINCT v) mark pass (see [`CudaResidentDeviceMemory::mark_new_distinct_device`]). Uploads
-/// the sorted (g, v) i64 tuple matrix + the permutation, runs `gpu_db_mark_new_distinct`, and returns
+/// the sorted `k`-wide i64 tuple matrix (key0 = group key) + the permutation, runs
+/// `gpu_db_mark_new_distinct`, and returns
 /// the two derived i64 device columns `(g_sorted, new_distinct)`. cuCtxSynchronize'd so the SEPARATE
 /// GROUP BY launch reads completed buffers (a fully-drained launch, off the bool-GROUP-BY hazard). The
 /// `keys`/`perm` upload buffers are temporary -- the synchronize guarantees the kernel read them before
@@ -13740,6 +13744,7 @@ fn launch_cuda_mark_new_distinct_device<'r>(
     keys: &[i64],
     perm: &[u32],
     n: u64,
+    k: usize,
 ) -> Result<(DeviceArithBuffer<'r>, DeviceArithBuffer<'r>), CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -13760,8 +13765,11 @@ fn launch_cuda_mark_new_distinct_device<'r>(
     if n_usize == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
+    if k < 2 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(k));
+    }
     let expected_keys = n_usize
-        .checked_mul(2)
+        .checked_mul(k)
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
     if keys.len() != expected_keys {
         return Err(CudaRuntimeProbeError::InvalidInputLength(keys.len()));
@@ -13820,14 +13828,16 @@ fn launch_cuda_mark_new_distinct_device<'r>(
         let mut a0 = keys_dev.ptr;
         let mut a1 = perm_dev.ptr;
         let mut a2 = n;
-        let mut a3 = g_out.ptr;
-        let mut a4 = nd_out.ptr;
+        let mut a3 = k as u64;
+        let mut a4 = g_out.ptr;
+        let mut a5 = nd_out.ptr;
         let mut args = [
             (&mut a0 as *mut u64).cast::<c_void>(),
             (&mut a1 as *mut u64).cast::<c_void>(),
             (&mut a2 as *mut u64).cast::<c_void>(),
             (&mut a3 as *mut u64).cast::<c_void>(),
             (&mut a4 as *mut u64).cast::<c_void>(),
+            (&mut a5 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(

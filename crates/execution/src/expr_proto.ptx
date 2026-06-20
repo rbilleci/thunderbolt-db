@@ -3393,22 +3393,27 @@ done_pack2:
     ret;
 }
 
-// COUNT(DISTINCT v) mark pass: inputs are the (g, v) i64 tuple matrix (row-major, 2 keys/row =
-// 16 bytes/row) already sorted by (g, v) via `perm`, plus that permutation. For each sorted
-// position i, emit g_sorted[i] = g[perm[i]] (the group key) and new_distinct[i] = 1 iff the (g, v)
-// tuple differs from the previous sorted tuple (i == 0 is always new). A pure MAP -- no atomics, no
-// hash -- so it cannot reintroduce the bool-GROUP-BY concurrency hazard. SUM(new_distinct) grouped
-// by g_sorted = the per-group distinct count. Buffers are leased (>=8-aligned) so i64 ld/st are safe.
+// COUNT(DISTINCT v) mark pass: mark the first row of each distinct (key0, key1, .., key{kdim-1})
+// tuple in SORTED order, and gather each sorted row's key0 (the group key). `keys_ptr` is the
+// row-major i64 tuple matrix (kdim i64 per row) ALREADY sorted via `perm` (the u32 permutation from
+// the multikey sort). For each sorted position i: g_out[i] = key0 of the row at perm[i]; nd_out[i] =
+// 1 iff position i begins a new tuple (i == 0, OR ANY of the kdim keys differs from sorted position
+// i-1), else 0. kdim = 2 for an int value (g, v); kdim = 3 for a numeric/uuid value (g, v_hi, v_lo)
+// -- distinctness only needs equal tuples to sort ADJACENT, so the i64 raw-bit order of (v_hi, v_lo)
+// is sufficient (a byte-identical i128 collapses). A pure MAP -- no atomics, no hash -- so it cannot
+// reintroduce the bool-GROUP-BY concurrency hazard. SUM(nd_out) grouped by g_out (via the GROUP BY
+// kernel's key/value_base_override) = the per-group distinct count. Buffers are leased (>=8-aligned)
+// so the i64 ld/st are safe.
 .visible .entry gpu_db_mark_new_distinct(
     .param .u64 keys_ptr,
     .param .u64 perm_ptr,
     .param .u64 n,
+    .param .u64 kdim,
     .param .u64 g_out,
     .param .u64 nd_out
 )
 {
     .reg .pred %p;
-    .reg .pred %q;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -3419,6 +3424,8 @@ done_pack2:
     .reg .u64 %keys;
     .reg .u64 %perm;
     .reg .u64 %n;
+    .reg .u64 %kdim;
+    .reg .u64 %k8;
     .reg .u64 %gout;
     .reg .u64 %ndout;
     .reg .u64 %i;
@@ -3428,17 +3435,20 @@ done_pack2:
     .reg .u64 %base;
     .reg .u64 %pbase;
     .reg .u64 %g;
-    .reg .u64 %v;
-    .reg .u64 %pg;
-    .reg .u64 %pv;
+    .reg .u64 %ka;
+    .reg .u64 %kb;
     .reg .u64 %nd;
     .reg .u64 %r64;
+    .reg .u64 %j;
+    .reg .u64 %jo;
 
     ld.param.u64 %keys, [keys_ptr];
     ld.param.u64 %perm, [perm_ptr];
     ld.param.u64 %n, [n];
+    ld.param.u64 %kdim, [kdim];
     ld.param.u64 %gout, [g_out];
     ld.param.u64 %ndout, [nd_out];
+    mul.lo.u64 %k8, %kdim, 8;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
     mov.u32 %bid, %ctaid.x;
@@ -3450,32 +3460,44 @@ done_pack2:
 loop_mark_nd:
     setp.ge.u64 %p, %i, %n;
     @%p bra done_mark_nd;
+    // row = perm[i]; base = &keys[row * kdim]
     mul.lo.u64 %o, %i, 4;
     add.u64 %addr, %perm, %o;
     ld.global.u32 %row, [%addr];
     cvt.u64.u32 %r64, %row;
-    mul.lo.u64 %o, %r64, 16;
+    mul.lo.u64 %o, %r64, %k8;
     add.u64 %base, %keys, %o;
+    // key0 (the group key) -> g_out[i]
     ld.global.u64 %g, [%base];
-    ld.global.u64 %v, [%base+8];
     mul.lo.u64 %o, %i, 8;
     add.u64 %addr, %gout, %o;
     st.global.u64 [%addr], %g;
+    // i == 0 always begins a new distinct tuple.
     setp.eq.u64 %p, %i, 0;
     @%p bra mark_is_new;
+    // pbase = &keys[perm[i-1] * kdim]
     sub.u64 %o, %i, 1;
     mul.lo.u64 %o, %o, 4;
     add.u64 %addr, %perm, %o;
     ld.global.u32 %prow, [%addr];
     cvt.u64.u32 %r64, %prow;
-    mul.lo.u64 %o, %r64, 16;
+    mul.lo.u64 %o, %r64, %k8;
     add.u64 %pbase, %keys, %o;
-    ld.global.u64 %pg, [%pbase];
-    ld.global.u64 %pv, [%pbase+8];
-    setp.ne.u64 %p, %g, %pg;
-    setp.ne.u64 %q, %v, %pv;
-    or.pred %p, %p, %q;
+    // new iff ANY of the kdim keys differs from sorted position i-1.
+    mov.u64 %j, 0;
+key_cmp_loop:
+    setp.ge.u64 %p, %j, %kdim;
+    @%p bra mark_not_new;
+    mul.lo.u64 %jo, %j, 8;
+    add.u64 %addr, %base, %jo;
+    ld.global.u64 %ka, [%addr];
+    add.u64 %addr, %pbase, %jo;
+    ld.global.u64 %kb, [%addr];
+    setp.ne.u64 %p, %ka, %kb;
     @%p bra mark_is_new;
+    add.u64 %j, %j, 1;
+    bra key_cmp_loop;
+mark_not_new:
     mov.u64 %nd, 0;
     bra mark_store;
 mark_is_new:
