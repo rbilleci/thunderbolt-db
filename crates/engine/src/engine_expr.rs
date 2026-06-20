@@ -1792,9 +1792,16 @@ impl Engine {
         // (int2/int4/int8/date/timestamp) to this path -- one key OR several (`ORDER BY a ASC, b DESC`).
         // A single TEXT-key ORDER BY takes the varlen GPU sort path (the byte-wise comparator); all
         // other routed keys are i64-sortable ints and go through the key-matrix path below.
-        let single_text_key = select.order_by.len() == 1
-            && table.columns[relational_column_index(table, &select.order_by[0].column)?].ty
-                == SqlType::Text;
+        // Classify the ORDER BY keys: k==1 text -> the varlen text sort; k>1 with ANY text key -> the
+        // heterogeneous mixed (int+text) sort; all-int -> the i64 key matrix.
+        let mut has_text_key = false;
+        for order in &select.order_by {
+            if table.columns[relational_column_index(table, &order.column)?].ty == SqlType::Text {
+                has_text_key = true;
+                break;
+            }
+        }
+        let single_text_key = select.order_by.len() == 1 && has_text_key;
         let indices_u64 = if select.order_by.is_empty() {
             indices_u64
         } else if single_text_key {
@@ -1812,6 +1819,97 @@ impl Engine {
                     order.descending,
                 )
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            perm.iter().map(|&p| indices_u64[p as usize]).collect()
+        } else if select.order_by.len() > 1 && has_text_key {
+            // Mixed int+text key tuple (`ORDER BY name /*text*/, age /*int*/, id /*int*/`): the
+            // heterogeneous GPU comparator dispatches each key to the s64 compare (int, read from a
+            // row-major by-position matrix) or the byte compare (text, read in place from the resident
+            // column). Charter-native GPU sort -- no host/CPU sort.
+            let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+            };
+            let n = indices_u64.len();
+            let k = select.order_by.len();
+            if k > 64 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "ORDER BY supports at most 64 sort keys on the GPU sort path".to_string(),
+                )));
+            }
+            // Walk the keys in order: each int key takes the next int-matrix column, each text key the
+            // next text-column slot; build key_plan (bit31=is_text, low bits=slot) + desc_mask.
+            let mut num_int = 0usize;
+            let mut text_cols: Vec<(u64, u64)> = Vec::new();
+            let mut key_plan: Vec<u32> = Vec::with_capacity(k);
+            let mut desc_mask: u64 = 0;
+            let mut int_key_cols: Vec<(usize, usize)> = Vec::new();
+            for (ki, order) in select.order_by.iter().enumerate() {
+                if order.descending {
+                    desc_mask |= 1u64 << ki;
+                }
+                let order_idx = relational_column_index(table, &order.column)?;
+                match table.columns[order_idx].ty {
+                    SqlType::Text => {
+                        let layout =
+                            resident_device_text_column_layout(&snapshot, table, order_idx)?;
+                        let text_slot = text_cols.len() as u32;
+                        text_cols.push((layout.offsets_byte_offset, layout.bytes_byte_offset));
+                        key_plan.push(0x8000_0000_u32 | text_slot);
+                    }
+                    SqlType::Int4
+                    | SqlType::Int2
+                    | SqlType::Date
+                    | SqlType::Int8
+                    | SqlType::Timestamp => {
+                        let int_slot = num_int;
+                        num_int += 1;
+                        key_plan.push(int_slot as u32);
+                        int_key_cols.push((order_idx, int_slot));
+                    }
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "mixed-key ORDER BY on the Expr path supports int2 / int4 / int8 / date \
+                             / timestamp / text columns (the GPU sort); other types are a follow-on"
+                                .to_string(),
+                        )));
+                    }
+                }
+            }
+            // Materialize the int keys into a row-major n*num_int matrix by position (matching the
+            // multikey kernel's layout; the text keys read in place via the indices indirection).
+            let mut int_keys = vec![0i64; n * num_int];
+            for (order_idx, int_slot) in int_key_cols {
+                let col_keys: Vec<i64> = match table.columns[order_idx].ty {
+                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
+                        let off = resident_device_int4_column_offset(&snapshot, table, order_idx)?;
+                        device_memory
+                            .project_i32_rows_from_payload(off, &indices_u64)
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(i64::from)
+                            .collect()
+                    }
+                    SqlType::Int8 | SqlType::Timestamp => {
+                        let off = resident_device_int8_column_offset(&snapshot, table, order_idx)?;
+                        device_memory
+                            .project_i64_rows_from_payload(off, &indices_u64)
+                            .map_err(map_err)?
+                    }
+                    _ => unreachable!("classified as an int key above"),
+                };
+                for (i, v) in col_keys.into_iter().enumerate() {
+                    int_keys[i * num_int + int_slot] = v;
+                }
+            }
+            let perm = device_memory
+                .bitonic_sort_hetero(
+                    &indices_u64,
+                    &int_keys,
+                    num_int,
+                    &text_cols,
+                    &key_plan,
+                    desc_mask,
+                )
+                .map_err(map_err)?;
             perm.iter().map(|&p| indices_u64[p as usize]).collect()
         } else {
             let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {

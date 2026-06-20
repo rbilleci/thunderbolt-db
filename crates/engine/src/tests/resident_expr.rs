@@ -3420,6 +3420,83 @@ fn gpu_nongrouped_order_by_multikey() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_mixed_int_text() {
+    // MIXED int+text multi-key ORDER BY (`ORDER BY name /*text*/, age /*int*/, id /*int*/`) sorts on the
+    // GPU via the HETEROGENEOUS comparator -- each key dispatched to the s64 compare (int) or the byte
+    // compare (text). executed_target==Gpu proves the general GPU path. Rows are engineered so EVERY key
+    // is the real tie-breaker. Completes the canonical `ORDER BY last_name, age, id`.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE people (name TEXT, age INT, id INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO people (name, age, id) VALUES \
+         ('bob', 30, 1), ('alice', 25, 2), ('alice', 25, 3), ('alice', 40, 4), \
+         ('bob', 30, 5), ('bob', 20, 6)",
+    )
+    .unwrap();
+    e.execute_text(3, "CREATE TABLE names (last TEXT, first TEXT, id INT)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO names (last, first, id) VALUES \
+         ('smith', 'bob', 1), ('jones', 'amy', 2), ('smith', 'amy', 3), ('smith', 'al', 4)",
+    )
+    .unwrap();
+    let snap = e.populate_relational_residency_snapshot("people").unwrap();
+    e.populate_relational_residency_snapshot("names").unwrap();
+    if snap.device_memory_proof.is_none() {
+        return;
+    }
+    let id_col = |res: &RelationalSelectResult| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(v) => v,
+                ref other => panic!("expected Int4, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // (a) the canonical 3-key: name ASC (text primary), age DESC (int), id ASC (int). alice<bob; within
+    // a name, age DESC; within name+age (the two alice/25 rows), id ASC. Each key a real tie-breaker.
+    let abc = e
+        .execute_relational_select_text("SELECT id FROM people ORDER BY name ASC, age DESC, id ASC")
+        .unwrap();
+    assert_eq!(
+        abc.executed_target,
+        DeviceTarget::Gpu(0),
+        "mixed int+text ORDER BY must run on the general GPU path"
+    );
+    assert_eq!(id_col(&abc), vec![4, 2, 3, 1, 5, 6], "name ASC / age DESC / id ASC");
+
+    // (b) int primary, text secondary: age ASC, name ASC, id ASC. ages group; name (degenerate tie
+    // within each age here) then id ASC. Proves age is primary (not name).
+    let ba = e
+        .execute_relational_select_text("SELECT id FROM people ORDER BY age ASC, name ASC, id ASC")
+        .unwrap();
+    assert_eq!(ba.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(id_col(&ba), vec![6, 2, 3, 1, 5, 4], "age ASC / name ASC / id ASC");
+
+    // (c) DESC on the TEXT key: name DESC, id ASC. bob before alice; within a name, id ASC. (The text
+    // key must sort DESC via the comparator direction, not a key sentinel.)
+    let nd = e
+        .execute_relational_select_text("SELECT id FROM people ORDER BY name DESC, id ASC")
+        .unwrap();
+    assert_eq!(nd.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(id_col(&nd), vec![1, 5, 6, 2, 3, 4], "name DESC / id ASC");
+
+    // (d) TWO text keys: last ASC, first ASC. jones<smith; within smith, first ASC ('al'<'amy'<'bob').
+    // Two text slots in the key_plan, both dispatched to the byte compare.
+    let lf = e
+        .execute_relational_select_text("SELECT id FROM names ORDER BY last ASC, first ASC")
+        .unwrap();
+    assert_eq!(lf.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(id_col(&lf), vec![2, 4, 3, 1], "last ASC / first ASC (two text keys)");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_uuid_key() {
     // GROUP BY a UUID (i128) key via atom.cas.b128; output sorts by canonical/memcmp byte order. Uses
     // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and

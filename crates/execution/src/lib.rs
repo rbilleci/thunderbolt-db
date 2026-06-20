@@ -1038,6 +1038,26 @@ impl CudaResidentDeviceMemory {
         launch_cuda_bitonic_sort_multikey(self, keys, n, k, desc_mask)
     }
 
+    /// GPU heterogeneous multi-key bitonic sort over a tuple MIXING int + text keys. `indices` =
+    /// the surviving row ids (n); `int_keys` = a row-major `n x num_int` i64 matrix by position (the
+    /// int keys only); `text_cols[t]` = (offsets_byte_offset, bytes_byte_offset) of text key t;
+    /// `key_plan[k]` selects key k (bit31=is_text, low bits=idx into the int columns / text_cols);
+    /// `desc_mask` bit k => DESC. Returns the positions 0..n in the tuple order. Completes the canonical
+    /// `ORDER BY <text>, <int>, <int>` on the GPU.
+    pub fn bitonic_sort_hetero(
+        &self,
+        indices: &[u64],
+        int_keys: &[i64],
+        num_int: usize,
+        text_cols: &[(u64, u64)],
+        key_plan: &[u32],
+        desc_mask: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_bitonic_sort_hetero(
+            self, indices, int_keys, num_int, text_cols, key_plan, desc_mask,
+        )
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -3480,6 +3500,249 @@ fn launch_cuda_bitonic_sort_multikey(
                     (&mut p5 as *mut u64).cast::<c_void>(),
                     (&mut p6 as *mut u64).cast::<c_void>(),
                     (&mut p7 as *mut u64).cast::<c_void>(),
+                ];
+                let rc = unsafe {
+                    cu_launch_kernel(
+                        sort_fn,
+                        grid,
+                        1,
+                        1,
+                        BLOCK,
+                        1,
+                        1,
+                        0,
+                        stream,
+                        args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return rc;
+                }
+                if jj == 1 {
+                    break;
+                }
+                jj >>= 1;
+            }
+            kk <<= 1;
+        }
+        0
+    })?;
+
+    let mut perm_host = vec![0_u32; npot];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            perm_host.as_mut_ptr().cast::<c_void>(),
+            perm_dev.ptr,
+            perm_bytes,
+        )
+    })?;
+    Ok(perm_host
+        .into_iter()
+        .filter(|&p| (p as usize) < n)
+        .collect())
+}
+
+/// GPU HETEROGENEOUS multi-key bitonic sort — a key tuple mixing INT and TEXT keys (`ORDER BY name
+/// /*text*/, age /*int*/, id /*int*/`). `int_keys` is a row-major `n x num_int` i64 matrix BY POSITION
+/// (only the int keys); `text_cols[t]` = (offsets_byte_offset, bytes_byte_offset) of text key t's
+/// resident column; `key_plan[k]` selects key k's source (bit31=is_text, bits0..30=idx into the int
+/// columns or the text_cols). `desc_mask` bit k => key k DESC. Returns the row positions (0..n) in the
+/// tuple order. The comparator walks the keys; the first non-equal decides; ties fall through.
+fn launch_cuda_bitonic_sort_hetero(
+    resident: &CudaResidentDeviceMemory,
+    indices: &[u64],
+    int_keys: &[i64],
+    num_int: usize,
+    text_cols: &[(u64, u64)],
+    key_plan: &[u32],
+    desc_mask: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    let n = indices.len();
+    let expected_int = n
+        .checked_mul(num_int)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    if int_keys.len() != expected_int {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(int_keys.len()));
+    }
+    if n <= 1 {
+        return Ok((0..n as u32).collect());
+    }
+    let num_text = text_cols.len();
+    let num_keys = key_plan.len();
+    let npot = n.next_power_of_two();
+    let perm_bytes = npot
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(npot))?;
+    let indices_bytes = n
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    // int_keys / text_cols / key_plan may be empty along one axis (all-text or all-int tuple); lease a
+    // non-zero floor so the device buffer is valid even when the kernel never reads it.
+    let int_keys_bytes = std::mem::size_of_val(int_keys).max(8);
+    let text_offs: Vec<u64> = text_cols.iter().map(|&(o, _)| o).collect();
+    let text_bytes_vec: Vec<u64> = text_cols.iter().map(|&(_, b)| b).collect();
+    let text_meta_bytes = (num_text * std::mem::size_of::<u64>()).max(8);
+    let plan_bytes = std::mem::size_of_val(key_plan).max(4);
+    let n_u64 = n as u64;
+    let npot_u64 = npot as u64;
+    let num_int_u64 = num_int as u64;
+    let num_keys_u64 = num_keys as u64;
+    let resident_base = resident.device_ptr();
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let sort_fn = primary.cached_function(c"gpu_db_bitonic_sort_hetero_step", &ptx)?;
+    let perm_dev = primary.lease_device_buffer(perm_bytes)?;
+    let indices_dev = primary.lease_device_buffer(indices_bytes)?;
+    let int_keys_dev = primary.lease_device_buffer(int_keys_bytes)?;
+    let text_offs_dev = primary.lease_device_buffer(text_meta_bytes)?;
+    let text_bytes_dev = primary.lease_device_buffer(text_meta_bytes)?;
+    let plan_dev = primary.lease_device_buffer(plan_bytes)?;
+    let identity: Vec<u32> = (0..npot as u32).collect();
+
+    const BLOCK: u32 = 256;
+    let grid = (npot.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
+
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                perm_dev.ptr,
+                identity.as_ptr().cast::<c_void>(),
+                perm_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
+            htod_async(
+                indices_dev.ptr,
+                indices.as_ptr().cast::<c_void>(),
+                indices_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        if !int_keys.is_empty() {
+            let rc = unsafe {
+                htod_async(
+                    int_keys_dev.ptr,
+                    int_keys.as_ptr().cast::<c_void>(),
+                    std::mem::size_of_val(int_keys),
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        if num_text != 0 {
+            let rc = unsafe {
+                htod_async(
+                    text_offs_dev.ptr,
+                    text_offs.as_ptr().cast::<c_void>(),
+                    num_text * std::mem::size_of::<u64>(),
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+            let rc = unsafe {
+                htod_async(
+                    text_bytes_dev.ptr,
+                    text_bytes_vec.as_ptr().cast::<c_void>(),
+                    num_text * std::mem::size_of::<u64>(),
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        let rc = unsafe {
+            htod_async(
+                plan_dev.ptr,
+                key_plan.as_ptr().cast::<c_void>(),
+                std::mem::size_of_val(key_plan),
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let mut kk = 2_u64;
+        while kk <= npot_u64 {
+            let mut jj = kk >> 1;
+            loop {
+                let mut p0 = perm_dev.ptr;
+                let mut p1 = indices_dev.ptr;
+                let mut p2 = int_keys_dev.ptr;
+                let mut p3 = num_int_u64;
+                let mut p4 = text_offs_dev.ptr;
+                let mut p5 = text_bytes_dev.ptr;
+                let mut p6 = resident_base;
+                let mut p7 = plan_dev.ptr;
+                let mut p8 = num_keys_u64;
+                let mut p9 = desc_mask;
+                let mut p10 = n_u64;
+                let mut p11 = npot_u64;
+                let mut p12 = kk;
+                let mut p13 = jj;
+                let mut args = [
+                    (&mut p0 as *mut u64).cast::<c_void>(),
+                    (&mut p1 as *mut u64).cast::<c_void>(),
+                    (&mut p2 as *mut u64).cast::<c_void>(),
+                    (&mut p3 as *mut u64).cast::<c_void>(),
+                    (&mut p4 as *mut u64).cast::<c_void>(),
+                    (&mut p5 as *mut u64).cast::<c_void>(),
+                    (&mut p6 as *mut u64).cast::<c_void>(),
+                    (&mut p7 as *mut u64).cast::<c_void>(),
+                    (&mut p8 as *mut u64).cast::<c_void>(),
+                    (&mut p9 as *mut u64).cast::<c_void>(),
+                    (&mut p10 as *mut u64).cast::<c_void>(),
+                    (&mut p11 as *mut u64).cast::<c_void>(),
+                    (&mut p12 as *mut u64).cast::<c_void>(),
+                    (&mut p13 as *mut u64).cast::<c_void>(),
                 ];
                 let rc = unsafe {
                     cu_launch_kernel(

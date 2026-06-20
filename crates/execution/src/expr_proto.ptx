@@ -4408,6 +4408,260 @@ mk_done:
     ret;
 }
 
+// Heterogeneous multi-key bitonic compare-exchange: a key tuple MIXING int and text keys. key_plan[k]
+// has bit31=is_text, bits0..30=idx (into the int_keys columns if int, into text_offs/text_bytes if
+// text). INT keys are a row-major n*num_int s64 matrix BY POSITION (int_keys[pos*num_int + idx]); TEXT
+// keys read the resident column at row indices[pos] (offsets base = resident_base + text_offs[idx],
+// bytes base = resident_base + text_bytes[idx]). Comparator walks keys 0..num_keys; first non-equal key
+// decides (desc_mask bit k => DESC) and stops; all-equal => no swap. Padding (perm value >= n) sorts
+// last by POSITION (never a key sentinel) so DESC is safe. Reuses the s64 compare (multikey) + the
+// byte compare (text). Offsets read as 2x ld.u32 (716-safe). One pass; host drives the kk/jj schedule.
+.visible .entry gpu_db_bitonic_sort_hetero_step(
+    .param .u64 perm_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 int_keys_ptr,
+    .param .u64 num_int,
+    .param .u64 text_offs_ptr,
+    .param .u64 text_bytes_ptr,
+    .param .u64 resident_base_ptr,
+    .param .u64 key_plan_ptr,
+    .param .u64 num_keys,
+    .param .u64 desc_mask,
+    .param .u64 n,
+    .param .u64 npot,
+    .param .u64 kk,
+    .param .u64 jj
+)
+{
+    .reg .pred %p;
+    .reg .pred %pseq;
+    .reg .pred %pafter;
+    .reg .pred %pap;
+    .reg .pred %pbp;
+    .reg .pred %pdesc;
+    .reg .pred %ptext;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .u32 %a32;
+    .reg .u32 %b32;
+    .reg .u32 %plan;
+    .reg .u64 %permp;
+    .reg .u64 %indp;
+    .reg .u64 %intp;
+    .reg .u64 %numint;
+    .reg .u64 %toffp;
+    .reg .u64 %tbytp;
+    .reg .u64 %resb;
+    .reg .u64 %planp;
+    .reg .u64 %numkeys;
+    .reg .u64 %descmask;
+    .reg .u64 %n;
+    .reg .u64 %npot;
+    .reg .u64 %kk;
+    .reg .u64 %jj;
+    .reg .u64 %i;
+    .reg .u64 %l;
+    .reg .u64 %au;
+    .reg .u64 %bu;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %stride;
+    .reg .u64 %rowa;
+    .reg .u64 %rowb;
+    .reg .u64 %kidx;
+    .reg .u64 %maskbit;
+    .reg .u64 %tmp;
+    .reg .u64 %idx;
+    .reg .u64 %offb;
+    .reg .u64 %bytb;
+    .reg .u64 %o8;
+    .reg .u64 %sta;
+    .reg .u64 %ena;
+    .reg .u64 %stb;
+    .reg .u64 %enb;
+    .reg .u64 %lena;
+    .reg .u64 %lenb;
+    .reg .u64 %minlen;
+    .reg .u64 %j;
+    .reg .u64 %ba;
+    .reg .u64 %bb;
+    .reg .s64 %ka;
+    .reg .s64 %kb;
+    .reg .s64 %cmp;
+
+    ld.param.u64 %permp, [perm_ptr];
+    ld.param.u64 %indp, [indices_ptr];
+    ld.param.u64 %intp, [int_keys_ptr];
+    ld.param.u64 %numint, [num_int];
+    ld.param.u64 %toffp, [text_offs_ptr];
+    ld.param.u64 %tbytp, [text_bytes_ptr];
+    ld.param.u64 %resb, [resident_base_ptr];
+    ld.param.u64 %planp, [key_plan_ptr];
+    ld.param.u64 %numkeys, [num_keys];
+    ld.param.u64 %descmask, [desc_mask];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %npot, [npot];
+    ld.param.u64 %kk, [kk];
+    ld.param.u64 %jj, [jj];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+het_loop:
+    setp.ge.u64 %p, %i, %npot;
+    @%p bra het_done;
+    xor.b64 %l, %i, %jj;
+    setp.le.u64 %p, %l, %i;
+    @%p bra het_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %a32, [%addr];
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %b32, [%addr];
+    cvt.u64.u32 %au, %a32;
+    cvt.u64.u32 %bu, %b32;
+    and.b64 %off, %i, %kk;
+    setp.eq.u64 %pseq, %off, 0;
+    setp.ge.u64 %pap, %au, %n;
+    setp.ge.u64 %pbp, %bu, %n;
+    @%pap bra het_apad;
+    @%pbp bra het_afalse;
+    mul.lo.u64 %off, %au, 8;
+    add.u64 %addr, %indp, %off;
+    ld.global.u64 %rowa, [%addr];
+    mul.lo.u64 %off, %bu, 8;
+    add.u64 %addr, %indp, %off;
+    ld.global.u64 %rowb, [%addr];
+    mov.u64 %kidx, 0;
+    mov.u64 %maskbit, 1;
+het_key_loop:
+    setp.ge.u64 %p, %kidx, %numkeys;
+    @%p bra het_alleq;
+    mul.lo.u64 %off, %kidx, 4;
+    add.u64 %addr, %planp, %off;
+    ld.global.u32 %plan, [%addr];
+    shr.u32 %t32, %plan, 31;
+    setp.ne.u32 %ptext, %t32, 0;
+    and.b32 %t32, %plan, 2147483647;
+    cvt.u64.u32 %idx, %t32;
+    @%ptext bra het_textcmp;
+    mul.lo.u64 %tmp, %au, %numint;
+    add.u64 %tmp, %tmp, %idx;
+    mul.lo.u64 %tmp, %tmp, 8;
+    add.u64 %addr, %intp, %tmp;
+    ld.global.s64 %ka, [%addr];
+    mul.lo.u64 %tmp, %bu, %numint;
+    add.u64 %tmp, %tmp, %idx;
+    mul.lo.u64 %tmp, %tmp, 8;
+    add.u64 %addr, %intp, %tmp;
+    ld.global.s64 %kb, [%addr];
+    setp.lt.s64 %p, %ka, %kb;
+    selp.s64 %cmp, -1, 0, %p;
+    setp.gt.s64 %p, %ka, %kb;
+    selp.s64 %cmp, 1, %cmp, %p;
+    bra het_havecmp;
+het_textcmp:
+    mul.lo.u64 %off, %idx, 8;
+    add.u64 %addr, %toffp, %off;
+    ld.global.u64 %tmp, [%addr];
+    add.u64 %offb, %resb, %tmp;
+    add.u64 %addr, %tbytp, %off;
+    ld.global.u64 %tmp, [%addr];
+    add.u64 %bytb, %resb, %tmp;
+    mul.lo.u64 %o8, %rowa, 8;
+    add.u64 %addr, %offb, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %sta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %ena, {%w0, %w1};
+    sub.u64 %lena, %ena, %sta;
+    mul.lo.u64 %o8, %rowb, 8;
+    add.u64 %addr, %offb, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %stb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enb, {%w0, %w1};
+    sub.u64 %lenb, %enb, %stb;
+    min.u64 %minlen, %lena, %lenb;
+    add.u64 %ba, %bytb, %sta;
+    add.u64 %bb, %bytb, %stb;
+    mov.u64 %j, 0;
+het_byte:
+    setp.ge.u64 %p, %j, %minlen;
+    @%p bra het_eqlen;
+    add.u64 %addr, %ba, %j;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %bb, %j;
+    ld.global.u8 %bbyte, [%addr];
+    setp.eq.u32 %p, %abyte, %bbyte;
+    @%p bra het_byte_next;
+    setp.gt.u32 %p, %abyte, %bbyte;
+    selp.s64 %cmp, 1, -1, %p;
+    bra het_havecmp;
+het_byte_next:
+    add.u64 %j, %j, 1;
+    bra het_byte;
+het_eqlen:
+    setp.gt.u64 %p, %lena, %lenb;
+    selp.s64 %cmp, 1, -1, %p;
+    setp.eq.u64 %p, %lena, %lenb;
+    selp.s64 %cmp, 0, %cmp, %p;
+het_havecmp:
+    setp.eq.s64 %p, %cmp, 0;
+    @%p bra het_key_next;
+    and.b64 %tmp, %descmask, %maskbit;
+    setp.ne.u64 %pdesc, %tmp, 0;
+    @%pdesc bra het_kdesc;
+    setp.gt.s64 %pafter, %cmp, 0;
+    bra het_adone;
+het_kdesc:
+    setp.lt.s64 %pafter, %cmp, 0;
+    bra het_adone;
+het_key_next:
+    add.u64 %kidx, %kidx, 1;
+    shl.b64 %maskbit, %maskbit, 1;
+    bra het_key_loop;
+het_alleq:
+    setp.ne.u64 %pafter, %n, %n;
+    bra het_adone;
+het_apad:
+    @%pbp bra het_afalse;
+    setp.eq.u64 %pafter, %n, %n;
+    bra het_adone;
+het_afalse:
+    setp.ne.u64 %pafter, %n, %n;
+het_adone:
+    xor.pred %p, %pafter, %pseq;
+    @%p bra het_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %b32;
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %a32;
+het_next:
+    add.u64 %i, %i, %stride;
+    bra het_loop;
+het_done:
+    ret;
+}
+
 // GROUP BY an int4 key, aggregating COUNT(*) and SUM(int4 value) into an open-addressing hash table
 // (the operator axis, doc 19; the general path -- the enumerated GROUP BY is a host BTreeMap).
 //   slot_keys : [s64; NSLOTS] host-init to EMPTY (i64::MIN) via gpu_db_fill_i64.

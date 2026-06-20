@@ -12,9 +12,9 @@ use super::*;
 /// `ORDER BY a ASC, b DESC, c`). Such a query is routed to the general GPU Expr executor, which sorts
 /// the surviving rows on the GPU (multi-key bitonic) -- the charter-native path, retiring the
 /// enumerated ordered-projection shape for this case. A SINGLE text key also routes here (the byte-wise
-/// GPU text sort). Other shapes -- multi-key WITH a text key, numeric/uuid keys, expressions -- stay on
-/// the existing path transitionally; the enumerated/CPU path rejects multi-key, so a multi-key sort with
-/// a non-routable key is a clean error, never a silent first-key-only sort.
+/// GPU text sort), and a MIXED int+text tuple uses the heterogeneous comparator. Other shapes --
+/// numeric/uuid keys, expressions -- stay on the existing path transitionally; the enumerated/CPU path
+/// rejects multi-key, so a multi-key sort with a non-routable key is a clean error, never first-key-only.
 fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -> bool {
     if select.group_by.is_some() || !select.having_groups.is_empty() {
         return false;
@@ -28,18 +28,10 @@ fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -
     ) {
         return false;
     }
-    // A single TEXT key sorts on the GPU via the byte-wise comparator (the text leg of the sort).
-    // Multi-key WITH a text key is NOT routed -- the multi-key bitonic kernel is i64-only -- so it stays
-    // on the existing path (which rejects multi-key cleanly rather than first-key-only).
-    if select.order_by.len() == 1
-        && table
-            .columns
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(&select.order_by[0].column))
-            .is_some_and(|c| c.ty == SqlType::Text)
-    {
-        return true;
-    }
+    // Every ORDER BY key must be a base column the GPU sort handles: an i64-sortable int
+    // (int2/4/8/date/timestamp) OR text (the byte-wise comparator). A single text key uses the text leg,
+    // an all-int tuple the i64 key matrix, a MIX the heterogeneous comparator. numeric/uuid keys +
+    // expressions stay on the existing path (which rejects multi-key cleanly, never first-key-only).
     select.order_by.iter().all(|order| {
         table
             .columns
@@ -53,6 +45,7 @@ fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -
                         | SqlType::Int2
                         | SqlType::Date
                         | SqlType::Timestamp
+                        | SqlType::Text
                 )
             })
     })
