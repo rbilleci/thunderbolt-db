@@ -3967,6 +3967,121 @@ fill128_done:
     ret;
 }
 
+// One bitonic compare-exchange pass over a permutation perm[0..npot) keyed by keys[0..n) (positions
+// >= n are PADDING that always sorts last). Pair l = i XOR jj; only the lower index i<l acts.
+// seq_asc = ((i & kk) == 0). a_after_b = "row a sorts after row b" (padding last; signed i64; flipped
+// by `descending`). SWAP perm[i],perm[l] iff a_after_b == seq_asc. Race-free: each pass partitions
+// [0,npot) into disjoint (i,l) pairs. The host loops kk=2..npot, jj=kk/2..1, launching this each pass.
+.visible .entry gpu_db_bitonic_sort_i64_step(
+    .param .u64 perm_ptr,
+    .param .u64 keys_ptr,
+    .param .u64 n,
+    .param .u64 npot,
+    .param .u64 kk,
+    .param .u64 jj,
+    .param .u64 descending
+)
+{
+    .reg .pred %p;
+    .reg .pred %pseq;
+    .reg .pred %pafter;
+    .reg .pred %pap;
+    .reg .pred %pbp;
+    .reg .pred %pdesc;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %a32;
+    .reg .u32 %b32;
+    .reg .u64 %permp;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %npot;
+    .reg .u64 %kk;
+    .reg .u64 %jj;
+    .reg .u64 %desc;
+    .reg .u64 %i;
+    .reg .u64 %l;
+    .reg .u64 %au;
+    .reg .u64 %bu;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %stride;
+    .reg .s64 %ka;
+    .reg .s64 %kb;
+
+    ld.param.u64 %permp, [perm_ptr];
+    ld.param.u64 %keysp, [keys_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %npot, [npot];
+    ld.param.u64 %kk, [kk];
+    ld.param.u64 %jj, [jj];
+    ld.param.u64 %desc, [descending];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+    setp.ne.u64 %pdesc, %desc, 0;
+bit_loop:
+    setp.ge.u64 %p, %i, %npot;
+    @%p bra bit_done;
+    xor.b64 %l, %i, %jj;
+    setp.le.u64 %p, %l, %i;
+    @%p bra bit_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %a32, [%addr];
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %b32, [%addr];
+    cvt.u64.u32 %au, %a32;
+    cvt.u64.u32 %bu, %b32;
+    and.b64 %off, %i, %kk;
+    setp.eq.u64 %pseq, %off, 0;
+    setp.ge.u64 %pap, %au, %n;
+    setp.ge.u64 %pbp, %bu, %n;
+    @%pap bra bit_apad;
+    @%pbp bra bit_afalse;
+    mul.lo.u64 %off, %au, 8;
+    add.u64 %addr, %keysp, %off;
+    ld.global.s64 %ka, [%addr];
+    mul.lo.u64 %off, %bu, 8;
+    add.u64 %addr, %keysp, %off;
+    ld.global.s64 %kb, [%addr];
+    @%pdesc bra bit_adesc;
+    setp.gt.s64 %pafter, %ka, %kb;
+    bra bit_adone;
+bit_adesc:
+    setp.lt.s64 %pafter, %ka, %kb;
+    bra bit_adone;
+bit_apad:
+    @%pbp bra bit_afalse;
+    setp.eq.u64 %pafter, %n, %n;
+    bra bit_adone;
+bit_afalse:
+    setp.ne.u64 %pafter, %n, %n;
+bit_adone:
+    xor.pred %p, %pafter, %pseq;
+    @%p bra bit_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %b32;
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %a32;
+bit_next:
+    add.u64 %i, %i, %stride;
+    bra bit_loop;
+bit_done:
+    ret;
+}
+
 // GROUP BY an int4 key, aggregating COUNT(*) and SUM(int4 value) into an open-addressing hash table
 // (the operator axis, doc 19; the general path -- the enumerated GROUP BY is a host BTreeMap).
 //   slot_keys : [s64; NSLOTS] host-init to EMPTY (i64::MIN) via gpu_db_fill_i64.

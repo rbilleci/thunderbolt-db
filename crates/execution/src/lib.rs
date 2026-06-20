@@ -994,6 +994,16 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_row_count(self)
     }
 
+    /// Sort `keys[0..n]` on the GPU (bitonic), returning the row positions in ascending (or, with
+    /// `descending`, descending) key order. The foundation of the charter-native GPU ORDER BY.
+    pub fn bitonic_sort_i64(
+        &self,
+        keys: &[i64],
+        descending: bool,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_bitonic_sort_i64(self, keys, descending)
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -3000,6 +3010,156 @@ fn launch_cuda_resident_row_count(
     })?;
 
     Ok(u64::from_le_bytes(output_bytes))
+}
+
+/// GPU bitonic sort of `keys` -> the row positions (0..n) in ascending (or `descending`) key order.
+/// Pads to a power of two; padding positions sort last and are dropped from the result. O(log^2 n)
+/// compare-exchange passes, each a `gpu_db_bitonic_sort_i64_step` launch on a pooled stream. The
+/// reusable core of the charter-native GPU ORDER BY (later slices add multi-key / typed / expr keys).
+fn launch_cuda_bitonic_sort_i64(
+    resident: &CudaResidentDeviceMemory,
+    keys: &[i64],
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    let n = keys.len();
+    if n <= 1 {
+        return Ok((0..n as u32).collect());
+    }
+    let npot = n.next_power_of_two();
+    let perm_bytes = npot
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(npot))?;
+    let keys_bytes = n
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    let n_u64 = n as u64;
+    let npot_u64 = npot as u64;
+    let desc_u64 = u64::from(descending);
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let sort_fn = primary.cached_function(c"gpu_db_bitonic_sort_i64_step", &ptx)?;
+    let perm_dev = primary.lease_device_buffer(perm_bytes)?;
+    let keys_dev = primary.lease_device_buffer(keys_bytes)?;
+    let identity: Vec<u32> = (0..npot as u32).collect();
+
+    const BLOCK: u32 = 256;
+    let grid = (npot.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
+
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                perm_dev.ptr,
+                identity.as_ptr().cast::<c_void>(),
+                perm_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc =
+            unsafe { htod_async(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        // Bitonic network: kk = the sorted-subsequence size (doubles), jj = the compare distance
+        // (halves). Each (kk, jj) is one compare-exchange pass over all npot indices on the stream.
+        let mut kk = 2_u64;
+        while kk <= npot_u64 {
+            let mut jj = kk >> 1;
+            loop {
+                let mut p0 = perm_dev.ptr;
+                let mut p1 = keys_dev.ptr;
+                let mut p2 = n_u64;
+                let mut p3 = npot_u64;
+                let mut p4 = kk;
+                let mut p5 = jj;
+                let mut p6 = desc_u64;
+                let mut args = [
+                    (&mut p0 as *mut u64).cast::<c_void>(),
+                    (&mut p1 as *mut u64).cast::<c_void>(),
+                    (&mut p2 as *mut u64).cast::<c_void>(),
+                    (&mut p3 as *mut u64).cast::<c_void>(),
+                    (&mut p4 as *mut u64).cast::<c_void>(),
+                    (&mut p5 as *mut u64).cast::<c_void>(),
+                    (&mut p6 as *mut u64).cast::<c_void>(),
+                ];
+                let rc = unsafe {
+                    cu_launch_kernel(
+                        sort_fn,
+                        grid,
+                        1,
+                        1,
+                        BLOCK,
+                        1,
+                        1,
+                        0,
+                        stream,
+                        args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return rc;
+                }
+                if jj == 1 {
+                    break;
+                }
+                jj >>= 1;
+            }
+            kk <<= 1;
+        }
+        0
+    })?;
+
+    let mut perm_host = vec![0_u32; npot];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            perm_host.as_mut_ptr().cast::<c_void>(),
+            perm_dev.ptr,
+            perm_bytes,
+        )
+    })?;
+    Ok(perm_host
+        .into_iter()
+        .filter(|&p| (p as usize) < n)
+        .collect())
 }
 
 /// Single-thread `(1,1,1)` serial filtered-count — retained ONLY as the A/B baseline for
@@ -18391,6 +18551,65 @@ mod tests {
         let runtime = CudaDriverRuntime::probe().unwrap();
 
         assert_eq!(runtime.launch_smoke_add_one(41).unwrap(), 42);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_bitonic_sort_i64_orders_and_permutes() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        // The sort never reads the residency; a tiny dummy payload just supplies the shared context.
+        let resident = runtime
+            .retain_device_memory_copy(0, &0_u64.to_le_bytes())
+            .expect("resident device memory");
+
+        // Verify the GPU permutation is a bijection of 0..n AND orders the keys monotonically (a sort
+        // is correct iff it produces such a permutation -- bitonic is unstable, so we do NOT pin the
+        // exact perm on ties).
+        let check = |keys: &[i64], descending: bool| {
+            let perm = resident.bitonic_sort_i64(keys, descending).expect("sort");
+            assert_eq!(perm.len(), keys.len(), "one position per row");
+            let mut seen: Vec<u32> = perm.clone();
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..keys.len() as u32).collect::<Vec<_>>(),
+                "perm must be a permutation of 0..n"
+            );
+            for w in perm.windows(2) {
+                let (a, b) = (keys[w[0] as usize], keys[w[1] as usize]);
+                if descending {
+                    assert!(a >= b, "descending order violated: {a} before {b}");
+                } else {
+                    assert!(a <= b, "ascending order violated: {a} before {b}");
+                }
+            }
+        };
+
+        // (a) padding (n=6 -> npot=8).
+        check(&[5, 2, 8, 1, 9, 3], false);
+        check(&[5, 2, 8, 1, 9, 3], true);
+        // (b) negatives + i64::MIN/MAX, non-power-of-2 n=9, with duplicates of the extremes.
+        let extremes = [0, -1, i64::MAX, i64::MIN, 7, -7, 100, i64::MIN, i64::MAX];
+        check(&extremes, false);
+        check(&extremes, true);
+        // (c) all-equal keys -- any permutation is valid (the monotonic check is vacuously satisfied;
+        // the bijection check still bites).
+        check(&[42_i64; 5], false);
+        // (d) 1000 keys via a deterministic xorshift (no rand dep), ASC + DESC.
+        let mut x = 0x2545_F491_4F6C_DD1D_u64;
+        let big: Vec<i64> = (0..1000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as i64
+            })
+            .collect();
+        check(&big, false);
+        check(&big, true);
+        // n<=1 is the already-sorted fast path.
+        assert_eq!(resident.bitonic_sort_i64(&[], false).unwrap(), Vec::<u32>::new());
+        assert_eq!(resident.bitonic_sort_i64(&[7], true).unwrap(), vec![0]);
     }
 
     #[test]
