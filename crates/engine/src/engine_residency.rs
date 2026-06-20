@@ -16,7 +16,7 @@ use super::*;
 /// resident-like buffer without re-implementing the byte mappings. `column_names` / `column_types` /
 /// each row in `rows` are parallel by column index.
 #[allow(clippy::type_complexity)]
-fn build_relational_device_payload(
+pub(crate) fn build_relational_device_payload(
     column_names: &[String],
     column_types: &[SqlType],
     rows: &[Vec<SqlValue>],
@@ -26,6 +26,9 @@ fn build_relational_device_payload(
         Vec<ResidentDeviceTextColumnLayout>,
         Vec<ResidentDeviceBoolColumnLayout>,
         Vec<ResidentDeviceInt4ColumnStats>,
+        // (column name, byte-offset) of each numeric/uuid 16-byte section -- so a non-table caller
+        // (the GPU grouped-sort) can address them without recomputing the layout by formula.
+        Vec<(String, u64)>,
     ),
     ExecuteError,
 > {
@@ -34,6 +37,7 @@ fn build_relational_device_payload(
     let mut resident_device_text_columns = Vec::new();
     let mut resident_device_bool_columns = Vec::new();
     let mut resident_device_int4_column_stats = Vec::new();
+    let mut resident_device_b128_columns: Vec<(String, u64)> = Vec::new();
 
     // int4 / date / int2 share the i32 section (a date is i32 days; a smallint widens to i32).
     for col_idx in column_types
@@ -89,6 +93,7 @@ fn build_relational_device_payload(
         .filter(|&(_i, ty)| matches!(ty, SqlType::Numeric { .. } | SqlType::Uuid))
         .map(|(i, _)| i)
     {
+        let section_byte_offset = device_payload.len() as u64;
         for row in rows {
             match &row[col_idx] {
                 SqlValue::Numeric(value) => {
@@ -103,6 +108,7 @@ fn build_relational_device_payload(
                 }
             }
         }
+        resident_device_b128_columns.push((column_names[col_idx].clone(), section_byte_offset));
     }
     // bool -> a 1-bit-per-row bitmap (ceil(row_count/32) LE u32 words, bit i = row i, LSB-first).
     for col_idx in column_types
@@ -173,6 +179,7 @@ fn build_relational_device_payload(
         resident_device_text_columns,
         resident_device_bool_columns,
         resident_device_int4_column_stats,
+        resident_device_b128_columns,
     ))
 }
 
@@ -276,6 +283,7 @@ impl Engine {
             resident_device_text_columns,
             resident_device_bool_columns,
             resident_device_int4_column_stats,
+            _resident_device_b128_columns,
         ) = build_relational_device_payload(&column_names, &column_types, &resident_rows)?;
         // The MVCC tuple bytes (key + value per row) ride after the columnar sections (unchanged).
         device_payload.extend_from_slice(&raw_device_tail);

@@ -443,24 +443,107 @@ fn select_text_non_resident_text_order_by_falls_through_to_existing_path() {
 }
 
 #[test]
-fn grouped_multikey_order_by_is_rejected_not_silently_first_key() {
-    // A multi-key ORDER BY on a GROUPED query has no GPU multi-key sort yet (the grouped result is
-    // sorted host-side by the PRIMARY key only). It must error cleanly rather than silently honoring
-    // just the first key. Guards the audit-found bypass: a multi-aggregate GROUP BY is rejected by the
-    // hand-rolled parser -> the Err arm -> the general path's grouped branch -> .first()-only sort.
-    let e = Engine::new_local();
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn grouped_multikey_order_by_sorts_on_the_gpu() {
+    // Multi-key ORDER BY on a GROUPED result now sorts ON THE GPU (the grouped-sort migration): no
+    // host-side sort, no first-key-only. A count tie is broken by the secondary key on-device. A
+    // multi-aggregate GROUP BY routes via the Err arm to the general path's grouped branch.
+    let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE g (a INT)").unwrap();
-    e.execute_text(2, "INSERT INTO g (a) VALUES (1), (1), (2), (3), (3), (3)")
+    // counts: a=1->2, a=2->2, a=3->1. ORDER BY count ASC, a DESC -> count 1 (a=3), then the count-2 tie
+    // by a DESC (a=2 then a=1) -> the `a` column = [3, 2, 1].
+    e.execute_text(2, "INSERT INTO g (a) VALUES (1), (1), (2), (2), (3)")
         .unwrap();
-    let err = e
+    let snapshot = e.populate_relational_residency_snapshot("g").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let s = e
         .execute_relational_select_text(
             "SELECT a, COUNT(*), SUM(a) FROM g GROUP BY a ORDER BY count ASC, a DESC",
         )
-        .expect_err("multi-key grouped ORDER BY must be rejected, not silently first-key sorted");
-    let msg = format!("{err:?}").to_lowercase();
-    assert!(
-        msg.contains("multi-key order by") && msg.contains("grouped"),
-        "expected a clean multi-key-grouped rejection, got: {err:?}"
+        .expect("multi-key grouped ORDER BY now sorts on the GPU");
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    let a_order: Vec<SqlValue> = s.rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        a_order,
+        vec![SqlValue::Int4(3), SqlValue::Int4(2), SqlValue::Int4(1)],
+        "count ASC then a DESC: a=3 (count 1), then the count-2 tie a=2,a=1 by a DESC"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn grouped_order_by_text_key_sorts_on_the_gpu() {
+    // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
+    // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.
+    // Multi-aggregate forces the general path.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (name TEXT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (name, v) VALUES ('cara', 1), ('amy', 2), ('bob', 3), ('amy', 4)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let s = e
+        .execute_relational_select_text(
+            "SELECT name, COUNT(*), SUM(v) FROM t GROUP BY name ORDER BY name DESC",
+        )
+        .expect("grouped text-key ORDER BY now sorts on the GPU");
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    let names: Vec<String> = s
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            SqlValue::Text(t) => t.to_string(),
+            other => panic!("expected text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["cara", "bob", "amy"], "name DESC -> cara, bob, amy");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn grouped_order_by_numeric_key_sorts_on_the_gpu() {
+    // GROUP BY a NUMERIC column, ORDER BY it DESC: the grouped GPU sort builds a resident-like 16-byte
+    // (b128) payload section + sorts on-device. Assert via the per-group COUNT (distinct) to avoid a
+    // numeric-literal compare. Multi-aggregate forces the general path.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (v NUMERIC(10,2), w INT)")
+        .unwrap();
+    // counts by v: 1.00->2, 2.00->3, 3.00->1. ORDER BY v DESC -> 3.00(1), 2.00(3), 1.00(2).
+    e.execute_text(
+        2,
+        "INSERT INTO t (v, w) VALUES (1.00,1),(1.00,1),(2.00,1),(2.00,1),(2.00,1),(3.00,1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let s = e
+        .execute_relational_select_text(
+            "SELECT v, COUNT(*), SUM(w) FROM t GROUP BY v ORDER BY v DESC",
+        )
+        .expect("grouped numeric-key ORDER BY now sorts on the GPU");
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    let counts: Vec<i64> = s
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            SqlValue::Int8(c) => *c,
+            SqlValue::Int4(c) => i64::from(*c),
+            other => panic!("unexpected count type: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        vec![1, 3, 2],
+        "v DESC: 3.00(count 1), 2.00(count 3), 1.00(count 2)"
     );
 }
 

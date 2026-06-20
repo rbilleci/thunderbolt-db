@@ -171,18 +171,9 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
     } else {
         Vec::new()
     };
-    // The grouped result is sorted host-side (one row per group) reading the PRIMARY key only; there is
-    // no GPU multi-key sort for grouped results yet (that lands with the grouped-sort migration).
-    // Reject a multi-key grouped ORDER BY cleanly rather than silently honoring just the first key.
-    if group_by.is_some() && order_by.len() > 1 {
-        return Err(sql_pg_error(
-            "multi-key ORDER BY on a grouped result is not yet supported (single-key only)"
-                .to_string(),
-        ));
-    }
-    // The grouped result is sorted host-side by a column key only; an expression ORDER BY (empty
-    // placeholder column) on a grouped result has no GPU sort yet (the grouped-sort migration lands
-    // that). Reject cleanly rather than mis-sorting.
+    // Multi-key COLUMN ORDER BY on a grouped result now sorts on the GPU (the grouped-sort migration).
+    // An EXPRESSION ORDER BY (empty placeholder column) on a grouped result still has no GPU path -- the
+    // grouped GPU sort reads result COLUMNS, not arbitrary expressions -- so reject it cleanly.
     if group_by.is_some() && order_by.iter().any(|key| key.column.is_empty()) {
         return Err(sql_pg_error(
             "ORDER BY an expression on a grouped result is not yet supported".to_string(),

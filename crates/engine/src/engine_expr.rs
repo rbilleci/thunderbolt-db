@@ -1566,25 +1566,128 @@ impl Engine {
                     })
                 });
             }
-            // Defense: the grouped result is sorted host-side by the PRIMARY key only. A multi-key
-            // grouped ORDER BY is rejected at parse (build_select_from_select_stmt); this guard ensures
-            // no future caller can reach here and silently honor only the first key.
-            if select.order_by.len() > 1 {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "multi-key ORDER BY on a grouped result is not yet supported (single-key only)"
-                        .to_string(),
-                )));
-            }
-            if let Some(order) = select.order_by.first() {
-                let idx = col_index(&order.column)?;
-                rows.sort_by(|a, b| {
-                    let ord = key_cmp(&a[idx], &b[idx]);
-                    if order.descending {
-                        ord.reverse()
-                    } else {
-                        ord
+            // The grouped result is sorted ON THE GPU (charter: every relational sort is a GPU sort,
+            // regardless of result size -- no host-side finalization). INT keys feed an i64 matrix by
+            // group position; TEXT/NUMERIC/UUID keys feed a resident-like payload built (via
+            // build_relational_device_payload) from just those result columns, which the hetero
+            // comparator reads on-device. Single- and multi-key are the same path (k=1 is K=1).
+            if !select.order_by.is_empty() && rows.len() > 1 {
+                let n = rows.len();
+                // (result-column index, kind 0=int / 1=text / 2=numeric / 3=uuid) per ORDER BY key.
+                let mut classified: Vec<(usize, u8)> = Vec::with_capacity(select.order_by.len());
+                for order in &select.order_by {
+                    let idx = col_index(&order.column)?;
+                    let kind = match bound.selected_columns[idx].ty {
+                        SqlType::Int4
+                        | SqlType::Int8
+                        | SqlType::Int2
+                        | SqlType::Date
+                        | SqlType::Timestamp => 0u8,
+                        SqlType::Text => 1,
+                        SqlType::Numeric { .. } => 2,
+                        SqlType::Uuid => 3,
+                        other => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "ORDER BY on a grouped {other:?} result is not yet supported"
+                            ))));
+                        }
+                    };
+                    classified.push((idx, kind));
+                }
+                let num_int = classified.iter().filter(|&&(_, k)| k == 0).count();
+                // INT key matrix, row-major by group position (matches `indices` = 0..n order).
+                let mut int_keys: Vec<i64> = Vec::with_capacity(n * num_int);
+                for row in &rows {
+                    for &(idx, kind) in &classified {
+                        if kind == 0 {
+                            int_keys.push(match row[idx] {
+                                SqlValue::Int4(v) | SqlValue::Date(v) => i64::from(v),
+                                SqlValue::Int2(v) => i64::from(v),
+                                SqlValue::Int8(v) | SqlValue::Timestamp(v) => v,
+                                _ => {
+                                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                        "grouped ORDER BY int key encountered a non-int value"
+                                            .to_string(),
+                                    )));
+                                }
+                            });
+                        }
                     }
-                });
+                }
+                let mut desc_mask = 0u64;
+                for (ki, order) in select.order_by.iter().enumerate() {
+                    if order.descending {
+                        desc_mask |= 1u64 << ki;
+                    }
+                }
+                let non_int: Vec<(usize, u8)> =
+                    classified.iter().copied().filter(|&(_, k)| k != 0).collect();
+                let map_sort_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+                };
+                let perm: Vec<u32> = if non_int.is_empty() {
+                    device_memory
+                        .bitonic_sort_multikey(&int_keys, n, num_int, desc_mask)
+                        .map_err(map_sort_err)?
+                } else {
+                    // A resident-like payload over ONLY the non-int key columns; the helper returns the
+                    // text (offsets,bytes) + numeric/uuid section offsets we feed the hetero comparator.
+                    let names: Vec<String> =
+                        (0..non_int.len()).map(|i| format!("__gsk{i}")).collect();
+                    let types: Vec<SqlType> = non_int
+                        .iter()
+                        .map(|&(idx, _)| bound.selected_columns[idx].ty)
+                        .collect();
+                    let payload_rows: Vec<Vec<SqlValue>> = rows
+                        .iter()
+                        .map(|r| non_int.iter().map(|&(idx, _)| r[idx].clone()).collect())
+                        .collect();
+                    let (payload, text_layouts, _bool, _int4, b128_layouts) =
+                        crate::engine_residency::build_relational_device_payload(
+                            &names,
+                            &types,
+                            &payload_rows,
+                        )?;
+                    // Walk ORDER BY order: int -> next matrix slot; text/numeric/uuid -> the next
+                    // section in its type group (helper lays them out in passed-column order per group).
+                    let mut int_slot = 0u32;
+                    let mut text_idx = 0usize;
+                    let mut b128_idx = 0usize;
+                    let mut text_cols: Vec<(u64, u64)> = Vec::new();
+                    let mut b128_cols: Vec<u64> = Vec::new();
+                    let mut key_plan: Vec<u32> = Vec::with_capacity(select.order_by.len());
+                    for &(_, kind) in &classified {
+                        match kind {
+                            0 => {
+                                key_plan.push(int_slot);
+                                int_slot += 1;
+                            }
+                            1 => {
+                                let tl = &text_layouts[text_idx];
+                                key_plan.push(0x4000_0000_u32 | text_cols.len() as u32);
+                                text_cols.push((tl.offsets_byte_offset, tl.bytes_byte_offset));
+                                text_idx += 1;
+                            }
+                            k => {
+                                let off = b128_layouts[b128_idx].1;
+                                let tag = if k == 2 { 0x8000_0000_u32 } else { 0xC000_0000_u32 };
+                                key_plan.push(tag | b128_cols.len() as u32);
+                                b128_cols.push(off);
+                                b128_idx += 1;
+                            }
+                        }
+                    }
+                    let indices: Vec<u64> = (0..n as u64).collect();
+                    device_memory
+                        .bitonic_sort_hetero_on_payload(
+                            &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols,
+                            &key_plan, desc_mask,
+                        )
+                        .map_err(map_sort_err)?
+                };
+                let reordered: Vec<Vec<SqlValue>> =
+                    perm.iter().map(|&p| rows[p as usize].clone()).collect();
+                rows = reordered;
             }
             if select.offset.is_some() || select.limit.is_some() {
                 let start = select.offset.unwrap_or(0).min(rows.len());

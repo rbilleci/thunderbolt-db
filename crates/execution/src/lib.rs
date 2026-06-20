@@ -1056,7 +1056,36 @@ impl CudaResidentDeviceMemory {
         desc_mask: u64,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_bitonic_sort_hetero(
-            self, indices, int_keys, num_int, text_cols, b128_cols, key_plan, desc_mask,
+            self, indices, int_keys, num_int, text_cols, b128_cols, key_plan, desc_mask, None,
+        )
+    }
+
+    /// As [`Self::bitonic_sort_hetero`] but the TEXT/NUMERIC/UUID legs read from `payload` -- a
+    /// resident-LIKE columnar buffer built (via build_relational_device_payload) from a NON-resident
+    /// result, e.g. a GROUP BY result. `self` supplies only the CUDA context/stream; text_cols/b128_cols
+    /// offsets index into `payload`. Lets the GPU sort a host-materialized grouped result on-device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bitonic_sort_hetero_on_payload(
+        &self,
+        payload: &[u8],
+        indices: &[u64],
+        int_keys: &[i64],
+        num_int: usize,
+        text_cols: &[(u64, u64)],
+        b128_cols: &[u64],
+        key_plan: &[u32],
+        desc_mask: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_bitonic_sort_hetero(
+            self,
+            indices,
+            int_keys,
+            num_int,
+            text_cols,
+            b128_cols,
+            key_plan,
+            desc_mask,
+            Some(payload),
         )
     }
 
@@ -3575,6 +3604,10 @@ fn launch_cuda_bitonic_sort_hetero(
     b128_cols: &[u64],
     key_plan: &[u32],
     desc_mask: u64,
+    // When Some, the text/numeric/uuid legs read from THIS uploaded payload (a resident-LIKE buffer
+    // built from a non-resident result, e.g. a grouped result) instead of `resident`'s own columns;
+    // `resident` is then used only for the CUDA context/stream. text_cols/b128_cols offsets are into it.
+    resident_base_payload: Option<&[u8]>,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -3624,7 +3657,6 @@ fn launch_cuda_bitonic_sort_hetero(
     let npot_u64 = npot as u64;
     let num_int_u64 = num_int as u64;
     let num_keys_u64 = num_keys as u64;
-    let resident_base = resident.device_ptr();
 
     let primary = resident.primary();
     primary.set_current()?;
@@ -3655,12 +3687,28 @@ fn launch_cuda_bitonic_sort_hetero(
     let text_bytes_dev = primary.lease_device_buffer(text_meta_bytes)?;
     let plan_dev = primary.lease_device_buffer(plan_bytes)?;
     let b128_offs_dev = primary.lease_device_buffer(b128_meta_bytes)?;
+    // The text/numeric/uuid legs read `resident_base`: default to `resident`'s own columns, or a leased
+    // copy of `resident_base_payload` (a grouped result's resident-like buffer) when provided.
+    let payload_dev = match resident_base_payload {
+        Some(p) => Some(primary.lease_device_buffer(p.len().max(8))?),
+        None => None,
+    };
+    let resident_base = payload_dev
+        .as_ref()
+        .map_or_else(|| resident.device_ptr(), |d| d.ptr);
     let identity: Vec<u32> = (0..npot as u32).collect();
 
     const BLOCK: u32 = 256;
     let grid = (npot.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
 
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        // Upload the grouped result's resident-like payload FIRST (the kernel reads it as resident_base).
+        if let (Some(p), Some(pd)) = (resident_base_payload, payload_dev.as_ref()) {
+            let rc = unsafe { htod_async(pd.ptr, p.as_ptr().cast::<c_void>(), p.len(), stream) };
+            if rc != 0 {
+                return rc;
+            }
+        }
         let rc = unsafe {
             htod_async(
                 perm_dev.ptr,
