@@ -2967,6 +2967,125 @@ fn gpu_grouped_multi_aggregate_text_key_merge_alignment() {
     }
 }
 
+// group counts for `t` below: g1=3, g2=1, g3=2, g4=4, g5=1.
+const GROUPED_CLAUSE_ROWS: &str =
+    "(1,10),(1,20),(1,30),(2,5),(3,7),(3,8),(4,1),(4,2),(4,3),(4,4),(5,99)";
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_order_by_and_limit() {
+    // ORDER BY (the key DESC, and an AGGREGATE DESC) + LIMIT/OFFSET applied host-side to the grouped
+    // rows on the Expr path (previously rejected at parse).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let r = |g: i32, c: i64| vec![SqlValue::Int4(g), SqlValue::Int8(c)];
+
+    let a = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC")
+        .unwrap();
+    assert_eq!(a.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        a.rows,
+        vec![r(5, 1), r(4, 4), r(3, 2), r(2, 1), r(1, 3)],
+        "ORDER BY the group key DESC"
+    );
+
+    let b = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY COUNT(*) DESC LIMIT 3",
+        )
+        .unwrap();
+    assert_eq!(
+        b.rows,
+        vec![r(4, 4), r(1, 3), r(3, 2)],
+        "ORDER BY COUNT(*) DESC LIMIT 3 (top 3 by count)"
+    );
+
+    let d = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 2 OFFSET 1")
+        .unwrap();
+    assert_eq!(
+        d.rows,
+        vec![r(2, 1), r(3, 2)],
+        "LIMIT 2 OFFSET 1 over the default key order (skip g1, take g2,g3)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_having_and_combined() {
+    // HAVING filters groups by an aggregate (or key) predicate; combined HAVING + ORDER BY + LIMIT.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let r = |g: i32, c: i64| vec![SqlValue::Int4(g), SqlValue::Int8(c)];
+
+    let c = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 2")
+        .unwrap();
+    assert_eq!(c.rows, vec![r(1, 3), r(4, 4)], "HAVING COUNT(*) > 2");
+
+    let comb = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) >= 2 ORDER BY COUNT(*) DESC LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(
+        comb.rows,
+        vec![r(4, 4), r(1, 3)],
+        "HAVING >= 2 then ORDER BY COUNT(*) DESC then LIMIT 2"
+    );
+
+    let k = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g HAVING g >= 4")
+        .unwrap();
+    assert_eq!(k.rows, vec![r(4, 4), r(5, 1)], "HAVING on the group key column");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_duplicate_aggregate_name_is_ambiguous() {
+    // Two same-function aggregates share a result-column name ("sum"); referencing it in ORDER BY or
+    // HAVING is ambiguous (PG: "column reference ... is ambiguous") -> error, not silent first-match.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT, w INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v, w) VALUES (1, 3, 100), (1, 4, 200), (2, 50, 1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT g, SUM(v), SUM(w) FROM t GROUP BY g ORDER BY sum"
+        )
+        .is_err(),
+        "ORDER BY an ambiguous aggregate name must error"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT g, SUM(v), SUM(w) FROM t GROUP BY g HAVING sum > 5"
+        )
+        .is_err(),
+        "HAVING an ambiguous aggregate name must error"
+    );
+}
+
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_uuid_key() {

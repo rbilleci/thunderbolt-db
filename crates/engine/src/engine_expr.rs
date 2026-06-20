@@ -1503,6 +1503,68 @@ impl Engine {
             }
             // Rows are already in key order (every pass was key-sorted above); this is a no-op guard.
             rows.sort_by(|a, b| key_cmp(&a[0], &b[0]));
+            // Apply the grouped query's HAVING (filter), ORDER BY (re-sort), and LIMIT/OFFSET (slice)
+            // HOST-SIDE over the materialized group rows, mapping each clause's referenced result column
+            // name to its index. All four are empty/None for a bare GROUP BY, so this is a no-op there.
+            let col_index = |name: &str| -> Result<usize, ExecuteError> {
+                let mut hits = bound
+                    .selected_columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.name.eq_ignore_ascii_case(name));
+                let first = hits.next().map(|(i, _)| i).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "GROUP BY ORDER BY / HAVING references unknown column \"{name}\""
+                    )))
+                })?;
+                // PG: a name shared by two aggregates (e.g. SUM(v), SUM(w) -> both "sum") is ambiguous;
+                // error rather than silently bind the first.
+                if hits.next().is_some() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "GROUP BY ORDER BY / HAVING column reference \"{name}\" is ambiguous"
+                    ))));
+                }
+                Ok(first)
+            };
+            if !select.having_groups.is_empty() {
+                // Pre-resolve each filter's result-column index (fail fast on an unknown name); then
+                // keep a row iff ANY OR-group's ANDed comparisons all hold.
+                let resolved = select
+                    .having_groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .iter()
+                            .map(|f| col_index(&f.column).map(|idx| (idx, f)))
+                            .collect::<Result<Vec<_>, ExecuteError>>()
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
+                rows.retain(|row| {
+                    resolved.iter().any(|group| {
+                        group
+                            .iter()
+                            .all(|(idx, f)| select_filter_matches(&row[*idx], f.op, &f.value))
+                    })
+                });
+            }
+            if let Some(order) = &select.order_by {
+                let idx = col_index(&order.column)?;
+                rows.sort_by(|a, b| {
+                    let ord = key_cmp(&a[idx], &b[idx]);
+                    if order.descending {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                });
+            }
+            if select.offset.is_some() || select.limit.is_some() {
+                let start = select.offset.unwrap_or(0).min(rows.len());
+                rows.drain(..start);
+                if let Some(limit) = select.limit {
+                    rows.truncate(limit);
+                }
+            }
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
                 rows,

@@ -13,10 +13,12 @@ use super::*;
 
 use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, Node, SelectStmt, SetOperation,
+    SortByDir,
 };
 use pg_query::NodeEnum;
 
 use crate::engine_expr::{ResidentBinaryOp, ResidentExpr};
+use gpu_db_sql::{SelectFilter, SelectFilterOp, SelectOrder};
 
 impl Engine {
     /// Parse `sql` (libpg_query / real Postgres grammar), map it to the general `ResidentExpr` IR, and
@@ -105,12 +107,18 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         .map(|alias| alias.aliasname.clone())
         .unwrap_or_else(|| table.clone());
 
+    // HAVING / ORDER BY / LIMIT / OFFSET are supported on the GROUPED Expr path (applied host-side to
+    // the materialized group rows below); still rejected for non-grouped selects.
+    let has_group_by = !stmt.group_clause.is_empty();
     let unsupported = [
         (!stmt.distinct_clause.is_empty(), "DISTINCT"),
-        (stmt.having_clause.is_some(), "HAVING"),
+        (stmt.having_clause.is_some() && !has_group_by, "HAVING without GROUP BY"),
         (!stmt.window_clause.is_empty(), "window functions"),
-        (!stmt.sort_clause.is_empty(), "ORDER BY"),
-        (stmt.limit_count.is_some() || stmt.limit_offset.is_some(), "LIMIT / OFFSET"),
+        (!stmt.sort_clause.is_empty() && !has_group_by, "ORDER BY"),
+        (
+            (stmt.limit_count.is_some() || stmt.limit_offset.is_some()) && !has_group_by,
+            "LIMIT / OFFSET",
+        ),
         (!stmt.locking_clause.is_empty(), "row locking (FOR UPDATE/SHARE)"),
         (stmt.with_clause.is_some(), "WITH / CTEs"),
         // A plain SELECT is SETOP_NONE (= 1; proto enums prefix Undefined = 0). UNION/INTERSECT/EXCEPT
@@ -137,18 +145,30 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         Some(group_column) => build_grouped_projection(&stmt.target_list, group_column, &qualifier)?,
         None => build_projection(&stmt.target_list, &qualifier)?,
     };
+    // Grouped queries may carry ORDER BY / LIMIT / OFFSET / HAVING (applied host-side after the GPU
+    // grouping in the executor); non-grouped queries rejected them above, so these stay empty there.
+    let (order_by, limit, offset, having_groups) = if group_by.is_some() {
+        (
+            parse_order_by(&stmt.sort_clause, &qualifier)?,
+            parse_limit(&stmt.limit_count)?,
+            parse_limit(&stmt.limit_offset)?,
+            parse_having(stmt.having_clause.as_deref(), &qualifier)?,
+        )
+    } else {
+        (None, None, None, Vec::new())
+    };
     let select = Select {
         table,
         distinct: false,
         projection,
         group_by,
-        having_groups: Vec::new(),
+        having_groups,
         filter: None,
         filters: Vec::new(),
         filter_groups: Vec::new(),
-        order_by: None,
-        limit: None,
-        offset: None,
+        order_by,
+        limit,
+        offset,
     };
     Ok((select, qualifier))
 }
@@ -594,6 +614,183 @@ fn aexpr_op_token(a_expr: &AExpr) -> Result<&str, ExecuteError> {
         },
         _ => Err(sql_pg_error(
             "schema-qualified or multi-part operators are not supported".to_string(),
+        )),
+    }
+}
+
+/// The RESULT column a GROUP BY ORDER BY / HAVING term references: a bare column (the group key) by its
+/// name, or an aggregate by the name the binding gives its result column (count/sum/min/max/avg). Used
+/// to look the value up by index in the materialized grouped row. (A projection with two of the same
+/// aggregate function makes that name ambiguous -- the first match wins; uncommon.)
+fn result_column_name(node: &Node, qualifier: &str) -> Result<String, ExecuteError> {
+    match node_enum(node)? {
+        NodeEnum::ColumnRef(column_ref) => Ok(resolve_column_name(column_ref, qualifier)?.to_string()),
+        NodeEnum::FuncCall(func) => {
+            let name = match func.funcname.last().map(node_enum).transpose()? {
+                Some(NodeEnum::String(string)) => string.sval.to_ascii_lowercase(),
+                _ => {
+                    return Err(sql_pg_error(
+                        "ORDER BY / HAVING references an unnamed function".to_string(),
+                    ))
+                }
+            };
+            if !matches!(name.as_str(), "count" | "sum" | "min" | "max" | "avg") {
+                return Err(sql_pg_error(format!(
+                    "ORDER BY / HAVING does not support the function \"{name}\""
+                )));
+            }
+            Ok(name)
+        }
+        _ => Err(sql_pg_error(
+            "ORDER BY / HAVING must reference a group column or an aggregate".to_string(),
+        )),
+    }
+}
+
+/// Parse a libpg_query `A_Const` literal to a `SqlValue` (HAVING right-hand side): integer -> Int4,
+/// decimal/exponent -> Numeric. compare_sql_values handles the cross-type compare against the (Int8)
+/// aggregate result.
+fn aconst_to_sql_value(node: &Node) -> Result<SqlValue, ExecuteError> {
+    match node_enum(node)? {
+        NodeEnum::AConst(constant) => match &constant.val {
+            Some(a_const::Val::Ival(integer)) => Ok(SqlValue::Int4(integer.ival)),
+            Some(a_const::Val::Fval(float)) => Decimal128::parse(&float.fval)
+                .map(SqlValue::Numeric)
+                .ok_or_else(|| sql_pg_error(format!("malformed numeric literal: {}", float.fval))),
+            _ => Err(sql_pg_error(
+                "HAVING right-hand side must be an integer or numeric literal".to_string(),
+            )),
+        },
+        _ => Err(sql_pg_error(
+            "HAVING right-hand side must be a literal".to_string(),
+        )),
+    }
+}
+
+fn select_filter_op_from_token(token: &str) -> Result<SelectFilterOp, ExecuteError> {
+    Ok(match token {
+        "=" => SelectFilterOp::Eq,
+        "<" => SelectFilterOp::Lt,
+        "<=" => SelectFilterOp::Lte,
+        ">" => SelectFilterOp::Gt,
+        ">=" => SelectFilterOp::Gte,
+        other => {
+            return Err(sql_pg_error(format!(
+                "HAVING operator \"{other}\" is not supported (use = < <= > >=)"
+            )))
+        }
+    })
+}
+
+/// One HAVING comparison `<aggregate-or-key> <op> <literal>` -> a `SelectFilter` keyed by the result
+/// column name (resolved by the executor against the materialized grouped columns).
+fn aexpr_to_select_filter(a_expr: &AExpr, qualifier: &str) -> Result<SelectFilter, ExecuteError> {
+    if a_expr.kind != AExprKind::AexprOp as i32 {
+        return Err(sql_pg_error(
+            "HAVING supports comparison operators only (no IN / LIKE / BETWEEN)".to_string(),
+        ));
+    }
+    let op = select_filter_op_from_token(aexpr_op_token(a_expr)?)?;
+    let lexpr = a_expr
+        .lexpr
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("HAVING comparison missing its left operand".to_string()))?;
+    let rexpr = a_expr
+        .rexpr
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("HAVING comparison missing its right operand".to_string()))?;
+    Ok(SelectFilter {
+        column: result_column_name(lexpr, qualifier)?,
+        op,
+        value: aconst_to_sql_value(rexpr)?,
+    })
+}
+
+/// Parse a `HAVING` clause to OR-of-ANDs `SelectFilter` groups: a bare comparison -> one group; top-
+/// level `AND` -> one group of all-match filters; top-level `OR` -> one group per (comparison) operand.
+/// One level deep -- nested AND/OR is rejected clearly rather than mis-parsed.
+fn parse_having(
+    having: Option<&Node>,
+    qualifier: &str,
+) -> Result<Vec<Vec<SelectFilter>>, ExecuteError> {
+    let Some(node) = having else {
+        return Ok(Vec::new());
+    };
+    match node_enum(node)? {
+        NodeEnum::AExpr(a_expr) => Ok(vec![vec![aexpr_to_select_filter(a_expr, qualifier)?]]),
+        NodeEnum::BoolExpr(bool_expr) if bool_expr.boolop == BoolExprType::AndExpr as i32 => {
+            let filters = bool_expr
+                .args
+                .iter()
+                .map(|arg| match node_enum(arg)? {
+                    NodeEnum::AExpr(a) => aexpr_to_select_filter(a, qualifier),
+                    _ => Err(sql_pg_error(
+                        "HAVING AND supports flat comparisons only (no nested AND/OR)".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(vec![filters])
+        }
+        NodeEnum::BoolExpr(bool_expr) if bool_expr.boolop == BoolExprType::OrExpr as i32 => {
+            let groups = bool_expr
+                .args
+                .iter()
+                .map(|arg| match node_enum(arg)? {
+                    NodeEnum::AExpr(a) => Ok(vec![aexpr_to_select_filter(a, qualifier)?]),
+                    _ => Err(sql_pg_error(
+                        "HAVING OR supports flat comparisons only (no nested AND/OR)".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(groups)
+        }
+        _ => Err(sql_pg_error(
+            "HAVING must be a comparison, optionally combined with a single level of AND / OR"
+                .to_string(),
+        )),
+    }
+}
+
+/// Parse a single-key `ORDER BY` (a group column or an aggregate, ASC/DESC). libpg_query `SortByDir`
+/// 3 == DESC.
+fn parse_order_by(
+    sort_clause: &[Node],
+    qualifier: &str,
+) -> Result<Option<SelectOrder>, ExecuteError> {
+    let Some(first) = sort_clause.first() else {
+        return Ok(None);
+    };
+    if sort_clause.len() > 1 {
+        return Err(sql_pg_error(
+            "ORDER BY supports a single sort key on the Expr path".to_string(),
+        ));
+    }
+    let NodeEnum::SortBy(sort_by) = node_enum(first)? else {
+        return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
+    };
+    let node = sort_by
+        .node
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
+    let column = result_column_name(node, qualifier)?;
+    let descending = sort_by.sortby_dir == SortByDir::SortbyDesc as i32;
+    Ok(Some(SelectOrder { column, descending }))
+}
+
+/// Parse a `LIMIT` / `OFFSET` count -> a non-negative `usize`.
+fn parse_limit(limit: &Option<Box<Node>>) -> Result<Option<usize>, ExecuteError> {
+    let Some(node) = limit.as_deref() else {
+        return Ok(None);
+    };
+    match node_enum(node)? {
+        NodeEnum::AConst(constant) => match &constant.val {
+            Some(a_const::Val::Ival(integer)) if integer.ival >= 0 => Ok(Some(integer.ival as usize)),
+            _ => Err(sql_pg_error(
+                "LIMIT / OFFSET must be a non-negative integer literal".to_string(),
+            )),
+        },
+        _ => Err(sql_pg_error(
+            "LIMIT / OFFSET must be an integer literal".to_string(),
         )),
     }
 }

@@ -1627,6 +1627,7 @@ pub(crate) fn select_is_aggregate(select: &Select) -> bool {
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
             | SelectProjection::GroupedMax { .. }
+            | SelectProjection::GroupedAggregates { .. }
     )
 }
 
@@ -1647,11 +1648,20 @@ pub(crate) fn select_is_aggregate_result_column(select: &Select, column: &str) -
         SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => {
             column.eq_ignore_ascii_case("max")
         }
-        // GroupedAggregates is produced only on the Expr path, which does not route through this
-        // CPU-path HAVING/ORDER-BY helper; never reached for it.
-        SelectProjection::All
-        | SelectProjection::Columns(_)
-        | SelectProjection::GroupedAggregates { .. } => false,
+        // The Expr path's grouped projection: ORDER BY may reference any aggregate by its result
+        // column name (count/sum/avg/min/max); the executor resolves it against the result columns,
+        // so the binding only needs to recognize the name and skip the table-column lookup.
+        SelectProjection::GroupedAggregates { ref aggregates, .. } => aggregates.iter().any(|agg| {
+            let name = match agg.kind {
+                GroupedAggKind::Count => "count",
+                GroupedAggKind::Sum => "sum",
+                GroupedAggKind::Avg => "avg",
+                GroupedAggKind::Min => "min",
+                GroupedAggKind::Max => "max",
+            };
+            column.eq_ignore_ascii_case(name)
+        }),
+        SelectProjection::All | SelectProjection::Columns(_) => false,
     }
 }
 
