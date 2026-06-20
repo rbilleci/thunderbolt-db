@@ -2674,6 +2674,94 @@ fn gpu_group_by_bool_minmax_value() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_two_columns() {
+    // Composite GROUP BY a, b: two int4 columns packed on-device into one i64 key `(a<<32)|b`, grouped,
+    // then the result UNPACKS it back into a, b. Distinct (a,b) tuples; same-a-diff-b are distinct;
+    // identical (a,b) MERGE. Positive values -> the packed-key order equals (a,b) order.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
+        .unwrap();
+    // (a,b): (1,1)x2 c={10,20}, (1,2)x1 c={5}, (2,1)x1 c={7}.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,c) VALUES (1,1,10),(1,1,20),(1,2,5),(2,1,7)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*), SUM(c) FROM t GROUP BY a, b")
+        .expect("composite GROUP BY a, b");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int8(2), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int8(1), SqlValue::Int8(5)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(1), SqlValue::Int8(1), SqlValue::Int8(7)],
+        ],
+        "composite (a,b) groups + count + sum, unpacked"
+    );
+    // Guard the result-SCHEMA patch (insert b's column + renumber attnums): a rows-only assertion lets
+    // a dropped `insert(1, b_col)` slip past (the audit's Fault B). The columns must be [a, b, ...] with
+    // the right group-column names/types.
+    assert_eq!(g.columns.len(), 4, "composite result columns: a, b, count, sum");
+    assert_eq!(g.columns[0].name, "a");
+    assert_eq!(g.columns[0].ty, SqlType::Int4);
+    assert_eq!(g.columns[1].name, "b");
+    assert_eq!(g.columns[1].ty, SqlType::Int4);
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_negatives_ordered() {
+    // Negative members round-trip through the `as u32 / as i32` pack/unpack; ORDER BY a, b gives the
+    // true (a,b) order (the host group order is by the packed key, signed).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    // (a,b): (-1,5)x2, (2,-3)x1, (-1,4)x1. ORDER BY a,b: (-1,4),(-1,5),(2,-3).
+    e.execute_text(2, "INSERT INTO t (a,b) VALUES (-1,5),(-1,5),(2,-3),(-1,4)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b ORDER BY a, b")
+        .expect("composite GROUP BY with negatives + ORDER BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int4(-1), SqlValue::Int4(4), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(-1), SqlValue::Int4(5), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(-3), SqlValue::Int8(1)],
+        ],
+        "negative composite keys round-trip, ORDER BY a,b true order"
+    );
+}
+
+#[test]
+fn group_by_composite_three_columns_rejected() {
+    // >2 composite GROUP BY columns is a clean error (the on-device pack covers two; i128/rep-row are
+    // follow-ups). Host-side (parse rejection), no GPU needed.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
+        .unwrap();
+    let err = e
+        .execute_relational_select_text("SELECT a, b, c, COUNT(*) FROM t GROUP BY a, b, c")
+        .expect_err("3-column composite GROUP BY rejected");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("group by") || msg.contains("composite") || msg.contains("column"),
+        "clean reject, got: {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_text_key() {
     // GROUP BY a TEXT (varlen) key -- the kernel FNV-1a-hashes the bytes, claims a b128
     // (representative_row_idx, hash) in slot_keys_i128 via atom.cas.b128 with a full-text

@@ -1150,6 +1150,19 @@ impl CudaResidentDeviceMemory {
         launch_cuda_bool_to_int4_column_device(self, bitmap_byte_offset, n_rows)
     }
 
+    /// Pack two int4-section columns (at byte offsets `off0`, `off1`) into one i64 derived key per row
+    /// (col0 in the high 32 bits, col1 in the low 32 -- bijective) and return it RESIDENT
+    /// (cuCtxSynchronize'd) for a COMPOSITE GROUP BY key via key_base_override. The executor unpacks the
+    /// result slot key back into the two column values.
+    pub fn pack_two_int4_cols_device(
+        &self,
+        off0: u64,
+        off1: u64,
+        n_rows: u64,
+    ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
+        launch_cuda_pack_two_int4_cols_device(self, off0, off1, n_rows)
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -13588,6 +13601,90 @@ fn launch_cuda_bool_to_int4_column_device<'r>(
         (&mut a0 as *mut u64).cast::<c_void>(),
         (&mut a1 as *mut u64).cast::<c_void>(),
         (&mut a2 as *mut u32).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let ptr = out.ptr;
+    Ok(DeviceArithBuffer { _lease: out, ptr })
+}
+
+/// Run `gpu_db_pack_two_int4_cols` into a leased i64 buffer (col0<<32 | col1 per row) and return it as a
+/// `DeviceArithBuffer` -- the derived composite GROUP BY key. cuCtxSynchronize'd so the SEPARATE GROUP BY
+/// launch (which reads it via key_base_override) sees the completed buffer, not a racing/stale one.
+fn launch_cuda_pack_two_int4_cols_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    off0: u64,
+    off1: u64,
+    n: u64,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    if n == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let out_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_pack_two_int4_cols", &ptx)?;
+    let out = primary.lease_device_buffer(out_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = off0;
+    let mut a2 = off1;
+    let mut a3 = n;
+    let mut a4 = out.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
         (&mut a3 as *mut u64).cast::<c_void>(),
         (&mut a4 as *mut u64).cast::<c_void>(),
     ];

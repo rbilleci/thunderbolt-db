@@ -3325,6 +3325,74 @@ done_bool:
     ret;
 }
 
+// Composite GROUP BY key (2 fixed-width int4-section columns): pack two i32 columns into one i64 derived
+// key per row -- col0 in the high 32 bits, col1 in the low 32 bits. Bijective (each (col0,col1) -> a
+// distinct i64) and reversible (the executor unpacks the result key). No atomics/hash (a pure MAP) so it
+// cannot reintroduce the bool-kernel concurrency hazard. The i64 group path then groups by the override.
+.visible .entry gpu_db_pack_two_int4_cols(
+    .param .u64 resident_ptr,
+    .param .u64 off0,
+    .param .u64 off1,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %c0;
+    .reg .u32 %c1;
+    .reg .u64 %rp;
+    .reg .u64 %b0;
+    .reg .u64 %b1;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %k;
+    .reg .u64 %tmp;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %o, [off0];
+    add.u64 %b0, %rp, %o;
+    ld.param.u64 %o, [off1];
+    add.u64 %b1, %rp, %o;
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_pack2:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_pack2;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b0, %o;
+    ld.global.u32 %c0, [%addr];
+    add.u64 %addr, %b1, %o;
+    ld.global.u32 %c1, [%addr];
+    cvt.u64.u32 %k, %c0;
+    shl.b64 %k, %k, 32;
+    cvt.u64.u32 %tmp, %c1;
+    or.b64 %k, %k, %tmp;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %out, %o;
+    st.global.u64 [%addr], %k;
+    add.u64 %i, %i, %stride;
+    bra loop_pack2;
+done_pack2:
+    ret;
+}
+
 // out[0] += sum over k<count of the i32 column value at row indices[k], sign-extended to i64 (the
 // operator axis, doc 19). `out_ptr` is a single i64 the host initialized to 0; `indices_ptr` is the
 // filter's surviving u32 row indices. SUM(int4) over a filtered set -> bigint; the i64 atomic add is

@@ -956,6 +956,7 @@ impl Engine {
             Some(predicate),
             &[],
             None,
+            &[],
         )
     }
 
@@ -1069,6 +1070,10 @@ impl Engine {
         // int key column the grouped kernel groups by (via key_base_override). `None` = a plain column
         // GROUP BY (the matrix path) or no GROUP BY.
         group_key_expr: Option<&ResidentExpr>,
+        // The GROUP BY key columns. len()==2 = a COMPOSITE key (`GROUP BY a, b`): the two fixed-width
+        // int columns are packed on-device into one i64 key (high|low) grouped via key_base_override,
+        // and the result key unpacks back to the two columns. len()<=1 = the single-key path (unchanged).
+        group_key_columns: &[String],
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Scalar aggregates (operator axis): COUNT(*) -> the surviving-row count; SUM(col) -> a GPU
         // reduction over the filtered column. They have no projected columns to materialize, so they
@@ -1240,17 +1245,56 @@ impl Engine {
             // GROUP BY <expression> (`a+b`): the key is a DERIVED int buffer materialized on-device
             // below (grouped via key_base_override), NOT a column -- so group_idx is only a placeholder
             // for the COUNT(*) pass (which reads no value), and key_ty is the expression result type.
+            // COMPOSITE GROUP BY (`GROUP BY a, b`): the on-device pack foundation
+            // (gpu_db_pack_two_int4_cols / pack_two_int4_cols_device) is landed, but the N-column result
+            // wiring -- build_grouped_projection accepting 2 leading group targets, bound.selected_columns
+            // carrying both columns, and the result-row UNPACK of the packed i64 key back into the two
+            // columns -- is a coupled change to the most-audited grouped path that belongs in its own
+            // auditable slice. Until then, reject cleanly (NOT a silent single-key grouping by the first
+            // column, which `select.group_by` carries).
+            // COMPOSITE GROUP BY (`GROUP BY a, b`): two int4-section columns (int2/int4/date) are packed
+            // on-device into ONE i64 key `(col0<<32)|col1` (gpu_db_pack_two_int4_cols) grouped via
+            // key_base_override (the audited i64 path), then UNPACKED in the result row into the two
+            // columns. A non-int4-section member is a clean error (i128 packing / the rep-row hash are
+            // follow-ups). parse_group_by already rejects >2 group terms.
+            let composite_cols: Option<(usize, SqlType, usize, SqlType)> =
+                if group_key_columns.len() == 2 {
+                    let c0 = relational_column_index(table, &group_key_columns[0])?;
+                    let c1 = relational_column_index(table, &group_key_columns[1])?;
+                    let t0 = table.columns[c0].ty;
+                    let t1 = table.columns[c1].ty;
+                    for t in [t0, t1] {
+                        if !matches!(t, SqlType::Int4 | SqlType::Int2 | SqlType::Date) {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "composite (multi-column) GROUP BY supports two int2/int4/date columns \
+                                 on the Expr path (wider/more members are a follow-up)"
+                                    .to_string(),
+                            )));
+                        }
+                    }
+                    Some((c0, t0, c1, t1))
+                } else {
+                    None
+                };
+            let is_composite_key = composite_cols.is_some();
             let is_expr_key = group_key_expr.is_some();
             let key_expr_is_int8 = match group_key_expr {
                 Some(expr) => expr_mentions_int8(expr, table),
                 None => false,
             };
-            let group_idx = if is_expr_key {
+            let group_idx = if is_composite_key {
+                // The packed key is grouped via key_base_override; group_idx is only the COUNT(*) pass's
+                // value placeholder (reads no value), so col0's index is a valid placeholder.
+                composite_cols.unwrap().0
+            } else if is_expr_key {
                 0
             } else {
                 relational_column_index(table, group_name)?
             };
-            let key_ty = if is_expr_key {
+            let key_ty = if is_composite_key {
+                // The on-device pack produces one i64 key; the result UNPACKS it back to the two columns.
+                SqlType::Int8
+            } else if is_expr_key {
                 if key_expr_is_int8 {
                     SqlType::Int8
                 } else {
@@ -1302,7 +1346,7 @@ impl Engine {
             };
             // The key BYTE offset, unused when key_base_override is set (the kernel then reads the
             // override base + idx*stride, not resident_base + key_offset).
-            let key_offset = if is_expr_key || key_is_text || key_is_bool {
+            let key_offset = if is_expr_key || is_composite_key || key_is_text || key_is_bool {
                 0
             } else if key_is_i128 {
                 resident_device_numeric_column_offset(&snapshot, table, group_idx)?
@@ -1353,6 +1397,23 @@ impl Engine {
                     _derived_key_buf = Some(buf);
                     ptr
                 }
+            } else if is_composite_key {
+                if row_count == 0 {
+                    _derived_key_buf = None;
+                    0
+                } else {
+                    // GROUP BY a, b: pack the two int4-section columns into one i64 key on-device
+                    // ((col0<<32)|col1) grouped via key_base_override; the result UNPACKS it.
+                    let (c0, _, c1, _) = composite_cols.unwrap();
+                    let off0 = resident_device_int4_column_offset(&snapshot, table, c0)?;
+                    let off1 = resident_device_int4_column_offset(&snapshot, table, c1)?;
+                    let buf = device_memory
+                        .pack_two_int4_cols_device(off0, off1, row_count)
+                        .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
+                    let ptr = buf.device_ptr();
+                    _derived_key_buf = Some(buf);
+                    ptr
+                }
             } else {
                 _derived_key_buf = None;
                 0
@@ -1379,6 +1440,16 @@ impl Engine {
                 if let Some(col) = bound.selected_columns.first_mut() {
                     "?column?".clone_into(&mut col.name);
                     col.ty = key_ty;
+                }
+            }
+            if let Some((_, _, c1, _)) = composite_cols {
+                // The binding produced [a, agg...] (GroupedAggregates carries one group_column); the
+                // composite result row is [a, b, agg...]. Insert b's full column metadata (from the
+                // table -- correct name/type/oid) after a, then renumber the result attnums 1..N.
+                let b_col = table.columns[c1].clone();
+                bound.selected_columns.insert(1, b_col);
+                for (i, col) in bound.selected_columns.iter_mut().enumerate() {
+                    col.attnum = (i + 1) as i16;
                 }
             }
             // An expression key is read via key_base_override, which only the single-level kernel honors.
@@ -1568,10 +1639,20 @@ impl Engine {
             let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(reference.groups.len());
             for i in 0..reference.groups.len() {
                 let gk = &reference.groups[i];
-                // The GROUP BY key narrows back to its own type (same closure used for the sort above).
-                let key = materialize_key(gk);
-                let mut row: Vec<SqlValue> = Vec::with_capacity(aggregates.len() + 1);
-                row.push(key);
+                let mut row: Vec<SqlValue> =
+                    Vec::with_capacity(aggregates.len() + if is_composite_key { 2 } else { 1 });
+                if let Some((_, t0, _, t1)) = composite_cols {
+                    // Composite key: UNPACK the packed i64 back into the two group columns -- col0 = the
+                    // high 32 bits, col1 = the low 32 (`as u32 as i32` round-trips negatives) -- narrowed
+                    // to each column's real SqlType. Emit BOTH before the aggregate columns.
+                    let col0 = ((((gk.key as u64) >> 32) as u32) as i32) as i64;
+                    let col1 = (((gk.key as u64) as u32) as i32) as i64;
+                    row.push(narrow_ordered_value(t0, col0, 0, 0));
+                    row.push(narrow_ordered_value(t1, col1, 0, 0));
+                } else {
+                    // The GROUP BY key narrows back to its own type (same closure used for the sort above).
+                    row.push(materialize_key(gk));
+                }
                 for (aggregate, value_idx_opt) in aggregates.iter().zip(&agg_value_indices) {
                     let value = match aggregate.kind {
                         GroupedAggKind::Count => SqlValue::Int8(reference.groups[i].count as i64),

@@ -75,6 +75,15 @@ impl Engine {
             }
             None => None,
         };
+        // The GROUP BY key COLUMNS (a composite `GROUP BY a, b` packs two on-device). Every group term
+        // that is a bare ColumnRef -> its name; an expression term is skipped (handled by group_key_expr).
+        // parse_group_by already rejected >2 terms.
+        let mut group_key_columns: Vec<String> = Vec::new();
+        for node in &stmt.group_clause {
+            if let NodeEnum::ColumnRef(column_ref) = node_enum(node)? {
+                group_key_columns.push(resolve_column_name(column_ref, &qualifier)?.to_string());
+            }
+        }
         self.execute_resident_expr_select_with_binding(
             &select,
             &table,
@@ -83,6 +92,7 @@ impl Engine {
             predicate.as_ref(),
             &order_by_exprs,
             group_key_expr.as_ref(),
+            &group_key_columns,
         )
     }
 }
@@ -172,12 +182,7 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
     // GROUP BY -> the scalar projection. The grouped EXECUTION is GPU hash aggregation (doc 19).
     let group_by = parse_group_by(&stmt.group_clause, &qualifier)?;
     let projection = match &group_by {
-        Some(group_column) => build_grouped_projection(
-            &stmt.target_list,
-            group_column,
-            stmt.group_clause.first(),
-            &qualifier,
-        )?,
+        Some(_) => build_grouped_projection(&stmt.target_list, &stmt.group_clause, &qualifier)?,
         None => build_projection(&stmt.target_list, &qualifier)?,
     };
     // ORDER BY / LIMIT / OFFSET apply to grouped (host-side) AND non-grouped (GPU-sorted projection)
@@ -230,8 +235,24 @@ fn parse_group_by(group_clause: &[Node], qualifier: &str) -> Result<Option<Strin
                 Ok(Some("(expr)".to_string()))
             }
         }
+        // COMPOSITE: exactly two COLUMN terms -> select.group_by carries the FIRST (back-compat); both
+        // names ride group_key_columns (built by the caller) which drives the on-device pack. A non-
+        // column member (expression/text) is out of scope this slice -> a clean error.
+        [first, second] => {
+            let (NodeEnum::ColumnRef(c0), NodeEnum::ColumnRef(c1)) =
+                (node_enum(first)?, node_enum(second)?)
+            else {
+                return Err(sql_pg_error(
+                    "composite GROUP BY supports two plain columns on the Expr path (no expression \
+                     member yet)"
+                        .to_string(),
+                ));
+            };
+            let _ = resolve_column_name(c1, qualifier)?;
+            Ok(Some(resolve_column_name(c0, qualifier)?.to_string()))
+        }
         _ => Err(sql_pg_error(
-            "GROUP BY supports a single column or expression on the Expr path yet".to_string(),
+            "GROUP BY supports one or two columns (or a single expression) on the Expr path".to_string(),
         )),
     }
 }
@@ -270,52 +291,58 @@ fn opt_node_struct_eq(a: Option<&Node>, b: Option<&Node>) -> bool {
 /// BY column. MIN/MAX grouping is a follow-on (the count+sum kernel does not cover it yet).
 fn build_grouped_projection(
     target_list: &[Node],
-    group_column: &str,
-    group_node: Option<&Node>,
+    group_clause: &[Node],
     qualifier: &str,
 ) -> Result<SelectProjection, ExecuteError> {
-    let [group_target, aggregate_targets @ ..] = target_list else {
+    let n_group = group_clause.len();
+    if target_list.len() <= n_group {
         return Err(sql_pg_error(
-            "a grouped SELECT must project the GROUP BY column and at least one aggregate".to_string(),
-        ));
-    };
-    if aggregate_targets.is_empty() {
-        return Err(sql_pg_error(
-            "a grouped SELECT must project at least one aggregate after the GROUP BY column"
+            "a grouped SELECT must project the GROUP BY column(s) and at least one aggregate"
                 .to_string(),
         ));
     }
-    // Target 0 must be the group column itself.
-    let NodeEnum::ResTarget(group_res) = node_enum(group_target)? else {
-        return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
-    };
-    let group_val = group_res
-        .val
-        .as_deref()
-        .ok_or_else(|| sql_pg_error("grouped SELECT group target has no value".to_string()))?;
-    // Target 0 is the group key: either the GROUP BY COLUMN (matrix path) or, for an expression GROUP
-    // BY, the SAME expression (e.g. `SELECT a+b ... GROUP BY a+b`). The executor's result column-0 is
-    // the group key (a derived value for an expression), which this projected target reads.
-    match node_enum(group_val)? {
-        NodeEnum::ColumnRef(group_ref) => {
-            if resolve_column_name(group_ref, qualifier)? != group_column {
-                return Err(sql_pg_error(
-                    "the projected column must be the GROUP BY column".to_string(),
-                ));
+    let (group_targets, aggregate_targets) = target_list.split_at(n_group);
+    // Each leading target i must be the i-th GROUP BY term: a bare column matches by resolved name; an
+    // expression GROUP BY matches the SAME expression structurally. The executor's result columns
+    // 0..n_group are the group key(s) (a composite GROUP BY unpacks its packed key into them).
+    for (group_target, group_node) in group_targets.iter().zip(group_clause) {
+        let NodeEnum::ResTarget(group_res) = node_enum(group_target)? else {
+            return Err(sql_pg_error("unexpected grouped SELECT target".to_string()));
+        };
+        let group_val = group_res
+            .val
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("grouped SELECT group target has no value".to_string()))?;
+        match node_enum(group_val)? {
+            NodeEnum::ColumnRef(group_ref) => {
+                let NodeEnum::ColumnRef(want_ref) = node_enum(group_node)? else {
+                    return Err(sql_pg_error(
+                        "the projected column must match the GROUP BY column".to_string(),
+                    ));
+                };
+                let want = resolve_column_name(want_ref, qualifier)?.to_string();
+                if resolve_column_name(group_ref, qualifier)? != want {
+                    return Err(sql_pg_error(
+                        "the projected column must be a GROUP BY column".to_string(),
+                    ));
+                }
             }
-        }
-        _ => {
-            let group_node = group_node.ok_or_else(|| {
-                sql_pg_error("the first grouped projection must be the GROUP BY column".to_string())
-            })?;
-            if !node_struct_eq(group_val, group_node) {
-                return Err(sql_pg_error(
-                    "the first grouped projection must be the GROUP BY column or its expression"
-                        .to_string(),
-                ));
+            _ => {
+                if !node_struct_eq(group_val, group_node) {
+                    return Err(sql_pg_error(
+                        "a leading grouped projection must be a GROUP BY column or its expression"
+                            .to_string(),
+                    ));
+                }
             }
         }
     }
+    // The GroupedAggregates carries the FIRST group column's name (a composite's later columns ride
+    // group_key_columns + the binding/executor; an expression GROUP BY uses the "(expr)" placeholder).
+    let group_column = match node_enum(&group_clause[0])? {
+        NodeEnum::ColumnRef(first_ref) => resolve_column_name(first_ref, qualifier)?.to_string(),
+        _ => "(expr)".to_string(),
+    };
     // Targets 1..=N must each be a scalar aggregate; lift each to a GroupedAggregate keyed by the
     // group column. A single aggregate yields a 1-element vec (same behavior as the old 1-agg form).
     let mut aggregates = Vec::with_capacity(aggregate_targets.len());
@@ -356,7 +383,7 @@ fn build_grouped_projection(
         aggregates.push(grouped);
     }
     Ok(SelectProjection::GroupedAggregates {
-        group_column: group_column.to_string(),
+        group_column,
         aggregates,
     })
 }
