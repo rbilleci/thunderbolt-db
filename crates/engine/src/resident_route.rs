@@ -82,7 +82,7 @@ pub(crate) fn resident_route_query_shape(
         _ => {}
     }
 
-    if select.order_by.is_some() {
+    if !select.order_by.is_empty() {
         return resident_route_ordered_projection_shape(select, table, bound);
     }
 
@@ -249,7 +249,7 @@ pub(crate) fn partitioned_resident_route_query_shape(
     if select.distinct
         || select.group_by.is_some()
         || !select.having_groups.is_empty()
-        || select.order_by.is_some()
+        || !select.order_by.is_empty()
         || select.limit.is_some()
         || select.offset.is_some()
     {

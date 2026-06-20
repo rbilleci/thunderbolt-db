@@ -7711,10 +7711,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                         op: SelectFilterOp::Gt,
                         value: SqlValue::Int4(1),
                     }]],
-                    order_by: Some(SelectOrder {
+                    order_by: vec![SelectOrder {
                         column: "id".to_string(),
                         descending: false,
-                    }),
+                    }],
                     limit: Some(5),
                     offset: None,
                 },
@@ -7736,7 +7736,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                     filter: None,
                     filters: Vec::new(),
                     filter_groups: Vec::new(),
-                    order_by: None,
+                    order_by: Vec::new(),
                     limit: None,
                     offset: None,
                 },
@@ -8603,7 +8603,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Eq,
                     value: SqlValue::Int4(1),
                 }]],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: Some(1),
                 offset: None,
             })
@@ -8631,7 +8631,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Eq,
                     value: SqlValue::Int4(1),
                 }]],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -8647,7 +8647,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -8672,10 +8672,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: Some(2),
                 offset: Some(1),
             })
@@ -8691,10 +8691,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: Some(2),
                 offset: Some(1),
             })
@@ -8724,10 +8724,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Eq,
                     value: SqlValue::Int4(1),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "name".to_string(),
                     descending: true,
-                }),
+                }],
                 limit: Some(5),
                 offset: None,
             })
@@ -8756,10 +8756,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: Some(5),
                 offset: None,
             })
@@ -8788,10 +8788,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: Some(5),
                 offset: None,
             })
@@ -8823,10 +8823,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: Some(5),
                 offset: None,
             })
@@ -8855,7 +8855,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Eq,
                     value: SqlValue::Text("O'Brien".to_string()),
                 }]],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -8894,10 +8894,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Text("Ada".to_string()),
                     }],
                 ],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: None,
                 offset: None,
             })
@@ -8940,7 +8940,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Text("Ada".to_string()),
                     },
                 ]],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -8976,7 +8976,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Text("Ada".to_string()),
                     }],
                 ],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9012,7 +9012,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Text("Ada".to_string()),
                     }],
                 ],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9096,10 +9096,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                         },
                     ],
                 ],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: None,
                 offset: None,
             })
@@ -9143,10 +9143,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Int4(5),
                     }],
                 ],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: None,
                 offset: None,
             })
@@ -9204,7 +9204,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                         },
                     ],
                 ],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9259,10 +9259,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Int4(4),
                     },
                 ]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: None,
                 offset: None,
             })
@@ -9313,7 +9313,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Int4(4),
                     }],
                 ],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9350,10 +9350,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::LikePrefix,
                     value: SqlValue::Text("Gra".to_string()),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "id".to_string(),
                     descending: false,
-                }),
+                }],
                 limit: None,
                 offset: None,
             })
@@ -9389,7 +9389,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                         value: SqlValue::Int4(3),
                     }],
                 ],
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9437,10 +9437,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::LikePrefix,
                     value: SqlValue::Text("G".to_string()),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "name".to_string(),
                     descending: true,
-                }),
+                }],
                 limit: Some(2),
                 offset: Some(1),
             })
@@ -9493,10 +9493,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "count".to_string(),
                     descending: true,
-                }),
+                }],
                 limit: Some(2),
                 offset: Some(1),
             })
@@ -9513,7 +9513,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9555,10 +9555,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "sum".to_string(),
                     descending: true,
-                }),
+                }],
                 limit: None,
                 offset: None,
             })
@@ -9596,10 +9596,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "sum".to_string(),
                     descending: true,
-                }),
+                }],
                 limit: Some(2),
                 offset: Some(1),
             })
@@ -9618,7 +9618,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9661,10 +9661,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "avg".to_string(),
                     descending: true,
-                }),
+                }],
                 limit: Some(2),
                 offset: Some(1),
             })
@@ -9683,7 +9683,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -9730,10 +9730,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }]],
-                order_by: Some(SelectOrder {
+                order_by: vec![SelectOrder {
                     column: "min".to_string(),
                     descending: true,
-                }),
+                }],
                 limit: Some(2),
                 offset: Some(1),
             })
@@ -9752,7 +9752,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             })
@@ -10171,10 +10171,10 @@ default: Some(ColumnDefault::SequenceNextVal {
                     filter: None,
                     filters: Vec::new(),
                     filter_groups: Vec::new(),
-                    order_by: Some(SelectOrder {
+                    order_by: vec![SelectOrder {
                         column: "id".to_string(),
                         descending: false,
-                    }),
+                    }],
                     limit: None,
                     offset: None,
                 },
@@ -10198,7 +10198,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                     filter: None,
                     filters: Vec::new(),
                     filter_groups: Vec::new(),
-                    order_by: None,
+                    order_by: Vec::new(),
                     limit: None,
                     offset: None,
                 },

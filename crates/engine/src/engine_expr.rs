@@ -1112,7 +1112,7 @@ impl Engine {
         // the path as if UNORDERED/UNLIMITED so no CPU sort fires; the GPU sort + the host OFFSET/LIMIT
         // below own the ordering and windowing.
         let mut ap_select = select.clone();
-        ap_select.order_by = None;
+        ap_select.order_by.clear();
         ap_select.limit = None;
         ap_select.offset = None;
         let (_query, access_path) =
@@ -1556,7 +1556,16 @@ impl Engine {
                     })
                 });
             }
-            if let Some(order) = &select.order_by {
+            // Defense: the grouped result is sorted host-side by the PRIMARY key only. A multi-key
+            // grouped ORDER BY is rejected at parse (build_select_from_select_stmt); this guard ensures
+            // no future caller can reach here and silently honor only the first key.
+            if select.order_by.len() > 1 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "multi-key ORDER BY on a grouped result is not yet supported (single-key only)"
+                        .to_string(),
+                )));
+            }
+            if let Some(order) = select.order_by.first() {
                 let idx = col_index(&order.column)?;
                 rows.sort_by(|a, b| {
                     let ord = key_cmp(&a[idx], &b[idx]);
@@ -1776,44 +1785,73 @@ impl Engine {
             });
         }
 
-        // Non-grouped ORDER BY: reorder the surviving indices by the order key on the GPU (bitonic
+        // Non-grouped ORDER BY: reorder the surviving indices by the order key(s) on the GPU (bitonic
         // sort) BEFORE gathering, so the projected rows come out sorted -- a charter-native GPU sort,
-        // not a host/CPU sort. The routing only sends int-keyed (i64-sortable) sorts to this path.
-        let indices_u64 = if let Some(order) = &select.order_by {
-            let order_idx = relational_column_index(table, &order.column)?;
+        // not a host/CPU sort. The routing only sends sorts whose keys are ALL i64-sortable int columns
+        // (int2/int4/int8/date/timestamp) to this path -- one key OR several (`ORDER BY a ASC, b DESC`).
+        let indices_u64 = if select.order_by.is_empty() {
+            indices_u64
+        } else {
             let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                 ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
             };
-            let keys: Vec<i64> = match table.columns[order_idx].ty {
-                SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
-                    let off = resident_device_int4_column_offset(&snapshot, table, order_idx)?;
-                    device_memory
-                        .project_i32_rows_from_payload(off, &indices_u64)
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(i64::from)
-                        .collect()
+            let n = indices_u64.len();
+            let k = select.order_by.len();
+            if k > 64 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "ORDER BY supports at most 64 sort keys on the GPU sort path".to_string(),
+                )));
+            }
+            // Materialize every ORDER BY key column's i64 value for the surviving rows into a row-major
+            // key matrix (`keys[row * K + key]`, key 0 most significant) and the per-key direction mask
+            // (bit k set => key k is DESC). int2/int4/date sign-extend through i32; int8/timestamp are
+            // the full i64. The GPU multi-key comparator breaks ties on key 0 by key 1, then key 2, ...
+            let mut key_matrix = vec![0i64; n * k];
+            let mut desc_mask: u64 = 0;
+            for (kk, order) in select.order_by.iter().enumerate() {
+                if order.descending {
+                    desc_mask |= 1u64 << kk;
                 }
-                SqlType::Int8 | SqlType::Timestamp => {
-                    let off = resident_device_int8_column_offset(&snapshot, table, order_idx)?;
-                    device_memory
-                        .project_i64_rows_from_payload(off, &indices_u64)
-                        .map_err(map_err)?
+                let order_idx = relational_column_index(table, &order.column)?;
+                let col_keys: Vec<i64> = match table.columns[order_idx].ty {
+                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
+                        let off = resident_device_int4_column_offset(&snapshot, table, order_idx)?;
+                        device_memory
+                            .project_i32_rows_from_payload(off, &indices_u64)
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(i64::from)
+                            .collect()
+                    }
+                    SqlType::Int8 | SqlType::Timestamp => {
+                        let off = resident_device_int8_column_offset(&snapshot, table, order_idx)?;
+                        device_memory
+                            .project_i64_rows_from_payload(off, &indices_u64)
+                            .map_err(map_err)?
+                    }
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "non-grouped ORDER BY on the Expr path supports int2 / int4 / int8 / \
+                             date / timestamp columns (the GPU sort); other types are a follow-on"
+                                .to_string(),
+                        )));
+                    }
+                };
+                for (i, v) in col_keys.into_iter().enumerate() {
+                    key_matrix[i * k + kk] = v;
                 }
-                _ => {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "non-grouped ORDER BY on the Expr path supports int2 / int4 / int8 / date / \
-                         timestamp columns (the GPU sort); other types are a follow-on"
-                            .to_string(),
-                    )));
-                }
+            }
+            // Single-key stays on the proven slice-2 kernel; multi-key uses the row-major comparator.
+            let perm = if k == 1 {
+                device_memory
+                    .bitonic_sort_i64(&key_matrix, (desc_mask & 1) != 0)
+                    .map_err(map_err)?
+            } else {
+                device_memory
+                    .bitonic_sort_multikey(&key_matrix, n, k, desc_mask)
+                    .map_err(map_err)?
             };
-            let perm = device_memory
-                .bitonic_sort_i64(&keys, order.descending)
-                .map_err(map_err)?;
             perm.iter().map(|&p| indices_u64[p as usize]).collect()
-        } else {
-            indices_u64
         };
         // Materialize: gather each projected column at the surviving row indices on the GPU, by type
         // (int4 -> i32 gather, int8 -> i64 gather; the type matrix, doc 19).

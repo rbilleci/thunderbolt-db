@@ -1958,7 +1958,7 @@ fn retained_select_literal_batch_candidate(
     if select.distinct
         || select.group_by.is_some()
         || !select.having_groups.is_empty()
-        || select.order_by.is_some()
+        || !select.order_by.is_empty()
         || select.limit.is_some()
         || select.offset.is_some()
         || select.filter_groups.len() > 1

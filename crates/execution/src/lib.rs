@@ -1004,6 +1004,20 @@ impl CudaResidentDeviceMemory {
         launch_cuda_bitonic_sort_i64(self, keys, descending)
     }
 
+    /// Multi-key GPU bitonic sort. `keys` is a row-major `n x k` matrix of i64 (`keys[row*k + key]`,
+    /// key 0 most significant); `desc_mask` bit j set => key j sorts descending. Returns the row
+    /// positions `0..n` in the multi-key order. The general multi-key ORDER BY core
+    /// (`ORDER BY a ASC, b DESC, ...`) -- ties on key 0 break on key 1, then key 2, ...
+    pub fn bitonic_sort_multikey(
+        &self,
+        keys: &[i64],
+        n: usize,
+        k: usize,
+        desc_mask: u64,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_bitonic_sort_multikey(self, keys, n, k, desc_mask)
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -3119,6 +3133,167 @@ fn launch_cuda_bitonic_sort_i64(
                     (&mut p4 as *mut u64).cast::<c_void>(),
                     (&mut p5 as *mut u64).cast::<c_void>(),
                     (&mut p6 as *mut u64).cast::<c_void>(),
+                ];
+                let rc = unsafe {
+                    cu_launch_kernel(
+                        sort_fn,
+                        grid,
+                        1,
+                        1,
+                        BLOCK,
+                        1,
+                        1,
+                        0,
+                        stream,
+                        args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return rc;
+                }
+                if jj == 1 {
+                    break;
+                }
+                jj >>= 1;
+            }
+            kk <<= 1;
+        }
+        0
+    })?;
+
+    let mut perm_host = vec![0_u32; npot];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            perm_host.as_mut_ptr().cast::<c_void>(),
+            perm_dev.ptr,
+            perm_bytes,
+        )
+    })?;
+    Ok(perm_host
+        .into_iter()
+        .filter(|&p| (p as usize) < n)
+        .collect())
+}
+
+/// GPU multi-key bitonic sort. `keys` is a row-major `n x k` matrix of i64 (`keys[row*k + key]`, key 0
+/// most significant); `desc_mask` bit j set => key j sorts descending. Returns the row positions (0..n)
+/// in the multi-key order. Pads to a power of two (padding sorts last, dropped from the result), driving
+/// the same O(log^2 n) kk/jj network as the single-key path but with a `gpu_db_bitonic_sort_multikey_step`
+/// comparator that walks the K keys. The general multi-key core of the charter-native GPU ORDER BY.
+fn launch_cuda_bitonic_sort_multikey(
+    resident: &CudaResidentDeviceMemory,
+    keys: &[i64],
+    n: usize,
+    k: usize,
+    desc_mask: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    let expected = n
+        .checked_mul(k)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    if keys.len() != expected {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(keys.len()));
+    }
+    if n <= 1 {
+        return Ok((0..n as u32).collect());
+    }
+    let npot = n.next_power_of_two();
+    let perm_bytes = npot
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(npot))?;
+    let keys_bytes = keys
+        .len()
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(keys.len()))?;
+    let n_u64 = n as u64;
+    let npot_u64 = npot as u64;
+    let k_u64 = k as u64;
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let sort_fn = primary.cached_function(c"gpu_db_bitonic_sort_multikey_step", &ptx)?;
+    let perm_dev = primary.lease_device_buffer(perm_bytes)?;
+    let keys_dev = primary.lease_device_buffer(keys_bytes)?;
+    let identity: Vec<u32> = (0..npot as u32).collect();
+
+    const BLOCK: u32 = 256;
+    let grid = (npot.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
+
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                perm_dev.ptr,
+                identity.as_ptr().cast::<c_void>(),
+                perm_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc =
+            unsafe { htod_async(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        // Same bitonic network as the single-key path: kk = the sorted-subsequence size (doubles), jj =
+        // the compare distance (halves). The kernel takes kdim (= K) and desc_mask as extra params.
+        let mut kk = 2_u64;
+        while kk <= npot_u64 {
+            let mut jj = kk >> 1;
+            loop {
+                let mut p0 = perm_dev.ptr;
+                let mut p1 = keys_dev.ptr;
+                let mut p2 = n_u64;
+                let mut p3 = npot_u64;
+                let mut p4 = k_u64;
+                let mut p5 = kk;
+                let mut p6 = jj;
+                let mut p7 = desc_mask;
+                let mut args = [
+                    (&mut p0 as *mut u64).cast::<c_void>(),
+                    (&mut p1 as *mut u64).cast::<c_void>(),
+                    (&mut p2 as *mut u64).cast::<c_void>(),
+                    (&mut p3 as *mut u64).cast::<c_void>(),
+                    (&mut p4 as *mut u64).cast::<c_void>(),
+                    (&mut p5 as *mut u64).cast::<c_void>(),
+                    (&mut p6 as *mut u64).cast::<c_void>(),
+                    (&mut p7 as *mut u64).cast::<c_void>(),
                 ];
                 let rc = unsafe {
                     cu_launch_kernel(
@@ -18610,6 +18785,102 @@ mod tests {
         // n<=1 is the already-sorted fast path.
         assert_eq!(resident.bitonic_sort_i64(&[], false).unwrap(), Vec::<u32>::new());
         assert_eq!(resident.bitonic_sort_i64(&[7], true).unwrap(), vec![0]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_bitonic_sort_multikey_orders_and_permutes() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let resident = runtime
+            .retain_device_memory_copy(0, &0_u64.to_le_bytes())
+            .expect("resident device memory");
+
+        // A sort is correct iff its output permutation is (1) a bijection of 0..n and (2) orders the
+        // rows monotonically under the multi-key comparator (key 0 most significant, per-key direction
+        // from desc_mask). We check that INVARIANT on adjacent pairs -- we do NOT recompute the expected
+        // permutation on the CPU (bitonic is unstable, so ties are not pinned). `cmp` is the order
+        // DEFINITION, not a re-implementation of the sort.
+        let cmp = |keys: &[i64], k: usize, mask: u64, a: usize, b: usize| -> std::cmp::Ordering {
+            for kk in 0..k {
+                let ka = keys[a * k + kk];
+                let kb = keys[b * k + kk];
+                if ka != kb {
+                    let asc = ka.cmp(&kb);
+                    return if (mask >> kk) & 1 == 1 { asc.reverse() } else { asc };
+                }
+            }
+            std::cmp::Ordering::Equal
+        };
+        let check = |keys: &[i64], n: usize, k: usize, mask: u64| {
+            let perm = resident
+                .bitonic_sort_multikey(keys, n, k, mask)
+                .expect("sort");
+            assert_eq!(perm.len(), n, "one position per row");
+            let mut seen = perm.clone();
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..n as u32).collect::<Vec<_>>(),
+                "perm must be a permutation of 0..n"
+            );
+            for w in perm.windows(2) {
+                assert_ne!(
+                    cmp(keys, k, mask, w[0] as usize, w[1] as usize),
+                    std::cmp::Ordering::Greater,
+                    "multi-key order violated: row {} placed before row {}",
+                    w[0],
+                    w[1]
+                );
+            }
+        };
+
+        // (a) 2 keys, a ASC + b DESC, n=6 (-> npot=8 padding); a-ties broken by b. Duplicate (2,50) row
+        // exercises full key equality.
+        let ab: Vec<i64> = [(1, 10), (1, 30), (1, 20), (2, 50), (2, 40), (2, 50)]
+            .iter()
+            .flat_map(|&(a, b)| [a as i64, b as i64])
+            .collect();
+        check(&ab, 6, 2, 0b10);
+        // (b) 3 keys a ASC, b DESC, c ASC -- the two (1,5,*) rows tie on a AND b, ordered only by c.
+        let abc: Vec<i64> = [(1, 5, 100), (1, 5, 50), (1, 8, 10), (2, 3, 7), (2, 3, 9)]
+            .iter()
+            .flat_map(|&(a, b, c)| [a as i64, b as i64, c as i64])
+            .collect();
+        check(&abc, 5, 3, 0b010);
+        // (c) all-equal first key -> the SECOND key fully determines order (asc). Negatives included.
+        let eqfirst: Vec<i64> = [(7, 3), (7, -1), (7, 9), (7, i64::MIN), (7, 5)]
+            .iter()
+            .flat_map(|&(a, b)| [a as i64, b])
+            .collect();
+        check(&eqfirst, 5, 2, 0b00);
+        // (d) 300 rows, 2 keys via xorshift: a low-cardinality first key (0..5, lots of ties) and a
+        // full-range second key (the tie-breaker), non-power-of-2 -> padding. All 4 direction masks.
+        let mut x = 0x2545_F491_4F6C_DD1D_u64;
+        let mut big = Vec::with_capacity(300 * 2);
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            big.push((x % 5) as i64);
+            big.push(x as i64);
+        }
+        check(&big, 300, 2, 0b00);
+        check(&big, 300, 2, 0b10);
+        check(&big, 300, 2, 0b01);
+        check(&big, 300, 2, 0b11);
+        // n<=1 fast path + the keys.len() == n*k validation.
+        assert_eq!(
+            resident.bitonic_sort_multikey(&[], 0, 3, 0).unwrap(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            resident.bitonic_sort_multikey(&[1, 2, 3], 1, 3, 0).unwrap(),
+            vec![0]
+        );
+        assert!(
+            resident.bitonic_sort_multikey(&[1, 2, 3], 2, 2, 0).is_err(),
+            "keys.len() must equal n*k"
+        );
     }
 
     #[test]

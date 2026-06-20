@@ -231,7 +231,7 @@ mod tests {
             filter: None,
             filters: Vec::new(),
             filter_groups: Vec::new(),
-            order_by: None,
+            order_by: Vec::new(),
             limit: None,
             offset: None,
         }));
@@ -264,7 +264,7 @@ mod tests {
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: None,
             }),

@@ -660,7 +660,7 @@ impl Engine {
                     .collect::<Result<Vec<_>, ExecuteError>>()?;
             }
 
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 let order_idx = if select_is_aggregate_result_column(select, &order.column) {
                     aggregate_rows.first().map_or(0, |row| row.len() - 1)
                 } else {

@@ -1206,7 +1206,7 @@ pub(crate) fn bind_relational_select(
     let filter = filters.first().cloned();
     let order = select
         .order_by
-        .as_ref()
+        .first()
         .map(|order| {
             if select_is_aggregate_result_column(select, &order.column) {
                 Ok((usize::MAX, order.descending))
@@ -1223,7 +1223,7 @@ pub(crate) fn bind_relational_select(
                 )));
             }
             SelectProjection::Columns(columns) => {
-                if let Some(order) = &select.order_by {
+                if let Some(order) = select.order_by.first() {
                     if !columns.iter().any(|column| column == &order.column) {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "SELECT DISTINCT ORDER BY must reference a selected column".to_string(),
@@ -1263,7 +1263,7 @@ pub(crate) fn bind_relational_select(
                     "GROUP BY column must match grouped COUNT(*) projection".to_string(),
                 )));
             }
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if order.column != *column && !order.column.eq_ignore_ascii_case("count") {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "GROUP BY ORDER BY must reference grouped column or count".to_string(),
@@ -1278,7 +1278,7 @@ pub(crate) fn bind_relational_select(
         }
         (SelectProjection::Sum { column }, None) => {
             validate_sum_column(table, column)?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if !order.column.eq_ignore_ascii_case("sum") {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "SUM ORDER BY only supports sum".to_string(),
@@ -1305,7 +1305,7 @@ pub(crate) fn bind_relational_select(
                 )));
             }
             validate_sum_column(table, sum_column)?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if order.column != *group_column && !order.column.eq_ignore_ascii_case("sum") {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "GROUP BY ORDER BY must reference grouped column or sum".to_string(),
@@ -1320,7 +1320,7 @@ pub(crate) fn bind_relational_select(
         }
         (SelectProjection::Avg { column }, None) => {
             validate_avg_column(table, column)?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if !order.column.eq_ignore_ascii_case("avg") {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "AVG ORDER BY only supports avg".to_string(),
@@ -1347,7 +1347,7 @@ pub(crate) fn bind_relational_select(
                 )));
             }
             validate_avg_column(table, avg_column)?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if order.column != *group_column && !order.column.eq_ignore_ascii_case("avg") {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "GROUP BY ORDER BY must reference grouped column or avg".to_string(),
@@ -1367,7 +1367,7 @@ pub(crate) fn bind_relational_select(
             } else {
                 "max"
             };
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if !order.column.eq_ignore_ascii_case(aggregate_name) {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "MIN/MAX ORDER BY only supports the aggregate result".to_string(),
@@ -1543,7 +1543,7 @@ pub(crate) fn bind_update_assignments(
 }
 
 pub(crate) fn relational_select_pushes_limit(select: &Select) -> bool {
-    select.limit.is_some() && select.offset.is_none() && select.order_by.is_none()
+    select.limit.is_some() && select.offset.is_none() && select.order_by.is_empty()
 }
 
 pub(crate) fn relational_select_pushed_limit(
@@ -1553,7 +1553,7 @@ pub(crate) fn relational_select_pushed_limit(
     if select.distinct || select_is_aggregate(select) {
         return None;
     }
-    let can_push = select.order_by.is_none() || ordered_access_path;
+    let can_push = select.order_by.is_empty() || ordered_access_path;
     if !can_push {
         return None;
     }
@@ -1591,7 +1591,7 @@ pub(crate) fn relational_select_needs_host_sql_finalization(
                     ..
                 }
         ))
-        || (select.order_by.is_some()
+        || (!select.order_by.is_empty()
             && !matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. }))
         || (select.limit.is_some()
             && select.offset.is_none()
@@ -1609,7 +1609,7 @@ pub(crate) fn select_is_plain_view_scan(select: &Select) -> bool {
         && select.group_by.is_none()
         && select.having_groups.is_empty()
         && !select_has_relational_filters(select)
-        && select.order_by.is_none()
+        && select.order_by.is_empty()
         && select.limit.is_none()
         && select.offset.is_none()
 }
@@ -1755,7 +1755,7 @@ pub(crate) fn validate_grouped_extreme(
         )));
     }
     relational_column_index(table, value_column)?;
-    if let Some(order) = &select.order_by {
+    if let Some(order) = select.order_by.first() {
         if order.column != group_column && !order.column.eq_ignore_ascii_case(aggregate_name) {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "GROUP BY ORDER BY must reference grouped column or min/max".to_string(),

@@ -441,6 +441,16 @@ fn execute_select_result_inner(
     select: &gpu_db_protocol::Select,
     enforce_relation_acl: bool,
 ) -> Result<SelectResult, ErrorField> {
+    // Multi-key ORDER BY (`ORDER BY a, b, ...`) is GPU-only -- it runs on the general Expr executor's
+    // bitonic-sort path (the consolidated server). This legacy pgwire handler sorts on the CPU off the
+    // first key only, so rather than silently mis-order a multi-key request, reject it cleanly.
+    if select.order_by.len() > 1 {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "multi-key ORDER BY is supported only on the GPU executor (consolidated server)",
+            position: None,
+        });
+    }
     let Some(table) = session.tables.get(&select.table) else {
         if let Some(view) = session.views.get(&select.table) {
             if !select_is_plain_view_scan(select) {
@@ -571,7 +581,7 @@ fn execute_select_result_inner(
                 });
             }
             SelectProjection::Columns(columns) => {
-                if let Some(order) = &select.order_by {
+                if let Some(order) = select.order_by.first() {
                     if !columns.iter().any(|column| column == &order.column) {
                         return Err(ErrorField {
                             code: "0A000",
@@ -624,7 +634,7 @@ fn execute_select_result_inner(
                 projected.push(selected);
             }
         }
-        if let Some(order) = &select.order_by {
+        if let Some(order) = select.order_by.first() {
             let Some(selected_order_idx) = selected_columns
                 .iter()
                 .position(|column| column.def.name == order.column)
@@ -662,7 +672,7 @@ fn execute_select_result_inner(
             .collect::<Vec<_>>();
         return Ok(SelectResult { columns, rows });
     }
-    if let Some(order) = &select.order_by {
+    if let Some(order) = select.order_by.first() {
         let Some(idx) = table
             .columns
             .iter()
@@ -907,7 +917,7 @@ fn select_is_plain_view_scan(select: &gpu_db_protocol::Select) -> bool {
         && select.filter.is_none()
         && select.filters.is_empty()
         && select.filter_groups.is_empty()
-        && select.order_by.is_none()
+        && select.order_by.is_empty()
         && select.limit.is_none()
         && select.offset.is_none()
 }
@@ -944,7 +954,7 @@ fn execute_aggregate_select_result(
                     position: None,
                 });
             }
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if !order.column.eq_ignore_ascii_case("count") {
                     return Err(ErrorField {
                         code: "0A000",
@@ -1013,7 +1023,7 @@ fn execute_aggregate_select_result(
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if order.column == *column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
                 } else if order.column.eq_ignore_ascii_case("count") {
@@ -1061,7 +1071,7 @@ fn execute_aggregate_select_result(
                     position: None,
                 });
             }
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if !order.column.eq_ignore_ascii_case("sum") {
                     return Err(ErrorField {
                         code: "0A000",
@@ -1143,7 +1153,7 @@ fn execute_aggregate_select_result(
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if order.column == *group_column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
                 } else if order.column.eq_ignore_ascii_case("sum") {
@@ -1191,7 +1201,7 @@ fn execute_aggregate_select_result(
                     position: None,
                 });
             }
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if !order.column.eq_ignore_ascii_case("avg") {
                     return Err(ErrorField {
                         code: "0A000",
@@ -1273,7 +1283,7 @@ fn execute_aggregate_select_result(
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if order.column == *group_column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
                 } else if order.column.eq_ignore_ascii_case("avg") {
@@ -1326,7 +1336,7 @@ fn execute_aggregate_select_result(
                     position: None,
                 });
             }
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if !order.column.eq_ignore_ascii_case(aggregate_name) {
                     return Err(ErrorField {
                         code: "0A000",
@@ -1416,7 +1426,7 @@ fn execute_aggregate_select_result(
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 if order.column == *group_column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
                 } else if order.column.eq_ignore_ascii_case(aggregate_name) {

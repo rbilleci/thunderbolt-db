@@ -415,6 +415,62 @@ fn select_text_non_resident_order_by_falls_through_to_existing_path() {
 }
 
 #[test]
+fn grouped_multikey_order_by_is_rejected_not_silently_first_key() {
+    // A multi-key ORDER BY on a GROUPED query has no GPU multi-key sort yet (the grouped result is
+    // sorted host-side by the PRIMARY key only). It must error cleanly rather than silently honoring
+    // just the first key. Guards the audit-found bypass: a multi-aggregate GROUP BY is rejected by the
+    // hand-rolled parser -> the Err arm -> the general path's grouped branch -> .first()-only sort.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE g (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO g (a) VALUES (1), (1), (2), (3), (3), (3)")
+        .unwrap();
+    let err = e
+        .execute_relational_select_text(
+            "SELECT a, COUNT(*), SUM(a) FROM g GROUP BY a ORDER BY count ASC, a DESC",
+        )
+        .expect_err("multi-key grouped ORDER BY must be rejected, not silently first-key sorted");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("multi-key order by") && msg.contains("grouped"),
+        "expected a clean multi-key-grouped rejection, got: {err:?}"
+    );
+}
+
+#[test]
+fn select_text_multikey_order_by_non_resident_rejects() {
+    // Multi-key ORDER BY is GPU-only: it sorts on the general Expr executor's bitonic-sort path, routed
+    // ONLY when every key is an i64-sortable base column on a GPU-RESIDENT table. On a non-resident
+    // table the routing gate falls through to the enumerated/CPU path, which has NO multi-key sort and
+    // must reject it cleanly (never silently sort by the first key). No GPU needed -- the rejection is
+    // on the CPU choke point. Charter: no CPU relational multi-key sort.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a, b) VALUES (1, 9), (1, 3), (2, 5)")
+        .unwrap();
+    // Deliberately NOT resident -> the multi-key sort cannot take the GPU path.
+    match e.execute_relational_select_text("SELECT a, b FROM t ORDER BY a ASC, b DESC") {
+        Ok(_) => panic!("multi-key ORDER BY on a non-resident table must error, not return rows"),
+        Err(err) => assert!(
+            err.to_string().contains("multi-key ORDER BY"),
+            "expected a clean multi-key rejection, got: {err}"
+        ),
+    }
+    // A SINGLE-key ORDER BY on the same non-resident table still works (unchanged) via the CPU path.
+    let single = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a DESC")
+        .expect("single-key ORDER BY still sorts via the existing path");
+    assert_eq!(
+        single.rows,
+        vec![
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(1)],
+        ],
+        "single-key ORDER BY unchanged"
+    );
+}
+
+#[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_select_text_routes_arithmetic_predicate_to_general_expr_path() {
     // The TEXT dispatch (execute_relational_select_text — what a consolidated server calls) routes an

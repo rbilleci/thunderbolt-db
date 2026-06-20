@@ -3206,6 +3206,105 @@ fn gpu_nongrouped_order_by_500_rows() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_multikey() {
+    // MULTI-KEY ORDER BY (`ORDER BY a ASC, b DESC, ...`) sorts on the GPU via the multi-key bitonic
+    // comparator on the general Expr executor: each key, in significance order with its own direction,
+    // breaks ties for the next. executed_target==Gpu proves the general GPU path (routing gate + GPU
+    // multi-key sort), NOT the CPU/enumerated path. Rows are engineered so EVERY key is the real
+    // tie-breaker -- drop any key and the expected order changes.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t2 (a INT, b INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t2 (a, b) VALUES (1, 10), (1, 30), (1, 20), (2, 50), (2, 40)",
+    )
+    .unwrap();
+    e.execute_text(3, "CREATE TABLE t3 (a INT, b INT, c INT)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO t3 (a, b, c) VALUES (1, 5, 100), (1, 5, 50), (1, 8, 10), (2, 3, 7), (2, 3, 9)",
+    )
+    .unwrap();
+    e.execute_text(5, "CREATE TABLE td (d DATE, x INT)").unwrap();
+    e.execute_text(
+        6,
+        "INSERT INTO td (d, x) VALUES ('2024-01-02', 5), ('2024-01-01', 9), \
+         ('2024-01-01', 3), ('2024-01-02', 7)",
+    )
+    .unwrap();
+    let s2 = e.populate_relational_residency_snapshot("t2").unwrap();
+    e.populate_relational_residency_snapshot("t3").unwrap();
+    e.populate_relational_residency_snapshot("td").unwrap();
+    if s2.device_memory_proof.is_none() {
+        return;
+    }
+    let int4_col = |res: &RelationalSelectResult, col: usize| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[col] {
+                SqlValue::Int4(v) => v,
+                ref other => panic!("expected Int4, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // (a) two keys: a ASC, b DESC -- a-ties (1,1,1 / 2,2) broken by b DESCENDING.
+    let ab = e
+        .execute_relational_select_text("SELECT a, b FROM t2 ORDER BY a ASC, b DESC")
+        .unwrap();
+    assert_eq!(
+        ab.executed_target,
+        DeviceTarget::Gpu(0),
+        "multi-key ORDER BY must run on the general GPU path"
+    );
+    assert_eq!(int4_col(&ab, 0), vec![1, 1, 1, 2, 2], "key a ASC");
+    assert_eq!(
+        int4_col(&ab, 1),
+        vec![30, 20, 10, 50, 40],
+        "key b DESC breaks a-ties"
+    );
+
+    // (b) three keys: a ASC, b DESC, c ASC -- a-ties broken by b, then (a,b)-ties broken by c. The two
+    // (1,5,*) rows tie on a AND b and are ordered ONLY by c ASC (50 before 100).
+    let abc = e
+        .execute_relational_select_text("SELECT a, b, c FROM t3 ORDER BY a ASC, b DESC, c ASC")
+        .unwrap();
+    assert_eq!(abc.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(int4_col(&abc, 0), vec![1, 1, 1, 2, 2], "key a ASC");
+    assert_eq!(int4_col(&abc, 1), vec![8, 5, 5, 3, 3], "key b DESC");
+    assert_eq!(
+        int4_col(&abc, 2),
+        vec![10, 50, 100, 7, 9],
+        "key c ASC breaks (a,b)-ties"
+    );
+
+    // (c) DATE + int: d ASC (primary), x DESC. The x order [9,3,7,5] proves d is the PRIMARY key --
+    // sorting by x DESC alone would give [9,7,5,3]. (A mixed key-type multi-key sort.)
+    let dx = e
+        .execute_relational_select_text("SELECT x FROM td ORDER BY d ASC, x DESC")
+        .unwrap();
+    assert_eq!(dx.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        int4_col(&dx, 0),
+        vec![9, 3, 7, 5],
+        "date primary ASC, int secondary DESC"
+    );
+
+    // (d) single-key down the SAME path is unchanged (K=1) -- regression guard.
+    let single = e
+        .execute_relational_select_text("SELECT a FROM t2 ORDER BY a ASC")
+        .unwrap();
+    assert_eq!(single.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        int4_col(&single, 0),
+        vec![1, 1, 1, 2, 2],
+        "single key a ASC unchanged"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_by_uuid_key() {
     // GROUP BY a UUID (i128) key via atom.cas.b128; output sorts by canonical/memcmp byte order. Uses
     // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and

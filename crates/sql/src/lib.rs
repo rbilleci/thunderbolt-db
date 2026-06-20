@@ -1718,7 +1718,10 @@ pub struct Select {
     pub filter: Option<SelectFilter>,
     pub filters: Vec<SelectFilter>,
     pub filter_groups: Vec<Vec<SelectFilter>>,
-    pub order_by: Option<SelectOrder>,
+    /// ORDER BY keys, in significance order (key 0 is primary). Empty = no ORDER BY. Multi-key sorts
+    /// run ONLY on the general GPU bitonic-sort path; the CPU/enumerated sort sites honor key 0 and
+    /// reject `len() > 1`.
+    pub order_by: Vec<SelectOrder>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -5821,7 +5824,7 @@ fn parse_select(input: &str, allow_catalog_schemas: bool) -> Result<Select, Pars
     let mut filter_groups = Vec::new();
     let mut group_by = None;
     let mut having_groups = Vec::new();
-    let mut order_by = None;
+    let mut order_by = Vec::new();
     let mut limit = None;
     let mut offset = None;
     while !tail.is_empty() {
@@ -5847,7 +5850,7 @@ fn parse_select(input: &str, allow_catalog_schemas: bool) -> Result<Select, Pars
                 .ok_or(ParseError::InvalidRelationalSql)?
                 .trim_start();
             let next = next_clause_pos(after_by).unwrap_or(after_by.len());
-            order_by = Some(parse_select_order(after_by[..next].trim())?);
+            order_by = parse_select_order(after_by[..next].trim())?;
             tail = after_by[next..].trim_start();
         } else if let Some(after_limit) = strip_keyword_prefix_case_insensitive(tail, "LIMIT") {
             let after_limit = after_limit.trim_start();
@@ -6213,22 +6216,33 @@ fn trim_wrapping_parentheses(input: &str) -> Result<&str, ParseError> {
     }
 }
 
-fn parse_select_order(input: &str) -> Result<SelectOrder, ParseError> {
-    let mut parts = input.split_whitespace();
-    let column = parts
-        .next()
-        .ok_or(ParseError::InvalidRelationalSql)
-        .and_then(normalize_identifier)?;
-    let descending = match parts.next() {
-        None => false,
-        Some(direction) if direction.eq_ignore_ascii_case("ASC") => false,
-        Some(direction) if direction.eq_ignore_ascii_case("DESC") => true,
-        _ => return Err(ParseError::InvalidRelationalSql),
-    };
-    if parts.next().is_some() {
+fn parse_select_order(input: &str) -> Result<Vec<SelectOrder>, ParseError> {
+    let mut keys = Vec::new();
+    for part in input.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let mut parts = part.split_whitespace();
+        let column = parts
+            .next()
+            .ok_or(ParseError::InvalidRelationalSql)
+            .and_then(normalize_identifier)?;
+        let descending = match parts.next() {
+            None => false,
+            Some(direction) if direction.eq_ignore_ascii_case("ASC") => false,
+            Some(direction) if direction.eq_ignore_ascii_case("DESC") => true,
+            _ => return Err(ParseError::InvalidRelationalSql),
+        };
+        if parts.next().is_some() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        keys.push(SelectOrder { column, descending });
+    }
+    if keys.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
-    Ok(SelectOrder { column, descending })
+    Ok(keys)
 }
 
 fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {

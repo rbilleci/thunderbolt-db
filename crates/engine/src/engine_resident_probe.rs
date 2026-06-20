@@ -216,7 +216,7 @@ fn compile_resident_plan(
     if select.distinct
         || select.group_by.is_some()
         || !select.having_groups.is_empty()
-        || select.order_by.is_some()
+        || !select.order_by.is_empty()
         || select.limit.is_some()
         || select.offset.is_some()
     {
@@ -670,7 +670,7 @@ impl Engine {
             || select.filter.is_some()
             || !select.filters.is_empty()
             || !select.filter_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
         {
@@ -791,7 +791,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.selected_indexes.len() != 1
@@ -935,7 +935,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.selected_indexes.len() < 2
@@ -1163,7 +1163,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || filter_groups.len() != 1
@@ -1377,7 +1377,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || filter_groups.len() != 1
@@ -1636,7 +1636,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || filter_groups.len() != 1
@@ -1832,7 +1832,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || filter_groups.len() != 1
@@ -2030,7 +2030,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || filter_groups.len() != 1
@@ -2212,7 +2212,7 @@ impl Engine {
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.filter_groups.len() != 1
@@ -2315,7 +2315,7 @@ impl Engine {
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.filter_groups.len() < 2
@@ -2440,7 +2440,7 @@ impl Engine {
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.filter_groups.len() != 1
@@ -2582,7 +2582,7 @@ impl Engine {
             || !matches!(select.projection, SelectProjection::CountAll)
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.filter_groups.is_empty()
@@ -2839,7 +2839,7 @@ impl Engine {
         };
         let gpu_order: Option<GroupedI64Order> = {
             let limit = select.limit.map(|limit| limit as u64);
-            let order_col = match &select.order_by {
+            let order_col = match select.order_by.first() {
                 Some(order) => {
                     let by_aggregate = select_is_aggregate_result_column(select, &order.column);
                     match (aggregate_col, by_aggregate) {
@@ -2860,7 +2860,7 @@ impl Engine {
             };
             order_col.map(|column| GroupedI64Order {
                 column,
-                descending: select.order_by.as_ref().is_some_and(|o| o.descending),
+                descending: select.order_by.first().is_some_and(|o| o.descending),
                 offset: 0,
                 limit,
             })
@@ -2997,7 +2997,7 @@ impl Engine {
                     })
                     .collect::<Result<Vec<_>, ExecuteError>>()?;
             }
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 let order_by_sum = select_is_aggregate_result_column(select, &order.column);
                 rows.sort_by(|left, right| {
                     let ordering = if order_by_sum {
@@ -3235,7 +3235,7 @@ impl Engine {
                     })
                     .collect::<Result<Vec<_>, ExecuteError>>()?;
             }
-            if let Some(order) = &select.order_by {
+            if let Some(order) = select.order_by.first() {
                 let order_by_sum = select_is_aggregate_result_column(select, &order.column);
                 rows.sort_by(|left, right| {
                     let ordering = if order_by_sum {
@@ -3299,7 +3299,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.selected_indexes.len() != 1
@@ -3430,7 +3430,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.selected_indexes.len() != 1
@@ -3555,7 +3555,7 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.order_by.is_some()
+            || !select.order_by.is_empty()
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.selected_indexes.len() < 2
@@ -3968,7 +3968,7 @@ impl Engine {
             if select.distinct
                 || select.group_by.is_some()
                 || !select.having_groups.is_empty()
-                || select.order_by.is_some()
+                || !select.order_by.is_empty()
                 || select.limit.is_some()
                 || select.offset.is_some()
                 || bound.selected_indexes.is_empty()

@@ -7,34 +7,42 @@
 
 use super::*;
 
-/// A non-grouped projection (no aggregate / GROUP BY / HAVING) with an ORDER BY whose key is an
-/// i64-sortable int column (int2/int4/int8/date/timestamp). Such a query is routed to the general GPU
-/// Expr executor, which sorts the surviving rows on the GPU (bitonic) -- the charter-native path,
-/// retiring the enumerated ordered-projection shape for this case. Other ORDER BY shapes (text/numeric/
-/// uuid keys, expressions, multi-key) stay on the existing path transitionally.
+/// A non-grouped projection (no aggregate / GROUP BY / HAVING) with an ORDER BY whose keys are ALL
+/// i64-sortable int columns (int2/int4/int8/date/timestamp) -- one OR several keys (e.g.
+/// `ORDER BY a ASC, b DESC, c`). Such a query is routed to the general GPU Expr executor, which sorts
+/// the surviving rows on the GPU (multi-key bitonic) -- the charter-native path, retiring the
+/// enumerated ordered-projection shape for this case. Other ORDER BY shapes (any text/numeric/uuid key,
+/// expressions) stay on the existing path transitionally; the enumerated/CPU path rejects multi-key, so
+/// a multi-key sort with a non-routable key is a clean error, never a silent first-key-only sort.
 fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -> bool {
     if select.group_by.is_some() || !select.having_groups.is_empty() {
         return false;
     }
-    let Some(order) = &select.order_by else {
+    if select.order_by.is_empty() {
         return false;
-    };
+    }
     if !matches!(
         select.projection,
         SelectProjection::All | SelectProjection::Columns(_)
     ) {
         return false;
     }
-    table
-        .columns
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&order.column))
-        .is_some_and(|c| {
-            matches!(
-                c.ty,
-                SqlType::Int4 | SqlType::Int8 | SqlType::Int2 | SqlType::Date | SqlType::Timestamp
-            )
-        })
+    select.order_by.iter().all(|order| {
+        table
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&order.column))
+            .is_some_and(|c| {
+                matches!(
+                    c.ty,
+                    SqlType::Int4
+                        | SqlType::Int8
+                        | SqlType::Int2
+                        | SqlType::Date
+                        | SqlType::Timestamp
+                )
+            })
+    })
 }
 
 impl Engine {
@@ -108,6 +116,19 @@ impl Engine {
         select: &Select,
         on_pinned: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        // Multi-key ORDER BY (`ORDER BY a, b, ...`) is GPU-only: it runs on the general Expr executor's
+        // bitonic-sort path, routed in `execute_relational_select_text` when every key is an i64-sortable
+        // base column on a GPU-resident table. This enumerated/CPU path has no multi-key sort and must
+        // NOT silently sort by the first key only -- so reject it. A multi-key sort reaching here means a
+        // non-routable key (text/numeric/uuid/expression) or a non-resident table: a clean error, never a
+        // wrong (first-key-only) result.
+        if select.order_by.len() > 1 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "multi-key ORDER BY runs on the GPU sort path (every key must be an i64-sortable \
+                 base column on a GPU-resident table)"
+                    .to_string(),
+            )));
+        }
         // PART B test seam. The hook is threaded to the CPU pinned read, where it fires in the window
         // BETWEEN binding the catalog and pinning the data — exactly the window co-pinning closes. The
         // test parks a reader there while a writer commits a shape-changing DDL: with co-pinning the

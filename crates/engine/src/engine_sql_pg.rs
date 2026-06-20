@@ -151,6 +151,15 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
     } else {
         Vec::new()
     };
+    // The grouped result is sorted host-side (one row per group) reading the PRIMARY key only; there is
+    // no GPU multi-key sort for grouped results yet (that lands with the grouped-sort migration).
+    // Reject a multi-key grouped ORDER BY cleanly rather than silently honoring just the first key.
+    if group_by.is_some() && order_by.len() > 1 {
+        return Err(sql_pg_error(
+            "multi-key ORDER BY on a grouped result is not yet supported (single-key only)"
+                .to_string(),
+        ));
+    }
     let select = Select {
         table,
         distinct: false,
@@ -750,25 +759,24 @@ fn parse_having(
 fn parse_order_by(
     sort_clause: &[Node],
     qualifier: &str,
-) -> Result<Option<SelectOrder>, ExecuteError> {
-    let Some(first) = sort_clause.first() else {
-        return Ok(None);
-    };
-    if sort_clause.len() > 1 {
-        return Err(sql_pg_error(
-            "ORDER BY supports a single sort key on the Expr path".to_string(),
-        ));
+) -> Result<Vec<SelectOrder>, ExecuteError> {
+    // Parse EVERY sort key, in significance order (`ORDER BY a ASC, b DESC, c`). Multi-key sorts run on
+    // the GPU bitonic-sort path (the general Expr executor); the CPU/enumerated sort sites reject
+    // `len() > 1`. NULLS FIRST/LAST is ignored (data is non-null until M3).
+    let mut keys = Vec::with_capacity(sort_clause.len());
+    for item in sort_clause {
+        let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
+            return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
+        };
+        let node = sort_by
+            .node
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
+        let column = result_column_name(node, qualifier)?;
+        let descending = sort_by.sortby_dir == SortByDir::SortbyDesc as i32;
+        keys.push(SelectOrder { column, descending });
     }
-    let NodeEnum::SortBy(sort_by) = node_enum(first)? else {
-        return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
-    };
-    let node = sort_by
-        .node
-        .as_deref()
-        .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
-    let column = result_column_name(node, qualifier)?;
-    let descending = sort_by.sortby_dir == SortByDir::SortbyDesc as i32;
-    Ok(Some(SelectOrder { column, descending }))
+    Ok(keys)
 }
 
 /// Parse a `LIMIT` / `OFFSET` count -> a non-negative `usize`.

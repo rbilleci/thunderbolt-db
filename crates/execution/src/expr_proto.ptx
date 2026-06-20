@@ -4082,6 +4082,151 @@ bit_done:
     ret;
 }
 
+// Multi-key variant of gpu_db_bitonic_sort_i64_step. `keys` is a row-major K-wide matrix of s64:
+// keys[row*K + k], key 0 most significant. `desc_mask` bit k set => key k sorts DESCENDING. The
+// comparator walks keys 0..K; the FIRST non-equal key decides the order (asc: a_after_b iff ka>kb;
+// desc: iff ka<kb) and stops; if all K keys are equal a_after_b is false (a stable no-swap). Padding
+// (a perm entry >= n) sorts last, identical to the single-key kernel -- the sentinel is the POSITION
+// (>= n), never a key value, so DESC keys are safe. One bitonic compare-exchange pass; the host drives
+// the kk/jj schedule. Each thread owns positions [i, i+stride, ...) of perm[0..npot).
+.visible .entry gpu_db_bitonic_sort_multikey_step(
+    .param .u64 perm_ptr,
+    .param .u64 keys_ptr,
+    .param .u64 n,
+    .param .u64 npot,
+    .param .u64 kdim,
+    .param .u64 kk,
+    .param .u64 jj,
+    .param .u64 desc_mask
+)
+{
+    .reg .pred %p;
+    .reg .pred %pseq;
+    .reg .pred %pafter;
+    .reg .pred %pap;
+    .reg .pred %pbp;
+    .reg .pred %pdesc;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %a32;
+    .reg .u32 %b32;
+    .reg .u64 %permp;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %npot;
+    .reg .u64 %kdim;
+    .reg .u64 %k8;
+    .reg .u64 %kk;
+    .reg .u64 %jj;
+    .reg .u64 %descmask;
+    .reg .u64 %i;
+    .reg .u64 %l;
+    .reg .u64 %au;
+    .reg .u64 %bu;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %stride;
+    .reg .u64 %basea;
+    .reg .u64 %baseb;
+    .reg .u64 %kidx;
+    .reg .u64 %maskbit;
+    .reg .u64 %tmp;
+    .reg .s64 %ka;
+    .reg .s64 %kb;
+
+    ld.param.u64 %permp, [perm_ptr];
+    ld.param.u64 %keysp, [keys_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %npot, [npot];
+    ld.param.u64 %kdim, [kdim];
+    ld.param.u64 %kk, [kk];
+    ld.param.u64 %jj, [jj];
+    ld.param.u64 %descmask, [desc_mask];
+    mul.lo.u64 %k8, %kdim, 8;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+mk_loop:
+    setp.ge.u64 %p, %i, %npot;
+    @%p bra mk_done;
+    xor.b64 %l, %i, %jj;
+    setp.le.u64 %p, %l, %i;
+    @%p bra mk_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %a32, [%addr];
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %b32, [%addr];
+    cvt.u64.u32 %au, %a32;
+    cvt.u64.u32 %bu, %b32;
+    and.b64 %off, %i, %kk;
+    setp.eq.u64 %pseq, %off, 0;
+    setp.ge.u64 %pap, %au, %n;
+    setp.ge.u64 %pbp, %bu, %n;
+    @%pap bra mk_apad;
+    @%pbp bra mk_afalse;
+    mul.lo.u64 %basea, %au, %k8;
+    add.u64 %basea, %keysp, %basea;
+    mul.lo.u64 %baseb, %bu, %k8;
+    add.u64 %baseb, %keysp, %baseb;
+    mov.u64 %kidx, 0;
+    mov.u64 %maskbit, 1;
+mk_key_loop:
+    setp.ge.u64 %p, %kidx, %kdim;
+    @%p bra mk_alleq;
+    mul.lo.u64 %off, %kidx, 8;
+    add.u64 %addr, %basea, %off;
+    ld.global.s64 %ka, [%addr];
+    add.u64 %addr, %baseb, %off;
+    ld.global.s64 %kb, [%addr];
+    setp.eq.s64 %p, %ka, %kb;
+    @%p bra mk_key_next;
+    and.b64 %tmp, %descmask, %maskbit;
+    setp.ne.u64 %pdesc, %tmp, 0;
+    @%pdesc bra mk_kdesc;
+    setp.gt.s64 %pafter, %ka, %kb;
+    bra mk_adone;
+mk_kdesc:
+    setp.lt.s64 %pafter, %ka, %kb;
+    bra mk_adone;
+mk_key_next:
+    add.u64 %kidx, %kidx, 1;
+    shl.b64 %maskbit, %maskbit, 1;
+    bra mk_key_loop;
+mk_alleq:
+    setp.ne.u64 %pafter, %n, %n;
+    bra mk_adone;
+mk_apad:
+    @%pbp bra mk_afalse;
+    setp.eq.u64 %pafter, %n, %n;
+    bra mk_adone;
+mk_afalse:
+    setp.ne.u64 %pafter, %n, %n;
+mk_adone:
+    xor.pred %p, %pafter, %pseq;
+    @%p bra mk_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %b32;
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %a32;
+mk_next:
+    add.u64 %i, %i, %stride;
+    bra mk_loop;
+mk_done:
+    ret;
+}
+
 // GROUP BY an int4 key, aggregating COUNT(*) and SUM(int4 value) into an open-addressing hash table
 // (the operator axis, doc 19; the general path -- the enumerated GROUP BY is a host BTreeMap).
 //   slot_keys : [s64; NSLOTS] host-init to EMPTY (i64::MIN) via gpu_db_fill_i64.
