@@ -4082,6 +4082,187 @@ bit_done:
     ret;
 }
 
+// Bitonic compare-exchange pass keyed by a resident TEXT column (lexicographic, UNSIGNED bytes, a
+// prefix sorts SMALLER). `perm` is the permutation over [0,npot); for a position pos<n, the row id is
+// `indices[pos]` and its text = bytes[offsets[row] .. offsets[row+1]]. Offsets are read as 2x ld.u32
+// (the section can land 4-mod-8 aligned, where an 8-byte load faults 716). Padding (perm value >= n)
+// sorts last by POSITION (never a key sentinel) so DESC is safe. Mirrors gpu_db_bitonic_sort_i64_step;
+// only the "both real" comparator differs (a byte-wise compare instead of an s64 compare).
+.visible .entry gpu_db_bitonic_sort_text_step(
+    .param .u64 perm_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 offsets_base_ptr,
+    .param .u64 bytes_base_ptr,
+    .param .u64 n,
+    .param .u64 npot,
+    .param .u64 kk,
+    .param .u64 jj,
+    .param .u64 descending
+)
+{
+    .reg .pred %p;
+    .reg .pred %pseq;
+    .reg .pred %pafter;
+    .reg .pred %pap;
+    .reg .pred %pbp;
+    .reg .pred %pdesc;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .u32 %a32;
+    .reg .u32 %b32;
+    .reg .u64 %permp;
+    .reg .u64 %indp;
+    .reg .u64 %offb;
+    .reg .u64 %bytb;
+    .reg .u64 %n;
+    .reg .u64 %npot;
+    .reg .u64 %kk;
+    .reg .u64 %jj;
+    .reg .u64 %desc;
+    .reg .u64 %i;
+    .reg .u64 %l;
+    .reg .u64 %au;
+    .reg .u64 %bu;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %stride;
+    .reg .u64 %rowa;
+    .reg .u64 %rowb;
+    .reg .u64 %o8;
+    .reg .u64 %sta;
+    .reg .u64 %ena;
+    .reg .u64 %stb;
+    .reg .u64 %enb;
+    .reg .u64 %lena;
+    .reg .u64 %lenb;
+    .reg .u64 %minlen;
+    .reg .u64 %j;
+    .reg .u64 %ba;
+    .reg .u64 %bb;
+    .reg .s64 %cmp;
+
+    ld.param.u64 %permp, [perm_ptr];
+    ld.param.u64 %indp, [indices_ptr];
+    ld.param.u64 %offb, [offsets_base_ptr];
+    ld.param.u64 %bytb, [bytes_base_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %npot, [npot];
+    ld.param.u64 %kk, [kk];
+    ld.param.u64 %jj, [jj];
+    ld.param.u64 %desc, [descending];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+    setp.ne.u64 %pdesc, %desc, 0;
+txt_loop:
+    setp.ge.u64 %p, %i, %npot;
+    @%p bra txt_done;
+    xor.b64 %l, %i, %jj;
+    setp.le.u64 %p, %l, %i;
+    @%p bra txt_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %a32, [%addr];
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    ld.global.u32 %b32, [%addr];
+    cvt.u64.u32 %au, %a32;
+    cvt.u64.u32 %bu, %b32;
+    and.b64 %off, %i, %kk;
+    setp.eq.u64 %pseq, %off, 0;
+    setp.ge.u64 %pap, %au, %n;
+    setp.ge.u64 %pbp, %bu, %n;
+    @%pap bra txt_apad;
+    @%pbp bra txt_afalse;
+    mul.lo.u64 %off, %au, 8;
+    add.u64 %addr, %indp, %off;
+    ld.global.u64 %rowa, [%addr];
+    mul.lo.u64 %off, %bu, 8;
+    add.u64 %addr, %indp, %off;
+    ld.global.u64 %rowb, [%addr];
+    mul.lo.u64 %o8, %rowa, 8;
+    add.u64 %addr, %offb, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %sta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %ena, {%w0, %w1};
+    sub.u64 %lena, %ena, %sta;
+    mul.lo.u64 %o8, %rowb, 8;
+    add.u64 %addr, %offb, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %stb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enb, {%w0, %w1};
+    sub.u64 %lenb, %enb, %stb;
+    min.u64 %minlen, %lena, %lenb;
+    add.u64 %ba, %bytb, %sta;
+    add.u64 %bb, %bytb, %stb;
+    mov.u64 %j, 0;
+txt_byte:
+    setp.ge.u64 %p, %j, %minlen;
+    @%p bra txt_eqlen;
+    add.u64 %addr, %ba, %j;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %bb, %j;
+    ld.global.u8 %bbyte, [%addr];
+    setp.eq.u32 %p, %abyte, %bbyte;
+    @%p bra txt_byte_next;
+    setp.gt.u32 %p, %abyte, %bbyte;
+    selp.s64 %cmp, 1, -1, %p;
+    bra txt_cmpdone;
+txt_byte_next:
+    add.u64 %j, %j, 1;
+    bra txt_byte;
+txt_eqlen:
+    setp.gt.u64 %p, %lena, %lenb;
+    selp.s64 %cmp, 1, -1, %p;
+    setp.eq.u64 %p, %lena, %lenb;
+    selp.s64 %cmp, 0, %cmp, %p;
+txt_cmpdone:
+    @%pdesc bra txt_desc;
+    setp.gt.s64 %pafter, %cmp, 0;
+    bra txt_adone;
+txt_desc:
+    setp.lt.s64 %pafter, %cmp, 0;
+    bra txt_adone;
+txt_apad:
+    @%pbp bra txt_afalse;
+    setp.eq.u64 %pafter, %n, %n;
+    bra txt_adone;
+txt_afalse:
+    setp.ne.u64 %pafter, %n, %n;
+txt_adone:
+    xor.pred %p, %pafter, %pseq;
+    @%p bra txt_next;
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %b32;
+    mul.lo.u64 %off, %l, 4;
+    add.u64 %addr, %permp, %off;
+    st.global.u32 [%addr], %a32;
+txt_next:
+    add.u64 %i, %i, %stride;
+    bra txt_loop;
+txt_done:
+    ret;
+}
+
 // Multi-key variant of gpu_db_bitonic_sort_i64_step. `keys` is a row-major K-wide matrix of s64:
 // keys[row*K + k], key 0 most significant. `desc_mask` bit k set => key k sorts DESCENDING. The
 // comparator walks keys 0..K; the FIRST non-equal key decides the order (asc: a_after_b iff ka>kb;

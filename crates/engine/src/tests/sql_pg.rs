@@ -415,6 +415,34 @@ fn select_text_non_resident_order_by_falls_through_to_existing_path() {
 }
 
 #[test]
+fn select_text_non_resident_text_order_by_falls_through_to_existing_path() {
+    // A single-text-key ORDER BY routes to the GPU text sort ONLY when the table is GPU-resident. On a
+    // NON-resident table the gate falls through to the existing path, which sorts the text correctly
+    // rather than hard-erroring. Guards the residency condition for the text leg of the GPU sort.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (s TEXT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (s) VALUES ('banana'), ('apple'), ('cherry')")
+        .unwrap();
+    // Deliberately do NOT populate residency -> t is not GPU-resident.
+    let result = e
+        .execute_relational_select_text("SELECT s FROM t ORDER BY s")
+        .expect("non-resident text ORDER BY falls through to the existing path, not a hard error");
+    let got: Vec<String> = result
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            SqlValue::Text(v) => v.to_string(),
+            other => panic!("expected Text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec!["apple", "banana", "cherry"],
+        "non-resident text ORDER BY sorted via the existing path"
+    );
+}
+
+#[test]
 fn grouped_multikey_order_by_is_rejected_not_silently_first_key() {
     // A multi-key ORDER BY on a GROUPED query has no GPU multi-key sort yet (the grouped result is
     // sorted host-side by the PRIMARY key only). It must error cleanly rather than silently honoring

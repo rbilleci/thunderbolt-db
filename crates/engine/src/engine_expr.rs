@@ -1096,10 +1096,11 @@ impl Engine {
                     && ty != SqlType::Uuid
                     && ty != SqlType::Int2
                     && ty != SqlType::Bool
+                    && ty != SqlType::Text
                 {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "resident Expr select currently materializes int4 / int8 / numeric / date / \
-                         timestamp / uuid / int2 / bool projection columns only"
+                         timestamp / uuid / int2 / bool / text projection columns only"
                             .to_string(),
                     )));
                 }
@@ -1789,8 +1790,29 @@ impl Engine {
         // sort) BEFORE gathering, so the projected rows come out sorted -- a charter-native GPU sort,
         // not a host/CPU sort. The routing only sends sorts whose keys are ALL i64-sortable int columns
         // (int2/int4/int8/date/timestamp) to this path -- one key OR several (`ORDER BY a ASC, b DESC`).
+        // A single TEXT-key ORDER BY takes the varlen GPU sort path (the byte-wise comparator); all
+        // other routed keys are i64-sortable ints and go through the key-matrix path below.
+        let single_text_key = select.order_by.len() == 1
+            && table.columns[relational_column_index(table, &select.order_by[0].column)?].ty
+                == SqlType::Text;
         let indices_u64 = if select.order_by.is_empty() {
             indices_u64
+        } else if single_text_key {
+            // The varlen text key can't live in the i64 key matrix, so the kernel sorts the surviving
+            // rows by reading each row's bytes from the resident text column via the indices indirection
+            // (lexicographic, unsigned bytes, a prefix sorts smaller). Charter-native GPU sort.
+            let order = &select.order_by[0];
+            let order_idx = relational_column_index(table, &order.column)?;
+            let layout = resident_device_text_column_layout(&snapshot, table, order_idx)?;
+            let perm = device_memory
+                .bitonic_sort_text(
+                    &indices_u64,
+                    layout.offsets_byte_offset,
+                    layout.bytes_byte_offset,
+                    order.descending,
+                )
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            perm.iter().map(|&p| indices_u64[p as usize]).collect()
         } else {
             let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                 ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
@@ -1867,6 +1889,9 @@ impl Engine {
             Int2(Vec<i32>),
             // Gathered straight from the 1-bit-per-row bool bitmap.
             Bool(Vec<bool>),
+            // The text VALUE is materialized host-side (the SqlValue::Text from host_rows), like the
+            // GROUP BY text result -- the GPU did the filter + the sort; this gathers the result strings.
+            Text(Vec<SqlValue>),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
@@ -1940,6 +1965,17 @@ impl Engine {
                         })?;
                     ProjectedColumn::Uuid(values)
                 }
+                SqlType::Text => {
+                    // The text VALUE is materialized host-side from the residency_entry's host rows (the
+                    // SAME generation as the GPU residency, like the GROUP BY text result), gathered at
+                    // the GPU-sorted surviving indices. The GPU did the hot path (filter + sort).
+                    let host_rows = &residency_entry.host_rows;
+                    let values: Vec<SqlValue> = indices_u64
+                        .iter()
+                        .map(|&row| host_rows[row as usize][col].clone())
+                        .collect();
+                    ProjectedColumn::Text(values)
+                }
                 _ => {
                     let byte_offset = resident_device_int4_column_offset(&snapshot, table, col)?;
                     let values = device_memory
@@ -1970,6 +2006,8 @@ impl Engine {
                         // The stored i32 is a widened i16, so the narrowing is exact.
                         ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
                         ProjectedColumn::Bool(values) => SqlValue::Bool(values[row]),
+                        // Already a SqlValue::Text from host_rows; clone it through.
+                        ProjectedColumn::Text(values) => values[row].clone(),
                     })
                     .collect()
             })

@@ -3206,6 +3206,121 @@ fn gpu_nongrouped_order_by_500_rows() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_text() {
+    // A non-grouped ORDER BY over a TEXT column sorts on the GENERAL GPU Expr executor via the byte-wise
+    // text bitonic comparator (lexicographic, UNSIGNED bytes, a prefix sorts smaller) -- NOT a CPU sort.
+    // executed_target==Gpu proves the general GPU path. Covers prefixes, the empty string, duplicates, DESC.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (s TEXT, id INT)").unwrap();
+    // Deliberate corner cases: prefixes ('a' < 'ab'), empty string (sorts first), duplicates, mixed length.
+    let rows: &[(&str, i32)] = &[
+        ("banana", 1),
+        ("apple", 2),
+        ("ab", 3),
+        ("a", 4),
+        ("", 5),
+        ("apple", 6),
+        ("ab", 7),
+        ("cherry", 8),
+    ];
+    let values = rows
+        .iter()
+        .map(|(s, id)| format!("('{s}', {id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (s, id) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let text_col = |res: &RelationalSelectResult| -> Vec<String> {
+        res.rows
+            .iter()
+            .map(|r| match &r[0] {
+                SqlValue::Text(v) => v.to_string(),
+                other => panic!("expected Text, got {other:?}"),
+            })
+            .collect()
+    };
+    // Host oracle: Rust's str Ord IS unsigned byte order (== the kernel's compare).
+    let mut oracle: Vec<String> = rows.iter().map(|(s, _)| s.to_string()).collect();
+    oracle.sort_unstable();
+
+    // (a) ORDER BY s ASC -- and confirm it took the general GPU path.
+    let asc = e
+        .execute_relational_select_text("SELECT s FROM t ORDER BY s")
+        .unwrap();
+    assert_eq!(
+        asc.executed_target,
+        DeviceTarget::Gpu(0),
+        "text ORDER BY must run on the general GPU path"
+    );
+    assert_eq!(text_col(&asc), oracle, "ORDER BY s ASC (prefixes, empty, dups)");
+
+    // (b) ORDER BY s DESC -- the reverse key order (ties are identical strings, so order among them is moot).
+    let desc = e
+        .execute_relational_select_text("SELECT s FROM t ORDER BY s DESC")
+        .unwrap();
+    assert_eq!(desc.executed_target, DeviceTarget::Gpu(0));
+    let mut oracle_desc = oracle.clone();
+    oracle_desc.reverse();
+    assert_eq!(text_col(&desc), oracle_desc, "ORDER BY s DESC");
+
+    // (c) WHERE id > 4 ORDER BY s -> id in {5,6,7,8} = {"", "apple", "ab", "cherry"} sorted.
+    let filtered = e
+        .execute_relational_select_text("SELECT s FROM t WHERE id > 4 ORDER BY s")
+        .unwrap();
+    assert_eq!(filtered.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        text_col(&filtered),
+        vec!["", "ab", "apple", "cherry"],
+        "WHERE + text ORDER BY"
+    );
+
+    // (d) ORDER BY s LIMIT 3 -> the first three: ["", "a", "ab"].
+    let limited = e
+        .execute_relational_select_text("SELECT s FROM t ORDER BY s LIMIT 3")
+        .unwrap();
+    assert_eq!(limited.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(text_col(&limited), vec!["", "a", "ab"], "text ORDER BY LIMIT 3");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nongrouped_order_by_text_300_rows() {
+    // 300 rows (not a power of two -> bitonic padding), distinct zero-padded strings shuffled via a
+    // coprime stride (a permutation of 0..300), GPU-sorted by the text comparator back to order.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE big (s TEXT)").unwrap();
+    let vals = (0..300usize)
+        .map(|i| format!("('{:04}')", (i * 137 + 11) % 300))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO big (s) VALUES {vals}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("big").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_relational_select_text("SELECT s FROM big ORDER BY s")
+        .unwrap();
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let got: Vec<String> = res
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            SqlValue::Text(v) => v.to_string(),
+            other => panic!("expected Text, got {other:?}"),
+        })
+        .collect();
+    let expected: Vec<String> = (0..300).map(|i| format!("{i:04}")).collect();
+    assert_eq!(got, expected, "300-row GPU text ORDER BY");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_nongrouped_order_by_multikey() {
     // MULTI-KEY ORDER BY (`ORDER BY a ASC, b DESC, ...`) sorts on the GPU via the multi-key bitonic
     // comparator on the general Expr executor: each key, in significance order with its own direction,

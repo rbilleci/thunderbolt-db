@@ -1004,6 +1004,26 @@ impl CudaResidentDeviceMemory {
         launch_cuda_bitonic_sort_i64(self, keys, descending)
     }
 
+    /// Sort the surviving rows `indices` on the GPU by a resident TEXT column (lexicographic, unsigned
+    /// bytes, a prefix sorts smaller), returning positions into `indices` in ascending (or, with
+    /// `descending`, descending) text order. `offsets_byte_offset`/`bytes_byte_offset` locate the
+    /// resident text column's offsets + bytes sections. The text leg of the charter-native GPU ORDER BY.
+    pub fn bitonic_sort_text(
+        &self,
+        indices: &[u64],
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        descending: bool,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_bitonic_sort_text(
+            self,
+            indices,
+            offsets_byte_offset,
+            bytes_byte_offset,
+            descending,
+        )
+    }
+
     /// Multi-key GPU bitonic sort. `keys` is a row-major `n x k` matrix of i64 (`keys[row*k + key]`,
     /// key 0 most significant); `desc_mask` bit j set => key j sorts descending. Returns the row
     /// positions `0..n` in the multi-key order. The general multi-key ORDER BY core
@@ -3133,6 +3153,172 @@ fn launch_cuda_bitonic_sort_i64(
                     (&mut p4 as *mut u64).cast::<c_void>(),
                     (&mut p5 as *mut u64).cast::<c_void>(),
                     (&mut p6 as *mut u64).cast::<c_void>(),
+                ];
+                let rc = unsafe {
+                    cu_launch_kernel(
+                        sort_fn,
+                        grid,
+                        1,
+                        1,
+                        BLOCK,
+                        1,
+                        1,
+                        0,
+                        stream,
+                        args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return rc;
+                }
+                if jj == 1 {
+                    break;
+                }
+                jj >>= 1;
+            }
+            kk <<= 1;
+        }
+        0
+    })?;
+
+    let mut perm_host = vec![0_u32; npot];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            perm_host.as_mut_ptr().cast::<c_void>(),
+            perm_dev.ptr,
+            perm_bytes,
+        )
+    })?;
+    Ok(perm_host
+        .into_iter()
+        .filter(|&p| (p as usize) < n)
+        .collect())
+}
+
+/// GPU bitonic sort keyed by a resident TEXT column (lexicographic, unsigned bytes, a prefix sorts
+/// smaller). `indices` are the surviving row ids (after WHERE); the comparator reads each row's text via
+/// the indices indirection (`text[ indices[pos] ]`). Returns positions into `indices` in sorted text
+/// order. Pads to a power of two (padding sorts last by position, dropped). The text leg of the
+/// charter-native GPU ORDER BY; mirrors `launch_cuda_bitonic_sort_i64` (perm + the kk/jj network),
+/// swapping the i64 key buffer for the indices buffer + the resident text section pointers.
+fn launch_cuda_bitonic_sort_text(
+    resident: &CudaResidentDeviceMemory,
+    indices: &[u64],
+    offsets_byte_offset: u64,
+    bytes_byte_offset: u64,
+    descending: bool,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+
+    let n = indices.len();
+    if n <= 1 {
+        return Ok((0..n as u32).collect());
+    }
+    let npot = n.next_power_of_two();
+    let perm_bytes = npot
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(npot))?;
+    let indices_bytes = n
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    let n_u64 = n as u64;
+    let npot_u64 = npot as u64;
+    let desc_u64 = u64::from(descending);
+    // The kernel reads the resident text sections directly; resolve their absolute device pointers
+    // here (device_ptr is the resident base, same as the text-eq/LIKE filters pass it).
+    let offsets_base = resident.device_ptr().wrapping_add(offsets_byte_offset);
+    let bytes_base = resident.device_ptr().wrapping_add(bytes_byte_offset);
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let sort_fn = primary.cached_function(c"gpu_db_bitonic_sort_text_step", &ptx)?;
+    let perm_dev = primary.lease_device_buffer(perm_bytes)?;
+    let indices_dev = primary.lease_device_buffer(indices_bytes)?;
+    let identity: Vec<u32> = (0..npot as u32).collect();
+
+    const BLOCK: u32 = 256;
+    let grid = (npot.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
+
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                perm_dev.ptr,
+                identity.as_ptr().cast::<c_void>(),
+                perm_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
+            htod_async(
+                indices_dev.ptr,
+                indices.as_ptr().cast::<c_void>(),
+                indices_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let mut kk = 2_u64;
+        while kk <= npot_u64 {
+            let mut jj = kk >> 1;
+            loop {
+                let mut p0 = perm_dev.ptr;
+                let mut p1 = indices_dev.ptr;
+                let mut p2 = offsets_base;
+                let mut p3 = bytes_base;
+                let mut p4 = n_u64;
+                let mut p5 = npot_u64;
+                let mut p6 = kk;
+                let mut p7 = jj;
+                let mut p8 = desc_u64;
+                let mut args = [
+                    (&mut p0 as *mut u64).cast::<c_void>(),
+                    (&mut p1 as *mut u64).cast::<c_void>(),
+                    (&mut p2 as *mut u64).cast::<c_void>(),
+                    (&mut p3 as *mut u64).cast::<c_void>(),
+                    (&mut p4 as *mut u64).cast::<c_void>(),
+                    (&mut p5 as *mut u64).cast::<c_void>(),
+                    (&mut p6 as *mut u64).cast::<c_void>(),
+                    (&mut p7 as *mut u64).cast::<c_void>(),
+                    (&mut p8 as *mut u64).cast::<c_void>(),
                 ];
                 let rc = unsafe {
                     cu_launch_kernel(
