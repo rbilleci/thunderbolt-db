@@ -3393,6 +3393,103 @@ done_pack2:
     ret;
 }
 
+// COUNT(DISTINCT v) mark pass: inputs are the (g, v) i64 tuple matrix (row-major, 2 keys/row =
+// 16 bytes/row) already sorted by (g, v) via `perm`, plus that permutation. For each sorted
+// position i, emit g_sorted[i] = g[perm[i]] (the group key) and new_distinct[i] = 1 iff the (g, v)
+// tuple differs from the previous sorted tuple (i == 0 is always new). A pure MAP -- no atomics, no
+// hash -- so it cannot reintroduce the bool-GROUP-BY concurrency hazard. SUM(new_distinct) grouped
+// by g_sorted = the per-group distinct count. Buffers are leased (>=8-aligned) so i64 ld/st are safe.
+.visible .entry gpu_db_mark_new_distinct(
+    .param .u64 keys_ptr,
+    .param .u64 perm_ptr,
+    .param .u64 n,
+    .param .u64 g_out,
+    .param .u64 nd_out
+)
+{
+    .reg .pred %p;
+    .reg .pred %q;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %row;
+    .reg .u32 %prow;
+    .reg .u64 %keys;
+    .reg .u64 %perm;
+    .reg .u64 %n;
+    .reg .u64 %gout;
+    .reg .u64 %ndout;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %base;
+    .reg .u64 %pbase;
+    .reg .u64 %g;
+    .reg .u64 %v;
+    .reg .u64 %pg;
+    .reg .u64 %pv;
+    .reg .u64 %nd;
+    .reg .u64 %r64;
+
+    ld.param.u64 %keys, [keys_ptr];
+    ld.param.u64 %perm, [perm_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %gout, [g_out];
+    ld.param.u64 %ndout, [nd_out];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_mark_nd:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_mark_nd;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %perm, %o;
+    ld.global.u32 %row, [%addr];
+    cvt.u64.u32 %r64, %row;
+    mul.lo.u64 %o, %r64, 16;
+    add.u64 %base, %keys, %o;
+    ld.global.u64 %g, [%base];
+    ld.global.u64 %v, [%base+8];
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %gout, %o;
+    st.global.u64 [%addr], %g;
+    setp.eq.u64 %p, %i, 0;
+    @%p bra mark_is_new;
+    sub.u64 %o, %i, 1;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %addr, %perm, %o;
+    ld.global.u32 %prow, [%addr];
+    cvt.u64.u32 %r64, %prow;
+    mul.lo.u64 %o, %r64, 16;
+    add.u64 %pbase, %keys, %o;
+    ld.global.u64 %pg, [%pbase];
+    ld.global.u64 %pv, [%pbase+8];
+    setp.ne.u64 %p, %g, %pg;
+    setp.ne.u64 %q, %v, %pv;
+    or.pred %p, %p, %q;
+    @%p bra mark_is_new;
+    mov.u64 %nd, 0;
+    bra mark_store;
+mark_is_new:
+    mov.u64 %nd, 1;
+mark_store:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %ndout, %o;
+    st.global.u64 [%addr], %nd;
+    add.u64 %i, %i, %stride;
+    bra loop_mark_nd;
+done_mark_nd:
+    ret;
+}
+
 // out[0] += sum over k<count of the i32 column value at row indices[k], sign-extended to i64 (the
 // operator axis, doc 19). `out_ptr` is a single i64 the host initialized to 0; `indices_ptr` is the
 // filter's surviving u32 row indices. SUM(int4) over a filtered set -> bigint; the i64 atomic add is

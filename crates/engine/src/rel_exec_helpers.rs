@@ -1022,6 +1022,31 @@ fn validate_grouped_aggregate_value_columns(
                 })?;
                 relational_column_index(table, column)?;
             }
+            GroupedAggKind::CountDistinct => {
+                // COUNT(DISTINCT v) sorts the (group, v) tuple as an i64 matrix, so v must be an
+                // i64-representable fixed-width type (int2/int4/int8/date/timestamp this slice;
+                // text/numeric/uuid distinct counts are clean follow-ups).
+                let column = aggregate.value_column.as_ref().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "grouped COUNT(DISTINCT) requires a value column".to_string(),
+                    ))
+                })?;
+                let idx = relational_column_index(table, column)?;
+                if !matches!(
+                    table.columns[idx].ty,
+                    SqlType::Int2
+                        | SqlType::Int4
+                        | SqlType::Int8
+                        | SqlType::Date
+                        | SqlType::Timestamp
+                ) {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "grouped COUNT(DISTINCT) supports int2/int4/int8/date/timestamp value \
+                         columns on the GPU path (text/numeric/uuid are follow-ups)"
+                            .to_string(),
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -1048,6 +1073,9 @@ pub(crate) fn bind_relational_select(
             vec![relational_column_index(table, group_column)?]
         }
         SelectProjection::Min { .. } | SelectProjection::Max { .. } => Vec::new(),
+        // A bare/scalar COUNT(DISTINCT v) selects no group column; it is rejected at the
+        // projection/group_by binding match below (a clean follow-up, not on the GPU path yet).
+        SelectProjection::CountDistinct { .. } => Vec::new(),
         SelectProjection::GroupedMin { group_column, .. }
         | SelectProjection::GroupedMax { group_column, .. } => {
             vec![relational_column_index(table, group_column)?]
@@ -1086,8 +1114,11 @@ pub(crate) fn bind_relational_select(
             SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => "avg",
             SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => "min",
             SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => "max",
+            // CountDistinct is excluded by the `matches!` guard above (it is rejected at the binding
+            // match), so this naming block is never reached for it.
             SelectProjection::All
             | SelectProjection::Columns(_)
+            | SelectProjection::CountDistinct { .. }
             | SelectProjection::GroupedAggregates { .. } => unreachable!(),
         };
         let (aggregate_ty, aggregate_type_oid, aggregate_type_size) = match &select.projection {
@@ -1203,6 +1234,8 @@ pub(crate) fn bind_relational_select(
                     let col = &table.columns[idx];
                     (name, col.ty, col.type_oid, col.type_size)
                 }
+                // COUNT(DISTINCT v) is an int8 count (PG names it "count"), like COUNT.
+                GroupedAggKind::CountDistinct => ("count", SqlType::Int8, 20, 8),
             };
             let attnum = selected_columns.len() as i16 + 1;
             selected_columns.push(RelationalColumn {
@@ -1292,6 +1325,7 @@ pub(crate) fn bind_relational_select(
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
             | SelectProjection::GroupedMax { .. }
+            | SelectProjection::CountDistinct { .. }
             | SelectProjection::GroupedAggregates { .. } => unreachable!(),
         }
     }
@@ -1311,6 +1345,13 @@ pub(crate) fn bind_relational_select(
         (SelectProjection::CountAll, Some(_)) => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "GROUP BY requires grouped COUNT(*) projection".to_string(),
+            )));
+        }
+        // A bare/scalar COUNT(DISTINCT v) (no GROUP BY): the GROUPED form runs on the GPU via the
+        // GroupedAggregates projection; the scalar form is a clean follow-up, rejected here.
+        (SelectProjection::CountDistinct { .. }, _) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "scalar COUNT(DISTINCT v) without GROUP BY is not on the GPU path yet".to_string(),
             )));
         }
         (SelectProjection::GroupedCount { column }, Some(idx)) => {
@@ -1662,6 +1703,7 @@ pub(crate) fn select_is_aggregate(select: &Select) -> bool {
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
             | SelectProjection::GroupedMax { .. }
+            | SelectProjection::CountDistinct { .. }
             | SelectProjection::GroupedAggregates { .. }
     )
 }
@@ -1688,7 +1730,7 @@ pub(crate) fn select_is_aggregate_result_column(select: &Select, column: &str) -
         // so the binding only needs to recognize the name and skip the table-column lookup.
         SelectProjection::GroupedAggregates { ref aggregates, .. } => aggregates.iter().any(|agg| {
             let name = match agg.kind {
-                GroupedAggKind::Count => "count",
+                GroupedAggKind::Count | GroupedAggKind::CountDistinct => "count",
                 GroupedAggKind::Sum => "sum",
                 GroupedAggKind::Avg => "avg",
                 GroupedAggKind::Min => "min",
@@ -1696,6 +1738,9 @@ pub(crate) fn select_is_aggregate_result_column(select: &Select, column: &str) -
             };
             column.eq_ignore_ascii_case(name)
         }),
+        // A bare/scalar COUNT(DISTINCT v) projects a "count" result column (rejected at binding, but
+        // recognize the name for completeness).
+        SelectProjection::CountDistinct { .. } => column.eq_ignore_ascii_case("count"),
         SelectProjection::All | SelectProjection::Columns(_) => false,
     }
 }
@@ -1707,6 +1752,8 @@ pub(crate) fn select_aggregate_result_column_name(select: &Select) -> Option<&'s
         SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => Some("avg"),
         SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => Some("min"),
         SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => Some("max"),
+        // A bare/scalar COUNT(DISTINCT v) projects a single "count" column (rejected at binding).
+        SelectProjection::CountDistinct { .. } => Some("count"),
         // GroupedAggregates has N aggregates (no single result-column name); Expr-path only.
         SelectProjection::All
         | SelectProjection::Columns(_)
@@ -1764,6 +1811,7 @@ pub(crate) fn aggregate_source_column<'a>(
         | SelectProjection::GroupedSum { .. }
         | SelectProjection::Avg { .. }
         | SelectProjection::GroupedAvg { .. }
+        | SelectProjection::CountDistinct { .. }
         | SelectProjection::All
         | SelectProjection::Columns(_)
         | SelectProjection::GroupedAggregates { .. } => None,

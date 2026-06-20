@@ -626,6 +626,14 @@ impl Engine {
                         .map(|(value, extreme)| vec![value, extreme])
                         .collect::<Vec<_>>()
                 }
+                // A bare/scalar COUNT(DISTINCT v) is rejected at binding (a GPU-path follow-up); guard
+                // here too rather than panic, in case routing reaches this legacy aggregate path.
+                SelectProjection::CountDistinct { .. } => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "scalar COUNT(DISTINCT v) without GROUP BY is not on the GPU path yet"
+                            .to_string(),
+                    )));
+                }
                 // GroupedAggregates (N aggregates) is produced only on the GPU Expr path, never here.
                 SelectProjection::All
                 | SelectProjection::Columns(_)

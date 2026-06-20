@@ -569,6 +569,7 @@ fn execute_select_result_inner(
         | SelectProjection::GroupedMin { .. }
         | SelectProjection::Max { .. }
         | SelectProjection::GroupedMax { .. }
+        | SelectProjection::CountDistinct { .. }
         | SelectProjection::GroupedAggregates { .. } => unreachable!(),
     };
     if select.distinct {
@@ -601,6 +602,7 @@ fn execute_select_result_inner(
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
             | SelectProjection::GroupedMax { .. }
+            | SelectProjection::CountDistinct { .. }
             | SelectProjection::GroupedAggregates { .. } => unreachable!(),
         }
     }
@@ -943,9 +945,11 @@ fn execute_aggregate_select_result(
     }
 
     match &select.projection {
-        // GroupedAggregates (N aggregates per group) is produced only by the engine Expr parser, not
-        // the wire-protocol parser that feeds this handler.
-        SelectProjection::GroupedAggregates { .. } => unreachable!(),
+        // GroupedAggregates (N aggregates per group) and a bare COUNT(DISTINCT v) are produced only by
+        // the engine Expr parser, not the wire-protocol parser that feeds this handler.
+        SelectProjection::GroupedAggregates { .. } | SelectProjection::CountDistinct { .. } => {
+            unreachable!()
+        }
         SelectProjection::CountAll => {
             if select.group_by.is_some() {
                 return Err(ErrorField {
@@ -16066,6 +16070,7 @@ fn pg_dump_attribute_metadata_rows(
                 | SelectProjection::GroupedMin { .. }
                 | SelectProjection::Max { .. }
                 | SelectProjection::GroupedMax { .. }
+                | SelectProjection::CountDistinct { .. }
                 | SelectProjection::GroupedAggregates { .. } => Vec::new(),
             };
             for (idx, column) in columns.into_iter().enumerate() {
@@ -20686,8 +20691,9 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
     };
     let table = session.tables.get(&table_name)?;
     match projection {
-        // GroupedAggregates is produced only by the engine Expr parser, not the wire-protocol parser.
-        SelectProjection::GroupedAggregates { .. } => None,
+        // GroupedAggregates and a bare COUNT(DISTINCT) are produced only by the engine Expr parser,
+        // not the wire-protocol parser.
+        SelectProjection::GroupedAggregates { .. } | SelectProjection::CountDistinct { .. } => None,
         SelectProjection::All => Some(
             table
                 .columns

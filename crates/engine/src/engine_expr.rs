@@ -1236,10 +1236,18 @@ impl Engine {
                         .transpose()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // The DIRECT (hash) passes -- one per distinct value column of a COUNT/SUM/AVG/MIN/MAX
+            // aggregate. A COUNT(DISTINCT v) column is NOT added here: it runs a separate sort-based
+            // pass (added after the direct passes), unless another DIRECT aggregate also needs it.
             let mut value_indices: Vec<usize> = Vec::new();
-            for value_idx in agg_value_indices.iter().flatten() {
-                if !value_indices.contains(value_idx) {
-                    value_indices.push(*value_idx);
+            for (aggregate, value_idx) in aggregates.iter().zip(&agg_value_indices) {
+                if aggregate.kind == GroupedAggKind::CountDistinct {
+                    continue;
+                }
+                if let Some(value_idx) = value_idx {
+                    if !value_indices.contains(value_idx) {
+                        value_indices.push(*value_idx);
+                    }
                 }
             }
             // GROUP BY <expression> (`a+b`): the key is a DERIVED int buffer materialized on-device
@@ -1432,6 +1440,10 @@ impl Engine {
                 value_is_numeric: bool,
                 value_is_uuid: bool,
                 value_is_text: bool,
+                // A COUNT(DISTINCT v) pass (sort -> mark -> SUM), where `groups[i].sum` is the per-group
+                // distinct count. Distinguished from a DIRECT pass on the same `value_idx` so the result
+                // builder reads the right one (a column can have both SUM(v) and COUNT(DISTINCT v)).
+                is_count_distinct: bool,
             }
             // The result group-key column for an expression GROUP BY is the DERIVED value (no source
             // column); the binding placeholdered it as column 0, so set its name + type to the
@@ -1564,6 +1576,7 @@ impl Engine {
                         value_is_numeric,
                         value_is_uuid,
                         value_is_text,
+                        is_count_distinct: false,
                     })
                 };
             let mut passes: Vec<Pass> = if value_indices.is_empty() {
@@ -1580,6 +1593,121 @@ impl Engine {
                 }
                 passes
             };
+            // COUNT(DISTINCT v) passes: a separate SORT-based pass per such aggregate (the direct hash
+            // pass cannot dedup). Materialize (group_key, v) as the i64 tuple matrix over the surviving
+            // rows, GPU-sort by (g, v), mark first-seen (g, v) tuples, then SUM the new-distinct flags
+            // grouped by g via key/value_base_override -> the per-group distinct count. Scoped to a
+            // plain-column int group key (expression/bool/composite/text/numeric/uuid keys are follow-
+            // ups); the value column is int2/4/8/date/timestamp (validated at bind). A pure map + the
+            // GPU sort + the AUDITED int4 GROUP BY kernel (fully-drained launches) -> no new hazard.
+            if aggregates
+                .iter()
+                .any(|a| a.kind == GroupedAggKind::CountDistinct)
+            {
+                if is_expr_key || key_is_bool || is_composite_key || key_is_text || key_is_i128 {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "COUNT(DISTINCT v) supports a plain int group key on the GPU path \
+                         (expression/bool/composite/text/numeric/uuid group keys are follow-ups)"
+                            .to_string(),
+                    )));
+                }
+                let materialize_i64_col =
+                    |col_idx: usize, idx_u64: &[u64]| -> Result<Vec<i64>, ExecuteError> {
+                        match table.columns[col_idx].ty {
+                            SqlType::Int4 | SqlType::Int2 | SqlType::Date => Ok(device_memory
+                                .project_i32_rows_from_payload(
+                                    resident_device_int4_column_offset(&snapshot, table, col_idx)?,
+                                    idx_u64,
+                                )
+                                .map_err(map_err)?
+                                .into_iter()
+                                .map(i64::from)
+                                .collect()),
+                            SqlType::Int8 | SqlType::Timestamp => device_memory
+                                .project_i64_rows_from_payload(
+                                    resident_device_int8_column_offset(&snapshot, table, col_idx)?,
+                                    idx_u64,
+                                )
+                                .map_err(map_err),
+                            _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "COUNT(DISTINCT) group key / value must be an i64-representable int \
+                                 column"
+                                    .to_string(),
+                            ))),
+                        }
+                    };
+                let idx_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
+                let n = idx_u64.len();
+                // The group key column values (sorted-tuple key 0), materialized once for every pass.
+                let g_vals = if n > 0 {
+                    Some(materialize_i64_col(group_idx, &idx_u64)?)
+                } else {
+                    None
+                };
+                for (aggregate, value_idx) in aggregates.iter().zip(&agg_value_indices) {
+                    if aggregate.kind != GroupedAggKind::CountDistinct {
+                        continue;
+                    }
+                    let value_idx = value_idx.expect("COUNT(DISTINCT) has a value column");
+                    let groups = if n == 0 {
+                        Vec::new()
+                    } else {
+                        let g_vals = g_vals.as_ref().expect("g_vals materialized for n > 0");
+                        let v_vals = materialize_i64_col(value_idx, &idx_u64)?;
+                        // The (g, v) tuple matrix, row-major (2 keys/row) for the multikey sort.
+                        let mut matrix = Vec::with_capacity(n * 2);
+                        for i in 0..n {
+                            matrix.push(g_vals[i]);
+                            matrix.push(v_vals[i]);
+                        }
+                        // ASC sort by (g, v) (desc_mask = 0): orders rows by group then value.
+                        let perm = device_memory
+                            .bitonic_sort_multikey(&matrix, n, 2, 0)
+                            .map_err(map_err)?;
+                        // Mark first-seen (g, v) tuples + gather the per-row group key (sorted order).
+                        let (g_sorted, new_distinct) = device_memory
+                            .mark_new_distinct_device(&matrix, &perm, n as u64)
+                            .map_err(map_err)?;
+                        // SUM(new_distinct) grouped by g_sorted = the per-group distinct count. indices
+                        // = 0..n (the sorted positions); the kernel reads g_sorted / new_distinct (both
+                        // i64) via key/value_base_override. The leases live across this synced call.
+                        let scan_indices: Vec<u32> = (0..n as u32).collect();
+                        let cd_groups = device_memory
+                            .group_by_i32_count_sum_minmax_from_payload(
+                                0,
+                                0,
+                                &scan_indices,
+                                true,  // value_is_int8 (new_distinct is i64)
+                                true,  // key_is_int8 (g_sorted is i64)
+                                false, // value not numeric
+                                false, // value not uuid
+                                false, // key not i128
+                                false, // key not text
+                                0,
+                                0,
+                                false, // value not text
+                                0,
+                                0,
+                                g_sorted.device_ptr(),
+                                new_distinct.device_ptr(),
+                            )
+                            .map_err(map_err)?;
+                        drop((g_sorted, new_distinct));
+                        cd_groups
+                    };
+                    passes.push(Pass {
+                        value_idx,
+                        groups,
+                        value_ty: SqlType::Int8,
+                        value_scale: 0,
+                        value_is_int8: false,
+                        value_is_numeric: false,
+                        value_is_uuid: false,
+                        value_is_text: false,
+                        is_count_distinct: true,
+                    });
+                }
+            }
             // A TEXT key/value's string lives host-side: the kernel stored each group's representative
             // ABSOLUTE row index; read it from the same residency_entry generation as the GPU result.
             let any_text_value = passes.iter().any(|p| p.value_is_text);
@@ -1656,12 +1784,24 @@ impl Engine {
                 for (aggregate, value_idx_opt) in aggregates.iter().zip(&agg_value_indices) {
                     let value = match aggregate.kind {
                         GroupedAggKind::Count => SqlValue::Int8(reference.groups[i].count as i64),
+                        GroupedAggKind::CountDistinct => {
+                            let value_idx =
+                                value_idx_opt.expect("COUNT(DISTINCT) has a value column");
+                            // The CountDistinct (sort -> mark -> SUM) pass for THIS column; its
+                            // groups[i].sum = the per-group distinct count (a small non-negative i64).
+                            let pass = passes
+                                .iter()
+                                .find(|p| p.value_idx == value_idx && p.is_count_distinct)
+                                .expect("a COUNT(DISTINCT) pass exists for its value column");
+                            SqlValue::Int8(pass.groups[i].sum)
+                        }
                         _ => {
                             let value_idx =
                                 value_idx_opt.expect("non-count aggregate has a value column");
+                            // A DIRECT pass (not the CountDistinct pass) -- a column may carry both.
                             let pass = passes
                                 .iter()
-                                .find(|p| p.value_idx == value_idx)
+                                .find(|p| p.value_idx == value_idx && !p.is_count_distinct)
                                 .expect("a pass exists for every value column");
                             let g = &pass.groups[i];
                             // For int8/numeric the SUM is the i128 (sum_hi:sum); else sign-extend.
@@ -1715,6 +1855,9 @@ impl Engine {
                                     pass.value_scale,
                                 ),
                                 GroupedAggKind::Count => unreachable!("count handled above"),
+                                GroupedAggKind::CountDistinct => {
+                                    unreachable!("count distinct handled above")
+                                }
                             }
                         }
                     };

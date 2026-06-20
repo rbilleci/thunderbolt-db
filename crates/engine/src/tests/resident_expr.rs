@@ -3018,6 +3018,142 @@ fn gpu_grouped_multiple_aggregates_same_value_column() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_basic() {
+    // SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g -- distinct counts KNOWN BY CONSTRUCTION:
+    //   g=1: v in {10,10,20} -> 2 distinct (< count 3, has a duplicate)
+    //   g=2: v in {5,15,25}  -> 3 distinct (== count 3, all distinct)
+    //   g=3: v in {7}        -> 1 distinct (single value)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    let rows: &[(i32, i32)] = &[(1, 10), (1, 10), (1, 20), (2, 5), (2, 15), (2, 25), (3, 7)];
+    let values = rows
+        .iter()
+        .map(|(g, v)| format!("({g}, {v})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT v) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1)],
+        ],
+        "per-group distinct count (duplicate / all-distinct / single)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_combined_with_count_star() {
+    // SELECT g, COUNT(*), COUNT(DISTINCT v) FROM t GROUP BY g -- the multi-aggregate merge folds a
+    // direct COUNT(*) pass and the sort-based COUNT(DISTINCT) pass by group key. count >= distinct.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    let rows: &[(i32, i32)] = &[(1, 10), (1, 10), (1, 20), (2, 5), (2, 15), (2, 25), (3, 7)];
+    let values = rows
+        .iter()
+        .map(|(g, v)| format!("({g}, {v})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*), COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(*) + COUNT(DISTINCT v) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(3), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(3), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1), SqlValue::Int8(1)],
+        ],
+        "COUNT(*) and COUNT(DISTINCT v) merged by group"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_with_sum_same_column() {
+    // SELECT g, SUM(v), COUNT(DISTINCT v) FROM t GROUP BY g -- a DIRECT (SUM) pass AND a CountDistinct
+    // pass over the SAME value column; the result builder must read the right pass for each.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    let rows: &[(i32, i32)] = &[(1, 10), (1, 10), (1, 20), (2, 5), (2, 15), (2, 25), (3, 7)];
+    let values = rows
+        .iter()
+        .map(|(g, v)| format!("({g}, {v})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v), COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("SUM(v) + COUNT(DISTINCT v) over one column");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    // SUM by construction: g=1 -> 40, g=2 -> 45, g=3 -> 7. Distinct: 2 / 3 / 1.
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(40), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(45), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(7), SqlValue::Int8(1)],
+        ],
+        "SUM and COUNT(DISTINCT) over the same column read distinct passes"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_int8_negative_and_large() {
+    // COUNT(DISTINCT v) over a BIGINT column spanning negatives + a value beyond int4 range.
+    //   g=1: v in {-5, -5, 9000000000} -> 2 distinct
+    //   g=2: v in {0}                  -> 1 distinct
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES (1, -5),(1, -5),(1, 9000000000),(2, 0)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT bigint) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(1)],
+        ],
+        "distinct count over int8 with negatives + beyond-int4 magnitude"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_multiple_aggregates_different_value_columns() {
     // SELECT g, SUM(v), MIN(w), MAX(w) FROM t GROUP BY g -- aggregates over TWO different value columns
     // (v int4, w int8) -> two grouping passes (single-level forced) merged by group index.

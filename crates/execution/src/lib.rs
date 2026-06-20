@@ -1163,6 +1163,21 @@ impl CudaResidentDeviceMemory {
         launch_cuda_pack_two_int4_cols_device(self, off0, off1, n_rows)
     }
 
+    /// COUNT(DISTINCT v) mark pass: `keys` is the (g, v) i64 tuple matrix (row-major, 2 values/row)
+    /// ALREADY sorted by (g, v) via `perm` (from [`Self::bitonic_sort_multikey`]). Runs
+    /// `gpu_db_mark_new_distinct` and returns `(g_sorted, new_distinct)` RESIDENT
+    /// (cuCtxSynchronize'd) -- `g_sorted[i]` = the group key at sorted position i, `new_distinct[i]` =
+    /// 1 at each first-seen (g, v) tuple else 0. SUM(new_distinct) grouped by g_sorted (via the GROUP BY
+    /// kernel's key/value_base_override) = the per-group distinct count. Both leases live in the result.
+    pub fn mark_new_distinct_device(
+        &self,
+        keys: &[i64],
+        perm: &[u32],
+        n: u64,
+    ) -> Result<(DeviceArithBuffer<'_>, DeviceArithBuffer<'_>), CudaRuntimeProbeError> {
+        launch_cuda_mark_new_distinct_device(self, keys, perm, n)
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -13712,6 +13727,137 @@ fn launch_cuda_pack_two_int4_cols_device<'r>(
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     let ptr = out.ptr;
     Ok(DeviceArithBuffer { _lease: out, ptr })
+}
+
+/// COUNT(DISTINCT v) mark pass (see [`CudaResidentDeviceMemory::mark_new_distinct_device`]). Uploads
+/// the sorted (g, v) i64 tuple matrix + the permutation, runs `gpu_db_mark_new_distinct`, and returns
+/// the two derived i64 device columns `(g_sorted, new_distinct)`. cuCtxSynchronize'd so the SEPARATE
+/// GROUP BY launch reads completed buffers (a fully-drained launch, off the bool-GROUP-BY hazard). The
+/// `keys`/`perm` upload buffers are temporary -- the synchronize guarantees the kernel read them before
+/// they return to the pool at function end; the output leases live in the returned buffers.
+fn launch_cuda_mark_new_distinct_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    keys: &[i64],
+    perm: &[u32],
+    n: u64,
+) -> Result<(DeviceArithBuffer<'r>, DeviceArithBuffer<'r>), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if n_usize == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let expected_keys = n_usize
+        .checked_mul(2)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    if keys.len() != expected_keys {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(keys.len()));
+    }
+    if perm.len() != n_usize {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(perm.len()));
+    }
+    let keys_bytes = keys
+        .len()
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(keys.len()))?;
+    let perm_bytes = n_usize
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let out_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_mark_new_distinct", &ptx)?;
+    let keys_dev = primary.lease_device_buffer(keys_bytes)?;
+    let perm_dev = primary.lease_device_buffer(perm_bytes)?;
+    let g_out = primary.lease_device_buffer(out_bytes)?;
+    let nd_out = primary.lease_device_buffer(out_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = (n_usize.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc =
+            unsafe { htod_async(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let rc =
+            unsafe { htod_async(perm_dev.ptr, perm.as_ptr().cast::<c_void>(), perm_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let mut a0 = keys_dev.ptr;
+        let mut a1 = perm_dev.ptr;
+        let mut a2 = n;
+        let mut a3 = g_out.ptr;
+        let mut a4 = nd_out.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast::<c_void>(),
+            (&mut a1 as *mut u64).cast::<c_void>(),
+            (&mut a2 as *mut u64).cast::<c_void>(),
+            (&mut a3 as *mut u64).cast::<c_void>(),
+            (&mut a4 as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                kernel_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let g_ptr = g_out.ptr;
+    let nd_ptr = nd_out.ptr;
+    Ok((
+        DeviceArithBuffer {
+            _lease: g_out,
+            ptr: g_ptr,
+        },
+        DeviceArithBuffer {
+            _lease: nd_out,
+            ptr: nd_ptr,
+        },
+    ))
 }
 
 fn launch_cuda_arith_value_column_at_indices(

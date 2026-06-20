@@ -1762,6 +1762,12 @@ pub enum SelectProjection {
         group_column: String,
         max_column: String,
     },
+    /// `COUNT(DISTINCT v)` -- a distinct count over one column. Only the GROUPED form (folded into
+    /// [`SelectProjection::GroupedAggregates`]) runs on the GPU path; the bare/scalar form is a clean
+    /// follow-up (rejected at execution).
+    CountDistinct {
+        column: String,
+    },
     /// A grouped SELECT projecting N aggregates over one GROUP BY key (the general grouped form on the
     /// Expr path). Each aggregate carries its own function + value column (None for COUNT(*)). The
     /// single Grouped{Count,Sum,Avg,Min,Max} variants above remain the legacy 1-aggregate shapes used
@@ -1787,6 +1793,9 @@ pub enum GroupedAggKind {
     Avg,
     Min,
     Max,
+    /// `COUNT(DISTINCT v)` -- the per-group count of distinct `value_column` values. Computed on the
+    /// GPU via a sort-of-`(group, v)` + mark-new-distinct + SUM pass (no CPU), not the direct hash.
+    CountDistinct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

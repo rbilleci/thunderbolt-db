@@ -378,6 +378,10 @@ fn build_grouped_projection(
                 kind: GroupedAggKind::Max,
                 value_column: Some(column),
             },
+            SelectProjection::CountDistinct { column } => GroupedAggregate {
+                kind: GroupedAggKind::CountDistinct,
+                value_column: Some(column),
+            },
             _ => return Err(sql_pg_error("unsupported grouped aggregate".to_string())),
         };
         aggregates.push(grouped);
@@ -468,15 +472,11 @@ fn try_parse_scalar_aggregate(
             "aggregate column aliases are not on the Expr path yet".to_string(),
         ));
     }
-    if func.agg_distinct {
-        return Err(sql_pg_error(
-            "aggregate DISTINCT is not on the Expr path yet".to_string(),
-        ));
-    }
     // FILTER / OVER / WITHIN GROUP / ordered-set modifiers live INSIDE the FuncCall, so the SELECT-
     // level guards (window_clause, ...) cannot see them. Reject them here, or `COUNT(*) FILTER (WHERE
     // p)` / `COUNT(*) OVER ()` would be silently treated as a plain COUNT(*) -- a WRONG answer (the
-    // FILTER/window dropped). [audit P0]
+    // FILTER/window dropped). [audit P0] (Checked BEFORE DISTINCT so `COUNT(DISTINCT v) FILTER (..)`
+    // is rejected too, not mis-parsed as a plain distinct count.)
     if func.agg_filter.is_some() {
         return Err(sql_pg_error(
             "aggregate FILTER is not on the Expr path yet".to_string(),
@@ -490,6 +490,23 @@ fn try_parse_scalar_aggregate(
     if !func.agg_order.is_empty() || func.agg_within_group {
         return Err(sql_pg_error(
             "ordered-set / WITHIN GROUP aggregates are not on the Expr path yet".to_string(),
+        ));
+    }
+    // COUNT(DISTINCT v): the only DISTINCT aggregate on the Expr path. The GROUPED form runs FULLY on
+    // the GPU -- sort (group, v) -> mark-new-distinct -> SUM of the per-row new-distinct flags per
+    // group (no CPU). Other DISTINCT aggregates (SUM/AVG/MIN/MAX DISTINCT) are follow-ups; COUNT(DISTINCT
+    // *) is invalid SQL. A bare/scalar COUNT(DISTINCT v) parses here too but is rejected at execution.
+    if func.agg_distinct {
+        if name == "count" && !func.agg_star {
+            if let [arg] = func.args.as_slice() {
+                if let NodeEnum::ColumnRef(column_ref) = node_enum(arg)? {
+                    let column = resolve_column_name(column_ref, qualifier)?.to_string();
+                    return Ok(Some(SelectProjection::CountDistinct { column }));
+                }
+            }
+        }
+        return Err(sql_pg_error(
+            "only COUNT(DISTINCT col) is supported on the Expr path's aggregate DISTINCT".to_string(),
         ));
     }
     if name == "count" && func.agg_star && func.args.is_empty() {

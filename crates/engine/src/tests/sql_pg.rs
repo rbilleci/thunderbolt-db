@@ -474,6 +474,37 @@ fn grouped_multikey_order_by_sorts_on_the_gpu() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn grouped_count_distinct_routes_through_text_entry() {
+    // COUNT(DISTINCT v) via the wire/text dispatch (execute_relational_select_text): the hand-rolled
+    // parser rejects DISTINCT, so the Err arm falls through to the general libpg_query path's grouped
+    // branch -- the same user-facing route the PG-wire server uses.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES (1,10),(1,10),(1,20),(2,5),(2,15)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let s = e
+        .execute_relational_select_text("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT v) via the text dispatch");
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        s.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(2)],
+        ],
+        "g=1 -> 2 distinct (10,20), g=2 -> 2 distinct (5,15)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.
