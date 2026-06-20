@@ -1,6 +1,6 @@
 # Session handover — GPU sort operator + GROUP BY breadth (2026-06-21)
 
-**Branch:** `phase0-m1-engine-facade` · **main:** `b889fdbf` · **tree:** clean.
+**Branch:** `phase0-m1-engine-facade` · **main:** pull latest `origin/main` (last code commit `b889fdbf`; handover docs committed on top) · **tree:** clean.
 **Hardware:** RTX PRO 6000 Blackwell (cc 12.0). Build ptxas tops at **sm_90**; runtime JITs to sm_120.
 **`--gpu-reset` is DENIED (shared infra).** ALWAYS run GPU tests under `timeout` (a hang can re-zombie the GPU).
 

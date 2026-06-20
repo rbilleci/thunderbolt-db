@@ -9,7 +9,7 @@ You're continuing a **GPU-native database engine** (Rust + CUDA PTX) on a Blackw
 **READ FIRST:** `docs/handover/2026-06-21-session-handover.md` — the full state, the open-points audit, the
 reusable mechanisms, the gotchas (each cost a P0), and the process. Don't start work until you've read it.
 
-**State:** branch `phase0-m1-engine-facade`, main `b889fdbf`, tree clean. The **GPU sort operator** (every
+**State:** branch `phase0-m1-engine-facade`, tree clean. Run **`git checkout main && git pull`** for the latest — the last code commit is `b889fdbf`, with the handover docs committed on top. The **GPU sort operator** (every
 ORDER BY is a GPU sort, bitonic + radix) and the **GROUP BY breadth** (type matrix closed + every operator
 gap: multiple aggregates, ORDER BY/LIMIT/HAVING, expressions, composite keys, COUNT(DISTINCT)) are COMPLETE
 and on main — all independently audited.
