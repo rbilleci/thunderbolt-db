@@ -1044,17 +1044,19 @@ impl CudaResidentDeviceMemory {
     /// `key_plan[k]` selects key k (bit31=is_text, low bits=idx into the int columns / text_cols);
     /// `desc_mask` bit k => DESC. Returns the positions 0..n in the tuple order. Completes the canonical
     /// `ORDER BY <text>, <int>, <int>` on the GPU.
+    #[allow(clippy::too_many_arguments)]
     pub fn bitonic_sort_hetero(
         &self,
         indices: &[u64],
         int_keys: &[i64],
         num_int: usize,
         text_cols: &[(u64, u64)],
+        b128_cols: &[u64],
         key_plan: &[u32],
         desc_mask: u64,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_bitonic_sort_hetero(
-            self, indices, int_keys, num_int, text_cols, key_plan, desc_mask,
+            self, indices, int_keys, num_int, text_cols, b128_cols, key_plan, desc_mask,
         )
     }
 
@@ -3563,12 +3565,14 @@ fn launch_cuda_bitonic_sort_multikey(
 /// resident column; `key_plan[k]` selects key k's source (bit31=is_text, bits0..30=idx into the int
 /// columns or the text_cols). `desc_mask` bit k => key k DESC. Returns the row positions (0..n) in the
 /// tuple order. The comparator walks the keys; the first non-equal decides; ties fall through.
+#[allow(clippy::too_many_arguments)]
 fn launch_cuda_bitonic_sort_hetero(
     resident: &CudaResidentDeviceMemory,
     indices: &[u64],
     int_keys: &[i64],
     num_int: usize,
     text_cols: &[(u64, u64)],
+    b128_cols: &[u64],
     key_plan: &[u32],
     desc_mask: u64,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -3614,6 +3618,8 @@ fn launch_cuda_bitonic_sort_hetero(
     let text_bytes_vec: Vec<u64> = text_cols.iter().map(|&(_, b)| b).collect();
     let text_meta_bytes = (num_text * std::mem::size_of::<u64>()).max(8);
     let plan_bytes = std::mem::size_of_val(key_plan).max(4);
+    let num_b128 = b128_cols.len();
+    let b128_meta_bytes = std::mem::size_of_val(b128_cols).max(8);
     let n_u64 = n as u64;
     let npot_u64 = npot as u64;
     let num_int_u64 = num_int as u64;
@@ -3648,6 +3654,7 @@ fn launch_cuda_bitonic_sort_hetero(
     let text_offs_dev = primary.lease_device_buffer(text_meta_bytes)?;
     let text_bytes_dev = primary.lease_device_buffer(text_meta_bytes)?;
     let plan_dev = primary.lease_device_buffer(plan_bytes)?;
+    let b128_offs_dev = primary.lease_device_buffer(b128_meta_bytes)?;
     let identity: Vec<u32> = (0..npot as u32).collect();
 
     const BLOCK: u32 = 256;
@@ -3713,6 +3720,19 @@ fn launch_cuda_bitonic_sort_hetero(
                 return rc;
             }
         }
+        if num_b128 != 0 {
+            let rc = unsafe {
+                htod_async(
+                    b128_offs_dev.ptr,
+                    b128_cols.as_ptr().cast::<c_void>(),
+                    std::mem::size_of_val(b128_cols),
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
         let rc = unsafe {
             htod_async(
                 plan_dev.ptr,
@@ -3742,6 +3762,7 @@ fn launch_cuda_bitonic_sort_hetero(
                 let mut p11 = npot_u64;
                 let mut p12 = kk;
                 let mut p13 = jj;
+                let mut p14 = b128_offs_dev.ptr;
                 let mut args = [
                     (&mut p0 as *mut u64).cast::<c_void>(),
                     (&mut p1 as *mut u64).cast::<c_void>(),
@@ -3757,6 +3778,7 @@ fn launch_cuda_bitonic_sort_hetero(
                     (&mut p11 as *mut u64).cast::<c_void>(),
                     (&mut p12 as *mut u64).cast::<c_void>(),
                     (&mut p13 as *mut u64).cast::<c_void>(),
+                    (&mut p14 as *mut u64).cast::<c_void>(),
                 ];
                 let rc = unsafe {
                     cu_launch_kernel(

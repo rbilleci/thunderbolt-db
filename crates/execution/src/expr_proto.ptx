@@ -4430,7 +4430,8 @@ mk_done:
     .param .u64 n,
     .param .u64 npot,
     .param .u64 kk,
-    .param .u64 jj
+    .param .u64 jj,
+    .param .u64 b128_offs_ptr
 )
 {
     .reg .pred %p;
@@ -4459,6 +4460,8 @@ mk_done:
     .reg .u64 %toffp;
     .reg .u64 %tbytp;
     .reg .u64 %resb;
+    .reg .u64 %b128p;
+    .reg .u64 %colbase;
     .reg .u64 %planp;
     .reg .u64 %numkeys;
     .reg .u64 %descmask;
@@ -4510,6 +4513,7 @@ mk_done:
     ld.param.u64 %npot, [npot];
     ld.param.u64 %kk, [kk];
     ld.param.u64 %jj, [jj];
+    ld.param.u64 %b128p, [b128_offs_ptr];
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
     mov.u32 %bid, %ctaid.x;
@@ -4552,11 +4556,15 @@ het_key_loop:
     mul.lo.u64 %off, %kidx, 4;
     add.u64 %addr, %planp, %off;
     ld.global.u32 %plan, [%addr];
-    shr.u32 %t32, %plan, 31;
-    setp.ne.u32 %ptext, %t32, 0;
-    and.b32 %t32, %plan, 2147483647;
-    cvt.u64.u32 %idx, %t32;
-    @%ptext bra het_textcmp;
+    shr.u32 %t32, %plan, 30;
+    and.b32 %w0, %plan, 1073741823;
+    cvt.u64.u32 %idx, %w0;
+    setp.eq.u32 %p, %t32, 1;
+    @%p bra het_textcmp;
+    setp.eq.u32 %p, %t32, 2;
+    @%p bra het_numcmp;
+    setp.eq.u32 %p, %t32, 3;
+    @%p bra het_uuidcmp;
     mul.lo.u64 %tmp, %au, %numint;
     add.u64 %tmp, %tmp, %idx;
     mul.lo.u64 %tmp, %tmp, 8;
@@ -4572,6 +4580,64 @@ het_key_loop:
     setp.gt.s64 %p, %ka, %kb;
     selp.s64 %cmp, 1, %cmp, %p;
     bra het_havecmp;
+het_numcmp:
+    mul.lo.u64 %off, %idx, 8;
+    add.u64 %addr, %b128p, %off;
+    ld.global.u64 %tmp, [%addr];
+    add.u64 %colbase, %resb, %tmp;
+    mul.lo.u64 %o8, %rowa, 16;
+    add.u64 %addr, %colbase, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %sta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %ena, {%w0, %w1};
+    mul.lo.u64 %o8, %rowb, 16;
+    add.u64 %addr, %colbase, %o8;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %stb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enb, {%w0, %w1};
+    setp.lt.s64 %p, %ena, %enb;
+    selp.s64 %cmp, -1, 0, %p;
+    setp.gt.s64 %p, %ena, %enb;
+    selp.s64 %cmp, 1, %cmp, %p;
+    setp.eq.s64 %p, %ena, %enb;
+    @!%p bra het_havecmp;
+    setp.lt.u64 %p, %sta, %stb;
+    selp.s64 %cmp, -1, 0, %p;
+    setp.gt.u64 %p, %sta, %stb;
+    selp.s64 %cmp, 1, %cmp, %p;
+    bra het_havecmp;
+het_uuidcmp:
+    mul.lo.u64 %off, %idx, 8;
+    add.u64 %addr, %b128p, %off;
+    ld.global.u64 %tmp, [%addr];
+    add.u64 %colbase, %resb, %tmp;
+    mul.lo.u64 %o8, %rowa, 16;
+    add.u64 %ba, %colbase, %o8;
+    mul.lo.u64 %o8, %rowb, 16;
+    add.u64 %bb, %colbase, %o8;
+    mov.u64 %j, 0;
+    mov.s64 %cmp, 0;
+het_uuid_byte:
+    setp.ge.u64 %p, %j, 16;
+    @%p bra het_havecmp;
+    add.u64 %addr, %ba, %j;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %bb, %j;
+    ld.global.u8 %bbyte, [%addr];
+    setp.eq.u32 %p, %abyte, %bbyte;
+    @%p bra het_uuid_byte_next;
+    setp.gt.u32 %p, %abyte, %bbyte;
+    selp.s64 %cmp, 1, -1, %p;
+    bra het_havecmp;
+het_uuid_byte_next:
+    add.u64 %j, %j, 1;
+    bra het_uuid_byte;
 het_textcmp:
     mul.lo.u64 %off, %idx, 8;
     add.u64 %addr, %toffp, %off;

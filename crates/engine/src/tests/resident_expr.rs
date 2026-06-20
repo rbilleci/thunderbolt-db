@@ -3204,6 +3204,196 @@ fn gpu_order_by_int8_expression_sorts_at_i64_width() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_numeric_b128_width() {
+    // ORDER BY a NUMERIC (i128) column on the GPU: the 16-byte comparator (signed HIGH limb, unsigned
+    // LOW limb). Mixed-sign values exercise both limbs -- the signed hi distinguishes sign (negatives
+    // hi=-1 below positives hi=0); the unsigned lo decides within a sign (two's-complement low bits).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (v NUMERIC(10,2), label INT)")
+        .unwrap();
+    // labels = the sorted rank (inserted shuffled): -20 < -10 < 0 < 5 < 10 < 20. 6 rows -> npot 8.
+    e.execute_text(
+        2,
+        "INSERT INTO t (v, label) VALUES \
+         (20.00, 5), (-10.00, 1), (5.00, 3), (-20.00, 0), (10.00, 4), (0.00, 2)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let asc = e
+        .execute_relational_select_text("SELECT label FROM t ORDER BY v")
+        .expect("numeric ORDER BY on the GPU");
+    assert_eq!(asc.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        asc.rows,
+        (0..6).map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        "numeric ASC (signed hi, unsigned lo)"
+    );
+    let desc = e
+        .execute_relational_select_text("SELECT label FROM t ORDER BY v DESC")
+        .expect("numeric DESC on the GPU");
+    assert_eq!(
+        desc.rows,
+        (0..6).rev().map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        "numeric DESC"
+    );
+    // WHERE v>0 -> ranks 3,4,5 ; LIMIT 2 -> 3,4.
+    let win = e
+        .execute_relational_select_text("SELECT label FROM t WHERE v > 0 ORDER BY v LIMIT 2")
+        .expect("numeric WHERE+LIMIT on the GPU");
+    assert_eq!(
+        win.rows,
+        vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(4)]],
+        "v>0 asc limit2 -> ranks 3,4"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_b128_secondary_key_dispatch() {
+    // A b128 (numeric) key as a tie-broken SECONDARY: the int primary `grp` ties, so the numeric `v`
+    // decides. Guards the 2-bit key_plan dispatch for a b128 key that is NOT the primary -- a
+    // `kind >> 31` (instead of >> 30) bug would misdispatch the secondary numeric onto the text leg
+    // and misorder within each group. (The other b128 multi-key test uses a b128 PRIMARY.)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (grp INT, v NUMERIC(10,2), label INT)")
+        .unwrap();
+    // ORDER BY grp ASC, v ASC: grp=1 {v=10,20,30 -> 0,1,2}, grp=2 {v=5,15,25 -> 3,4,5}. label = rank.
+    e.execute_text(
+        2,
+        "INSERT INTO t (grp, v, label) VALUES \
+         (1, 30.00, 2), (1, 10.00, 0), (1, 20.00, 1), (2, 15.00, 4), (2, 5.00, 3), (2, 25.00, 5)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let s = e
+        .execute_relational_select_text("SELECT label FROM t ORDER BY grp ASC, v ASC")
+        .expect("int-primary + numeric-secondary ORDER BY on the GPU");
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        s.rows,
+        (0..6).map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        "numeric as a tie-broken SECONDARY key dispatches correctly"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_uuid_big_endian_unsigned() {
+    // ORDER BY a UUID column: 16 raw bytes, UNSIGNED BIG-ENDIAN (byte 0 most significant). Bytes >= 0x80
+    // sort ABOVE 0x7f (unsigned). byte-15 breaks a byte-0 tie. 7 rows -> npot 8 exercises padding.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id UUID, label INT)").unwrap();
+    let uuid_b0 = |b: u32| format!("{b:02x}000000-0000-0000-0000-000000000000");
+    // sorted order: 00/00, 00/ff, 10, 40, 7f, 80, ff -> labels = rank, inserted shuffled.
+    let rows: [(String, i32); 7] = [
+        (uuid_b0(0xff), 6),
+        (uuid_b0(0x00), 0),
+        (uuid_b0(0x80), 5),
+        (uuid_b0(0x10), 2),
+        ("00000000-0000-0000-0000-0000000000ff".to_string(), 1),
+        (uuid_b0(0x7f), 4),
+        (uuid_b0(0x40), 3),
+    ];
+    let mut values = String::new();
+    for (i, (uuid, label)) in rows.iter().enumerate() {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("('{uuid}', {label})"));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (id, label) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let asc = e
+        .execute_relational_select_text("SELECT label FROM t ORDER BY id")
+        .expect("uuid ORDER BY on the GPU");
+    assert_eq!(asc.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        asc.rows,
+        (0..7).map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        "uuid ASC big-endian unsigned"
+    );
+    let desc = e
+        .execute_relational_select_text("SELECT label FROM t ORDER BY id DESC")
+        .expect("uuid DESC on the GPU");
+    assert_eq!(
+        desc.rows,
+        (0..7).rev().map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        "uuid DESC"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_mixed_b128_keys() {
+    // Multi-key ORDER BY with a b128 key as the tie-broken primary, on the heterogeneous comparator.
+    let mut e = Engine::new_local();
+    // (a) numeric DESC, int ASC: a numeric tie is broken by the int key.
+    e.execute_text(1, "CREATE TABLE t (v NUMERIC(10,2), tb INT, label INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (v, tb, label) VALUES (10.00, 2, 2), (10.00, 1, 1), (20.00, 5, 0)",
+    )
+    .unwrap();
+    let s1 = e.populate_relational_residency_snapshot("t").unwrap();
+    if s1.device_memory_proof.is_none() {
+        return;
+    }
+    let r = e
+        .execute_relational_select_text("SELECT label FROM t ORDER BY v DESC, tb ASC")
+        .expect("numeric+int hetero sort");
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int4(0)],
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(2)]
+        ],
+        "v=20 first; the v=10 tie broken by tb ASC"
+    );
+    // (b) uuid ASC, text ASC: a uuid tie is broken by the text key.
+    e.execute_text(3, "CREATE TABLE u (id UUID, name TEXT, label INT)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO u (id, name, label) VALUES \
+         ('00000000-0000-0000-0000-000000000001', 'bob', 1), \
+         ('00000000-0000-0000-0000-000000000001', 'amy', 0), \
+         ('00000000-0000-0000-0000-000000000002', 'zoe', 2)",
+    )
+    .unwrap();
+    let s2 = e.populate_relational_residency_snapshot("u").unwrap();
+    if s2.device_memory_proof.is_none() {
+        return;
+    }
+    let r2 = e
+        .execute_relational_select_text("SELECT label FROM u ORDER BY id ASC, name ASC")
+        .expect("uuid+text hetero sort");
+    assert_eq!(r2.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        r2.rows,
+        vec![
+            vec![SqlValue::Int4(0)],
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(2)]
+        ],
+        "uuid tie (..01) broken by name ASC (amy<bob), then ..02"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_order_by_expression_overflow_is_pg_error() {
     // ORDER BY a+b where a+b overflows int4 -> a clean PG "integer out of range" error (checked
     // arithmetic on-device), NOT a wrapped value, NOT a CPU re-execution.

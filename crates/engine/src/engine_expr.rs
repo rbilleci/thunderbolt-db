@@ -1849,15 +1849,22 @@ impl Engine {
                 ))),
             }
         };
-        // A sort EXPRESSION is int-valued (never text); only a TEXT COLUMN key sets has_text_key.
+        // A sort EXPRESSION is int-valued. has_text_key (TEXT only) gates the single-text fast path;
+        // has_hetero_key (TEXT/NUMERIC/UUID -- the keys that can't live in the i64 matrix) routes to the
+        // heterogeneous comparator.
         let mut has_text_key = false;
+        let mut has_hetero_key = false;
         for (ki, order) in select.order_by.iter().enumerate() {
             if order_by_exprs.get(ki).is_some_and(|e| e.is_some()) {
                 continue;
             }
-            if table.columns[relational_column_index(table, &order.column)?].ty == SqlType::Text {
-                has_text_key = true;
-                break;
+            match table.columns[relational_column_index(table, &order.column)?].ty {
+                SqlType::Text => {
+                    has_text_key = true;
+                    has_hetero_key = true;
+                }
+                SqlType::Numeric { .. } | SqlType::Uuid => has_hetero_key = true,
+                _ => {}
             }
         }
         let single_text_key = select.order_by.len() == 1 && has_text_key;
@@ -1879,11 +1886,12 @@ impl Engine {
                 )
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
             perm.iter().map(|&p| indices_u64[p as usize]).collect()
-        } else if select.order_by.len() > 1 && has_text_key {
-            // Mixed int+text key tuple (`ORDER BY name /*text*/, age /*int*/, id /*int*/`): the
-            // heterogeneous GPU comparator dispatches each key to the s64 compare (int, read from a
-            // row-major by-position matrix) or the byte compare (text, read in place from the resident
-            // column). Charter-native GPU sort -- no host/CPU sort.
+        } else if has_hetero_key {
+            // A key tuple with a TEXT/NUMERIC/UUID key (`ORDER BY name /*text*/, age /*int*/`, or a
+            // single numeric/uuid key): the heterogeneous GPU comparator dispatches each key to the s64
+            // compare (int, from a row-major by-position matrix), the byte compare (text, in place), or
+            // the 16-byte compare (numeric = signed-hi/unsigned-lo i128; uuid = big-endian unsigned),
+            // reading numeric/uuid in place from the resident column. Charter-native GPU sort.
             let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                 ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
             };
@@ -1898,6 +1906,7 @@ impl Engine {
             // next text-column slot; build key_plan (bit31=is_text, low bits=slot) + desc_mask.
             let mut num_int = 0usize;
             let mut text_cols: Vec<(u64, u64)> = Vec::new();
+            let mut b128_cols: Vec<u64> = Vec::new();
             let mut key_plan: Vec<u32> = Vec::with_capacity(k);
             let mut desc_mask: u64 = 0;
             let mut int_key_slots: Vec<(usize, usize)> = Vec::new();
@@ -1920,7 +1929,24 @@ impl Engine {
                             resident_device_text_column_layout(&snapshot, table, order_idx)?;
                         let text_slot = text_cols.len() as u32;
                         text_cols.push((layout.offsets_byte_offset, layout.bytes_byte_offset));
-                        key_plan.push(0x8000_0000_u32 | text_slot);
+                        // kind 1 (key_plan bits 30-31 = 01) = text.
+                        key_plan.push(0x4000_0000_u32 | text_slot);
+                    }
+                    SqlType::Numeric { .. } => {
+                        let b128_slot = b128_cols.len() as u32;
+                        b128_cols.push(resident_device_numeric_column_offset(
+                            &snapshot, table, order_idx,
+                        )?);
+                        // kind 2 (bits 30-31 = 10) = numeric (signed-hi/unsigned-lo i128).
+                        key_plan.push(0x8000_0000_u32 | b128_slot);
+                    }
+                    SqlType::Uuid => {
+                        let b128_slot = b128_cols.len() as u32;
+                        b128_cols.push(resident_device_numeric_column_offset(
+                            &snapshot, table, order_idx,
+                        )?);
+                        // kind 3 (bits 30-31 = 11) = uuid (big-endian unsigned).
+                        key_plan.push(0xC000_0000_u32 | b128_slot);
                     }
                     SqlType::Int4
                     | SqlType::Int2
@@ -1934,8 +1960,9 @@ impl Engine {
                     }
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "mixed-key ORDER BY on the Expr path supports int2 / int4 / int8 / date \
-                             / timestamp / text columns (the GPU sort); other types are a follow-on"
+                            "mixed-key ORDER BY on the Expr path supports int2 / int4 / int8 / date / \
+                             timestamp / text / numeric / uuid columns (the GPU sort); other types \
+                             are a follow-on"
                                 .to_string(),
                         )));
                     }
@@ -1956,6 +1983,7 @@ impl Engine {
                     &int_keys,
                     num_int,
                     &text_cols,
+                    &b128_cols,
                     &key_plan,
                     desc_mask,
                 )

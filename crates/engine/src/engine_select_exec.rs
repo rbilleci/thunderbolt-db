@@ -29,9 +29,9 @@ fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -
         return false;
     }
     // Every ORDER BY key must be a base column the GPU sort handles: an i64-sortable int
-    // (int2/4/8/date/timestamp) OR text (the byte-wise comparator). A single text key uses the text leg,
-    // an all-int tuple the i64 key matrix, a MIX the heterogeneous comparator. numeric/uuid keys +
-    // expressions stay on the existing path (which rejects multi-key cleanly, never first-key-only).
+    // (int2/4/8/date/timestamp), text (byte-wise), or numeric/uuid (the 16-byte comparator). A single
+    // text key uses the text leg, an all-int tuple the i64 key matrix, anything with a text/numeric/uuid
+    // key the heterogeneous comparator. Expression keys go via the libpg_query (Err-arm) path, not here.
     select.order_by.iter().all(|order| {
         table
             .columns
@@ -46,6 +46,8 @@ fn select_is_gpu_sortable_projection(select: &Select, table: &RelationalTable) -
                         | SqlType::Date
                         | SqlType::Timestamp
                         | SqlType::Text
+                        | SqlType::Numeric { .. }
+                        | SqlType::Uuid
                 )
             })
     })
