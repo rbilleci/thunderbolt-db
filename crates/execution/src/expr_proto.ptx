@@ -3583,10 +3583,15 @@ done_widen:
     .param .u64 n_members,
     .param .u64 wbytes,
     .param .u64 n,
-    .param .u64 out_ptr
+    .param .u64 out_ptr,
+    // A SEPARATE per-row buffer for a DERIVED member (the expression group key, materialized into its
+    // own i32/i64 buffer): kind 4 reads it as i32 (sign-extend -> i64), kind 5 as i64. 0 = no derived
+    // member (every column-only wide key). src_off is unused for kinds 4/5 (the base is derived_ptr).
+    .param .u64 derived_ptr
 )
 {
     .reg .pred %p;
+    .reg .u64 %derived;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -3622,6 +3627,7 @@ done_widen:
     ld.param.u64 %wb, [wbytes];
     ld.param.u64 %n, [n];
     ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %derived, [derived_ptr];
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
     mov.u32 %bid, %ctaid.x;
@@ -3646,6 +3652,10 @@ wk_member:
     ld.global.u64 %srcoff, [%dbase+8];
     ld.global.u64 %dstoff, [%dbase+16];
     add.u64 %dst, %rowbase, %dstoff;
+    setp.eq.u64 %p, %kind, 5;
+    @%p bra wk_dervi64;
+    setp.eq.u64 %p, %kind, 4;
+    @%p bra wk_dervi32;
     setp.eq.u64 %p, %kind, 3;
     @%p bra wk_bool;
     setp.eq.u64 %p, %kind, 2;
@@ -3683,6 +3693,24 @@ wk_i128:
     mov.b64 %vhi, {%w0, %w1};
     st.global.u64 [%dst], %v;
     st.global.u64 [%dst+8], %vhi;
+    bra wk_member_next;
+wk_dervi32:
+    // kind 4: a derived i32 buffer (the expr group key) -> sign-extend to i64, write 8 bytes. The base
+    // is derived_ptr (a separate per-row buffer, indexed by the absolute row i); src_off is unused.
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %src, %derived, %o;
+    ld.global.s32 %s32, [%src];
+    cvt.s64.s32 %v, %s32;
+    st.global.u64 [%dst], %v;
+    bra wk_member_next;
+wk_dervi64:
+    // kind 5: a derived i64 buffer (the int8 expr group key) -> write 8 bytes (716-safe 2x u32).
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %src, %derived, %o;
+    ld.global.u32 %w0, [%src];
+    ld.global.u32 %w1, [%src+4];
+    mov.b64 %v, {%w0, %w1};
+    st.global.u64 [%dst], %v;
     bra wk_member_next;
 wk_bool:
     // kind 3: bool bitmap (1 bit/row, LE u32 words, LSB-first) -> i64 0/1. word = bitmap[i/32];

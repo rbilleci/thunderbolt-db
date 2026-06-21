@@ -1203,8 +1203,11 @@ impl CudaResidentDeviceMemory {
         descriptors: &[(u64, u64, u64)],
         wbytes: u64,
         n_rows: u64,
+        // A separate per-row buffer for a DERIVED wide-key member (the expression group key), read by
+        // descriptor kinds 4 (i32) / 5 (i64). 0 when the wide key has only column members.
+        derived_ptr: u64,
     ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
-        launch_cuda_build_wide_key_device(self, descriptors, wbytes, n_rows)
+        launch_cuda_build_wide_key_device(self, descriptors, wbytes, n_rows, derived_ptr)
     }
 
     /// Upload a small u64 array to device for the general-composite GROUP BY claim's TEXT-member
@@ -14083,6 +14086,9 @@ fn launch_cuda_build_wide_key_device<'r>(
     descriptors: &[(u64, u64, u64)],
     wbytes: u64,
     n: u64,
+    // A separate per-row buffer for a DERIVED member (the expression group key); read by descriptor
+    // kinds 4 (i32) / 5 (i64). 0 when the wide key has only column members.
+    derived_ptr: u64,
 ) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -14154,6 +14160,7 @@ fn launch_cuda_build_wide_key_device<'r>(
         let mut a3 = wbytes;
         let mut a4 = n;
         let mut a5 = out.ptr;
+        let mut a6 = derived_ptr;
         let mut args = [
             (&mut a0 as *mut u64).cast::<c_void>(),
             (&mut a1 as *mut u64).cast::<c_void>(),
@@ -14161,6 +14168,7 @@ fn launch_cuda_build_wide_key_device<'r>(
             (&mut a3 as *mut u64).cast::<c_void>(),
             (&mut a4 as *mut u64).cast::<c_void>(),
             (&mut a5 as *mut u64).cast::<c_void>(),
+            (&mut a6 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(

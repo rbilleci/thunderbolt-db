@@ -122,12 +122,14 @@ fn narrow_ordered_value(ty: SqlType, lo: i64, hi: i64, scale: u8) -> SqlValue {
 
 /// COUNT(DISTINCT v) over a NON-int group key: the building block of the GROUP-BY-(g,v) reduction.
 /// Runs a general composite GROUP BY COUNT(*) over `members` (any mix of fixed-width + text columns --
-/// the wide-key buffer for the fixed members + a text descriptor for the text ones) over the rows in
-/// `indices`, and returns each distinct tuple's REPRESENTATIVE absolute row (the b128 slot's lo).
-/// `members` must route to a rep_idx path (a text member, or a numeric/uuid member, or >2 columns --
-/// never the 2-fixed i64/i128 pack, which has no representative row); the reduction guarantees this by
-/// always appending the non-int value/key member. All grouping is on the GPU; the rep rows are
-/// control-plane row indices (like the WHERE survivors).
+/// the wide-key buffer for the fixed members + a text descriptor for the text ones), OPTIONALLY
+/// prefixed by a DERIVED member `derived = Some((buffer_ptr, is_i64))` (the EXPRESSION group key,
+/// materialized into its own per-row i32/i64 buffer -- read by wide-key build kind 4/5), over the rows
+/// in `indices`, and returns each distinct tuple's REPRESENTATIVE absolute row (the b128 slot's lo).
+/// The members (+ derived) must route to a rep_idx path (a text/numeric/uuid/derived member, or >2
+/// columns -- never the 2-fixed i64/i128 pack, which has no representative row); the reduction
+/// guarantees this by always appending the non-int value member. All grouping is on the GPU; the rep
+/// rows are control-plane row indices (like the WHERE survivors) -- NO host download of key values.
 fn composite_group_count_reps(
     snapshot: &RelationalResidencySnapshot,
     table: &RelationalTable,
@@ -135,6 +137,7 @@ fn composite_group_count_reps(
     members: &[(usize, SqlType)],
     indices: &[u32],
     row_count: u64,
+    derived: Option<(u64, bool)>,
 ) -> Result<Vec<u32>, ExecuteError> {
     let map_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
         ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
@@ -143,8 +146,14 @@ fn composite_group_count_reps(
         return Ok(Vec::new());
     }
     // Fixed members -> the comp_w wide-key buffer (int 8B, numeric/uuid 16B); text -> the descriptor.
+    // A derived member (the expr key) is prefixed at dst 0 (kind 5=i64, kind 4=i32), read from its own
+    // buffer (derived_ptr) -- so the column members start at dst 8.
     let mut descriptors: Vec<(u64, u64, u64)> = Vec::new();
     let mut dst_off: u64 = 0;
+    if let Some((_, is_i64)) = derived {
+        descriptors.push((if is_i64 { 5 } else { 4 }, 0, dst_off));
+        dst_off += 8;
+    }
     for &(idx, ty) in members {
         match ty {
             SqlType::Numeric { .. } | SqlType::Uuid => {
@@ -183,10 +192,11 @@ fn composite_group_count_reps(
         }
     }
     let comp_w = dst_off;
+    let derived_ptr = derived.map_or(0, |(ptr, _)| ptr);
     let _kbuf;
     let key_base_override = if comp_w > 0 {
         let buf = device_memory
-            .build_wide_key_device(&descriptors, comp_w, row_count)
+            .build_wide_key_device(&descriptors, comp_w, row_count, derived_ptr)
             .map_err(map_err)?;
         let ptr = buf.device_ptr();
         _kbuf = Some(buf);
@@ -1924,6 +1934,20 @@ impl Engine {
                 Some(expr) => expr_mentions_int8(expr, table),
                 None => false,
             };
+            // The arith VM is mono-typed (one element width per program): a MIXED int4/int8 expression
+            // key would load an int4 column with the i64 kernel (wrong stride -> reads off the section ->
+            // garbage). Reject it (honest error, not a wrong answer) -- pure int4 or pure int8 work;
+            // widening int4->i64 in the VM is a follow-up. Covers the COUNT(DISTINCT) reduction too (it
+            // reuses this expr key buffer).
+            if let Some(expr) = group_key_expr {
+                if key_expr_is_int8 && expr_mentions_int4_column(expr, table) {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "GROUP BY a mixed int4/int8 arithmetic expression is not supported (the \
+                         on-device arith program is mono-typed); cast the operands to one width"
+                            .to_string(),
+                    )));
+                }
+            }
             let group_idx = if is_composite_key {
                 // The packed key is grouped via key_base_override; group_idx is only the COUNT(*) pass's
                 // value placeholder (reads no value), so col0's index is a valid placeholder.
@@ -2181,7 +2205,7 @@ impl Engine {
                         dst_off += w;
                     }
                     let buf = device_memory
-                        .build_wide_key_device(&descriptors, widekey_w, row_count)
+                        .build_wide_key_device(&descriptors, widekey_w, row_count, 0)
                         .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
                     let ptr = buf.device_ptr();
                     _derived_key_buf = Some(buf);
@@ -2414,17 +2438,6 @@ impl Engine {
                 .iter()
                 .any(|a| a.kind == GroupedAggKind::CountDistinct)
             {
-                // An EXPRESSION group key is a derived ARITHMETIC buffer, not a column the (g, v)
-                // composite can include -> a follow-up. Every COLUMN group key
-                // (int/text/numeric/uuid/bool/composite) is supported below. (A bool key's derived
-                // int4 buffer IS reused as the step-2 g config; its (bool, v) step-1 uses build kind 3.)
-                if is_expr_key {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "COUNT(DISTINCT v) over an expression GROUP BY key is a follow-up (column \
-                         group keys -- int / text / numeric / uuid / bool / composite -- are supported)"
-                            .to_string(),
-                    )));
-                }
                 let idx_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
                 let n = idx_u64.len();
                 if is_composite_key
@@ -2432,18 +2445,29 @@ impl Engine {
                     || key_is_text
                     || key_is_i128
                     || key_is_bool
+                    || is_expr_key
                 {
                     // NON-int group key: reduce COUNT(DISTINCT v) per g to counting DISTINCT (g, v)
                     // pairs per g. (1) GROUP BY (g..., v) -> one representative row per distinct (g, v)
                     // [the general composite path]; (2) GROUP BY g over those reps, COUNT(*) -> the
                     // distinct-v count per g [reusing the MAIN g config so the groups carry the real g
                     // key and align with the reference pass via materialize_key]. All on the GPU.
-                    let g_members: Vec<(usize, SqlType)> = if let Some(m) = &widekey_cols {
+                    // An EXPRESSION group key has NO group COLUMNS -- it rides a DERIVED buffer
+                    // (key_base_override), fed to step 1 as the wide key's derived member (build kind
+                    // 4/5) and reused as the step-2 key config; column group keys pass derived = None.
+                    let g_members: Vec<(usize, SqlType)> = if is_expr_key {
+                        Vec::new()
+                    } else if let Some(m) = &widekey_cols {
                         m.clone()
                     } else if let Some((c0, t0, c1, t1)) = composite_cols {
                         vec![(c0, t0), (c1, t1)]
                     } else {
                         vec![(group_idx, key_ty)]
+                    };
+                    let derived_g: Option<(u64, bool)> = if is_expr_key {
+                        Some((key_base_override, key_expr_is_int8))
+                    } else {
+                        None
                     };
                     for (aggregate, value_idx) in aggregates.iter().zip(&agg_value_indices) {
                         if aggregate.kind != GroupedAggKind::CountDistinct {
@@ -2463,6 +2487,7 @@ impl Engine {
                                 &gv_members,
                                 &indices,
                                 row_count,
+                                derived_g,
                             )?;
                             // (2) GROUP BY g over the reps (reusing the main g config) COUNT(*).
                             let mut g2 = if reps.is_empty() {

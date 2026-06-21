@@ -4328,27 +4328,100 @@ fn gpu_grouped_count_distinct_numeric_value_text_group_shared() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_grouped_count_distinct_expr_group_rejected() {
-    // COUNT(DISTINCT v) over an EXPRESSION group key is a follow-up (a derived arithmetic buffer can't
-    // be a (g,v) composite member) -> a clean reject (at execution, on the GPU path). (A BOOL group key
-    // IS supported -- see gpu_grouped_count_distinct_bool_group_key.)
+fn gpu_grouped_count_distinct_expr_group_key() {
+    // COUNT(DISTINCT v) over an EXPRESSION group key (a+b, int4) -> the (g,v) reduction with the expr's
+    // DERIVED buffer as the wide-key's kind-4 (i32) member; step 2 reuses the expr key_base_override.
+    // v=5 and v=9 are SHARED across groups (so distinct-per-group != global distinct -> the derived
+    // member is load-bearing). a+b=2: v{5,5,7,9}->3; a+b=3: {9,5}->2; a+b=0: {3}->1. Order: 0,2,3.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)")
         .unwrap();
-    e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (1,2,5),(1,2,5)")
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,v) VALUES (1,1,5),(1,1,5),(1,1,7),(1,1,9),(3,0,9),(3,0,5),(0,0,3)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT a + b, COUNT(DISTINCT v) FROM t GROUP BY a + b")
+        .expect("COUNT(DISTINCT v) over an expression group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(0), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(2)],
+        ],
+        "distinct v per (a+b) expression group (v shared across groups)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_expr_group_key_int8() {
+    // COUNT(DISTINCT v) over a PURE INT8 EXPRESSION group key (a+c, both BIGINT) -> the derived buffer
+    // is i64, so the wide key uses kind 5 (i64 derived) and step 2 reuses the int8 expr config. The
+    // expr value is beyond the int4 range; v=5 and v=9 are SHARED across the two groups (derived member
+    // load-bearing). a+c=10000000000: v{5,5,7,9}->3; a+c=5: {9,5}->2.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, c BIGINT, v INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,c,v) VALUES (10000000000,0,5),(10000000000,0,5),(10000000000,0,7),\
+         (10000000000,0,9),(5,0,9),(5,0,5)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT a + c, COUNT(DISTINCT v) FROM t GROUP BY a + c")
+        .expect("COUNT(DISTINCT v) over a pure int8 expression group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int8(5), SqlValue::Int8(2)],
+            vec![SqlValue::Int8(10000000000), SqlValue::Int8(3)],
+        ],
+        "distinct v per (a+c) int8 expression group, value beyond int4 range, v shared across groups"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_mixed_int_width_expr_key_rejected() {
+    // GROUP BY a MIXED int4/int8 arithmetic expression (a BIGINT + b INT) is rejected -- the arith VM is
+    // mono-typed, so a mixed expr would load the int4 column at the wrong stride (garbage). An honest
+    // error, not a wrong answer (pre-existing latent bug; surfaced + guarded). Covers the plain GROUP BY
+    // (no CD) AND the COUNT(DISTINCT) reduction (which reuses this expr key buffer).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b INT, v INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (10000000000,1,5),(5,2,9)")
         .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    let expr_err = e
-        .execute_resident_expr_select_sql("SELECT a + b, COUNT(DISTINCT v) FROM t GROUP BY a + b")
-        .expect_err("expression group key + COUNT(DISTINCT) rejected");
-    assert!(
-        format!("{expr_err:?}").to_lowercase().contains("expression")
-            || format!("{expr_err:?}").to_lowercase().contains("follow-up"),
-        "clean reject, got: {expr_err:?}"
-    );
+    for sql in [
+        "SELECT a + b, COUNT(*) FROM t GROUP BY a + b",
+        "SELECT a + b, COUNT(DISTINCT v) FROM t GROUP BY a + b",
+    ] {
+        let err = e
+            .execute_resident_expr_select_sql(sql)
+            .expect_err("mixed int4/int8 expression GROUP BY rejected");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("mixed int4/int8"),
+            "clean reject for {sql}, got: {err:?}"
+        );
+    }
 }
 
 #[test]
