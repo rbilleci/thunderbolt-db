@@ -1664,6 +1664,8 @@ impl Engine {
                     g_sorted.device_ptr(),
                     new_distinct.device_ptr(),
                     0, // comp_w (not a wide-key composite)
+                    0, // n_text (no text members)
+                    0, // text_desc_ptr
                 )
                 .map_err(map_err)?;
             drop((g_sorted, new_distinct));
@@ -1726,11 +1728,11 @@ impl Engine {
             //    (gpu_db_pack_two_int4_cols) or, when a member is int8/timestamp (> 64 bits combined),
             //    one i128 `c0:c1` (gpu_db_pack_two_cols_i128 -> the b128 key path);
             //  - one text + one fixed-int: the text-key b128 claim with the fixed member folded in.
-            // The GENERAL path (composite_is_widekey) handles every OTHER all-fixed composite -- >2
-            // columns, a numeric/uuid member, or a tuple > 128 bits -- via a fixed-width WIDE KEY buffer
-            // (gpu_db_build_wide_key) grouped by a (rep_idx, hash) b128 claim (memcmp the wide bytes);
-            // the result reads each member from the representative row. A text member beyond the
-            // 2-member (fixed, text) case (two-text, text in a >2 key) is a follow-up.
+            // The GENERAL path (composite_is_widekey) handles every OTHER composite -- >2 columns, a
+            // numeric/uuid member, a tuple > 128 bits, AND any text member beyond the 2-member (fixed,
+            // text) case (two-text, text in a >2 key) -- via a fixed-width WIDE KEY buffer
+            // (gpu_db_build_wide_key, for the fixed members) PLUS a text-member descriptor; the claim
+            // hashes + verifies both. The result reads each member from the representative row.
             let is_text = |t: SqlType| matches!(t, SqlType::Text);
             let is_fixed_int = |t: SqlType| {
                 matches!(
@@ -1770,18 +1772,19 @@ impl Engine {
                 }
                 _ => None,
             };
-            // General all-fixed WIDE KEY path: an N>=2 composite NOT taken by the 2-member fast path,
-            // with EVERY member fixed-width (int/numeric/uuid -- no text).
+            // General WIDE KEY path: an N>=2 composite NOT taken by the 2-member fast path. Every member
+            // is fixed-width (int/numeric/uuid) OR text -- the fixed members concatenate into the
+            // comp_w wide-key buffer; the text members ride a descriptor the claim folds into the hash +
+            // byte-verifies (so two-text and text-in-a->2 keys are covered). bool members are a follow-up.
             let widekey_cols: Option<Vec<(usize, SqlType)>> = match &composite_members {
                 Some(m) if composite_cols.is_none() => {
-                    if m.iter().all(|&(_, t)| is_widekey_member(t)) {
+                    if m.iter().all(|&(_, t)| is_widekey_member(t) || is_text(t)) {
                         Some(m.clone())
                     } else {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "composite GROUP BY supports all-fixed-width members \
-                             (int2/int4/int8/date/timestamp/numeric/uuid, any count) or a 2-member \
-                             (fixed, text) key on the Expr path (a text member in a two-text / >2 \
-                             composite is a follow-up)"
+                            "composite GROUP BY supports fixed-width members \
+                             (int2/int4/int8/date/timestamp/numeric/uuid) and text members, any \
+                             count, on the Expr path (a bool member is a follow-up)"
                                 .to_string(),
                         )));
                     }
@@ -1916,16 +1919,16 @@ impl Engine {
             } else {
                 resident_device_int4_column_offset(&snapshot, table, group_idx)?
             };
-            // The wide-key width (bytes/row): each int member 8 bytes (i64), each numeric/uuid 16. 0 when
-            // not a wide-key composite. Drives comp_w on the GROUP BY launch + the build descriptors.
+            // The wide-key width (bytes/row) of the FIXED members only: each int member 8 bytes (i64),
+            // each numeric/uuid 16; text members contribute 0 here (they ride the text descriptor, not
+            // the fixed buffer). 0 when not a wide-key composite OR a pure all-text composite. Drives
+            // comp_w on the GROUP BY launch + the build descriptors.
             let widekey_w: u64 = widekey_cols.as_ref().map_or(0, |m| {
                 m.iter()
-                    .map(|&(_, t)| {
-                        if matches!(t, SqlType::Numeric { .. } | SqlType::Uuid) {
-                            16
-                        } else {
-                            8
-                        }
+                    .map(|&(_, t)| match t {
+                        SqlType::Numeric { .. } | SqlType::Uuid => 16,
+                        SqlType::Text => 0,
+                        _ => 8,
                     })
                     .sum()
             });
@@ -2030,13 +2033,16 @@ impl Engine {
                     ptr
                 }
             } else if composite_is_widekey {
-                if row_count == 0 {
+                if row_count == 0 || widekey_w == 0 {
+                    // Empty input, OR a pure all-text composite (no fixed members) -> no fixed wide-key
+                    // buffer; the text members are grouped via the text descriptor (key_base_override 0).
                     _derived_key_buf = None;
                     0
                 } else {
-                    // General all-fixed composite: build the W-byte/row wide key (each member's canonical
-                    // bytes concatenated -- int 8B, numeric/uuid 16B) -> grouped via the (rep_idx, hash)
-                    // b128 claim (comp_w = widekey_w). The result reads each member from the rep row.
+                    // General composite: build the widekey_w-byte/row FIXED wide key (each fixed member's
+                    // canonical bytes concatenated -- int 8B, numeric/uuid 16B; TEXT members are skipped
+                    // here, handled by the text descriptor) -> grouped via the (rep_idx, hash) b128 claim
+                    // (comp_w = widekey_w). The result reads each member from the rep row.
                     let members = widekey_cols.as_ref().expect("composite_is_widekey");
                     let mut descriptors: Vec<(u64, u64, u64)> = Vec::with_capacity(members.len());
                     let mut dst_off: u64 = 0;
@@ -2052,6 +2058,8 @@ impl Engine {
                                 resident_device_int8_column_offset(&snapshot, table, idx)?,
                                 8u64,
                             ),
+                            // Text members are not in the fixed buffer (they ride the text descriptor).
+                            SqlType::Text => continue,
                             _ => (
                                 0u64,
                                 resident_device_int4_column_offset(&snapshot, table, idx)?,
@@ -2071,6 +2079,38 @@ impl Engine {
             } else {
                 _derived_key_buf = None;
                 0
+            };
+            // General composite TEXT members: each text member's (offsets_off, bytes_off) -> a small
+            // device descriptor the wide-key claim folds into the hash AND byte-verifies (row vs rep),
+            // in DECLARED-relative order. Built once + held alive across the pass. No text members
+            // (all-fixed wide key) -> n_text = 0, byte-identical to the prior wide-key path.
+            let _widekey_text_desc;
+            let (widekey_n_text, widekey_text_desc_ptr): (u64, u64) = match &widekey_cols {
+                Some(members) if row_count > 0 => {
+                    let mut flat: Vec<u64> = Vec::new();
+                    for &(idx, ty) in members {
+                        if matches!(ty, SqlType::Text) {
+                            let layout =
+                                resident_device_text_column_layout(&snapshot, table, idx)?;
+                            flat.push(layout.offsets_byte_offset);
+                            flat.push(layout.bytes_byte_offset);
+                        }
+                    }
+                    if flat.is_empty() {
+                        _widekey_text_desc = None;
+                        (0, 0)
+                    } else {
+                        let n_text = (flat.len() / 2) as u64;
+                        let buf = device_memory.upload_u64_device(&flat).map_err(map_err)?;
+                        let ptr = buf.device_ptr();
+                        _widekey_text_desc = Some(buf);
+                        (n_text, ptr)
+                    }
+                }
+                _ => {
+                    _widekey_text_desc = None;
+                    (0, 0)
+                }
             };
             // One grouping PASS per distinct value column. The kernel yields count+sum+min+max for one
             // value column; each aggregate projects from its column's pass. Every pass groups the SAME
@@ -2215,6 +2255,8 @@ impl Engine {
                             key_base_override,
                             value_base_override,
                             widekey_w,
+                            widekey_n_text,
+                            widekey_text_desc_ptr,
                         )
                     } else {
                         device_memory.group_by_i32_count_sum_from_payload(

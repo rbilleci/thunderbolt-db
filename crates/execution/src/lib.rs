@@ -1207,6 +1207,17 @@ impl CudaResidentDeviceMemory {
         launch_cuda_build_wide_key_device(self, descriptors, wbytes, n_rows)
     }
 
+    /// Upload a small u64 array to device for the general-composite GROUP BY claim's TEXT-member
+    /// descriptor: `data` is `n_text` pairs of (offsets_off, bytes_off) into the resident payload.
+    /// Returns a leased buffer the caller holds alive + passes as `text_desc_ptr` (n_text = len/2) to
+    /// [`Self::group_by_i32_count_sum_minmax_from_payload`]. Blocking H2D (data is on-device on return).
+    pub fn upload_u64_device(
+        &self,
+        data: &[u64],
+    ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
+        launch_cuda_upload_u64_device(self, data)
+    }
+
     /// GPU inner equi-join (M5) on an int key with a UNIQUE build-side key. `build_keys`/`probe_keys`
     /// are the join-key columns sign-extended to i64 (each relation's full-scan rows). Builds an
     /// open-addressing b128 hash table on the build side (lock-free atom.cas.b128 claim) and probes;
@@ -1476,6 +1487,8 @@ impl CudaResidentDeviceMemory {
             0,     // key_base_override (column key path -> no derived-buffer override)
             0,     // value_base_override (column value path)
             0,     // comp_w (not a wide-key composite)
+            0,     // n_text (no text members)
+            0,     // text_desc_ptr
         )
     }
 
@@ -1506,6 +1519,10 @@ impl CudaResidentDeviceMemory {
         // General all-fixed COMPOSITE key: comp_w > 0 -> the `comp_w`-byte wide key per row lives in
         // key_base_override (built by [`Self::build_wide_key_device`]); 0 = every other path.
         comp_w: u64,
+        // General COMPOSITE with TEXT members: n_text members, each (offsets_off, bytes_off) [16 bytes]
+        // in text_desc_ptr (a device buffer the caller holds alive). 0 = no text members.
+        n_text: u64,
+        text_desc_ptr: u64,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1527,6 +1544,8 @@ impl CudaResidentDeviceMemory {
             key_base_override,
             value_base_override,
             comp_w,
+            n_text,
+            text_desc_ptr,
         )
     }
 
@@ -1565,6 +1584,8 @@ impl CudaResidentDeviceMemory {
             0, // key_base_override (bench uses column keys)
             0, // value_base_override
             0, // comp_w (not a wide-key composite)
+            0, // n_text (no text members)
+            0, // text_desc_ptr
         )
     }
 
@@ -6762,6 +6783,10 @@ fn launch_cuda_group_by_i32_count_sum(
     // General all-fixed COMPOSITE key: comp_w > 0 -> the key is a `comp_w`-byte wide key per row in
     // key_base_override (built by gpu_db_build_wide_key); grouped via a (rep_idx, hash) b128 claim.
     comp_w: u64,
+    // General COMPOSITE with TEXT members: n_text members, each (offsets_off, bytes_off) [16 bytes] in
+    // text_desc_ptr (a device buffer the CALLER holds alive). 0 = no text members.
+    n_text: u64,
+    text_desc_ptr: u64,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -6873,7 +6898,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let slot_keys_i128 = primary.lease_device_buffer(uuid_slot_bytes)?;
     // Text GROUP-BY keys also live in slot_keys_i128 (b128 = (rep_row_idx, text_hash), claimed via
     // atom.cas.b128 with a full-text verify-on-lost-CAS), so the EMPTY128 fill is needed for them too.
-    let fill_i128_fn = if key_is_i128 || key_is_text || comp_w > 0 {
+    let fill_i128_fn = if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
         Some(primary.cached_function(c"gpu_db_fill_i128", &ptx)?)
     } else {
         None
@@ -6947,6 +6972,8 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a30 = key_base_override;
     let mut a31 = value_base_override;
     let mut a32 = comp_w;
+    let mut a33 = n_text;
+    let mut a34 = text_desc_ptr;
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -6992,6 +7019,8 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a30 as *mut u64).cast::<c_void>(),
         (&mut a31 as *mut u64).cast::<c_void>(),
         (&mut a32 as *mut u64).cast::<c_void>(),
+        (&mut a33 as *mut u64).cast::<c_void>(),
+        (&mut a34 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -7207,7 +7236,7 @@ fn launch_cuda_group_by_i32_count_sum(
     // i128 / text GROUP BY keys: copy the b128 key slots back. Each slot's 16 LE bytes are the i128 key
     // (numeric mantissa or uuid bytes), or for a text key the b128 (hi=text hash, lo=representative row
     // index), claimed via atom.cas.b128.
-    let keys_i128: Vec<i128> = if key_is_i128 || key_is_text || comp_w > 0 {
+    let keys_i128: Vec<i128> = if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
         let mut k = vec![0i128; alloc_slots];
         check_cuda(unsafe {
             cu_memcpy_dtoh(k.as_mut_ptr().cast::<c_void>(), slot_keys_i128.ptr, uuid_slot_bytes)
@@ -7241,7 +7270,7 @@ fn launch_cuda_group_by_i32_count_sum(
         // Occupancy: i128 + text keys live in slot_keys_i128 (EMPTY128 = i128::MIN); i64 keys in
         // slot_keys (EMPTY = i64::MIN). The i128/text path never writes the i64 slot_keys, so it must
         // test its own. (A text key never aliases i128::MIN -- the kernel remaps hash i64::MIN->0.)
-        let occupied = if key_is_i128 || key_is_text || comp_w > 0 {
+        let occupied = if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
             keys_i128[i] != i128::MIN
         } else {
             keys[i] != EMPTY
@@ -7258,7 +7287,7 @@ fn launch_cuda_group_by_i32_count_sum(
                 max_hi: max_his[i],
                 min_uuid: uuid_at(&mins_uuid, i),
                 max_uuid: uuid_at(&maxs_uuid, i),
-                key_i128: if key_is_i128 || key_is_text || comp_w > 0 {
+                key_i128: if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
                     keys_i128[i]
                 } else {
                     0
@@ -7437,6 +7466,8 @@ fn launch_cuda_group_by_kernel_timed(
         0, // key_base_override = 0: the timed bench uses column keys (no derived-buffer override)
         0, // value_base_override = 0: the timed bench uses column values
         0, // comp_w = 0: the timed bench is not a wide-key composite
+        0, // n_text = 0: the timed bench has no text members
+        0, // text_desc_ptr = 0
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -14021,6 +14052,32 @@ fn launch_cuda_widen_col_to_i64_device<'r>(
 /// Run `gpu_db_build_wide_key` into a leased [u8; wbytes*n] buffer (the all-fixed composite wide key per
 /// row) and return it. `descriptors` = (kind, src_off, dst_off) per member, uploaded as 3 u64 each.
 /// cuCtxSynchronize'd so the SEPARATE GROUP BY launch reads the completed buffer via key_base_override.
+fn launch_cuda_upload_u64_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    data: &[u64],
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    if data.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let bytes = std::mem::size_of_val(data);
+    let primary = resident.primary();
+    primary.set_current()?;
+    let buf = primary.lease_device_buffer(bytes)?;
+    let cu_memcpy_htod = unsafe {
+        *primary
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    // cuMemcpyHtoD is host-synchronous: the data is fully on device when it returns, so the GROUP BY
+    // kernel (on the pooled stream) sees it without a further sync.
+    check_cuda(unsafe { cu_memcpy_htod(buf.ptr, data.as_ptr().cast::<c_void>(), bytes) })?;
+    let ptr = buf.ptr;
+    Ok(DeviceArithBuffer { _lease: buf, ptr })
+}
+
 fn launch_cuda_build_wide_key_device<'r>(
     resident: &'r CudaResidentDeviceMemory,
     descriptors: &[(u64, u64, u64)],

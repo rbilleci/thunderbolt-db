@@ -3030,6 +3030,184 @@ fn gpu_group_by_composite_three_int_columns() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_two_text() {
+    // Composite GROUP BY a, b where BOTH members are TEXT -> the general wide-key path with NO fixed
+    // members (comp_w = 0) + TWO text descriptors (n_text = 2): the claim folds + byte-verifies each
+    // text member. The SAME first text under different second texts must be distinct groups.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+    // (x,p)x2, (x,q)x1, (y,p)x1.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES ('x','p'),('x','p'),('x','q'),('y','p')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect("two-text composite GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Text("x".into()), SqlValue::Text("p".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Text("x".into()), SqlValue::Text("q".into()), SqlValue::Int8(1)],
+            vec![SqlValue::Text("y".into()), SqlValue::Text("p".into()), SqlValue::Int8(1)],
+        ],
+        "two text members, distinct (a,b) groups, default order by (a,b)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_two_text_concat_ambiguity() {
+    // CRITICAL adversarial case: ('ab','c') and ('a','bc') must be DISTINCT groups even though a naive
+    // concatenated hash of the member bytes ("abc") collides -- the PER-MEMBER byte-verify distinguishes
+    // them (member 0 "ab" != "a"). ('a','c') is a third distinct group sharing member 0 with ('a','bc').
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES ('ab','c'),('a','bc'),('a','c')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect("two-text concat-ambiguity GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Text("bc".into()), SqlValue::Int8(1)],
+            vec![SqlValue::Text("a".into()), SqlValue::Text("c".into()), SqlValue::Int8(1)],
+            vec![SqlValue::Text("ab".into()), SqlValue::Text("c".into()), SqlValue::Int8(1)],
+        ],
+        "concatenation-ambiguous member splits stay distinct (the per-member verify, not the hash)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_two_text_empty_member() {
+    // Empty-string text members: a zero-length member (offsets[i]==offsets[i+1]) hashes to nothing and
+    // verifies as a 0-byte compare. ('','x'), ('x',''), and ('','') are three distinct groups.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES ('','x'),('','x'),('x',''),('','')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect("two-text empty-member GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Text("".into()), SqlValue::Text("".into()), SqlValue::Int8(1)],
+            vec![SqlValue::Text("".into()), SqlValue::Text("x".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Text("x".into()), SqlValue::Text("".into()), SqlValue::Int8(1)],
+        ],
+        "empty-string text members group correctly (order by (a,b): '' < 'x')"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_int_text_int() {
+    // A TEXT member in a >2-column composite: (int, text, int) -> the general wide-key path with TWO
+    // fixed members (comp_w = 16) + ONE text member (n_text = 1). The SAME text under different fixed
+    // members are distinct groups -- exercises BOTH the fixed memcmp AND the text byte-verify legs.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b TEXT, c INT)")
+        .unwrap();
+    // (1,x,1)x2, (1,x,2)x1, (1,y,1)x1, (2,x,1)x1.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,c) VALUES (1,'x',1),(1,'x',1),(1,'x',2),(1,'y',1),(2,'x',1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, c, COUNT(*) FROM t GROUP BY a, b, c")
+        .expect("(int, text, int) composite GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Text("x".into()), SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(1), SqlValue::Text("x".into()), SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(1), SqlValue::Text("y".into()), SqlValue::Int4(1), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(2), SqlValue::Text("x".into()), SqlValue::Int4(1), SqlValue::Int8(1)],
+        ],
+        "text member among fixed members, distinct (a,b,c), order by the full tuple"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_two_text_and_int_with_sum() {
+    // Mixed (text, text, int) composite with a non-COUNT aggregate (SUM) -> comp_w = 8 (the int) +
+    // n_text = 2. Verifies declared member ORDER (text, text, int) in the result + the value aggregate.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT, k INT, v INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,k,v) VALUES ('x','p',1,10),('x','p',1,20),('x','q',1,5),('y','p',2,7)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, k, SUM(v) FROM t GROUP BY a, b, k")
+        .expect("(text, text, int) composite GROUP BY with SUM");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![
+                SqlValue::Text("x".into()),
+                SqlValue::Text("p".into()),
+                SqlValue::Int4(1),
+                SqlValue::Int8(30)
+            ],
+            vec![
+                SqlValue::Text("x".into()),
+                SqlValue::Text("q".into()),
+                SqlValue::Int4(1),
+                SqlValue::Int8(5)
+            ],
+            vec![
+                SqlValue::Text("y".into()),
+                SqlValue::Text("p".into()),
+                SqlValue::Int4(2),
+                SqlValue::Int8(7)
+            ],
+        ],
+        "(text, text, int) composite, SUM per group, default order by (a,b,k)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_composite_numeric_member() {
     // A composite with a NUMERIC member (can't pack into <=128 bits with another) -> the wide-key path
     // (16 bytes for the numeric + 8 for the int). SUM(c) (single aggregate). Construction oracle.
@@ -3150,30 +3328,6 @@ fn gpu_group_by_composite_widekey_multi_aggregate_rejected() {
     let msg = format!("{err:?}").to_lowercase();
     assert!(
         msg.contains("single aggregate") || msg.contains("follow-up"),
-        "clean reject, got: {err:?}"
-    );
-}
-
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_group_by_composite_two_text_rejected() {
-    // A two-text composite is a clean error (the (fixed, text) path folds ONE fixed member; two text
-    // members are a follow-up). The reject is in the executor (after the residency load), so it needs
-    // a resident snapshot to reach it.
-    let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a,b) VALUES ('x','y')")
-        .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
-    if snapshot.device_memory_proof.is_none() {
-        return;
-    }
-    let err = e
-        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
-        .expect_err("two-text composite GROUP BY rejected");
-    let msg = format!("{err:?}").to_lowercase();
-    assert!(
-        msg.contains("text") || msg.contains("composite") || msg.contains("follow-up"),
         "clean reject, got: {err:?}"
     );
 }

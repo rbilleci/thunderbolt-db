@@ -5638,7 +5638,14 @@ het_done:
     // General all-fixed COMPOSITE key: when comp_w > 0 the key is a `comp_w`-byte WIDE KEY per row in
     // key_base_override (built by gpu_db_build_wide_key) -- grouped via a (rep_idx, hash) b128 claim
     // that hashes + memcmps the comp_w bytes. 0 = not a wide-key composite (every existing path).
-    .param .u64 comp_w
+    .param .u64 comp_w,
+    // General COMPOSITE with TEXT members: n_text text members, each (offsets_off, bytes_off) [16 bytes]
+    // in text_desc_ptr. The wide-key claim ALSO folds every text member's bytes into the hash AND
+    // byte-verifies it (row idx vs the representative olo). 0 = no text members (the all-fixed wide key,
+    // byte-identical). comp_w may be 0 here (a pure all-text composite, e.g. two-text), so the wide-key
+    // path is entered on comp_w>0 OR n_text>0.
+    .param .u64 n_text,
+    .param .u64 text_desc_ptr
 )
 {
     .reg .pred %pvt;
@@ -5822,10 +5829,31 @@ het_done:
     ld.param.u64 %vbov, [value_base_override];
     .reg .u64 %compw;
     .reg .pred %pcw;
+    .reg .pred %pnt;
+    .reg .pred %pgen;
     .reg .u64 %wkbase;
     .reg .u64 %wkb;
     .reg .u64 %jw;
+    // General-composite text members: n_text + the (offsets_off, bytes_off) descriptor array, plus the
+    // per-member scratch used by the wide-key hash/verify text loops.
+    .reg .u64 %ntext;
+    .reg .u64 %tdesc;
+    .reg .u64 %tmem;
+    .reg .u64 %tdbase;
+    .reg .u64 %tdooff;
+    .reg .u64 %tdboff;
+    .reg .u64 %mstart;
+    .reg .u64 %mend;
+    .reg .u64 %mlen;
+    .reg .u64 %mbaddr;
+    .reg .u64 %rstart;
+    .reg .u64 %rend;
+    .reg .u64 %rlen;
+    .reg .u64 %rbaddr;
+    .reg .u64 %jm;
     ld.param.u64 %compw, [comp_w];
+    ld.param.u64 %ntext, [n_text];
+    ld.param.u64 %tdesc, [text_desc_ptr];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -5849,9 +5877,12 @@ row_loop:
     // 0 -> byte-identical to the column-key path. A derived key is always int (ktext/ki128/k128 = 0).
     setp.ne.u64 %pkbov, %kbov, 0;
     @%pkbov mov.u64 %addr, %kbov;
-    // General all-fixed COMPOSITE: comp_w > 0 -> the wide key is comp_w bytes at kbov + idx*comp_w.
+    // General COMPOSITE: comp_w > 0 (fixed bytes at kbov + idx*comp_w) OR n_text > 0 (text members) ->
+    // the wide-key (rep_idx, hash) claim. A pure all-text composite has comp_w == 0, so route on either.
     setp.ne.u64 %pcw, %compw, 0;
-    @%pcw bra gb_kwidekey;
+    setp.ne.u64 %pnt, %ntext, 0;
+    or.pred %pgen, %pcw, %pnt;
+    @%pgen bra gb_kwidekey;
     setp.ne.u64 %pkt, %ktext, 0;
     @%pkt bra gb_ktext;
     setp.ne.u64 %pki, %ki128, 0;
@@ -5947,7 +5978,7 @@ gb_kwidekey:
     mov.u64 %jw, 0;
 wkey_hash:
     setp.ge.u64 %p, %jw, %compw;
-    @%p bra wkey_hash_done;
+    @%p bra wkey_hash_text;
     add.u64 %addr, %wkbase, %jw;
     ld.global.u8 %abyte, [%addr];
     cvt.u64.u32 %tmp, %abyte;
@@ -5955,6 +5986,45 @@ wkey_hash:
     mul.lo.u64 %thash, %thash, 0x100000001b3;
     add.u64 %jw, %jw, 1;
     bra wkey_hash;
+wkey_hash_text:
+    // Fold each text member's bytes (row idx) into the same FNV hash. n_text == 0 -> 0 iterations, so
+    // the all-fixed wide key is byte-identical. The verify (gb_kwidekeyclaim) re-checks every member, so
+    // hashing without a separator is collision-safe (a collision merely probes; it never mis-groups).
+    mov.u64 %tmem, 0;
+wkey_htext_member:
+    setp.ge.u64 %p, %tmem, %ntext;
+    @%p bra wkey_hash_done;
+    mul.lo.u64 %o8, %tmem, 16;
+    add.u64 %tdbase, %tdesc, %o8;
+    ld.global.u64 %tdooff, [%tdbase];
+    ld.global.u64 %tdboff, [%tdbase+8];
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %addr, %base, %tdooff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %mstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %mend, {%klo, %khi};
+    sub.u64 %mlen, %mend, %mstart;
+    add.u64 %mbaddr, %base, %tdboff;
+    add.u64 %mbaddr, %mbaddr, %mstart;
+    mov.u64 %jm, 0;
+wkey_htext_byte:
+    setp.ge.u64 %p, %jm, %mlen;
+    @%p bra wkey_htext_member_next;
+    add.u64 %addr, %mbaddr, %jm;
+    ld.global.u8 %abyte, [%addr];
+    cvt.u64.u32 %tmp, %abyte;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %jm, %jm, 1;
+    bra wkey_htext_byte;
+wkey_htext_member_next:
+    add.u64 %tmem, %tmem, 1;
+    bra wkey_htext_member;
 wkey_hash_done:
     setp.eq.s64 %p, %thash, %empty;
     selp.b64 %thash, 0, %thash, %p;
@@ -6039,8 +6109,13 @@ gb_vuuid:
     mov.b64 %ulo, {%bw3, %bw2};
     mov.b128 %val128, {%ulo, %uhi};
 gb_vdone:
+    // General COMPOSITE claim: comp_w > 0 OR n_text > 0 (a pure all-text composite has comp_w == 0, so
+    // route on either -- mirrors the key-build routing; without the n_text leg a pure-text key would
+    // fall through to the i64 claim on a stale %key and collapse every row into one group).
     setp.ne.u64 %pcw, %compw, 0;
-    @%pcw bra gb_kwidekeyclaim;
+    setp.ne.u64 %pnt, %ntext, 0;
+    or.pred %pgen, %pcw, %pnt;
+    @%pgen bra gb_kwidekeyclaim;
     @%pkt bra gb_ktextclaim;
     @%pki bra gb_ki128claim;
     // The key i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table. Route
@@ -6224,7 +6299,7 @@ probe_loop_widekey:
     mov.u64 %jw, 0;
 wkey_vbyte:
     setp.ge.u64 %p, %jw, %compw;
-    @%p bra do_agg;
+    @%p bra wkey_vtext;
     add.u64 %addr, %wkbase, %jw;
     ld.global.u8 %abyte, [%addr];
     add.u64 %addr, %wkb, %jw;
@@ -6233,6 +6308,60 @@ wkey_vbyte:
     @%p bra wkey_probe_next;
     add.u64 %jw, %jw, 1;
     bra wkey_vbyte;
+wkey_vtext:
+    // Byte-verify each text member: this row (idx) vs the representative (olo). Length first, then bytes.
+    // n_text == 0 -> 0 iterations -> do_agg (the all-fixed wide key is byte-identical). A differing
+    // member -> probe on (a hash collision across that member).
+    mov.u64 %tmem, 0;
+wkey_vtext_member:
+    setp.ge.u64 %p, %tmem, %ntext;
+    @%p bra do_agg;
+    mul.lo.u64 %o8, %tmem, 16;
+    add.u64 %tdbase, %tdesc, %o8;
+    ld.global.u64 %tdooff, [%tdbase];
+    ld.global.u64 %tdboff, [%tdbase+8];
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %addr, %base, %tdooff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %mstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %mend, {%klo, %khi};
+    sub.u64 %mlen, %mend, %mstart;
+    mul.lo.u64 %o8, %olo, 8;
+    add.u64 %addr, %base, %tdooff;
+    add.u64 %addr, %addr, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %rstart, {%klo, %khi};
+    ld.global.u32 %klo, [%addr+8];
+    ld.global.u32 %khi, [%addr+12];
+    mov.b64 %rend, {%klo, %khi};
+    sub.u64 %rlen, %rend, %rstart;
+    setp.ne.u64 %p, %mlen, %rlen;
+    @%p bra wkey_probe_next;
+    add.u64 %mbaddr, %base, %tdboff;
+    add.u64 %mbaddr, %mbaddr, %mstart;
+    add.u64 %rbaddr, %base, %tdboff;
+    add.u64 %rbaddr, %rbaddr, %rstart;
+    mov.u64 %jm, 0;
+wkey_vtext_byte:
+    setp.ge.u64 %p, %jm, %mlen;
+    @%p bra wkey_vtext_member_next;
+    add.u64 %addr, %mbaddr, %jm;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %rbaddr, %jm;
+    ld.global.u8 %bbyte, [%addr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra wkey_probe_next;
+    add.u64 %jm, %jm, 1;
+    bra wkey_vtext_byte;
+wkey_vtext_member_next:
+    add.u64 %tmem, %tmem, 1;
+    bra wkey_vtext_member;
 wkey_probe_next:
     add.u64 %h, %h, 1;
     and.b64 %h, %h, %mask;
