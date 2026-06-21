@@ -1359,8 +1359,10 @@ impl Engine {
         // per-conjunct (accumulated relation, its key column, the new relation's key column); the newly
         // joined relation is `k+1`. Conjuncts may reference DIFFERENT accumulated relations.
         let mut step_keys: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(plan.steps.len());
-        // Per step: does it join on a TEXT key (-> the GPU text hash join) vs INT keys (-> the i64 path)?
+        // Per step's key kind: TEXT or NUMERIC/UUID (b128, both -> the GPU text/byte hash join) vs INT
+        // (the i64 path). `step_is_text` = TEXT bytes; `step_is_b128` = a 16-byte numeric/uuid value.
         let mut step_is_text: Vec<bool> = Vec::with_capacity(plan.steps.len());
+        let mut step_is_b128: Vec<bool> = Vec::with_capacity(plan.steps.len());
         for (k, step) in plan.steps.iter().enumerate() {
             let new_rel = k + 1;
             // A step always carries 1 or 2 equality conjuncts (the parsers guarantee >=1 -- an explicit
@@ -1398,22 +1400,48 @@ impl Engine {
                 };
                 conj_keys.push((acc_rel, acc_col, new_col));
             }
-            // Determine the key kind + validate types. A TEXT key (a single conjunct, TEXT on both sides)
-            // routes to the GPU text hash join (FNV-hash + byte-verify); INT keys (incl. a 2-column
-            // composite) route to the i64 hash join.
-            let has_text = conj_keys.iter().any(|&(acc_rel, acc_col, new_col)| {
-                matches!(tables[acc_rel].columns[acc_col].ty, SqlType::Text)
-                    || matches!(tables[new_rel].columns[new_col].ty, SqlType::Text)
+            // Determine the key kind + validate types. A single-conjunct key may be TEXT (-> the GPU text
+            // hash join: FNV + byte-verify), NUMERIC/UUID (-> the SAME kernel over the 16-byte canonical
+            // value), or INT (-> the i64 hash join). A 2-conjunct composite is INT-only (i64-packed).
+            let non_int = |t: SqlType| {
+                matches!(t, SqlType::Text | SqlType::Numeric { .. } | SqlType::Uuid)
+            };
+            let has_non_int = conj_keys.iter().any(|&(acc_rel, acc_col, new_col)| {
+                non_int(tables[acc_rel].columns[acc_col].ty)
+                    || non_int(tables[new_rel].columns[new_col].ty)
             });
-            if has_text {
+            let mut is_text = false;
+            let mut is_b128 = false;
+            if has_non_int {
+                // text / numeric / uuid: a single conjunct, the SAME key type on both sides (numeric also
+                // the same scale, so the i128 mantissa compares value-for-value).
                 let (acc_rel, acc_col, new_col) = conj_keys[0];
-                if conj_keys.len() != 1
-                    || !matches!(tables[acc_rel].columns[acc_col].ty, SqlType::Text)
-                    || !matches!(tables[new_rel].columns[new_col].ty, SqlType::Text)
-                {
+                let acc_ty = tables[acc_rel].columns[acc_col].ty;
+                let new_ty = tables[new_rel].columns[new_col].ty;
+                let same_type = conj_keys.len() == 1
+                    && match (acc_ty, new_ty) {
+                        (SqlType::Text, SqlType::Text) => {
+                            is_text = true;
+                            true
+                        }
+                        (SqlType::Uuid, SqlType::Uuid) => {
+                            is_b128 = true;
+                            true
+                        }
+                        (
+                            SqlType::Numeric { scale: s_acc, .. },
+                            SqlType::Numeric { scale: s_new, .. },
+                        ) if s_acc == s_new => {
+                            is_b128 = true;
+                            true
+                        }
+                        _ => false,
+                    };
+                if !same_type {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "a text join key must be a single `a.t = b.t` with TEXT on BOTH sides \
-                         (composite text keys / mixed text+int keys are a follow-up)"
+                        "a text/numeric/uuid join key must be a single `a.k = b.k` with the SAME type \
+                         on BOTH sides (numeric: the same scale); composite / mixed / different-scale \
+                         keys with these types are a follow-up"
                             .to_string(),
                     )));
                 }
@@ -1428,14 +1456,15 @@ impl Engine {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "a join key must be an integer column on both sides (int2/int4/int8/date/\
                              timestamp for a single key; int2/int4/date for each member of a 2-column \
-                             composite key); numeric/uuid/wide keys are a follow-up"
+                             composite key)"
                                 .to_string(),
                         )));
                     }
                 }
             }
             step_keys.push(conj_keys);
-            step_is_text.push(has_text);
+            step_is_text.push(is_text);
+            step_is_b128.push(is_b128);
         }
         // Resolve the SELECT list to a flat (relation index, column index) list, expanding `*` (every
         // relation's columns, left-to-right PG order) and `alias.*` (that relation's columns).
@@ -1592,6 +1621,21 @@ impl Engine {
                 })
                 .collect()
         };
+        // Gather a NUMERIC/UUID key's 16-byte canonical value from host_rows (uuid = raw bytes; numeric =
+        // the i128 mantissa LE -- the precompute requires equal scale on both sides, so the mantissa
+        // compares value-for-value). Returns OWNED 16-byte values (the caller borrows them into &[u8] for
+        // the SAME text hash join: a 16-byte "text" -> FNV + 16-byte verify = b128 equality).
+        let key_b128 = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<[u8; 16]>, ExecuteError> {
+            abs.iter()
+                .map(|&row| match &sides[ri].0.host_rows[row as usize][col_idx] {
+                    SqlValue::Uuid(bytes) => Ok(*bytes),
+                    SqlValue::Numeric(value) => Ok(value.mantissa.to_le_bytes()),
+                    _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "a numeric/uuid join key encountered a value of another type".to_string(),
+                    ))),
+                })
+                .collect()
+        };
         // Pack a step's per-conjunct host i64 key columns into one i64 per row: a single conjunct is the
         // key itself; a 2-conjunct composite puts member 0 in the HIGH 32 bits and member 1 in the LOW
         // (each member is a <=32-bit int, so this is bijective -- distinct (k0,k1) -> distinct i64; a
@@ -1617,6 +1661,15 @@ impl Engine {
                 let acc_texts = key_texts(acc_rel, acc_col, &work_idx[acc_rel])?;
                 let new_texts = key_texts(new_rel, new_col, &survivors_all[new_rel])?;
                 text_hash_join(sides[new_rel].1.mem(), &acc_texts, &new_texts)?
+            } else if step_is_b128[k] {
+                // NUMERIC/UUID key: gather each side's 16-byte canonical value and run the SAME text/byte
+                // hash join over it (a 16-byte "text" -> FNV + 16-byte verify = exact 128-bit equality).
+                let (acc_rel, acc_col, new_col) = conjuncts[0];
+                let acc_vals = key_b128(acc_rel, acc_col, &work_idx[acc_rel])?;
+                let new_vals = key_b128(new_rel, new_col, &survivors_all[new_rel])?;
+                let acc_refs: Vec<&[u8]> = acc_vals.iter().map(|v| v.as_slice()).collect();
+                let new_refs: Vec<&[u8]> = new_vals.iter().map(|v| v.as_slice()).collect();
+                text_hash_join(sides[new_rel].1.mem(), &acc_refs, &new_refs)?
             } else {
                 // INT key (incl. composite). Project each conjunct's accumulated-side + new-side key on
                 // the GPU, then pack into one i64. Conjuncts may project from different accumulated

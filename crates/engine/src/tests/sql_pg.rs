@@ -1376,7 +1376,7 @@ fn gpu_inner_join_text_key() {
         .unwrap_err()
         .to_string();
     assert!(
-        mixed.contains("TEXT on BOTH sides") || mixed.contains("integer column"),
+        mixed.contains("SAME type on BOTH sides") || mixed.contains("integer column"),
         "mixed text/int key rejected, got: {mixed}"
     );
 }
@@ -1423,6 +1423,89 @@ fn gpu_inner_join_text_key_step_in_multi_way() {
             ("o3".to_string(), "east".to_string()),
         ],
         "each order -> its customer (by email) -> that customer's region (by rid)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_uuid_and_numeric_keys() {
+    // M5 J4c: NUMERIC and UUID join keys reuse the J4b text/byte hash join over each value's 16-byte
+    // canonical form (uuid = raw bytes; numeric = i128 mantissa, both columns the same scale).
+    let mut e = Engine::new_local();
+    // --- UUID key: users.gid -> groups.gid (groups.gid unique build side) ---
+    e.execute_text(1, "CREATE TABLE groups (gid UUID, gname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE users (uid INT, gid UUID)").unwrap();
+    let g1 = "11111111-1111-1111-1111-111111111111";
+    let g2 = "22222222-2222-2222-2222-222222222222";
+    let g3 = "33333333-3333-3333-3333-333333333333";
+    e.execute_text(3, &format!("INSERT INTO groups (gid, gname) VALUES ('{g1}','admins'),('{g2}','members')")).unwrap();
+    e.execute_text(4, &format!("INSERT INTO users (uid, gid) VALUES (1,'{g1}'),(2,'{g1}'),(3,'{g2}'),(4,'{g3}')")).unwrap();
+    // --- NUMERIC key: accounts.bal -> targets.bal (same scale (10,2); targets.bal unique) ---
+    e.execute_text(5, "CREATE TABLE targets (bal NUMERIC(10,2), tname TEXT)").unwrap();
+    e.execute_text(6, "CREATE TABLE accounts (aid INT, bal NUMERIC(10,2))").unwrap();
+    e.execute_text(7, "INSERT INTO targets (bal, tname) VALUES (100.00,'hundred'),(200.50,'two-fifty')").unwrap();
+    e.execute_text(8, "INSERT INTO accounts (aid, bal) VALUES (1,100.00),(2,100.00),(3,200.50),(4,999.99)").unwrap();
+    let mut ok = true;
+    for t in ["groups", "users", "targets", "accounts"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let int_text = |res: &RelationalSelectResult| -> Vec<(i32, String)> {
+        let mut v: Vec<(i32, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let n = match &r[0] {
+                    SqlValue::Int4(v) => *v,
+                    other => panic!("expected int4, got {other:?}"),
+                };
+                let s = match &r[1] {
+                    SqlValue::Text(t) => t.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                (n, s)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let uuid_res = e
+        .execute_resident_expr_select_sql(
+            "SELECT users.uid, groups.gname FROM users JOIN groups ON users.gid = groups.gid",
+        )
+        .expect("uuid-key inner join");
+    assert_eq!(uuid_res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        int_text(&uuid_res),
+        vec![(1, "admins".to_string()), (2, "admins".to_string()), (3, "members".to_string())],
+        "uuid FK 1:N; the g3 user (no group) is dropped"
+    );
+    let num_res = e
+        .execute_resident_expr_select_sql(
+            "SELECT accounts.aid, targets.tname FROM accounts JOIN targets ON accounts.bal = targets.bal",
+        )
+        .expect("numeric-key inner join");
+    assert_eq!(num_res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        int_text(&num_res),
+        vec![(1, "hundred".to_string()), (2, "hundred".to_string()), (3, "two-fifty".to_string())],
+        "numeric (same scale) FK 1:N; the 999.99 account is dropped"
+    );
+    // Different-scale numeric on the two sides -> a clean reject (the mantissas are not comparable).
+    e.execute_text(9, "CREATE TABLE precise (bal NUMERIC(10,4), pname TEXT)").unwrap();
+    e.execute_text(10, "INSERT INTO precise (bal, pname) VALUES (100.0000,'p')").unwrap();
+    let _ = e.populate_relational_residency_snapshot("precise");
+    let scale_err = e
+        .execute_resident_expr_select_sql(
+            "SELECT accounts.aid FROM accounts JOIN precise ON accounts.bal = precise.bal",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        scale_err.contains("same scale") || scale_err.contains("SAME type"),
+        "different-scale numeric join rejected, got: {scale_err}"
     );
 }
 
