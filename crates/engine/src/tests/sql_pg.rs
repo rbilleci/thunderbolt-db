@@ -1661,6 +1661,64 @@ fn gpu_where_in_and_not_in() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_where_text_and_or_and_in() {
+    // Text AND/OR on the general executor: each text `=`/`<>` becomes a TextEqMask the mask VM combines
+    // with AND/OR (and with int4) -- so text IN / NOT IN / multi-text WHERE run on the GPU.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tq (id INT, tag TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tq (id, tag) VALUES (1,'apple'),(2,'banana'),(3,'cherry'),(4,'apple')",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("tq").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let ids = |res: &RelationalSelectResult| -> Vec<i32> {
+        let mut v: Vec<i32> = res
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                SqlValue::Int4(v) => *v,
+                other => panic!("expected int4, got {other:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let run = |sql: &str| e.execute_resident_expr_select_sql(sql).expect(sql);
+    let or = run("SELECT id FROM tq WHERE tag = 'apple' OR tag = 'cherry'");
+    assert_eq!(or.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(ids(&or), vec![1, 3, 4], "text OR (apple, cherry) runs on the GPU");
+    assert_eq!(
+        ids(&run("SELECT id FROM tq WHERE tag = 'apple' AND id > 1")),
+        vec![4],
+        "text = AND an int4 comparison (mixed masks under the i32 VM)"
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM tq WHERE tag IN ('banana', 'cherry')")),
+        vec![2, 3],
+        "text IN -> OR-chain of text ="
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM tq WHERE tag NOT IN ('apple')")),
+        vec![2, 3],
+        "text NOT IN -> AND-chain of text <>"
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM tq WHERE tag <> 'apple' AND tag <> 'banana'")),
+        vec![3],
+        "text <> AND text <>"
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM tq WHERE tag IN ('apple', 'banana') AND id <> 2")),
+        vec![1, 4],
+        "text IN AND an int4 <> compose"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
     // Closes the function-free `\d` family (golden 23/29): pg_class JOIN pg_namespace, projecting
     // relpersistence (newly synthesized), filtered by nspname + relkind, ORDER BY relname -- the whole
@@ -1669,6 +1727,7 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
     let e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE dz_people (id INT, name TEXT)").unwrap();
     e.execute_text(2, "CREATE TABLE dz_teams (id INT)").unwrap();
+    e.execute_text(3, "CREATE TABLE dz_ignored (id INT)").unwrap();
     // Probe: the transient catalog payload needs a GPU; skip cleanly if unavailable.
     let probe = e.execute_resident_expr_select_sql(
         "SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
@@ -1692,8 +1751,10 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
     };
     let people = ("public".to_string(), "dz_people".to_string(), "r".to_string(), "p".to_string());
     let teams = ("public".to_string(), "dz_teams".to_string(), "r".to_string(), "p".to_string());
-    // Golden 23 form: every public relkind='r' relation, ordered by name (dz_people < dz_teams). The whole
-    // query -- the join, the per-side text filters, the ORDER BY, and the new relpersistence -- is on GPU.
+    let ignored =
+        ("public".to_string(), "dz_ignored".to_string(), "r".to_string(), "p".to_string());
+    // Golden 23 form: every public relkind='r' relation, ordered by name (dz_ignored < dz_people < dz_teams).
+    // The whole query -- the join, the per-side text filters, the ORDER BY, and relpersistence -- is on GPU.
     let all = e
         .execute_resident_expr_select_sql(
             "SELECT n.nspname, c.relname, c.relkind, c.relpersistence \
@@ -1704,8 +1765,23 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
     assert_eq!(all.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(
         meta_rows(&all),
-        vec![people, teams],
+        vec![ignored.clone(), people.clone(), teams.clone()],
         "golden 23: the join filters + orders on the GPU and projects relpersistence='p'"
+    );
+    // Golden 29 form: the same, restricted by `relname IN (...)` (a text IN -> GPU mask VM) -> dz_ignored
+    // is excluded. The IN runs as a per-side text OR-chain on the pg_class side before the join.
+    let subset = e
+        .execute_resident_expr_select_sql(
+            "SELECT n.nspname, c.relname, c.relkind, c.relpersistence \
+             FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname IN ('dz_people', 'dz_teams') \
+             AND c.relkind = 'r' ORDER BY c.relname",
+        )
+        .expect("catalog \\d metadata join (golden 29, text IN)");
+    assert_eq!(
+        meta_rows(&subset),
+        vec![people, teams],
+        "golden 29: relname IN (...) excludes dz_ignored, still GPU join + sort"
     );
 }
 

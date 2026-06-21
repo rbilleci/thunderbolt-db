@@ -2172,7 +2172,20 @@ impl CudaResidentDeviceMemory {
         row_count: u64,
         elem: ResidentElemType,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
-        launch_cuda_resident_expr_predicate_filter(self, program, row_count, elem)
+        launch_cuda_resident_expr_predicate_filter(self, program, &[], row_count, elem)
+    }
+
+    /// `run_expr_predicate_filter` with the out-of-band varlen needles a `TextEqMask` step references
+    /// (`text_needles[needle_idx]`). For text `IN` / multi-text-condition WHERE: the text comparisons
+    /// run on the GPU as mask steps the VM combines with AND/OR (no host-side relational filtering).
+    pub fn run_expr_predicate_filter_with_text(
+        &self,
+        program: &[ExprStep],
+        text_needles: &[Vec<u8>],
+        row_count: u64,
+        elem: ResidentElemType,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_expr_predicate_filter(self, program, text_needles, row_count, elem)
     }
 
     pub fn project_i32_compare_ordered_from_payload(
@@ -12981,6 +12994,16 @@ pub enum ExprStep {
     CompareBuffers { cmp: u32 },
     /// Pop b, pop a (masks), push `op==0 ? a&&b : a||b` (0/1).
     MaskBinary { op: u32 },
+    /// Push the mask `(textcol[i] == needle) ^ negate ? 1 : 0` for the resident TEXT column at
+    /// (`offsets_byte_offset`, `bytes_byte_offset`). The needle bytes are `text_needles[needle_idx]`
+    /// (varlen, so threaded out-of-band to keep this step `Copy`). Lets the mask VM combine text
+    /// equality/inequality with AND/OR (and with int4 comparisons) -- text `IN`, multi-text WHERE.
+    TextEqMask {
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        needle_idx: u32,
+        negate: bool,
+    },
 }
 
 /// Compare an int4 value buffer (absolute device ptr) to `needle` and return the matching row
@@ -13287,6 +13310,7 @@ impl ResidentElemType {
 fn run_resident_arith_program<'r>(
     resident: &'r CudaResidentDeviceMemory,
     program: &[ExprStep],
+    text_needles: &[Vec<u8>],
     n: u64,
     elem: ResidentElemType,
 ) -> Result<Vec<PooledBufferLease<'r>>, CudaRuntimeProbeError> {
@@ -13368,6 +13392,16 @@ fn run_resident_arith_program<'r>(
     let compare_scalar_mask_fn = primary.cached_function(compare_scalar_name, &ptx)?;
     let compare_buffers_mask_fn = primary.cached_function(compare_buffers_name, &ptx)?;
     let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &ptx)?;
+    // Text equality -> i32 mask, so the VM can combine text `=`/`<>` with AND/OR (text IN, multi-text
+    // WHERE). The needle is the varlen bytes `text_needles[needle_idx]`. Loaded lazily (only if used).
+    let text_eq_mask_fn = if program
+        .iter()
+        .any(|s| matches!(s, ExprStep::TextEqMask { .. }))
+    {
+        Some(primary.cached_function(c"gpu_db_resident_text_eq_scalar_to_mask", &ptx)?)
+    } else {
+        None
+    };
     // numeric (i128) multiply is a SEPARATE kernel — the signed 128x128->256 product is too large to
     // inline into the add/sub binary kernel — loaded only for I128. int4/int8 multiply lives in their
     // binary kernel (mul.hi), so this stays None there.
@@ -13645,6 +13679,52 @@ fn run_resident_arith_program<'r>(
                 launch(mask_binary_fn, &mut args)?;
                 stack.push(out);
             }
+            ExprStep::TextEqMask {
+                offsets_byte_offset,
+                bytes_byte_offset,
+                needle_idx,
+                negate,
+            } => {
+                // textcol[i] == needle (XOR negate) -> i32 mask pushed on the stack; the VM combines it
+                // with AND/OR like any other mask. The needle is uploaded H2D into a fresh lease (>=1
+                // byte so the pointer is valid for the empty string, which the kernel never reads).
+                let needle = text_needles
+                    .get(needle_idx as usize)
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(needle_idx as usize))?;
+                let function =
+                    text_eq_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let needle_lease = primary.lease_device_buffer(needle.len().max(1))?;
+                if !needle.is_empty() {
+                    check_cuda(unsafe {
+                        cu_memcpy_htod(
+                            needle_lease.ptr,
+                            needle.as_ptr().cast::<c_void>(),
+                            needle.len(),
+                        )
+                    })?;
+                }
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = offsets_byte_offset;
+                let mut a2 = bytes_byte_offset;
+                let mut a3 = needle_lease.ptr;
+                let mut a4 = needle.len() as u64;
+                let mut a5 = u32::from(negate);
+                let mut a6 = n;
+                let mut a7 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u32).cast::<c_void>(),
+                    (&mut a6 as *mut u64).cast::<c_void>(),
+                    (&mut a7 as *mut u64).cast::<c_void>(),
+                ];
+                launch(function, &mut args)?;
+                stack.push(out);
+            }
         }
     }
 
@@ -13681,7 +13761,7 @@ fn launch_cuda_resident_expr_arith_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut stack = run_resident_arith_program(resident, program, n, ResidentElemType::I32)?;
+    let mut stack = run_resident_arith_program(resident, program, &[], n, ResidentElemType::I32)?;
     let value = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -13727,7 +13807,7 @@ fn launch_cuda_arith_value_column_device<'r>(
     if n == 0 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
-    let mut stack = run_resident_arith_program(resident, program, n_rows, elem)?;
+    let mut stack = run_resident_arith_program(resident, program, &[], n_rows, elem)?;
     let value = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -15540,7 +15620,7 @@ fn launch_cuda_arith_value_column_at_indices(
     // VM checks the matching overflow bounds internally -> PG error, no wrap); the value buffer (lease)
     // is the single result + must stay alive through the D2H. Read it at that width, gather at the
     // survivor indices, widen to i64 (the universal sort-key width).
-    let mut stack = run_resident_arith_program(resident, program, n_rows, elem)?;
+    let mut stack = run_resident_arith_program(resident, program, &[], n_rows, elem)?;
     let value = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -15603,7 +15683,7 @@ fn launch_cuda_resident_expr_compare_buffers_filter(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut stack = run_resident_arith_program(resident, program, n, ResidentElemType::I32)?;
+    let mut stack = run_resident_arith_program(resident, program, &[], n, ResidentElemType::I32)?;
     let rhs = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -15745,13 +15825,14 @@ fn compact_mask_i32_to_indices(
 fn launch_cuda_resident_expr_predicate_filter(
     resident: &CudaResidentDeviceMemory,
     program: &[ExprStep],
+    text_needles: &[Vec<u8>],
     n: u64,
     elem: ResidentElemType,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut stack = run_resident_arith_program(resident, program, n, elem)?;
+    let mut stack = run_resident_arith_program(resident, program, text_needles, n, elem)?;
     let mask = stack
         .pop()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;

@@ -1187,6 +1187,7 @@ fn compile_predicate_program(
     table: &RelationalTable,
     snapshot: &RelationalResidencySnapshot,
     program: &mut Vec<ExprStep>,
+    needles: &mut Vec<Vec<u8>>,
 ) -> Result<(), ExecuteError> {
     let ResidentExpr::Binary { op, lhs, rhs } = expr else {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1194,10 +1195,15 @@ fn compile_predicate_program(
         )));
     };
     if let Some(bool_op) = boolean_op_code(*op) {
-        compile_predicate_program(lhs, table, snapshot, program)?;
-        compile_predicate_program(rhs, table, snapshot, program)?;
+        compile_predicate_program(lhs, table, snapshot, program, needles)?;
+        compile_predicate_program(rhs, table, snapshot, program, needles)?;
         program.push(ExprStep::MaskBinary { op: bool_op });
         return Ok(());
+    }
+    // TEXT comparison leaf (`textcol =/<> 'literal'`) -> a TextEqMask step the VM combines with AND/OR
+    // (so text IN / multi-text WHERE run on the GPU). int4 leaves fall through to the arith VM below.
+    if expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table) {
+        return compile_text_eq_leaf(*op, lhs, rhs, table, snapshot, program, needles);
     }
     let Some(cmp) = predicate_compare_code(*op) else {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1234,6 +1240,59 @@ fn compile_predicate_program(
                 .to_string(),
         ))),
     }
+}
+
+/// Compile a TEXT comparison leaf (`textcol = 'lit'` / `<>`) into a `TextEqMask` VM step + record its
+/// needle bytes in `needles` (indexed by `needle_idx`). Mirrors the single-comparison text fast path
+/// but as a mask the VM can AND/OR. `=` -> negate false, `<>` -> negate true; text inequalities (need
+/// collation sort keys) and text column-vs-column are follow-ons, rejected here (never mis-answered).
+fn compile_text_eq_leaf(
+    op: ResidentBinaryOp,
+    lhs: &ResidentExpr,
+    rhs: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+    needles: &mut Vec<Vec<u8>>,
+) -> Result<(), ExecuteError> {
+    let negate = match op {
+        ResidentBinaryOp::Eq => false,
+        ResidentBinaryOp::Ne => true,
+        _ => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "text inequalities need collation sort keys (a follow-on); only = and <> run on the GPU"
+                    .to_string(),
+            )));
+        }
+    };
+    let (col, literal) = match (text_column_index(lhs, table), text_column_index(rhs, table)) {
+        (Some(col), None) if text_literal_value(rhs).is_some() => {
+            (col, text_literal_value(rhs).expect("checked"))
+        }
+        (None, Some(col)) if text_literal_value(lhs).is_some() => {
+            (col, text_literal_value(lhs).expect("checked"))
+        }
+        (Some(_), Some(_)) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "text column-vs-column comparison is a follow-on".to_string(),
+            )));
+        }
+        _ => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "text comparison must be a column against a literal".to_string(),
+            )));
+        }
+    };
+    let layout = resident_device_text_column_layout(snapshot, table, col)?;
+    let needle_idx = needles.len() as u32;
+    needles.push(literal.as_bytes().to_vec());
+    program.push(ExprStep::TextEqMask {
+        offsets_byte_offset: layout.offsets_byte_offset,
+        bytes_byte_offset: layout.bytes_byte_offset,
+        needle_idx,
+        negate,
+    });
+    Ok(())
 }
 
 impl Engine {
@@ -4071,8 +4130,16 @@ impl Engine {
                     .to_string(),
             )));
         }
+        // Mixed int8/text (e.g. `bigcol > 5 AND tag = 'a'`) would mix an i64 VM with i32 text masks --
+        // a follow-on; reject rather than mis-answer (text AND/OR runs under the i32 VM, int4 + text).
+        if expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor does not support mixed int8/text expressions yet".to_string(),
+            )));
+        }
         let mut program = Vec::new();
-        compile_predicate_program(predicate, table, snapshot, &mut program)?;
+        let mut needles: Vec<Vec<u8>> = Vec::new();
+        compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
         device_memory
             .run_expr_predicate_filter(&program, row_count, ResidentElemType::I64)
             .map(Some)
@@ -4417,6 +4484,13 @@ impl Engine {
         if !(expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table)) {
             return Ok(None);
         }
+        // AND/OR is not a single comparison: fall through (Ok(None)) so the mask VM compiles each leaf
+        // (text -> TextEqMask, int4 -> arith+compare) and combines them. A text+int4 AND/OR is VALID
+        // even though mixing the two types within ONE comparison (the guard below) is not. Mixed
+        // text+int8/numeric AND/OR is rejected later (the int8/numeric paths) -- the i32 mask VM only.
+        if matches!(compare, ResidentBinaryOp::And | ResidentBinaryOp::Or) {
+            return Ok(None);
+        }
         if expr_mentions_int4_column(lhs, table)
             || expr_mentions_int4_column(rhs, table)
             || expr_mentions_int8(lhs, table)
@@ -4468,10 +4542,10 @@ impl Engine {
                         .to_string(),
                 )));
             }
+            // AND/OR returned early (above) -> the mask VM. Any other op here is unsupported.
             _ => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "the general GPU executor supports text = and <> only (LIKE and text AND/OR \
-                     are follow-ons)"
+                    "the general GPU executor supports text = and <> only (LIKE is a follow-on)"
                         .to_string(),
                 )));
             }
@@ -4889,9 +4963,15 @@ impl Engine {
             ResidentBinaryOp::And | ResidentBinaryOp::Or | ResidentBinaryOp::Ne
         ) {
             let mut program = Vec::new();
-            compile_predicate_program(predicate, table, snapshot, &mut program)?;
+            let mut needles: Vec<Vec<u8>> = Vec::new();
+            compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
             return device_memory
-                .run_expr_predicate_filter(&program, row_count, ResidentElemType::I32)
+                .run_expr_predicate_filter_with_text(
+                    &program,
+                    &needles,
+                    row_count,
+                    ResidentElemType::I32,
+                )
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
         }
 
