@@ -3944,6 +3944,354 @@ hjp_done:
     ret;
 }
 
+// GPU inner equi-join (M5 J4b) -- BUILD side, TEXT key, UNIQUE build key. Reads build row i's text from a
+// dense [offsets][bytes] buffer (offsets = 8-byte entries read as 2x ld.u32 -- 716-safe when the section
+// is 4-mod-8), FNV-1a-64 hashes the bytes -> %thash (remap i64::MIN->0 so (idx,thash) never aliases
+// EMPTY128), slot key128 = (lo=i, hi=thash). Claims via atom.cas.b128 (lock-free, advance-on-failure
+// linear probe -- NEVER a spin lock). On a hash MATCH (hi==thash) it VERIFIES the full text byte-for-byte
+// (this row vs the slot's stored build row olo): equal = a DUPLICATE build key (N:N follow-up -> set
+// dup_flag); a hash collision (different text) keeps probing. murmur3 finalizer on thash -> bucket.
+.visible .entry gpu_db_hash_join_build_text(
+    .param .u64 payload_ptr,
+    .param .u64 offsets_off,
+    .param .u64 bytes_off,
+    .param .u64 build_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 dup_flag_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %ba;
+    .reg .u32 %bb;
+    .reg .u64 %payload;
+    .reg .u64 %offb;
+    .reg .u64 %bytesb;
+    .reg .u64 %n;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %dupp;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %starta;
+    .reg .u64 %enda;
+    .reg .u64 %lena;
+    .reg .u64 %taddra;
+    .reg .u64 %startb;
+    .reg .u64 %endb;
+    .reg .u64 %lenb;
+    .reg .u64 %taddrb;
+    .reg .u64 %thash;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %j;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .b128 %empty128;
+    .reg .b128 %key128;
+    .reg .b128 %old128;
+
+    ld.param.u64 %payload, [payload_ptr];
+    ld.param.u64 %offb, [offsets_off];
+    add.u64 %offb, %payload, %offb;
+    ld.param.u64 %bytesb, [bytes_off];
+    add.u64 %bytesb, %payload, %bytesb;
+    ld.param.u64 %n, [build_n];
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %dupp, [dup_flag_ptr];
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u64 %tmp, 0;
+    mov.b128 %empty128, {%tmp, %empty};
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjbt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjbt_done;
+    // text[i]: starta = offsets[i], enda = offsets[i+1]
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %starta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enda, {%w0, %w1};
+    sub.u64 %lena, %enda, %starta;
+    add.u64 %taddra, %bytesb, %starta;
+    // FNV-1a-64 over the bytes
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %j, 0;
+hjbt_hash:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra hjbt_hash_done;
+    add.u64 %addr, %taddra, %j;
+    ld.global.u8 %w0, [%addr];
+    cvt.u64.u32 %tmp, %w0;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %j, %j, 1;
+    bra hjbt_hash;
+hjbt_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    mov.b128 %key128, {%i, %thash};
+    // bucket = murmur3-64 finalizer(thash) & mask
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjbt_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjbt_next;
+    // occupied: same hash? (different hash = collision -> probe)
+    setp.eq.u64 %p, %ohi, %thash;
+    @!%p bra hjbt_advance;
+    // same hash -> VERIFY text[i] vs text[olo]
+    mul.lo.u64 %o, %olo, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endb, {%w0, %w1};
+    sub.u64 %lenb, %endb, %startb;
+    setp.ne.u64 %p, %lena, %lenb;
+    @%p bra hjbt_advance;
+    add.u64 %taddrb, %bytesb, %startb;
+    mov.u64 %j, 0;
+hjbt_verify:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra hjbt_dup;
+    add.u64 %addr, %taddra, %j;
+    ld.global.u8 %ba, [%addr];
+    add.u64 %addr, %taddrb, %j;
+    ld.global.u8 %bb, [%addr];
+    setp.ne.u32 %p, %ba, %bb;
+    @%p bra hjbt_advance;
+    add.u64 %j, %j, 1;
+    bra hjbt_verify;
+hjbt_dup:
+    mov.u64 %tmp, 1;
+    atom.global.exch.b64 %o, [%dupp], %tmp;
+    bra hjbt_next;
+hjbt_advance:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjbt_probe;
+hjbt_next:
+    add.u64 %i, %i, %stride;
+    bra hjbt_loop;
+hjbt_done:
+    ret;
+}
+
+// GPU inner equi-join (M5 J4b) -- PROBE side, TEXT key. Reads probe row j's text from the probe section
+// of the dense buffer, FNV-1a-64 hashes it (same remap), linear-probes slot_keys. EMPTY128 -> no match.
+// A slot whose hi == thash -> VERIFY probe text[j] vs the matched build row's text (read from the BUILD
+// section via the slot's lo) byte-for-byte; equal -> emit (build_idx=lo, probe_idx=j) at atom.add(cursor);
+// a hash collision keeps probing. Output <= probe_n (each probe matches <=1 unique build key).
+.visible .entry gpu_db_hash_join_probe_text(
+    .param .u64 payload_ptr,
+    .param .u64 probe_offsets_off,
+    .param .u64 probe_bytes_off,
+    .param .u64 probe_n,
+    .param .u64 build_offsets_off,
+    .param .u64 build_bytes_off,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 out_pairs_ptr,
+    .param .u64 out_cursor_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %ba;
+    .reg .u32 %bb;
+    .reg .u32 %bidx;
+    .reg .u32 %pidx;
+    .reg .u64 %payload;
+    .reg .u64 %poffb;
+    .reg .u64 %pbytesb;
+    .reg .u64 %n;
+    .reg .u64 %boffb;
+    .reg .u64 %bbytesb;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %outp;
+    .reg .u64 %curp;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %startp;
+    .reg .u64 %endp;
+    .reg .u64 %lenp;
+    .reg .u64 %taddrp;
+    .reg .u64 %startb;
+    .reg .u64 %endb;
+    .reg .u64 %lenb;
+    .reg .u64 %taddrb;
+    .reg .u64 %thash;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %j;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .u64 %slotu;
+
+    ld.param.u64 %payload, [payload_ptr];
+    ld.param.u64 %poffb, [probe_offsets_off];
+    add.u64 %poffb, %payload, %poffb;
+    ld.param.u64 %pbytesb, [probe_bytes_off];
+    add.u64 %pbytesb, %payload, %pbytesb;
+    ld.param.u64 %n, [probe_n];
+    ld.param.u64 %boffb, [build_offsets_off];
+    add.u64 %boffb, %payload, %boffb;
+    ld.param.u64 %bbytesb, [build_bytes_off];
+    add.u64 %bbytesb, %payload, %bbytesb;
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %outp, [out_pairs_ptr];
+    ld.param.u64 %curp, [out_cursor_ptr];
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjpt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjpt_done;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %poffb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startp, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endp, {%w0, %w1};
+    sub.u64 %lenp, %endp, %startp;
+    add.u64 %taddrp, %pbytesb, %startp;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %j, 0;
+hjpt_hash:
+    setp.ge.u64 %p, %j, %lenp;
+    @%p bra hjpt_hash_done;
+    add.u64 %addr, %taddrp, %j;
+    ld.global.u8 %w0, [%addr];
+    cvt.u64.u32 %tmp, %w0;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %j, %j, 1;
+    bra hjpt_hash;
+hjpt_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjpt_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    ld.global.u64 %olo, [%addr];
+    ld.global.u64 %ohi, [%addr+8];
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjpt_next;
+    setp.eq.u64 %p, %ohi, %thash;
+    @!%p bra hjpt_advance;
+    // VERIFY probe text[i] vs build text[olo] (build section)
+    mul.lo.u64 %o, %olo, 8;
+    add.u64 %addr, %boffb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %startb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %endb, {%w0, %w1};
+    sub.u64 %lenb, %endb, %startb;
+    setp.ne.u64 %p, %lenp, %lenb;
+    @%p bra hjpt_advance;
+    add.u64 %taddrb, %bbytesb, %startb;
+    mov.u64 %j, 0;
+hjpt_verify:
+    setp.ge.u64 %p, %j, %lenp;
+    @%p bra hjpt_emit;
+    add.u64 %addr, %taddrp, %j;
+    ld.global.u8 %ba, [%addr];
+    add.u64 %addr, %taddrb, %j;
+    ld.global.u8 %bb, [%addr];
+    setp.ne.u32 %p, %ba, %bb;
+    @%p bra hjpt_advance;
+    add.u64 %j, %j, 1;
+    bra hjpt_verify;
+hjpt_emit:
+    mov.u64 %tmp, 1;
+    atom.global.add.u64 %slotu, [%curp], %tmp;
+    mul.lo.u64 %o, %slotu, 8;
+    add.u64 %addr, %outp, %o;
+    cvt.u32.u64 %bidx, %olo;
+    st.global.u32 [%addr], %bidx;
+    cvt.u32.u64 %pidx, %i;
+    st.global.u32 [%addr+4], %pidx;
+    bra hjpt_next;
+hjpt_advance:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjpt_probe;
+hjpt_next:
+    add.u64 %i, %i, %stride;
+    bra hjpt_loop;
+hjpt_done:
+    ret;
+}
+
 // COUNT(DISTINCT v) mark pass: mark the first row of each distinct (key0, key1, .., key{kdim-1})
 // tuple in SORTED order, and gather each sorted row's key0 (the group key). `keys_ptr` is the
 // row-major i64 tuple matrix (kdim i64 per row) ALREADY sorted via `perm` (the u32 permutation from

@@ -1334,6 +1334,100 @@ fn gpu_inner_join_comma_join_from_where() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_text_key() {
+    // M5 J4b: a join on a TEXT key, run by the GPU text hash join (FNV-hash + full byte-verify -- a
+    // 64-bit hash collision between distinct names can never mis-join). users.name is UNIQUE (the build
+    // side); logins.name is the FK (1:N + a userless 'dave' + a loginless 'carol').
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE users (uid INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE logins (name TEXT, ts INT)").unwrap();
+    e.execute_text(3, "INSERT INTO users (uid, name) VALUES (1,'alice'),(2,'bob'),(3,'carol')").unwrap();
+    e.execute_text(4, "INSERT INTO logins (name, ts) VALUES ('alice',100),('alice',101),('bob',200),('dave',300)").unwrap();
+    let us = e.populate_relational_residency_snapshot("users").unwrap();
+    let ls = e.populate_relational_residency_snapshot("logins").unwrap();
+    if us.device_memory_proof.is_none() || ls.device_memory_proof.is_none() {
+        return;
+    }
+    let int_pairs = |res: &RelationalSelectResult| -> Vec<(i32, i32)> {
+        let n = |c: &SqlValue| match c {
+            SqlValue::Int4(v) => *v,
+            other => panic!("expected int4, got {other:?}"),
+        };
+        let mut v: Vec<(i32, i32)> = res.rows.iter().map(|r| (n(&r[0]), n(&r[1]))).collect();
+        v.sort();
+        v
+    };
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT users.uid, logins.ts FROM users JOIN logins ON users.name = logins.name",
+        )
+        .expect("text-key inner join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        int_pairs(&res),
+        vec![(1, 100), (1, 101), (2, 200)],
+        "alice 1:N, bob 1:1; carol (no login) and dave (no user) dropped"
+    );
+    // A mixed text/int ON is not comparable -> a clean reject.
+    let mixed = e
+        .execute_resident_expr_select_sql(
+            "SELECT users.uid FROM users JOIN logins ON users.name = logins.ts",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        mixed.contains("TEXT on BOTH sides") || mixed.contains("integer column"),
+        "mixed text/int key rejected, got: {mixed}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_text_key_step_in_multi_way() {
+    // M5 J4b: a TEXT-key step (cust.email = ord.email) followed by an INT-key step (region.rid = cust.rid)
+    // in the carried-index multi-way pipeline -- the text join's matched indices feed the next step.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, email TEXT)").unwrap();
+    e.execute_text(3, "CREATE TABLE ord (oid INT, email TEXT, label TEXT)").unwrap();
+    e.execute_text(4, "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')").unwrap();
+    e.execute_text(5, "INSERT INTO cust (cid, rid, email) VALUES (10,1,'a@x'),(20,2,'b@x')").unwrap();
+    e.execute_text(6, "INSERT INTO ord (oid, email, label) VALUES (100,'a@x','o1'),(101,'a@x','o2'),(102,'b@x','o3')").unwrap();
+    let mut ok = true;
+    for t in ["region", "cust", "ord"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT ord.label, region.rname FROM ord \
+             JOIN cust ON cust.email = ord.email \
+             JOIN region ON region.rid = cust.rid",
+        )
+        .expect("text step + int step multi-way join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let s = |c: &SqlValue| match c {
+        SqlValue::Text(t) => t.clone(),
+        other => panic!("expected text, got {other:?}"),
+    };
+    let mut got: Vec<(String, String)> =
+        res.rows.iter().map(|r| (s(&r[0]), s(&r[1]))).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("o1".to_string(), "west".to_string()),
+            ("o2".to_string(), "west".to_string()),
+            ("o3".to_string(), "east".to_string()),
+        ],
+        "each order -> its customer (by email) -> that customer's region (by rid)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.

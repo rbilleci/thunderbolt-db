@@ -1359,6 +1359,8 @@ impl Engine {
         // per-conjunct (accumulated relation, its key column, the new relation's key column); the newly
         // joined relation is `k+1`. Conjuncts may reference DIFFERENT accumulated relations.
         let mut step_keys: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(plan.steps.len());
+        // Per step: does it join on a TEXT key (-> the GPU text hash join) vs INT keys (-> the i64 path)?
+        let mut step_is_text: Vec<bool> = Vec::with_capacity(plan.steps.len());
         for (k, step) in plan.steps.iter().enumerate() {
             let new_rel = k + 1;
             // A step always carries 1 or 2 equality conjuncts (the parsers guarantee >=1 -- an explicit
@@ -1377,7 +1379,6 @@ impl Engine {
                         .to_string(),
                 )));
             }
-            let composite = step.conjuncts.len() == 2;
             let mut conj_keys: Vec<(usize, usize, usize)> = Vec::with_capacity(step.conjuncts.len());
             for (on_a, on_b) in &step.conjuncts {
                 // Each conjunct must equate the newly joined relation (`new_rel`) to an already-joined
@@ -1395,21 +1396,46 @@ impl Engine {
                             .to_string(),
                     )));
                 };
-                // A composite member must be <=32 bits so two pack into one i64; a single key may be int8.
-                let ok = |t: SqlType| if composite { narrow_key(t) } else { int_key(t) };
-                if !ok(tables[acc_rel].columns[acc_col].ty)
-                    || !ok(tables[new_rel].columns[new_col].ty)
+                conj_keys.push((acc_rel, acc_col, new_col));
+            }
+            // Determine the key kind + validate types. A TEXT key (a single conjunct, TEXT on both sides)
+            // routes to the GPU text hash join (FNV-hash + byte-verify); INT keys (incl. a 2-column
+            // composite) route to the i64 hash join.
+            let has_text = conj_keys.iter().any(|&(acc_rel, acc_col, new_col)| {
+                matches!(tables[acc_rel].columns[acc_col].ty, SqlType::Text)
+                    || matches!(tables[new_rel].columns[new_col].ty, SqlType::Text)
+            });
+            if has_text {
+                let (acc_rel, acc_col, new_col) = conj_keys[0];
+                if conj_keys.len() != 1
+                    || !matches!(tables[acc_rel].columns[acc_col].ty, SqlType::Text)
+                    || !matches!(tables[new_rel].columns[new_col].ty, SqlType::Text)
                 {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "a join key must be an integer column on both sides (int2/int4/int8/date/\
-                         timestamp for a single key; int2/int4/date for each member of a 2-column \
-                         composite key); numeric/uuid/text/wide keys are a follow-up"
+                        "a text join key must be a single `a.t = b.t` with TEXT on BOTH sides \
+                         (composite text keys / mixed text+int keys are a follow-up)"
                             .to_string(),
                     )));
                 }
-                conj_keys.push((acc_rel, acc_col, new_col));
+            } else {
+                // A composite member must be <=32 bits so two pack into one i64; a single key may be int8.
+                let composite = conj_keys.len() == 2;
+                for &(acc_rel, acc_col, new_col) in &conj_keys {
+                    let ok = |t: SqlType| if composite { narrow_key(t) } else { int_key(t) };
+                    if !ok(tables[acc_rel].columns[acc_col].ty)
+                        || !ok(tables[new_rel].columns[new_col].ty)
+                    {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "a join key must be an integer column on both sides (int2/int4/int8/date/\
+                             timestamp for a single key; int2/int4/date for each member of a 2-column \
+                             composite key); numeric/uuid/wide keys are a follow-up"
+                                .to_string(),
+                        )));
+                    }
+                }
             }
             step_keys.push(conj_keys);
+            step_is_text.push(has_text);
         }
         // Resolve the SELECT list to a flat (relation index, column index) list, expanding `*` (every
         // relation's columns, left-to-right PG order) and `alias.*` (that relation's columns).
@@ -1524,6 +1550,48 @@ impl Engine {
                 }
             }
         };
+        // The TEXT analogue (M5 J4b): build on the smaller side (by row count), unique-build fallback. The
+        // kernel FNV-hashes + byte-verifies, so a 64-bit hash collision between distinct texts never
+        // mis-joins or spuriously reports a duplicate. Returns (left_is_build, build, probe).
+        let text_hash_join = |ctx: &gpu_db_execution::CudaResidentDeviceMemory,
+                              left: &[&[u8]],
+                              right: &[&[u8]]|
+         -> Result<(bool, Vec<u32>, Vec<u32>), ExecuteError> {
+            let smaller_is_left = left.len() <= right.len();
+            let (first_build, first_probe) = if smaller_is_left { (left, right) } else { (right, left) };
+            match ctx.hash_join_inner_text(first_build, first_probe).map_err(map_err)? {
+                HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
+                    Ok((smaller_is_left, build_idxs, probe_idxs))
+                }
+                HashJoinOutcome::DuplicateBuildKey => {
+                    match ctx.hash_join_inner_text(first_probe, first_build).map_err(map_err)? {
+                        HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
+                            Ok((!smaller_is_left, build_idxs, probe_idxs))
+                        }
+                        HashJoinOutcome::DuplicateBuildKey => {
+                            Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "N:N join (both sides have duplicate join keys) is a follow-up; one \
+                                 side's join key must be unique"
+                                    .to_string(),
+                            )))
+                        }
+                    }
+                }
+            }
+        };
+        // Gather relation `ri`'s TEXT key bytes from host_rows at the given ABSOLUTE rows (the keys
+        // crossing to host, like the i64 projection). Errors on a non-text value (the precompute already
+        // validated the column is TEXT, so this is a guard, not a path).
+        let key_texts = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<&[u8]>, ExecuteError> {
+            abs.iter()
+                .map(|&row| match &sides[ri].0.host_rows[row as usize][col_idx] {
+                    SqlValue::Text(text) => Ok(text.as_bytes()),
+                    _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "a text join key encountered a non-text value".to_string(),
+                    ))),
+                })
+                .collect()
+        };
         // Pack a step's per-conjunct host i64 key columns into one i64 per row: a single conjunct is the
         // key itself; a 2-conjunct composite puts member 0 in the HIGH 32 bits and member 1 in the LOW
         // (each member is a <=32-bit int, so this is bijective -- distinct (k0,k1) -> distinct i64; a
@@ -1542,21 +1610,29 @@ impl Engine {
         let mut work_idx: Vec<Vec<u32>> = vec![survivors_all[0].clone()];
         for (k, conjuncts) in step_keys.iter().enumerate() {
             let new_rel = k + 1;
-            // Project each conjunct's accumulated-side + new-side key on the GPU, then pack into one i64.
-            // Conjuncts may project from different accumulated relations; all share the tuple count, so the
-            // packed columns align row-for-row.
-            let acc_members: Vec<Vec<i64>> = conjuncts
-                .iter()
-                .map(|&(acc_rel, acc_col, _)| key_i64(acc_rel, acc_col, &work_idx[acc_rel]))
-                .collect::<Result<_, _>>()?;
-            let new_members: Vec<Vec<i64>> = conjuncts
-                .iter()
-                .map(|&(_, _, new_col)| key_i64(new_rel, new_col, &survivors_all[new_rel]))
-                .collect::<Result<_, _>>()?;
-            let acc_keys = pack_keys(&acc_members);
-            let new_keys = pack_keys(&new_members);
-            let (acc_is_build, build_idxs, probe_idxs) =
-                hash_join(sides[new_rel].1.mem(), &acc_keys, &new_keys)?;
+            let (acc_is_build, build_idxs, probe_idxs) = if step_is_text[k] {
+                // TEXT key (a single conjunct, validated). Gather both sides' key bytes from host_rows and
+                // run the GPU text hash join (FNV-hash + byte-verify).
+                let (acc_rel, acc_col, new_col) = conjuncts[0];
+                let acc_texts = key_texts(acc_rel, acc_col, &work_idx[acc_rel])?;
+                let new_texts = key_texts(new_rel, new_col, &survivors_all[new_rel])?;
+                text_hash_join(sides[new_rel].1.mem(), &acc_texts, &new_texts)?
+            } else {
+                // INT key (incl. composite). Project each conjunct's accumulated-side + new-side key on
+                // the GPU, then pack into one i64. Conjuncts may project from different accumulated
+                // relations; all share the tuple count, so the packed columns align row-for-row.
+                let acc_members: Vec<Vec<i64>> = conjuncts
+                    .iter()
+                    .map(|&(acc_rel, acc_col, _)| key_i64(acc_rel, acc_col, &work_idx[acc_rel]))
+                    .collect::<Result<_, _>>()?;
+                let new_members: Vec<Vec<i64>> = conjuncts
+                    .iter()
+                    .map(|&(_, _, new_col)| key_i64(new_rel, new_col, &survivors_all[new_rel]))
+                    .collect::<Result<_, _>>()?;
+                let acc_keys = pack_keys(&acc_members);
+                let new_keys = pack_keys(&new_members);
+                hash_join(sides[new_rel].1.mem(), &acc_keys, &new_keys)?
+            };
             // build/probe positions -> (accumulated tuple position, new-relation survivor position).
             let (acc_match, new_match): (&[u32], &[u32]) = if acc_is_build {
                 (&build_idxs, &probe_idxs)
