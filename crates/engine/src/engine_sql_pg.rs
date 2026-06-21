@@ -43,15 +43,24 @@ impl Engine {
             // exactly one relation; a cross-relation conjunct is a follow-up).
             let s = self.committed_seq();
             let catalog = self.read_state.catalog_as_of(s);
-            let bind = |name: &str| -> Result<RelationalTable, ExecuteError> {
-                catalog
-                    .relational_catalog
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| sql_pg_error(format!("relation \"{name}\" does not exist")))
+            // Resolve each join relation to its catalog table + (for a synthesized catalog relation) its
+            // host rows. A real user relation is resolved FIRST (so it shadows a catalog name, mirroring
+            // the single-relation path) and takes the resident join path (rows = None). A
+            // `pg_catalog`/`information_schema` relation has no residency snapshot, so it is SYNTHESIZED
+            // here (M5 J5) and its rows are threaded to the executor, which uploads a TRANSIENT device
+            // payload and runs the SAME GPU hash join -- no CPU relational join (charter).
+            #[allow(clippy::type_complexity)] // (catalog table, synthesized rows) | resident table
+            let bind = |name: &str| -> Result<(RelationalTable, Option<Vec<Vec<SqlValue>>>), ExecuteError> {
+                if let Some(table) = catalog.relational_catalog.get(name).cloned() {
+                    Ok((table, None))
+                } else if let Some((table, rows)) = synthesize_catalog_relation(name, &catalog) {
+                    Ok((table, Some(rows)))
+                } else {
+                    Err(sql_pg_error(format!("relation \"{name}\" does not exist")))
+                }
             };
-            let left_table = bind(&plan.left_table)?;
-            let right_table = bind(&plan.right_table)?;
+            let (left_table, left_rows) = bind(&plan.left_table)?;
+            let (right_table, right_rows) = bind(&plan.right_table)?;
             let (left_pred, right_pred) = match stmt.where_clause.as_deref() {
                 Some(where_node) => split_join_where(
                     where_node,
@@ -66,6 +75,8 @@ impl Engine {
                 &plan,
                 &left_table,
                 &right_table,
+                left_rows,
+                right_rows,
                 left_pred.as_ref(),
                 right_pred.as_ref(),
             );

@@ -477,6 +477,91 @@ impl Engine {
         runtime.retain_device_memory_copy(gpu_id, payload).ok()
     }
 
+    /// Build a TRANSIENT resident-like relation from already-materialized host `rows` -- a `RelationalTable`
+    /// descriptor + an uploaded device payload that the GPU join path consumes EXACTLY like a published
+    /// resident table (`lower_resident_predicate`, `project_*_rows_from_payload`, `hash_join_inner_i64`),
+    /// but WITHOUT publishing/admitting/evicting anything (the descriptor + device memory live only for the
+    /// caller's query). This is the M5 J5 bridge for a SYNTHESIZED `pg_catalog`/`information_schema`
+    /// relation, which has no residency snapshot: synthesize its rows -> this helper -> the existing int4
+    /// inner join over the transient payload. Charter: the catalog join runs on the SAME GPU kernels as a
+    /// user-table join (no CPU relational join; only the host-rows gather crosses to the host, as for a
+    /// resident table). `&self`: the upload only needs `cuda_driver_probe_runtime` (also `&self`).
+    ///
+    /// Mirrors `populate_relational_residency_snapshot_on_gpu`'s payload + descriptor build (the column
+    /// lists feed `build_relational_device_payload`, whose offsets the descriptor's resident-column lists
+    /// index), but SKIPS the MVCC tuple tail (the join reads columnar sections + host rows, never the tail)
+    /// and the admission machinery. A 0-row relation is fine: the payload is still a non-empty 8-byte
+    /// row-count header (the upload's empty-payload guard never trips), and the inner join then yields an
+    /// empty result via the empty-survivor / empty-key short-circuits (an empty side is the join's identity).
+    pub(crate) fn build_transient_relation_residency(
+        &self,
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+    ) -> Result<(RelationalResidencySnapshot, CudaResidentDeviceMemory), ExecuteError> {
+        let gpu_id = self.planner.default_gpu_id();
+        let column_names: Vec<String> =
+            table.columns.iter().map(|column| column.name.clone()).collect();
+        let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
+        // The resident-column lists name (in catalog order) the columns living in each type-grouped
+        // payload section; the descriptor's offset helpers index `build_relational_device_payload`'s
+        // sections via these lists, so they MUST use the SAME type filters as the resident builder.
+        let resident_device_int4_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let resident_device_int8_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Int8 | SqlType::Timestamp))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let resident_device_numeric_columns = table
+            .columns
+            .iter()
+            .filter(|column| matches!(column.ty, SqlType::Numeric { .. } | SqlType::Uuid))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let (
+            device_payload,
+            resident_device_text_columns,
+            resident_device_bool_columns,
+            resident_device_int4_column_stats,
+            _resident_device_b128_columns,
+        ) = build_relational_device_payload(&column_names, &column_types, rows)?;
+        let runtime = self.cuda_driver_probe_runtime();
+        let device_memory = runtime
+            .retain_device_memory_copy(gpu_id, &device_payload)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let snapshot = RelationalResidencySnapshot {
+            gpu_id,
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            generation: 1,
+            row_count: rows.len(),
+            column_count: table.columns.len(),
+            resident_bytes: device_payload.len() as u64,
+            resident_device_int4_columns,
+            resident_device_int4_column_stats,
+            resident_device_int8_columns,
+            resident_device_numeric_columns,
+            resident_device_bool_columns,
+            resident_device_text_columns,
+            valid_through_index: self.committed_seq(),
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: false,
+            memory_pressure_active: false,
+            last_refresh_cost: None,
+            admission_budget_bytes: None,
+            resident_bytes_after_admission: 0,
+            evicted_tables_on_admission: Vec::new(),
+            device_memory_proof: Some(device_memory.metadata().clone()),
+        };
+        Ok((snapshot, device_memory))
+    }
+
     pub fn install_benchmark_relational_residency_chunks(
         &mut self,
         install: BenchmarkRelationalResidencyChunkInstall<'_>,

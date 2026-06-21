@@ -937,6 +937,87 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_catalog_relations_transient_payload() {
+    // M5 J5: a 2-relation INNER equi-join where BOTH sides are SYNTHESIZED pg_catalog relations (which
+    // have NO residency snapshot). The executor uploads each as a TRANSIENT device payload + descriptor
+    // and runs the SAME GPU per-side WHERE pushdown + hash join as a user-table join (no CPU relational
+    // join -- charter). Construction oracle: the user tables we CREATE are EXACTLY the relkind='r' rows
+    // of pg_class in the public namespace, so `pg_class JOIN pg_namespace ON n.oid = c.relnamespace`
+    // filtered to public/'r' is identity over their names -> {(alpha,public),(beta,public)}.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE alpha (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE beta (id INT)").unwrap();
+    // Gate on GPU availability via ANY resident snapshot (the catalog relations are not resident -- they
+    // are synthesized + transiently uploaded inside the join; this just detects a usable driver/GPU).
+    let snapshot = e.populate_relational_residency_snapshot("alpha").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // Extract (relname, nspname) text pairs + sort (the join emit order is unspecified without ORDER BY,
+    // and pg_class rows come from a HashMap).
+    let names = |res: &RelationalSelectResult| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let s = |c: &SqlValue| match c {
+                    SqlValue::Text(t) => t.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                (s(&r[0]), s(&r[1]))
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let expected = vec![
+        ("alpha".to_string(), "public".to_string()),
+        ("beta".to_string(), "public".to_string()),
+    ];
+    // pg_class JOIN pg_namespace, with a per-side GPU text WHERE on EACH synthesized relation (c.relkind
+    // on pg_class, n.nspname on pg_namespace) pushed down over its transient payload.
+    let q = "SELECT c.relname, n.nspname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'r' AND n.nspname = 'public'";
+    let direct = e
+        .execute_resident_expr_select_sql(q)
+        .expect("catalog inner join (general path)");
+    assert_eq!(direct.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(direct.columns.len(), 2);
+    assert!(direct.columns[0].name.eq_ignore_ascii_case("relname"));
+    assert!(direct.columns[1].name.eq_ignore_ascii_case("nspname"));
+    assert_eq!(names(&direct), expected, "both user tables join to the public namespace");
+    // Same query through the production wire/text dispatch (the hand-rolled parser rejects JOIN -> the
+    // Err arm routes to the general path).
+    let wire = e
+        .execute_relational_select_text(q)
+        .expect("catalog inner join (text/wire dispatch)");
+    assert_eq!(wire.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(names(&wire), expected, "the wire dispatch routes the catalog JOIN to the general path");
+    // Reversed FROM order (pg_namespace is now the LEFT/build side -- its `oid` key is UNIQUE, so the
+    // build-on-smaller path succeeds here too); same result.
+    let reversed = e
+        .execute_resident_expr_select_sql(
+            "SELECT c.relname, n.nspname FROM pg_catalog.pg_namespace n \
+             JOIN pg_catalog.pg_class c ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'r' AND n.nspname = 'public'",
+        )
+        .expect("catalog inner join, reversed FROM order");
+    assert_eq!(names(&reversed), expected, "join is symmetric in FROM order");
+    // No-WHERE variant: the join key itself (relnamespace = oid) selects only the public namespace
+    // (pg_catalog/information_schema oids match no relnamespace), so the result is the same WITHOUT any
+    // per-side filter -- exercising the all-rows survivor path over the transient payloads.
+    let no_where = e
+        .execute_resident_expr_select_sql(
+            "SELECT c.relname, n.nspname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+        )
+        .expect("catalog inner join, no WHERE");
+    assert_eq!(names(&no_where), expected, "the join key alone selects the public namespace");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.

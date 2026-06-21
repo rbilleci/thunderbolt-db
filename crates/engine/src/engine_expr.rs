@@ -1211,11 +1211,16 @@ impl Engine {
     /// mapping + the join read the same generation); `left_predicate`/`right_predicate` are the
     /// per-relation WHERE conjuncts (mapped against each relation), GPU-evaluated to pre-filter each
     /// side before the join (inner-join semantics are filter-commutative on per-side predicates).
+    // left_rows/right_rows carry a synthesized catalog relation's host rows (None = resident table);
+    // they are threaded alongside the tables + per-side predicates (M5 J5).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_resident_expr_inner_join(
         &self,
         plan: &JoinPlan,
         left_table: &RelationalTable,
         right_table: &RelationalTable,
+        left_rows: Option<Vec<Vec<SqlValue>>>,
+        right_rows: Option<Vec<Vec<SqlValue>>>,
         left_predicate: Option<&ResidentExpr>,
         right_predicate: Option<&ResidentExpr>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
@@ -1311,45 +1316,68 @@ impl Engine {
                 }
             }
         }
-        // Pin both residency entries + their device memory (no CPU join fallback -- charter).
-        let load = |name: &str| -> Result<(RelationalResidencyEntry, usize), ExecuteError> {
-            let entry = self.relational_residency_entry(name).ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{name}\" has no resident snapshot (the join path is GPU-only)"
-                )))
-            })?;
-            if !entry.descriptor.is_valid() {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{name}\" resident snapshot is invalid"
-                ))));
+        // Resolve each relation to its (residency entry, device memory): a RESIDENT user table uses its
+        // published snapshot + retained device memory; a SYNTHESIZED catalog relation (rows = Some, M5 J5)
+        // is uploaded as a TRANSIENT device payload + descriptor that lives only for this query. Either
+        // way the join then runs the SAME GPU WHERE-pushdown + hash-join kernels (no CPU relational join
+        // fallback -- charter); only the host-rows gather crosses to the host, as for a resident join.
+        enum JoinDeviceMemory {
+            Resident(std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>),
+            Transient(gpu_db_execution::CudaResidentDeviceMemory),
+        }
+        impl JoinDeviceMemory {
+            fn mem(&self) -> &gpu_db_execution::CudaResidentDeviceMemory {
+                match self {
+                    JoinDeviceMemory::Resident(memory) => memory,
+                    JoinDeviceMemory::Transient(memory) => memory,
+                }
             }
-            let row_count = entry.descriptor.row_count;
-            Ok((entry, row_count))
+        }
+        let resolve_side = |name: &str,
+                            table: &RelationalTable,
+                            rows: Option<Vec<Vec<SqlValue>>>|
+         -> Result<(RelationalResidencyEntry, JoinDeviceMemory, usize), ExecuteError> {
+            match rows {
+                None => {
+                    let entry = self.relational_residency_entry(name).ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "relation \"{name}\" has no resident snapshot (the join path is GPU-only)"
+                        )))
+                    })?;
+                    if !entry.descriptor.is_valid() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "relation \"{name}\" resident snapshot is invalid"
+                        ))));
+                    }
+                    let row_count = entry.descriptor.row_count;
+                    let memory = self
+                        .read_state
+                        .residency
+                        .device_memory
+                        .get(name)
+                        .ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "relation \"{name}\" has no retained resident device memory"
+                            )))
+                        })?;
+                    Ok((entry, JoinDeviceMemory::Resident(memory), row_count))
+                }
+                Some(rows) => {
+                    let (snapshot, memory) =
+                        self.build_transient_relation_residency(table, &rows)?;
+                    let row_count = rows.len();
+                    let entry = RelationalResidencyEntry {
+                        descriptor: std::sync::Arc::new(snapshot),
+                        host_rows: std::sync::Arc::new(rows),
+                    };
+                    Ok((entry, JoinDeviceMemory::Transient(memory), row_count))
+                }
+            }
         };
-        let (left_entry, left_n) = load(&plan.left_table)?;
-        let (right_entry, right_n) = load(&plan.right_table)?;
-        let device_memory = self
-            .read_state
-            .residency
-            .device_memory
-            .get(&plan.left_table)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    plan.left_table
-                )))
-            })?;
-        let right_dm = self
-            .read_state
-            .residency
-            .device_memory
-            .get(&plan.right_table)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    plan.right_table
-                )))
-            })?;
+        let (left_entry, left_dm, left_n) =
+            resolve_side(&plan.left_table, left_table, left_rows)?;
+        let (right_entry, right_dm, right_n) =
+            resolve_side(&plan.right_table, right_table, right_rows)?;
         let gpu_id = left_entry.descriptor.gpu_id;
         // Pre-filter each relation by its per-relation WHERE conjuncts on the GPU -> surviving ABSOLUTE
         // row indices (inner join is filter-commutative on per-side predicates). No predicate -> all
@@ -1368,9 +1396,9 @@ impl Engine {
             }
         };
         let left_survivors =
-            survivors(left_predicate, left_table, &left_entry, &device_memory, left_n)?;
+            survivors(left_predicate, left_table, &left_entry, left_dm.mem(), left_n)?;
         let right_survivors =
-            survivors(right_predicate, right_table, &right_entry, &right_dm, right_n)?;
+            survivors(right_predicate, right_table, &right_entry, right_dm.mem(), right_n)?;
         // Project each relation's integer key column to host i64 at the SURVIVING rows: int8/timestamp
         // from the i64 section; int2/int4/date from the i32 section, sign-extended.
         let key_i64 = |entry: &RelationalResidencyEntry,
@@ -1399,9 +1427,10 @@ impl Engine {
                 }
             }
         };
-        let left_keys = key_i64(&left_entry, left_table, &device_memory, left_key_idx, &left_survivors)?;
+        let left_keys =
+            key_i64(&left_entry, left_table, left_dm.mem(), left_key_idx, &left_survivors)?;
         let right_keys =
-            key_i64(&right_entry, right_table, &right_dm, right_key_idx, &right_survivors)?;
+            key_i64(&right_entry, right_table, right_dm.mem(), right_key_idx, &right_survivors)?;
         // GPU hash join: build on the SMALLER side; if its key is non-unique, retry building on the
         // OTHER side (covers 1:1 + 1:N regardless of size). Both non-unique => N:N (a follow-up).
         use gpu_db_execution::HashJoinOutcome;
@@ -1411,7 +1440,8 @@ impl Engine {
         } else {
             (&right_keys, &left_keys)
         };
-        let (left_is_build, build_idxs, probe_idxs) = match device_memory
+        let (left_is_build, build_idxs, probe_idxs) = match left_dm
+            .mem()
             .hash_join_inner_i64(first_build, first_probe)
             .map_err(map_err)?
         {
@@ -1420,7 +1450,8 @@ impl Engine {
                 probe_idxs,
             } => (smaller_is_left, build_idxs, probe_idxs),
             HashJoinOutcome::DuplicateBuildKey => {
-                match device_memory
+                match left_dm
+                    .mem()
                     .hash_join_inner_i64(first_probe, first_build)
                     .map_err(map_err)?
                 {
