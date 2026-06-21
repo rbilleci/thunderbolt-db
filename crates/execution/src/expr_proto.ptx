@@ -3691,6 +3691,213 @@ done_widekey:
     ret;
 }
 
+// GPU inner equi-join (M5) -- BUILD side, int4 key, UNIQUE build key. Open-addressing hash table in
+// slot_keys_i128 (b128 = (lo=build_row_idx, hi=key); EMPTY128 = (0, i64::MIN) -- an int4 key is never
+// i64::MIN so a real slot never aliases EMPTY). For each build row b: hash the i64 key (murmur
+// finalizer), atom.cas.b128 claim-on-empty (lock-free, advance-on-failure linear probe -- NEVER a spin
+// lock). A LOST cas whose hi limb == this key means a DUPLICATE build key (N:N is a follow-up) -> set
+// dup_flag (the host rejects the query). build_keys are i64 (the executor sign-extends int4 -> i64).
+.visible .entry gpu_db_hash_join_build_i32(
+    .param .u64 build_keys_ptr,
+    .param .u64 build_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 dup_flag_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %dupp;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %zero;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .b128 %empty128;
+    .reg .b128 %key128;
+    .reg .b128 %old128;
+
+    ld.param.u64 %keysp, [build_keys_ptr];
+    ld.param.u64 %n, [build_n];
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %dupp, [dup_flag_ptr];
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u64 %zero, 0;
+    mov.b128 %empty128, {%zero, %empty};
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjb_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjb_done;
+    // key = build_keys[i]
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %keysp, %o;
+    ld.global.u64 %key, [%addr];
+    // h = murmur(key) & mask
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    // key128 = (lo=i, hi=key)
+    mov.b128 %key128, {%i, %key};
+hjb_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    // The cas WROTE key128 iff the slot was EMPTY128 (old.hi == i64::MIN). A real slot has hi = key
+    // (an int4 key, never i64::MIN), so hi == EMPTY uniquely means "was empty -> claimed".
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjb_next;
+    // occupied: hi == this key -> DUPLICATE build key (N:N is a follow-up); else collision -> probe.
+    setp.eq.u64 %p, %ohi, %key;
+    @%p bra hjb_dup;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjb_probe;
+hjb_dup:
+    mov.u64 %tmp, 1;
+    atom.global.exch.b64 %o, [%dupp], %tmp;
+    bra hjb_next;
+hjb_next:
+    add.u64 %i, %i, %stride;
+    bra hjb_loop;
+hjb_done:
+    ret;
+}
+
+// GPU inner equi-join (M5) -- PROBE side, int4 key, UNIQUE build key. For each probe row p: hash the
+// i64 key, linear-probe slot_keys_i128. EMPTY128 slot -> no match (stop; open addressing). A slot whose
+// hi limb == key -> the single matching build row (lo): emit the pair (build_idx, probe_idx) at
+// atom.add(out_cursor) -- lock-free append. Output is bounded by probe_n (each probe matches <=1 unique
+// build key). out_pairs is [build_idx, probe_idx] u32 pairs.
+.visible .entry gpu_db_hash_join_probe_i32(
+    .param .u64 probe_keys_ptr,
+    .param .u64 probe_n,
+    .param .u64 slot_keys_ptr,
+    .param .u64 mask,
+    .param .u64 out_pairs_ptr,
+    .param .u64 out_cursor_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %slot;
+    .reg .u32 %pidx;
+    .reg .u32 %bidx;
+    .reg .u64 %keysp;
+    .reg .u64 %n;
+    .reg .u64 %slots;
+    .reg .u64 %mask;
+    .reg .u64 %outp;
+    .reg .u64 %curp;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %key;
+    .reg .u64 %mix;
+    .reg .u64 %tmp;
+    .reg .u64 %h;
+    .reg .u64 %empty;
+    .reg .u64 %olo;
+    .reg .u64 %ohi;
+    .reg .u64 %slotu;
+
+    ld.param.u64 %keysp, [probe_keys_ptr];
+    ld.param.u64 %n, [probe_n];
+    ld.param.u64 %slots, [slot_keys_ptr];
+    ld.param.u64 %mask, [mask];
+    ld.param.u64 %outp, [out_pairs_ptr];
+    ld.param.u64 %curp, [out_cursor_ptr];
+    mov.u64 %empty, 0x8000000000000000;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+hjp_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra hjp_done;
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %keysp, %o;
+    ld.global.u64 %key, [%addr];
+    mov.b64 %mix, %key;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+hjp_probe:
+    mul.lo.u64 %o, %h, 16;
+    add.u64 %addr, %slots, %o;
+    ld.global.u64 %olo, [%addr];
+    ld.global.u64 %ohi, [%addr+8];
+    // EMPTY128 (hi==i64::MIN) -> no match (open addressing: the bucket run ended).
+    setp.eq.u64 %p, %ohi, %empty;
+    @%p bra hjp_next;
+    // hi == key -> the unique matching build row (lo).
+    setp.eq.u64 %p, %ohi, %key;
+    @%p bra hjp_emit;
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra hjp_probe;
+hjp_emit:
+    // slot = atom.add(cursor, 1); out_pairs[slot*2] = build_idx (lo); out_pairs[slot*2+1] = probe_idx
+    mov.u64 %tmp, 1;
+    atom.global.add.u64 %slotu, [%curp], %tmp;
+    mul.lo.u64 %o, %slotu, 8;
+    add.u64 %addr, %outp, %o;
+    cvt.u32.u64 %bidx, %olo;
+    st.global.u32 [%addr], %bidx;
+    cvt.u32.u64 %pidx, %i;
+    st.global.u32 [%addr+4], %pidx;
+hjp_next:
+    add.u64 %i, %i, %stride;
+    bra hjp_loop;
+hjp_done:
+    ret;
+}
+
 // COUNT(DISTINCT v) mark pass: mark the first row of each distinct (key0, key1, .., key{kdim-1})
 // tuple in SORTED order, and gather each sorted row's key0 (the group key). `keys_ptr` is the
 // row-major i64 tuple matrix (kdim i64 per row) ALREADY sorted via `perm` (the u32 permutation from
