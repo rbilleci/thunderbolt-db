@@ -3496,6 +3496,78 @@ done_pack128:
     ret;
 }
 
+// Widen a fixed-width int column to a per-row i64 derived buffer (sign-extended): w==8 -> int8 section
+// (2x ld.u32, 716-safe), w==4 -> int4 section (ld.s32). Used as the key_base_override fixed member of a
+// composite (fixed-width, text) GROUP BY key -- the text-key claim folds out[idx] into its hash and
+// verifies out[idx] vs the representative's. A pure MAP (no atomics) -> no bool-kernel hazard.
+.visible .entry gpu_db_widen_col_to_i64(
+    .param .u64 resident_ptr,
+    .param .u64 off,
+    .param .u64 w,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %lo32;
+    .reg .u32 %hi32;
+    .reg .s32 %s32;
+    .reg .u64 %rp;
+    .reg .u64 %b;
+    .reg .u64 %w;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %c;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %o, [off];
+    add.u64 %b, %rp, %o;
+    ld.param.u64 %w, [w];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_widen:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_widen;
+    setp.eq.u64 %p, %w, 8;
+    @%p bra widen_8;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b, %o;
+    ld.global.s32 %s32, [%addr];
+    cvt.s64.s32 %c, %s32;
+    bra widen_store;
+widen_8:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %b, %o;
+    ld.global.u32 %lo32, [%addr];
+    ld.global.u32 %hi32, [%addr+4];
+    mov.b64 %c, {%lo32, %hi32};
+widen_store:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %out, %o;
+    st.global.u64 [%addr], %c;
+    add.u64 %i, %i, %stride;
+    bra loop_widen;
+done_widen:
+    ret;
+}
+
 // COUNT(DISTINCT v) mark pass: mark the first row of each distinct (key0, key1, .., key{kdim-1})
 // tuple in SORTED order, and gather each sorted row's key0 (the group key). `keys_ptr` is the
 // row-major i64 tuple matrix (kdim i64 per row) ALREADY sorted via `perm` (the u32 permutation from
@@ -5500,6 +5572,21 @@ ktext_hash:
     add.u64 %jt, %jt, 1;
     bra ktext_hash;
 ktext_hash_done:
+    // Composite (fixed-width member, text member): a NON-ZERO key_base_override holds the fixed member's
+    // i64 value per row (materialized into a derived buffer). Fold kbov[idx] into the hash so tuples that
+    // differ only in the fixed member hash differently; the verify in the claim ALSO compares it. A
+    // plain text key has kbov == 0 (this fold is skipped -> byte-identical to the single-text-key path).
+    setp.eq.u64 %p, %kbov, 0;
+    @%p bra ktext_no_fixed;
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %addr, %kbov, %o8;
+    ld.global.u32 %klo, [%addr];
+    ld.global.u32 %khi, [%addr+4];
+    mov.b64 %tmp, {%klo, %khi};
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+ktext_no_fixed:
     setp.eq.s64 %p, %thash, %empty;
     selp.b64 %thash, 0, %thash, %p;
     cvt.u64.u32 %keylo, %idx;
@@ -5679,6 +5766,25 @@ probe_loop_text:
     @%claimed bra do_agg;
     setp.ne.u64 %pf, %ohi, %thash;
     @%pf bra ktext_probe_next;
+    // Composite (fixed, text): the hash matched -- also verify the fixed member (kbov[idx] vs the rep's
+    // kbov[olo]); differ -> a hash collision across the fixed member, probe on. kbov == 0 (plain text
+    // key) skips this -> identical to the single-text-key verify.
+    setp.eq.u64 %pf, %kbov, 0;
+    @%pf bra ktext_skip_fixed;
+    cvt.u64.u32 %o8, %idx;
+    mul.lo.u64 %o8, %o8, 8;
+    add.u64 %vaddr, %kbov, %o8;
+    ld.global.u32 %klo, [%vaddr];
+    ld.global.u32 %khi, [%vaddr+4];
+    mov.b64 %sstart, {%klo, %khi};
+    mul.lo.u64 %o8, %olo, 8;
+    add.u64 %vaddr, %kbov, %o8;
+    ld.global.u32 %klo, [%vaddr];
+    ld.global.u32 %khi, [%vaddr+4];
+    mov.b64 %send, {%klo, %khi};
+    setp.ne.u64 %pf, %sstart, %send;
+    @%pf bra ktext_probe_next;
+ktext_skip_fixed:
     mul.lo.u64 %o8, %olo, 8;
     add.u64 %vaddr, %base, %koffoff;
     add.u64 %vaddr, %vaddr, %o8;

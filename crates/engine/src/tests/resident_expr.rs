@@ -2873,6 +2873,128 @@ fn gpu_group_by_composite_two_int8_min_edge() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_int_and_text() {
+    // Composite GROUP BY a, b where a is INT and b is TEXT -> the text-key b128 claim with the fixed
+    // member (a) folded into the hash + verify (key_base_override). CRITICAL: the SAME text "x" appears
+    // under a=1 AND a=2 -> they MUST be distinct groups (the fixed member splits them). Single agg.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b TEXT)").unwrap();
+    // (a,b): (1,"x")x2, (1,"y")x1, (2,"x")x1.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES (1,'x'),(1,'x'),(1,'y'),(2,'x')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect("composite (int, text) GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Text("x".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(1), SqlValue::Text("y".into()), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(2), SqlValue::Text("x".into()), SqlValue::Int8(1)],
+        ],
+        "same text under different fixed members are distinct groups (default order by a,b)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_text_first_with_sum() {
+    // Composite GROUP BY name, k where name is TEXT (the FIRST member) and k is INT, with SUM(c) (single
+    // aggregate). Verifies declared member ORDER in the result (text, int) + a non-COUNT aggregate.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (name TEXT, k INT, c INT)")
+        .unwrap();
+    // ("apple",1,10),("apple",1,20),("apple",2,5),("banana",1,7).
+    e.execute_text(
+        2,
+        "INSERT INTO t (name,k,c) VALUES ('apple',1,10),('apple',1,20),('apple',2,5),('banana',1,7)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT name, k, SUM(c) FROM t GROUP BY name, k")
+        .expect("composite (text, int) GROUP BY with SUM");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Text("apple".into()), SqlValue::Int4(1), SqlValue::Int8(30)],
+            vec![SqlValue::Text("apple".into()), SqlValue::Int4(2), SqlValue::Int8(5)],
+            vec![SqlValue::Text("banana".into()), SqlValue::Int4(1), SqlValue::Int8(7)],
+        ],
+        "text-first composite, SUM per (name,k), default order by name,k"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_int8_and_text() {
+    // Composite GROUP BY a, b where a is BIGINT (width-8 widen) + b is TEXT, with a value beyond the
+    // int4 range. Exercises the width-8 fixed-member widen folded into the text-key hash/verify.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b TEXT)").unwrap();
+    // (9e9,"x")x2, (9e9,"y")x1, (5,"x")x1.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES (9000000000,'x'),(9000000000,'x'),(9000000000,'y'),(5,'x')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect("composite (int8, text) GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int8(5), SqlValue::Text("x".into()), SqlValue::Int8(1)],
+            vec![SqlValue::Int8(9000000000), SqlValue::Text("x".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Int8(9000000000), SqlValue::Text("y".into()), SqlValue::Int8(1)],
+        ],
+        "int8 fixed member (width-8 widen) + text, value beyond int4 range"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_fixed_text_multi_aggregate_rejected() {
+    // A (fixed, text) composite supports a SINGLE aggregate; multiple aggregates need per-pass alignment
+    // (a follow-up) -> clean reject (at execution, on the GPU path).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b TEXT, c INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b,c) VALUES (1,'x',10)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let err = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*), SUM(c) FROM t GROUP BY a, b")
+        .expect_err("multi-aggregate (fixed, text) composite rejected");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("single aggregate") || msg.contains("follow-up"),
+        "clean reject, got: {err:?}"
+    );
+}
+
+#[test]
 fn group_by_composite_three_columns_rejected() {
     // >2 composite GROUP BY columns is a clean error (the on-device pack covers two; i128/rep-row are
     // follow-ups). Host-side (parse rejection), no GPU needed.

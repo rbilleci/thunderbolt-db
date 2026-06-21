@@ -1180,6 +1180,18 @@ impl CudaResidentDeviceMemory {
         launch_cuda_pack_two_cols_i128_device(self, off0, w0, off1, w1, n_rows)
     }
 
+    /// Widen a fixed-width int column (`w` = 4 or 8 bytes) to a per-row i64 derived buffer
+    /// (sign-extended). The fixed member of a composite (fixed-width, text) GROUP BY key, passed as
+    /// key_base_override so the text-key claim folds it into the hash + verifies it. cuCtxSynchronize'd.
+    pub fn widen_col_to_i64_device(
+        &self,
+        off: u64,
+        w: u64,
+        n_rows: u64,
+    ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
+        launch_cuda_widen_col_to_i64_device(self, off, w, n_rows)
+    }
+
     /// COUNT(DISTINCT v) mark pass: `keys` is the (key0, key1, ..) i64 tuple matrix (row-major, `k`
     /// values/row) ALREADY sorted via `perm` (from [`Self::bitonic_sort_multikey`]). key0 is the group
     /// key; the remaining keys are the value's fixed-width i64 representation (`k`=2 for an int value
@@ -13838,6 +13850,93 @@ fn launch_cuda_pack_two_cols_i128_device<'r>(
         (&mut a4 as *mut u64).cast::<c_void>(),
         (&mut a5 as *mut u64).cast::<c_void>(),
         (&mut a6 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let ptr = out.ptr;
+    Ok(DeviceArithBuffer { _lease: out, ptr })
+}
+
+/// Run `gpu_db_widen_col_to_i64` into a leased [i64; n] buffer (the column sign-extended to i64) for the
+/// fixed member of a composite (fixed-width, text) GROUP BY key. `w` = 4 or 8. cuCtxSynchronize'd so the
+/// SEPARATE text-key GROUP BY launch reads the completed buffer via key_base_override.
+fn launch_cuda_widen_col_to_i64_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    off: u64,
+    w: u64,
+    n: u64,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    if n == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    if w != 4 && w != 8 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let out_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_widen_col_to_i64", &ptx)?;
+    let out = primary.lease_device_buffer(out_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = off;
+    let mut a2 = w;
+    let mut a3 = n;
+    let mut a4 = out.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
         cu_launch_kernel(
