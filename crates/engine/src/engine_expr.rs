@@ -552,6 +552,20 @@ fn expr_mentions_text(expr: &ResidentExpr, table: &RelationalTable) -> bool {
     }
 }
 
+/// Whether `expr` mentions a BOOL column anywhere (a bool literal alone does not -- it only matters
+/// paired with a bool column). Marks a predicate as touching the i32 bool-mask path.
+fn expr_mentions_bool_column(expr: &ResidentExpr, table: &RelationalTable) -> bool {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Bool)
+        }
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            expr_mentions_bool_column(lhs, table) || expr_mentions_bool_column(rhs, table)
+        }
+        _ => false,
+    }
+}
+
 /// The column index if `expr` is a `Column` of `date` type, else `None`.
 fn date_column_index(expr: &ResidentExpr, table: &RelationalTable) -> Option<usize> {
     match expr {
@@ -1189,6 +1203,21 @@ fn compile_predicate_program(
     program: &mut Vec<ExprStep>,
     needles: &mut Vec<Vec<u8>>,
 ) -> Result<(), ExecuteError> {
+    // A bare BOOL column used as a predicate leaf (`WHERE flag AND ...`) -> its bitmap as a mask.
+    if let ResidentExpr::Column(idx) = expr {
+        if table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Bool) {
+            let offset = resident_device_bool_column_offset(snapshot, table, *idx)?;
+            program.push(ExprStep::BoolMask {
+                bitmap_byte_offset: offset,
+                negate: false,
+            });
+            return Ok(());
+        }
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a bare column predicate leaf must be a bool column (argument of WHERE must be boolean)"
+                .to_string(),
+        )));
+    }
     let ResidentExpr::Binary { op, lhs, rhs } = expr else {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "resident predicate must be a comparison or boolean (AND/OR) combination".to_string(),
@@ -1204,6 +1233,15 @@ fn compile_predicate_program(
     // (so text IN / multi-text WHERE run on the GPU). int4 leaves fall through to the arith VM below.
     if expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table) {
         return compile_text_eq_leaf(*op, lhs, rhs, table, snapshot, program, needles);
+    }
+    // BOOL comparison leaf (`boolcol =/<> true|false`, either order) -> a BoolMask step. `NOT flag` is
+    // mapped to `flag = false` upstream, so this also covers it. int4 leaves fall through below.
+    let is_bool_col = |e: &ResidentExpr| {
+        matches!(e, ResidentExpr::Column(i)
+            if table.columns.get(*i).map(|column| column.ty) == Some(SqlType::Bool))
+    };
+    if is_bool_col(lhs) || is_bool_col(rhs) {
+        return compile_bool_leaf(*op, lhs, rhs, table, snapshot, program);
     }
     let Some(cmp) = predicate_compare_code(*op) else {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1290,6 +1328,46 @@ fn compile_text_eq_leaf(
         offsets_byte_offset: layout.offsets_byte_offset,
         bytes_byte_offset: layout.bytes_byte_offset,
         needle_idx,
+        negate,
+    });
+    Ok(())
+}
+
+/// Compile a BOOL comparison leaf (`boolcol =/<> true|false`, either operand order) into a `BoolMask` VM
+/// step the mask VM combines with AND/OR. `= true` -> the set bits (negate false); `= false` (and the
+/// upstream `NOT flag` -> `flag = false`) -> the clear bits (negate true); `<>` is the complement.
+/// Mirrors the single-comparison bool fast path but as a mask. Ordering ops are rejected (never mis-run).
+fn compile_bool_leaf(
+    op: ResidentBinaryOp,
+    lhs: &ResidentExpr,
+    rhs: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+) -> Result<(), ExecuteError> {
+    let is_bool_col =
+        |idx: usize| table.columns.get(idx).map(|column| column.ty) == Some(SqlType::Bool);
+    let (col, literal) = match (lhs, rhs) {
+        (ResidentExpr::Column(col), ResidentExpr::BoolLiteral(b)) if is_bool_col(*col) => (*col, *b),
+        (ResidentExpr::BoolLiteral(b), ResidentExpr::Column(col)) if is_bool_col(*col) => (*col, *b),
+        _ => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a bool comparison must be a bool column against a true/false literal".to_string(),
+            )));
+        }
+    };
+    let negate = match op {
+        ResidentBinaryOp::Eq => !literal,
+        ResidentBinaryOp::Ne => literal,
+        _ => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor supports only = / <> against a bool literal".to_string(),
+            )));
+        }
+    };
+    let offset = resident_device_bool_column_offset(snapshot, table, col)?;
+    program.push(ExprStep::BoolMask {
+        bitmap_byte_offset: offset,
         negate,
     });
     Ok(())
@@ -4130,11 +4208,17 @@ impl Engine {
                     .to_string(),
             )));
         }
-        // Mixed int8/text (e.g. `bigcol > 5 AND tag = 'a'`) would mix an i64 VM with i32 text masks --
-        // a follow-on; reject rather than mis-answer (text AND/OR runs under the i32 VM, int4 + text).
-        if expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table) {
+        // Mixed int8/text or int8/bool (e.g. `bigcol > 5 AND tag = 'a'` / `AND flag`) mixes the i64 VM
+        // with i32 text/bool masks -- a follow-on; reject rather than run the untested path (text/bool
+        // AND/OR runs under the i32 VM, with int4). int8-only AND/OR stays on this i64 VM.
+        if expr_mentions_text(lhs, table)
+            || expr_mentions_text(rhs, table)
+            || expr_mentions_bool_column(lhs, table)
+            || expr_mentions_bool_column(rhs, table)
+        {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "the general GPU executor does not support mixed int8/text expressions yet".to_string(),
+                "the general GPU executor does not support mixed int8/text or int8/bool expressions yet"
+                    .to_string(),
             )));
         }
         let mut program = Vec::new();

@@ -13004,6 +13004,13 @@ pub enum ExprStep {
         needle_idx: u32,
         negate: bool,
     },
+    /// Push the mask `bitmap[i] ^ negate ? 1 : 0` for the resident BOOL column whose 1-bit-per-row
+    /// bitmap is at `bitmap_byte_offset` (`negate` selects the clear bits, i.e. `flag = false` / `NOT
+    /// flag`). Lets the mask VM combine a bool column with AND/OR (and int4/text) -- e.g. `flag AND x>0`.
+    BoolMask {
+        bitmap_byte_offset: u64,
+        negate: bool,
+    },
 }
 
 /// Compare an int4 value buffer (absolute device ptr) to `needle` and return the matching row
@@ -13402,6 +13409,15 @@ fn run_resident_arith_program<'r>(
     } else {
         None
     };
+    // Bool column bitmap -> i32 mask, so the VM can combine a bool column with AND/OR. Lazy (only if used).
+    let bool_mask_fn = if program
+        .iter()
+        .any(|s| matches!(s, ExprStep::BoolMask { .. }))
+    {
+        Some(primary.cached_function(c"gpu_db_resident_bool_to_mask", &ptx)?)
+    } else {
+        None
+    };
     // numeric (i128) multiply is a SEPARATE kernel — the signed 128x128->256 product is too large to
     // inline into the add/sub binary kernel — loaded only for I128. int4/int8 multiply lives in their
     // binary kernel (mul.hi), so this stays None there.
@@ -13721,6 +13737,28 @@ fn run_resident_arith_program<'r>(
                     (&mut a5 as *mut u32).cast::<c_void>(),
                     (&mut a6 as *mut u64).cast::<c_void>(),
                     (&mut a7 as *mut u64).cast::<c_void>(),
+                ];
+                launch(function, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::BoolMask {
+                bitmap_byte_offset,
+                negate,
+            } => {
+                // bitmap[i] ^ negate -> i32 mask pushed on the stack; the VM combines it with AND/OR.
+                let function = bool_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = bitmap_byte_offset;
+                let mut a2 = u32::from(negate);
+                let mut a3 = n;
+                let mut a4 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);

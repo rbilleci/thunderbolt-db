@@ -1787,6 +1787,114 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_where_bool_and_or() {
+    // Bool column in AND/OR on the general executor: a bool bitmap -> i32 mask the VM combines with
+    // AND/OR (and int4). `NOT flag` is `flag = false`. Reuses gpu_db_resident_bool_to_mask (no new kernel).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE bq (id INT, active BOOL, qty INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO bq (id, active, qty) VALUES (1,true,5),(2,false,3),(3,true,10),(4,false,8)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("bq").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let ids = |res: &RelationalSelectResult| -> Vec<i32> {
+        let mut v: Vec<i32> = res
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                SqlValue::Int4(v) => *v,
+                other => panic!("expected int4, got {other:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let run = |sql: &str| e.execute_resident_expr_select_sql(sql).expect(sql);
+    let and = run("SELECT id FROM bq WHERE active AND qty > 6");
+    assert_eq!(and.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(ids(&and), vec![3], "bare bool AND an int4 comparison");
+    assert_eq!(
+        ids(&run("SELECT id FROM bq WHERE NOT active AND qty > 4")),
+        vec![4],
+        "NOT bool (-> bool=false) AND int4"
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM bq WHERE active OR qty > 7")),
+        vec![1, 3, 4],
+        "bool OR int4"
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM bq WHERE active = false AND qty < 5")),
+        vec![2],
+        "bool = false AND int4"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_catalog_pg_attribute_d_table_columns() {
+    // Function-free `\d <table>` column listing (golden 24 minus format_type): 3-way pg_attribute JOIN
+    // pg_class JOIN pg_namespace, the per-side `attnum > 0 AND NOT attisdropped` (int4 AND bool, now on
+    // the GPU mask VM), ORDER BY attnum, projecting the newly-synthesized atttypmod/attisdropped.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE dt_widget (id INT, label TEXT, qty INT)").unwrap();
+    let probe = e.execute_resident_expr_select_sql(
+        "SELECT a.attname FROM pg_catalog.pg_attribute a \
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid WHERE c.relname = 'dt_widget'",
+    );
+    match &probe {
+        Ok(r) if r.executed_target == DeviceTarget::Gpu(0) => {}
+        _ => return,
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT a.attnum, a.attname, a.attnotnull, a.atttypmod \
+             FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname = 'dt_widget' \
+             AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+        )
+        .expect("catalog \\d <table> column listing");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let cols: Vec<(i32, String, bool, i32)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            let num = match &r[0] {
+                SqlValue::Int4(v) => *v,
+                o => panic!("attnum int4, got {o:?}"),
+            };
+            let name = match &r[1] {
+                SqlValue::Text(s) => s.clone(),
+                o => panic!("attname text, got {o:?}"),
+            };
+            let notnull = match &r[2] {
+                SqlValue::Bool(b) => *b,
+                o => panic!("attnotnull bool, got {o:?}"),
+            };
+            let typmod = match &r[3] {
+                SqlValue::Int4(v) => *v,
+                o => panic!("atttypmod int4, got {o:?}"),
+            };
+            (num, name, notnull, typmod)
+        })
+        .collect();
+    assert_eq!(
+        cols,
+        vec![
+            (1, "id".to_string(), false, -1),
+            (2, "label".to_string(), false, -1),
+            (3, "qty".to_string(), false, -1),
+        ],
+        "the \\d <table> column join filters (attnum>0 AND NOT attisdropped) + orders on the GPU"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_order_by_limit_offset() {
     // M5 (catalog \d prerequisite): ORDER BY / LIMIT / OFFSET on a join. ORDER BY is a GPU sort over the
     // join result (int key via the matrix path, text+int multi-key via the hetero payload path).

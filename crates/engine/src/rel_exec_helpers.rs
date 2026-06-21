@@ -508,6 +508,10 @@ pub(crate) fn synthesize_pg_attribute(
             ("attnum", SqlType::Int4),
             ("attlen", SqlType::Int4),
             ("attnotnull", SqlType::Bool),
+            // -1 = no type modifier (PG's atttypmod for unparameterized types); numeric typmod is a
+            // follow-up alongside format_type. attisdropped is always false (no column drops yet).
+            ("atttypmod", SqlType::Int4),
+            ("attisdropped", SqlType::Bool),
         ],
     );
     let attribute_row = |oid: u32, col: &RelationalColumn| {
@@ -517,6 +521,8 @@ pub(crate) fn synthesize_pg_attribute(
             SqlValue::Int4(col.type_oid as i32),
             SqlValue::Int4(i32::from(col.attnum)),
             SqlValue::Int4(i32::from(col.type_size)),
+            SqlValue::Bool(false),
+            SqlValue::Int4(-1),
             SqlValue::Bool(false),
         ]
     };
