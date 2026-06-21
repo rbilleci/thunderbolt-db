@@ -1660,51 +1660,93 @@ impl Engine {
                         // limbs suffices and a byte-identical i128 -- the engine's own numeric/uuid
                         // equality (the GROUP BY b128 key) -- collapses to one distinct value.
                         let value_ty = table.columns[value_idx].ty;
-                        let (matrix, k) = match value_ty {
+                        // GPU-sort (g, value) ASC + mark the first row of each distinct tuple ->
+                        // g_sorted (the per-row group key) and new_distinct (0/1). A FIXED-WIDTH value
+                        // packs into an i64 multikey matrix (int = k2 (g, v); numeric/uuid = k3
+                        // (g, v_hi, v_lo)); a TEXT value (varlen) routes through the hetero sort + the
+                        // text-aware mark, which read the value text from the resident payload.
+                        let (g_sorted, new_distinct) = match value_ty {
                             SqlType::Int2
                             | SqlType::Int4
                             | SqlType::Int8
                             | SqlType::Date
-                            | SqlType::Timestamp => {
-                                let v_vals = materialize_i64_col(value_idx, &idx_u64)?;
-                                let mut m = Vec::with_capacity(n * 2);
-                                for i in 0..n {
-                                    m.push(g_vals[i]);
-                                    m.push(v_vals[i]);
-                                }
-                                (m, 2usize)
+                            | SqlType::Timestamp
+                            | SqlType::Numeric { .. }
+                            | SqlType::Uuid => {
+                                let (matrix, k) = if matches!(
+                                    value_ty,
+                                    SqlType::Numeric { .. } | SqlType::Uuid
+                                ) {
+                                    let off = resident_device_numeric_column_offset(
+                                        &snapshot, table, value_idx,
+                                    )?;
+                                    let v128 = device_memory
+                                        .project_i128_rows_from_payload(off, &idx_u64)
+                                        .map_err(map_err)?;
+                                    let mut m = Vec::with_capacity(n * 3);
+                                    for i in 0..n {
+                                        m.push(g_vals[i]);
+                                        m.push((v128[i] >> 64) as i64);
+                                        m.push((v128[i] as u64) as i64);
+                                    }
+                                    (m, 3usize)
+                                } else {
+                                    let v_vals = materialize_i64_col(value_idx, &idx_u64)?;
+                                    let mut m = Vec::with_capacity(n * 2);
+                                    for i in 0..n {
+                                        m.push(g_vals[i]);
+                                        m.push(v_vals[i]);
+                                    }
+                                    (m, 2usize)
+                                };
+                                let perm = device_memory
+                                    .bitonic_sort_multikey(&matrix, n, k, 0)
+                                    .map_err(map_err)?;
+                                device_memory
+                                    .mark_new_distinct_device(&matrix, &perm, n as u64, k)
+                                    .map_err(map_err)?
                             }
-                            SqlType::Numeric { .. } | SqlType::Uuid => {
-                                let off = resident_device_numeric_column_offset(
+                            SqlType::Text => {
+                                // (g int key, text_v text key): the hetero sort groups equal
+                                // (g, text_v) tuples adjacent; the text-aware mark then compares the
+                                // value text byte-for-byte. key_plan[0]=int slot 0, [1]=text slot 0.
+                                let layout = resident_device_text_column_layout(
                                     &snapshot, table, value_idx,
                                 )?;
-                                let v128 = device_memory
-                                    .project_i128_rows_from_payload(off, &idx_u64)
+                                let key_plan: Vec<u32> = vec![0, 0x4000_0000_u32];
+                                let perm = device_memory
+                                    .bitonic_sort_hetero(
+                                        &idx_u64,
+                                        g_vals,
+                                        1,
+                                        &[(
+                                            layout.offsets_byte_offset,
+                                            layout.bytes_byte_offset,
+                                        )],
+                                        &[],
+                                        &key_plan,
+                                        0,
+                                    )
                                     .map_err(map_err)?;
-                                let mut m = Vec::with_capacity(n * 3);
-                                for i in 0..n {
-                                    m.push(g_vals[i]);
-                                    m.push((v128[i] >> 64) as i64);
-                                    m.push((v128[i] as u64) as i64);
-                                }
-                                (m, 3usize)
+                                device_memory
+                                    .mark_new_distinct_text_device(
+                                        &perm,
+                                        &idx_u64,
+                                        g_vals,
+                                        layout.offsets_byte_offset,
+                                        layout.bytes_byte_offset,
+                                        n as u64,
+                                    )
+                                    .map_err(map_err)?
                             }
                             _ => {
                                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                    "COUNT(DISTINCT) value column must be int/numeric/uuid on the \
-                                     GPU path (text is a follow-up)"
+                                    "COUNT(DISTINCT) value column must be \
+                                     int/numeric/uuid/text on the GPU path"
                                         .to_string(),
                                 )));
                             }
                         };
-                        // ASC sort by (g, value) (desc_mask = 0): orders rows by group then value.
-                        let perm = device_memory
-                            .bitonic_sort_multikey(&matrix, n, k, 0)
-                            .map_err(map_err)?;
-                        // Mark first-seen (g, value) tuples + gather the per-row group key (sorted).
-                        let (g_sorted, new_distinct) = device_memory
-                            .mark_new_distinct_device(&matrix, &perm, n as u64, k)
-                            .map_err(map_err)?;
                         // SUM(new_distinct) grouped by g_sorted = the per-group distinct count. indices
                         // = 0..n (the sorted positions); the kernel reads g_sorted / new_distinct (both
                         // i64) via key/value_base_override. The leases live across this synced call.

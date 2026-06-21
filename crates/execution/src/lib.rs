@@ -1181,6 +1181,28 @@ impl CudaResidentDeviceMemory {
         launch_cuda_mark_new_distinct_device(self, keys, perm, n, k)
     }
 
+    /// COUNT(DISTINCT v) mark pass for a TEXT value (varlen -> cannot pack into i64 keys). `perm` is
+    /// the positions 0..n from [`Self::bitonic_sort_hetero`] over the `(g, text_v)` tuple; `indices`
+    /// the surviving absolute resident rows (by position); `g_keys` the int group key (by position,
+    /// like the hetero sort's `int_keys`). `text_off`/`text_bytes` are the value column's offsets/bytes
+    /// section byte offsets into the resident payload. Runs `gpu_db_mark_new_distinct_text` and returns
+    /// `(g_sorted, new_distinct)` RESIDENT (cuCtxSynchronize'd). SUM(new_distinct) grouped by g_sorted
+    /// (via the GROUP BY kernel's key/value_base_override) = the per-group distinct count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_new_distinct_text_device(
+        &self,
+        perm: &[u32],
+        indices: &[u64],
+        g_keys: &[i64],
+        text_off: u64,
+        text_bytes: u64,
+        n: u64,
+    ) -> Result<(DeviceArithBuffer<'_>, DeviceArithBuffer<'_>), CudaRuntimeProbeError> {
+        launch_cuda_mark_new_distinct_text_device(
+            self, perm, indices, g_keys, text_off, text_bytes, n,
+        )
+    }
+
     pub fn count_i32_equal_from_payload(
         &self,
         byte_offset: u64,
@@ -13838,6 +13860,168 @@ fn launch_cuda_mark_new_distinct_device<'r>(
             (&mut a3 as *mut u64).cast::<c_void>(),
             (&mut a4 as *mut u64).cast::<c_void>(),
             (&mut a5 as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                kernel_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let g_ptr = g_out.ptr;
+    let nd_ptr = nd_out.ptr;
+    Ok((
+        DeviceArithBuffer {
+            _lease: g_out,
+            ptr: g_ptr,
+        },
+        DeviceArithBuffer {
+            _lease: nd_out,
+            ptr: nd_ptr,
+        },
+    ))
+}
+
+/// COUNT(DISTINCT v) mark pass for a TEXT value (see
+/// [`CudaResidentDeviceMemory::mark_new_distinct_text_device`]). Uploads the hetero-sort permutation,
+/// the surviving absolute rows, and the per-position group key; runs `gpu_db_mark_new_distinct_text`
+/// (which reads the value text from the resident payload via text_off/text_bytes), and returns the two
+/// derived i64 device columns `(g_sorted, new_distinct)`. cuCtxSynchronize'd so the SEPARATE GROUP BY
+/// launch reads completed buffers (a fully-drained launch, off the bool-GROUP-BY hazard).
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_mark_new_distinct_text_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    perm: &[u32],
+    indices: &[u64],
+    g_keys: &[i64],
+    text_off: u64,
+    text_bytes: u64,
+    n: u64,
+) -> Result<(DeviceArithBuffer<'r>, DeviceArithBuffer<'r>), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if n_usize == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    if perm.len() != n_usize {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(perm.len()));
+    }
+    if indices.len() != n_usize {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(indices.len()));
+    }
+    if g_keys.len() != n_usize {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(g_keys.len()));
+    }
+    let perm_bytes = n_usize
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let indices_bytes = n_usize
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let gkeys_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let out_bytes = gkeys_bytes;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_mark_new_distinct_text", &ptx)?;
+    let resident_base = resident.device_ptr();
+    let perm_dev = primary.lease_device_buffer(perm_bytes)?;
+    let indices_dev = primary.lease_device_buffer(indices_bytes)?;
+    let gkeys_dev = primary.lease_device_buffer(gkeys_bytes)?;
+    let g_out = primary.lease_device_buffer(out_bytes)?;
+    let nd_out = primary.lease_device_buffer(out_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = (n_usize.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc =
+            unsafe { htod_async(perm_dev.ptr, perm.as_ptr().cast::<c_void>(), perm_bytes, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
+            htod_async(
+                indices_dev.ptr,
+                indices.as_ptr().cast::<c_void>(),
+                indices_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let rc = unsafe {
+            htod_async(
+                gkeys_dev.ptr,
+                g_keys.as_ptr().cast::<c_void>(),
+                gkeys_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let mut a0 = perm_dev.ptr;
+        let mut a1 = indices_dev.ptr;
+        let mut a2 = gkeys_dev.ptr;
+        let mut a3 = resident_base;
+        let mut a4 = text_off;
+        let mut a5 = text_bytes;
+        let mut a6 = n;
+        let mut a7 = g_out.ptr;
+        let mut a8 = nd_out.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast::<c_void>(),
+            (&mut a1 as *mut u64).cast::<c_void>(),
+            (&mut a2 as *mut u64).cast::<c_void>(),
+            (&mut a3 as *mut u64).cast::<c_void>(),
+            (&mut a4 as *mut u64).cast::<c_void>(),
+            (&mut a5 as *mut u64).cast::<c_void>(),
+            (&mut a6 as *mut u64).cast::<c_void>(),
+            (&mut a7 as *mut u64).cast::<c_void>(),
+            (&mut a8 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(

@@ -3512,6 +3512,180 @@ done_mark_nd:
     ret;
 }
 
+// COUNT(DISTINCT v) mark pass for a TEXT value: the value is varlen so it cannot pack into i64 keys;
+// the (g, text_v) tuple was instead sorted on the GPU via gpu_db_bitonic_sort_hetero (g the int key,
+// text_v the text key), giving `perm` (positions 0..n). This kernel marks the first row of each
+// distinct (g, text_v) tuple in that sorted order and gathers each sorted row's g. For sorted
+// position i: pos = perm[i], abs = indices[pos] (the absolute resident row), g = gkeys[pos] (the int
+// group key, laid out BY POSITION exactly like the hetero sort's int_keys). g_out[i] = g; nd_out[i] =
+// 1 iff position i begins a new tuple (i == 0, OR g != g[i-1], OR the text bytes at abs differ from
+// the text at indices[perm[i-1]]). The sort already made equal (g, text_v) ADJACENT, so the text test
+// is plain byte EQUALITY (length then bytes), not a lexicographic compare. text_off/text_bytes are the
+// value column's offsets/bytes section byte offsets into resident_base; offsets are read 2x ld.u32
+// (716-safe). A pure MAP -- no atomics -- so it cannot reintroduce the bool-GROUP-BY hazard.
+// SUM(nd_out) grouped by g_out = the per-group distinct count.
+.visible .entry gpu_db_mark_new_distinct_text(
+    .param .u64 perm_ptr,
+    .param .u64 indices_ptr,
+    .param .u64 gkeys_ptr,
+    .param .u64 resident_base_ptr,
+    .param .u64 text_off,
+    .param .u64 text_bytes,
+    .param .u64 n,
+    .param .u64 g_out,
+    .param .u64 nd_out
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %pos;
+    .reg .u32 %ppos;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %abyte;
+    .reg .u32 %bbyte;
+    .reg .u64 %permp;
+    .reg .u64 %indp;
+    .reg .u64 %gkp;
+    .reg .u64 %resb;
+    .reg .u64 %toff;
+    .reg .u64 %tbyt;
+    .reg .u64 %n;
+    .reg .u64 %gout;
+    .reg .u64 %ndout;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %abs;
+    .reg .u64 %pabs;
+    .reg .u64 %g;
+    .reg .u64 %pg;
+    .reg .u64 %nd;
+    .reg .u64 %offb;
+    .reg .u64 %bytb;
+    .reg .u64 %sta;
+    .reg .u64 %ena;
+    .reg .u64 %stb;
+    .reg .u64 %enb;
+    .reg .u64 %lena;
+    .reg .u64 %lenb;
+    .reg .u64 %ba;
+    .reg .u64 %bb;
+    .reg .u64 %j;
+    .reg .u64 %posq;
+    .reg .u64 %pposq;
+
+    ld.param.u64 %permp, [perm_ptr];
+    ld.param.u64 %indp, [indices_ptr];
+    ld.param.u64 %gkp, [gkeys_ptr];
+    ld.param.u64 %resb, [resident_base_ptr];
+    ld.param.u64 %toff, [text_off];
+    ld.param.u64 %tbyt, [text_bytes];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %gout, [g_out];
+    ld.param.u64 %ndout, [nd_out];
+    add.u64 %offb, %resb, %toff;
+    add.u64 %bytb, %resb, %tbyt;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+mtxt_loop:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra mtxt_done;
+    // pos = perm[i]; abs = indices[pos]; g = gkeys[pos]
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %permp, %o;
+    ld.global.u32 %pos, [%addr];
+    cvt.u64.u32 %posq, %pos;
+    mul.lo.u64 %o, %posq, 8;
+    add.u64 %addr, %indp, %o;
+    ld.global.u64 %abs, [%addr];
+    add.u64 %addr, %gkp, %o;
+    ld.global.u64 %g, [%addr];
+    // g_out[i] = g
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %gout, %o;
+    st.global.u64 [%addr], %g;
+    // i == 0 always begins a new distinct tuple.
+    setp.eq.u64 %p, %i, 0;
+    @%p bra mtxt_new;
+    // ppos = perm[i-1]; pabs = indices[ppos]; pg = gkeys[ppos]
+    sub.u64 %o, %i, 1;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %addr, %permp, %o;
+    ld.global.u32 %ppos, [%addr];
+    cvt.u64.u32 %pposq, %ppos;
+    mul.lo.u64 %o, %pposq, 8;
+    add.u64 %addr, %indp, %o;
+    ld.global.u64 %pabs, [%addr];
+    add.u64 %addr, %gkp, %o;
+    ld.global.u64 %pg, [%addr];
+    // g != pg -> new
+    setp.ne.u64 %p, %g, %pg;
+    @%p bra mtxt_new;
+    // text of abs: sta = offsets[abs], ena = offsets[abs+1] (read 2x u32 = 716-safe)
+    mul.lo.u64 %o, %abs, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %sta, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %ena, {%w0, %w1};
+    sub.u64 %lena, %ena, %sta;
+    // text of pabs
+    mul.lo.u64 %o, %pabs, 8;
+    add.u64 %addr, %offb, %o;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mov.b64 %stb, {%w0, %w1};
+    ld.global.u32 %w0, [%addr+8];
+    ld.global.u32 %w1, [%addr+12];
+    mov.b64 %enb, {%w0, %w1};
+    sub.u64 %lenb, %enb, %stb;
+    // unequal length -> new
+    setp.ne.u64 %p, %lena, %lenb;
+    @%p bra mtxt_new;
+    // compare lena bytes; any differ -> new
+    add.u64 %ba, %bytb, %sta;
+    add.u64 %bb, %bytb, %stb;
+    mov.u64 %j, 0;
+mtxt_byte:
+    setp.ge.u64 %p, %j, %lena;
+    @%p bra mtxt_eq;
+    add.u64 %addr, %ba, %j;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %bb, %j;
+    ld.global.u8 %bbyte, [%addr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra mtxt_new;
+    add.u64 %j, %j, 1;
+    bra mtxt_byte;
+mtxt_eq:
+    mov.u64 %nd, 0;
+    bra mtxt_store;
+mtxt_new:
+    mov.u64 %nd, 1;
+mtxt_store:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %ndout, %o;
+    st.global.u64 [%addr], %nd;
+    add.u64 %i, %i, %stride;
+    bra mtxt_loop;
+mtxt_done:
+    ret;
+}
+
 // out[0] += sum over k<count of the i32 column value at row indices[k], sign-extended to i64 (the
 // operator axis, doc 19). `out_ptr` is a single i64 the host initialized to 0; `indices_ptr` is the
 // filter's surviving u32 row indices. SUM(int4) over a filtered set -> bigint; the i64 atomic add is

@@ -3270,6 +3270,113 @@ fn gpu_grouped_count_distinct_numeric_combined_with_count_star() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_text_value() {
+    // COUNT(DISTINCT v) over a TEXT value -- varlen, so the (g, text_v) tuple GPU-sorts via the hetero
+    // sort and the text-aware mark compares the value bytes. 7 rows (ODD -> the text offsets section is
+    // 4-mod-8 after the single int4 column, exercising the 8-align pad). Distinct counts KNOWN BY
+    // CONSTRUCTION; g=2 includes length-differing prefixes (the empty-string case in
+    // `..._combined_with_count_star` is the robust guard for the byte-length check):
+    //   g=1: {"apple", "apple", "banana"} -> 2 distinct (a duplicate)
+    //   g=2: {"x", "xy", "xyz"}           -> 3 distinct (each a prefix of the next; lengths differ)
+    //   g=3: {"hello"}                     -> 1 distinct (single)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES \
+         (1, 'apple'),(1, 'apple'),(1, 'banana'),(2, 'x'),(2, 'xy'),(2, 'xyz'),(3, 'hello')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT text) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1)],
+        ],
+        "distinct text count (duplicate / length-differing prefixes / single)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_text_combined_with_count_star() {
+    // SELECT g, COUNT(*), COUNT(DISTINCT v) over a TEXT value -- a direct COUNT(*) pass folded with the
+    // hetero-sort text COUNT(DISTINCT) pass, merged by the MATERIALIZED group key. g=1 includes the
+    // EMPTY STRING (a valid distinct value, length 0 -> the byte loop runs zero iterations).
+    //   g=1: {"", "", "z"}   -> count 3, distinct 2 (empty duplicated)
+    //   g=2: {"foo", "bar"}  -> count 2, distinct 2
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES (1, ''),(1, ''),(1, 'z'),(2, 'foo'),(2, 'bar')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*), COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(*) + COUNT(DISTINCT text) grouped");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(3), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(2), SqlValue::Int8(2)],
+        ],
+        "COUNT(*) and COUNT(DISTINCT text) merged by group, incl. the empty string"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_text_shared_value_across_groups() {
+    // The SAME text value ("same") appears in three groups -- so in (g, text_v) sorted order the rows
+    // (1,"same"),(1,"same"),(2,"same"),(3,"same") are ADJACENT with IDENTICAL text but changing g.
+    // This makes the text mark's GROUP-KEY comparison load-bearing: if it ignored g and compared only
+    // the text, g=2 and g=3 would collapse into g=1's run (distinct 0/1 instead of 1/1). Construction:
+    //   g=1: {"same", "same"} -> 1 distinct
+    //   g=2: {"same"}         -> 1 distinct (text equals g=1's, but a new group)
+    //   g=3: {"same", "zzz"}  -> 2 distinct (shared "same" + a distinct value)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES (1, 'same'),(1, 'same'),(2, 'same'),(3, 'same'),(3, 'zzz')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT text) with a value shared across groups");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(2)],
+        ],
+        "the group-key compare splits identical text across group boundaries"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_multiple_aggregates_different_value_columns() {
     // SELECT g, SUM(v), MIN(w), MAX(w) FROM t GROUP BY g -- aggregates over TWO different value columns
     // (v int4, w int8) -> two grouping passes (single-level forced) merged by group index.
