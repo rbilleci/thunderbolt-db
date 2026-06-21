@@ -17,7 +17,9 @@ use pg_query::protobuf::{
 };
 use pg_query::NodeEnum;
 
-use crate::engine_expr::{JoinColRef, JoinPlan, JoinProjItem, ResidentBinaryOp, ResidentExpr};
+use crate::engine_expr::{
+    JoinColRef, JoinPlan, JoinProjItem, JoinRelationRef, JoinStep, ResidentBinaryOp, ResidentExpr,
+};
 use gpu_db_sql::{SelectFilter, SelectFilterOp, SelectOrder};
 
 impl Engine {
@@ -59,27 +61,20 @@ impl Engine {
                     Err(sql_pg_error(format!("relation \"{name}\" does not exist")))
                 }
             };
-            let (left_table, left_rows) = bind(&plan.left_table)?;
-            let (right_table, right_rows) = bind(&plan.right_table)?;
-            let (left_pred, right_pred) = match stmt.where_clause.as_deref() {
-                Some(where_node) => split_join_where(
-                    where_node,
-                    &left_table,
-                    &plan.left_alias,
-                    &right_table,
-                    &plan.right_alias,
-                )?,
-                None => (None, None),
+            let mut tables: Vec<RelationalTable> = Vec::with_capacity(plan.relations.len());
+            let mut rows: Vec<Option<Vec<Vec<SqlValue>>>> =
+                Vec::with_capacity(plan.relations.len());
+            for relation in &plan.relations {
+                let (table, relation_rows) = bind(&relation.table)?;
+                tables.push(table);
+                rows.push(relation_rows);
+            }
+            let aliases: Vec<&str> = plan.relations.iter().map(|r| r.alias.as_str()).collect();
+            let predicates = match stmt.where_clause.as_deref() {
+                Some(where_node) => split_join_where(where_node, &tables, &aliases)?,
+                None => (0..plan.relations.len()).map(|_| None).collect(),
             };
-            return self.execute_resident_expr_inner_join(
-                &plan,
-                &left_table,
-                &right_table,
-                left_rows,
-                right_rows,
-                left_pred.as_ref(),
-                right_pred.as_ref(),
-            );
+            return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates);
         }
         let (select, qualifier) = build_select_from_select_stmt(&stmt)?;
         // Bind once; map the predicate (if any) against that SAME bound table; execute against that
@@ -352,34 +347,16 @@ fn join_side_name_alias(node: &Node) -> Result<(String, String), ExecuteError> {
     Ok((table, alias))
 }
 
-/// Parse `SELECT <cols> FROM a JOIN b ON a.k = b.k` (libpg_query) into a [`JoinPlan`] (M5). Slice scope:
-/// INNER JOIN, a single `=` equi-join conjunct between two base tables, plain-column projection, and NO
-/// WHERE/GROUP BY/HAVING/ORDER BY/LIMIT/DISTINCT (each a clean "not on the join path yet"). The
-/// executor resolves the ON operands + projection to relations/columns and validates the key types.
-fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
-    let unsupported = [
-        // WHERE is supported (mapped per-relation in the entry); GROUP BY / aggregates / ORDER BY /
-        // LIMIT / DISTINCT over a join are follow-ups.
-        (!stmt.group_clause.is_empty(), "GROUP BY"),
-        (stmt.having_clause.is_some(), "HAVING"),
-        (!stmt.sort_clause.is_empty(), "ORDER BY"),
-        (stmt.limit_count.is_some(), "LIMIT"),
-        (stmt.limit_offset.is_some(), "OFFSET"),
-        (!stmt.distinct_clause.is_empty(), "DISTINCT"),
-        (!stmt.window_clause.is_empty(), "window functions"),
-        (stmt.with_clause.is_some(), "WITH / CTEs"),
-    ];
-    if let Some((_, clause)) = unsupported.iter().find(|(present, _)| *present) {
-        return Err(sql_pg_error(format!(
-            "{clause} on a JOIN is not on the general GPU executor's join path yet"
-        )));
-    }
-    let [from] = stmt.from_clause.as_slice() else {
-        return Err(sql_pg_error("expected a single JOIN in the FROM clause".to_string()));
-    };
-    let NodeEnum::JoinExpr(join) = node_enum(from)? else {
-        return Err(sql_pg_error("expected a JOIN in the FROM clause".to_string()));
-    };
+/// Flatten ONE INNER-join node of a LEFT-DEEP chain into `relations` + `steps` (M5 J6). The left arg may
+/// be a nested `JoinExpr` (recurse first, so relations end up in left-deep order) or a base table; the
+/// right arg MUST be a base table (a right-nested `a JOIN (b JOIN c)` / bushy tree is a follow-up). Per
+/// node: INNER only, no NATURAL/USING, a single `=` ON between two columns. `steps[k]` (the k-th node
+/// folded in) carries that node's ON; the executor figures out which operand is the newly joined relation.
+fn flatten_join_chain(
+    join: &pg_query::protobuf::JoinExpr,
+    relations: &mut Vec<JoinRelationRef>,
+    steps: &mut Vec<JoinStep>,
+) -> Result<(), ExecuteError> {
     if join.jointype != JoinType::JoinInner as i32 {
         return Err(sql_pg_error(
             "only INNER JOIN is on the join path yet (LEFT/RIGHT/FULL are a follow-up)".to_string(),
@@ -398,8 +375,15 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
         .rarg
         .as_deref()
         .ok_or_else(|| sql_pg_error("JOIN missing its right relation".to_string()))?;
-    let (left_table, left_alias) = join_side_name_alias(larg)?;
-    let (right_table, right_alias) = join_side_name_alias(rarg)?;
+    match node_enum(larg)? {
+        NodeEnum::JoinExpr(inner) => flatten_join_chain(inner, relations, steps)?,
+        _ => {
+            let (table, alias) = join_side_name_alias(larg)?;
+            relations.push(JoinRelationRef { table, alias });
+        }
+    }
+    let (table, alias) = join_side_name_alias(rarg)?;
+    relations.push(JoinRelationRef { table, alias });
     // ON: a single `=` between two column references.
     let quals = join
         .quals
@@ -425,9 +409,46 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
         .rexpr
         .as_deref()
         .ok_or_else(|| sql_pg_error("malformed join ON condition".to_string()))?;
-    let on_a = parse_join_col_ref(lexpr)?;
-    let on_b = parse_join_col_ref(rexpr)?;
-    // Projection: a non-empty list of plain column references.
+    steps.push(JoinStep {
+        on_a: parse_join_col_ref(lexpr)?,
+        on_b: parse_join_col_ref(rexpr)?,
+    });
+    Ok(())
+}
+
+/// Parse `SELECT <cols> FROM a JOIN b ON .. [JOIN c ON ..]` (libpg_query) into a [`JoinPlan`] (M5). Scope:
+/// a LEFT-DEEP chain of INNER JOINs, each with a single `=` equi-join conjunct between two base tables,
+/// plain-column / `*` projection, and NO GROUP BY/HAVING/ORDER BY/LIMIT/DISTINCT (each a clean "not on the
+/// join path yet"). WHERE is supported (split per-relation in the entry). The executor resolves the ON
+/// operands + projection to relations/columns, validates the key types, and pipelines the chain.
+fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
+    let unsupported = [
+        // WHERE is supported (mapped per-relation in the entry); GROUP BY / aggregates / ORDER BY /
+        // LIMIT / DISTINCT over a join are follow-ups.
+        (!stmt.group_clause.is_empty(), "GROUP BY"),
+        (stmt.having_clause.is_some(), "HAVING"),
+        (!stmt.sort_clause.is_empty(), "ORDER BY"),
+        (stmt.limit_count.is_some(), "LIMIT"),
+        (stmt.limit_offset.is_some(), "OFFSET"),
+        (!stmt.distinct_clause.is_empty(), "DISTINCT"),
+        (!stmt.window_clause.is_empty(), "window functions"),
+        (stmt.with_clause.is_some(), "WITH / CTEs"),
+    ];
+    if let Some((_, clause)) = unsupported.iter().find(|(present, _)| *present) {
+        return Err(sql_pg_error(format!(
+            "{clause} on a JOIN is not on the general GPU executor's join path yet"
+        )));
+    }
+    let [from] = stmt.from_clause.as_slice() else {
+        return Err(sql_pg_error("expected a single JOIN in the FROM clause".to_string()));
+    };
+    let NodeEnum::JoinExpr(join) = node_enum(from)? else {
+        return Err(sql_pg_error("expected a JOIN in the FROM clause".to_string()));
+    };
+    let mut relations: Vec<JoinRelationRef> = Vec::new();
+    let mut steps: Vec<JoinStep> = Vec::new();
+    flatten_join_chain(join, &mut relations, &mut steps)?;
+    // Projection: a non-empty list of plain column references / stars.
     if stmt.target_list.is_empty() {
         return Err(sql_pg_error("a join SELECT must project at least one column".to_string()));
     }
@@ -443,59 +464,60 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
         projection.push(parse_join_proj_item(val)?);
     }
     Ok(JoinPlan {
-        left_table,
-        left_alias,
-        right_table,
-        right_alias,
-        on_a,
-        on_b,
+        relations,
+        steps,
         projection,
     })
 }
 
-/// Split a join WHERE into per-relation predicates (M5 J3). Each top-level AND conjunct must reference
-/// exactly ONE relation; it is mapped (via `map_predicate_node`, which handles all literal types +
-/// arithmetic/comparison/AND-OR) against that relation, and each side's conjuncts are AND-folded into
-/// that relation's predicate (the executor GPU-evaluates it to pre-filter before the join -- inner-join
-/// semantics are filter-commutative on per-side predicates). A conjunct referencing BOTH relations (a
-/// join predicate beyond the ON, e.g. `a.x > b.y`) is a follow-up -> a clean error.
+/// Split a join WHERE into per-relation predicates, one per relation in `tables`/`aliases` (M5 J3/J6).
+/// Each top-level AND conjunct must reference exactly ONE relation; it is mapped (via
+/// `map_predicate_node`, which handles all literal types + arithmetic/comparison/AND-OR) against the
+/// FIRST relation it resolves against (left-deep order -- matching the original 2-relation left-first
+/// behavior), and that relation's conjuncts are AND-folded into its predicate (the executor GPU-evaluates
+/// it to pre-filter before the join -- inner-join semantics are filter-commutative on per-side
+/// predicates). A conjunct referencing NO single relation (a cross-relation predicate beyond the ON, e.g.
+/// `a.x > b.y`) is a follow-up -> a clean error. Returns a Vec parallel to `tables`.
 fn split_join_where(
     where_node: &Node,
-    left_table: &RelationalTable,
-    left_alias: &str,
-    right_table: &RelationalTable,
-    right_alias: &str,
-) -> Result<(Option<ResidentExpr>, Option<ResidentExpr>), ExecuteError> {
+    tables: &[RelationalTable],
+    aliases: &[&str],
+) -> Result<Vec<Option<ResidentExpr>>, ExecuteError> {
     let mut conjuncts: Vec<&Node> = Vec::new();
     collect_and_conjuncts(where_node, &mut conjuncts)?;
-    let mut left: Vec<ResidentExpr> = Vec::new();
-    let mut right: Vec<ResidentExpr> = Vec::new();
+    let mut per_relation: Vec<Vec<ResidentExpr>> = (0..tables.len()).map(|_| Vec::new()).collect();
     for conjunct in conjuncts {
-        // Map against the LEFT relation, else the RIGHT. A conjunct referencing the other relation's
-        // qualifier/columns fails the first map and succeeds the second; a cross-relation conjunct
-        // fails both.
-        match map_predicate_node(conjunct, left_table, left_alias) {
-            Ok(expr) => left.push(expr),
-            Err(_) => match map_predicate_node(conjunct, right_table, right_alias) {
-                Ok(expr) => right.push(expr),
-                Err(_) => {
-                    return Err(sql_pg_error(
-                        "a join WHERE conjunct must reference exactly one relation (a cross-relation \
-                         predicate beyond the ON is a follow-up)"
-                            .to_string(),
-                    ))
-                }
-            },
+        // Map against each relation in order; the FIRST that succeeds owns the conjunct (a conjunct
+        // referencing another relation's qualifier/columns fails earlier maps; a cross-relation conjunct
+        // fails them all).
+        let mapped = tables
+            .iter()
+            .zip(aliases)
+            .enumerate()
+            .find_map(|(i, (table, alias))| {
+                map_predicate_node(conjunct, table, alias).ok().map(|expr| (i, expr))
+            });
+        match mapped {
+            Some((i, expr)) => per_relation[i].push(expr),
+            None => {
+                return Err(sql_pg_error(
+                    "a join WHERE conjunct must reference exactly one relation (a cross-relation \
+                     predicate beyond the ON is a follow-up)"
+                        .to_string(),
+                ))
+            }
         }
     }
-    let fold = |conjuncts: Vec<ResidentExpr>| -> Option<ResidentExpr> {
-        conjuncts.into_iter().reduce(|acc, expr| ResidentExpr::Binary {
-            op: ResidentBinaryOp::And,
-            lhs: Box::new(acc),
-            rhs: Box::new(expr),
+    Ok(per_relation
+        .into_iter()
+        .map(|conjuncts| {
+            conjuncts.into_iter().reduce(|acc, expr| ResidentExpr::Binary {
+                op: ResidentBinaryOp::And,
+                lhs: Box::new(acc),
+                rhs: Box::new(expr),
+            })
         })
-    };
-    Ok((fold(left), fold(right)))
+        .collect())
 }
 
 /// Flatten a top-level chain of `AND`s into individual conjuncts; any other node is a single conjunct.

@@ -909,10 +909,10 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
         ambig.contains("ambiguous"),
         "ambiguous unqualified column rejected, got: {ambig}"
     );
-    // An ON that equates two columns of the SAME relation is not a 2-relation equi-join.
+    // An ON that equates two columns of the SAME relation does not join the newly added relation.
     let same_rel = reject("SELECT x, y FROM a JOIN b ON a.k = a.x");
     assert!(
-        same_rel.contains("each relation") || same_rel.contains("ambiguous"),
+        same_rel.contains("already-joined") || same_rel.contains("ambiguous"),
         "ON within one relation rejected, got: {same_rel}"
     );
     // A qualifier naming no FROM relation is rejected.
@@ -1014,6 +1014,166 @@ fn gpu_inner_join_catalog_relations_transient_payload() {
         )
         .expect("catalog inner join, no WHERE");
     assert_eq!(names(&no_where), expected, "the join key alone selects the public namespace");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_three_way_user_tables() {
+    // M5 J6: a 3-way LEFT-DEEP chain of INNER joins over RESIDENT user tables, pipelined by carrying
+    // per-relation absolute-row indices (no intermediate materialized to a device payload). The second
+    // step joins on a column from the FIRST relation joined in step 0 (cust.rid), exercising
+    // accumulated-set resolution.
+    //   ord JOIN cust ON cust.cid = ord.cid JOIN region ON region.rid = cust.rid
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)").unwrap();
+    e.execute_text(3, "CREATE TABLE ord (oid INT, cid INT, label TEXT)").unwrap();
+    e.execute_text(4, "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')").unwrap();
+    e.execute_text(5, "INSERT INTO cust (cid, rid, cname) VALUES (10,1,'alice'),(20,2,'bob')").unwrap();
+    e.execute_text(6, "INSERT INTO ord (oid, cid, label) VALUES (100,10,'x'),(101,10,'y'),(102,20,'z')").unwrap();
+    let rs = e.populate_relational_residency_snapshot("region").unwrap();
+    let cs = e.populate_relational_residency_snapshot("cust").unwrap();
+    let os = e.populate_relational_residency_snapshot("ord").unwrap();
+    if rs.device_memory_proof.is_none() || cs.device_memory_proof.is_none() || os.device_memory_proof.is_none() {
+        return;
+    }
+    let triples = |res: &RelationalSelectResult| -> Vec<(String, String, String)> {
+        let s = |c: &SqlValue| match c {
+            SqlValue::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let mut v: Vec<(String, String, String)> =
+            res.rows.iter().map(|r| (s(&r[0]), s(&r[1]), s(&r[2]))).collect();
+        v.sort();
+        v
+    };
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT ord.label, cust.cname, region.rname FROM ord \
+             JOIN cust ON cust.cid = ord.cid \
+             JOIN region ON region.rid = cust.rid",
+        )
+        .expect("3-way inner join over user tables");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(res.columns.len(), 3);
+    assert_eq!(
+        triples(&res),
+        vec![
+            ("x".to_string(), "alice".to_string(), "west".to_string()),
+            ("y".to_string(), "alice".to_string(), "west".to_string()),
+            ("z".to_string(), "bob".to_string(), "east".to_string()),
+        ],
+        "each order -> its customer -> that customer's region"
+    );
+    // Right-nested (bushy) joins are a follow-up: the right arg of a JOIN must be a base table.
+    let bushy = e
+        .execute_resident_expr_select_sql(
+            "SELECT ord.label FROM ord JOIN (cust JOIN region ON region.rid = cust.rid) \
+             ON cust.cid = ord.cid",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(bushy.contains("base table"), "right-nested join rejected, got: {bushy}");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_three_way_catalog_describe_shape() {
+    // M5 J6: the psql `\d`-family 3-way catalog chain -- pg_attribute JOIN pg_class JOIN pg_namespace --
+    // entirely over SYNTHESIZED (transient-payload) relations, with a per-relation GPU WHERE on each.
+    //   pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+    // Construction oracle: `people` has exactly columns (id, name); filtering c.relname='people' selects
+    // them out of multiple tables -> the people columns, each tagged public.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE teams (tid INT)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("people").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT a.attname, c.relname, n.nspname \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname = 'people' AND a.attnum > 0",
+        )
+        .expect("3-way catalog \\d-shape join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let mut got: Vec<(String, String, String)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            let s = |c: &SqlValue| match c {
+                SqlValue::Text(t) => t.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            (s(&r[0]), s(&r[1]), s(&r[2]))
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("id".to_string(), "people".to_string(), "public".to_string()),
+            ("name".to_string(), "people".to_string(), "public".to_string()),
+        ],
+        "people's columns join to its pg_class row and the public namespace; teams is filtered out"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_four_way_back_reference_to_first_relation() {
+    // M5 J6: a 4-way chain whose LAST step joins BACK to relation 0 (`d.aid = a.aid`), with a 1:N fan-out
+    // at relation 2 (c) BEFORE it -- so the carried `work_idx[0]` (a's rows, repeated by the fan-out) and
+    // `work_idx[2]` (c's rows) DIFFER. This is the regression guard for accumulated-set resolution: a step
+    // must project the accumulated key from the relation the ON names (a, index 0), NOT the immediately
+    // prior relation -- the very distinction the index-vector pipeline exists for.
+    //   a JOIN b ON b.aid=a.aid JOIN c ON c.bid=b.bid JOIN d ON d.aid=a.aid
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE a (aid INT, label TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE b (bid INT, aid INT)").unwrap();
+    e.execute_text(3, "CREATE TABLE c (cid INT, bid INT)").unwrap();
+    e.execute_text(4, "CREATE TABLE d (did INT, aid INT, dlabel TEXT)").unwrap();
+    e.execute_text(5, "INSERT INTO a (aid, label) VALUES (1,'x'),(2,'y')").unwrap();
+    e.execute_text(6, "INSERT INTO b (bid, aid) VALUES (10,1)").unwrap();
+    e.execute_text(7, "INSERT INTO c (cid, bid) VALUES (100,10),(101,10)").unwrap();
+    e.execute_text(8, "INSERT INTO d (did, aid, dlabel) VALUES (1000,1,'d1')").unwrap();
+    let mut ok = true;
+    for t in ["a", "b", "c", "d"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT a.label, d.dlabel FROM a \
+             JOIN b ON b.aid = a.aid \
+             JOIN c ON c.bid = b.bid \
+             JOIN d ON d.aid = a.aid",
+        )
+        .expect("4-way join with a back-reference to the first relation");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let pairs = |r: &RelationalSelectResult| -> Vec<(String, String)> {
+        let s = |c: &SqlValue| match c {
+            SqlValue::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let mut v: Vec<(String, String)> =
+            r.rows.iter().map(|row| (s(&row[0]), s(&row[1]))).collect();
+        v.sort();
+        v
+    };
+    // a(1) -> b(10) -> {c(100), c(101)} -> back to a(1) -> d(1000): the fan-out at c gives TWO tuples,
+    // both carrying a(1)'s label 'x' and d(1000)'s 'd1'. a(2) never joins (no b row), so it is absent.
+    assert_eq!(
+        pairs(&res),
+        vec![("x".to_string(), "d1".to_string()), ("x".to_string(), "d1".to_string())],
+        "the c-fan-out duplicates the (a,d) pairing; the back-join reads a's carried rows, not c's"
+    );
 }
 
 #[test]

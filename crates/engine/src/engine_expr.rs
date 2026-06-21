@@ -85,20 +85,52 @@ pub(crate) enum JoinProjItem {
     Star(Option<String>),
 }
 
-/// A 2-relation INNER equi-join parsed from the libpg_query FROM clause (M5). The probe/build choice is
-/// made in the executor (build on the smaller relation). `on_a`/`on_b` are the two ON operands (one
-/// resolves to the left relation, one to the right); `projection` is the SELECT column list (each a
-/// qualified/unqualified column from either relation). A separate path from the single-table `Select`,
-/// so the single-relation executor + the legacy parser stay untouched.
+/// One relation in a JOIN's FROM clause: its base name + the alias columns are qualified by (the alias,
+/// or the relation name when unaliased -- mirrors the single-table builder).
 #[derive(Debug, Clone)]
-pub(crate) struct JoinPlan {
-    pub left_table: String,
-    pub left_alias: String,
-    pub right_table: String,
-    pub right_alias: String,
+pub(crate) struct JoinRelationRef {
+    pub table: String,
+    pub alias: String,
+}
+
+/// One INNER-join step in a left-deep chain: the two `=` ON operands. One operand resolves to the newly
+/// joined relation (`relations[k+1]`), the other to some already-accumulated relation (`relations[0..=k]`);
+/// the executor figures out which is which.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinStep {
     pub on_a: JoinColRef,
     pub on_b: JoinColRef,
+}
+
+/// A LEFT-DEEP chain of INNER equi-joins parsed from the libpg_query FROM clause (M5). `relations` are in
+/// left-deep order (`a JOIN b ON.. JOIN c ON..` => `[a, b, c]`); `steps[k]` is the ON that folds
+/// `relations[k+1]` into the accumulated set `relations[0..=k]` (so `steps.len() == relations.len()-1`).
+/// `projection` is the SELECT list (qualified/unqualified columns + `*` / `alias.*`). The executor
+/// pipelines the chain: each intermediate result is materialized as a transient relation (the J5a bridge)
+/// that the next step's GPU hash join probes -- no CPU relational join. A 2-relation join is the N=2 case
+/// (one relation pair, one step), byte-identical to the original 2-way path.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinPlan {
+    pub relations: Vec<JoinRelationRef>,
+    pub steps: Vec<JoinStep>,
     pub projection: Vec<JoinProjItem>,
+}
+
+/// The device memory backing a join relation: a RESIDENT user table's published `Arc` (shared), or a
+/// SYNTHESIZED catalog relation's freshly-uploaded TRANSIENT payload (owned for the query). `.mem()`
+/// yields the `&CudaResidentDeviceMemory` the GPU pre-filter / key-projection / hash-join kernels run on.
+enum JoinDeviceMemory {
+    Resident(std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>),
+    Transient(gpu_db_execution::CudaResidentDeviceMemory),
+}
+
+impl JoinDeviceMemory {
+    fn mem(&self) -> &gpu_db_execution::CudaResidentDeviceMemory {
+        match self {
+            JoinDeviceMemory::Resident(memory) => memory,
+            JoinDeviceMemory::Transient(memory) => memory,
+        }
+    }
 }
 
 /// Narrow a grouped MIN/MAX or GROUP BY key, which the GPU kernel computes as an i64 (or, for
@@ -1201,82 +1233,116 @@ impl Engine {
     /// `table`. The SQL->Expr entry (`engine_sql_pg`) routes through here so the predicate's column
     /// indices, the projection, and the residency snapshot all derive from one catalog generation — a
     /// concurrent shape-changing DDL cannot split the column resolution from the execution.
-    /// Execute a 2-relation INNER equi-join (M5) on the GPU. Binds both relations at ONE catalog
-    /// generation, projects the two int-key columns, runs the GPU hash join (build on whichever side
-    /// has a UNIQUE key; N:N is a follow-up), and marshals the matched rows' projected columns from
-    /// host_rows. The join MATCH is on the GPU (the hash build+probe); only the matched index pairs +
-    /// the key columns cross to the host -- the same control-plane gather the single-table text
-    /// projection uses. No CPU relational join (charter).
-    /// `left_table`/`right_table` are bound at ONE catalog generation by the caller (so the WHERE
-    /// mapping + the join read the same generation); `left_predicate`/`right_predicate` are the
-    /// per-relation WHERE conjuncts (mapped against each relation), GPU-evaluated to pre-filter each
-    /// side before the join (inner-join semantics are filter-commutative on per-side predicates).
-    // left_rows/right_rows carry a synthesized catalog relation's host rows (None = resident table);
-    // they are threaded alongside the tables + per-side predicates (M5 J5).
-    #[allow(clippy::too_many_arguments)]
+    /// Resolve one join relation to its (residency entry, device memory, row count): a RESIDENT user
+    /// table uses its published snapshot + retained device memory; a SYNTHESIZED catalog relation
+    /// (`rows = Some`, M5 J5) is uploaded as a TRANSIENT device payload + descriptor that lives only for
+    /// this query. Either way the join runs the SAME GPU pre-filter + key-projection + hash-join kernels
+    /// over the result -- no CPU relational join (charter).
+    fn resolve_join_side(
+        &self,
+        name: &str,
+        table: &RelationalTable,
+        rows: Option<Vec<Vec<SqlValue>>>,
+    ) -> Result<(RelationalResidencyEntry, JoinDeviceMemory, usize), ExecuteError> {
+        match rows {
+            None => {
+                let entry = self.relational_residency_entry(name).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{name}\" has no resident snapshot (the join path is GPU-only)"
+                    )))
+                })?;
+                if !entry.descriptor.is_valid() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{name}\" resident snapshot is invalid"
+                    ))));
+                }
+                let row_count = entry.descriptor.row_count;
+                let memory = self
+                    .read_state
+                    .residency
+                    .device_memory
+                    .get(name)
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "relation \"{name}\" has no retained resident device memory"
+                        )))
+                    })?;
+                Ok((entry, JoinDeviceMemory::Resident(memory), row_count))
+            }
+            Some(rows) => {
+                let (snapshot, memory) = self.build_transient_relation_residency(table, &rows)?;
+                let row_count = rows.len();
+                let entry = RelationalResidencyEntry {
+                    descriptor: std::sync::Arc::new(snapshot),
+                    host_rows: std::sync::Arc::new(rows),
+                };
+                Ok((entry, JoinDeviceMemory::Transient(memory), row_count))
+            }
+        }
+    }
+
+    /// Execute a LEFT-DEEP chain of INNER equi-joins (M5) on the GPU. `tables`/`rows`/`predicates` are
+    /// parallel to `plan.relations` (one per relation, all bound at ONE catalog generation by the
+    /// caller). Each step GPU-pre-filters the newly joined relation by its WHERE, projects the two
+    /// int-key columns, and runs the GPU hash join (build on whichever side has a UNIQUE key; N:N is a
+    /// follow-up). The pipeline carries, per relation, the ABSOLUTE row index each surviving tuple came
+    /// from -- so the only growing host state is index vectors (control-plane, like survivors), each
+    /// step's keys are projected on the GPU from the source payloads, and ONLY the final gather reads
+    /// host_rows. Every relational op (WHERE filter, key compare, hash match) runs on the GPU; no CPU
+    /// relational join (charter). A 2-relation join is the N=2 case (a single step), matching the prior
+    /// 2-way path. The intermediate result is never materialized to a device payload -- the carried
+    /// indices let each later step project keys straight from the original relations' payloads.
     pub(crate) fn execute_resident_expr_inner_join(
         &self,
         plan: &JoinPlan,
-        left_table: &RelationalTable,
-        right_table: &RelationalTable,
-        left_rows: Option<Vec<Vec<SqlValue>>>,
-        right_rows: Option<Vec<Vec<SqlValue>>>,
-        left_predicate: Option<&ResidentExpr>,
-        right_predicate: Option<&ResidentExpr>,
+        tables: Vec<RelationalTable>,
+        rows: Vec<Option<Vec<Vec<SqlValue>>>>,
+        predicates: Vec<Option<ResidentExpr>>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
-        #[derive(Clone, Copy, PartialEq)]
-        enum Rel {
-            Left,
-            Right,
-        }
-        // Resolve a JOIN column reference to (relation, column index) against the two bound tables: a
-        // qualifier must name exactly one relation; an unqualified column must be in exactly one (PG's
-        // "ambiguous" / "does not exist").
-        let resolve = |c: &JoinColRef| -> Result<(Rel, usize), ExecuteError> {
+        let n_rel = plan.relations.len();
+        // Resolve a JOIN column reference to (relation index, column index) against relations[0..=upto]:
+        // a qualifier must name exactly one of them; an unqualified column must be in exactly one (PG's
+        // "ambiguous" / "does not exist"). `upto` bounds an ON operand to the relations joined so far.
+        let resolve = |c: &JoinColRef, upto: usize| -> Result<(usize, usize), ExecuteError> {
             match &c.qualifier {
-                Some(q) if *q == plan.left_alias => {
-                    Ok((Rel::Left, relational_column_index(left_table, &c.column)?))
-                }
-                Some(q) if *q == plan.right_alias => {
-                    Ok((Rel::Right, relational_column_index(right_table, &c.column)?))
-                }
-                Some(q) => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "missing FROM-clause entry for table \"{q}\""
-                )))),
-                None => {
-                    let l = relational_column_index(left_table, &c.column).ok();
-                    let r = relational_column_index(right_table, &c.column).ok();
-                    match (l, r) {
-                        (Some(_), Some(_)) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            format!("column reference \"{}\" is ambiguous", c.column),
-                        ))),
-                        (Some(i), None) => Ok((Rel::Left, i)),
-                        (None, Some(i)) => Ok((Rel::Right, i)),
-                        (None, None) => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "column \"{}\" does not exist", c.column
-                        )))),
+                Some(q) => {
+                    for (i, rel) in plan.relations.iter().enumerate().take(upto + 1) {
+                        if rel.alias == *q {
+                            return Ok((i, relational_column_index(&tables[i], &c.column)?));
+                        }
                     }
+                    Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "missing FROM-clause entry for table \"{q}\""
+                    ))))
+                }
+                None => {
+                    let mut found: Option<(usize, usize)> = None;
+                    for (i, table) in tables.iter().take(upto + 1).enumerate() {
+                        if let Ok(ci) = relational_column_index(table, &c.column) {
+                            if found.is_some() {
+                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                    "column reference \"{}\" is ambiguous",
+                                    c.column
+                                ))));
+                            }
+                            found = Some((i, ci));
+                        }
+                    }
+                    found.ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "column \"{}\" does not exist",
+                            c.column
+                        )))
+                    })
                 }
             }
         };
-        // ON: one operand resolves to each relation -> the per-relation key column indices.
-        let a = resolve(&plan.on_a)?;
-        let b = resolve(&plan.on_b)?;
-        let (left_key_idx, right_key_idx) = match (a.0, b.0) {
-            (Rel::Left, Rel::Right) => (a.1, b.1),
-            (Rel::Right, Rel::Left) => (b.1, a.1),
-            _ => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "the join ON must equate a column from EACH relation (a.k = b.k)".to_string(),
-                )))
-            }
-        };
-        // Integer join keys: int2/int4/date (i32 section) OR int8/timestamp (i64 section). Both project
-        // to i64, so a mixed int4=int8 equi-join compares correctly (int4 sign-extends to the same i64).
-        // numeric/uuid/text keys are a follow-up (need the b128 / text-verify claim). i64::MIN as an
+        // Integer join keys only this slice: int2/int4/date (i32 section) OR int8/timestamp (i64
+        // section) -- both project to i64, so a mixed int4=int8 equi-join compares correctly (int4
+        // sign-extends to the same i64). numeric/uuid/text keys are a follow-up (J4b/c). i64::MIN as an
         // int8 key value aliases the hash sentinel -> the launcher rejects it (dedicated-slot follow-up).
         let int_key = |t: SqlType| {
             matches!(
@@ -1284,141 +1350,108 @@ impl Engine {
                 SqlType::Int4 | SqlType::Int2 | SqlType::Date | SqlType::Int8 | SqlType::Timestamp
             )
         };
-        if !int_key(left_table.columns[left_key_idx].ty)
-            || !int_key(right_table.columns[right_key_idx].ty)
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "a join key must be an integer column (int2/int4/int8/date/timestamp) on both sides \
-                 on the join path yet (numeric/uuid/text keys are a follow-up)"
-                    .to_string(),
-            )));
+        // Pre-resolve each step's ON + validate the key types, and resolve the SELECT projection, BEFORE
+        // touching residency -- so a malformed query (unknown column, ambiguous ref, non-int key) fails
+        // fast with a query error, not a "not resident" one. `step_keys[k]` = (accumulated relation, its
+        // key column, the new relation's key column); the newly joined relation is `k+1`.
+        let mut step_keys: Vec<(usize, usize, usize)> = Vec::with_capacity(plan.steps.len());
+        for (k, step) in plan.steps.iter().enumerate() {
+            let new_rel = k + 1;
+            // The ON must equate the newly joined relation (`new_rel`) to an already-joined one (<new_rel).
+            let ra = resolve(&step.on_a, new_rel)?;
+            let rb = resolve(&step.on_b, new_rel)?;
+            let ((acc_rel, acc_col), new_col) = if rb.0 == new_rel && ra.0 < new_rel {
+                ((ra.0, ra.1), rb.1)
+            } else if ra.0 == new_rel && rb.0 < new_rel {
+                ((rb.0, rb.1), ra.1)
+            } else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "each JOIN's ON must equate the newly joined relation to an already-joined one \
+                     (a.k = b.k)"
+                        .to_string(),
+                )));
+            };
+            if !int_key(tables[acc_rel].columns[acc_col].ty)
+                || !int_key(tables[new_rel].columns[new_col].ty)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "a join key must be an integer column (int2/int4/int8/date/timestamp) on both \
+                     sides on the join path yet (numeric/uuid/text keys are a follow-up)"
+                        .to_string(),
+                )));
+            }
+            step_keys.push((acc_rel, acc_col, new_col));
         }
-        // Resolve the SELECT list to a flat (relation, column index) list, expanding `*` / `alias.*` to
-        // every column of the relation(s) (bare `*` = all LEFT columns then all RIGHT, PG order).
-        let mut proj: Vec<(Rel, usize)> = Vec::new();
+        // Resolve the SELECT list to a flat (relation index, column index) list, expanding `*` (every
+        // relation's columns, left-to-right PG order) and `alias.*` (that relation's columns).
+        let mut proj: Vec<(usize, usize)> = Vec::new();
         for item in &plan.projection {
             match item {
-                JoinProjItem::Column(c) => proj.push(resolve(c)?),
+                JoinProjItem::Column(c) => proj.push(resolve(c, n_rel - 1)?),
                 JoinProjItem::Star(None) => {
-                    proj.extend((0..left_table.columns.len()).map(|i| (Rel::Left, i)));
-                    proj.extend((0..right_table.columns.len()).map(|i| (Rel::Right, i)));
+                    for (ri, table) in tables.iter().enumerate() {
+                        proj.extend((0..table.columns.len()).map(|ci| (ri, ci)));
+                    }
                 }
                 JoinProjItem::Star(Some(alias)) => {
-                    if *alias == plan.left_alias {
-                        proj.extend((0..left_table.columns.len()).map(|i| (Rel::Left, i)));
-                    } else if *alias == plan.right_alias {
-                        proj.extend((0..right_table.columns.len()).map(|i| (Rel::Right, i)));
-                    } else {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "missing FROM-clause entry for table \"{alias}\""
-                        ))));
-                    }
-                }
-            }
-        }
-        // Resolve each relation to its (residency entry, device memory): a RESIDENT user table uses its
-        // published snapshot + retained device memory; a SYNTHESIZED catalog relation (rows = Some, M5 J5)
-        // is uploaded as a TRANSIENT device payload + descriptor that lives only for this query. Either
-        // way the join then runs the SAME GPU WHERE-pushdown + hash-join kernels (no CPU relational join
-        // fallback -- charter); only the host-rows gather crosses to the host, as for a resident join.
-        enum JoinDeviceMemory {
-            Resident(std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>),
-            Transient(gpu_db_execution::CudaResidentDeviceMemory),
-        }
-        impl JoinDeviceMemory {
-            fn mem(&self) -> &gpu_db_execution::CudaResidentDeviceMemory {
-                match self {
-                    JoinDeviceMemory::Resident(memory) => memory,
-                    JoinDeviceMemory::Transient(memory) => memory,
-                }
-            }
-        }
-        let resolve_side = |name: &str,
-                            table: &RelationalTable,
-                            rows: Option<Vec<Vec<SqlValue>>>|
-         -> Result<(RelationalResidencyEntry, JoinDeviceMemory, usize), ExecuteError> {
-            match rows {
-                None => {
-                    let entry = self.relational_residency_entry(name).ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "relation \"{name}\" has no resident snapshot (the join path is GPU-only)"
-                        )))
-                    })?;
-                    if !entry.descriptor.is_valid() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "relation \"{name}\" resident snapshot is invalid"
-                        ))));
-                    }
-                    let row_count = entry.descriptor.row_count;
-                    let memory = self
-                        .read_state
-                        .residency
-                        .device_memory
-                        .get(name)
+                    let ri = plan
+                        .relations
+                        .iter()
+                        .position(|r| r.alias == *alias)
                         .ok_or_else(|| {
                             ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                "relation \"{name}\" has no retained resident device memory"
+                                "missing FROM-clause entry for table \"{alias}\""
                             )))
                         })?;
-                    Ok((entry, JoinDeviceMemory::Resident(memory), row_count))
-                }
-                Some(rows) => {
-                    let (snapshot, memory) =
-                        self.build_transient_relation_residency(table, &rows)?;
-                    let row_count = rows.len();
-                    let entry = RelationalResidencyEntry {
-                        descriptor: std::sync::Arc::new(snapshot),
-                        host_rows: std::sync::Arc::new(rows),
-                    };
-                    Ok((entry, JoinDeviceMemory::Transient(memory), row_count))
+                    proj.extend((0..tables[ri].columns.len()).map(|ci| (ri, ci)));
                 }
             }
-        };
-        let (left_entry, left_dm, left_n) =
-            resolve_side(&plan.left_table, left_table, left_rows)?;
-        let (right_entry, right_dm, right_n) =
-            resolve_side(&plan.right_table, right_table, right_rows)?;
-        let gpu_id = left_entry.descriptor.gpu_id;
-        // Pre-filter each relation by its per-relation WHERE conjuncts on the GPU -> surviving ABSOLUTE
-        // row indices (inner join is filter-commutative on per-side predicates). No predicate -> all
-        // rows (0..n). The join then returns indices INTO these survivor arrays.
-        let survivors = |pred: Option<&ResidentExpr>,
-                         table: &RelationalTable,
-                         entry: &RelationalResidencyEntry,
-                         dm: &gpu_db_execution::CudaResidentDeviceMemory,
-                         n: usize|
-         -> Result<Vec<u32>, ExecuteError> {
-            match pred {
-                Some(p) if n > 0 => {
-                    self.lower_resident_predicate(p, table, &entry.descriptor, dm, n as u64)
-                }
-                _ => Ok((0..n as u32).collect()),
-            }
-        };
-        let left_survivors =
-            survivors(left_predicate, left_table, &left_entry, left_dm.mem(), left_n)?;
-        let right_survivors =
-            survivors(right_predicate, right_table, &right_entry, right_dm.mem(), right_n)?;
-        // Project each relation's integer key column to host i64 at the SURVIVING rows: int8/timestamp
-        // from the i64 section; int2/int4/date from the i32 section, sign-extended.
-        let key_i64 = |entry: &RelationalResidencyEntry,
-                       table: &RelationalTable,
-                       dm: &gpu_db_execution::CudaResidentDeviceMemory,
-                       col_idx: usize,
-                       surv: &[u32]|
-         -> Result<Vec<i64>, ExecuteError> {
-            if surv.is_empty() {
+        }
+        // Resolve every relation's device payload, at the one bound catalog generation: a RESIDENT user
+        // table's published memory, or a SYNTHESIZED catalog relation's transient upload.
+        let mut sides: Vec<(RelationalResidencyEntry, JoinDeviceMemory, usize)> =
+            Vec::with_capacity(n_rel);
+        for (row_opt, (relation, table)) in
+            rows.into_iter().zip(plan.relations.iter().zip(&tables))
+        {
+            sides.push(self.resolve_join_side(&relation.table, table, row_opt)?);
+        }
+        let gpu_id = sides[0].0.descriptor.gpu_id;
+        // Pre-filter each relation by its per-relation WHERE on the GPU -> the surviving ABSOLUTE row
+        // indices (inner join is filter-commutative on per-side predicates). No predicate -> all rows.
+        let mut survivors_all: Vec<Vec<u32>> = Vec::with_capacity(n_rel);
+        for (i, (entry, dm, n)) in sides.iter().enumerate() {
+            let surv = match &predicates[i] {
+                Some(p) if *n > 0 => self.lower_resident_predicate(
+                    p,
+                    &tables[i],
+                    &entry.descriptor,
+                    dm.mem(),
+                    *n as u64,
+                )?,
+                _ => (0..*n as u32).collect(),
+            };
+            survivors_all.push(surv);
+        }
+        // Project relation `ri`'s integer key column `col_idx` to host i64 at the given ABSOLUTE rows:
+        // int8/timestamp from the i64 section; int2/int4/date from the i32 section, sign-extended.
+        let key_i64 = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<i64>, ExecuteError> {
+            if abs.is_empty() {
                 return Ok(Vec::new());
             }
-            let idxs: Vec<u64> = surv.iter().map(|&i| u64::from(i)).collect();
-            match table.columns[col_idx].ty {
+            let (entry, dm, _) = &sides[ri];
+            let idxs: Vec<u64> = abs.iter().map(|&i| u64::from(i)).collect();
+            match tables[ri].columns[col_idx].ty {
                 SqlType::Int8 | SqlType::Timestamp => {
-                    let off = resident_device_int8_column_offset(&entry.descriptor, table, col_idx)?;
-                    dm.project_i64_rows_from_payload(off, &idxs).map_err(map_err)
+                    let off =
+                        resident_device_int8_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
+                    dm.mem().project_i64_rows_from_payload(off, &idxs).map_err(map_err)
                 }
                 _ => {
-                    let off = resident_device_int4_column_offset(&entry.descriptor, table, col_idx)?;
+                    let off =
+                        resident_device_int4_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
                     Ok(dm
+                        .mem()
                         .project_i32_rows_from_payload(off, &idxs)
                         .map_err(map_err)?
                         .into_iter()
@@ -1427,89 +1460,87 @@ impl Engine {
                 }
             }
         };
-        let left_keys =
-            key_i64(&left_entry, left_table, left_dm.mem(), left_key_idx, &left_survivors)?;
-        let right_keys =
-            key_i64(&right_entry, right_table, right_dm.mem(), right_key_idx, &right_survivors)?;
-        // GPU hash join: build on the SMALLER side; if its key is non-unique, retry building on the
-        // OTHER side (covers 1:1 + 1:N regardless of size). Both non-unique => N:N (a follow-up).
+        // GPU hash join over two host i64 key arrays: build on the SMALLER side; if its key is
+        // non-unique, retry building on the OTHER side (covers 1:1 + 1:N either way). Both non-unique =>
+        // N:N (a follow-up). `ctx` only supplies the CUDA context (the kernel uploads the host keys); the
+        // result is independent of which relation's memory hosts it. Returns (left_is_build, build, probe).
         use gpu_db_execution::HashJoinOutcome;
-        let smaller_is_left = left_survivors.len() <= right_survivors.len();
-        let (first_build, first_probe) = if smaller_is_left {
-            (&left_keys, &right_keys)
-        } else {
-            (&right_keys, &left_keys)
-        };
-        let (left_is_build, build_idxs, probe_idxs) = match left_dm
-            .mem()
-            .hash_join_inner_i64(first_build, first_probe)
-            .map_err(map_err)?
-        {
-            HashJoinOutcome::Pairs {
-                build_idxs,
-                probe_idxs,
-            } => (smaller_is_left, build_idxs, probe_idxs),
-            HashJoinOutcome::DuplicateBuildKey => {
-                match left_dm
-                    .mem()
-                    .hash_join_inner_i64(first_probe, first_build)
-                    .map_err(map_err)?
-                {
-                    HashJoinOutcome::Pairs {
-                        build_idxs,
-                        probe_idxs,
-                    } => (!smaller_is_left, build_idxs, probe_idxs),
-                    HashJoinOutcome::DuplicateBuildKey => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "N:N join (both sides have duplicate join keys) is a follow-up; one \
-                             side's join key must be unique"
-                                .to_string(),
-                        )))
+        let hash_join = |ctx: &gpu_db_execution::CudaResidentDeviceMemory,
+                         left_keys: &[i64],
+                         right_keys: &[i64]|
+         -> Result<(bool, Vec<u32>, Vec<u32>), ExecuteError> {
+            let smaller_is_left = left_keys.len() <= right_keys.len();
+            let (first_build, first_probe) = if smaller_is_left {
+                (left_keys, right_keys)
+            } else {
+                (right_keys, left_keys)
+            };
+            match ctx.hash_join_inner_i64(first_build, first_probe).map_err(map_err)? {
+                HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
+                    Ok((smaller_is_left, build_idxs, probe_idxs))
+                }
+                HashJoinOutcome::DuplicateBuildKey => {
+                    match ctx.hash_join_inner_i64(first_probe, first_build).map_err(map_err)? {
+                        HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
+                            Ok((!smaller_is_left, build_idxs, probe_idxs))
+                        }
+                        HashJoinOutcome::DuplicateBuildKey => {
+                            Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "N:N join (both sides have duplicate join keys) is a follow-up; one \
+                                 side's join key must be unique"
+                                    .to_string(),
+                            )))
+                        }
                     }
                 }
             }
         };
-        // Map (build_idx, probe_idx) [positions INTO the survivor arrays] -> per-side survivor positions.
-        let (left_match, right_match): (&[u32], &[u32]) = if left_is_build {
-            (&build_idxs, &probe_idxs)
-        } else {
-            (&probe_idxs, &build_idxs)
-        };
-        // Marshal the matched rows: each projected column read from its relation's host_rows at the
-        // ABSOLUTE row (survivors[match_position]) -- control-plane gather; the join ran on the GPU.
-        let n_pairs = left_match.len();
-        let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(n_pairs);
-        for i in 0..n_pairs {
-            let mut row = Vec::with_capacity(proj.len());
-            for &(rel, col_idx) in &proj {
-                let cell = match rel {
-                    Rel::Left => {
-                        let abs = left_survivors[left_match[i] as usize] as usize;
-                        left_entry.host_rows[abs][col_idx].clone()
-                    }
-                    Rel::Right => {
-                        let abs = right_survivors[right_match[i] as usize] as usize;
-                        right_entry.host_rows[abs][col_idx].clone()
-                    }
-                };
-                row.push(cell);
+        // Left-deep pipeline. `work_idx[j]` holds, for each surviving tuple, the ABSOLUTE row index that
+        // tuple took from relation j; it starts as relation 0's survivors and grows one relation per step.
+        let mut work_idx: Vec<Vec<u32>> = vec![survivors_all[0].clone()];
+        for (k, &(acc_rel, acc_col, new_col)) in step_keys.iter().enumerate() {
+            let new_rel = k + 1;
+            // Accumulated-side keys: relation `acc_rel`'s key at the rows carried by each tuple. New-side
+            // keys: relation `new_rel`'s key at its survivors. Both projected on the GPU.
+            let acc_keys = key_i64(acc_rel, acc_col, &work_idx[acc_rel])?;
+            let new_keys = key_i64(new_rel, new_col, &survivors_all[new_rel])?;
+            let (acc_is_build, build_idxs, probe_idxs) =
+                hash_join(sides[new_rel].1.mem(), &acc_keys, &new_keys)?;
+            // build/probe positions -> (accumulated tuple position, new-relation survivor position).
+            let (acc_match, new_match): (&[u32], &[u32]) = if acc_is_build {
+                (&build_idxs, &probe_idxs)
+            } else {
+                (&probe_idxs, &build_idxs)
+            };
+            // Extend the carried indices: keep each matched tuple's prior rows, append the new relation's
+            // matched ABSOLUTE survivor row.
+            let mut next: Vec<Vec<u32>> = Vec::with_capacity(new_rel + 1);
+            for col in &work_idx {
+                next.push(acc_match.iter().map(|&p| col[p as usize]).collect());
             }
-            rows.push(row);
+            next.push(new_match.iter().map(|&p| survivors_all[new_rel][p as usize]).collect());
+            work_idx = next;
         }
+        // Gather: for each surviving tuple, read each projected column from its relation's host_rows at
+        // the carried ABSOLUTE row -- the control-plane gather; the join ran on the GPU.
+        let work_n = work_idx[0].len();
+        let result_rows: Vec<Vec<SqlValue>> = (0..work_n)
+            .map(|t| {
+                proj.iter()
+                    .map(|&(ri, ci)| sides[ri].0.host_rows[work_idx[ri][t] as usize][ci].clone())
+                    .collect()
+            })
+            .collect();
         // Result schema: each projected column's RelationalColumn from its owning table, attnums 1..N.
         let mut columns = Vec::with_capacity(proj.len());
-        for (i, &(rel, col_idx)) in proj.iter().enumerate() {
-            let src = match rel {
-                Rel::Left => &left_table,
-                Rel::Right => &right_table,
-            };
-            let mut col = src.columns[col_idx].clone();
+        for (i, &(ri, ci)) in proj.iter().enumerate() {
+            let mut col = tables[ri].columns[ci].clone();
             col.attnum = (i + 1) as i16;
             columns.push(col);
         }
         Ok(RelationalSelectResult {
             columns,
-            rows,
+            rows: result_rows,
             planned_target: DeviceTarget::Gpu(gpu_id),
             executed_target: DeviceTarget::Gpu(gpu_id),
             fallback_reason: None,
