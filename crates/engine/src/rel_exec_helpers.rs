@@ -452,6 +452,8 @@ pub(crate) fn synthesize_pg_class(
             ("relnatts", SqlType::Int4),
             ("relowner", SqlType::Int4),
             ("relhasindex", SqlType::Bool),
+            // PG `char`: 'p' permanent / 'u' unlogged / 't' temp. All synthesized relations are permanent.
+            ("relpersistence", SqlType::Text),
         ],
     );
     let namespace = SqlValue::Int4(PG_PUBLIC_NAMESPACE_OID);
@@ -465,6 +467,7 @@ pub(crate) fn synthesize_pg_class(
             SqlValue::Int4(natts as i32),
             owner.clone(),
             SqlValue::Bool(has_index),
+            SqlValue::Text("p".to_string()),
         ]
     };
     let mut rows = Vec::new();

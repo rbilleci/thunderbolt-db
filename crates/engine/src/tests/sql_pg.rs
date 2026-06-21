@@ -1611,6 +1611,106 @@ fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_where_in_and_not_in() {
+    // IN / NOT IN lower to an OR-chain of `=` / AND-chain of `<>` on the general GPU executor (no new
+    // kernel) -- INT keys here (text IN awaits text AND/OR on the executor; see gpu-type-matrix).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE inq (id INT, tag INT)").unwrap();
+    e.execute_text(2, "INSERT INTO inq (id, tag) VALUES (1,10),(2,20),(3,30),(4,40)").unwrap();
+    if e.populate_relational_residency_snapshot("inq").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let ids = |res: &RelationalSelectResult| -> Vec<i32> {
+        let mut v: Vec<i32> = res
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                SqlValue::Int4(v) => *v,
+                other => panic!("expected int4, got {other:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let run = |sql: &str| e.execute_resident_expr_select_sql(sql).expect(sql);
+    let in_int = run("SELECT id FROM inq WHERE id IN (1, 3)");
+    assert_eq!(in_int.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(ids(&in_int), vec![1, 3], "id IN (1,3)");
+    assert_eq!(
+        ids(&run("SELECT id FROM inq WHERE id NOT IN (1, 3)")),
+        vec![2, 4],
+        "id NOT IN (1,3) is the complement"
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM inq WHERE id IN (4, 2, 4)")),
+        vec![2, 4],
+        "multi-element IN with a duplicate"
+    );
+    assert_eq!(
+        ids(&run("SELECT id FROM inq WHERE id IN (2)")),
+        vec![2],
+        "single-element IN"
+    );
+    // IN composes with AND under the general boolean executor.
+    assert_eq!(
+        ids(&run("SELECT id FROM inq WHERE id IN (1, 2, 3) AND tag <> 20")),
+        vec![1, 3],
+        "IN AND <> composes"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
+    // Closes the function-free `\d` family (golden 23/29): pg_class JOIN pg_namespace, projecting
+    // relpersistence (newly synthesized), filtered by nspname + relkind, ORDER BY relname -- the whole
+    // query on the GPU join + GPU sort path. BOTH sides are SYNTHESIZED catalog relations (transient
+    // device payloads), schema-qualified `pg_catalog.<rel>`.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE dz_people (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE dz_teams (id INT)").unwrap();
+    // Probe: the transient catalog payload needs a GPU; skip cleanly if unavailable.
+    let probe = e.execute_resident_expr_select_sql(
+        "SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
+         ON n.oid = c.relnamespace WHERE c.relname = 'dz_people'",
+    );
+    match &probe {
+        Ok(r) if r.executed_target == DeviceTarget::Gpu(0) => {}
+        _ => return,
+    }
+    let meta_rows = |res: &RelationalSelectResult| -> Vec<(String, String, String, String)> {
+        res.rows
+            .iter()
+            .map(|r| {
+                let t = |c: &SqlValue| match c {
+                    SqlValue::Text(s) => s.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                (t(&r[0]), t(&r[1]), t(&r[2]), t(&r[3]))
+            })
+            .collect()
+    };
+    let people = ("public".to_string(), "dz_people".to_string(), "r".to_string(), "p".to_string());
+    let teams = ("public".to_string(), "dz_teams".to_string(), "r".to_string(), "p".to_string());
+    // Golden 23 form: every public relkind='r' relation, ordered by name (dz_people < dz_teams). The whole
+    // query -- the join, the per-side text filters, the ORDER BY, and the new relpersistence -- is on GPU.
+    let all = e
+        .execute_resident_expr_select_sql(
+            "SELECT n.nspname, c.relname, c.relkind, c.relpersistence \
+             FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY c.relname",
+        )
+        .expect("catalog \\d metadata join (golden 23)");
+    assert_eq!(all.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        meta_rows(&all),
+        vec![people, teams],
+        "golden 23: the join filters + orders on the GPU and projects relpersistence='p'"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_order_by_limit_offset() {
     // M5 (catalog \d prerequisite): ORDER BY / LIMIT / OFFSET on a join. ORDER BY is a GPU sort over the
     // join result (int key via the matrix path, text+int multi-key via the hetero payload path).

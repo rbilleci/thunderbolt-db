@@ -1281,12 +1281,17 @@ fn map_a_expr(
     table: &RelationalTable,
     qualifier: &str,
 ) -> Result<ResidentExpr, ExecuteError> {
+    // AEXPR_IN is `x IN (a, b, ...)` -> an OR-chain of equalities (`NOT IN` -> an AND-chain of `<>`),
+    // entirely on the general GPU executor (the same Binary Eq/Ne + And/Or it already runs).
+    if a_expr.kind == AExprKind::AexprIn as i32 {
+        return map_in_expr(a_expr, table, qualifier);
+    }
     // AEXPR_OP is a normal operator (`+ - * = <> < <= > >=`); AEXPR_LIKE is `LIKE` (operator `~~`,
     // `!~~` for NOT LIKE). Both carry the operator token in `name` and both operands; other kinds
-    // (`IN` / `BETWEEN` / ...) are rejected.
+    // (`BETWEEN` / ...) are rejected.
     if a_expr.kind != AExprKind::AexprOp as i32 && a_expr.kind != AExprKind::AexprLike as i32 {
         return Err(sql_pg_error(
-            "only operator and LIKE predicates are supported (no IN / BETWEEN yet)".to_string(),
+            "only operator, LIKE, and IN predicates are supported (no BETWEEN yet)".to_string(),
         ));
     }
     let op = map_operator(aexpr_op_token(a_expr)?)?;
@@ -1305,6 +1310,58 @@ fn map_a_expr(
         lhs: Box::new(map_predicate_node(lexpr, table, qualifier)?),
         rhs: Box::new(map_predicate_node(rexpr, table, qualifier)?),
     })
+}
+
+/// Map `x IN (v1, v2, ...)` to an OR-chain of equalities (`x = v1 OR x = v2 OR ...`); `x NOT IN (...)`
+/// to an AND-chain of not-equals (`x <> v1 AND x <> v2 AND ...`). libpg_query tags both as `AEXPR_IN`
+/// and carries the operator in `name` (`=` for IN, `<>` for NOT IN) with the value LIST in `rexpr`. The
+/// whole thing lowers to the Binary Eq/Ne + And/Or the general GPU executor already runs (no new kernel).
+/// A subquery `IN (SELECT ...)` (rexpr is not a value list) is a follow-up.
+fn map_in_expr(
+    a_expr: &AExpr,
+    table: &RelationalTable,
+    qualifier: &str,
+) -> Result<ResidentExpr, ExecuteError> {
+    let negated = aexpr_op_token(a_expr)? == "<>";
+    let lexpr = a_expr
+        .lexpr
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("IN is missing its left operand".to_string()))?;
+    let rexpr = a_expr
+        .rexpr
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("IN is missing its value list".to_string()))?;
+    let NodeEnum::List(list) = node_enum(rexpr)? else {
+        return Err(sql_pg_error(
+            "IN requires a parenthesized value list (subquery IN is a follow-up)".to_string(),
+        ));
+    };
+    if list.items.is_empty() {
+        return Err(sql_pg_error("IN requires at least one value".to_string()));
+    }
+    let lhs = map_predicate_node(lexpr, table, qualifier)?;
+    let (cmp, combine) = if negated {
+        (ResidentBinaryOp::Ne, ResidentBinaryOp::And)
+    } else {
+        (ResidentBinaryOp::Eq, ResidentBinaryOp::Or)
+    };
+    let mut folded: Option<ResidentExpr> = None;
+    for item in &list.items {
+        let term = ResidentExpr::Binary {
+            op: cmp,
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(map_predicate_node(item, table, qualifier)?),
+        };
+        folded = Some(match folded {
+            None => term,
+            Some(prev) => ResidentExpr::Binary {
+                op: combine,
+                lhs: Box::new(prev),
+                rhs: Box::new(term),
+            },
+        });
+    }
+    Ok(folded.expect("non-empty IN list checked above"))
 }
 
 /// Map a Postgres operator token to a `ResidentBinaryOp`. `<>` is PG's not-equal (PG normalizes `!=`
