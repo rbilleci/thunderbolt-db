@@ -1560,6 +1560,57 @@ fn gpu_inner_join_n_to_n_cross_product() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
+    // M5: N:N many-to-many over NON-int keys (text + numeric/uuid reuse the chaining text/byte kernel).
+    // Both sides duplicate the key -> each key's (left x right) cross product.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE lt (lid INT, tag TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE rt (rid INT, tag TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO lt (lid, tag) VALUES (1,'x'),(2,'x'),(3,'y')").unwrap();
+    e.execute_text(4, "INSERT INTO rt (rid, tag) VALUES (10,'x'),(11,'x'),(12,'z')").unwrap();
+    e.execute_text(5, "CREATE TABLE la (laid INT, amt NUMERIC(10,2))").unwrap();
+    e.execute_text(6, "CREATE TABLE ra (raid INT, amt NUMERIC(10,2))").unwrap();
+    e.execute_text(7, "INSERT INTO la (laid, amt) VALUES (1,5.00),(2,5.00),(3,9.00)").unwrap();
+    e.execute_text(8, "INSERT INTO ra (raid, amt) VALUES (10,5.00),(11,5.00),(12,1.00)").unwrap();
+    let mut ok = true;
+    for t in ["lt", "rt", "la", "ra"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let pairs = |res: &RelationalSelectResult| -> Vec<(i32, i32)> {
+        let n = |c: &SqlValue| match c {
+            SqlValue::Int4(v) => *v,
+            other => panic!("expected int4, got {other:?}"),
+        };
+        let mut v: Vec<(i32, i32)> = res.rows.iter().map(|r| (n(&r[0]), n(&r[1]))).collect();
+        v.sort();
+        v
+    };
+    // text N:N: tag 'x' -> lt {1,2} x rt {10,11} = 4 pairs; 'y'/'z' drop.
+    let text_nn = e
+        .execute_resident_expr_select_sql("SELECT lt.lid, rt.rid FROM lt JOIN rt ON lt.tag = rt.tag")
+        .expect("text N:N join");
+    assert_eq!(text_nn.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        pairs(&text_nn),
+        vec![(1, 10), (1, 11), (2, 10), (2, 11)],
+        "text key 'x' yields the 2x2 cross product"
+    );
+    // numeric N:N: amt 5.00 -> la {1,2} x ra {10,11} = 4 pairs (reuses the same chaining kernel).
+    let num_nn = e
+        .execute_resident_expr_select_sql("SELECT la.laid, ra.raid FROM la JOIN ra ON la.amt = ra.amt")
+        .expect("numeric N:N join");
+    assert_eq!(
+        pairs(&num_nn),
+        vec![(1, 10), (1, 11), (2, 10), (2, 11)],
+        "numeric key 5.00 yields the 2x2 cross product"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_using_and_natural() {
     // M5: USING / NATURAL joins -- the join column is COALESCED (appears once in `*`, PG order: join cols,
     // then left's rest, then right's; an unqualified ref resolves to the left copy).

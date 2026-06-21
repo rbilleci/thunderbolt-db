@@ -1653,11 +1653,11 @@ impl Engine {
                             Ok((!smaller_is_left, build_idxs, probe_idxs))
                         }
                         HashJoinOutcome::DuplicateBuildKey => {
-                            Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                "N:N join (both sides have duplicate join keys) is a follow-up; one \
-                                 side's join key must be unique"
-                                    .to_string(),
-                            )))
+                            // N:N: both sides have duplicate text/numeric/uuid keys -> the chaining
+                            // many-to-many text join (build the chain on the LEFT/acc side -> (acc, new)).
+                            let (build_idxs, probe_idxs) =
+                                ctx.hash_join_inner_text_nn(left, right).map_err(map_err)?;
+                            Ok((true, build_idxs, probe_idxs))
                         }
                     }
                 }
