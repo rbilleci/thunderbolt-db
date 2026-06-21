@@ -2995,18 +2995,185 @@ fn gpu_group_by_composite_fixed_text_multi_aggregate_rejected() {
 }
 
 #[test]
-fn group_by_composite_three_columns_rejected() {
-    // >2 composite GROUP BY columns is a clean error (the on-device pack covers two; i128/rep-row are
-    // follow-ups). Host-side (parse rejection), no GPU needed.
-    let e = Engine::new_local();
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_three_int_columns() {
+    // >2 columns (all fixed-width int) -> the general WIDE-KEY path (gpu_db_build_wide_key + the
+    // (rep_idx, hash) b128 claim with a memcmp verify). Distinct (a,b,c) tuples by construction.
+    let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
         .unwrap();
+    // (1,1,1)x2, (1,1,2)x1, (1,2,1)x1, (2,1,1)x1.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,c) VALUES (1,1,1),(1,1,1),(1,1,2),(1,2,1),(2,1,1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, c, COUNT(*) FROM t GROUP BY a, b, c")
+        .expect("3-column wide-key GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int4(1), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int8(1)],
+        ],
+        "distinct (a,b,c) tuples, default order by the full tuple"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_numeric_member() {
+    // A composite with a NUMERIC member (can't pack into <=128 bits with another) -> the wide-key path
+    // (16 bytes for the numeric + 8 for the int). SUM(c) (single aggregate). Construction oracle.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (n NUMERIC(10,2), k INT, c INT)")
+        .unwrap();
+    // (1.50,1,10),(1.50,1,20),(1.50,2,5),(2.50,1,7).
+    e.execute_text(
+        2,
+        "INSERT INTO t (n,k,c) VALUES (1.50,1,10),(1.50,1,20),(1.50,2,5),(2.50,1,7)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT n, k, SUM(c) FROM t GROUP BY n, k")
+        .expect("composite (numeric, int) wide-key GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    let num = |m: i128| SqlValue::Numeric(Decimal128::new(m, 2));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![num(150), SqlValue::Int4(1), SqlValue::Int8(30)],
+            vec![num(150), SqlValue::Int4(2), SqlValue::Int8(5)],
+            vec![num(250), SqlValue::Int4(1), SqlValue::Int8(7)],
+        ],
+        "(numeric, int) composite, SUM per group, default order by (n,k)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_int8_and_numeric_member() {
+    // A composite of an INT8 member + a NUMERIC member -> the wide-key path with BOTH a wk_int8 (8-byte)
+    // and a wk_i128 (16-byte) leg in gpu_db_build_wide_key. The int8 value is beyond the int4 range, so
+    // a truncated (4-byte) int8 write would mis-group it -> this exercises the wk_int8 build leg.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, n NUMERIC(10,2))")
+        .unwrap();
+    // (9e9,1.50)x2, (9e9,2.50)x1, (5,1.50)x1.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,n) VALUES (9000000000,1.50),(9000000000,1.50),(9000000000,2.50),(5,1.50)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, n, COUNT(*) FROM t GROUP BY a, n")
+        .expect("composite (int8, numeric) wide-key GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    let num = |m: i128| SqlValue::Numeric(Decimal128::new(m, 2));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int8(5), num(150), SqlValue::Int8(1)],
+            vec![SqlValue::Int8(9000000000), num(150), SqlValue::Int8(2)],
+            vec![SqlValue::Int8(9000000000), num(250), SqlValue::Int8(1)],
+        ],
+        "int8 (8-byte) + numeric (16-byte) wide-key legs; int8 beyond int4 range survives"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_uuid_member() {
+    // A composite with a UUID member -> the wide-key path (16 bytes for the uuid + 8 for the int).
+    let a = "11111111-1111-1111-1111-111111111111";
+    let b = "22222222-2222-2222-2222-222222222222";
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id UUID, k INT)").unwrap();
+    // (a,1)x2, (a,2)x1, (b,1)x1.
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (id,k) VALUES ('{a}',1),('{a}',1),('{a}',2),('{b}',1)"),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT id, k, COUNT(*) FROM t GROUP BY id, k")
+        .expect("composite (uuid, int) wide-key GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    let uid = |s: &str| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(s).expect("valid uuid"));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![uid(a), SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![uid(a), SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![uid(b), SqlValue::Int4(1), SqlValue::Int8(1)],
+        ],
+        "(uuid, int) composite, default order by (id,k)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_widekey_multi_aggregate_rejected() {
+    // A wide-key composite supports a SINGLE aggregate (multi-pass alignment is a follow-up) -> reject.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT, d INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b,c,d) VALUES (1,1,1,10)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
     let err = e
-        .execute_relational_select_text("SELECT a, b, c, COUNT(*) FROM t GROUP BY a, b, c")
-        .expect_err("3-column composite GROUP BY rejected");
+        .execute_resident_expr_select_sql("SELECT a, b, c, COUNT(*), SUM(d) FROM t GROUP BY a, b, c")
+        .expect_err("multi-aggregate wide-key composite rejected");
     let msg = format!("{err:?}").to_lowercase();
     assert!(
-        msg.contains("group by") || msg.contains("composite") || msg.contains("column"),
+        msg.contains("single aggregate") || msg.contains("follow-up"),
+        "clean reject, got: {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_two_text_rejected() {
+    // A two-text composite is a clean error (the (fixed, text) path folds ONE fixed member; two text
+    // members are a follow-up). The reject is in the executor (after the residency load), so it needs
+    // a resident snapshot to reach it.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b) VALUES ('x','y')")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let err = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect_err("two-text composite GROUP BY rejected");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("text") || msg.contains("composite") || msg.contains("follow-up"),
         "clean reject, got: {err:?}"
     );
 }

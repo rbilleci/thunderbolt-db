@@ -1192,6 +1192,21 @@ impl CudaResidentDeviceMemory {
         launch_cuda_widen_col_to_i64_device(self, off, w, n_rows)
     }
 
+    /// Build a fixed-width WIDE KEY buffer for a general all-fixed composite GROUP BY key (>2 columns,
+    /// or a numeric/uuid member, or a tuple wider than 128 bits). `descriptors` is one (kind, src_off,
+    /// dst_off) per member (kind: 0=int4-section, 1=int8-section, 2=numeric/uuid 16B); `wbytes` is the
+    /// per-row width (each int member 8 bytes, each numeric/uuid 16). Returns a leased [u8; wbytes*n]
+    /// buffer the caller holds alive + passes as key_base_override with comp_w=wbytes to the GROUP BY
+    /// kernel (which groups via a (rep_idx, hash) b128 claim that memcmps the wbytes). cuCtxSynchronize'd.
+    pub fn build_wide_key_device(
+        &self,
+        descriptors: &[(u64, u64, u64)],
+        wbytes: u64,
+        n_rows: u64,
+    ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
+        launch_cuda_build_wide_key_device(self, descriptors, wbytes, n_rows)
+    }
+
     /// COUNT(DISTINCT v) mark pass: `keys` is the (key0, key1, ..) i64 tuple matrix (row-major, `k`
     /// values/row) ALREADY sorted via `perm` (from [`Self::bitonic_sort_multikey`]). key0 is the group
     /// key; the remaining keys are the value's fixed-width i64 representation (`k`=2 for an int value
@@ -1446,6 +1461,7 @@ impl CudaResidentDeviceMemory {
             0,     // value_bytes_off
             0,     // key_base_override (column key path -> no derived-buffer override)
             0,     // value_base_override (column value path)
+            0,     // comp_w (not a wide-key composite)
         )
     }
 
@@ -1473,6 +1489,9 @@ impl CudaResidentDeviceMemory {
         value_bytes_off: u64,
         key_base_override: u64,
         value_base_override: u64,
+        // General all-fixed COMPOSITE key: comp_w > 0 -> the `comp_w`-byte wide key per row lives in
+        // key_base_override (built by [`Self::build_wide_key_device`]); 0 = every other path.
+        comp_w: u64,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1493,6 +1512,7 @@ impl CudaResidentDeviceMemory {
             value_bytes_off,
             key_base_override,
             value_base_override,
+            comp_w,
         )
     }
 
@@ -1530,6 +1550,7 @@ impl CudaResidentDeviceMemory {
             0,
             0, // key_base_override (bench uses column keys)
             0, // value_base_override
+            0, // comp_w (not a wide-key composite)
         )
     }
 
@@ -6711,6 +6732,9 @@ fn launch_cuda_group_by_i32_count_sum(
     value_bytes_off: u64,
     key_base_override: u64,
     value_base_override: u64,
+    // General all-fixed COMPOSITE key: comp_w > 0 -> the key is a `comp_w`-byte wide key per row in
+    // key_base_override (built by gpu_db_build_wide_key); grouped via a (rep_idx, hash) b128 claim.
+    comp_w: u64,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -6822,7 +6846,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let slot_keys_i128 = primary.lease_device_buffer(uuid_slot_bytes)?;
     // Text GROUP-BY keys also live in slot_keys_i128 (b128 = (rep_row_idx, text_hash), claimed via
     // atom.cas.b128 with a full-text verify-on-lost-CAS), so the EMPTY128 fill is needed for them too.
-    let fill_i128_fn = if key_is_i128 || key_is_text {
+    let fill_i128_fn = if key_is_i128 || key_is_text || comp_w > 0 {
         Some(primary.cached_function(c"gpu_db_fill_i128", &ptx)?)
     } else {
         None
@@ -6895,6 +6919,7 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a29 = value_bytes_off;
     let mut a30 = key_base_override;
     let mut a31 = value_base_override;
+    let mut a32 = comp_w;
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -6939,6 +6964,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a29 as *mut u64).cast::<c_void>(),
         (&mut a30 as *mut u64).cast::<c_void>(),
         (&mut a31 as *mut u64).cast::<c_void>(),
+        (&mut a32 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -7154,7 +7180,7 @@ fn launch_cuda_group_by_i32_count_sum(
     // i128 / text GROUP BY keys: copy the b128 key slots back. Each slot's 16 LE bytes are the i128 key
     // (numeric mantissa or uuid bytes), or for a text key the b128 (hi=text hash, lo=representative row
     // index), claimed via atom.cas.b128.
-    let keys_i128: Vec<i128> = if key_is_i128 || key_is_text {
+    let keys_i128: Vec<i128> = if key_is_i128 || key_is_text || comp_w > 0 {
         let mut k = vec![0i128; alloc_slots];
         check_cuda(unsafe {
             cu_memcpy_dtoh(k.as_mut_ptr().cast::<c_void>(), slot_keys_i128.ptr, uuid_slot_bytes)
@@ -7188,7 +7214,7 @@ fn launch_cuda_group_by_i32_count_sum(
         // Occupancy: i128 + text keys live in slot_keys_i128 (EMPTY128 = i128::MIN); i64 keys in
         // slot_keys (EMPTY = i64::MIN). The i128/text path never writes the i64 slot_keys, so it must
         // test its own. (A text key never aliases i128::MIN -- the kernel remaps hash i64::MIN->0.)
-        let occupied = if key_is_i128 || key_is_text {
+        let occupied = if key_is_i128 || key_is_text || comp_w > 0 {
             keys_i128[i] != i128::MIN
         } else {
             keys[i] != EMPTY
@@ -7205,7 +7231,7 @@ fn launch_cuda_group_by_i32_count_sum(
                 max_hi: max_his[i],
                 min_uuid: uuid_at(&mins_uuid, i),
                 max_uuid: uuid_at(&maxs_uuid, i),
-                key_i128: if key_is_i128 || key_is_text {
+                key_i128: if key_is_i128 || key_is_text || comp_w > 0 {
                     keys_i128[i]
                 } else {
                     0
@@ -7383,6 +7409,7 @@ fn launch_cuda_group_by_kernel_timed(
         0, // value_bytes_off (unused)
         0, // key_base_override = 0: the timed bench uses column keys (no derived-buffer override)
         0, // value_base_override = 0: the timed bench uses column values
+        0, // comp_w = 0: the timed bench is not a wide-key composite
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -13952,6 +13979,120 @@ fn launch_cuda_widen_col_to_i64_device<'r>(
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
+    })?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let ptr = out.ptr;
+    Ok(DeviceArithBuffer { _lease: out, ptr })
+}
+
+/// Run `gpu_db_build_wide_key` into a leased [u8; wbytes*n] buffer (the all-fixed composite wide key per
+/// row) and return it. `descriptors` = (kind, src_off, dst_off) per member, uploaded as 3 u64 each.
+/// cuCtxSynchronize'd so the SEPARATE GROUP BY launch reads the completed buffer via key_base_override.
+fn launch_cuda_build_wide_key_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    descriptors: &[(u64, u64, u64)],
+    wbytes: u64,
+    n: u64,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    if n == 0 || descriptors.is_empty() || wbytes == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let wbytes_usize =
+        usize::try_from(wbytes).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let out_bytes = n_usize
+        .checked_mul(wbytes_usize)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    // Flatten the descriptors to a [u64] (kind, src_off, dst_off per member) for the device upload.
+    let mut desc_flat: Vec<u64> = Vec::with_capacity(descriptors.len() * 3);
+    for &(kind, src_off, dst_off) in descriptors {
+        desc_flat.push(kind);
+        desc_flat.push(src_off);
+        desc_flat.push(dst_off);
+    }
+    let desc_bytes = std::mem::size_of_val(desc_flat.as_slice());
+    let n_members = descriptors.len() as u64;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_build_wide_key", &ptx)?;
+    let desc_dev = primary.lease_device_buffer(desc_bytes)?;
+    let out = primary.lease_device_buffer(out_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe {
+            htod_async(
+                desc_dev.ptr,
+                desc_flat.as_ptr().cast::<c_void>(),
+                desc_bytes,
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        let mut a0 = resident.device_ptr();
+        let mut a1 = desc_dev.ptr;
+        let mut a2 = n_members;
+        let mut a3 = wbytes;
+        let mut a4 = n;
+        let mut a5 = out.ptr;
+        let mut args = [
+            (&mut a0 as *mut u64).cast::<c_void>(),
+            (&mut a1 as *mut u64).cast::<c_void>(),
+            (&mut a2 as *mut u64).cast::<c_void>(),
+            (&mut a3 as *mut u64).cast::<c_void>(),
+            (&mut a4 as *mut u64).cast::<c_void>(),
+            (&mut a5 as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                kernel_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
     })?;
     let cu_ctx_synchronize = unsafe {
         resident

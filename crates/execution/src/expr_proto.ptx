@@ -3568,6 +3568,129 @@ done_widen:
     ret;
 }
 
+// Build a fixed-width WIDE KEY buffer for a general all-fixed composite GROUP BY key (>2 columns, or a
+// numeric/uuid member, or a tuple wider than 128 bits -- the cases the i64/i128 pack can't hold). Each
+// member's canonical bytes are concatenated into out[row*wbytes + dst_off]: an int member (int2/int4/
+// date via kind 0; int8/timestamp via kind 1) writes 8 bytes (the value as i64, 716-safe 2x ld.u32 for
+// int8); a numeric/uuid member (kind 2) writes its 16 raw bytes. `desc` is n_members entries of 3 u64
+// (kind, src_off, dst_off). The wide-key GROUP BY claim then hashes + memcmps `wbytes` bytes (the b128
+// slot holds (rep_idx, hash)). A pure MAP -- no atomics/hash -> it cannot reintroduce the bool hazard.
+// The out buffer is freshly leased (8-aligned) and every dst_off is a multiple of 8, so the 8-byte
+// stores are aligned.
+.visible .entry gpu_db_build_wide_key(
+    .param .u64 resident_ptr,
+    .param .u64 desc_ptr,
+    .param .u64 n_members,
+    .param .u64 wbytes,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .s32 %s32;
+    .reg .u64 %rp;
+    .reg .u64 %descp;
+    .reg .u64 %nm;
+    .reg .u64 %wb;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %rowbase;
+    .reg .u64 %m;
+    .reg .u64 %dbase;
+    .reg .u64 %kind;
+    .reg .u64 %srcoff;
+    .reg .u64 %dstoff;
+    .reg .u64 %src;
+    .reg .u64 %dst;
+    .reg .u64 %v;
+    .reg .u64 %vhi;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %descp, [desc_ptr];
+    ld.param.u64 %nm, [n_members];
+    ld.param.u64 %wb, [wbytes];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_widekey:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_widekey;
+    mul.lo.u64 %rowbase, %i, %wb;
+    add.u64 %rowbase, %out, %rowbase;
+    mov.u64 %m, 0;
+wk_member:
+    setp.ge.u64 %p, %m, %nm;
+    @%p bra wk_member_done;
+    // desc[m] = (kind, src_off, dst_off) at descp + m*24
+    mul.lo.u64 %o, %m, 24;
+    add.u64 %dbase, %descp, %o;
+    ld.global.u64 %kind, [%dbase];
+    ld.global.u64 %srcoff, [%dbase+8];
+    ld.global.u64 %dstoff, [%dbase+16];
+    add.u64 %dst, %rowbase, %dstoff;
+    setp.eq.u64 %p, %kind, 2;
+    @%p bra wk_i128;
+    setp.eq.u64 %p, %kind, 1;
+    @%p bra wk_int8;
+    // kind 0: int4 (4-byte) -> i64, write 8 bytes.
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.s32 %s32, [%src];
+    cvt.s64.s32 %v, %s32;
+    st.global.u64 [%dst], %v;
+    bra wk_member_next;
+wk_int8:
+    // kind 1: int8 (8-byte, 716-safe 2x u32) -> write 8 bytes.
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    ld.global.u32 %w1, [%src+4];
+    mov.b64 %v, {%w0, %w1};
+    st.global.u64 [%dst], %v;
+    bra wk_member_next;
+wk_i128:
+    // kind 2: numeric/uuid (16-byte, 4x u32) -> write 16 bytes (lo, hi).
+    mul.lo.u64 %o, %i, 16;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    ld.global.u32 %w1, [%src+4];
+    mov.b64 %v, {%w0, %w1};
+    ld.global.u32 %w0, [%src+8];
+    ld.global.u32 %w1, [%src+12];
+    mov.b64 %vhi, {%w0, %w1};
+    st.global.u64 [%dst], %v;
+    st.global.u64 [%dst+8], %vhi;
+wk_member_next:
+    add.u64 %m, %m, 1;
+    bra wk_member;
+wk_member_done:
+    add.u64 %i, %i, %stride;
+    bra loop_widekey;
+done_widekey:
+    ret;
+}
+
 // COUNT(DISTINCT v) mark pass: mark the first row of each distinct (key0, key1, .., key{kdim-1})
 // tuple in SORTED order, and gather each sorted row's key0 (the group key). `keys_ptr` is the
 // row-major i64 tuple matrix (kdim i64 per row) ALREADY sorted via `perm` (the u32 permutation from
@@ -5304,7 +5427,11 @@ het_done:
     .param .u64 value_offsets_off,
     .param .u64 value_bytes_off,
     .param .u64 key_base_override,
-    .param .u64 value_base_override
+    .param .u64 value_base_override,
+    // General all-fixed COMPOSITE key: when comp_w > 0 the key is a `comp_w`-byte WIDE KEY per row in
+    // key_base_override (built by gpu_db_build_wide_key) -- grouped via a (rep_idx, hash) b128 claim
+    // that hashes + memcmps the comp_w bytes. 0 = not a wide-key composite (every existing path).
+    .param .u64 comp_w
 )
 {
     .reg .pred %pvt;
@@ -5486,6 +5613,12 @@ het_done:
     .reg .u64 %vbov;
     .reg .pred %pvbov;
     ld.param.u64 %vbov, [value_base_override];
+    .reg .u64 %compw;
+    .reg .pred %pcw;
+    .reg .u64 %wkbase;
+    .reg .u64 %wkb;
+    .reg .u64 %jw;
+    ld.param.u64 %compw, [comp_w];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -5509,6 +5642,9 @@ row_loop:
     // 0 -> byte-identical to the column-key path. A derived key is always int (ktext/ki128/k128 = 0).
     setp.ne.u64 %pkbov, %kbov, 0;
     @%pkbov mov.u64 %addr, %kbov;
+    // General all-fixed COMPOSITE: comp_w > 0 -> the wide key is comp_w bytes at kbov + idx*comp_w.
+    setp.ne.u64 %pcw, %compw, 0;
+    @%pcw bra gb_kwidekey;
     setp.ne.u64 %pkt, %ktext, 0;
     @%pkt bra gb_ktext;
     setp.ne.u64 %pki, %ki128, 0;
@@ -5592,6 +5728,32 @@ ktext_no_fixed:
     cvt.u64.u32 %keylo, %idx;
     mov.u64 %keyhi, %thash;
     mov.b128 %key128, {%keylo, %keyhi};
+    bra gb_kdone;
+gb_kwidekey:
+    // General all-fixed COMPOSITE key: FNV-1a-64 hash the comp_w wide-key bytes at kbov + idx*comp_w
+    // -> thash; key128 = (lo=idx, hi=thash). Remap thash==i64::MIN->0 so (idx,thash) never aliases
+    // EMPTY128. The claim verifies the comp_w bytes (memcmp) on a hash collision (gb_kwidekeyclaim).
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %o8, %koff2, %compw;
+    add.u64 %wkbase, %kbov, %o8;
+    mov.u64 %thash, 0xcbf29ce484222325;
+    mov.u64 %jw, 0;
+wkey_hash:
+    setp.ge.u64 %p, %jw, %compw;
+    @%p bra wkey_hash_done;
+    add.u64 %addr, %wkbase, %jw;
+    ld.global.u8 %abyte, [%addr];
+    cvt.u64.u32 %tmp, %abyte;
+    xor.b64 %thash, %thash, %tmp;
+    mul.lo.u64 %thash, %thash, 0x100000001b3;
+    add.u64 %jw, %jw, 1;
+    bra wkey_hash;
+wkey_hash_done:
+    setp.eq.s64 %p, %thash, %empty;
+    selp.b64 %thash, 0, %thash, %p;
+    cvt.u64.u32 %keylo, %idx;
+    mov.u64 %keyhi, %thash;
+    mov.b128 %key128, {%keylo, %keyhi};
 gb_kdone:
     add.u64 %addr, %base, %soff;
     // Derived value column (bool MIN/MAX materialized to int4): a non-zero value_base_override replaces
@@ -5670,6 +5832,8 @@ gb_vuuid:
     mov.b64 %ulo, {%bw3, %bw2};
     mov.b128 %val128, {%ulo, %uhi};
 gb_vdone:
+    setp.ne.u64 %pcw, %compw, 0;
+    @%pcw bra gb_kwidekeyclaim;
     @%pkt bra gb_ktextclaim;
     @%pki bra gb_ki128claim;
     // The key i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table. Route
@@ -5815,6 +5979,57 @@ ktext_probe_next:
     add.u64 %h, %h, 1;
     and.b64 %h, %h, %mask;
     bra probe_loop_text;
+gb_kwidekeyclaim:
+    // General all-fixed COMPOSITE: the b128 slot holds (lo=rep_idx, hi=hash). Claim for the FIRST row
+    // of a wide key; a LOST cas means occupied -- if its hash matches AND a memcmp of this row's comp_w
+    // wide-key bytes vs the representative's confirms equality, same group (hit); else (collision) probe
+    // on. So equal tuples collapse + collisions never merge. thash was remapped off i64::MIN, so the
+    // (idx, thash) slot key never aliases EMPTY128 (no dedicated-slot route needed, like the text path).
+    mov.b64 %mix, %thash;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xff51afd7ed558ccd;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    mul.lo.u64 %mix, %mix, 0xc4ceb9fe1a85ec53;
+    shr.u64 %tmp, %mix, 33;
+    xor.b64 %mix, %mix, %tmp;
+    and.b64 %h, %mix, %mask;
+    mov.u64 %clo, 0;
+    mov.b128 %empty128, {%clo, %empty};
+probe_loop_widekey:
+    mul.lo.u64 %off16, %h, 16;
+    add.u64 %addr, %ski128, %off16;
+    atom.global.cas.b128 %old128, [%addr], %empty128, %key128;
+    mov.b128 {%olo, %ohi}, %old128;
+    setp.eq.u64 %pe, %olo, 0;
+    setp.eq.u64 %pf, %ohi, %empty;
+    and.pred %claimed, %pe, %pf;
+    @%claimed bra do_agg;
+    setp.ne.u64 %pf, %ohi, %thash;
+    @%pf bra wkey_probe_next;
+    // memcmp comp_w wide-key bytes: this row (idx) vs the representative (olo).
+    cvt.u64.u32 %koff2, %idx;
+    mul.lo.u64 %o8, %koff2, %compw;
+    add.u64 %wkbase, %kbov, %o8;
+    mul.lo.u64 %o8, %olo, %compw;
+    add.u64 %wkb, %kbov, %o8;
+    mov.u64 %jw, 0;
+wkey_vbyte:
+    setp.ge.u64 %p, %jw, %compw;
+    @%p bra do_agg;
+    add.u64 %addr, %wkbase, %jw;
+    ld.global.u8 %abyte, [%addr];
+    add.u64 %addr, %wkb, %jw;
+    ld.global.u8 %bbyte, [%addr];
+    setp.ne.u32 %p, %abyte, %bbyte;
+    @%p bra wkey_probe_next;
+    add.u64 %jw, %jw, 1;
+    bra wkey_vbyte;
+wkey_probe_next:
+    add.u64 %h, %h, 1;
+    and.b64 %h, %h, %mask;
+    bra probe_loop_widekey;
 do_agg:
     mul.lo.u64 %off, %h, 8;
     add.u64 %addr, %cptr, %off;

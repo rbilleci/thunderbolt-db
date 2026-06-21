@@ -75,9 +75,9 @@ impl Engine {
             }
             None => None,
         };
-        // The GROUP BY key COLUMNS (a composite `GROUP BY a, b` packs two on-device). Every group term
-        // that is a bare ColumnRef -> its name; an expression term is skipped (handled by group_key_expr).
-        // parse_group_by already rejected >2 terms.
+        // The GROUP BY key COLUMNS (a composite `GROUP BY a, b[, ...]` packs/wide-keys them on-device).
+        // Every group term that is a bare ColumnRef -> its name; an expression term is skipped (handled
+        // by group_key_expr). The executor validates the member count + types.
         let mut group_key_columns: Vec<String> = Vec::new();
         for node in &stmt.group_clause {
             if let NodeEnum::ColumnRef(column_ref) = node_enum(node)? {
@@ -235,25 +235,27 @@ fn parse_group_by(group_clause: &[Node], qualifier: &str) -> Result<Option<Strin
                 Ok(Some("(expr)".to_string()))
             }
         }
-        // COMPOSITE: exactly two COLUMN terms -> select.group_by carries the FIRST (back-compat); both
-        // names ride group_key_columns (built by the caller) which drives the on-device pack. A non-
-        // column member (expression/text) is out of scope this slice -> a clean error.
-        [first, second] => {
-            let (NodeEnum::ColumnRef(c0), NodeEnum::ColumnRef(c1)) =
-                (node_enum(first)?, node_enum(second)?)
-            else {
-                return Err(sql_pg_error(
-                    "composite GROUP BY supports two plain columns on the Expr path (no expression \
-                     member yet)"
-                        .to_string(),
-                ));
-            };
-            let _ = resolve_column_name(c1, qualifier)?;
-            Ok(Some(resolve_column_name(c0, qualifier)?.to_string()))
+        // COMPOSITE: two or more COLUMN terms -> select.group_by carries the FIRST (back-compat); ALL
+        // names ride group_key_columns (built by the caller) which drives the on-device pack / wide key.
+        // Every member must be a plain column (a non-column member -- expression/etc. -- in a composite
+        // is out of scope -> a clean error). The executor validates the member TYPES.
+        terms => {
+            let mut first_name: Option<String> = None;
+            for term in terms {
+                let NodeEnum::ColumnRef(column_ref) = node_enum(term)? else {
+                    return Err(sql_pg_error(
+                        "composite GROUP BY supports plain columns on the Expr path (no expression \
+                         member yet)"
+                            .to_string(),
+                    ));
+                };
+                let name = resolve_column_name(column_ref, qualifier)?.to_string();
+                if first_name.is_none() {
+                    first_name = Some(name);
+                }
+            }
+            Ok(first_name)
         }
-        _ => Err(sql_pg_error(
-            "GROUP BY supports one or two columns (or a single expression) on the Expr path".to_string(),
-        )),
     }
 }
 
