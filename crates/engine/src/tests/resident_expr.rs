@@ -4024,6 +4024,245 @@ fn gpu_scalar_count_distinct_text_numeric_and_filtered() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_text_group_key() {
+    // COUNT(DISTINCT v) over a TEXT group key (the GROUP-BY-(g,v) reduction: distinct (cat, uid) pairs
+    // per cat). cat=a: uid in {1,1,2} -> 2 distinct; cat=b: {5,5} -> 1 distinct.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (cat, uid) VALUES ('a',1),('a',1),('a',2),('b',5),('b',5)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT cat, COUNT(DISTINCT uid) FROM t GROUP BY cat")
+        .expect("COUNT(DISTINCT) over a text group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Text("b".into()), SqlValue::Int8(1)],
+        ],
+        "distinct uid per text category"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_text_group_and_text_value() {
+    // COUNT(DISTINCT v) where BOTH the group key AND the value are TEXT -> the (g, v) reduction's step 1
+    // is a two-text composite. cat=a: tag in {x,x,y} -> 2; cat=b: {z} -> 1.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, tag TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (cat, tag) VALUES ('a','x'),('a','x'),('a','y'),('b','z')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT cat, COUNT(DISTINCT tag) FROM t GROUP BY cat")
+        .expect("COUNT(DISTINCT text) over a text group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Text("b".into()), SqlValue::Int8(1)],
+        ],
+        "distinct text tag per text category"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_text_group_combined_with_count_star() {
+    // A TEXT group key (not composite) supports COUNT(*) (direct pass) + COUNT(DISTINCT) (reduction)
+    // merged by the group key. cat=a: count 3, distinct{1,2}=2; cat=b: count 1, distinct{5}=1.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (cat, uid) VALUES ('a',1),('a',1),('a',2),('b',5)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT cat, COUNT(*), COUNT(DISTINCT uid) FROM t GROUP BY cat",
+        )
+        .expect("text group key COUNT(*) + COUNT(DISTINCT)");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Int8(3), SqlValue::Int8(2)],
+            vec![SqlValue::Text("b".into()), SqlValue::Int8(1), SqlValue::Int8(1)],
+        ],
+        "count >= distinct, aligned by the text group key"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_numeric_group_key() {
+    // COUNT(DISTINCT v) over a NUMERIC group key (i128 key; the (g,v) reduction's step 1 is a
+    // (numeric, int) wide-key). g=1.50: v in {5,5,7} -> 2; g=2.50: {9} -> 1.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g NUMERIC(10,2), v INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES (1.50,5),(1.50,5),(1.50,7),(2.50,9)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+        .expect("COUNT(DISTINCT) over a numeric group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let num = |m: i128| SqlValue::Numeric(Decimal128::new(m, 2));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![num(150), SqlValue::Int8(2)],
+            vec![num(250), SqlValue::Int8(1)],
+        ],
+        "distinct v per numeric group"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_composite_group_key() {
+    // COUNT(DISTINCT v) over a COMPOSITE (int, int) group key (single aggregate). step 1 = (a,b,v)
+    // wide-key; step 2 = (a,b) i64-pack over the reps. (1,1): v{5,5,7}->2; (1,2): {9}->1; (2,1): {9}->1.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,v) VALUES (1,1,5),(1,1,5),(1,1,7),(1,2,9),(2,1,9)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(DISTINCT v) FROM t GROUP BY a, b")
+        .expect("COUNT(DISTINCT) over a composite group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(2), SqlValue::Int4(1), SqlValue::Int8(1)],
+        ],
+        "distinct v per (a,b) composite group"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_text_group_key_empty() {
+    // A WHERE that drops every row -> no groups (the reduction handles empty survivors / empty reps).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (cat, uid) VALUES ('a',1),('b',2)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT cat, COUNT(DISTINCT uid) FROM t WHERE uid > 100 GROUP BY cat",
+        )
+        .expect("COUNT(DISTINCT) text group key, empty survivors");
+    assert!(res.rows.is_empty(), "no surviving rows -> no groups");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_numeric_value_text_group_shared() {
+    // COUNT(DISTINCT numeric_value) over a TEXT group key, with a value SHARED across groups: 1.50
+    // appears under cat=a AND cat=b -> it counts once PER group. a: {1.50,2.50}=2; b: {1.50}=1.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, n NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (cat, n) VALUES ('a',1.50),('a',1.50),('a',2.50),('b',1.50)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT cat, COUNT(DISTINCT n) FROM t GROUP BY cat")
+        .expect("COUNT(DISTINCT numeric) over a text group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Text("a".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Text("b".into()), SqlValue::Int8(1)],
+        ],
+        "distinct numeric value per text group; a shared value is counted once per group"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_expr_and_bool_group_rejected() {
+    // COUNT(DISTINCT v) over an EXPRESSION or BOOL group key is a follow-up (a derived buffer can't be
+    // a (g,v) composite member) -> a clean reject (at execution, on the GPU path).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, flag BOOL, v INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b,flag,v) VALUES (1,2,true,5),(1,2,false,5)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let expr_err = e
+        .execute_resident_expr_select_sql("SELECT a + b, COUNT(DISTINCT v) FROM t GROUP BY a + b")
+        .expect_err("expression group key + COUNT(DISTINCT) rejected");
+    assert!(
+        format!("{expr_err:?}").to_lowercase().contains("expression")
+            || format!("{expr_err:?}").to_lowercase().contains("follow-up"),
+        "clean reject, got: {expr_err:?}"
+    );
+    let bool_err = e
+        .execute_resident_expr_select_sql("SELECT flag, COUNT(DISTINCT v) FROM t GROUP BY flag")
+        .expect_err("bool group key + COUNT(DISTINCT) rejected");
+    assert!(
+        format!("{bool_err:?}").to_lowercase().contains("bool")
+            || format!("{bool_err:?}").to_lowercase().contains("follow-up"),
+        "clean reject, got: {bool_err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_multiple_aggregates_different_value_columns() {
     // SELECT g, SUM(v), MIN(w), MAX(w) FROM t GROUP BY g -- aggregates over TWO different value columns
     // (v int4, w int8) -> two grouping passes (single-level forced) merged by group index.

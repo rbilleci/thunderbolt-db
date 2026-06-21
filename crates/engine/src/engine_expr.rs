@@ -120,6 +120,101 @@ fn narrow_ordered_value(ty: SqlType, lo: i64, hi: i64, scale: u8) -> SqlValue {
     }
 }
 
+/// COUNT(DISTINCT v) over a NON-int group key: the building block of the GROUP-BY-(g,v) reduction.
+/// Runs a general composite GROUP BY COUNT(*) over `members` (any mix of fixed-width + text columns --
+/// the wide-key buffer for the fixed members + a text descriptor for the text ones) over the rows in
+/// `indices`, and returns each distinct tuple's REPRESENTATIVE absolute row (the b128 slot's lo).
+/// `members` must route to a rep_idx path (a text member, or a numeric/uuid member, or >2 columns --
+/// never the 2-fixed i64/i128 pack, which has no representative row); the reduction guarantees this by
+/// always appending the non-int value/key member. All grouping is on the GPU; the rep rows are
+/// control-plane row indices (like the WHERE survivors).
+fn composite_group_count_reps(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
+    members: &[(usize, SqlType)],
+    indices: &[u32],
+    row_count: u64,
+) -> Result<Vec<u32>, ExecuteError> {
+    let map_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
+        ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+    };
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Fixed members -> the comp_w wide-key buffer (int 8B, numeric/uuid 16B); text -> the descriptor.
+    let mut descriptors: Vec<(u64, u64, u64)> = Vec::new();
+    let mut dst_off: u64 = 0;
+    for &(idx, ty) in members {
+        match ty {
+            SqlType::Numeric { .. } | SqlType::Uuid => {
+                descriptors.push((
+                    2,
+                    resident_device_numeric_column_offset(snapshot, table, idx)?,
+                    dst_off,
+                ));
+                dst_off += 16;
+            }
+            SqlType::Int8 | SqlType::Timestamp => {
+                descriptors.push((
+                    1,
+                    resident_device_int8_column_offset(snapshot, table, idx)?,
+                    dst_off,
+                ));
+                dst_off += 8;
+            }
+            SqlType::Text => {}
+            _ => {
+                descriptors.push((
+                    0,
+                    resident_device_int4_column_offset(snapshot, table, idx)?,
+                    dst_off,
+                ));
+                dst_off += 8;
+            }
+        }
+    }
+    let comp_w = dst_off;
+    let _kbuf;
+    let key_base_override = if comp_w > 0 {
+        let buf = device_memory
+            .build_wide_key_device(&descriptors, comp_w, row_count)
+            .map_err(map_err)?;
+        let ptr = buf.device_ptr();
+        _kbuf = Some(buf);
+        ptr
+    } else {
+        _kbuf = None;
+        0
+    };
+    let mut flat: Vec<u64> = Vec::new();
+    for &(idx, ty) in members {
+        if matches!(ty, SqlType::Text) {
+            let layout = resident_device_text_column_layout(snapshot, table, idx)?;
+            flat.push(layout.offsets_byte_offset);
+            flat.push(layout.bytes_byte_offset);
+        }
+    }
+    let _tdesc;
+    let (n_text, text_desc_ptr) = if flat.is_empty() {
+        _tdesc = None;
+        (0, 0)
+    } else {
+        let n = (flat.len() / 2) as u64;
+        let buf = device_memory.upload_u64_device(&flat).map_err(map_err)?;
+        let ptr = buf.device_ptr();
+        _tdesc = Some(buf);
+        (n, ptr)
+    };
+    let groups = device_memory
+        .group_by_i32_count_sum_minmax_from_payload(
+            0, 0, indices, false, false, false, false, false, false, 0, 0, false, 0, 0,
+            key_base_override, 0, comp_w, n_text, text_desc_ptr,
+        )
+        .map_err(map_err)?;
+    Ok(groups.iter().map(|g| g.key_i128 as u64 as u32).collect())
+}
+
 /// Device op-code for an arithmetic binary op (matches `expr_proto.ptx`: 0=add, 1=sub, 2=mul), or
 /// `None` if `op` is not arithmetic.
 fn arith_op_code(op: ResidentBinaryOp) -> Option<u32> {
@@ -2303,76 +2398,159 @@ impl Engine {
                 .iter()
                 .any(|a| a.kind == GroupedAggKind::CountDistinct)
             {
-                if is_expr_key
-                    || key_is_bool
-                    || is_composite_key
-                    || composite_is_widekey
-                    || key_is_text
-                    || key_is_i128
-                {
+                // An EXPRESSION or BOOL group key is a derived buffer, not a column the (g, v) composite
+                // can include -> a follow-up. Column group keys (int/text/numeric/uuid/composite) are
+                // supported below.
+                if is_expr_key || key_is_bool {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "COUNT(DISTINCT v) supports a plain int group key on the GPU path \
-                         (expression/bool/composite/text/numeric/uuid group keys are follow-ups)"
+                        "COUNT(DISTINCT v) over an expression / bool GROUP BY key is a follow-up \
+                         (int / text / numeric / uuid / composite column group keys are supported)"
                             .to_string(),
                     )));
                 }
-                let materialize_i64_col =
-                    |col_idx: usize, idx_u64: &[u64]| -> Result<Vec<i64>, ExecuteError> {
-                        match table.columns[col_idx].ty {
-                            SqlType::Int4 | SqlType::Int2 | SqlType::Date => Ok(device_memory
-                                .project_i32_rows_from_payload(
-                                    resident_device_int4_column_offset(&snapshot, table, col_idx)?,
-                                    idx_u64,
-                                )
-                                .map_err(map_err)?
-                                .into_iter()
-                                .map(i64::from)
-                                .collect()),
-                            SqlType::Int8 | SqlType::Timestamp => device_memory
-                                .project_i64_rows_from_payload(
-                                    resident_device_int8_column_offset(&snapshot, table, col_idx)?,
-                                    idx_u64,
-                                )
-                                .map_err(map_err),
-                            _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                "COUNT(DISTINCT) group key / value must be an i64-representable int \
-                                 column"
-                                    .to_string(),
-                            ))),
-                        }
-                    };
                 let idx_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
                 let n = idx_u64.len();
-                // The group key column values (sorted-tuple key 0), materialized once for every pass.
-                let g_vals = if n > 0 {
-                    Some(materialize_i64_col(group_idx, &idx_u64)?)
-                } else {
-                    None
-                };
-                for (aggregate, value_idx) in aggregates.iter().zip(&agg_value_indices) {
-                    if aggregate.kind != GroupedAggKind::CountDistinct {
-                        continue;
-                    }
-                    let value_idx = value_idx.expect("COUNT(DISTINCT) has a value column");
-                    // GPU sort -> mark -> per-group SUM over (group_key, value); see
-                    // `count_distinct_groups`. The group key is the real plain-int group column.
-                    let groups = if n == 0 {
-                        Vec::new()
+                if is_composite_key || composite_is_widekey || key_is_text || key_is_i128 {
+                    // NON-int group key: reduce COUNT(DISTINCT v) per g to counting DISTINCT (g, v)
+                    // pairs per g. (1) GROUP BY (g..., v) -> one representative row per distinct (g, v)
+                    // [the general composite path]; (2) GROUP BY g over those reps, COUNT(*) -> the
+                    // distinct-v count per g [reusing the MAIN g config so the groups carry the real g
+                    // key and align with the reference pass via materialize_key]. All on the GPU.
+                    let g_members: Vec<(usize, SqlType)> = if let Some(m) = &widekey_cols {
+                        m.clone()
+                    } else if let Some((c0, t0, c1, t1)) = composite_cols {
+                        vec![(c0, t0), (c1, t1)]
                     } else {
-                        let g_vals = g_vals.as_ref().expect("g_vals materialized for n > 0");
-                        count_distinct_groups(value_idx, g_vals, &idx_u64)?
+                        vec![(group_idx, key_ty)]
                     };
-                    passes.push(Pass {
-                        value_idx,
-                        groups,
-                        value_ty: SqlType::Int8,
-                        value_scale: 0,
-                        value_is_int8: false,
-                        value_is_numeric: false,
-                        value_is_uuid: false,
-                        value_is_text: false,
-                        is_count_distinct: true,
-                    });
+                    for (aggregate, value_idx) in aggregates.iter().zip(&agg_value_indices) {
+                        if aggregate.kind != GroupedAggKind::CountDistinct {
+                            continue;
+                        }
+                        let value_idx = value_idx.expect("COUNT(DISTINCT) has a value column");
+                        let groups = if n == 0 {
+                            Vec::new()
+                        } else {
+                            // (1) the distinct (g, v) representative rows.
+                            let mut gv_members = g_members.clone();
+                            gv_members.push((value_idx, table.columns[value_idx].ty));
+                            let reps = composite_group_count_reps(
+                                &snapshot,
+                                table,
+                                &device_memory,
+                                &gv_members,
+                                &indices,
+                                row_count,
+                            )?;
+                            // (2) GROUP BY g over the reps (reusing the main g config) COUNT(*).
+                            let mut g2 = if reps.is_empty() {
+                                Vec::new()
+                            } else {
+                                device_memory
+                                    .group_by_i32_count_sum_minmax_from_payload(
+                                        key_offset,
+                                        0,
+                                        &reps,
+                                        false,
+                                        key_is_int8,
+                                        false,
+                                        false,
+                                        key_is_i128,
+                                        key_is_text,
+                                        key_offsets_off,
+                                        key_bytes_off,
+                                        false,
+                                        0,
+                                        0,
+                                        key_base_override,
+                                        0,
+                                        widekey_w,
+                                        widekey_n_text,
+                                        widekey_text_desc_ptr,
+                                    )
+                                    .map_err(map_err)?
+                            };
+                            // The CountDistinct pass carries the per-group distinct count in `.sum`
+                            // (the result builder reads groups[i].sum for such a pass).
+                            for grp in &mut g2 {
+                                grp.sum = grp.count as i64;
+                            }
+                            g2
+                        };
+                        passes.push(Pass {
+                            value_idx,
+                            groups,
+                            value_ty: SqlType::Int8,
+                            value_scale: 0,
+                            value_is_int8: false,
+                            value_is_numeric: false,
+                            value_is_uuid: false,
+                            value_is_text: false,
+                            is_count_distinct: true,
+                        });
+                    }
+                } else {
+                    // Plain int group key: the direct sort -> mark -> per-group SUM pipeline.
+                    let materialize_i64_col =
+                        |col_idx: usize, idx_u64: &[u64]| -> Result<Vec<i64>, ExecuteError> {
+                            match table.columns[col_idx].ty {
+                                SqlType::Int4 | SqlType::Int2 | SqlType::Date => Ok(device_memory
+                                    .project_i32_rows_from_payload(
+                                        resident_device_int4_column_offset(
+                                            &snapshot, table, col_idx,
+                                        )?,
+                                        idx_u64,
+                                    )
+                                    .map_err(map_err)?
+                                    .into_iter()
+                                    .map(i64::from)
+                                    .collect()),
+                                SqlType::Int8 | SqlType::Timestamp => device_memory
+                                    .project_i64_rows_from_payload(
+                                        resident_device_int8_column_offset(
+                                            &snapshot, table, col_idx,
+                                        )?,
+                                        idx_u64,
+                                    )
+                                    .map_err(map_err),
+                                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "COUNT(DISTINCT) group key / value must be an i64-representable \
+                                     int column"
+                                        .to_string(),
+                                ))),
+                            }
+                        };
+                    // The group key column values (sorted-tuple key 0), materialized once per pass.
+                    let g_vals = if n > 0 {
+                        Some(materialize_i64_col(group_idx, &idx_u64)?)
+                    } else {
+                        None
+                    };
+                    for (aggregate, value_idx) in aggregates.iter().zip(&agg_value_indices) {
+                        if aggregate.kind != GroupedAggKind::CountDistinct {
+                            continue;
+                        }
+                        let value_idx = value_idx.expect("COUNT(DISTINCT) has a value column");
+                        // GPU sort -> mark -> per-group SUM over (group_key, value); see
+                        // `count_distinct_groups`. The group key is the real plain-int group column.
+                        let groups = if n == 0 {
+                            Vec::new()
+                        } else {
+                            let g_vals = g_vals.as_ref().expect("g_vals materialized for n > 0");
+                            count_distinct_groups(value_idx, g_vals, &idx_u64)?
+                        };
+                        passes.push(Pass {
+                            value_idx,
+                            groups,
+                            value_ty: SqlType::Int8,
+                            value_scale: 0,
+                            value_is_int8: false,
+                            value_is_numeric: false,
+                            value_is_uuid: false,
+                            value_is_text: false,
+                            is_count_distinct: true,
+                        });
+                    }
                 }
             }
             // A TEXT key/value's string -- and a wide-key composite's member values -- live host-side: the
