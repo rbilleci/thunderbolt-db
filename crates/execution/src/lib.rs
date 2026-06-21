@@ -1163,6 +1163,23 @@ impl CudaResidentDeviceMemory {
         launch_cuda_pack_two_int4_cols_device(self, off0, off1, n_rows)
     }
 
+    /// Composite GROUP BY key whose combined width exceeds 64 bits (an int8/timestamp member): pack two
+    /// fixed-width int columns into one i128 derived key per row (col0 = HIGH 64 bits, col1 = LOW 64).
+    /// `w0`/`w1` are each member's read width in bytes (4 = int4 section, 8 = int8 section). Returns a
+    /// leased [i128; n] device buffer (16 bytes/row) the caller holds alive; the b128 GROUP BY claim
+    /// (key_is_i128 + key_base_override) groups by it. cuCtxSynchronize'd so the GROUP BY launch reads
+    /// the completed buffer.
+    pub fn pack_two_cols_i128_device(
+        &self,
+        off0: u64,
+        w0: u64,
+        off1: u64,
+        w1: u64,
+        n_rows: u64,
+    ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
+        launch_cuda_pack_two_cols_i128_device(self, off0, w0, off1, w1, n_rows)
+    }
+
     /// COUNT(DISTINCT v) mark pass: `keys` is the (key0, key1, ..) i64 tuple matrix (row-major, `k`
     /// values/row) ALREADY sorted via `perm` (from [`Self::bitonic_sort_multikey`]). key0 is the group
     /// key; the remaining keys are the value's fixed-width i64 representation (`k`=2 for an int value
@@ -13727,6 +13744,100 @@ fn launch_cuda_pack_two_int4_cols_device<'r>(
         (&mut a2 as *mut u64).cast::<c_void>(),
         (&mut a3 as *mut u64).cast::<c_void>(),
         (&mut a4 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            kernel_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let ptr = out.ptr;
+    Ok(DeviceArithBuffer { _lease: out, ptr })
+}
+
+/// Run `gpu_db_pack_two_cols_i128` into a leased [i128; n] buffer (col0 high 64 bits, col1 low 64) and
+/// return it as a `DeviceArithBuffer` -- the derived composite GROUP BY key for a wider (int8/timestamp
+/// member) composite. `w0`/`w1` are each member's read width (4 or 8). cuCtxSynchronize'd so the
+/// SEPARATE b128 GROUP BY launch (key_is_i128 + key_base_override) sees the completed buffer.
+fn launch_cuda_pack_two_cols_i128_device<'r>(
+    resident: &'r CudaResidentDeviceMemory,
+    off0: u64,
+    w0: u64,
+    off1: u64,
+    w1: u64,
+    n: u64,
+) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    if n == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    if (w0 != 4 && w0 != 8) || (w1 != 4 && w1 != 8) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let out_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i128>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let kernel_fn = primary.cached_function(c"gpu_db_pack_two_cols_i128", &ptx)?;
+    let out = primary.lease_device_buffer(out_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = off0;
+    let mut a2 = w0;
+    let mut a3 = off1;
+    let mut a4 = w1;
+    let mut a5 = n;
+    let mut a6 = out.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+        (&mut a5 as *mut u64).cast::<c_void>(),
+        (&mut a6 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
         cu_launch_kernel(

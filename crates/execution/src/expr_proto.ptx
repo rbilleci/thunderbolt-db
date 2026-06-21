@@ -3393,6 +3393,109 @@ done_pack2:
     ret;
 }
 
+// Composite GROUP BY key (2 fixed-width int columns whose combined width EXCEEDS 64 bits -- i.e. an
+// int8/timestamp member): pack the two members into one i128 derived key per row, col0 in the HIGH 64
+// bits, col1 in the LOW 64 bits. Each member is read at its own width: w==8 -> int8 section (2x ld.u32,
+// the section may be 4-mod-8 aligned), w==4 -> int4 section (ld.s32, sign-extend); both become a
+// sign-extended i64 occupying a full 64-bit half. Bijective + reversible (the executor unpacks
+// gk.key_i128: hi -> col0, lo -> col1). A pure MAP -- no atomics/hash -> no bool-kernel hazard. The
+// b128 GROUP BY claim (key_is_i128 + key_base_override, reading 16 bytes at idx*16) groups by it; the
+// 16-byte i128 is an EQUALITY key (raw LE limbs, no ordering needed). The out buffer is freshly leased
+// (16-aligned), so the two 8-byte stores at idx*16 / idx*16+8 are 8-aligned.
+.visible .entry gpu_db_pack_two_cols_i128(
+    .param .u64 resident_ptr,
+    .param .u64 off0,
+    .param .u64 w0,
+    .param .u64 off1,
+    .param .u64 w1,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %lo32;
+    .reg .u32 %hi32;
+    .reg .s32 %s32;
+    .reg .u64 %rp;
+    .reg .u64 %b0;
+    .reg .u64 %b1;
+    .reg .u64 %w0;
+    .reg .u64 %w1;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %o;
+    .reg .u64 %addr;
+    .reg .u64 %c0;
+    .reg .u64 %c1;
+
+    ld.param.u64 %rp, [resident_ptr];
+    ld.param.u64 %o, [off0];
+    add.u64 %b0, %rp, %o;
+    ld.param.u64 %w0, [w0];
+    ld.param.u64 %o, [off1];
+    add.u64 %b1, %rp, %o;
+    ld.param.u64 %w1, [w1];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_pack128:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_pack128;
+    // col0 (the HIGH limb), read at width w0.
+    setp.eq.u64 %p, %w0, 8;
+    @%p bra p128_c0_8;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b0, %o;
+    ld.global.s32 %s32, [%addr];
+    cvt.s64.s32 %c0, %s32;
+    bra p128_c0_done;
+p128_c0_8:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %b0, %o;
+    ld.global.u32 %lo32, [%addr];
+    ld.global.u32 %hi32, [%addr+4];
+    mov.b64 %c0, {%lo32, %hi32};
+p128_c0_done:
+    // col1 (the LOW limb), read at width w1.
+    setp.eq.u64 %p, %w1, 8;
+    @%p bra p128_c1_8;
+    mul.lo.u64 %o, %i, 4;
+    add.u64 %addr, %b1, %o;
+    ld.global.s32 %s32, [%addr];
+    cvt.s64.s32 %c1, %s32;
+    bra p128_c1_done;
+p128_c1_8:
+    mul.lo.u64 %o, %i, 8;
+    add.u64 %addr, %b1, %o;
+    ld.global.u32 %lo32, [%addr];
+    ld.global.u32 %hi32, [%addr+4];
+    mov.b64 %c1, {%lo32, %hi32};
+p128_c1_done:
+    // out[idx*16 + 0..8] = col1 (lo limb), out[idx*16 + 8..16] = col0 (hi limb).
+    mul.lo.u64 %o, %i, 16;
+    add.u64 %addr, %out, %o;
+    st.global.u64 [%addr], %c1;
+    st.global.u64 [%addr+8], %c0;
+    add.u64 %i, %i, %stride;
+    bra loop_pack128;
+done_pack128:
+    ret;
+}
+
 // COUNT(DISTINCT v) mark pass: mark the first row of each distinct (key0, key1, .., key{kdim-1})
 // tuple in SORTED order, and gather each sorted row's key0 (the group key). `keys_ptr` is the
 // row-major i64 tuple matrix (kdim i64 per row) ALREADY sorted via `perm` (the u32 permutation from

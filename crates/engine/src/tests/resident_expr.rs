@@ -2744,6 +2744,135 @@ fn gpu_group_by_composite_negatives_ordered() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_int8_member_bare() {
+    // Composite GROUP BY a, b where a is BIGINT (so combined width > 64 bits) -> the i128 pack
+    // (col0 high 64, col1 low 64) + the b128 claim, UNPACKED back to (a:int8, b:int4). Bare GROUP BY:
+    // default order is by a (distinct here). a holds a value beyond the int4 range.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b INT)").unwrap();
+    // (a,b): (100,1)x2, (200,2)x1, (9000000000,3)x1 -> 3 groups, distinct a.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES (100,1),(100,1),(200,2),(9000000000,3)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect("composite int8+int4 GROUP BY (i128 pack)");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Int8(100), SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int8(200), SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![SqlValue::Int8(9000000000), SqlValue::Int4(3), SqlValue::Int8(1)],
+        ],
+        "int8+int4 composite unpacks to (int8, int4); value beyond int4 range survives"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_int8_and_int4_ordered() {
+    // Composite GROUP BY a, b (a BIGINT, b INT) with a NEGATIVE wide member + a duplicate group +
+    // SUM(c); ORDER BY a, b gives the true (a,b) order over the unpacked columns.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b INT, c INT)")
+        .unwrap();
+    // (a,b,c): (9e9,1,10),(9e9,1,20),(9e9,2,5),(-5,1,7).
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,c) VALUES \
+         (9000000000,1,10),(9000000000,1,20),(9000000000,2,5),(-5,1,7)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql(
+            "SELECT a, b, COUNT(*), SUM(c) FROM t GROUP BY a, b ORDER BY a, b",
+        )
+        .expect("composite int8+int4 GROUP BY with negatives + ORDER BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![
+                SqlValue::Int8(-5),
+                SqlValue::Int4(1),
+                SqlValue::Int8(1),
+                SqlValue::Int8(7),
+            ],
+            vec![
+                SqlValue::Int8(9000000000),
+                SqlValue::Int4(1),
+                SqlValue::Int8(2),
+                SqlValue::Int8(30),
+            ],
+            vec![
+                SqlValue::Int8(9000000000),
+                SqlValue::Int4(2),
+                SqlValue::Int8(1),
+                SqlValue::Int8(5),
+            ],
+        ],
+        "negative + wide composite keys round-trip, ORDER BY a,b true order"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_two_int8_min_edge() {
+    // Composite GROUP BY a, b where BOTH are BIGINT, INCLUDING the (i64::MIN, 0) tuple whose i128 pack
+    // == i128::MIN == EMPTY128 -- it must route to the b128 claim's DEDICATED slot, not vanish.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b BIGINT, c INT)")
+        .unwrap();
+    // (i64::MIN, 0)x2 [the EMPTY128 edge], (5e9, 6e9)x1.
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b,c) VALUES \
+         (-9223372036854775808,0,1),(-9223372036854775808,0,2),(5000000000,6000000000,3)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql(
+            "SELECT a, b, COUNT(*), SUM(c) FROM t GROUP BY a, b ORDER BY a, b",
+        )
+        .expect("composite two-int8 GROUP BY incl. the i64::MIN/EMPTY128 edge");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![
+                SqlValue::Int8(i64::MIN),
+                SqlValue::Int8(0),
+                SqlValue::Int8(2),
+                SqlValue::Int8(3),
+            ],
+            vec![
+                SqlValue::Int8(5000000000),
+                SqlValue::Int8(6000000000),
+                SqlValue::Int8(1),
+                SqlValue::Int8(3),
+            ],
+        ],
+        "the (i64::MIN, 0) composite routes to the dedicated slot (not lost to EMPTY128)"
+    );
+}
+
+#[test]
 fn group_by_composite_three_columns_rejected() {
     // >2 composite GROUP BY columns is a clean error (the on-device pack covers two; i128/rep-row are
     // follow-ups). Host-side (parse rejection), no GPU needed.

@@ -1400,11 +1400,13 @@ impl Engine {
             // columns -- is a coupled change to the most-audited grouped path that belongs in its own
             // auditable slice. Until then, reject cleanly (NOT a silent single-key grouping by the first
             // column, which `select.group_by` carries).
-            // COMPOSITE GROUP BY (`GROUP BY a, b`): two int4-section columns (int2/int4/date) are packed
-            // on-device into ONE i64 key `(col0<<32)|col1` (gpu_db_pack_two_int4_cols) grouped via
-            // key_base_override (the audited i64 path), then UNPACKED in the result row into the two
-            // columns. A non-int4-section member is a clean error (i128 packing / the rep-row hash are
-            // follow-ups). parse_group_by already rejects >2 group terms.
+            // COMPOSITE GROUP BY (`GROUP BY a, b`): the two fixed-width int members are packed on-device
+            // into ONE derived key grouped via key_base_override, then UNPACKED in the result. If both
+            // members fit in 32 bits (int2/int4/date), the pack is one i64 `(col0<<32)|col1`
+            // (gpu_db_pack_two_int4_cols, the audited i64 path); if a member is int8/timestamp (combined
+            // width > 64 bits), the pack is one i128 `col0:col1` (gpu_db_pack_two_cols_i128 -> the b128
+            // key path). text/numeric/uuid members + >2 members are follow-ups. parse_group_by already
+            // rejects >2 group terms.
             let composite_cols: Option<(usize, SqlType, usize, SqlType)> =
                 if group_key_columns.len() == 2 {
                     let c0 = relational_column_index(table, &group_key_columns[0])?;
@@ -1412,10 +1414,18 @@ impl Engine {
                     let t0 = table.columns[c0].ty;
                     let t1 = table.columns[c1].ty;
                     for t in [t0, t1] {
-                        if !matches!(t, SqlType::Int4 | SqlType::Int2 | SqlType::Date) {
+                        if !matches!(
+                            t,
+                            SqlType::Int4
+                                | SqlType::Int2
+                                | SqlType::Date
+                                | SqlType::Int8
+                                | SqlType::Timestamp
+                        ) {
                             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                "composite (multi-column) GROUP BY supports two int2/int4/date columns \
-                                 on the Expr path (wider/more members are a follow-up)"
+                                "composite (multi-column) GROUP BY supports two \
+                                 int2/int4/int8/date/timestamp columns on the Expr path \
+                                 (text/numeric/uuid members + >2 members are a follow-up)"
                                     .to_string(),
                             )));
                         }
@@ -1425,6 +1435,13 @@ impl Engine {
                     None
                 };
             let is_composite_key = composite_cols.is_some();
+            // A composite is i128-packed iff a member is int8/timestamp (combined width > 64 bits);
+            // otherwise both members fit the i64 pack. Drives key_is_i128 / key_is_int8 / the pack
+            // kernel / the result unpack below.
+            let composite_is_i128 = composite_cols.is_some_and(|(_, t0, _, t1)| {
+                matches!(t0, SqlType::Int8 | SqlType::Timestamp)
+                    || matches!(t1, SqlType::Int8 | SqlType::Timestamp)
+            });
             let is_expr_key = group_key_expr.is_some();
             let key_expr_is_int8 = match group_key_expr {
                 Some(expr) => expr_mentions_int8(expr, table),
@@ -1455,7 +1472,11 @@ impl Engine {
             // (8-byte) section, which forces the single-level kernel (only it reads 64-bit keys + routes
             // the i64::MIN key, which collides with EMPTY, to its dedicated slot). An expression key is
             // int4/int8 by its result width.
-            let key_is_int8 = if is_expr_key {
+            let key_is_int8 = if is_composite_key {
+                // A composite packs into one derived key: the i64 pack reads via the int8 key path; the
+                // i128 pack reads via the i128 key path (key_is_int8 = false).
+                !composite_is_i128
+            } else if is_expr_key {
                 key_expr_is_int8
             } else {
                 match key_ty {
@@ -1471,10 +1492,11 @@ impl Engine {
                 }
             };
             // numeric / uuid GROUP BY keys are 128-bit -- claimed via atom.cas.b128 into slot_keys_i128
-            // (the single-level kernel). An expression key is never i128/text. key_scale carries the
-            // numeric column scale onto the result key.
-            let key_is_i128 =
-                !is_expr_key && matches!(key_ty, SqlType::Numeric { .. } | SqlType::Uuid);
+            // (the single-level kernel). A WIDER COMPOSITE key (int8/timestamp member) is also packed into
+            // an i128 and uses the same b128 claim. An expression key is never i128/text. key_scale
+            // carries the numeric column scale onto the result key.
+            let key_is_i128 = composite_is_i128
+                || (!is_expr_key && matches!(key_ty, SqlType::Numeric { .. } | SqlType::Uuid));
             // A TEXT key is varlen: the kernel hashes the bytes, claims a b128 (rep_row_idx, hash) in
             // slot_keys_i128 with a full-text verify-on-lost-CAS, and the result key is read host-side
             // from the representative row. key_offsets_off/key_bytes_off locate the Arrow varlen column.
@@ -1550,14 +1572,40 @@ impl Engine {
                     _derived_key_buf = None;
                     0
                 } else {
-                    // GROUP BY a, b: pack the two int4-section columns into one i64 key on-device
-                    // ((col0<<32)|col1) grouped via key_base_override; the result UNPACKS it.
-                    let (c0, _, c1, _) = composite_cols.unwrap();
-                    let off0 = resident_device_int4_column_offset(&snapshot, table, c0)?;
-                    let off1 = resident_device_int4_column_offset(&snapshot, table, c1)?;
-                    let buf = device_memory
-                        .pack_two_int4_cols_device(off0, off1, row_count)
-                        .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
+                    // GROUP BY a, b: pack the two members into one derived key grouped via
+                    // key_base_override; the result UNPACKS it. Both-int4 -> one i64 ((col0<<32)|col1);
+                    // a wider member (int8/timestamp) -> one i128 (col0 high 64, col1 low 64) read by
+                    // the b128 claim. Each member's width selects its section offset + the pack arg.
+                    let (c0, t0, c1, t1) = composite_cols.unwrap();
+                    let col_off = |idx: usize, ty: SqlType| -> Result<u64, ExecuteError> {
+                        if matches!(ty, SqlType::Int8 | SqlType::Timestamp) {
+                            resident_device_int8_column_offset(&snapshot, table, idx)
+                        } else {
+                            resident_device_int4_column_offset(&snapshot, table, idx)
+                        }
+                    };
+                    let width = |ty: SqlType| -> u64 {
+                        if matches!(ty, SqlType::Int8 | SqlType::Timestamp) {
+                            8
+                        } else {
+                            4
+                        }
+                    };
+                    let off0 = col_off(c0, t0)?;
+                    let off1 = col_off(c1, t1)?;
+                    let buf = if composite_is_i128 {
+                        device_memory
+                            .pack_two_cols_i128_device(off0, width(t0), off1, width(t1), row_count)
+                            .map_err(|e| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+                            })?
+                    } else {
+                        device_memory
+                            .pack_two_int4_cols_device(off0, off1, row_count)
+                            .map_err(|e| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+                            })?
+                    };
                     let ptr = buf.device_ptr();
                     _derived_key_buf = Some(buf);
                     ptr
@@ -1825,7 +1873,18 @@ impl Engine {
             // passes (and the merged output ends up key-ordered). A TEXT key must sort by the
             // materialized string -- there key_i128 is a per-pass representative row index, not the key.
             let materialize_key = |gk: &gpu_db_execution::GroupByI32Row| -> SqlValue {
-                if key_is_text {
+                if is_composite_key {
+                    // The result row UNPACKS the packed key into the two columns; here we only need a
+                    // CONSISTENT, deterministic representation of the packed key for pass-alignment +
+                    // ordering. i64 pack -> Int8(key); i128 pack -> Numeric wrapping the packed i128
+                    // (compares by the i128 value). (Composite sets key_is_i128 for the wider case, so
+                    // this MUST precede the key_is_i128 arm below, which is numeric/uuid-only.)
+                    if composite_is_i128 {
+                        SqlValue::Numeric(Decimal128::new(gk.key_i128, 0))
+                    } else {
+                        SqlValue::Int8(gk.key)
+                    }
+                } else if key_is_text {
                     let rep_idx = gk.key_i128 as u64 as usize;
                     text_host_rows
                         .as_ref()
@@ -1872,11 +1931,18 @@ impl Engine {
                 let mut row: Vec<SqlValue> =
                     Vec::with_capacity(aggregates.len() + if is_composite_key { 2 } else { 1 });
                 if let Some((_, t0, _, t1)) = composite_cols {
-                    // Composite key: UNPACK the packed i64 back into the two group columns -- col0 = the
-                    // high 32 bits, col1 = the low 32 (`as u32 as i32` round-trips negatives) -- narrowed
-                    // to each column's real SqlType. Emit BOTH before the aggregate columns.
-                    let col0 = ((((gk.key as u64) >> 32) as u32) as i32) as i64;
-                    let col1 = (((gk.key as u64) as u32) as i32) as i64;
+                    // Composite key: UNPACK the packed key into the two group columns, each narrowed to
+                    // its real SqlType, emitted BEFORE the aggregate columns. i64 pack -> col0 = high 32
+                    // bits, col1 = low 32 (`as u32 as i32` round-trips negatives). i128 pack -> col0 =
+                    // high 64 bits, col1 = low 64 (each member was sign-extended into its half).
+                    let (col0, col1) = if composite_is_i128 {
+                        let k = gk.key_i128;
+                        ((k >> 64) as i64, k as u64 as i64)
+                    } else {
+                        let col0 = ((((gk.key as u64) >> 32) as u32) as i32) as i64;
+                        let col1 = (((gk.key as u64) as u32) as i32) as i64;
+                        (col0, col1)
+                    };
                     row.push(narrow_ordered_value(t0, col0, 0, 0));
                     row.push(narrow_ordered_value(t1, col1, 0, 0));
                 } else {
