@@ -12,12 +12,12 @@
 use super::*;
 
 use pg_query::protobuf::{
-    a_const, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, Node, SelectStmt, SetOperation,
-    SortByDir,
+    a_const, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, JoinType, Node, SelectStmt,
+    SetOperation, SortByDir,
 };
 use pg_query::NodeEnum;
 
-use crate::engine_expr::{ResidentBinaryOp, ResidentExpr};
+use crate::engine_expr::{JoinColRef, JoinPlan, ResidentBinaryOp, ResidentExpr};
 use gpu_db_sql::{SelectFilter, SelectFilterOp, SelectOrder};
 
 impl Engine {
@@ -34,6 +34,12 @@ impl Engine {
         sql: &str,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let stmt = parse_single_select(sql)?;
+        // A JOIN in the FROM clause routes to the dedicated 2-relation inner-equi-join path (M5). The
+        // single-table path below is byte-identical for a non-join query.
+        if from_clause_is_join(&stmt) {
+            let plan = build_join_plan(&stmt)?;
+            return self.execute_resident_expr_inner_join(&plan);
+        }
         let (select, qualifier) = build_select_from_select_stmt(&stmt)?;
         // Bind once; map the predicate (if any) against that SAME bound table; execute against that
         // binding. No WHERE clause is a full-table scan (the executor takes `None` for the predicate).
@@ -217,6 +223,168 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
         offset,
     };
     Ok((select, qualifier))
+}
+
+/// True iff the FROM clause is a single explicit `JoinExpr` (an `a JOIN b ON ...`), routing to the M5
+/// 2-relation path. (A comma join `FROM a, b` arrives as two from_clause entries -- not this -- and is
+/// rejected by the single-table builder; explicit JOIN is required for the join path in this slice.)
+fn from_clause_is_join(stmt: &SelectStmt) -> bool {
+    matches!(stmt.from_clause.as_slice(), [from] if matches!(from.node.as_ref(), Some(NodeEnum::JoinExpr(_))))
+}
+
+/// A JOIN column reference (ON operand or projection item): bare `col` or qualified `alias.col`. No
+/// validation here (the executor resolves it against the two relations); rejects `*` / 3-part refs.
+fn parse_join_col_ref(node: &Node) -> Result<JoinColRef, ExecuteError> {
+    let NodeEnum::ColumnRef(column_ref) = node_enum(node)? else {
+        return Err(sql_pg_error(
+            "a join ON/SELECT term must be a plain column reference (expressions / `*` / aggregates \
+             are not on the join path yet)"
+                .to_string(),
+        ));
+    };
+    let parts = column_ref
+        .fields
+        .iter()
+        .map(|field| match field.node.as_ref() {
+            Some(NodeEnum::String(string)) => Ok(string.sval.as_str()),
+            _ => Err(sql_pg_error(
+                "a join column reference must be a name (got `*` or a non-name reference)"
+                    .to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match parts.as_slice() {
+        [column] => Ok(JoinColRef {
+            qualifier: None,
+            column: (*column).to_string(),
+        }),
+        [qualifier, column] => Ok(JoinColRef {
+            qualifier: Some((*qualifier).to_string()),
+            column: (*column).to_string(),
+        }),
+        _ => Err(sql_pg_error(
+            "schema-qualified or multi-part join column references are not supported".to_string(),
+        )),
+    }
+}
+
+/// The (relation name, qualifier) of a join side -- a base-table RangeVar (nested joins / subqueries
+/// are a multi-way follow-up). The qualifier is the alias, else the relation name (mirrors the
+/// single-table builder).
+fn join_side_name_alias(node: &Node) -> Result<(String, String), ExecuteError> {
+    let NodeEnum::RangeVar(range_var) = node_enum(node)? else {
+        return Err(sql_pg_error(
+            "each side of a JOIN must be a base table (nested joins / subqueries are a follow-up)"
+                .to_string(),
+        ));
+    };
+    let table = range_var.relname.clone();
+    let alias = range_var
+        .alias
+        .as_ref()
+        .map(|alias| alias.aliasname.clone())
+        .unwrap_or_else(|| table.clone());
+    Ok((table, alias))
+}
+
+/// Parse `SELECT <cols> FROM a JOIN b ON a.k = b.k` (libpg_query) into a [`JoinPlan`] (M5). Slice scope:
+/// INNER JOIN, a single `=` equi-join conjunct between two base tables, plain-column projection, and NO
+/// WHERE/GROUP BY/HAVING/ORDER BY/LIMIT/DISTINCT (each a clean "not on the join path yet"). The
+/// executor resolves the ON operands + projection to relations/columns and validates the key types.
+fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
+    let unsupported = [
+        (stmt.where_clause.is_some(), "WHERE"),
+        (!stmt.group_clause.is_empty(), "GROUP BY"),
+        (stmt.having_clause.is_some(), "HAVING"),
+        (!stmt.sort_clause.is_empty(), "ORDER BY"),
+        (stmt.limit_count.is_some(), "LIMIT"),
+        (stmt.limit_offset.is_some(), "OFFSET"),
+        (!stmt.distinct_clause.is_empty(), "DISTINCT"),
+        (!stmt.window_clause.is_empty(), "window functions"),
+        (stmt.with_clause.is_some(), "WITH / CTEs"),
+    ];
+    if let Some((_, clause)) = unsupported.iter().find(|(present, _)| *present) {
+        return Err(sql_pg_error(format!(
+            "{clause} on a JOIN is not on the general GPU executor's join path yet"
+        )));
+    }
+    let [from] = stmt.from_clause.as_slice() else {
+        return Err(sql_pg_error("expected a single JOIN in the FROM clause".to_string()));
+    };
+    let NodeEnum::JoinExpr(join) = node_enum(from)? else {
+        return Err(sql_pg_error("expected a JOIN in the FROM clause".to_string()));
+    };
+    if join.jointype != JoinType::JoinInner as i32 {
+        return Err(sql_pg_error(
+            "only INNER JOIN is on the join path yet (LEFT/RIGHT/FULL are a follow-up)".to_string(),
+        ));
+    }
+    if join.is_natural || !join.using_clause.is_empty() {
+        return Err(sql_pg_error(
+            "NATURAL / USING joins are a follow-up; use an explicit ON a.k = b.k".to_string(),
+        ));
+    }
+    let larg = join
+        .larg
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("JOIN missing its left relation".to_string()))?;
+    let rarg = join
+        .rarg
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("JOIN missing its right relation".to_string()))?;
+    let (left_table, left_alias) = join_side_name_alias(larg)?;
+    let (right_table, right_alias) = join_side_name_alias(rarg)?;
+    // ON: a single `=` between two column references.
+    let quals = join
+        .quals
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("INNER JOIN requires an ON condition".to_string()))?;
+    let NodeEnum::AExpr(aexpr) = node_enum(quals)? else {
+        return Err(sql_pg_error(
+            "the join ON condition must be a single `a.k = b.k` equi-join (AND / non-equi / \
+             multi-conjunct are a follow-up)"
+                .to_string(),
+        ));
+    };
+    if aexpr.kind != AExprKind::AexprOp as i32 || aexpr_op_token(aexpr)? != "=" {
+        return Err(sql_pg_error(
+            "the join ON condition must be an equality (=) between two columns".to_string(),
+        ));
+    }
+    let lexpr = aexpr
+        .lexpr
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("malformed join ON condition".to_string()))?;
+    let rexpr = aexpr
+        .rexpr
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("malformed join ON condition".to_string()))?;
+    let on_a = parse_join_col_ref(lexpr)?;
+    let on_b = parse_join_col_ref(rexpr)?;
+    // Projection: a non-empty list of plain column references.
+    if stmt.target_list.is_empty() {
+        return Err(sql_pg_error("a join SELECT must project at least one column".to_string()));
+    }
+    let mut projection = Vec::with_capacity(stmt.target_list.len());
+    for target in &stmt.target_list {
+        let NodeEnum::ResTarget(res_target) = node_enum(target)? else {
+            return Err(sql_pg_error("malformed join SELECT target".to_string()));
+        };
+        let val = res_target
+            .val
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("join SELECT target has no expression".to_string()))?;
+        projection.push(parse_join_col_ref(val)?);
+    }
+    Ok(JoinPlan {
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        on_a,
+        on_b,
+        projection,
+    })
 }
 
 /// Resolve the GROUP BY clause to a single grouped column name (the Expr path groups by one column

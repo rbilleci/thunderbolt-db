@@ -529,6 +529,179 @@ fn scalar_count_distinct_routes_through_text_entry() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_two_relations_int_key() {
+    // M5: a 2-relation INNER equi-join on an int key, via the general path's GPU hash join. parent.id
+    // is UNIQUE (the build side); child.parent_id is the FK (1:N + an orphan + a childless parent).
+    //   parent: (1,a),(2,b),(3,c)   child: (1,x),(1,y),(2,z),(99,orphan)
+    //   parent JOIN child ON parent.id = child.parent_id -> (a,x),(a,y),(b,z); 99 + parent 3 dropped.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE parent (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE child (parent_id INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO parent (id, name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO child (parent_id, label) VALUES (1,'x'),(1,'y'),(2,'z'),(99,'orphan')",
+    )
+    .unwrap();
+    let ps = e.populate_relational_residency_snapshot("parent").unwrap();
+    let cs = e.populate_relational_residency_snapshot("child").unwrap();
+    if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
+        return;
+    }
+    // Extract (name, label) text pairs + sort (the join emit order is unspecified without ORDER BY).
+    let pairs = |res: &RelationalSelectResult| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let s = |c: &SqlValue| match c {
+                    SqlValue::Text(t) => t.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                (s(&r[0]), s(&r[1]))
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let expected = vec![
+        ("a".to_string(), "x".to_string()),
+        ("a".to_string(), "y".to_string()),
+        ("b".to_string(), "z".to_string()),
+    ];
+    // Via the general path directly + via the production wire/text dispatch (the hand-rolled parser
+    // rejects JOIN -> the Err arm -> the general path).
+    let direct = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM parent JOIN child ON parent.id = child.parent_id",
+        )
+        .expect("inner join (general path)");
+    assert_eq!(direct.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(direct.columns.len(), 2);
+    assert!(direct.columns[0].name.eq_ignore_ascii_case("name"));
+    assert!(direct.columns[1].name.eq_ignore_ascii_case("label"));
+    assert_eq!(pairs(&direct), expected, "1:N inner join, orphan + childless dropped");
+    let wire = e
+        .execute_relational_select_text(
+            "SELECT name, label FROM parent JOIN child ON parent.id = child.parent_id",
+        )
+        .expect("inner join (text/wire dispatch)");
+    assert_eq!(wire.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(pairs(&wire), expected, "the wire dispatch routes JOIN to the general path");
+    // Qualified projection (parent.name, child.label) resolves each column to its relation.
+    let qualified = e
+        .execute_resident_expr_select_sql(
+            "SELECT parent.name, child.label FROM parent JOIN child ON parent.id = child.parent_id",
+        )
+        .expect("inner join, qualified projection");
+    assert_eq!(pairs(&qualified), expected, "qualified column refs resolve per-relation");
+    // The ON written the other way around (child.parent_id = parent.id) is the same join.
+    let swapped = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM parent JOIN child ON child.parent_id = parent.id",
+        )
+        .expect("inner join, ON operands swapped");
+    assert_eq!(pairs(&swapped), expected, "ON operand order does not matter");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
+    // The SMALLER side (s, the left/probe-by-size) has a DUPLICATE join key, so build-on-smaller hits
+    // DuplicateBuildKey -> the executor falls back to building on the LARGER (unique) side. This
+    // exercises the fallback + the left_is_build = !smaller_is_left index mapping (a left column must
+    // still read the left relation's rows after the build side flips).
+    //   s: (1,'p'),(1,'q')  [smaller, key 1 duplicated]   l: (1,'A'),(2,'B'),(3,'C')  [larger, unique]
+    //   s JOIN l ON s.k = l.k -> (p,A),(q,A).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE s (k INT, sv TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE l (k INT, lv TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO s (k, sv) VALUES (1,'p'),(1,'q')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO l (k, lv) VALUES (1,'A'),(2,'B'),(3,'C')")
+        .unwrap();
+    let ss = e.populate_relational_residency_snapshot("s").unwrap();
+    let ls = e.populate_relational_residency_snapshot("l").unwrap();
+    if ss.device_memory_proof.is_none() || ls.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT sv, lv FROM s JOIN l ON s.k = l.k")
+        .expect("inner join with build fallback");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let mut got: Vec<(String, String)> = res
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (SqlValue::Text(a), SqlValue::Text(b)) => (a.clone(), b.clone()),
+            other => panic!("expected text pair, got {other:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![("p".to_string(), "A".to_string()), ("q".to_string(), "A".to_string())],
+        "fallback build-on-larger keeps left(sv)/right(lv) rows correctly paired"
+    );
+}
+
+#[test]
+fn gpu_inner_join_rejects_unsupported_shapes() {
+    // Host-side clean rejections (no GPU): the parser gates the join slice's scope.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE a (k INT, x INT)").unwrap();
+    e.execute_text(2, "CREATE TABLE b (k INT, y INT)").unwrap();
+    let reject = |sql: &str| {
+        let err = e
+            .execute_resident_expr_select_sql(sql)
+            .err()
+            .unwrap_or_else(|| panic!("expected a rejection for: {sql}"));
+        format!("{err:?}").to_lowercase()
+    };
+    assert!(
+        reject("SELECT x, y FROM a LEFT JOIN b ON a.k = b.k").contains("inner"),
+        "LEFT JOIN rejected"
+    );
+    assert!(
+        reject("SELECT x, y FROM a JOIN b ON a.k > b.k").contains("equality")
+            || reject("SELECT x, y FROM a JOIN b ON a.k > b.k").contains("equi"),
+        "non-equi ON rejected"
+    );
+    let comma = reject("SELECT x, y FROM a, b WHERE a.k = b.k");
+    assert!(
+        comma.contains("one from relation") || comma.contains("join"),
+        "comma join rejected, got: {comma}"
+    );
+    let where_join = reject("SELECT x, y FROM a JOIN b ON a.k = b.k WHERE a.x > 5");
+    assert!(
+        where_join.contains("where"),
+        "WHERE on a join rejected (a follow-up), got: {where_join}"
+    );
+    // An UNQUALIFIED column present in BOTH relations is ambiguous (both a.k and b.k exist).
+    let ambig = reject("SELECT k FROM a JOIN b ON a.k = b.k");
+    assert!(
+        ambig.contains("ambiguous"),
+        "ambiguous unqualified column rejected, got: {ambig}"
+    );
+    // An ON that equates two columns of the SAME relation is not a 2-relation equi-join.
+    let same_rel = reject("SELECT x, y FROM a JOIN b ON a.k = a.x");
+    assert!(
+        same_rel.contains("each relation") || same_rel.contains("ambiguous"),
+        "ON within one relation rejected, got: {same_rel}"
+    );
+    // A qualifier naming no FROM relation is rejected.
+    let bad_qual = reject("SELECT a.x, b.y FROM a JOIN b ON a.k = c.k");
+    assert!(
+        bad_qual.contains("missing from-clause") || bad_qual.contains("\"c\""),
+        "unknown qualifier rejected, got: {bad_qual}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.
