@@ -1511,6 +1511,55 @@ fn gpu_inner_join_uuid_and_numeric_keys() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_n_to_n_cross_product() {
+    // M5 N:N: BOTH sides have duplicate join keys -> the chaining many-to-many join emits each key's
+    // (left rows x right rows). On k=100, left {lid 1,2} x right {rid 10,11} = 4 pairs; k=200 (left-only)
+    // and k=300 (right-only) drop. (Previously a hard "N:N is a follow-up" reject.)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE lhs (lid INT, k INT)").unwrap();
+    e.execute_text(2, "CREATE TABLE rhs (rid INT, k INT)").unwrap();
+    e.execute_text(3, "INSERT INTO lhs (lid, k) VALUES (1,100),(2,100),(3,200)").unwrap();
+    e.execute_text(4, "INSERT INTO rhs (rid, k) VALUES (10,100),(11,100),(12,300)").unwrap();
+    let ls = e.populate_relational_residency_snapshot("lhs").unwrap();
+    let rs = e.populate_relational_residency_snapshot("rhs").unwrap();
+    if ls.device_memory_proof.is_none() || rs.device_memory_proof.is_none() {
+        return;
+    }
+    let pairs = |res: &RelationalSelectResult| -> Vec<(i32, i32)> {
+        let n = |c: &SqlValue| match c {
+            SqlValue::Int4(v) => *v,
+            other => panic!("expected int4, got {other:?}"),
+        };
+        let mut v: Vec<(i32, i32)> = res.rows.iter().map(|r| (n(&r[0]), n(&r[1]))).collect();
+        v.sort();
+        v
+    };
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT lhs.lid, rhs.rid FROM lhs JOIN rhs ON lhs.k = rhs.k",
+        )
+        .expect("N:N many-to-many join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        pairs(&res),
+        vec![(1, 10), (1, 11), (2, 10), (2, 11)],
+        "k=100 yields the full 2x2 cross product; the left-only/right-only keys drop"
+    );
+    // N:N composes with a per-side WHERE (still GPU-pre-filtered): restrict to lid <= 1 -> only lid 1.
+    let filtered = e
+        .execute_resident_expr_select_sql(
+            "SELECT lhs.lid, rhs.rid FROM lhs JOIN rhs ON lhs.k = rhs.k WHERE lhs.lid <= 1",
+        )
+        .expect("N:N join with a per-side filter");
+    assert_eq!(
+        pairs(&filtered),
+        vec![(1, 10), (1, 11)],
+        "the lid<=1 filter leaves one left row -> a 1x2 cross product"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.

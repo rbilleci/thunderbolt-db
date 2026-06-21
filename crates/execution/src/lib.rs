@@ -1251,6 +1251,21 @@ impl CudaResidentDeviceMemory {
         launch_cuda_hash_join_inner_text(self, build_texts, probe_texts)
     }
 
+    /// GPU inner equi-join (M5 N:N) on an int key where BOTH sides may have DUPLICATE keys -- the general
+    /// many-to-many join (each key's build rows × probe rows). `build_keys`/`probe_keys` are sign-extended
+    /// to i64. Builds a per-bucket CHAIN of all build rows with each key (lock-free atom.cas.b64 claim +
+    /// atom.exch.b64 prepend), then for each probe row emits one pair per chained build row. Returns the
+    /// matched `(build_row_idx, probe_row_idx)` pairs (output = sum over probes of its key's build count,
+    /// up to build_n×probe_n). The join is on the GPU; only the index pairs come back. No DuplicateBuildKey
+    /// (duplicates are the point).
+    pub fn hash_join_inner_i64_nn(
+        &self,
+        build_keys: &[i64],
+        probe_keys: &[i64],
+    ) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
+        launch_cuda_hash_join_inner_i64_nn(self, build_keys, probe_keys)
+    }
+
     /// COUNT(DISTINCT v) mark pass: `keys` is the (key0, key1, ..) i64 tuple matrix (row-major, `k`
     /// values/row) ALREADY sorted via `perm` (from [`Self::bitonic_sort_multikey`]). key0 is the group
     /// key; the remaining keys are the value's fixed-width i64 representation (`k`=2 for an int value
@@ -14676,6 +14691,245 @@ fn launch_cuda_hash_join_inner_text(
     })
 }
 
+/// Backs [`CudaResidentDeviceMemory::hash_join_inner_i64_nn`] (M5 N:N). Builds a per-bucket CHAIN of all
+/// build rows per key (`gpu_db_hash_join_build_i64_nn`: cas.b64 claim + exch.b64 prepend + next[]), then
+/// EMITS one pair per (chained build row × matching probe row). Output is unbounded (up to build×probe),
+/// so the emit runs TWICE: a COUNT pass (cap=0 -> the cursor counts every match, no write), then the real
+/// emit (cap=total) into an exactly-sized buffer. Within phase 1 the BUILD + COUNT-emit are STREAM-ORDERED
+/// (build completes before the count-emit walks `next[]`); a cuCtxSynchronize separates phase 1 from phase
+/// 2 (read the cursor, then the real emit). The upload/lease buffers outlive every launch.
+fn launch_cuda_hash_join_inner_i64_nn(
+    resident: &CudaResidentDeviceMemory,
+    build_keys: &[i64],
+    probe_keys: &[i64],
+) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    let build_n = build_keys.len();
+    let probe_n = probe_keys.len();
+    if build_n == 0 || probe_n == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // i64::MIN aliases the EMPTY slot sentinel (a missed match); reject it (int4 keys never reach it; an
+    // int8 key that IS i64::MIN is the dedicated-slot follow-up, as for the unique-build join).
+    if build_keys.iter().chain(probe_keys).any(|&k| k == i64::MIN) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let build_n_u64 = build_n as u64;
+    let probe_n_u64 = probe_n as u64;
+    let npot = build_n
+        .checked_mul(2)
+        .and_then(|x| x.checked_next_power_of_two())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(build_n))?
+        .max(2);
+    let mask = (npot - 1) as u64;
+    let slot_bytes = npot
+        .checked_mul(8)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(npot))?;
+    let build_bytes = build_n
+        .checked_mul(8)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(build_n))?;
+    let probe_bytes = probe_n
+        .checked_mul(8)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(probe_n))?;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = primary
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+    let cu_ctx_synchronize = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let fill_fn = primary.cached_function(c"gpu_db_fill_i64", &ptx)?;
+    let build_fn = primary.cached_function(c"gpu_db_hash_join_build_i64_nn", &ptx)?;
+    let emit_fn = primary.cached_function(c"gpu_db_hash_join_emit_i64_nn", &ptx)?;
+    let slot_keys = primary.lease_device_buffer(slot_bytes)?;
+    let slot_head = primary.lease_device_buffer(slot_bytes)?;
+    let next = primary.lease_device_buffer(build_bytes)?;
+    let build_dev = primary.lease_device_buffer(build_bytes)?;
+    let probe_dev = primary.lease_device_buffer(probe_bytes)?;
+    let cursor = primary.lease_device_buffer(8)?;
+    const BLOCK: u32 = 256;
+    let grid = |n: usize| (n.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
+    let zero8 = [0u64];
+    // Phase 1: upload keys, zero cursor, fill slot_keys -> EMPTY (i64::MIN) + slot_head -> END (u64::MAX),
+    // BUILD the chains, then a COUNT emit (cap=0) so the cursor holds the exact output size.
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        for (dst, src, bytes) in [
+            (build_dev.ptr, build_keys.as_ptr().cast::<c_void>(), build_bytes),
+            (probe_dev.ptr, probe_keys.as_ptr().cast::<c_void>(), probe_bytes),
+            (cursor.ptr, zero8.as_ptr().cast::<c_void>(), 8usize),
+        ] {
+            let rc = unsafe { htod_async(dst, src, bytes, stream) };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        for (ptr, value) in [(slot_keys.ptr, i64::MIN as u64), (slot_head.ptr, u64::MAX)] {
+            let mut f0 = ptr;
+            let mut f1 = npot as u64;
+            let mut f2 = value;
+            let mut fargs = [
+                (&mut f0 as *mut u64).cast::<c_void>(),
+                (&mut f1 as *mut u64).cast::<c_void>(),
+                (&mut f2 as *mut u64).cast::<c_void>(),
+            ];
+            let rc = unsafe {
+                cu_launch_kernel(
+                    fill_fn, grid(npot), 1, 1, BLOCK, 1, 1, 0, stream, fargs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        let mut b0 = build_dev.ptr;
+        let mut b1 = build_n_u64;
+        let mut b2 = slot_keys.ptr;
+        let mut b3 = slot_head.ptr;
+        let mut b4 = next.ptr;
+        let mut b5 = mask;
+        let mut bargs = [
+            (&mut b0 as *mut u64).cast::<c_void>(),
+            (&mut b1 as *mut u64).cast::<c_void>(),
+            (&mut b2 as *mut u64).cast::<c_void>(),
+            (&mut b3 as *mut u64).cast::<c_void>(),
+            (&mut b4 as *mut u64).cast::<c_void>(),
+            (&mut b5 as *mut u64).cast::<c_void>(),
+        ];
+        let rc = unsafe {
+            cu_launch_kernel(
+                build_fn, grid(build_n), 1, 1, BLOCK, 1, 1, 0, stream, bargs.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
+        // COUNT emit: cap = 0 -> every match increments the cursor, none writes.
+        let mut e0 = probe_dev.ptr;
+        let mut e1 = probe_n_u64;
+        let mut e2 = slot_keys.ptr;
+        let mut e3 = slot_head.ptr;
+        let mut e4 = next.ptr;
+        let mut e5 = mask;
+        let mut e6 = 0u64;
+        let mut e7 = 0u64; // out_pairs (unused at cap=0)
+        let mut e8 = cursor.ptr;
+        let mut eargs = [
+            (&mut e0 as *mut u64).cast::<c_void>(),
+            (&mut e1 as *mut u64).cast::<c_void>(),
+            (&mut e2 as *mut u64).cast::<c_void>(),
+            (&mut e3 as *mut u64).cast::<c_void>(),
+            (&mut e4 as *mut u64).cast::<c_void>(),
+            (&mut e5 as *mut u64).cast::<c_void>(),
+            (&mut e6 as *mut u64).cast::<c_void>(),
+            (&mut e7 as *mut u64).cast::<c_void>(),
+            (&mut e8 as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                emit_fn, grid(probe_n), 1, 1, BLOCK, 1, 1, 0, stream, eargs.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let mut cur_host = [0u64];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8)
+    })?;
+    let total = usize::try_from(cur_host[0])
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if total == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let pairs_bytes = total
+        .checked_mul(8)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(total))?;
+    let pairs = primary.lease_device_buffer(pairs_bytes)?;
+    let total_u64 = total as u64;
+    // Phase 2: zero the cursor, EMIT for real (cap = total -> every match writes).
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        let rc = unsafe { htod_async(cursor.ptr, zero8.as_ptr().cast::<c_void>(), 8usize, stream) };
+        if rc != 0 {
+            return rc;
+        }
+        let mut e0 = probe_dev.ptr;
+        let mut e1 = probe_n_u64;
+        let mut e2 = slot_keys.ptr;
+        let mut e3 = slot_head.ptr;
+        let mut e4 = next.ptr;
+        let mut e5 = mask;
+        let mut e6 = total_u64;
+        let mut e7 = pairs.ptr;
+        let mut e8 = cursor.ptr;
+        let mut eargs = [
+            (&mut e0 as *mut u64).cast::<c_void>(),
+            (&mut e1 as *mut u64).cast::<c_void>(),
+            (&mut e2 as *mut u64).cast::<c_void>(),
+            (&mut e3 as *mut u64).cast::<c_void>(),
+            (&mut e4 as *mut u64).cast::<c_void>(),
+            (&mut e5 as *mut u64).cast::<c_void>(),
+            (&mut e6 as *mut u64).cast::<c_void>(),
+            (&mut e7 as *mut u64).cast::<c_void>(),
+            (&mut e8 as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                emit_fn, grid(probe_n), 1, 1, BLOCK, 1, 1, 0, stream, eargs.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    let mut flat = vec![0u32; total * 2];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(flat.as_mut_ptr().cast::<c_void>(), pairs.ptr, pairs_bytes)
+    })?;
+    let mut build_idxs = Vec::with_capacity(total);
+    let mut probe_idxs = Vec::with_capacity(total);
+    for pair in flat.chunks_exact(2) {
+        build_idxs.push(pair[0]);
+        probe_idxs.push(pair[1]);
+    }
+    Ok((build_idxs, probe_idxs))
+}
+
 /// COUNT(DISTINCT v) mark pass (see [`CudaResidentDeviceMemory::mark_new_distinct_device`]). Uploads
 /// the sorted `k`-wide i64 tuple matrix (key0 = group key) + the permutation, runs
 /// `gpu_db_mark_new_distinct`, and returns
@@ -21356,6 +21610,60 @@ mod tests {
             expected,
             "200 unique build texts probed by all 200 + 2 misses"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_hash_join_inner_i64_nn_emits_full_cross_product() {
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let resident = runtime
+            .retain_device_memory_copy(0, &0_u64.to_le_bytes())
+            .expect("resident device memory");
+        let join = |build: &[i64], probe: &[i64]| -> Vec<(u32, u32)> {
+            let (b, p) = resident.hash_join_inner_i64_nn(build, probe).unwrap();
+            let mut v: Vec<(u32, u32)> = b.into_iter().zip(p).collect();
+            v.sort_unstable();
+            v
+        };
+        // (a) N:N -- key 1 has 2 build x 2 probe = 4 pairs; key 2 = 1x1; key 3 (probe-only) = 0.
+        assert_eq!(
+            join(&[1, 1, 2], &[1, 1, 2, 3]),
+            vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 2)],
+            "N:N cross product per key + a probe-only key dropped"
+        );
+        // (b) 1:1 (no dups) behaves like the unique join.
+        assert_eq!(join(&[10, 20], &[20, 10]), vec![(0, 1), (1, 0)], "1:1");
+        // (c) 1:N (unique build) and (d) N:1 (unique probe).
+        assert_eq!(join(&[5], &[5, 5, 5]), vec![(0, 0), (0, 1), (0, 2)], "1:N");
+        assert_eq!(join(&[5, 5], &[5]), vec![(0, 0), (1, 0)], "N:1 (both build rows match)");
+        // (e) a heavier 3x2 cross product on one key.
+        assert_eq!(
+            join(&[7, 7, 7], &[7, 7]),
+            vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+            "3 build x 2 probe = 6 pairs"
+        );
+        // (f) no matches / empty sides.
+        assert_eq!(join(&[1], &[2]), Vec::<(u32, u32)>::new(), "disjoint");
+        assert_eq!(join(&[], &[1, 2]), Vec::<(u32, u32)>::new(), "empty build");
+        assert_eq!(join(&[1, 2], &[]), Vec::<(u32, u32)>::new(), "empty probe");
+        // (g) negatives + a larger spread of duplicated keys (forces collision walks in both passes).
+        //   build: keys 0..50 each appearing 3x; probe: keys 0..50 each 2x + 5 misses. Each of the 50
+        //   keys -> 3 build x 2 probe = 6 pairs -> 300 total.
+        let mut build: Vec<i64> = Vec::new();
+        for k in 0..50 {
+            build.extend_from_slice(&[k - 25, k - 25, k - 25]);
+        }
+        let mut probe: Vec<i64> = Vec::new();
+        for k in 0..50 {
+            probe.extend_from_slice(&[k - 25, k - 25]);
+        }
+        probe.extend_from_slice(&[1000, 1001, 1002, 1003, 1004]);
+        let got = join(&build, &probe);
+        assert_eq!(got.len(), 300, "50 keys x (3 build x 2 probe) = 300 pairs (misses dropped)");
+        // every emitted pair must share the same key on both sides.
+        for &(b, p) in &got {
+            assert_eq!(build[b as usize], probe[p as usize], "a pair must match on the key");
+        }
     }
 
     #[test]
