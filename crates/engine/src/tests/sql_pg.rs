@@ -147,7 +147,9 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
 
     // NB: `SELECT a FROM t` (no WHERE) is NOT rejected any more -- it is a supported full-table scan
     // (covered by gpu_execute_resident_expr_select_sql_full_table_no_where).
-    assert_sql_err_contains(&e, "SELECT a FROM t x, t y WHERE a > 0", "one FROM relation"); // join
+    // A comma join WITH an equi-join condition is supported now (gpu_inner_join_comma_join_from_where);
+    // a comma list with NO join condition between the relations is a cartesian product -> a clean reject.
+    assert_sql_err_contains(&e, "SELECT a FROM t x, t y WHERE a > 0", "equi-join condition");
     // count(*) / sum / min / max / avg are supported now (operator axis, GPU-tested); count(col) and
     // other functions are follow-ons, still rejected at the parser.
     assert_sql_err_contains(&e, "SELECT count(a) FROM t WHERE a > 0", "COUNT(*) / SUM / MIN / MAX");
@@ -891,10 +893,12 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
             || reject("SELECT x, y FROM a JOIN b ON a.k > b.k").contains("equi"),
         "non-equi ON rejected"
     );
+    // A comma join `FROM a, b WHERE a.k = b.k` is SUPPORTED now -- it routes to the join path (which, with
+    // a/b not resident here, stops at the GPU-only residency check rather than a parser rejection).
     let comma = reject("SELECT x, y FROM a, b WHERE a.k = b.k");
     assert!(
-        comma.contains("one from relation") || comma.contains("join"),
-        "comma join rejected, got: {comma}"
+        comma.contains("resident snapshot") || comma.contains("join path"),
+        "comma join routes to the join path, got: {comma}"
     );
     // A per-relation WHERE conjunct is supported (J3); a CROSS-relation WHERE predicate (beyond the ON)
     // is a follow-up -> clean reject.
@@ -1255,6 +1259,76 @@ fn gpu_inner_join_composite_on_int8_member_rejected() {
     assert!(
         err.contains("composite") || err.contains("int2/int4/date"),
         "int8 composite member rejected, got: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_comma_join_from_where() {
+    // M5 J6: a comma join `FROM ord, cust, region WHERE ...` -- the join conditions live in the WHERE and
+    // are lifted into the SAME left-deep `JoinStep` pipeline as an explicit JOIN. A single-relation WHERE
+    // conjunct stays a per-relation GPU filter; a cross-relation `=` becomes a join edge.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)").unwrap();
+    e.execute_text(3, "CREATE TABLE ord (oid INT, cid INT, label TEXT)").unwrap();
+    e.execute_text(4, "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')").unwrap();
+    e.execute_text(5, "INSERT INTO cust (cid, rid, cname) VALUES (10,1,'alice'),(20,2,'bob')").unwrap();
+    e.execute_text(6, "INSERT INTO ord (oid, cid, label) VALUES (100,10,'x'),(101,10,'y'),(102,20,'z')").unwrap();
+    let mut ok = true;
+    for t in ["region", "cust", "ord"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let triples = |res: &RelationalSelectResult| -> Vec<(String, String, String)> {
+        let s = |c: &SqlValue| match c {
+            SqlValue::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let mut v: Vec<(String, String, String)> =
+            res.rows.iter().map(|r| (s(&r[0]), s(&r[1]), s(&r[2]))).collect();
+        v.sort();
+        v
+    };
+    // 3-way comma join (same result as the explicit-JOIN 3-way test).
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT ord.label, cust.cname, region.rname FROM ord, cust, region \
+             WHERE cust.cid = ord.cid AND region.rid = cust.rid",
+        )
+        .expect("3-way comma join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        triples(&res),
+        vec![
+            ("x".to_string(), "alice".to_string(), "west".to_string()),
+            ("y".to_string(), "alice".to_string(), "west".to_string()),
+            ("z".to_string(), "bob".to_string(), "east".to_string()),
+        ],
+        "comma join derives the same left-deep chain as the explicit JOIN"
+    );
+    // A per-relation filter in the WHERE alongside the join edges (label filter -> ord's GPU pre-filter).
+    let filtered = e
+        .execute_resident_expr_select_sql(
+            "SELECT ord.label, cust.cname, region.rname FROM ord, cust, region \
+             WHERE cust.cid = ord.cid AND region.rid = cust.rid AND ord.label = 'z'",
+        )
+        .expect("comma join with a per-relation filter");
+    assert_eq!(
+        triples(&filtered),
+        vec![("z".to_string(), "bob".to_string(), "east".to_string())],
+        "the ord.label='z' filter is pushed to ord; only that row survives"
+    );
+    // A relation with no join condition to an earlier one (a cartesian product) is a clean follow-up error.
+    let cartesian = e
+        .execute_resident_expr_select_sql("SELECT ord.label, cust.cname, region.rname FROM ord, cust, region WHERE cust.cid = ord.cid")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        cartesian.contains("no equi-join condition") || cartesian.contains("cartesian"),
+        "disconnected comma join rejected, got: {cartesian}"
     );
 }
 

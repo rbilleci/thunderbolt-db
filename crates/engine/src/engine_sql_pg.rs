@@ -76,6 +76,41 @@ impl Engine {
             };
             return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates);
         }
+        // A comma join (`FROM a, b[, c] WHERE a.k = b.k ...`) is an INNER join whose conditions live in
+        // the WHERE: bind the relations, then derive the left-deep steps + per-relation filters from the
+        // WHERE (the same `JoinStep`/executor as an explicit JOIN, incl. composite 2-edge keys).
+        if let Some(relations) = comma_join_relations(&stmt) {
+            reject_unsupported_join_clauses(&stmt)?;
+            let projection = parse_join_projection(&stmt)?;
+            let s = self.committed_seq();
+            let catalog = self.read_state.catalog_as_of(s);
+            #[allow(clippy::type_complexity)] // (catalog table, synthesized rows) | resident table
+            let bind = |name: &str| -> Result<(RelationalTable, Option<Vec<Vec<SqlValue>>>), ExecuteError> {
+                if let Some(table) = catalog.relational_catalog.get(name).cloned() {
+                    Ok((table, None))
+                } else if let Some((table, rows)) = synthesize_catalog_relation(name, &catalog) {
+                    Ok((table, Some(rows)))
+                } else {
+                    Err(sql_pg_error(format!("relation \"{name}\" does not exist")))
+                }
+            };
+            let mut tables: Vec<RelationalTable> = Vec::with_capacity(relations.len());
+            let mut rows: Vec<Option<Vec<Vec<SqlValue>>>> = Vec::with_capacity(relations.len());
+            for relation in &relations {
+                let (table, relation_rows) = bind(&relation.table)?;
+                tables.push(table);
+                rows.push(relation_rows);
+            }
+            let aliases: Vec<&str> = relations.iter().map(|r| r.alias.as_str()).collect();
+            let (steps, predicates) =
+                plan_comma_join_where(stmt.where_clause.as_deref(), &relations, &tables, &aliases)?;
+            let plan = JoinPlan {
+                relations,
+                steps,
+                projection,
+            };
+            return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates);
+        }
         let (select, qualifier) = build_select_from_select_stmt(&stmt)?;
         // Bind once; map the predicate (if any) against that SAME bound table; execute against that
         // binding. No WHERE clause is a full-table scan (the executor takes `None` for the predicate).
@@ -443,9 +478,28 @@ fn parse_on_conjuncts(quals: &Node) -> Result<Vec<(JoinColRef, JoinColRef)>, Exe
 /// join path yet"). WHERE is supported (split per-relation in the entry). The executor resolves the ON
 /// operands + projection to relations/columns, validates the key types, and pipelines the chain.
 fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
+    reject_unsupported_join_clauses(stmt)?;
+    let [from] = stmt.from_clause.as_slice() else {
+        return Err(sql_pg_error("expected a single JOIN in the FROM clause".to_string()));
+    };
+    let NodeEnum::JoinExpr(join) = node_enum(from)? else {
+        return Err(sql_pg_error("expected a JOIN in the FROM clause".to_string()));
+    };
+    let mut relations: Vec<JoinRelationRef> = Vec::new();
+    let mut steps: Vec<JoinStep> = Vec::new();
+    flatten_join_chain(join, &mut relations, &mut steps)?;
+    let projection = parse_join_projection(stmt)?;
+    Ok(JoinPlan {
+        relations,
+        steps,
+        projection,
+    })
+}
+
+/// Reject the clauses not on the join path yet (GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET / DISTINCT /
+/// window / WITH). WHERE is supported (split per-relation in the entry). Shared by explicit + comma joins.
+fn reject_unsupported_join_clauses(stmt: &SelectStmt) -> Result<(), ExecuteError> {
     let unsupported = [
-        // WHERE is supported (mapped per-relation in the entry); GROUP BY / aggregates / ORDER BY /
-        // LIMIT / DISTINCT over a join are follow-ups.
         (!stmt.group_clause.is_empty(), "GROUP BY"),
         (stmt.having_clause.is_some(), "HAVING"),
         (!stmt.sort_clause.is_empty(), "ORDER BY"),
@@ -460,16 +514,12 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
             "{clause} on a JOIN is not on the general GPU executor's join path yet"
         )));
     }
-    let [from] = stmt.from_clause.as_slice() else {
-        return Err(sql_pg_error("expected a single JOIN in the FROM clause".to_string()));
-    };
-    let NodeEnum::JoinExpr(join) = node_enum(from)? else {
-        return Err(sql_pg_error("expected a JOIN in the FROM clause".to_string()));
-    };
-    let mut relations: Vec<JoinRelationRef> = Vec::new();
-    let mut steps: Vec<JoinStep> = Vec::new();
-    flatten_join_chain(join, &mut relations, &mut steps)?;
-    // Projection: a non-empty list of plain column references / stars.
+    Ok(())
+}
+
+/// Parse the SELECT target list into join projection items (plain columns / `*` / `alias.*`); non-empty.
+/// Shared by explicit + comma joins.
+fn parse_join_projection(stmt: &SelectStmt) -> Result<Vec<JoinProjItem>, ExecuteError> {
     if stmt.target_list.is_empty() {
         return Err(sql_pg_error("a join SELECT must project at least one column".to_string()));
     }
@@ -484,11 +534,148 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
             .ok_or_else(|| sql_pg_error("join SELECT target has no expression".to_string()))?;
         projection.push(parse_join_proj_item(val)?);
     }
-    Ok(JoinPlan {
-        relations,
-        steps,
-        projection,
-    })
+    Ok(projection)
+}
+
+/// Detect a comma join (`FROM a, b[, c]`) and lift out its relations. Returns `None` (not this path) for
+/// a single FROM relation or any non-base-table FROM entry (an explicit `JoinExpr` -- handled by
+/// `build_join_plan` -- or a subquery; a comma list MIXING those is a follow-up). Each entry's qualifier
+/// is its alias, else the relation name (mirrors the explicit-JOIN builder).
+fn comma_join_relations(stmt: &SelectStmt) -> Option<Vec<JoinRelationRef>> {
+    if stmt.from_clause.len() < 2 {
+        return None;
+    }
+    let mut relations = Vec::with_capacity(stmt.from_clause.len());
+    for from in &stmt.from_clause {
+        let Some(NodeEnum::RangeVar(range_var)) = from.node.as_ref() else {
+            return None;
+        };
+        let table = range_var.relname.clone();
+        let alias = range_var
+            .alias
+            .as_ref()
+            .map(|alias| alias.aliasname.clone())
+            .unwrap_or_else(|| table.clone());
+        relations.push(JoinRelationRef { table, alias });
+    }
+    Some(relations)
+}
+
+/// Resolve a column reference to its relation index among `relations`/`tables` (parallel): a qualifier
+/// must name exactly one relation (and the column must exist in it); an unqualified column must be in
+/// exactly one (PG's "ambiguous" / "does not exist"). Used to find a comma-join WHERE equi-join's endpoints.
+fn which_relation(
+    c: &JoinColRef,
+    relations: &[JoinRelationRef],
+    tables: &[RelationalTable],
+) -> Result<usize, ExecuteError> {
+    match &c.qualifier {
+        Some(q) => {
+            let i = relations
+                .iter()
+                .position(|r| &r.alias == q)
+                .ok_or_else(|| sql_pg_error(format!("missing FROM-clause entry for table \"{q}\"")))?;
+            relational_column_index(&tables[i], &c.column)?;
+            Ok(i)
+        }
+        None => {
+            let mut found: Option<usize> = None;
+            for (i, table) in tables.iter().enumerate() {
+                if relational_column_index(table, &c.column).is_ok() {
+                    if found.is_some() {
+                        return Err(sql_pg_error(format!(
+                            "column reference \"{}\" is ambiguous",
+                            c.column
+                        )));
+                    }
+                    found = Some(i);
+                }
+            }
+            found.ok_or_else(|| sql_pg_error(format!("column \"{}\" does not exist", c.column)))
+        }
+    }
+}
+
+/// Plan a comma join (M5 J6): partition the WHERE into per-relation filters + cross-relation equi-join
+/// EDGES, then derive the left-deep `steps` (in FROM order) + per-relation predicates. Each top-level AND
+/// conjunct is either (a) mapped to exactly one relation -> a filter, or (b) an `=` between columns of two
+/// DIFFERENT relations -> an edge folded into the LATER relation's step (so it joins to an earlier one).
+/// Each non-first relation must have >=1 edge to an earlier relation (else the graph is disconnected -- a
+/// cartesian/cross join, a follow-up). >2 edges into one relation (a composite key wider than 64 bits) is a
+/// follow-up. This reuses the same `JoinStep`/executor as explicit JOINs (incl. composite 2-edge keys).
+fn plan_comma_join_where(
+    where_clause: Option<&Node>,
+    relations: &[JoinRelationRef],
+    tables: &[RelationalTable],
+    aliases: &[&str],
+) -> Result<(Vec<JoinStep>, Vec<Option<ResidentExpr>>), ExecuteError> {
+    let n = relations.len();
+    let mut conjuncts: Vec<&Node> = Vec::new();
+    if let Some(where_node) = where_clause {
+        collect_and_conjuncts(where_node, &mut conjuncts)?;
+    }
+    let mut filters: Vec<Vec<ResidentExpr>> = (0..n).map(|_| Vec::new()).collect();
+    // edges[i] = the equi-join conjuncts that fold relation i into the accumulated set (i.e. that connect
+    // relation i to some relation < i). edges[0] stays empty.
+    let mut edges: Vec<Vec<(JoinColRef, JoinColRef)>> = (0..n).map(|_| Vec::new()).collect();
+    for conjunct in conjuncts {
+        // A conjunct that resolves wholly against one relation is that relation's filter (first match wins,
+        // matching split_join_where).
+        if let Some((i, expr)) = tables
+            .iter()
+            .zip(aliases)
+            .enumerate()
+            .find_map(|(i, (table, alias))| {
+                map_predicate_node(conjunct, table, alias).ok().map(|expr| (i, expr))
+            })
+        {
+            filters[i].push(expr);
+            continue;
+        }
+        // Otherwise it must be a cross-relation `colA = colB` equi-join edge.
+        let (on_a, on_b) = parse_equi_conjunct(conjunct)?;
+        let ra = which_relation(&on_a, relations, tables)?;
+        let rb = which_relation(&on_b, relations, tables)?;
+        if ra == rb {
+            return Err(sql_pg_error(
+                "a comma-join WHERE conjunct must reference one relation (a filter) or two different \
+                 relations (an equi-join); other cross-relation predicates are a follow-up"
+                    .to_string(),
+            ));
+        }
+        edges[ra.max(rb)].push((on_a, on_b));
+    }
+    let mut steps = Vec::with_capacity(n - 1);
+    for (i, relation_edges) in edges.into_iter().enumerate().skip(1) {
+        if relation_edges.is_empty() {
+            return Err(sql_pg_error(format!(
+                "relation \"{}\" has no equi-join condition to an earlier relation (a comma cross-join / \
+                 cartesian product is a follow-up; add `WHERE a.k = b.k` or use an explicit JOIN)",
+                relations[i].alias
+            )));
+        }
+        if relation_edges.len() > 2 {
+            return Err(sql_pg_error(
+                "more than 2 join conditions into one relation (a composite key wider than 64 bits) is a \
+                 follow-up"
+                    .to_string(),
+            ));
+        }
+        steps.push(JoinStep {
+            conjuncts: relation_edges,
+        });
+    }
+    let predicates = filters
+        .into_iter()
+        .map(|conjuncts| {
+            conjuncts.into_iter().reduce(|acc, expr| ResidentExpr::Binary {
+                op: ResidentBinaryOp::And,
+                lhs: Box::new(acc),
+                rhs: Box::new(expr),
+            })
+        })
+        .collect();
+    Ok((steps, predicates))
 }
 
 /// Split a join WHERE into per-relation predicates, one per relation in `tables`/`aliases` (M5 J3/J6).

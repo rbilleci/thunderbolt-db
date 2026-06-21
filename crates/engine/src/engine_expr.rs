@@ -1361,6 +1361,15 @@ impl Engine {
         let mut step_keys: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(plan.steps.len());
         for (k, step) in plan.steps.iter().enumerate() {
             let new_rel = k + 1;
+            // A step always carries 1 or 2 equality conjuncts (the parsers guarantee >=1 -- an explicit
+            // ON has >=1, a comma join rejects an unconnected relation); reject an empty step defensively
+            // so a future planner change can never reach `pack_keys` with zero members (which would panic).
+            if step.conjuncts.is_empty() {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "a join step requires at least one equality condition between the relations"
+                        .to_string(),
+                )));
+            }
             if step.conjuncts.len() > 2 {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "a join ON with more than 2 equality conjuncts (a composite key wider than 64 \
