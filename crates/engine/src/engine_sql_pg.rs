@@ -104,10 +104,14 @@ impl Engine {
             let aliases: Vec<&str> = relations.iter().map(|r| r.alias.as_str()).collect();
             let (steps, predicates) =
                 plan_comma_join_where(stmt.where_clause.as_deref(), &relations, &tables, &aliases)?;
+            let (order_by, limit, offset) = parse_join_order_by_limit(&stmt)?;
             let plan = JoinPlan {
                 relations,
                 steps,
                 projection,
+                order_by,
+                limit,
+                offset,
             };
             return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates);
         }
@@ -569,22 +573,24 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
         ));
     }
     let projection = parse_join_projection(stmt)?;
+    let (order_by, limit, offset) = parse_join_order_by_limit(stmt)?;
     Ok(JoinPlan {
         relations,
         steps,
         projection,
+        order_by,
+        limit,
+        offset,
     })
 }
 
-/// Reject the clauses not on the join path yet (GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET / DISTINCT /
-/// window / WITH). WHERE is supported (split per-relation in the entry). Shared by explicit + comma joins.
+/// Reject the clauses not on the join path yet (GROUP BY / HAVING / DISTINCT / window / WITH). WHERE is
+/// supported (split per-relation in the entry); ORDER BY / LIMIT / OFFSET are parsed by
+/// `parse_join_order_by_limit` and applied to the result (a GPU sort then a slice). Shared by both joins.
 fn reject_unsupported_join_clauses(stmt: &SelectStmt) -> Result<(), ExecuteError> {
     let unsupported = [
         (!stmt.group_clause.is_empty(), "GROUP BY"),
         (stmt.having_clause.is_some(), "HAVING"),
-        (!stmt.sort_clause.is_empty(), "ORDER BY"),
-        (stmt.limit_count.is_some(), "LIMIT"),
-        (stmt.limit_offset.is_some(), "OFFSET"),
         (!stmt.distinct_clause.is_empty(), "DISTINCT"),
         (!stmt.window_clause.is_empty(), "window functions"),
         (stmt.with_clause.is_some(), "WITH / CTEs"),
@@ -595,6 +601,31 @@ fn reject_unsupported_join_clauses(stmt: &SelectStmt) -> Result<(), ExecuteError
         )));
     }
     Ok(())
+}
+
+/// Parse a join's ORDER BY / LIMIT / OFFSET. ORDER BY keys are PLAIN columns only (qualified or not -- the
+/// executor resolves them to a projected result column and sorts on the GPU); an arithmetic / aggregate
+/// sort expression on the join path is a follow-up. LIMIT / OFFSET are non-negative integer literals.
+/// NULLS FIRST/LAST is ignored (join data is non-null until M3). Shared by explicit + comma joins.
+#[allow(clippy::type_complexity)] // (ORDER BY keys, LIMIT, OFFSET) -- a plain 3-tuple, naming it adds noise
+fn parse_join_order_by_limit(
+    stmt: &SelectStmt,
+) -> Result<(Vec<(JoinColRef, bool)>, Option<usize>, Option<usize>), ExecuteError> {
+    let mut order_by = Vec::with_capacity(stmt.sort_clause.len());
+    for item in &stmt.sort_clause {
+        let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
+            return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
+        };
+        let node = sort_by
+            .node
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
+        let descending = sort_by.sortby_dir == SortByDir::SortbyDesc as i32;
+        order_by.push((parse_join_col_ref(node)?, descending));
+    }
+    let limit = parse_limit(&stmt.limit_count)?;
+    let offset = parse_limit(&stmt.limit_offset)?;
+    Ok((order_by, limit, offset))
 }
 
 /// Parse the SELECT target list into join projection items (plain columns / `*` / `alias.*`); non-empty.

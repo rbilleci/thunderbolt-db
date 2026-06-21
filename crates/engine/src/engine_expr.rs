@@ -121,6 +121,12 @@ pub(crate) struct JoinPlan {
     pub relations: Vec<JoinRelationRef>,
     pub steps: Vec<JoinStep>,
     pub projection: Vec<JoinProjItem>,
+    /// ORDER BY keys (plain columns only, each `(column, descending)`) applied to the join RESULT via a
+    /// GPU sort. Every key must appear in `projection` (a non-projected ORDER BY key is a follow-up).
+    pub order_by: Vec<(JoinColRef, bool)>,
+    /// LIMIT / OFFSET sliced off the (sorted) join result. `None` = unbounded / from row 0.
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 /// The device memory backing a join relation: a RESIDENT user table's published `Arc` (shared), or a
@@ -138,6 +144,121 @@ impl JoinDeviceMemory {
             JoinDeviceMemory::Transient(memory) => memory,
         }
     }
+}
+
+/// Sort `rows` ON THE GPU by `order` -- each `(result-column index, descending)` (charter: every relational
+/// sort is a GPU sort, no host-side finalization). INT keys (int2/4/8/date/timestamp) feed an i64 matrix
+/// (`bitonic_sort_multikey`); TEXT/NUMERIC/UUID keys feed a resident-like payload built from just those key
+/// columns (`build_relational_device_payload`) that the hetero comparator reads on-device. `col_types[i]`
+/// is result column `i`'s type. A no-op for <=1 row or empty `order`. `device_memory` supplies the CUDA
+/// context. SHARED by the grouped result + the join result (both gather host rows then sort them on-device).
+pub(crate) fn gpu_sort_result_rows(
+    rows: Vec<Vec<SqlValue>>,
+    order: &[(usize, bool)],
+    col_types: &[SqlType],
+    device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
+) -> Result<Vec<Vec<SqlValue>>, ExecuteError> {
+    if order.is_empty() || rows.len() <= 1 {
+        return Ok(rows);
+    }
+    let n = rows.len();
+    let map_sort_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
+        ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+    };
+    // (result-column index, kind 0=int / 1=text / 2=numeric / 3=uuid) per ORDER BY key.
+    let mut classified: Vec<(usize, u8)> = Vec::with_capacity(order.len());
+    for &(idx, _desc) in order {
+        let kind = match col_types[idx] {
+            SqlType::Int4 | SqlType::Int8 | SqlType::Int2 | SqlType::Date | SqlType::Timestamp => 0u8,
+            SqlType::Text => 1,
+            SqlType::Numeric { .. } => 2,
+            SqlType::Uuid => 3,
+            other => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "ORDER BY on a {other:?} result column is not yet supported"
+                ))));
+            }
+        };
+        classified.push((idx, kind));
+    }
+    let num_int = classified.iter().filter(|&&(_, k)| k == 0).count();
+    // INT key matrix, row-major by row position (matches the 0..n index order).
+    let mut int_keys: Vec<i64> = Vec::with_capacity(n * num_int);
+    for row in &rows {
+        for &(idx, kind) in &classified {
+            if kind == 0 {
+                int_keys.push(match row[idx] {
+                    SqlValue::Int4(v) | SqlValue::Date(v) => i64::from(v),
+                    SqlValue::Int2(v) => i64::from(v),
+                    SqlValue::Int8(v) | SqlValue::Timestamp(v) => v,
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "ORDER BY int key encountered a non-int value".to_string(),
+                        )));
+                    }
+                });
+            }
+        }
+    }
+    let mut desc_mask = 0u64;
+    for (ki, &(_, desc)) in order.iter().enumerate() {
+        if desc {
+            desc_mask |= 1u64 << ki;
+        }
+    }
+    let non_int: Vec<(usize, u8)> = classified.iter().copied().filter(|&(_, k)| k != 0).collect();
+    let perm: Vec<u32> = if non_int.is_empty() {
+        device_memory
+            .bitonic_sort_multikey(&int_keys, n, num_int, desc_mask)
+            .map_err(map_sort_err)?
+    } else {
+        // A resident-like payload over ONLY the non-int key columns; the helper returns the text
+        // (offsets,bytes) + numeric/uuid section offsets the hetero comparator reads on-device.
+        let names: Vec<String> = (0..non_int.len()).map(|i| format!("__gsk{i}")).collect();
+        let types: Vec<SqlType> = non_int.iter().map(|&(idx, _)| col_types[idx]).collect();
+        let payload_rows: Vec<Vec<SqlValue>> = rows
+            .iter()
+            .map(|r| non_int.iter().map(|&(idx, _)| r[idx].clone()).collect())
+            .collect();
+        let (payload, text_layouts, _bool, _int4, b128_layouts) =
+            crate::engine_residency::build_relational_device_payload(&names, &types, &payload_rows)?;
+        // Walk ORDER BY order: int -> next matrix slot; text/numeric/uuid -> the next section in its type
+        // group (the helper lays them out in passed-column order per group).
+        let mut int_slot = 0u32;
+        let mut text_idx = 0usize;
+        let mut b128_idx = 0usize;
+        let mut text_cols: Vec<(u64, u64)> = Vec::new();
+        let mut b128_cols: Vec<u64> = Vec::new();
+        let mut key_plan: Vec<u32> = Vec::with_capacity(order.len());
+        for &(_, kind) in &classified {
+            match kind {
+                0 => {
+                    key_plan.push(int_slot);
+                    int_slot += 1;
+                }
+                1 => {
+                    let tl = &text_layouts[text_idx];
+                    key_plan.push(0x4000_0000_u32 | text_cols.len() as u32);
+                    text_cols.push((tl.offsets_byte_offset, tl.bytes_byte_offset));
+                    text_idx += 1;
+                }
+                k => {
+                    let off = b128_layouts[b128_idx].1;
+                    let tag = if k == 2 { 0x8000_0000_u32 } else { 0xC000_0000_u32 };
+                    key_plan.push(tag | b128_cols.len() as u32);
+                    b128_cols.push(off);
+                    b128_idx += 1;
+                }
+            }
+        }
+        let indices: Vec<u64> = (0..n as u64).collect();
+        device_memory
+            .bitonic_sort_hetero_on_payload(
+                &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols, &key_plan, desc_mask,
+            )
+            .map_err(map_sort_err)?
+    };
+    Ok(perm.iter().map(|&p| rows[p as usize].clone()).collect())
 }
 
 /// Narrow a grouped MIN/MAX or GROUP BY key, which the GPU kernel computes as an i64 (or, for
@@ -1759,7 +1880,7 @@ impl Engine {
         // Gather: for each surviving tuple, read each projected column from its relation's host_rows at
         // the carried ABSOLUTE row -- the control-plane gather; the join ran on the GPU.
         let work_n = work_idx[0].len();
-        let result_rows: Vec<Vec<SqlValue>> = (0..work_n)
+        let mut result_rows: Vec<Vec<SqlValue>> = (0..work_n)
             .map(|t| {
                 proj.iter()
                     .map(|&(ri, ci)| sides[ri].0.host_rows[work_idx[ri][t] as usize][ci].clone())
@@ -1772,6 +1893,36 @@ impl Engine {
             let mut col = tables[ri].columns[ci].clone();
             col.attnum = (i + 1) as i16;
             columns.push(col);
+        }
+        // ORDER BY on the join result is a GPU SORT (charter: every relational sort is a GPU sort). Each key
+        // resolves to a PROJECTED result column (same resolution as the projection, incl. USING/NATURAL
+        // coalescing); a non-projected ORDER BY key on the join path is a follow-up. Then OFFSET/LIMIT slice.
+        if !plan.order_by.is_empty() && result_rows.len() > 1 {
+            let mut order: Vec<(usize, bool)> = Vec::with_capacity(plan.order_by.len());
+            for (c, descending) in &plan.order_by {
+                let resolved = if c.qualifier.is_none() && is_coalesced(&c.column) {
+                    (0, relational_column_index(&tables[0], &c.column)?)
+                } else {
+                    resolve(c, n_rel - 1)?
+                };
+                let idx = proj.iter().position(|&p| p == resolved).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "ORDER BY column `{}` must appear in the SELECT list on the join path (a \
+                         non-projected ORDER BY key is a follow-up)",
+                        c.column
+                    )))
+                })?;
+                order.push((idx, *descending));
+            }
+            let col_types: Vec<SqlType> = columns.iter().map(|col| col.ty).collect();
+            result_rows = gpu_sort_result_rows(result_rows, &order, &col_types, sides[0].1.mem())?;
+        }
+        if plan.offset.is_some() || plan.limit.is_some() {
+            let start = plan.offset.unwrap_or(0).min(result_rows.len());
+            result_rows.drain(..start);
+            if let Some(limit) = plan.limit {
+                result_rows.truncate(limit);
+            }
         }
         Ok(RelationalSelectResult {
             columns,
@@ -3191,122 +3342,16 @@ impl Engine {
             // build_relational_device_payload) from just those result columns, which the hetero
             // comparator reads on-device. Single- and multi-key are the same path (k=1 is K=1).
             if !select.order_by.is_empty() && rows.len() > 1 {
-                let n = rows.len();
-                // (result-column index, kind 0=int / 1=text / 2=numeric / 3=uuid) per ORDER BY key.
-                let mut classified: Vec<(usize, u8)> = Vec::with_capacity(select.order_by.len());
-                for order in &select.order_by {
-                    let idx = col_index(&order.column)?;
-                    let kind = match bound.selected_columns[idx].ty {
-                        SqlType::Int4
-                        | SqlType::Int8
-                        | SqlType::Int2
-                        | SqlType::Date
-                        | SqlType::Timestamp => 0u8,
-                        SqlType::Text => 1,
-                        SqlType::Numeric { .. } => 2,
-                        SqlType::Uuid => 3,
-                        other => {
-                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                "ORDER BY on a grouped {other:?} result is not yet supported"
-                            ))));
-                        }
-                    };
-                    classified.push((idx, kind));
-                }
-                let num_int = classified.iter().filter(|&&(_, k)| k == 0).count();
-                // INT key matrix, row-major by group position (matches `indices` = 0..n order).
-                let mut int_keys: Vec<i64> = Vec::with_capacity(n * num_int);
-                for row in &rows {
-                    for &(idx, kind) in &classified {
-                        if kind == 0 {
-                            int_keys.push(match row[idx] {
-                                SqlValue::Int4(v) | SqlValue::Date(v) => i64::from(v),
-                                SqlValue::Int2(v) => i64::from(v),
-                                SqlValue::Int8(v) | SqlValue::Timestamp(v) => v,
-                                _ => {
-                                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                        "grouped ORDER BY int key encountered a non-int value"
-                                            .to_string(),
-                                    )));
-                                }
-                            });
-                        }
-                    }
-                }
-                let mut desc_mask = 0u64;
-                for (ki, order) in select.order_by.iter().enumerate() {
-                    if order.descending {
-                        desc_mask |= 1u64 << ki;
-                    }
-                }
-                let non_int: Vec<(usize, u8)> =
-                    classified.iter().copied().filter(|&(_, k)| k != 0).collect();
-                let map_sort_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
-                };
-                let perm: Vec<u32> = if non_int.is_empty() {
-                    device_memory
-                        .bitonic_sort_multikey(&int_keys, n, num_int, desc_mask)
-                        .map_err(map_sort_err)?
-                } else {
-                    // A resident-like payload over ONLY the non-int key columns; the helper returns the
-                    // text (offsets,bytes) + numeric/uuid section offsets we feed the hetero comparator.
-                    let names: Vec<String> =
-                        (0..non_int.len()).map(|i| format!("__gsk{i}")).collect();
-                    let types: Vec<SqlType> = non_int
-                        .iter()
-                        .map(|&(idx, _)| bound.selected_columns[idx].ty)
-                        .collect();
-                    let payload_rows: Vec<Vec<SqlValue>> = rows
-                        .iter()
-                        .map(|r| non_int.iter().map(|&(idx, _)| r[idx].clone()).collect())
-                        .collect();
-                    let (payload, text_layouts, _bool, _int4, b128_layouts) =
-                        crate::engine_residency::build_relational_device_payload(
-                            &names,
-                            &types,
-                            &payload_rows,
-                        )?;
-                    // Walk ORDER BY order: int -> next matrix slot; text/numeric/uuid -> the next
-                    // section in its type group (helper lays them out in passed-column order per group).
-                    let mut int_slot = 0u32;
-                    let mut text_idx = 0usize;
-                    let mut b128_idx = 0usize;
-                    let mut text_cols: Vec<(u64, u64)> = Vec::new();
-                    let mut b128_cols: Vec<u64> = Vec::new();
-                    let mut key_plan: Vec<u32> = Vec::with_capacity(select.order_by.len());
-                    for &(_, kind) in &classified {
-                        match kind {
-                            0 => {
-                                key_plan.push(int_slot);
-                                int_slot += 1;
-                            }
-                            1 => {
-                                let tl = &text_layouts[text_idx];
-                                key_plan.push(0x4000_0000_u32 | text_cols.len() as u32);
-                                text_cols.push((tl.offsets_byte_offset, tl.bytes_byte_offset));
-                                text_idx += 1;
-                            }
-                            k => {
-                                let off = b128_layouts[b128_idx].1;
-                                let tag = if k == 2 { 0x8000_0000_u32 } else { 0xC000_0000_u32 };
-                                key_plan.push(tag | b128_cols.len() as u32);
-                                b128_cols.push(off);
-                                b128_idx += 1;
-                            }
-                        }
-                    }
-                    let indices: Vec<u64> = (0..n as u64).collect();
-                    device_memory
-                        .bitonic_sort_hetero_on_payload(
-                            &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols,
-                            &key_plan, desc_mask,
-                        )
-                        .map_err(map_sort_err)?
-                };
-                let reordered: Vec<Vec<SqlValue>> =
-                    perm.iter().map(|&p| rows[p as usize].clone()).collect();
-                rows = reordered;
+                // Resolve each ORDER BY key to its result-column index, then sort the grouped rows on the
+                // GPU (the shared helper; int matrix vs hetero payload by key type).
+                let order: Vec<(usize, bool)> = select
+                    .order_by
+                    .iter()
+                    .map(|o| Ok::<_, ExecuteError>((col_index(&o.column)?, o.descending)))
+                    .collect::<Result<_, _>>()?;
+                let col_types: Vec<SqlType> =
+                    bound.selected_columns.iter().map(|c| c.ty).collect();
+                rows = gpu_sort_result_rows(rows, &order, &col_types, &device_memory)?;
             }
             if select.offset.is_some() || select.limit.is_some() {
                 let start = select.offset.unwrap_or(0).min(rows.len());

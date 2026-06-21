@@ -1611,6 +1611,111 @@ fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_order_by_limit_offset() {
+    // M5 (catalog \d prerequisite): ORDER BY / LIMIT / OFFSET on a join. ORDER BY is a GPU sort over the
+    // join result (int key via the matrix path, text+int multi-key via the hetero payload path).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, lid INT, score INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'charlie'),(2,'alice'),(3,'bob')").unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid, lid, score) VALUES (10,1,50),(11,2,90),(12,3,70),(13,1,30)",
+    )
+    .unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    // Join is {charlie:50, charlie:30, alice:90, bob:70} over (name, score).
+    let pairs = |res: &RelationalSelectResult| -> Vec<(String, i32)> {
+        res.rows
+            .iter()
+            .map(|r| {
+                let name = match &r[0] {
+                    SqlValue::Text(s) => s.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                let score = match &r[1] {
+                    SqlValue::Int4(v) => *v,
+                    other => panic!("expected int4, got {other:?}"),
+                };
+                (name, score)
+            })
+            .collect()
+    };
+    // (a) ORDER BY an INT key, DESC -> the matrix sort path; full descending order.
+    let desc = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name, r.score FROM l JOIN r ON l.id = r.lid ORDER BY r.score DESC",
+        )
+        .expect("order by int desc");
+    assert_eq!(desc.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        pairs(&desc),
+        vec![
+            ("alice".to_string(), 90),
+            ("bob".to_string(), 70),
+            ("charlie".to_string(), 50),
+            ("charlie".to_string(), 30),
+        ],
+        "ORDER BY r.score DESC sorts the join result on the GPU"
+    );
+    // (b) ORDER BY INT ASC + LIMIT 2 -> the two smallest scores, in order.
+    let asc_lim = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name, r.score FROM l JOIN r ON l.id = r.lid ORDER BY r.score ASC LIMIT 2",
+        )
+        .expect("order by asc + limit");
+    assert_eq!(
+        pairs(&asc_lim),
+        vec![("charlie".to_string(), 30), ("charlie".to_string(), 50)],
+        "ORDER BY ASC LIMIT 2 keeps the two smallest after the GPU sort"
+    );
+    // (c) Multi-key ORDER BY (TEXT ASC, INT DESC) -> the hetero payload sort path.
+    let multi = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name, r.score FROM l JOIN r ON l.id = r.lid ORDER BY l.name ASC, r.score DESC",
+        )
+        .expect("multi-key order by");
+    assert_eq!(
+        pairs(&multi),
+        vec![
+            ("alice".to_string(), 90),
+            ("bob".to_string(), 70),
+            ("charlie".to_string(), 50),
+            ("charlie".to_string(), 30),
+        ],
+        "ORDER BY name ASC, score DESC (text+int multi-key) sorts on the GPU"
+    );
+    // (d) OFFSET + LIMIT after the sort -> the middle window.
+    let window = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name, r.score FROM l JOIN r ON l.id = r.lid ORDER BY r.score DESC OFFSET 1 LIMIT 2",
+        )
+        .expect("offset + limit");
+    assert_eq!(
+        pairs(&window),
+        vec![("bob".to_string(), 70), ("charlie".to_string(), 50)],
+        "OFFSET 1 LIMIT 2 slices the sorted result"
+    );
+    // A non-projected ORDER BY key is a follow-up -> a clear error, not a wrong/partial answer.
+    let err = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name FROM l JOIN r ON l.id = r.lid ORDER BY r.score DESC",
+        )
+        .expect_err("non-projected ORDER BY key must be rejected, not silently dropped");
+    assert!(
+        format!("{err:?}").contains("must appear in the SELECT list"),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_using_and_natural() {
     // M5: USING / NATURAL joins -- the join column is COALESCED (appears once in `*`, PG order: join cols,
     // then left's rest, then right's; an unqualified ref resolves to the left copy).
