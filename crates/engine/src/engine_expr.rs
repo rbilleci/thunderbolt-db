@@ -93,14 +93,20 @@ pub(crate) struct JoinRelationRef {
     pub alias: String,
 }
 
-/// One INNER-join step in a left-deep chain: the ON's equality conjuncts (`a.k1=b.k1 [AND a.k2=b.k2]`).
-/// In each `(on_a, on_b)` pair one operand resolves to the newly joined relation (`relations[k+1]`), the
-/// other to some already-accumulated relation (`relations[0..=k]`); the executor figures out which is
-/// which. A single conjunct is the plain equi-join; 2 conjuncts are a composite key (packed into one i64
-/// for the hash join). >2 conjuncts (a key wider than 64 bits) are a follow-up.
+/// One INNER-join step in a left-deep chain. Its condition is one of: explicit ON `conjuncts`
+/// (`a.k1=b.k1 [AND a.k2=b.k2]` -- in each pair one operand resolves to the newly joined relation
+/// `relations[k+1]`, the other to an accumulated one); `USING(cols)`, which the parser desugars to
+/// qualified `conjuncts` AND records the join column names in `coalesce` (they appear ONCE in `*`); or
+/// `NATURAL` (`natural=true`, `conjuncts` empty), where the executor joins on -- and coalesces -- the
+/// relations' common column names. A single join column is a plain equi-join; 2 are a composite key
+/// (packed into one i64); >2 (a key wider than 64 bits) are a follow-up. USING/NATURAL are 2-relation only.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinStep {
     pub conjuncts: Vec<(JoinColRef, JoinColRef)>,
+    /// `true` for a NATURAL join (the executor derives the conjuncts + coalesce from common columns).
+    pub natural: bool,
+    /// USING/NATURAL join column names -- emitted ONCE in `*` and resolvable unqualified (else empty).
+    pub coalesce: Vec<String>,
 }
 
 /// A LEFT-DEEP chain of INNER equi-joins parsed from the libpg_query FROM clause (M5). `relations` are in
@@ -1363,43 +1369,66 @@ impl Engine {
         // (the i64 path). `step_is_text` = TEXT bytes; `step_is_b128` = a 16-byte numeric/uuid value.
         let mut step_is_text: Vec<bool> = Vec::with_capacity(plan.steps.len());
         let mut step_is_b128: Vec<bool> = Vec::with_capacity(plan.steps.len());
+        // USING/NATURAL join columns, coalesced (emitted ONCE in `*`, resolvable unqualified). 2-relation
+        // only (build_join_plan rejects multi-way USING/NATURAL), so this collects a single step's set.
+        let mut coalesce_cols: Vec<String> = Vec::new();
         for (k, step) in plan.steps.iter().enumerate() {
             let new_rel = k + 1;
-            // A step always carries 1 or 2 equality conjuncts (the parsers guarantee >=1 -- an explicit
-            // ON has >=1, a comma join rejects an unconnected relation); reject an empty step defensively
-            // so a future planner change can never reach `pack_keys` with zero members (which would panic).
-            if step.conjuncts.is_empty() {
+            let mut conj_keys: Vec<(usize, usize, usize)> = Vec::new();
+            let step_coalesce: Vec<String> = if step.natural {
+                // NATURAL (2-relation, so new_rel == 1 and acc == 0): join on the relations' COMMON column
+                // names -> conjuncts (rel0.c = rel1.c) + the coalesce set.
+                let mut common: Vec<String> = Vec::new();
+                for (c0, col) in tables[0].columns.iter().enumerate() {
+                    if let Ok(c1) = relational_column_index(&tables[new_rel], &col.name) {
+                        conj_keys.push((0, c0, c1));
+                        common.push(col.name.clone());
+                    }
+                }
+                if common.is_empty() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "NATURAL JOIN has no common column name between the two relations".to_string(),
+                    )));
+                }
+                common
+            } else {
+                for (on_a, on_b) in &step.conjuncts {
+                    // Each conjunct must equate the newly joined relation (`new_rel`) to an already-joined
+                    // one (<new_rel).
+                    let ra = resolve(on_a, new_rel)?;
+                    let rb = resolve(on_b, new_rel)?;
+                    let ((acc_rel, acc_col), new_col) = if rb.0 == new_rel && ra.0 < new_rel {
+                        ((ra.0, ra.1), rb.1)
+                    } else if ra.0 == new_rel && rb.0 < new_rel {
+                        ((rb.0, rb.1), ra.1)
+                    } else {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "each JOIN's ON conjunct must equate the newly joined relation to an \
+                             already-joined one (a.k = b.k)"
+                                .to_string(),
+                        )));
+                    };
+                    conj_keys.push((acc_rel, acc_col, new_col));
+                }
+                step.coalesce.clone()
+            };
+            // A step joins on 1 or 2 columns (ON/comma guarantee >=1; NATURAL errored above on 0). It always
+            // reaches `pack_keys`, which handles only 1-2 members; reject an empty step (defensive) and >2
+            // columns (a composite key wider than 64 bits -- e.g. NATURAL/USING over 3+ columns).
+            if conj_keys.is_empty() {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "a join step requires at least one equality condition between the relations"
                         .to_string(),
                 )));
             }
-            if step.conjuncts.len() > 2 {
+            if conj_keys.len() > 2 {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "a join ON with more than 2 equality conjuncts (a composite key wider than 64 \
-                     bits) is a follow-up"
+                    "a join on more than 2 equality columns (a composite key wider than 64 bits) is a \
+                     follow-up"
                         .to_string(),
                 )));
             }
-            let mut conj_keys: Vec<(usize, usize, usize)> = Vec::with_capacity(step.conjuncts.len());
-            for (on_a, on_b) in &step.conjuncts {
-                // Each conjunct must equate the newly joined relation (`new_rel`) to an already-joined
-                // one (<new_rel).
-                let ra = resolve(on_a, new_rel)?;
-                let rb = resolve(on_b, new_rel)?;
-                let ((acc_rel, acc_col), new_col) = if rb.0 == new_rel && ra.0 < new_rel {
-                    ((ra.0, ra.1), rb.1)
-                } else if ra.0 == new_rel && rb.0 < new_rel {
-                    ((rb.0, rb.1), ra.1)
-                } else {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "each JOIN's ON conjunct must equate the newly joined relation to an \
-                         already-joined one (a.k = b.k)"
-                            .to_string(),
-                    )));
-                };
-                conj_keys.push((acc_rel, acc_col, new_col));
-            }
+            coalesce_cols.extend(step_coalesce);
             // Determine the key kind + validate types. A single-conjunct key may be TEXT (-> the GPU text
             // hash join: FNV + byte-verify), NUMERIC/UUID (-> the SAME kernel over the 16-byte canonical
             // value), or INT (-> the i64 hash join). A 2-conjunct composite is INT-only (i64-packed).
@@ -1466,12 +1495,37 @@ impl Engine {
             step_is_text.push(is_text);
             step_is_b128.push(is_b128);
         }
-        // Resolve the SELECT list to a flat (relation index, column index) list, expanding `*` (every
-        // relation's columns, left-to-right PG order) and `alias.*` (that relation's columns).
+        // Resolve the SELECT list to a flat (relation index, column index) list, expanding `*` and
+        // `alias.*`. With USING/NATURAL, a join column is COALESCED: it appears ONCE in bare `*` (PG order:
+        // the join columns first, then the left relation's other columns, then the right's), and an
+        // UNQUALIFIED reference to it resolves to the left copy (not ambiguous). `alias.*` is unchanged
+        // (a relation's own columns). `coalesce_cols` is empty for ON/comma joins -> the prior behavior.
+        let is_coalesced = |name: &str| coalesce_cols.iter().any(|c| c == name);
         let mut proj: Vec<(usize, usize)> = Vec::new();
         for item in &plan.projection {
             match item {
+                JoinProjItem::Column(c) if c.qualifier.is_none() && is_coalesced(&c.column) => {
+                    // The coalesced join column lives in relation 0 (the left side of the 2-relation join).
+                    proj.push((0, relational_column_index(&tables[0], &c.column)?));
+                }
                 JoinProjItem::Column(c) => proj.push(resolve(c, n_rel - 1)?),
+                JoinProjItem::Star(None) if !coalesce_cols.is_empty() => {
+                    // USING/NATURAL (2-relation): coalesced columns first (from rel0), then each relation's
+                    // remaining columns left-to-right (the right copy of a coalesced column is skipped).
+                    for name in &coalesce_cols {
+                        proj.push((0, relational_column_index(&tables[0], name)?));
+                    }
+                    for (ri, table) in tables.iter().enumerate() {
+                        proj.extend(
+                            table
+                                .columns
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, col)| !is_coalesced(&col.name))
+                                .map(|(ci, _)| (ri, ci)),
+                        );
+                    }
+                }
                 JoinProjItem::Star(None) => {
                     for (ri, table) in tables.iter().enumerate() {
                         proj.extend((0..table.columns.len()).map(|ci| (ri, ci)));

@@ -1560,6 +1560,101 @@ fn gpu_inner_join_n_to_n_cross_product() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_using_and_natural() {
+    // M5: USING / NATURAL joins -- the join column is COALESCED (appears once in `*`, PG order: join cols,
+    // then left's rest, then right's; an unqualified ref resolves to the left copy).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE emp (eid INT, dept INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE dept (dept INT, dname TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO emp (eid, dept, name) VALUES (1,10,'alice'),(2,10,'bob'),(3,20,'carol')").unwrap();
+    e.execute_text(4, "INSERT INTO dept (dept, dname) VALUES (10,'eng'),(20,'sales'),(30,'hr')").unwrap();
+    let es = e.populate_relational_residency_snapshot("emp").unwrap();
+    let ds = e.populate_relational_residency_snapshot("dept").unwrap();
+    if es.device_memory_proof.is_none() || ds.device_memory_proof.is_none() {
+        return;
+    }
+    // bare `*`: coalesced `dept` once, then emp's other cols (eid, name), then dept's other (dname).
+    let rows4 = |res: &RelationalSelectResult| -> Vec<(i32, i32, String, String)> {
+        let i = |c: &SqlValue| match c {
+            SqlValue::Int4(v) => *v,
+            other => panic!("expected int4, got {other:?}"),
+        };
+        let s = |c: &SqlValue| match c {
+            SqlValue::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let mut v: Vec<(i32, i32, String, String)> =
+            res.rows.iter().map(|r| (i(&r[0]), i(&r[1]), s(&r[2]), s(&r[3]))).collect();
+        v.sort();
+        v
+    };
+    let star = e
+        .execute_resident_expr_select_sql("SELECT * FROM emp JOIN dept USING (dept)")
+        .expect("USING join with `*`");
+    assert_eq!(star.executed_target, DeviceTarget::Gpu(0));
+    let names: Vec<String> = star.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, vec!["dept", "eid", "name", "dname"], "USING coalesces `dept` once, PG `*` order");
+    assert_eq!(
+        rows4(&star),
+        vec![
+            (10, 1, "alice".to_string(), "eng".to_string()),
+            (10, 2, "bob".to_string(), "eng".to_string()),
+            (20, 3, "carol".to_string(), "sales".to_string()),
+        ],
+        "USING(dept) joins emp.dept=dept.dept; dept 30 (no emp) dropped"
+    );
+    // NATURAL JOIN derives USING(common columns) = USING(dept) here -> identical result.
+    let nat = e
+        .execute_resident_expr_select_sql("SELECT * FROM emp NATURAL JOIN dept")
+        .expect("NATURAL join");
+    assert_eq!(
+        nat.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        vec!["dept", "eid", "name", "dname"],
+        "NATURAL joins on (and coalesces) the common column `dept`"
+    );
+    assert_eq!(rows4(&nat), rows4(&star), "NATURAL == USING(dept) here");
+    // An UNQUALIFIED reference to the coalesced join column resolves (not ambiguous).
+    let explicit = e
+        .execute_resident_expr_select_sql("SELECT name, dept, dname FROM emp JOIN dept USING (dept)")
+        .expect("USING join, unqualified coalesced column");
+    let mut got: Vec<(String, i32, String)> = explicit
+        .rows
+        .iter()
+        .map(|r| {
+            let s = |c: &SqlValue| match c {
+                SqlValue::Text(t) => t.clone(),
+                other => panic!("text expected, got {other:?}"),
+            };
+            let n = match &r[1] {
+                SqlValue::Int4(v) => *v,
+                other => panic!("int expected, got {other:?}"),
+            };
+            (s(&r[0]), n, s(&r[2]))
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("alice".to_string(), 10, "eng".to_string()),
+            ("bob".to_string(), 10, "eng".to_string()),
+            ("carol".to_string(), 20, "sales".to_string()),
+        ],
+        "unqualified `dept` is the coalesced column"
+    );
+    // NATURAL/USING in a MULTI-WAY join is a clean follow-up reject.
+    e.execute_text(5, "CREATE TABLE loc (dept INT, city TEXT)").unwrap();
+    let multi = e
+        .execute_resident_expr_select_sql(
+            "SELECT * FROM emp JOIN dept USING (dept) JOIN loc ON loc.dept = emp.dept",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(multi.contains("multi-way"), "multi-way USING rejected, got: {multi}");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.

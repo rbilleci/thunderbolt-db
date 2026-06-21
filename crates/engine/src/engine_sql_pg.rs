@@ -385,8 +385,10 @@ fn join_side_name_alias(node: &Node) -> Result<(String, String), ExecuteError> {
 /// Flatten ONE INNER-join node of a LEFT-DEEP chain into `relations` + `steps` (M5 J6). The left arg may
 /// be a nested `JoinExpr` (recurse first, so relations end up in left-deep order) or a base table; the
 /// right arg MUST be a base table (a right-nested `a JOIN (b JOIN c)` / bushy tree is a follow-up). Per
-/// node: INNER only, no NATURAL/USING, a single `=` ON between two columns. `steps[k]` (the k-th node
-/// folded in) carries that node's ON; the executor figures out which operand is the newly joined relation.
+/// node: INNER only; the condition is ON (`a.k = b.k [AND ..]`), USING(cols) (desugared to qualified
+/// conjuncts + recorded coalesce columns), or NATURAL (deferred to the executor). USING/NATURAL require a
+/// base-table left arg (their multi-way coalescing is a follow-up). `steps[k]` (the k-th node folded in)
+/// carries that node's condition; the executor figures out which operand is the newly joined relation.
 fn flatten_join_chain(
     join: &pg_query::protobuf::JoinExpr,
     relations: &mut Vec<JoinRelationRef>,
@@ -397,11 +399,6 @@ fn flatten_join_chain(
             "only INNER JOIN is on the join path yet (LEFT/RIGHT/FULL are a follow-up)".to_string(),
         ));
     }
-    if join.is_natural || !join.using_clause.is_empty() {
-        return Err(sql_pg_error(
-            "NATURAL / USING joins are a follow-up; use an explicit ON a.k = b.k".to_string(),
-        ));
-    }
     let larg = join
         .larg
         .as_deref()
@@ -410,24 +407,97 @@ fn flatten_join_chain(
         .rarg
         .as_deref()
         .ok_or_else(|| sql_pg_error("JOIN missing its right relation".to_string()))?;
-    match node_enum(larg)? {
-        NodeEnum::JoinExpr(inner) => flatten_join_chain(inner, relations, steps)?,
+    // Process the left arg (recurse if nested) and capture its alias if it is a base table -- USING needs
+    // it to build qualified conjuncts, and USING/NATURAL are 2-relation only (left must be a base table).
+    let left_alias: Option<String> = match node_enum(larg)? {
+        NodeEnum::JoinExpr(inner) => {
+            flatten_join_chain(inner, relations, steps)?;
+            None
+        }
         _ => {
             let (table, alias) = join_side_name_alias(larg)?;
-            relations.push(JoinRelationRef { table, alias });
+            relations.push(JoinRelationRef {
+                table,
+                alias: alias.clone(),
+            });
+            Some(alias)
         }
-    }
-    let (table, alias) = join_side_name_alias(rarg)?;
-    relations.push(JoinRelationRef { table, alias });
-    // ON: a single `=` equi-join, or a top-level AND of `=` equi-joins (a composite key).
-    let quals = join
-        .quals
-        .as_deref()
-        .ok_or_else(|| sql_pg_error("INNER JOIN requires an ON condition".to_string()))?;
-    steps.push(JoinStep {
-        conjuncts: parse_on_conjuncts(quals)?,
+    };
+    let (right_table, right_alias) = join_side_name_alias(rarg)?;
+    relations.push(JoinRelationRef {
+        table: right_table,
+        alias: right_alias.clone(),
     });
+    // USING/NATURAL require a base-table left arg (their multi-way coalescing is a follow-up).
+    let multi_way_using = || {
+        sql_pg_error(
+            "NATURAL / USING on a multi-way join is a follow-up; the left side of a NATURAL/USING join \
+             must be a single base table"
+                .to_string(),
+        )
+    };
+    let step = if join.is_natural {
+        // NATURAL: the executor joins on (and coalesces) the relations' common column names.
+        if left_alias.is_none() {
+            return Err(multi_way_using());
+        }
+        JoinStep {
+            conjuncts: Vec::new(),
+            natural: true,
+            coalesce: Vec::new(),
+        }
+    } else if !join.using_clause.is_empty() {
+        // USING(cols): desugar to qualified `left.c = right.c` conjuncts + record the coalesce columns.
+        let left_alias = left_alias.ok_or_else(multi_way_using)?;
+        let cols = parse_using_columns(&join.using_clause)?;
+        let conjuncts = cols
+            .iter()
+            .map(|c| {
+                (
+                    JoinColRef {
+                        qualifier: Some(left_alias.clone()),
+                        column: c.clone(),
+                    },
+                    JoinColRef {
+                        qualifier: Some(right_alias.clone()),
+                        column: c.clone(),
+                    },
+                )
+            })
+            .collect();
+        JoinStep {
+            conjuncts,
+            natural: false,
+            coalesce: cols,
+        }
+    } else {
+        // ON: a single `=` equi-join, or a top-level AND of `=` equi-joins (a composite key).
+        let quals = join
+            .quals
+            .as_deref()
+            .ok_or_else(|| sql_pg_error("INNER JOIN requires an ON condition".to_string()))?;
+        JoinStep {
+            conjuncts: parse_on_conjuncts(quals)?,
+            natural: false,
+            coalesce: Vec::new(),
+        }
+    };
+    steps.push(step);
     Ok(())
+}
+
+/// Parse a USING column list (`USING (a, b)`) into the column names. Each entry is a String node.
+fn parse_using_columns(using_clause: &[Node]) -> Result<Vec<String>, ExecuteError> {
+    if using_clause.is_empty() {
+        return Err(sql_pg_error("USING requires at least one column".to_string()));
+    }
+    using_clause
+        .iter()
+        .map(|node| match node_enum(node)? {
+            NodeEnum::String(string) => Ok(string.sval.clone()),
+            _ => Err(sql_pg_error("a USING column must be a plain column name".to_string())),
+        })
+        .collect()
 }
 
 /// Parse a single `=` equi-join ON conjunct (`a.k = b.k`) into its two column operands.
@@ -488,6 +558,16 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
     let mut relations: Vec<JoinRelationRef> = Vec::new();
     let mut steps: Vec<JoinStep> = Vec::new();
     flatten_join_chain(join, &mut relations, &mut steps)?;
+    // USING/NATURAL coalescing is supported for a single 2-relation join only (its interaction with the
+    // multi-way `*` expansion is a follow-up). A USING/NATURAL node only arises with a base-table left
+    // arg, so any chain longer than 2 relations that carries one is multi-way -> reject.
+    if relations.len() > 2 && steps.iter().any(|s| s.natural || !s.coalesce.is_empty()) {
+        return Err(sql_pg_error(
+            "NATURAL / USING in a multi-way join is a follow-up; it is supported for a 2-relation join \
+             only (use explicit ON in a multi-way chain)"
+                .to_string(),
+        ));
+    }
     let projection = parse_join_projection(stmt)?;
     Ok(JoinPlan {
         relations,
@@ -663,6 +743,8 @@ fn plan_comma_join_where(
         }
         steps.push(JoinStep {
             conjuncts: relation_edges,
+            natural: false,
+            coalesce: Vec::new(),
         });
     }
     let predicates = filters
