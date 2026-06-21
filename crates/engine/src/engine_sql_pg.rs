@@ -384,15 +384,23 @@ fn flatten_join_chain(
     }
     let (table, alias) = join_side_name_alias(rarg)?;
     relations.push(JoinRelationRef { table, alias });
-    // ON: a single `=` between two column references.
+    // ON: a single `=` equi-join, or a top-level AND of `=` equi-joins (a composite key).
     let quals = join
         .quals
         .as_deref()
         .ok_or_else(|| sql_pg_error("INNER JOIN requires an ON condition".to_string()))?;
-    let NodeEnum::AExpr(aexpr) = node_enum(quals)? else {
+    steps.push(JoinStep {
+        conjuncts: parse_on_conjuncts(quals)?,
+    });
+    Ok(())
+}
+
+/// Parse a single `=` equi-join ON conjunct (`a.k = b.k`) into its two column operands.
+fn parse_equi_conjunct(node: &Node) -> Result<(JoinColRef, JoinColRef), ExecuteError> {
+    let NodeEnum::AExpr(aexpr) = node_enum(node)? else {
         return Err(sql_pg_error(
-            "the join ON condition must be a single `a.k = b.k` equi-join (AND / non-equi / \
-             multi-conjunct are a follow-up)"
+            "a join ON condition must be `a.k = b.k` equalities (AND-combined for a composite key); \
+             non-equi / function / subquery ON terms are a follow-up"
                 .to_string(),
         ));
     };
@@ -409,11 +417,24 @@ fn flatten_join_chain(
         .rexpr
         .as_deref()
         .ok_or_else(|| sql_pg_error("malformed join ON condition".to_string()))?;
-    steps.push(JoinStep {
-        on_a: parse_join_col_ref(lexpr)?,
-        on_b: parse_join_col_ref(rexpr)?,
-    });
-    Ok(())
+    Ok((parse_join_col_ref(lexpr)?, parse_join_col_ref(rexpr)?))
+}
+
+/// Parse a JOIN ON into its equi-join conjuncts: a single `=` (one conjunct), or a top-level `AND` chain
+/// of `=` (a composite key, ≥2 conjuncts). `OR`/`NOT` in an ON is a follow-up (a clean error). The
+/// executor packs a 2-conjunct key into one i64 for the hash join; >2 conjuncts (wider than 64 bits) are
+/// validated/rejected there.
+fn parse_on_conjuncts(quals: &Node) -> Result<Vec<(JoinColRef, JoinColRef)>, ExecuteError> {
+    if let NodeEnum::BoolExpr(bool_expr) = node_enum(quals)? {
+        if bool_expr.boolop == BoolExprType::AndExpr as i32 {
+            return bool_expr.args.iter().map(parse_equi_conjunct).collect();
+        }
+        return Err(sql_pg_error(
+            "a join ON with OR / NOT is a follow-up; use AND-combined `a.k = b.k` equalities"
+                .to_string(),
+        ));
+    }
+    Ok(vec![parse_equi_conjunct(quals)?])
 }
 
 /// Parse `SELECT <cols> FROM a JOIN b ON .. [JOIN c ON ..]` (libpg_query) into a [`JoinPlan`] (M5). Scope:

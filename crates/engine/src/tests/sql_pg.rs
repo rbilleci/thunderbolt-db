@@ -1178,6 +1178,88 @@ fn gpu_inner_join_four_way_back_reference_to_first_relation() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_composite_on_two_column_key() {
+    // M5 J6: a 2-conjunct (composite) ON `parent.pa = child.ca AND parent.pb = child.cb`. The executor
+    // packs each side's two <=32-bit keys into one i64 (pa<<32|pb) for the existing hash join. The oracle
+    // is constructed so a SINGLE-column join would mis-match: child(1,20) shares pa=1 with parent(1,10)
+    // but must map to parent(1,20) -- proving BOTH members are compared.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE parent (pa INT, pb INT, pname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE child (ca INT, cb INT, label TEXT)").unwrap();
+    // Negative members (-1,-2)/(-1,5) also exercise the pack on sign-extended values: -1's low 32 bits
+    // are all-ones, so an incorrect mask/shift would corrupt the other member and cross-match.
+    e.execute_text(3, "INSERT INTO parent (pa, pb, pname) VALUES (1,10,'p1'),(1,20,'p2'),(2,10,'p3'),(-1,-2,'pneg'),(-1,5,'pneg2')").unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO child (ca, cb, label) VALUES (1,10,'x'),(1,20,'y'),(2,10,'z'),(1,99,'orphan'),(9,10,'orphan2'),(-1,-2,'neg'),(-1,5,'neg2')",
+    )
+    .unwrap();
+    let ps = e.populate_relational_residency_snapshot("parent").unwrap();
+    let cs = e.populate_relational_residency_snapshot("child").unwrap();
+    if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
+        return;
+    }
+    let pairs = |r: &RelationalSelectResult| -> Vec<(String, String)> {
+        let s = |c: &SqlValue| match c {
+            SqlValue::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let mut v: Vec<(String, String)> =
+            r.rows.iter().map(|row| (s(&row[0]), s(&row[1]))).collect();
+        v.sort();
+        v
+    };
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT child.label, parent.pname FROM child \
+             JOIN parent ON parent.pa = child.ca AND parent.pb = child.cb",
+        )
+        .expect("composite 2-column ON join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        pairs(&res),
+        vec![
+            ("neg".to_string(), "pneg".to_string()),
+            ("neg2".to_string(), "pneg2".to_string()),
+            ("x".to_string(), "p1".to_string()),
+            ("y".to_string(), "p2".to_string()),
+            ("z".to_string(), "p3".to_string()),
+        ],
+        "(ca,cb) matches (pa,pb) on BOTH columns; the pa=1/-1 rows do not cross-match; orphans dropped"
+    );
+    // >2 ON conjuncts (a key wider than 64 bits) is a clean follow-up error.
+    let three = e
+        .execute_resident_expr_select_sql(
+            "SELECT child.label FROM child JOIN parent \
+             ON parent.pa = child.ca AND parent.pb = child.cb AND parent.pa = child.cb",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(three.contains("more than 2"), "3-conjunct ON rejected, got: {three}");
+}
+
+#[test]
+fn gpu_inner_join_composite_on_int8_member_rejected() {
+    // A 2-column composite key packs two members into ONE i64, so each member must be <=32 bits. An
+    // int8/timestamp composite member would overflow -> a clean reject (the `narrow_key` gate). This runs
+    // BEFORE residency (the key-type precompute), so it needs no GPU. A SINGLE int8 key is still allowed.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE pp (pa BIGINT, pb INT)").unwrap();
+    e.execute_text(2, "CREATE TABLE cc (ca BIGINT, cb INT)").unwrap();
+    let err = e
+        .execute_resident_expr_select_sql(
+            "SELECT pp.pb FROM pp JOIN cc ON pp.pa = cc.ca AND pp.pb = cc.cb",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("composite") || err.contains("int2/int4/date"),
+        "int8 composite member rejected, got: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.

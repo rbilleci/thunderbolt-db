@@ -93,13 +93,14 @@ pub(crate) struct JoinRelationRef {
     pub alias: String,
 }
 
-/// One INNER-join step in a left-deep chain: the two `=` ON operands. One operand resolves to the newly
-/// joined relation (`relations[k+1]`), the other to some already-accumulated relation (`relations[0..=k]`);
-/// the executor figures out which is which.
+/// One INNER-join step in a left-deep chain: the ON's equality conjuncts (`a.k1=b.k1 [AND a.k2=b.k2]`).
+/// In each `(on_a, on_b)` pair one operand resolves to the newly joined relation (`relations[k+1]`), the
+/// other to some already-accumulated relation (`relations[0..=k]`); the executor figures out which is
+/// which. A single conjunct is the plain equi-join; 2 conjuncts are a composite key (packed into one i64
+/// for the hash join). >2 conjuncts (a key wider than 64 bits) are a follow-up.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinStep {
-    pub on_a: JoinColRef,
-    pub on_b: JoinColRef,
+    pub conjuncts: Vec<(JoinColRef, JoinColRef)>,
 }
 
 /// A LEFT-DEEP chain of INNER equi-joins parsed from the libpg_query FROM clause (M5). `relations` are in
@@ -1340,47 +1341,66 @@ impl Engine {
                 }
             }
         };
-        // Integer join keys only this slice: int2/int4/date (i32 section) OR int8/timestamp (i64
-        // section) -- both project to i64, so a mixed int4=int8 equi-join compares correctly (int4
-        // sign-extends to the same i64). numeric/uuid/text keys are a follow-up (J4b/c). i64::MIN as an
-        // int8 key value aliases the hash sentinel -> the launcher rejects it (dedicated-slot follow-up).
+        // A single-conjunct key may be any int (int2/int4/date in the i32 section, int8/timestamp in the
+        // i64 section -- both project to i64, so a mixed int4=int8 equi-join compares correctly). A
+        // COMPOSITE (2-conjunct) key packs two members into one i64 (member0 in the high 32 bits, member1
+        // in the low), so each member must be <=32 bits (int2/int4/date); an int8/timestamp composite
+        // member (or >2 conjuncts) overflows 64 bits -> a follow-up. numeric/uuid/text keys are J4b/c.
         let int_key = |t: SqlType| {
             matches!(
                 t,
                 SqlType::Int4 | SqlType::Int2 | SqlType::Date | SqlType::Int8 | SqlType::Timestamp
             )
         };
-        // Pre-resolve each step's ON + validate the key types, and resolve the SELECT projection, BEFORE
-        // touching residency -- so a malformed query (unknown column, ambiguous ref, non-int key) fails
-        // fast with a query error, not a "not resident" one. `step_keys[k]` = (accumulated relation, its
-        // key column, the new relation's key column); the newly joined relation is `k+1`.
-        let mut step_keys: Vec<(usize, usize, usize)> = Vec::with_capacity(plan.steps.len());
+        let narrow_key = |t: SqlType| matches!(t, SqlType::Int4 | SqlType::Int2 | SqlType::Date);
+        // Pre-resolve each step's ON conjuncts + validate the key types, and resolve the SELECT
+        // projection, BEFORE touching residency -- so a malformed query (unknown column, ambiguous ref,
+        // non-int key) fails fast with a query error, not a "not resident" one. `step_keys[k]` = the
+        // per-conjunct (accumulated relation, its key column, the new relation's key column); the newly
+        // joined relation is `k+1`. Conjuncts may reference DIFFERENT accumulated relations.
+        let mut step_keys: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(plan.steps.len());
         for (k, step) in plan.steps.iter().enumerate() {
             let new_rel = k + 1;
-            // The ON must equate the newly joined relation (`new_rel`) to an already-joined one (<new_rel).
-            let ra = resolve(&step.on_a, new_rel)?;
-            let rb = resolve(&step.on_b, new_rel)?;
-            let ((acc_rel, acc_col), new_col) = if rb.0 == new_rel && ra.0 < new_rel {
-                ((ra.0, ra.1), rb.1)
-            } else if ra.0 == new_rel && rb.0 < new_rel {
-                ((rb.0, rb.1), ra.1)
-            } else {
+            if step.conjuncts.len() > 2 {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "each JOIN's ON must equate the newly joined relation to an already-joined one \
-                     (a.k = b.k)"
-                        .to_string(),
-                )));
-            };
-            if !int_key(tables[acc_rel].columns[acc_col].ty)
-                || !int_key(tables[new_rel].columns[new_col].ty)
-            {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "a join key must be an integer column (int2/int4/int8/date/timestamp) on both \
-                     sides on the join path yet (numeric/uuid/text keys are a follow-up)"
+                    "a join ON with more than 2 equality conjuncts (a composite key wider than 64 \
+                     bits) is a follow-up"
                         .to_string(),
                 )));
             }
-            step_keys.push((acc_rel, acc_col, new_col));
+            let composite = step.conjuncts.len() == 2;
+            let mut conj_keys: Vec<(usize, usize, usize)> = Vec::with_capacity(step.conjuncts.len());
+            for (on_a, on_b) in &step.conjuncts {
+                // Each conjunct must equate the newly joined relation (`new_rel`) to an already-joined
+                // one (<new_rel).
+                let ra = resolve(on_a, new_rel)?;
+                let rb = resolve(on_b, new_rel)?;
+                let ((acc_rel, acc_col), new_col) = if rb.0 == new_rel && ra.0 < new_rel {
+                    ((ra.0, ra.1), rb.1)
+                } else if ra.0 == new_rel && rb.0 < new_rel {
+                    ((rb.0, rb.1), ra.1)
+                } else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "each JOIN's ON conjunct must equate the newly joined relation to an \
+                         already-joined one (a.k = b.k)"
+                            .to_string(),
+                    )));
+                };
+                // A composite member must be <=32 bits so two pack into one i64; a single key may be int8.
+                let ok = |t: SqlType| if composite { narrow_key(t) } else { int_key(t) };
+                if !ok(tables[acc_rel].columns[acc_col].ty)
+                    || !ok(tables[new_rel].columns[new_col].ty)
+                {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "a join key must be an integer column on both sides (int2/int4/int8/date/\
+                         timestamp for a single key; int2/int4/date for each member of a 2-column \
+                         composite key); numeric/uuid/text/wide keys are a follow-up"
+                            .to_string(),
+                    )));
+                }
+                conj_keys.push((acc_rel, acc_col, new_col));
+            }
+            step_keys.push(conj_keys);
         }
         // Resolve the SELECT list to a flat (relation index, column index) list, expanding `*` (every
         // relation's columns, left-to-right PG order) and `alias.*` (that relation's columns).
@@ -1495,15 +1515,37 @@ impl Engine {
                 }
             }
         };
+        // Pack a step's per-conjunct host i64 key columns into one i64 per row: a single conjunct is the
+        // key itself; a 2-conjunct composite puts member 0 in the HIGH 32 bits and member 1 in the LOW
+        // (each member is a <=32-bit int, so this is bijective -- distinct (k0,k1) -> distinct i64; a
+        // (i32::MIN, 0) pair packs to i64::MIN and is rejected by the hash launcher, as for a plain key).
+        let pack_keys = |members: &[Vec<i64>]| -> Vec<i64> {
+            if members.len() == 1 {
+                members[0].clone()
+            } else {
+                (0..members[0].len())
+                    .map(|i| (members[0][i] << 32) | (members[1][i] & 0xFFFF_FFFF))
+                    .collect()
+            }
+        };
         // Left-deep pipeline. `work_idx[j]` holds, for each surviving tuple, the ABSOLUTE row index that
         // tuple took from relation j; it starts as relation 0's survivors and grows one relation per step.
         let mut work_idx: Vec<Vec<u32>> = vec![survivors_all[0].clone()];
-        for (k, &(acc_rel, acc_col, new_col)) in step_keys.iter().enumerate() {
+        for (k, conjuncts) in step_keys.iter().enumerate() {
             let new_rel = k + 1;
-            // Accumulated-side keys: relation `acc_rel`'s key at the rows carried by each tuple. New-side
-            // keys: relation `new_rel`'s key at its survivors. Both projected on the GPU.
-            let acc_keys = key_i64(acc_rel, acc_col, &work_idx[acc_rel])?;
-            let new_keys = key_i64(new_rel, new_col, &survivors_all[new_rel])?;
+            // Project each conjunct's accumulated-side + new-side key on the GPU, then pack into one i64.
+            // Conjuncts may project from different accumulated relations; all share the tuple count, so the
+            // packed columns align row-for-row.
+            let acc_members: Vec<Vec<i64>> = conjuncts
+                .iter()
+                .map(|&(acc_rel, acc_col, _)| key_i64(acc_rel, acc_col, &work_idx[acc_rel]))
+                .collect::<Result<_, _>>()?;
+            let new_members: Vec<Vec<i64>> = conjuncts
+                .iter()
+                .map(|&(_, _, new_col)| key_i64(new_rel, new_col, &survivors_all[new_rel]))
+                .collect::<Result<_, _>>()?;
+            let acc_keys = pack_keys(&acc_members);
+            let new_keys = pack_keys(&new_members);
             let (acc_is_build, build_idxs, probe_idxs) =
                 hash_join(sides[new_rel].1.mem(), &acc_keys, &new_keys)?;
             // build/probe positions -> (accumulated tuple position, new-relation survivor position).
