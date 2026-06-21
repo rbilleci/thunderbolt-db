@@ -705,6 +705,83 @@ fn gpu_inner_join_with_where_pushed_per_side() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_int8_and_mixed_int_keys() {
+    // M5 J4a: int8/bigint join keys (i64 section) -- incl. a value beyond the int4 range -- and a MIXED
+    // int4=int8 join (both project to i64, so 5_i32 == 5_i64 matches).
+    let mut e = Engine::new_local();
+    // (a) both BIGINT keys, one beyond int4 range.
+    e.execute_text(1, "CREATE TABLE big (id BIGINT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE rref (big_id BIGINT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO big (id, name) VALUES (9000000000,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO rref (big_id, label) VALUES (9000000000,'x'),(2,'y'),(2,'z'),(99,'w')",
+    )
+    .unwrap();
+    // (b) mixed: INT key joined to a BIGINT key.
+    e.execute_text(5, "CREATE TABLE p4 (id INT, name TEXT)").unwrap();
+    e.execute_text(6, "CREATE TABLE c8 (pid BIGINT, label TEXT)")
+        .unwrap();
+    // Include a NEGATIVE key so the int4 sign-extension to i64 (-3 -> i64 -3) is checked against the
+    // int8 -3 in the mixed join.
+    e.execute_text(7, "INSERT INTO p4 (id, name) VALUES (5,'a'),(6,'b'),(-3,'n')")
+        .unwrap();
+    e.execute_text(8, "INSERT INTO c8 (pid, label) VALUES (5,'x'),(6,'y'),(6,'z'),(-3,'m')")
+        .unwrap();
+    for t in ["big", "rref", "p4", "c8"] {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
+            return;
+        }
+    }
+    let pairs = |res: &RelationalSelectResult| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (SqlValue::Text(a), SqlValue::Text(b)) => (a.clone(), b.clone()),
+                other => panic!("expected text pair, got {other:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let expected = vec![
+        ("a".to_string(), "x".to_string()),
+        ("b".to_string(), "y".to_string()),
+        ("b".to_string(), "z".to_string()),
+    ];
+    let r1 = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM big JOIN rref ON big.id = rref.big_id",
+        )
+        .expect("int8 join");
+    assert_eq!(r1.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(pairs(&r1), expected, "int8 keys incl. a value beyond int4 range");
+    let r2 = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM p4 JOIN c8 ON p4.id = c8.pid")
+        .expect("mixed int4=int8 join");
+    let expected_mixed = vec![
+        ("a".to_string(), "x".to_string()),
+        ("b".to_string(), "y".to_string()),
+        ("b".to_string(), "z".to_string()),
+        ("n".to_string(), "m".to_string()),
+    ];
+    assert_eq!(
+        pairs(&r2),
+        expected_mixed,
+        "int4 key == int8 key (both i64), incl. a negative key (-3) via sign extension"
+    );
+}
+
+#[test]
 fn gpu_inner_join_rejects_unsupported_shapes() {
     // Host-side clean rejections (no GPU): the parser gates the join slice's scope.
     let e = Engine::new_local();

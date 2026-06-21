@@ -1147,15 +1147,22 @@ impl Engine {
                 )))
             }
         };
-        // Slice scope: int4-section keys (int2/int4/date) on BOTH sides. int8/numeric/uuid/text keys
-        // are a follow-up (J4).
-        let int4_key = |t: SqlType| matches!(t, SqlType::Int4 | SqlType::Int2 | SqlType::Date);
-        if !int4_key(left_table.columns[left_key_idx].ty)
-            || !int4_key(right_table.columns[right_key_idx].ty)
+        // Integer join keys: int2/int4/date (i32 section) OR int8/timestamp (i64 section). Both project
+        // to i64, so a mixed int4=int8 equi-join compares correctly (int4 sign-extends to the same i64).
+        // numeric/uuid/text keys are a follow-up (need the b128 / text-verify claim). i64::MIN as an
+        // int8 key value aliases the hash sentinel -> the launcher rejects it (dedicated-slot follow-up).
+        let int_key = |t: SqlType| {
+            matches!(
+                t,
+                SqlType::Int4 | SqlType::Int2 | SqlType::Date | SqlType::Int8 | SqlType::Timestamp
+            )
+        };
+        if !int_key(left_table.columns[left_key_idx].ty)
+            || !int_key(right_table.columns[right_key_idx].ty)
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "a join key must be an int2/int4/date column on both sides on the join path yet \
-                 (int8/numeric/uuid/text keys are a follow-up)"
+                "a join key must be an integer column (int2/int4/int8/date/timestamp) on both sides \
+                 on the join path yet (numeric/uuid/text keys are a follow-up)"
                     .to_string(),
             )));
         }
@@ -1224,8 +1231,8 @@ impl Engine {
             survivors(left_predicate, left_table, &left_entry, &device_memory, left_n)?;
         let right_survivors =
             survivors(right_predicate, right_table, &right_entry, &right_dm, right_n)?;
-        // Project each relation's int key column to host i64 at the SURVIVING rows (int4 section,
-        // sign-extended).
+        // Project each relation's integer key column to host i64 at the SURVIVING rows: int8/timestamp
+        // from the i64 section; int2/int4/date from the i32 section, sign-extended.
         let key_i64 = |entry: &RelationalResidencyEntry,
                        table: &RelationalTable,
                        dm: &gpu_db_execution::CudaResidentDeviceMemory,
@@ -1235,14 +1242,22 @@ impl Engine {
             if surv.is_empty() {
                 return Ok(Vec::new());
             }
-            let off = resident_device_int4_column_offset(&entry.descriptor, table, col_idx)?;
             let idxs: Vec<u64> = surv.iter().map(|&i| u64::from(i)).collect();
-            Ok(dm
-                .project_i32_rows_from_payload(off, &idxs)
-                .map_err(map_err)?
-                .into_iter()
-                .map(i64::from)
-                .collect())
+            match table.columns[col_idx].ty {
+                SqlType::Int8 | SqlType::Timestamp => {
+                    let off = resident_device_int8_column_offset(&entry.descriptor, table, col_idx)?;
+                    dm.project_i64_rows_from_payload(off, &idxs).map_err(map_err)
+                }
+                _ => {
+                    let off = resident_device_int4_column_offset(&entry.descriptor, table, col_idx)?;
+                    Ok(dm
+                        .project_i32_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect())
+                }
+            }
         };
         let left_keys = key_i64(&left_entry, left_table, &device_memory, left_key_idx, &left_survivors)?;
         let right_keys =
