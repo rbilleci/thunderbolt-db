@@ -76,6 +76,15 @@ pub(crate) struct JoinColRef {
     pub column: String,
 }
 
+/// A SELECT-list item in a JOIN projection: a single column, or a `*` star expanded in the executor to
+/// every column of the named relation (`Star(Some(alias))` = `alias.*`) or of BOTH relations, left then
+/// right (`Star(None)` = bare `*`).
+#[derive(Debug, Clone)]
+pub(crate) enum JoinProjItem {
+    Column(JoinColRef),
+    Star(Option<String>),
+}
+
 /// A 2-relation INNER equi-join parsed from the libpg_query FROM clause (M5). The probe/build choice is
 /// made in the executor (build on the smaller relation). `on_a`/`on_b` are the two ON operands (one
 /// resolves to the left relation, one to the right); `projection` is the SELECT column list (each a
@@ -89,7 +98,7 @@ pub(crate) struct JoinPlan {
     pub right_alias: String,
     pub on_a: JoinColRef,
     pub on_b: JoinColRef,
-    pub projection: Vec<JoinColRef>,
+    pub projection: Vec<JoinProjItem>,
 }
 
 /// Narrow a grouped MIN/MAX or GROUP BY key, which the GPU kernel computes as an i64 (or, for
@@ -1166,11 +1175,29 @@ impl Engine {
                     .to_string(),
             )));
         }
-        let proj: Vec<(Rel, usize)> = plan
-            .projection
-            .iter()
-            .map(&resolve)
-            .collect::<Result<_, _>>()?;
+        // Resolve the SELECT list to a flat (relation, column index) list, expanding `*` / `alias.*` to
+        // every column of the relation(s) (bare `*` = all LEFT columns then all RIGHT, PG order).
+        let mut proj: Vec<(Rel, usize)> = Vec::new();
+        for item in &plan.projection {
+            match item {
+                JoinProjItem::Column(c) => proj.push(resolve(c)?),
+                JoinProjItem::Star(None) => {
+                    proj.extend((0..left_table.columns.len()).map(|i| (Rel::Left, i)));
+                    proj.extend((0..right_table.columns.len()).map(|i| (Rel::Right, i)));
+                }
+                JoinProjItem::Star(Some(alias)) => {
+                    if *alias == plan.left_alias {
+                        proj.extend((0..left_table.columns.len()).map(|i| (Rel::Left, i)));
+                    } else if *alias == plan.right_alias {
+                        proj.extend((0..right_table.columns.len()).map(|i| (Rel::Right, i)));
+                    } else {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "missing FROM-clause entry for table \"{alias}\""
+                        ))));
+                    }
+                }
+            }
+        }
         // Pin both residency entries + their device memory (no CPU join fallback -- charter).
         let load = |name: &str| -> Result<(RelationalResidencyEntry, usize), ExecuteError> {
             let entry = self.relational_residency_entry(name).ok_or_else(|| {

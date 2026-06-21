@@ -782,6 +782,94 @@ fn gpu_inner_join_int8_and_mixed_int_keys() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_star_projection() {
+    // M5: `SELECT *` (all columns of both relations, left then right) and `SELECT alias.*` (one
+    // relation) on a join.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE parent (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE child (pid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO parent (id, name) VALUES (1,'a'),(2,'b')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO child (pid, label) VALUES (1,'x'),(2,'y')")
+        .unwrap();
+    if e.populate_relational_residency_snapshot("parent")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+        || e.populate_relational_residency_snapshot("child")
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+    {
+        return;
+    }
+    // SELECT * -> 4 columns (id, name, pid, label), in left-then-right order.
+    let star = e
+        .execute_resident_expr_select_sql("SELECT * FROM parent JOIN child ON parent.id = child.pid")
+        .expect("SELECT * join");
+    assert_eq!(
+        star.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["id", "name", "pid", "label"],
+        "bare * = all left columns then all right"
+    );
+    let mut srows: Vec<(i32, String, i32, String)> = star
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1], &r[2], &r[3]) {
+            (SqlValue::Int4(a), SqlValue::Text(b), SqlValue::Int4(c), SqlValue::Text(d)) => {
+                (*a, b.clone(), *c, d.clone())
+            }
+            other => panic!("unexpected row shape {other:?}"),
+        })
+        .collect();
+    srows.sort();
+    assert_eq!(
+        srows,
+        vec![
+            (1, "a".to_string(), 1, "x".to_string()),
+            (2, "b".to_string(), 2, "y".to_string()),
+        ]
+    );
+    // SELECT parent.* -> only the left relation's columns.
+    let qual = e
+        .execute_resident_expr_select_sql(
+            "SELECT parent.* FROM parent JOIN child ON parent.id = child.pid",
+        )
+        .expect("SELECT alias.* join");
+    assert_eq!(
+        qual.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["id", "name"],
+        "alias.* = only that relation's columns"
+    );
+    assert_eq!(qual.rows.len(), 2);
+    // SELECT child.* -> only the RIGHT relation's columns (exercises the right-side alias.* path).
+    let qual_r = e
+        .execute_resident_expr_select_sql(
+            "SELECT child.* FROM parent JOIN child ON parent.id = child.pid",
+        )
+        .expect("right alias.* join");
+    assert_eq!(
+        qual_r.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["pid", "label"],
+        "right alias.* = only the right relation's columns"
+    );
+    // Mixed: an explicit column followed by `*` -> the explicit col, then all-left, then all-right.
+    let mixed = e
+        .execute_resident_expr_select_sql(
+            "SELECT parent.name, * FROM parent JOIN child ON parent.id = child.pid",
+        )
+        .expect("mixed explicit + star join");
+    assert_eq!(
+        mixed.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["name", "id", "name", "pid", "label"],
+        "an explicit column then bare * (left then right)"
+    );
+}
+
+#[test]
 fn gpu_inner_join_rejects_unsupported_shapes() {
     // Host-side clean rejections (no GPU): the parser gates the join slice's scope.
     let e = Engine::new_local();
@@ -832,6 +920,18 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
     assert!(
         bad_qual.contains("missing from-clause") || bad_qual.contains("\"c\""),
         "unknown qualifier rejected, got: {bad_qual}"
+    );
+    // `SELECT *` / `alias.*` are supported, but a schema-qualified 3-part `s.t.*` is not.
+    let three_part_star = reject("SELECT s.t.* FROM a JOIN b ON a.k = b.k");
+    assert!(
+        three_part_star.contains("schema-qualified") || three_part_star.contains("not supported"),
+        "3-part star rejected, got: {three_part_star}"
+    );
+    // A `*` is invalid as an ON operand (the ON path must not accept a star).
+    let star_in_on = reject("SELECT x, y FROM a JOIN b ON a.k = b.*");
+    assert!(
+        star_in_on.contains("`*`") || star_in_on.contains("non-name") || star_in_on.contains("name"),
+        "star in ON rejected, got: {star_in_on}"
     );
 }
 

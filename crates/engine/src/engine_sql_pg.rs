@@ -17,7 +17,7 @@ use pg_query::protobuf::{
 };
 use pg_query::NodeEnum;
 
-use crate::engine_expr::{JoinColRef, JoinPlan, ResidentBinaryOp, ResidentExpr};
+use crate::engine_expr::{JoinColRef, JoinPlan, JoinProjItem, ResidentBinaryOp, ResidentExpr};
 use gpu_db_sql::{SelectFilter, SelectFilterOp, SelectOrder};
 
 impl Engine {
@@ -298,6 +298,30 @@ fn parse_join_col_ref(node: &Node) -> Result<JoinColRef, ExecuteError> {
     }
 }
 
+/// Parse a JOIN SELECT-list item: a plain column, or a `*` / `alias.*` star (expanded in the executor).
+/// A star is an `A_Star` field in the last position: `*` = `[A_Star]`; `alias.*` = `[String, A_Star]`.
+fn parse_join_proj_item(node: &Node) -> Result<JoinProjItem, ExecuteError> {
+    if let NodeEnum::ColumnRef(column_ref) = node_enum(node)? {
+        let last_is_star = matches!(
+            column_ref.fields.last().and_then(|field| field.node.as_ref()),
+            Some(NodeEnum::AStar(_))
+        );
+        if last_is_star {
+            return match column_ref.fields.as_slice() {
+                [_star] => Ok(JoinProjItem::Star(None)),
+                [qualifier, _star] => match qualifier.node.as_ref() {
+                    Some(NodeEnum::String(string)) => {
+                        Ok(JoinProjItem::Star(Some(string.sval.clone())))
+                    }
+                    _ => Err(sql_pg_error("a qualified `*` must be `alias.*`".to_string())),
+                },
+                _ => Err(sql_pg_error("a schema-qualified `*` is not supported".to_string())),
+            };
+        }
+    }
+    parse_join_col_ref(node).map(JoinProjItem::Column)
+}
+
 /// The (relation name, qualifier) of a join side -- a base-table RangeVar (nested joins / subqueries
 /// are a multi-way follow-up). The qualifier is the alias, else the relation name (mirrors the
 /// single-table builder).
@@ -405,7 +429,7 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
             .val
             .as_deref()
             .ok_or_else(|| sql_pg_error("join SELECT target has no expression".to_string()))?;
-        projection.push(parse_join_col_ref(val)?);
+        projection.push(parse_join_proj_item(val)?);
     }
     Ok(JoinPlan {
         left_table,
