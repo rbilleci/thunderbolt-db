@@ -505,6 +505,30 @@ fn grouped_count_distinct_routes_through_text_entry() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn scalar_count_distinct_routes_through_text_entry() {
+    // Scalar COUNT(DISTINCT v) (no GROUP BY) via the wire/text dispatch: the hand-rolled parser rejects
+    // DISTINCT, so the Err arm falls through to the general path's scalar-aggregate branch.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (v) VALUES (10),(10),(20),(30),(30)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let s = e
+        .execute_relational_select_text("SELECT COUNT(DISTINCT v) FROM t")
+        .expect("scalar COUNT(DISTINCT v) via the text dispatch");
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        s.rows,
+        vec![vec![SqlValue::Int8(3)]],
+        "3 distinct values (10,20,30) across the table"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // GROUP BY a TEXT column, ORDER BY that text key: the grouped GPU sort builds a resident-like TEXT
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.

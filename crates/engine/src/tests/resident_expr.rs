@@ -3377,6 +3377,81 @@ fn gpu_grouped_count_distinct_text_shared_value_across_groups() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_scalar_count_distinct_int() {
+    // Scalar COUNT(DISTINCT v) with NO GROUP BY -> one group (g=0). KNOWN BY CONSTRUCTION: v in
+    // {10,10,20,20,20,30,30} -> 3 distinct values across the whole table.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (v) VALUES (10),(10),(20),(20),(20),(30),(30)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t")
+        .expect("scalar COUNT(DISTINCT int)");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(res.columns.len(), 1);
+    assert!(res.columns[0].name.eq_ignore_ascii_case("count"));
+    assert_eq!(
+        res.rows,
+        vec![vec![SqlValue::Int8(3)]],
+        "total distinct values across the table"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_scalar_count_distinct_text_numeric_and_filtered() {
+    // Scalar COUNT(DISTINCT) over a TEXT value, a NUMERIC value, and an int value WITH a WHERE filter
+    // (so the surviving indices are not the full scan), plus an empty-result case (PG -> 0, not NULL).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (k INT, v INT, s TEXT, n NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (k, v, s, n) VALUES \
+         (1, 5, 'a', 1.50),(1, 5, 'a', 1.50),(1, 7, 'b', 2.50),(2, 9, 'a', 1.50),(2, 9, 'c', 3.00)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // TEXT distinct over the whole table: {"a","a","b","a","c"} -> 3 distinct.
+    let text = e
+        .execute_resident_expr_select_sql("SELECT COUNT(DISTINCT s) FROM t")
+        .expect("scalar COUNT(DISTINCT text)");
+    assert_eq!(text.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(text.rows, vec![vec![SqlValue::Int8(3)]], "distinct text");
+    // NUMERIC distinct: {1.50,1.50,2.50,1.50,3.00} -> 3 distinct.
+    let num = e
+        .execute_resident_expr_select_sql("SELECT COUNT(DISTINCT n) FROM t")
+        .expect("scalar COUNT(DISTINCT numeric)");
+    assert_eq!(num.rows, vec![vec![SqlValue::Int8(3)]], "distinct numeric");
+    // WHERE k = 1 -> v in {5,5,7} -> 2 distinct (the filter narrows the surviving rows).
+    let filtered = e
+        .execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t WHERE k = 1")
+        .expect("scalar COUNT(DISTINCT int) with WHERE");
+    assert_eq!(
+        filtered.rows,
+        vec![vec![SqlValue::Int8(2)]],
+        "distinct over the filtered survivors"
+    );
+    // WHERE matches nothing -> COUNT(DISTINCT) is 0 (not NULL).
+    let empty = e
+        .execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t WHERE k = 99")
+        .expect("scalar COUNT(DISTINCT) over empty");
+    assert_eq!(
+        empty.rows,
+        vec![vec![SqlValue::Int8(0)]],
+        "distinct over an empty set is 0"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_multiple_aggregates_different_value_columns() {
     // SELECT g, SUM(v), MIN(w), MAX(w) FROM t GROUP BY g -- aggregates over TWO different value columns
     // (v int4, w int8) -> two grouping passes (single-level forced) merged by group index.

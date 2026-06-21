@@ -1077,8 +1077,8 @@ pub(crate) fn bind_relational_select(
             vec![relational_column_index(table, group_column)?]
         }
         SelectProjection::Min { .. } | SelectProjection::Max { .. } => Vec::new(),
-        // A bare/scalar COUNT(DISTINCT v) selects no group column; it is rejected at the
-        // projection/group_by binding match below (a clean follow-up, not on the GPU path yet).
+        // A bare/scalar COUNT(DISTINCT v) selects no group column; the single int8 "count" aggregate
+        // column is appended below, and it runs on the GPU as a one-group distinct count.
         SelectProjection::CountDistinct { .. } => Vec::new(),
         SelectProjection::GroupedMin { group_column, .. }
         | SelectProjection::GroupedMax { group_column, .. } => {
@@ -1111,18 +1111,19 @@ pub(crate) fn bind_relational_select(
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
             | SelectProjection::GroupedMax { .. }
+            | SelectProjection::CountDistinct { .. }
     ) {
         let aggregate_name = match &select.projection {
-            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => "count",
+            // Scalar COUNT(DISTINCT v) projects a single int8 "count" column (PG names it "count").
+            SelectProjection::CountAll
+            | SelectProjection::GroupedCount { .. }
+            | SelectProjection::CountDistinct { .. } => "count",
             SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => "sum",
             SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => "avg",
             SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => "min",
             SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => "max",
-            // CountDistinct is excluded by the `matches!` guard above (it is rejected at the binding
-            // match), so this naming block is never reached for it.
             SelectProjection::All
             | SelectProjection::Columns(_)
-            | SelectProjection::CountDistinct { .. }
             | SelectProjection::GroupedAggregates { .. } => unreachable!(),
         };
         let (aggregate_ty, aggregate_type_oid, aggregate_type_size) = match &select.projection {
@@ -1135,10 +1136,10 @@ pub(crate) fn bind_relational_select(
                 1700,
                 -1,
             ),
-            // COUNT is int8 (OID 20) regardless of the counted column (Phase-3 widening).
-            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => {
-                (SqlType::Int8, 20, 8)
-            }
+            // COUNT / COUNT(DISTINCT) are int8 (OID 20) regardless of the counted column.
+            SelectProjection::CountAll
+            | SelectProjection::GroupedCount { .. }
+            | SelectProjection::CountDistinct { .. } => (SqlType::Int8, 20, 8),
             // SUM: PG SUM(int8) -> numeric (the bigint sum can exceed int8); SUM(int4) keeps the
             // pre-existing (Int4 ty, oid 20, size 8) declaration (value widened to int8). NB:
             // aggregate_source_column intentionally returns None for SUM, so look the source column
@@ -1351,11 +1352,33 @@ pub(crate) fn bind_relational_select(
                 "GROUP BY requires grouped COUNT(*) projection".to_string(),
             )));
         }
-        // A bare/scalar COUNT(DISTINCT v) (no GROUP BY): the GROUPED form runs on the GPU via the
-        // GroupedAggregates projection; the scalar form is a clean follow-up, rejected here.
-        (SelectProjection::CountDistinct { .. }, _) => {
+        // Scalar COUNT(DISTINCT v) (no GROUP BY): runs on the GPU as a single-group distinct count
+        // (sort/mark/SUM over (g=0, v)). Validate the value column exists + is a supported type. A
+        // GROUP BY folds COUNT(DISTINCT) into GroupedAggregates at parse time, so the bare
+        // CountDistinct projection should never carry a group_by_index.
+        (SelectProjection::CountDistinct { column }, None) => {
+            let idx = relational_column_index(table, column)?;
+            if !matches!(
+                table.columns[idx].ty,
+                SqlType::Int2
+                    | SqlType::Int4
+                    | SqlType::Int8
+                    | SqlType::Date
+                    | SqlType::Timestamp
+                    | SqlType::Numeric { .. }
+                    | SqlType::Uuid
+                    | SqlType::Text
+            ) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "scalar COUNT(DISTINCT) supports int2/int4/int8/date/timestamp/numeric/uuid/\
+                     text value columns on the GPU path"
+                        .to_string(),
+                )));
+            }
+        }
+        (SelectProjection::CountDistinct { .. }, Some(_)) => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "scalar COUNT(DISTINCT v) without GROUP BY is not on the GPU path yet".to_string(),
+                "COUNT(DISTINCT) with GROUP BY uses the grouped aggregates projection".to_string(),
             )));
         }
         (SelectProjection::GroupedCount { column }, Some(idx)) => {

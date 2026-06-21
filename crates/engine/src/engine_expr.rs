@@ -1085,6 +1085,7 @@ impl Engine {
                 | SelectProjection::Min { .. }
                 | SelectProjection::Max { .. }
                 | SelectProjection::Avg { .. }
+                | SelectProjection::CountDistinct { .. }
         );
         // Grouped aggregates (GROUP BY) emit one row per group from a GPU hash aggregation; they are
         // handled separately below (not via the scalar-aggregate or the plain-projection paths).
@@ -1209,6 +1210,145 @@ impl Engine {
             }
         };
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
+
+        // COUNT(DISTINCT v) over a (group key, value) tuple: GPU-sort (g, value) ASC + mark the first
+        // row of each distinct tuple -> per-group SUM of the new-distinct flags = the per-group distinct
+        // count. Shared by the grouped branch (g = the real group key) AND the scalar form below (g = a
+        // constant 0 -> ONE group whose count = the total distinct). A FIXED-WIDTH value packs into an
+        // i64 multikey matrix (int = k2 (g, v); numeric/uuid = k3 (g, v_hi, v_lo)); a varlen TEXT value
+        // routes through the hetero sort + the text-aware mark (reads the value text on-device). The
+        // sort/mark/SUM run ENTIRELY on the GPU; the host marshals only the control-plane g / index
+        // arrays. `g_vals`/`idx_u64` are parallel, length n (the surviving positions). Empty -> caller
+        // guards n == 0.
+        let count_distinct_groups = |value_idx: usize,
+                                     g_vals: &[i64],
+                                     idx_u64: &[u64]|
+         -> Result<Vec<gpu_db_execution::GroupByI32Row>, ExecuteError> {
+            let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+            };
+            let n = idx_u64.len();
+            let value_ty = table.columns[value_idx].ty;
+            let (g_sorted, new_distinct) = match value_ty {
+                SqlType::Int2
+                | SqlType::Int4
+                | SqlType::Int8
+                | SqlType::Date
+                | SqlType::Timestamp
+                | SqlType::Numeric { .. }
+                | SqlType::Uuid => {
+                    let (matrix, k) =
+                        if matches!(value_ty, SqlType::Numeric { .. } | SqlType::Uuid) {
+                            let off = resident_device_numeric_column_offset(
+                                &snapshot, table, value_idx,
+                            )?;
+                            let v128 = device_memory
+                                .project_i128_rows_from_payload(off, idx_u64)
+                                .map_err(map_err)?;
+                            let mut m = Vec::with_capacity(n * 3);
+                            for i in 0..n {
+                                m.push(g_vals[i]);
+                                m.push((v128[i] >> 64) as i64);
+                                m.push((v128[i] as u64) as i64);
+                            }
+                            (m, 3usize)
+                        } else {
+                            let v_vals: Vec<i64> = match value_ty {
+                                SqlType::Int8 | SqlType::Timestamp => device_memory
+                                    .project_i64_rows_from_payload(
+                                        resident_device_int8_column_offset(
+                                            &snapshot, table, value_idx,
+                                        )?,
+                                        idx_u64,
+                                    )
+                                    .map_err(map_err)?,
+                                _ => device_memory
+                                    .project_i32_rows_from_payload(
+                                        resident_device_int4_column_offset(
+                                            &snapshot, table, value_idx,
+                                        )?,
+                                        idx_u64,
+                                    )
+                                    .map_err(map_err)?
+                                    .into_iter()
+                                    .map(i64::from)
+                                    .collect(),
+                            };
+                            let mut m = Vec::with_capacity(n * 2);
+                            for i in 0..n {
+                                m.push(g_vals[i]);
+                                m.push(v_vals[i]);
+                            }
+                            (m, 2usize)
+                        };
+                    let perm = device_memory
+                        .bitonic_sort_multikey(&matrix, n, k, 0)
+                        .map_err(map_err)?;
+                    device_memory
+                        .mark_new_distinct_device(&matrix, &perm, n as u64, k)
+                        .map_err(map_err)?
+                }
+                SqlType::Text => {
+                    let layout =
+                        resident_device_text_column_layout(&snapshot, table, value_idx)?;
+                    let key_plan: Vec<u32> = vec![0, 0x4000_0000_u32];
+                    let perm = device_memory
+                        .bitonic_sort_hetero(
+                            idx_u64,
+                            g_vals,
+                            1,
+                            &[(layout.offsets_byte_offset, layout.bytes_byte_offset)],
+                            &[],
+                            &key_plan,
+                            0,
+                        )
+                        .map_err(map_err)?;
+                    device_memory
+                        .mark_new_distinct_text_device(
+                            &perm,
+                            idx_u64,
+                            g_vals,
+                            layout.offsets_byte_offset,
+                            layout.bytes_byte_offset,
+                            n as u64,
+                        )
+                        .map_err(map_err)?
+                }
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "COUNT(DISTINCT) value column must be int/numeric/uuid/text on the \
+                         GPU path"
+                            .to_string(),
+                    )));
+                }
+            };
+            // SUM(new_distinct) grouped by g_sorted = the per-group distinct count. indices = 0..n (the
+            // sorted positions); the kernel reads g_sorted / new_distinct (both i64) via the
+            // key/value_base_override. The leases live across this synced call.
+            let scan_indices: Vec<u32> = (0..n as u32).collect();
+            let cd_groups = device_memory
+                .group_by_i32_count_sum_minmax_from_payload(
+                    0,
+                    0,
+                    &scan_indices,
+                    true,  // value_is_int8 (new_distinct is i64)
+                    true,  // key_is_int8 (g_sorted is i64)
+                    false, // value not numeric
+                    false, // value not uuid
+                    false, // key not i128
+                    false, // key not text
+                    0,
+                    0,
+                    false, // value not text
+                    0,
+                    0,
+                    g_sorted.device_ptr(),
+                    new_distinct.device_ptr(),
+                )
+                .map_err(map_err)?;
+            drop((g_sorted, new_distinct));
+            Ok(cd_groups)
+        };
 
         // Grouped aggregate (GROUP BY <int4 key>): GPU hash aggregation over the filtered rows -> one
         // row per distinct key. COUNT/SUM/AVG share the count+sum kernel; grouped MIN/MAX is a
@@ -1649,130 +1789,13 @@ impl Engine {
                         continue;
                     }
                     let value_idx = value_idx.expect("COUNT(DISTINCT) has a value column");
+                    // GPU sort -> mark -> per-group SUM over (group_key, value); see
+                    // `count_distinct_groups`. The group key is the real plain-int group column.
                     let groups = if n == 0 {
                         Vec::new()
                     } else {
                         let g_vals = g_vals.as_ref().expect("g_vals materialized for n > 0");
-                        // The (g, value) tuple matrix, row-major (k i64/row) for the multikey sort.
-                        // An int value is one i64 (k=2 -> (g, v)); a numeric/uuid value is its raw
-                        // 16-byte i128 split into two i64 limbs (k=3 -> (g, v_hi, v_lo)). Distinctness
-                        // only needs equal values to sort ADJACENT, so the raw-bit i64 order of the
-                        // limbs suffices and a byte-identical i128 -- the engine's own numeric/uuid
-                        // equality (the GROUP BY b128 key) -- collapses to one distinct value.
-                        let value_ty = table.columns[value_idx].ty;
-                        // GPU-sort (g, value) ASC + mark the first row of each distinct tuple ->
-                        // g_sorted (the per-row group key) and new_distinct (0/1). A FIXED-WIDTH value
-                        // packs into an i64 multikey matrix (int = k2 (g, v); numeric/uuid = k3
-                        // (g, v_hi, v_lo)); a TEXT value (varlen) routes through the hetero sort + the
-                        // text-aware mark, which read the value text from the resident payload.
-                        let (g_sorted, new_distinct) = match value_ty {
-                            SqlType::Int2
-                            | SqlType::Int4
-                            | SqlType::Int8
-                            | SqlType::Date
-                            | SqlType::Timestamp
-                            | SqlType::Numeric { .. }
-                            | SqlType::Uuid => {
-                                let (matrix, k) = if matches!(
-                                    value_ty,
-                                    SqlType::Numeric { .. } | SqlType::Uuid
-                                ) {
-                                    let off = resident_device_numeric_column_offset(
-                                        &snapshot, table, value_idx,
-                                    )?;
-                                    let v128 = device_memory
-                                        .project_i128_rows_from_payload(off, &idx_u64)
-                                        .map_err(map_err)?;
-                                    let mut m = Vec::with_capacity(n * 3);
-                                    for i in 0..n {
-                                        m.push(g_vals[i]);
-                                        m.push((v128[i] >> 64) as i64);
-                                        m.push((v128[i] as u64) as i64);
-                                    }
-                                    (m, 3usize)
-                                } else {
-                                    let v_vals = materialize_i64_col(value_idx, &idx_u64)?;
-                                    let mut m = Vec::with_capacity(n * 2);
-                                    for i in 0..n {
-                                        m.push(g_vals[i]);
-                                        m.push(v_vals[i]);
-                                    }
-                                    (m, 2usize)
-                                };
-                                let perm = device_memory
-                                    .bitonic_sort_multikey(&matrix, n, k, 0)
-                                    .map_err(map_err)?;
-                                device_memory
-                                    .mark_new_distinct_device(&matrix, &perm, n as u64, k)
-                                    .map_err(map_err)?
-                            }
-                            SqlType::Text => {
-                                // (g int key, text_v text key): the hetero sort groups equal
-                                // (g, text_v) tuples adjacent; the text-aware mark then compares the
-                                // value text byte-for-byte. key_plan[0]=int slot 0, [1]=text slot 0.
-                                let layout = resident_device_text_column_layout(
-                                    &snapshot, table, value_idx,
-                                )?;
-                                let key_plan: Vec<u32> = vec![0, 0x4000_0000_u32];
-                                let perm = device_memory
-                                    .bitonic_sort_hetero(
-                                        &idx_u64,
-                                        g_vals,
-                                        1,
-                                        &[(
-                                            layout.offsets_byte_offset,
-                                            layout.bytes_byte_offset,
-                                        )],
-                                        &[],
-                                        &key_plan,
-                                        0,
-                                    )
-                                    .map_err(map_err)?;
-                                device_memory
-                                    .mark_new_distinct_text_device(
-                                        &perm,
-                                        &idx_u64,
-                                        g_vals,
-                                        layout.offsets_byte_offset,
-                                        layout.bytes_byte_offset,
-                                        n as u64,
-                                    )
-                                    .map_err(map_err)?
-                            }
-                            _ => {
-                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                    "COUNT(DISTINCT) value column must be \
-                                     int/numeric/uuid/text on the GPU path"
-                                        .to_string(),
-                                )));
-                            }
-                        };
-                        // SUM(new_distinct) grouped by g_sorted = the per-group distinct count. indices
-                        // = 0..n (the sorted positions); the kernel reads g_sorted / new_distinct (both
-                        // i64) via key/value_base_override. The leases live across this synced call.
-                        let scan_indices: Vec<u32> = (0..n as u32).collect();
-                        let cd_groups = device_memory
-                            .group_by_i32_count_sum_minmax_from_payload(
-                                0,
-                                0,
-                                &scan_indices,
-                                true,  // value_is_int8 (new_distinct is i64)
-                                true,  // key_is_int8 (g_sorted is i64)
-                                false, // value not numeric
-                                false, // value not uuid
-                                false, // key not i128
-                                false, // key not text
-                                0,
-                                0,
-                                false, // value not text
-                                0,
-                                0,
-                                g_sorted.device_ptr(),
-                                new_distinct.device_ptr(),
-                            )
-                            .map_err(map_err)?;
-                        drop((g_sorted, new_distinct));
-                        cd_groups
+                        count_distinct_groups(value_idx, g_vals, &idx_u64)?
                     };
                     passes.push(Pass {
                         value_idx,
@@ -2310,7 +2333,24 @@ impl Engine {
                         }
                     }
                 }
-                _ => unreachable!("is_aggregate gates on CountAll | Sum | Min | Max | Avg"),
+                // Scalar COUNT(DISTINCT v) (no GROUP BY) = ONE group: sort/mark/SUM over (g=0, v) via
+                // `count_distinct_groups` with a constant group key, so the single group's count is the
+                // total distinct. PG: COUNT(DISTINCT) over zero rows is 0 (NOT NULL), so an empty
+                // filtered set returns 0 (the lone exception to the SUM/AVG empty-set NULL hard-error).
+                SelectProjection::CountDistinct { column } => {
+                    let value_idx = relational_column_index(table, column)?;
+                    if indices_u64.is_empty() {
+                        SqlValue::Int8(0)
+                    } else {
+                        let g_vals = vec![0i64; indices_u64.len()];
+                        let groups = count_distinct_groups(value_idx, &g_vals, &indices_u64)?;
+                        // The constant key yields exactly one group; its SUM = the total distinct.
+                        SqlValue::Int8(groups.first().map_or(0, |g| g.sum))
+                    }
+                }
+                _ => unreachable!(
+                    "is_aggregate gates on CountAll | Sum | Min | Max | Avg | CountDistinct"
+                ),
             };
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
