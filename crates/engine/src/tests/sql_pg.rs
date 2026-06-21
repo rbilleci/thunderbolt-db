@@ -649,6 +649,62 @@ fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_with_where_pushed_per_side() {
+    // M5 J3: a WHERE on a join, with per-relation conjuncts pushed to each side's GPU pre-filter.
+    //   parent: (1,a),(2,b),(3,c)   child: (1,10,x),(1,20,y),(2,30,z),(3,40,w)
+    //   ON parent.id = child.parent_id WHERE parent.id >= 2 AND child.v > 15
+    //   -> parent survivors abs{1,2}, child survivors abs{1,2,3} (BOTH sides drop an EARLY row, so the
+    //      matched survivor POSITION != the absolute row on both sides) -> (b,z),(c,w).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE parent (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE child (parent_id INT, v INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO parent (id, name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO child (parent_id, v, label) VALUES (1,10,'x'),(1,20,'y'),(2,30,'z'),(3,40,'w')",
+    )
+    .unwrap();
+    let ps = e.populate_relational_residency_snapshot("parent").unwrap();
+    let cs = e.populate_relational_residency_snapshot("child").unwrap();
+    if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM parent JOIN child ON parent.id = child.parent_id \
+             WHERE parent.id >= 2 AND child.v > 15",
+        )
+        .expect("inner join with per-side WHERE");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let mut pairs: Vec<(String, String)> = res
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (SqlValue::Text(a), SqlValue::Text(b)) => (a.clone(), b.clone()),
+            other => panic!("expected text pair, got {other:?}"),
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![("b".to_string(), "z".to_string()), ("c".to_string(), "w".to_string())],
+        "per-side WHERE pre-filters both relations (early-row drop on both -> survivor pos != abs row)"
+    );
+    // A WHERE that filters everything out -> no rows.
+    let empty = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM parent JOIN child ON parent.id = child.parent_id \
+             WHERE parent.id > 100",
+        )
+        .expect("inner join with an all-filtering WHERE");
+    assert!(empty.rows.is_empty(), "a WHERE that drops all left rows -> no join output");
+}
+
+#[test]
 fn gpu_inner_join_rejects_unsupported_shapes() {
     // Host-side clean rejections (no GPU): the parser gates the join slice's scope.
     let e = Engine::new_local();
@@ -675,10 +731,12 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
         comma.contains("one from relation") || comma.contains("join"),
         "comma join rejected, got: {comma}"
     );
-    let where_join = reject("SELECT x, y FROM a JOIN b ON a.k = b.k WHERE a.x > 5");
+    // A per-relation WHERE conjunct is supported (J3); a CROSS-relation WHERE predicate (beyond the ON)
+    // is a follow-up -> clean reject.
+    let cross_where = reject("SELECT x, y FROM a JOIN b ON a.k = b.k WHERE a.x > b.y");
     assert!(
-        where_join.contains("where"),
-        "WHERE on a join rejected (a follow-up), got: {where_join}"
+        cross_where.contains("cross-relation") || cross_where.contains("one relation"),
+        "cross-relation WHERE rejected, got: {cross_where}"
     );
     // An UNQUALIFIED column present in BOTH relations is ambiguous (both a.k and b.k exist).
     let ambig = reject("SELECT k FROM a JOIN b ON a.k = b.k");

@@ -38,7 +38,37 @@ impl Engine {
         // single-table path below is byte-identical for a non-join query.
         if from_clause_is_join(&stmt) {
             let plan = build_join_plan(&stmt)?;
-            return self.execute_resident_expr_inner_join(&plan);
+            // Bind BOTH relations at ONE catalog generation (so the WHERE mapping + the join read the
+            // same generation), then map the per-relation WHERE conjuncts (each conjunct must reference
+            // exactly one relation; a cross-relation conjunct is a follow-up).
+            let s = self.committed_seq();
+            let catalog = self.read_state.catalog_as_of(s);
+            let bind = |name: &str| -> Result<RelationalTable, ExecuteError> {
+                catalog
+                    .relational_catalog
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| sql_pg_error(format!("relation \"{name}\" does not exist")))
+            };
+            let left_table = bind(&plan.left_table)?;
+            let right_table = bind(&plan.right_table)?;
+            let (left_pred, right_pred) = match stmt.where_clause.as_deref() {
+                Some(where_node) => split_join_where(
+                    where_node,
+                    &left_table,
+                    &plan.left_alias,
+                    &right_table,
+                    &plan.right_alias,
+                )?,
+                None => (None, None),
+            };
+            return self.execute_resident_expr_inner_join(
+                &plan,
+                &left_table,
+                &right_table,
+                left_pred.as_ref(),
+                right_pred.as_ref(),
+            );
         }
         let (select, qualifier) = build_select_from_select_stmt(&stmt)?;
         // Bind once; map the predicate (if any) against that SAME bound table; execute against that
@@ -293,7 +323,8 @@ fn join_side_name_alias(node: &Node) -> Result<(String, String), ExecuteError> {
 /// executor resolves the ON operands + projection to relations/columns and validates the key types.
 fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
     let unsupported = [
-        (stmt.where_clause.is_some(), "WHERE"),
+        // WHERE is supported (mapped per-relation in the entry); GROUP BY / aggregates / ORDER BY /
+        // LIMIT / DISTINCT over a join are follow-ups.
         (!stmt.group_clause.is_empty(), "GROUP BY"),
         (stmt.having_clause.is_some(), "HAVING"),
         (!stmt.sort_clause.is_empty(), "ORDER BY"),
@@ -385,6 +416,65 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
         on_b,
         projection,
     })
+}
+
+/// Split a join WHERE into per-relation predicates (M5 J3). Each top-level AND conjunct must reference
+/// exactly ONE relation; it is mapped (via `map_predicate_node`, which handles all literal types +
+/// arithmetic/comparison/AND-OR) against that relation, and each side's conjuncts are AND-folded into
+/// that relation's predicate (the executor GPU-evaluates it to pre-filter before the join -- inner-join
+/// semantics are filter-commutative on per-side predicates). A conjunct referencing BOTH relations (a
+/// join predicate beyond the ON, e.g. `a.x > b.y`) is a follow-up -> a clean error.
+fn split_join_where(
+    where_node: &Node,
+    left_table: &RelationalTable,
+    left_alias: &str,
+    right_table: &RelationalTable,
+    right_alias: &str,
+) -> Result<(Option<ResidentExpr>, Option<ResidentExpr>), ExecuteError> {
+    let mut conjuncts: Vec<&Node> = Vec::new();
+    collect_and_conjuncts(where_node, &mut conjuncts)?;
+    let mut left: Vec<ResidentExpr> = Vec::new();
+    let mut right: Vec<ResidentExpr> = Vec::new();
+    for conjunct in conjuncts {
+        // Map against the LEFT relation, else the RIGHT. A conjunct referencing the other relation's
+        // qualifier/columns fails the first map and succeeds the second; a cross-relation conjunct
+        // fails both.
+        match map_predicate_node(conjunct, left_table, left_alias) {
+            Ok(expr) => left.push(expr),
+            Err(_) => match map_predicate_node(conjunct, right_table, right_alias) {
+                Ok(expr) => right.push(expr),
+                Err(_) => {
+                    return Err(sql_pg_error(
+                        "a join WHERE conjunct must reference exactly one relation (a cross-relation \
+                         predicate beyond the ON is a follow-up)"
+                            .to_string(),
+                    ))
+                }
+            },
+        }
+    }
+    let fold = |conjuncts: Vec<ResidentExpr>| -> Option<ResidentExpr> {
+        conjuncts.into_iter().reduce(|acc, expr| ResidentExpr::Binary {
+            op: ResidentBinaryOp::And,
+            lhs: Box::new(acc),
+            rhs: Box::new(expr),
+        })
+    };
+    Ok((fold(left), fold(right)))
+}
+
+/// Flatten a top-level chain of `AND`s into individual conjuncts; any other node is a single conjunct.
+fn collect_and_conjuncts<'a>(node: &'a Node, out: &mut Vec<&'a Node>) -> Result<(), ExecuteError> {
+    if let NodeEnum::BoolExpr(bool_expr) = node_enum(node)? {
+        if bool_expr.boolop == BoolExprType::AndExpr as i32 {
+            for arg in &bool_expr.args {
+                collect_and_conjuncts(arg, out)?;
+            }
+            return Ok(());
+        }
+    }
+    out.push(node);
+    Ok(())
 }
 
 /// Resolve the GROUP BY clause to a single grouped column name (the Expr path groups by one column

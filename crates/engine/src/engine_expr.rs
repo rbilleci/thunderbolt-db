@@ -1085,29 +1085,21 @@ impl Engine {
     /// host_rows. The join MATCH is on the GPU (the hash build+probe); only the matched index pairs +
     /// the key columns cross to the host -- the same control-plane gather the single-table text
     /// projection uses. No CPU relational join (charter).
+    /// `left_table`/`right_table` are bound at ONE catalog generation by the caller (so the WHERE
+    /// mapping + the join read the same generation); `left_predicate`/`right_predicate` are the
+    /// per-relation WHERE conjuncts (mapped against each relation), GPU-evaluated to pre-filter each
+    /// side before the join (inner-join semantics are filter-commutative on per-side predicates).
     pub(crate) fn execute_resident_expr_inner_join(
         &self,
         plan: &JoinPlan,
+        left_table: &RelationalTable,
+        right_table: &RelationalTable,
+        left_predicate: Option<&ResidentExpr>,
+        right_predicate: Option<&ResidentExpr>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
-        // Bind BOTH relations at one catalog generation (co-pinned, like the single-table bind).
-        let s = self.committed_seq();
-        let catalog = self.read_state.catalog_as_of(s);
-        let get_table = |name: &str| -> Result<RelationalTable, ExecuteError> {
-            catalog
-                .relational_catalog
-                .get(name)
-                .cloned()
-                .ok_or_else(|| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "relation \"{name}\" does not exist"
-                    )))
-                })
-        };
-        let left_table = get_table(&plan.left_table)?;
-        let right_table = get_table(&plan.right_table)?;
         #[derive(Clone, Copy, PartialEq)]
         enum Rel {
             Left,
@@ -1119,17 +1111,17 @@ impl Engine {
         let resolve = |c: &JoinColRef| -> Result<(Rel, usize), ExecuteError> {
             match &c.qualifier {
                 Some(q) if *q == plan.left_alias => {
-                    Ok((Rel::Left, relational_column_index(&left_table, &c.column)?))
+                    Ok((Rel::Left, relational_column_index(left_table, &c.column)?))
                 }
                 Some(q) if *q == plan.right_alias => {
-                    Ok((Rel::Right, relational_column_index(&right_table, &c.column)?))
+                    Ok((Rel::Right, relational_column_index(right_table, &c.column)?))
                 }
                 Some(q) => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "missing FROM-clause entry for table \"{q}\""
                 )))),
                 None => {
-                    let l = relational_column_index(&left_table, &c.column).ok();
-                    let r = relational_column_index(&right_table, &c.column).ok();
+                    let l = relational_column_index(left_table, &c.column).ok();
+                    let r = relational_column_index(right_table, &c.column).ok();
                     match (l, r) {
                         (Some(_), Some(_)) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             format!("column reference \"{}\" is ambiguous", c.column),
@@ -1212,18 +1204,39 @@ impl Engine {
                 )))
             })?;
         let gpu_id = left_entry.descriptor.gpu_id;
-        // Project each relation's int key column to host i64 (int4 section, sign-extended).
+        // Pre-filter each relation by its per-relation WHERE conjuncts on the GPU -> surviving ABSOLUTE
+        // row indices (inner join is filter-commutative on per-side predicates). No predicate -> all
+        // rows (0..n). The join then returns indices INTO these survivor arrays.
+        let survivors = |pred: Option<&ResidentExpr>,
+                         table: &RelationalTable,
+                         entry: &RelationalResidencyEntry,
+                         dm: &gpu_db_execution::CudaResidentDeviceMemory,
+                         n: usize|
+         -> Result<Vec<u32>, ExecuteError> {
+            match pred {
+                Some(p) if n > 0 => {
+                    self.lower_resident_predicate(p, table, &entry.descriptor, dm, n as u64)
+                }
+                _ => Ok((0..n as u32).collect()),
+            }
+        };
+        let left_survivors =
+            survivors(left_predicate, left_table, &left_entry, &device_memory, left_n)?;
+        let right_survivors =
+            survivors(right_predicate, right_table, &right_entry, &right_dm, right_n)?;
+        // Project each relation's int key column to host i64 at the SURVIVING rows (int4 section,
+        // sign-extended).
         let key_i64 = |entry: &RelationalResidencyEntry,
                        table: &RelationalTable,
                        dm: &gpu_db_execution::CudaResidentDeviceMemory,
                        col_idx: usize,
-                       n: usize|
+                       surv: &[u32]|
          -> Result<Vec<i64>, ExecuteError> {
-            if n == 0 {
+            if surv.is_empty() {
                 return Ok(Vec::new());
             }
             let off = resident_device_int4_column_offset(&entry.descriptor, table, col_idx)?;
-            let idxs: Vec<u64> = (0..n as u64).collect();
+            let idxs: Vec<u64> = surv.iter().map(|&i| u64::from(i)).collect();
             Ok(dm
                 .project_i32_rows_from_payload(off, &idxs)
                 .map_err(map_err)?
@@ -1231,12 +1244,13 @@ impl Engine {
                 .map(i64::from)
                 .collect())
         };
-        let left_keys = key_i64(&left_entry, &left_table, &device_memory, left_key_idx, left_n)?;
-        let right_keys = key_i64(&right_entry, &right_table, &right_dm, right_key_idx, right_n)?;
+        let left_keys = key_i64(&left_entry, left_table, &device_memory, left_key_idx, &left_survivors)?;
+        let right_keys =
+            key_i64(&right_entry, right_table, &right_dm, right_key_idx, &right_survivors)?;
         // GPU hash join: build on the SMALLER side; if its key is non-unique, retry building on the
         // OTHER side (covers 1:1 + 1:N regardless of size). Both non-unique => N:N (a follow-up).
         use gpu_db_execution::HashJoinOutcome;
-        let smaller_is_left = left_n <= right_n;
+        let smaller_is_left = left_survivors.len() <= right_survivors.len();
         let (first_build, first_probe) = if smaller_is_left {
             (&left_keys, &right_keys)
         } else {
@@ -1269,22 +1283,28 @@ impl Engine {
                 }
             }
         };
-        // Map the (build_idx, probe_idx) pairs back to (left_idx, right_idx) per pair.
+        // Map (build_idx, probe_idx) [positions INTO the survivor arrays] -> per-side survivor positions.
         let (left_match, right_match): (&[u32], &[u32]) = if left_is_build {
             (&build_idxs, &probe_idxs)
         } else {
             (&probe_idxs, &build_idxs)
         };
         // Marshal the matched rows: each projected column read from its relation's host_rows at the
-        // matched absolute index (control-plane gather; the join itself ran on the GPU).
+        // ABSOLUTE row (survivors[match_position]) -- control-plane gather; the join ran on the GPU.
         let n_pairs = left_match.len();
         let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(n_pairs);
         for i in 0..n_pairs {
             let mut row = Vec::with_capacity(proj.len());
             for &(rel, col_idx) in &proj {
                 let cell = match rel {
-                    Rel::Left => left_entry.host_rows[left_match[i] as usize][col_idx].clone(),
-                    Rel::Right => right_entry.host_rows[right_match[i] as usize][col_idx].clone(),
+                    Rel::Left => {
+                        let abs = left_survivors[left_match[i] as usize] as usize;
+                        left_entry.host_rows[abs][col_idx].clone()
+                    }
+                    Rel::Right => {
+                        let abs = right_survivors[right_match[i] as usize] as usize;
+                        right_entry.host_rows[abs][col_idx].clone()
+                    }
                 };
                 row.push(cell);
             }
