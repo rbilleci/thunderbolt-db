@@ -3208,6 +3208,103 @@ fn gpu_group_by_composite_two_text_and_int_with_sum() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_bool_member() {
+    // A BOOL composite member (1-byte resident, widened 0/1 -> i64 by build kind 3) -> the wide-key
+    // path. (bool, int): (true,1)x2,(true,2)x1,(false,1)x1. Default order by (flag,k): false(0)<true(1).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, k INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (flag, k) VALUES (true,1),(true,1),(true,2),(false,1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT flag, k, COUNT(*) FROM t GROUP BY flag, k")
+        .expect("(bool, int) composite GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Bool(false), SqlValue::Int4(1), SqlValue::Int8(1)],
+            vec![SqlValue::Bool(true), SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Bool(true), SqlValue::Int4(2), SqlValue::Int8(1)],
+        ],
+        "bool member groups by 0/1, distinct (flag,k), order by (flag,k)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_bool_member_word_boundary() {
+    // >32 rows so the bool BITMAP spans TWO LE u32 words -> the (i/32)*4 word-index math in wk_bool is
+    // exercised ACROSS the word boundary (the prior gap: 4-row tests stay in word 0). flag = row >= 20
+    // (the true group crosses row 32); k = row % 2. 4 groups x 10 rows each.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, k INT)").unwrap();
+    let values = (0..40)
+        .map(|r| format!("({}, {})", if r >= 20 { "true" } else { "false" }, r % 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    e.execute_text(2, &format!("INSERT INTO t (flag, k) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT flag, k, COUNT(*) FROM t GROUP BY flag, k")
+        .expect("(bool, int) composite GROUP BY across a bitmap word boundary");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Bool(false), SqlValue::Int4(0), SqlValue::Int8(10)],
+            vec![SqlValue::Bool(false), SqlValue::Int4(1), SqlValue::Int8(10)],
+            vec![SqlValue::Bool(true), SqlValue::Int4(0), SqlValue::Int8(10)],
+            vec![SqlValue::Bool(true), SqlValue::Int4(1), SqlValue::Int8(10)],
+        ],
+        "bool bitmap read is correct across the 32-row word boundary"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_composite_bool_and_text_member() {
+    // A BOOL fixed member + a TEXT member -> the general wide-key (comp_w=8) + text descriptor (n_text=1)
+    // path. (true,a)x2,(false,a)x1,(true,b)x1. Order by (flag,name): false<true.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, name TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (flag, name) VALUES (true,'a'),(true,'a'),(false,'a'),(true,'b')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT flag, name, COUNT(*) FROM t GROUP BY flag, name")
+        .expect("(bool, text) composite GROUP BY");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        g.rows,
+        vec![
+            vec![SqlValue::Bool(false), SqlValue::Text("a".into()), SqlValue::Int8(1)],
+            vec![SqlValue::Bool(true), SqlValue::Text("a".into()), SqlValue::Int8(2)],
+            vec![SqlValue::Bool(true), SqlValue::Text("b".into()), SqlValue::Int8(1)],
+        ],
+        "bool fixed member + text member, distinct (flag,name), order by (flag,name)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_composite_numeric_member() {
     // A composite with a NUMERIC member (can't pack into <=128 bits with another) -> the wide-key path
     // (16 bytes for the numeric + 8 for the int). SUM(c) (single aggregate). Construction oracle.
@@ -4231,13 +4328,14 @@ fn gpu_grouped_count_distinct_numeric_value_text_group_shared() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_grouped_count_distinct_expr_and_bool_group_rejected() {
-    // COUNT(DISTINCT v) over an EXPRESSION or BOOL group key is a follow-up (a derived buffer can't be
-    // a (g,v) composite member) -> a clean reject (at execution, on the GPU path).
+fn gpu_grouped_count_distinct_expr_group_rejected() {
+    // COUNT(DISTINCT v) over an EXPRESSION group key is a follow-up (a derived arithmetic buffer can't
+    // be a (g,v) composite member) -> a clean reject (at execution, on the GPU path). (A BOOL group key
+    // IS supported -- see gpu_grouped_count_distinct_bool_group_key.)
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a INT, b INT, flag BOOL, v INT)")
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)")
         .unwrap();
-    e.execute_text(2, "INSERT INTO t (a,b,flag,v) VALUES (1,2,true,5),(1,2,false,5)")
+    e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (1,2,5),(1,2,5)")
         .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
@@ -4251,13 +4349,35 @@ fn gpu_grouped_count_distinct_expr_and_bool_group_rejected() {
             || format!("{expr_err:?}").to_lowercase().contains("follow-up"),
         "clean reject, got: {expr_err:?}"
     );
-    let bool_err = e
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_count_distinct_bool_group_key() {
+    // COUNT(DISTINCT v) over a BOOL group key: the (bool, v) reduction (step 1 uses build kind 3 for the
+    // bool member; step 2 reuses the bool->int4 key buffer). flag=true: v{1,1,2}->2; flag=false: {5}->1.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (flag, v) VALUES (true,1),(true,1),(true,2),(false,5)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
         .execute_resident_expr_select_sql("SELECT flag, COUNT(DISTINCT v) FROM t GROUP BY flag")
-        .expect_err("bool group key + COUNT(DISTINCT) rejected");
-    assert!(
-        format!("{bool_err:?}").to_lowercase().contains("bool")
-            || format!("{bool_err:?}").to_lowercase().contains("follow-up"),
-        "clean reject, got: {bool_err:?}"
+        .expect("COUNT(DISTINCT) over a bool group key");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![SqlValue::Bool(false), SqlValue::Int8(1)],
+            vec![SqlValue::Bool(true), SqlValue::Int8(2)],
+        ],
+        "distinct v per bool group (order by flag: false < true)"
     );
 }
 

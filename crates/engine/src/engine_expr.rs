@@ -163,6 +163,14 @@ fn composite_group_count_reps(
                 ));
                 dst_off += 8;
             }
+            SqlType::Bool => {
+                descriptors.push((
+                    3,
+                    resident_device_bool_column_offset(snapshot, table, idx)?,
+                    dst_off,
+                ));
+                dst_off += 8;
+            }
             SqlType::Text => {}
             _ => {
                 descriptors.push((
@@ -1839,8 +1847,10 @@ impl Engine {
                         | SqlType::Timestamp
                 )
             };
-            let is_widekey_member =
-                |t: SqlType| is_fixed_int(t) || matches!(t, SqlType::Numeric { .. } | SqlType::Uuid);
+            let is_widekey_member = |t: SqlType| {
+                is_fixed_int(t)
+                    || matches!(t, SqlType::Numeric { .. } | SqlType::Uuid | SqlType::Bool)
+            };
             let composite_members: Option<Vec<(usize, SqlType)>> = if group_key_columns.len() >= 2 {
                 let mut m = Vec::with_capacity(group_key_columns.len());
                 for name in group_key_columns {
@@ -2153,6 +2163,12 @@ impl Engine {
                                 resident_device_int8_column_offset(&snapshot, table, idx)?,
                                 8u64,
                             ),
+                            // A bool member (1-byte resident) is widened 0/1 -> i64 by build kind 3.
+                            SqlType::Bool => (
+                                3u64,
+                                resident_device_bool_column_offset(&snapshot, table, idx)?,
+                                8u64,
+                            ),
                             // Text members are not in the fixed buffer (they ride the text descriptor).
                             SqlType::Text => continue,
                             _ => (
@@ -2398,19 +2414,25 @@ impl Engine {
                 .iter()
                 .any(|a| a.kind == GroupedAggKind::CountDistinct)
             {
-                // An EXPRESSION or BOOL group key is a derived buffer, not a column the (g, v) composite
-                // can include -> a follow-up. Column group keys (int/text/numeric/uuid/composite) are
-                // supported below.
-                if is_expr_key || key_is_bool {
+                // An EXPRESSION group key is a derived ARITHMETIC buffer, not a column the (g, v)
+                // composite can include -> a follow-up. Every COLUMN group key
+                // (int/text/numeric/uuid/bool/composite) is supported below. (A bool key's derived
+                // int4 buffer IS reused as the step-2 g config; its (bool, v) step-1 uses build kind 3.)
+                if is_expr_key {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "COUNT(DISTINCT v) over an expression / bool GROUP BY key is a follow-up \
-                         (int / text / numeric / uuid / composite column group keys are supported)"
+                        "COUNT(DISTINCT v) over an expression GROUP BY key is a follow-up (column \
+                         group keys -- int / text / numeric / uuid / bool / composite -- are supported)"
                             .to_string(),
                     )));
                 }
                 let idx_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
                 let n = idx_u64.len();
-                if is_composite_key || composite_is_widekey || key_is_text || key_is_i128 {
+                if is_composite_key
+                    || composite_is_widekey
+                    || key_is_text
+                    || key_is_i128
+                    || key_is_bool
+                {
                     // NON-int group key: reduce COUNT(DISTINCT v) per g to counting DISTINCT (g, v)
                     // pairs per g. (1) GROUP BY (g..., v) -> one representative row per distinct (g, v)
                     // [the general composite path]; (2) GROUP BY g over those reps, COUNT(*) -> the

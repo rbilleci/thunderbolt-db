@@ -3646,6 +3646,8 @@ wk_member:
     ld.global.u64 %srcoff, [%dbase+8];
     ld.global.u64 %dstoff, [%dbase+16];
     add.u64 %dst, %rowbase, %dstoff;
+    setp.eq.u64 %p, %kind, 3;
+    @%p bra wk_bool;
     setp.eq.u64 %p, %kind, 2;
     @%p bra wk_i128;
     setp.eq.u64 %p, %kind, 1;
@@ -3681,6 +3683,22 @@ wk_i128:
     mov.b64 %vhi, {%w0, %w1};
     st.global.u64 [%dst], %v;
     st.global.u64 [%dst+8], %vhi;
+    bra wk_member_next;
+wk_bool:
+    // kind 3: bool bitmap (1 bit/row, LE u32 words, LSB-first) -> i64 0/1. word = bitmap[i/32];
+    // bit = (word >> (i%32)) & 1. srcoff is the bitmap's byte offset in the resident payload.
+    shr.u64 %o, %i, 5;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %src, %rp, %srcoff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    and.b64 %o, %i, 31;
+    cvt.u32.u64 %w1, %o;
+    shr.u32 %w0, %w0, %w1;
+    and.b32 %w0, %w0, 1;
+    setp.ne.u32 %p, %w0, 0;
+    selp.u64 %v, 1, 0, %p;
+    st.global.u64 [%dst], %v;
 wk_member_next:
     add.u64 %m, %m, 1;
     bra wk_member;
