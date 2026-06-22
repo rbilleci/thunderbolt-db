@@ -464,6 +464,26 @@ impl Engine {
         };
         let row_count = resident_snapshot_row_count(snapshot)?;
 
+        // M3 (doc 21) — NULL 3VL: SUM/AVG/MIN/MAX skip NULL values. `Some` = the aggregate column has a
+        // GPU-resident validity bitmap (it holds ≥1 NULL); `None` = no NULL ⇒ the byte-identical fast
+        // path below. A NULL value's payload bytes are a 0 placeholder, so an unaware kernel would fold
+        // a phantom 0 into MIN/AVG/SUM — the bitmap is read ON-DEVICE to exclude those rows.
+        let agg_null_offset = resident_device_null_column_offset(snapshot, table, agg_col)?;
+        // Filtered/BETWEEN aggregates still route through the non-NULL-aware filtered-stats kernels, so a
+        // nullable filter/aggregate column would leak the 0 placeholder. Clean-error it (M3 follow-up)
+        // rather than return a wrong answer; the filter targets the aggregate column by construction.
+        if agg_null_offset.is_some()
+            && matches!(
+                predicate,
+                ResidentPredicate::Int4Compare { .. } | ResidentPredicate::Int4Between { .. }
+            )
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident filtered scalar aggregate over a nullable column is not yet supported"
+                    .to_string(),
+            )));
+        }
+
         // MAX over a provably-empty int4 compare domain: the retained column stats already prove the
         // result is empty, so answer from them with no kernel launch (matches the pre-unification
         // filtered probe's fast path; only the D2H of the i64 result counter is charged).
@@ -510,7 +530,8 @@ impl Engine {
         let byte_offset = resident_device_int4_column_offset(snapshot, table, scan_col)?;
 
         match predicate {
-            ResidentPredicate::All => match aggregate {
+            // Non-nullable fast path: byte-identical to before M3 (no validity bitmap to read).
+            ResidentPredicate::All if agg_null_offset.is_none() => match aggregate {
                 ResidentScalarAggregate::Sum { .. } => {
                     let started = Instant::now();
                     let sum = device_memory
@@ -584,6 +605,81 @@ impl Engine {
                     EngineError::ApplyFailed("resident COUNT routed to scalar path".to_string()),
                 )),
             },
+            // M3 NULL 3VL path (the aggregate column holds ≥1 NULL): route ALL of SUM/AVG/MIN/MAX through
+            // the validity-bitmap-aware self-grouped stats kernel, which skips NULL rows ON-DEVICE. The
+            // reduction is over only the non-NULL rows; when none survive (all-NULL column) the result is
+            // SQL NULL for every aggregate (PG: SUM/AVG/MIN/MAX of no rows is NULL; COUNT is not on this
+            // path). `agg_null_offset` is `Some` here by the match guard above.
+            ResidentPredicate::All => {
+                let started = Instant::now();
+                let grouped_stats = device_memory
+                    .grouped_stats_i32_nullable_from_payload(
+                        byte_offset,
+                        byte_offset,
+                        row_count,
+                        agg_null_offset,
+                    )
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                let elapsed = started.elapsed();
+                let copied_group_count = grouped_stats.len();
+                let total_count = grouped_stats.iter().map(|group| group.count).sum::<u64>();
+                let total_sum = grouped_stats.iter().map(|group| group.sum).sum::<i64>();
+                let result_value = match aggregate {
+                    ResidentScalarAggregate::Sum { .. } => {
+                        if total_count == 0 {
+                            SqlValue::Null
+                        } else {
+                            SqlValue::Int8(total_sum)
+                        }
+                    }
+                    ResidentScalarAggregate::Avg { .. } => {
+                        if total_count == 0 {
+                            SqlValue::Null
+                        } else {
+                            average_sql_value(
+                                i128::from(total_sum),
+                                usize::try_from(total_count).map_err(|_| {
+                                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                        "resident device-memory scalar aggregate count {total_count} exceeds AVG result range"
+                                    )))
+                                })?,
+                            )
+                        }
+                    }
+                    ResidentScalarAggregate::Min { .. } => grouped_stats
+                        .iter()
+                        .map(|group| group.min)
+                        .min()
+                        .map(SqlValue::Int4)
+                        .unwrap_or(SqlValue::Null),
+                    ResidentScalarAggregate::Max { .. } => grouped_stats
+                        .iter()
+                        .map(|group| group.max)
+                        .max()
+                        .map(SqlValue::Int4)
+                        .unwrap_or(SqlValue::Null),
+                    ResidentScalarAggregate::Count => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "resident COUNT routed to scalar path".to_string(),
+                        )));
+                    }
+                };
+                let result_d2h_bytes = copied_group_count
+                    .checked_mul(
+                        std::mem::size_of::<i32>()
+                            + std::mem::size_of::<u64>()
+                            + std::mem::size_of::<i64>()
+                            + (2 * std::mem::size_of::<i32>()),
+                    )
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(u64::MAX);
+                self.metrics.observe_d2h_bytes(result_d2h_bytes);
+                self.metrics.observe_kernel_exec_ms(
+                    elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                );
+                Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
+            }
             ResidentPredicate::Int4Compare {
                 needle, comparison, ..
             } => {

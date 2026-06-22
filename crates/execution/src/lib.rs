@@ -2021,6 +2021,31 @@ impl CudaResidentDeviceMemory {
             None,
             row_count,
             None,
+            None,
+        )
+        .map(|(rows, _)| rows)
+    }
+
+    /// NULL-aware self-grouped stats (M3 — doc 21): identical to [`Self::grouped_stats_i32_from_payload`]
+    /// except a NULL value (per the `value_null_bitmap_offset` validity bitmap, 1 = valid) is skipped —
+    /// it joins no group and feeds no count/sum/min/max. `null_bitmap_offset = None` ⇒ no bitmap ⇒ every
+    /// row valid (so this reduces to the plain path). The aggregate path uses this for nullable columns;
+    /// the result reduces to NULL when the non-NULL count is zero (all-NULL column).
+    pub fn grouped_stats_i32_nullable_from_payload(
+        &self,
+        group_byte_offset: u64,
+        value_byte_offset: u64,
+        row_count: u64,
+        null_bitmap_offset: Option<u64>,
+    ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_grouped_stats(
+            self,
+            group_byte_offset,
+            value_byte_offset,
+            None,
+            row_count,
+            null_bitmap_offset,
+            None,
         )
         .map(|(rows, _)| rows)
     }
@@ -2044,6 +2069,7 @@ impl CudaResidentDeviceMemory {
             value_byte_offset,
             None,
             row_count,
+            None,
             Some(GroupedI64Post { order, having }),
         )
     }
@@ -2063,6 +2089,7 @@ impl CudaResidentDeviceMemory {
             value_byte_offset,
             Some((filter_byte_offset, needle, comparison)),
             row_count,
+            None,
             None,
         )
         .map(|(rows, _)| rows)
@@ -11126,6 +11153,10 @@ fn launch_cuda_resident_i32_grouped_stats(
     value_byte_offset: u64,
     filter: Option<(u64, i32, CudaI32Comparison)>,
     row_count: u64,
+    // M3 (doc 21): `Some(off)` = the VALUE (aggregate) column's NULL validity bitmap byte offset
+    // (1 = valid, 0 = NULL); `None` = no bitmap ⇒ all rows valid. NULL values are skipped by the
+    // hash-aggregate (they join no group and feed no statistic) — 3VL aggregate semantics.
+    null_bitmap_offset: Option<u64>,
     post: Option<GroupedI64Post<'_>>,
 ) -> Result<(Vec<CudaI32GroupedStats>, usize), CudaRuntimeProbeError> {
     // Returns (rows, group_count): `rows` is windowed/ordered when `order` is set, else all groups;
@@ -11231,7 +11262,8 @@ init_done:
     .param .u64 sums_ptr,
     .param .u64 mins_ptr,
     .param .u64 maxs_ptr,
-    .param .u32 table_mask
+    .param .u32 table_mask,
+    .param .u64 value_null_bitmap_offset
 )
 {
     .reg .pred %p_done;
@@ -11239,6 +11271,15 @@ init_done:
     .reg .pred %p_match;
     .reg .pred %p_claimed;
     .reg .pred %p_exists;
+    .reg .pred %p_no_bitmap;
+    .reg .pred %p_valid;
+    .reg .u64 %val_null_off;
+    .reg .u64 %sentinel;
+    .reg .u64 %word_byte;
+    .reg .u64 %bitmap_addr;
+    .reg .u32 %bitmap_word;
+    .reg .u32 %bit_pos;
+    .reg .u32 %valid_bit;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -11292,6 +11333,7 @@ init_done:
     ld.param.u64 %mins, [mins_ptr];
     ld.param.u64 %maxs, [maxs_ptr];
     ld.param.u32 %mask, [table_mask];
+    ld.param.u64 %val_null_off, [value_null_bitmap_offset];
 
     add.u64 %group_base, %resident, %group_base;
     add.u64 %value_base, %resident, %value_base;
@@ -11299,6 +11341,7 @@ init_done:
     mov.u64 %zero, 0;
     mov.u64 %one, 1;
     mov.u64 %hibit, 4294967296;
+    mov.u64 %sentinel, 0xFFFFFFFFFFFFFFFF;
 
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -11343,6 +11386,23 @@ f_done:
     @!%p_match bra next_row;
 
 do_agg:
+    // M3 3VL: a NULL aggregate value contributes to no group and no statistic, so skip NULL rows
+    // (their value-section bytes are a 0 placeholder). val_null_off == 0xFFFF... (sentinel) means the
+    // value column has no validity bitmap => every row valid (the no-NULL fast path, no extra load).
+    setp.eq.u64 %p_no_bitmap, %val_null_off, %sentinel;
+    @%p_no_bitmap bra do_agg_valid;
+    shr.u64 %word_byte, %idx, 5;          // idx / 32 (the validity word index)
+    mul.lo.u64 %word_byte, %word_byte, 4; // * 4 bytes per u32 word
+    add.u64 %bitmap_addr, %resident, %val_null_off;
+    add.u64 %bitmap_addr, %bitmap_addr, %word_byte;
+    ld.global.u32 %bitmap_word, [%bitmap_addr];
+    cvt.u32.u64 %bit_pos, %idx;
+    and.b32 %bit_pos, %bit_pos, 31;       // idx % 32
+    bfe.u32 %valid_bit, %bitmap_word, %bit_pos, 1;
+    setp.eq.u32 %p_valid, %valid_bit, 1;  // 1 = valid/present, 0 = NULL
+    @!%p_valid bra next_row;              // NULL value => skip this row
+
+do_agg_valid:
     add.u64 %addr, %group_base, %roff;
     ld.global.u32 %group_u, [%addr];
     add.u64 %addr, %value_base, %roff;
@@ -11695,6 +11755,8 @@ compact_done:
     let mut needle_arg = needle;
     let mut comparison_arg = comparison_code;
     let mut mask_arg = table_mask;
+    // u64::MAX sentinel when there is no validity bitmap; otherwise the bounds-checked byte offset.
+    let mut value_null_off_arg = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
     let mut agg_args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut group_offset_arg as *mut u64).cast::<c_void>(),
@@ -11709,6 +11771,7 @@ compact_done:
         (&mut mins_arg as *mut u64).cast::<c_void>(),
         (&mut maxs_arg as *mut u64).cast::<c_void>(),
         (&mut mask_arg as *mut u32).cast::<c_void>(),
+        (&mut value_null_off_arg as *mut u64).cast::<c_void>(),
     ];
     check_cuda(launch(aggregate_fn, agg_grid, &mut agg_args)).map_err(drain_err)?;
 
@@ -12036,6 +12099,9 @@ fn launch_cuda_resident_i32_grouped_stats_serial(
     value_byte_offset: u64,
     filter: Option<(u64, i32, CudaI32Comparison)>,
     row_count: u64,
+    // M3 (doc 21): the VALUE column's NULL validity bitmap byte offset (`Some`), or `None` = all valid.
+    // The serial single-thread oracle skips NULL values exactly as the parallel hash-agg does.
+    null_bitmap_offset: Option<u64>,
 ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
@@ -12077,13 +12143,23 @@ fn launch_cuda_resident_i32_grouped_stats_serial(
     .param .u64 out_sums_ptr,
     .param .u64 out_mins_ptr,
     .param .u64 out_maxs_ptr,
-    .param .u64 out_count_ptr
+    .param .u64 out_count_ptr,
+    .param .u64 value_null_bitmap_offset
 )
 {
     .reg .pred %p_done;
     .reg .pred %p_found;
     .reg .pred %p_scan_done;
     .reg .pred %p_same;
+    .reg .pred %p_no_bitmap;
+    .reg .pred %p_valid;
+    .reg .u64 %val_null_off;
+    .reg .u64 %sentinel;
+    .reg .u64 %word_byte;
+    .reg .u64 %bitmap_addr;
+    .reg .u32 %bitmap_word;
+    .reg .u32 %bit_pos;
+    .reg .u32 %valid_bit;
     .reg .u64 %resident;
     .reg .u64 %group_offset;
     .reg .u64 %r_value_offset;
@@ -12134,12 +12210,14 @@ fn launch_cuda_resident_i32_grouped_stats_serial(
     ld.param.u64 %out_mins, [out_mins_ptr];
     ld.param.u64 %out_maxs, [out_maxs_ptr];
     ld.param.u64 %out_count, [out_count_ptr];
+    ld.param.u64 %val_null_off, [value_null_bitmap_offset];
 
     add.u64 %group_base, %resident, %group_offset;
     add.u64 %r_value_base, %resident, %r_value_offset;
     add.u64 %filter_base, %resident, %filter_offset;
     mov.u64 %idx, 0;
     mov.u64 %group_count, 0;
+    mov.u64 %sentinel, 0xFFFFFFFFFFFFFFFF;
 
 row_loop:
     setp.ge.u64 %p_done, %idx, %rows;
@@ -12175,6 +12253,22 @@ predicate_checked:
     @!%p_match bra next_row;
 
 predicate_pass:
+    // M3 3VL: skip rows whose aggregate (value) column is NULL -- they join no group and feed no stat.
+    // val_null_off == 0xFFFF... (sentinel) => the value column has no validity bitmap => every row valid.
+    setp.eq.u64 %p_no_bitmap, %val_null_off, %sentinel;
+    @%p_no_bitmap bra value_valid;
+    shr.u64 %word_byte, %idx, 5;          // idx / 32 (the validity word index)
+    mul.lo.u64 %word_byte, %word_byte, 4; // * 4 bytes per u32 word
+    add.u64 %bitmap_addr, %resident, %val_null_off;
+    add.u64 %bitmap_addr, %bitmap_addr, %word_byte;
+    ld.global.u32 %bitmap_word, [%bitmap_addr];
+    cvt.u32.u64 %bit_pos, %idx;
+    and.b32 %bit_pos, %bit_pos, 31;       // idx % 32
+    bfe.u32 %valid_bit, %bitmap_word, %bit_pos, 1;
+    setp.eq.u32 %p_valid, %valid_bit, 1;  // 1 = valid/present, 0 = NULL
+    @!%p_valid bra next_row;              // NULL value => skip this row
+
+value_valid:
     mul.lo.u64 %input_addr, %idx, 4;
     add.u64 %input_addr, %group_base, %input_addr;
     ld.global.s32 %group_value, [%input_addr];
@@ -12432,6 +12526,7 @@ done:
     let mut mins_arg = mins_guard.ptr;
     let mut maxs_arg = maxs_guard.ptr;
     let mut count_arg = count_guard.ptr;
+    let mut value_null_off_arg = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
     let mut args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut group_offset_arg as *mut u64).cast::<c_void>(),
@@ -12446,6 +12541,7 @@ done:
         (&mut mins_arg as *mut u64).cast::<c_void>(),
         (&mut maxs_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
+        (&mut value_null_off_arg as *mut u64).cast::<c_void>(),
     ];
     launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
@@ -25178,6 +25274,131 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_resident_i32_grouped_stats_skips_null_values_via_validity_bitmap() {
+        // M3 (doc 21): the self-grouped stats kernels (the SUM/AVG/MIN/MAX scalar-aggregate engine) skip
+        // NULL values ON THE GPU via the per-column validity bitmap (1 = valid, 0 = NULL). A NULL value's
+        // section bytes are a 0 placeholder, so an unaware kernel would fold a phantom 0 into MIN/AVG and
+        // count it — wrong 3VL. GPU-native oracle: the parallel hash-agg == the serial linear-probe ON
+        // THE GPU (no CPU re-implementation), plus a construction check, plus a control that shows the
+        // bitmap is precisely what excludes the NULL rows, plus the all-NULL edge (zero surviving groups).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Build a self-grouped resident column (group == value): NULL every 7th row; non-null values are
+        // (i % 5) + 1 ∈ {1,2,3,4,5}, so 0 is NEVER a real value — it can only be a NULL row's placeholder.
+        let retain_nullable = |values: &[i32], bitmap: &[u32]| {
+            let n = values.len() as u64;
+            // SAFETY: i32/u32 are POD; native little-endian bytes match the kernels' ld.global; the Vecs
+            // outlive this synchronous retain.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let bitmap_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(bitmap.as_ptr().cast::<u8>(), bitmap.len() * 4) };
+            let header = n.to_le_bytes();
+            let header_len = std::mem::size_of::<u64>() as u64;
+            let null_offset = header_len + column_bytes.len() as u64;
+            let allocated = null_offset + bitmap_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+                        CudaDeviceMemoryChunk { byte_offset: header_len, bytes: column_bytes },
+                        CudaDeviceMemoryChunk { byte_offset: null_offset, bytes: bitmap_bytes },
+                    ],
+                )
+                .expect("retain resident column + validity bitmap");
+            (resident, header_len, null_offset)
+        };
+        let sorted = |mut v: Vec<CudaI32GroupedStats>| {
+            v.sort_by_key(|g| g.group);
+            v
+        };
+
+        let n: u64 = 200;
+        let is_null = |i: u64| i.is_multiple_of(7);
+        let values: Vec<i32> = (0..n)
+            .map(|i| if is_null(i) { 0 } else { (i % 5) as i32 + 1 })
+            .collect();
+        let mut bitmap = vec![0u32; (n as usize).div_ceil(32)];
+        for i in 0..n as usize {
+            if !is_null(i as u64) {
+                bitmap[i / 32] |= 1u32 << (i % 32);
+            }
+        }
+        let n_null = (0..n).filter(|&i| is_null(i)).count() as u64;
+        assert!(n_null > 0);
+        let (resident, off, null_off) = retain_nullable(&values, &bitmap);
+
+        // (1) GPU oracle: serial == parallel, both honoring the bitmap (self-grouped, group == value).
+        let serial = sorted(
+            launch_cuda_resident_i32_grouped_stats_serial(&resident, off, off, None, n, Some(null_off))
+                .expect("serial nullable grouped"),
+        );
+        let parallel = sorted(
+            launch_cuda_resident_i32_grouped_stats(&resident, off, off, None, n, Some(null_off), None)
+                .expect("parallel nullable grouped")
+                .0,
+        );
+        assert_eq!(serial, parallel, "serial == parallel (GPU oracle) with NULL skip");
+
+        // The NULL placeholder value 0 must NOT appear as a group — NULL rows feed no group/stat.
+        assert!(
+            !parallel.iter().any(|g| g.group == 0),
+            "NULL rows (placeholder 0) must not form a group"
+        );
+
+        // (2) Construction: each non-null value v ∈ {1..=5} is its own group (self-grouped). count =
+        //     #(non-null rows with value v); sum = v*count; min == max == v.
+        for v in 1..=5_i32 {
+            let expected_count = (0..n)
+                .filter(|&i| !is_null(i) && (i % 5) as i32 + 1 == v)
+                .count() as u64;
+            let group = parallel
+                .iter()
+                .find(|g| g.group == v)
+                .unwrap_or_else(|| panic!("missing group {v}"));
+            assert_eq!(group.count, expected_count, "count for group {v}");
+            assert_eq!(group.sum, i64::from(v) * expected_count as i64, "sum for group {v}");
+            assert_eq!(group.min, v, "min for group {v}");
+            assert_eq!(group.max, v, "max for group {v}");
+        }
+
+        // Control: WITHOUT the bitmap (None), the 0 placeholders leak as a real group-0 of size n_null —
+        // proving the construction is non-vacuous and the bitmap is exactly what excludes the NULL rows.
+        let leaked = sorted(
+            launch_cuda_resident_i32_grouped_stats_serial(&resident, off, off, None, n, None)
+                .expect("serial grouped without bitmap"),
+        );
+        let group0 = leaked
+            .iter()
+            .find(|g| g.group == 0)
+            .expect("without the bitmap the NULL placeholders must form a group 0");
+        assert_eq!(
+            group0.count, n_null,
+            "without the validity bitmap, every NULL placeholder leaks into group 0"
+        );
+
+        // (3) All-NULL edge: a column whose every row is NULL yields ZERO groups under both kernels — the
+        //     engine reads this as SQL NULL for SUM/AVG/MIN/MAX (no surviving non-NULL rows).
+        let m: u64 = 64;
+        let all_null_values = vec![0i32; m as usize];
+        let all_null_bitmap = vec![0u32; (m as usize).div_ceil(32)]; // every bit 0 => every row NULL
+        let (resident_an, off_an, null_off_an) = retain_nullable(&all_null_values, &all_null_bitmap);
+        let serial_an =
+            launch_cuda_resident_i32_grouped_stats_serial(&resident_an, off_an, off_an, None, m, Some(null_off_an))
+                .expect("serial all-null grouped");
+        let parallel_an =
+            launch_cuda_resident_i32_grouped_stats(&resident_an, off_an, off_an, None, m, Some(null_off_an), None)
+                .expect("parallel all-null grouped")
+                .0;
+        assert!(serial_an.is_empty(), "all-NULL column must yield no serial groups");
+        assert!(parallel_an.is_empty(), "all-NULL column must yield no parallel groups");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn gpu_parallel_i32_compare_count_matches_serial_and_wins_on_large_tables() {
         // P2-M2 — compare-count parallelization parity + perf gate (GPU-native oracle).
         //
@@ -25592,11 +25813,11 @@ mod tests {
             let values: Vec<i32> = (0..n).map(|i| (i % 100) as i32).collect();
             let (resident, go, vo) = retain(&groups, &values);
             let serial = sorted(
-                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n)
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n, None)
                     .expect("serial grouped"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None, None)
                     .expect("hash-agg grouped")
                     .0,
             );
@@ -25607,11 +25828,11 @@ mod tests {
             // Filtered (resident filtered-grouped-aggregate path): keep rows where value >= 50.
             let filt = Some((vo, 50_i32, CudaI32Comparison::Gte));
             let serial_f = sorted(
-                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, filt, n)
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, filt, n, None)
                     .expect("serial filtered grouped"),
             );
             let hash_f = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, n, None)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, n, None, None)
                     .expect("hash-agg filtered grouped")
                     .0,
             );
@@ -25629,11 +25850,11 @@ mod tests {
             let values: Vec<i32> = (0..2_000).map(|i| (i % 100) - 50).collect();
             let (resident, go, vo) = retain(&groups, &values);
             let serial = sorted(
-                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, 2_000)
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, 2_000, None)
                     .expect("serial negatives"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, 2_000, None)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, 2_000, None, None)
                     .expect("hash-agg negatives")
                     .0,
             );
@@ -25657,11 +25878,11 @@ mod tests {
             let (resident, go, vo) = retain(&groups, &values);
             let filt = Some((vo, 50_i32, CudaI32Comparison::Gte));
             let serial = sorted(
-                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, filt, 2_000)
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, filt, 2_000, None)
                     .expect("serial fully-filtered"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, 2_000, None)
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, 2_000, None, None)
                     .expect("hash-agg fully-filtered")
                     .0,
             );
@@ -25689,10 +25910,10 @@ mod tests {
             let mut hash_ms = f64::MAX;
             for _ in 0..3 {
                 let t = Instant::now();
-                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n).unwrap();
+                launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n, None).unwrap();
                 serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 let t = Instant::now();
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None).unwrap();
+                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None, None).unwrap();
                 hash_ms = hash_ms.min(t.elapsed().as_secs_f64() * 1e3);
             }
             let speedup = if hash_ms > 0.0 {

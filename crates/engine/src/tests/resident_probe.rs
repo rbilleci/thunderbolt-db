@@ -1387,6 +1387,85 @@ fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results()
 }
 
 #[test]
+fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
+    // M3 (doc 21) end-to-end: unfiltered SUM/AVG/MIN/MAX over a nullable int4 column skip NULL rows ON
+    // THE GPU (the validity bitmap is read on-device by the self-grouped stats kernel), and an all-NULL
+    // column yields SQL NULL for every aggregate (PG: aggregate of no rows is NULL). Expected values are
+    // closed-form construction (the non-NULL sum/count/min/max computed by hand, AVG via the engine's
+    // own PG-exact finalization) — NOT a CPU-operator oracle, per the GPU-native-oracle charter.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE events (amount INT, allnull INT)")
+        .unwrap();
+    // amount: 10, NULL, 30, NULL, 20, 5  -> non-NULL {10, 30, 20, 5}: count 4, sum 65, min 5, max 30.
+    // allnull: every row NULL.
+    e.execute_text(
+        2,
+        "INSERT INTO events (amount, allnull) VALUES (10, NULL), (NULL, NULL), (30, NULL), (NULL, NULL), (20, NULL), (5, NULL)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // Partially-NULL column: NULL rows are excluded from every aggregate.
+    let cases: [(&str, SqlValue); 4] = [
+        ("SELECT SUM(amount) FROM events", SqlValue::Int8(65)),
+        (
+            "SELECT AVG(amount) FROM events",
+            crate::rel_exec_helpers::average_sql_value(65, 4),
+        ),
+        ("SELECT MIN(amount) FROM events", SqlValue::Int4(5)),
+        ("SELECT MAX(amount) FROM events", SqlValue::Int4(30)),
+    ];
+    for (sql, expected) in cases {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let resident = e.execute_resident_plan(&select).unwrap();
+        assert_eq!(resident.rows, vec![vec![expected]], "{sql}");
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(resident.fallback_reason, None, "{sql}");
+    }
+
+    // All-NULL column: SUM/AVG/MIN/MAX are SQL NULL (no surviving non-NULL rows).
+    for sql in [
+        "SELECT SUM(allnull) FROM events",
+        "SELECT AVG(allnull) FROM events",
+        "SELECT MIN(allnull) FROM events",
+        "SELECT MAX(allnull) FROM events",
+    ] {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let resident = e.execute_resident_plan(&select).unwrap();
+        assert_eq!(
+            resident.rows,
+            vec![vec![SqlValue::Null]],
+            "{sql} over an all-NULL column must be NULL"
+        );
+    }
+
+    // A FILTERED aggregate over a nullable column is a clean error (M3 follow-up: the filtered-stats
+    // kernels are not yet NULL-aware), NOT a wrong answer that folds the 0 placeholder in. The `<= 10`
+    // predicate is deliberately one the 0 placeholders WOULD pass — so without the guard a NULL row's
+    // phantom 0 would corrupt MIN/SUM/count — making the guard's necessity concrete, not coincidental.
+    let Command::Select(filtered) =
+        parse_command("SELECT MIN(amount) FROM events WHERE amount <= 10").unwrap()
+    else {
+        unreachable!()
+    };
+    let err = e
+        .execute_resident_plan(&filtered)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("filtered scalar aggregate over a nullable column"),
+        "expected the nullable-filtered clean error, got: {err}"
+    );
+}
+
+#[test]
 fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_results() {
     let mut e = Engine::new_local();
     e.execute_text(
