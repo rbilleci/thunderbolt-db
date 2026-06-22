@@ -82,28 +82,29 @@ its `Null` arm is documented as wire-unreachable.
 
 ---
 
-## 3. Three-valued logic, staged
+## 3. Three-valued logic is GPU-native; the host path is legacy
 
-Full 3VL is **not** in the first slice. The representation comes first; the
-semantics are layered so each slice is independently auditable and non-regressing.
+The charter is GPU-native (`00-gpu-native-principles.md` Rule 1): the relational data
+path — including 3VL — runs on the GPU; the CPU host relational path is tracked **debt
+to be retired by unification, not a place to invest.** So 3VL belongs on the GPU (§4),
+and the host helpers get the **bare minimum** to stay total when the shared value model
+gains a variant — *not* a 3VL feature build.
 
-The load-bearing rule, applied incrementally: **any comparison or arithmetic with a
-NULL operand yields UNKNOWN/NULL, and a `WHERE` predicate that evaluates to UNKNOWN
-excludes the row** (it is not TRUE).
+The load-bearing rule, evaluated **on the GPU**: *any comparison/arithmetic with a NULL
+operand yields UNKNOWN/NULL, and a `WHERE` predicate that is UNKNOWN excludes the row.*
 
-- **Host comparison (`compare_sql_values`, `rel_exec_helpers.rs:844`).** Stays a
-  total `Ordering` for internal use; add explicit `Null` arms (`Null` vs `Null` =
-  `Equal`; `Null` vs non-null = `Less`) so it never panics and the value-index order
-  is total.
-- **Host predicate (`select_filter_matches`, `rel_exec_helpers.rs:954`).**
-  Short-circuit to `false` whenever **either** operand is `SqlValue::Null`, *before*
-  `compare_sql_values`. This is exact PG `WHERE` semantics (a comparison to NULL is
-  never TRUE) and is a few lines, not a 3VL rewrite. `IS NULL` / `IS NOT NULL` are
-  *separate operators* (a later slice), not `select_filter_matches`'s `Eq`.
-- **GPU (later slices).** The kernels read the per-column null bitmap (§4) and apply
-  the same rule on-device: a row whose operand bit is null does not satisfy a
-  comparison; an equi-join excludes NULL keys; aggregates skip NULL inputs
-  (`COUNT(*)` excepted). This is where 3VL becomes GPU-native.
+- **GPU (the real work, §4, slices 2–4).** The kernels read the per-column null bitmap
+  and apply the rule on-device: a row whose operand bit is null does not satisfy a
+  comparison; an equi-join excludes NULL keys (the latent join-key gate); aggregates
+  skip NULL inputs (`COUNT(*)` excepted); ORDER BY honors `NULLS FIRST/LAST`. This is
+  the 3VL of record.
+- **Host helpers — minimum-to-stay-total, NOT a deliverable.** Adding `SqlValue::Null`
+  forces arms on the legacy host helpers. `compare_sql_values` gets total `Null` arms
+  purely so the internal value-index/dedup order never panics (Null = Null → Equal,
+  Null < non-null). `select_filter_matches` short-circuits a NULL operand to `false`
+  only so the legacy host filter is not *wrong* about NULL while it still exists; it is
+  not an investment in the host path and carries no host-3VL test burden of its own.
+  These helpers are slated for retirement with the legacy server.
 
 ---
 
@@ -192,6 +193,8 @@ bugs early; it does not wait on any slice above.
 
 The representation keeps the relational data path on the GPU: the null bitmap is a
 device-resident column companion read by the kernels, and 3VL is evaluated on-device
-(§3, §4). No CPU relational execution is introduced; the host only marshals the bit
-the way it already marshals keys and offsets. The value model gains exactly one
-variant, and the executor remains a general interpreter — no per-shape NULL code.
+(§3, §4). No NEW CPU relational execution is introduced; the host only marshals the
+bit the way it already marshals keys and offsets, and the legacy host helpers get only
+the minimum to stay total (they are being retired by unification, not extended — the
+investment is entirely GPU-side). The value model gains exactly one variant, and the
+executor remains a general interpreter — no per-shape NULL code.
