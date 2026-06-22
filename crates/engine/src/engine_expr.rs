@@ -209,6 +209,15 @@ pub(crate) fn gpu_sort_result_rows(
                     SqlValue::Int4(v) | SqlValue::Date(v) => i64::from(v),
                     SqlValue::Int2(v) => i64::from(v),
                     SqlValue::Int8(v) | SqlValue::Timestamp(v) => v,
+                    // M3 (doc 21): a NULL sort key takes PG's DEFAULT placement — NULLs sort as if larger
+                    // than every non-NULL value, i.e. last under ASC and first under DESC (the per-key
+                    // `desc_mask` reversal below turns "largest" into "first" for a DESC key). Mapping NULL
+                    // to i64::MAX realizes both: ASC -> MAX sorts last, DESC -> MAX reverses to first. For
+                    // int2/int4/date no real value reaches i64::MAX, so it is an unambiguous sentinel;
+                    // for int8/timestamp a genuine i64::MAX would tie with NULL (an unspecified order
+                    // among them, acceptable per SQL). Explicit NULLS FIRST/LAST is a clean parse error
+                    // today (a follow-up), so this never silently overrides an explicit request.
+                    SqlValue::Null => i64::MAX,
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "ORDER BY int key encountered a non-int value".to_string(),
@@ -225,6 +234,21 @@ pub(crate) fn gpu_sort_result_rows(
         }
     }
     let non_int: Vec<(usize, u8)> = classified.iter().copied().filter(|&(_, k)| k != 0).collect();
+    // M3 (doc 21): a NULL in a TEXT/NUMERIC/UUID sort key is a clean-error follow-up — the on-device
+    // hetero comparator reads the column's placeholder (empty span / 0), which would sort the NULL as a
+    // real small value rather than at the PG-default end. (The int-key path above places NULLs correctly
+    // via the i64::MAX sentinel.) Detect it here rather than mis-order on-device.
+    if !non_int.is_empty()
+        && rows
+            .iter()
+            .any(|row| non_int.iter().any(|&(idx, _)| matches!(row[idx], SqlValue::Null)))
+    {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "ORDER BY with a NULL in a text/numeric/uuid key is not yet supported on the GPU \
+             (M3 3VL follow-up); int/date/timestamp keys place NULLs (PG default ordering)"
+                .to_string(),
+        )));
+    }
     let perm: Vec<u32> = if non_int.is_empty() {
         device_memory
             .bitonic_sort_multikey(&int_keys, n, num_int, desc_mask)
@@ -4025,8 +4049,8 @@ impl Engine {
             }
             let order = &select.order_by[ki];
             let order_idx = relational_column_index(table, &order.column)?;
-            match table.columns[order_idx].ty {
-                SqlType::Int4 | SqlType::Int2 | SqlType::Date => Ok(device_memory
+            let mut keys: Vec<i64> = match table.columns[order_idx].ty {
+                SqlType::Int4 | SqlType::Int2 | SqlType::Date => device_memory
                     .project_i32_rows_from_payload(
                         resident_device_int4_column_offset(&snapshot, table, order_idx)?,
                         indices,
@@ -4034,17 +4058,34 @@ impl Engine {
                     .map_err(map_err)?
                     .into_iter()
                     .map(i64::from)
-                    .collect()),
+                    .collect(),
                 SqlType::Int8 | SqlType::Timestamp => device_memory
                     .project_i64_rows_from_payload(
                         resident_device_int8_column_offset(&snapshot, table, order_idx)?,
                         indices,
                     )
-                    .map_err(map_err),
-                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "ORDER BY key is not an i64-sortable int column".to_string(),
-                ))),
+                    .map_err(map_err)?,
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "ORDER BY key is not an i64-sortable int column".to_string(),
+                    )))
+                }
+            };
+            // M3 (doc 21): a NULL key row's projected value is the 0 PLACEHOLDER; override it with the
+            // i64::MAX sentinel so the GPU sort places NULLs at PG's DEFAULT end (last ASC / first DESC,
+            // via the per-key desc reversal). The validity bitmap is read by the bool projector (same
+            // 1-bit-per-row layout). No bitmap => the column holds no NULLs (keys unchanged).
+            if let Some(null_off) = resident_device_null_column_offset(&snapshot, table, order_idx)? {
+                let validity = device_memory
+                    .project_bool_rows_from_payload(null_off, indices)
+                    .map_err(map_err)?;
+                for (key, valid) in keys.iter_mut().zip(validity) {
+                    if !valid {
+                        *key = i64::MAX;
+                    }
+                }
             }
+            Ok(keys)
         };
         // A sort EXPRESSION is int-valued. has_text_key (TEXT only) gates the single-text fast path;
         // has_hetero_key (TEXT/NUMERIC/UUID -- the keys that can't live in the i64 matrix) routes to the
@@ -4052,16 +4093,47 @@ impl Engine {
         let mut has_text_key = false;
         let mut has_hetero_key = false;
         for (ki, order) in select.order_by.iter().enumerate() {
-            if order_by_exprs.get(ki).is_some_and(|e| e.is_some()) {
+            if let Some(Some(expr)) = order_by_exprs.get(ki) {
+                // M3 (doc 21): a sort EXPRESSION over a NULLABLE column would be evaluated on-device from
+                // the placeholder bytes (an arith result is NULL if any operand is NULL, but the VM folds
+                // the 0 placeholder) and then mis-placed by the i64 sort. The int-COLUMN key path places
+                // NULLs via the validity bitmap, but an expression has no single column bitmap — so a
+                // nullable sort expression is a clean-error follow-up, never a silent mis-order.
+                let mut expr_cols = Vec::new();
+                collect_expr_columns(expr, &mut expr_cols);
+                for col in expr_cols {
+                    if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "ORDER BY an expression over a nullable column is not yet supported on the \
+                             GPU (M3 3VL follow-up); ORDER BY the plain column places NULLs (PG default)"
+                                .to_string(),
+                        )));
+                    }
+                }
                 continue;
             }
-            match table.columns[relational_column_index(table, &order.column)?].ty {
+            let order_idx = relational_column_index(table, &order.column)?;
+            match table.columns[order_idx].ty {
                 SqlType::Text => {
                     has_text_key = true;
                     has_hetero_key = true;
                 }
                 SqlType::Numeric { .. } | SqlType::Uuid => has_hetero_key = true,
                 _ => {}
+            }
+            // M3 (doc 21): NULL placement for a TEXT/NUMERIC/UUID sort key is a clean-error follow-up (the
+            // on-device hetero comparator reads the column's placeholder, not the validity bitmap, so it
+            // would mis-place NULLs). The int/date/timestamp key path above places NULLs (PG default).
+            if matches!(
+                table.columns[order_idx].ty,
+                SqlType::Text | SqlType::Numeric { .. } | SqlType::Uuid
+            ) && resident_device_null_column_offset(&snapshot, table, order_idx)?.is_some()
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "ORDER BY with a NULL in a text/numeric/uuid key is not yet supported on the GPU \
+                     (M3 3VL follow-up); int/date/timestamp keys place NULLs (PG default ordering)"
+                        .to_string(),
+                )));
             }
         }
         let single_text_key = select.order_by.len() == 1 && has_text_key;

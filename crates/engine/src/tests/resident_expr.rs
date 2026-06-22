@@ -176,6 +176,65 @@ fn gpu_resident_expr_where_excludes_null_operands_and_projection_carries_null() 
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_order_by_places_nulls_per_pg_default() {
+    // M3 (doc 21) Slice E: ORDER BY a NULLABLE int column places NULLs at PG's DEFAULT end ON THE GPU
+    // sort — last under ASC, first under DESC (the i64::MAX sentinel realizes both). Without it the sort
+    // would error on the NULL value. a is nullable; b = 100 (non-null) so `WHERE b >= 0` keeps every row.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    // a = [3, NULL, 1, NULL, 2]
+    e.execute_text(
+        2,
+        "INSERT INTO t (a, b) VALUES (3, 100), (NULL, 100), (1, 100), (NULL, 100), (2, 100)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let all_rows = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Ge,
+        lhs: Box::new(ResidentExpr::Column(1)),
+        rhs: Box::new(ResidentExpr::Int4Literal(0)),
+    };
+
+    // ASC: non-NULL ascending then NULLs last.
+    let Command::Select(asc) = parse_command("SELECT a FROM t ORDER BY a").unwrap() else {
+        unreachable!()
+    };
+    let r = e.execute_resident_expr_select(&asc, &all_rows).unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Null],
+            vec![SqlValue::Null],
+        ],
+        "ORDER BY a (ASC) must place NULLs last (PG default)"
+    );
+
+    // DESC: NULLs first then non-NULL descending.
+    let Command::Select(desc) = parse_command("SELECT a FROM t ORDER BY a DESC").unwrap() else {
+        unreachable!()
+    };
+    let r = e.execute_resident_expr_select(&desc, &all_rows).unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null],
+            vec![SqlValue::Null],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(1)],
+        ],
+        "ORDER BY a DESC must place NULLs first (PG default)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_select_evaluates_deep_arithmetic_tree_via_vm() {
     // A DEEPER arithmetic tree than the 2-col fast-path — `WHERE (a + b) * 2 - 5 > K` — routes
     // through the engine's Expr compiler -> device bytecode VM (not the peephole), evaluated and
