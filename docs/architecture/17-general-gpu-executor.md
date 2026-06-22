@@ -10,6 +10,12 @@ before adding any execution path. If you are about to write
 `execute_relational_<some_shape>_with_resident_device_memory_probe`, stop — that
 is the anti-pattern this design retires.
 
+This executor grows by node / type / operator / **function**. The function-execution
+engine (scalar built-ins + user-defined functions on the GPU — intrinsics → SQL
+inlining → JIT, never a per-function host hack) and the GPU-resident catalog (the
+catalog is just relations, not per-query synthesis) are designed in
+`20-gpu-resident-catalog-and-function-engine.md`, which extends this document.
+
 ---
 
 ## 1. Why this exists (the mistake we are correcting)

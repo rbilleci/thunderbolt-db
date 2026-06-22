@@ -172,7 +172,12 @@ remaining program is:
       and bounded OLTP joins). **Never a CPU nested-loop.**
    5. **GPU-resident catalog** — `pg_catalog`/`information_schema` as
       GPU-resident system relations executed by the *same* GPU operators
-      (including the GPU join path), superseding any CPU catalog synthesis.
+      (including the GPU join path), superseding any CPU catalog synthesis. The
+      catalog is just relations (DDL = DML against catalog tables; a host syscache
+      fronts planning). With the **function-execution engine** (step 1.3) catalog
+      functions (`format_type`, `pg_get_expr`, …) are ordinary GPU intrinsics/inlined
+      SQL, not host hacks. Design:
+      `docs/architecture/20-gpu-resident-catalog-and-function-engine.md`.
    6. **GPU write path** — real device work on commit (build/mutate the next
       GPU-resident generation), replacing the simulated write telemetry.
 
@@ -608,10 +613,17 @@ debt, never the hot path). The authoritative milestone track is
   pattern-match, never by a shape name). **Status:** built for any int4 `WHERE`
   predicate (arithmetic + comparisons + col-vs-col + AND/OR), filter + materialization
   on-device (`docs/architecture/17-general-gpu-executor.md`, `7b19e7ef`..`01e0c4e2`).
-  Grow it by **node / type / operator** — composable filters/projections/aggregates
-  over arbitrary column types (the GPU-native payoff for Phase-3 typed columns) — and
-  bind real SQL to it via `libpg_query` (`18-sql-to-expr-handoff.md`). Adding "one
-  more query-shape method" is the anti-pattern this step exists to end.
+  Grow it by **node / type / operator / function** — composable filters/projections/
+  aggregates over arbitrary column types (the GPU-native payoff for Phase-3 typed
+  columns) — and bind real SQL to it via `libpg_query` (`18-sql-to-expr-handoff.md`).
+  Adding "one more query-shape method" is the anti-pattern this step exists to end.
+  - **Function-execution engine (extends this step).** Scalar functions — SQL
+    built-ins **and** user-defined — execute **on the GPU**, never via a per-function
+    host hack: an intrinsic library (GPU built-ins) → SQL-function inlining → an
+    expression JIT to PTX, with a costed host-fallback only for the procedural tail.
+    The forcing rule: a function in a predicate/join/sort over user data must compile
+    to the GPU (no CPU↔GPU per-row shuffle). Design:
+    `docs/architecture/20-gpu-resident-catalog-and-function-engine.md` (Part B).
 - **GPU join operator (first-class milestone).** Build a **real GPU join** —
   partitioned/hash join over GPU-resident relations (build a hash table on the
   keyed/smaller side on-device, probe the other side in parallel), not a CPU
@@ -628,7 +640,12 @@ debt, never the hot path). The authoritative milestone track is
   any Phase-3 CPU catalog tables are stepping-stones, tracked as GPU-parity debt).
   Catalog introspection — including multi-relation catalog joins — runs on the GPU
   join path. This is the GPU-native target the Phase-3 "real queryable catalog"
-  enabler feeds into.
+  enabler feeds into. The catalog is **just relations** (DDL = DML against catalog
+  tables; a host syscache fronts planning) — no per-query synthesis / transient
+  payload. Design:
+  `docs/architecture/20-gpu-resident-catalog-and-function-engine.md` (Part A); with
+  the function engine (Part B), catalog functions like `format_type` become ordinary
+  GPU intrinsics rather than a special case.
 - **GPU write path.** Make the write path do **real device work** — build/mutate the
   next GPU-resident generation on commit — replacing the simulated GPU telemetry. The
   Phase-4 durability work is the enabler that makes this crash-safe.
