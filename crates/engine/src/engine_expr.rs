@@ -2710,6 +2710,33 @@ impl Engine {
                     }
                 }
             }
+            // M3 (doc 21) GROUP BY 3VL guard: a NULL group KEY must form its OWN group (distinct from any
+            // real value), and a NULL aggregate VALUE must be SKIPPED from SUM/AVG/MIN/MAX/COUNT(col)
+            // while COUNT(*) still counts the row. The multi-type hash-agg kernel does neither yet — it
+            // reads the 0/empty PLACEHOLDER, so it would group NULL keys under 0 and fold a phantom 0 into
+            // the value aggregate. Until the (two-count, key+value-validity) kernel redesign lands, detect
+            // a key/value column that ACTUALLY contains a NULL and CLEAN-ERROR rather than mis-answer. A
+            // nullable-TYPED column with no NULLs has no validity bitmap, so it still runs unchanged.
+            let mut group_by_null_check: Vec<usize> = agg_value_indices.iter().flatten().copied().collect();
+            if let Some(expr) = group_key_expr {
+                collect_expr_columns(expr, &mut group_by_null_check);
+            } else if !group_key_columns.is_empty() {
+                for name in group_key_columns {
+                    group_by_null_check.push(relational_column_index(table, name)?);
+                }
+            } else if let Ok(idx) = relational_column_index(table, group_name) {
+                group_by_null_check.push(idx);
+            }
+            for col in group_by_null_check {
+                if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "GROUP BY over a column that contains NULLs is not yet supported on the GPU \
+                         (M3 3VL follow-up): a NULL key must form its own group and a NULL aggregate \
+                         value must be skipped"
+                            .to_string(),
+                    )));
+                }
+            }
             // GROUP BY <expression> (`a+b`): the key is a DERIVED int buffer materialized on-device
             // below (grouped via key_base_override), NOT a column -- so group_idx is only a placeholder
             // for the COUNT(*) pass (which reads no value), and key_ty is the expression result type.

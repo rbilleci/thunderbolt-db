@@ -2343,6 +2343,61 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_over_a_nullable_column_is_a_clean_error_not_a_wrong_answer() {
+    // M3 (doc 21) Slice B guard: GROUP BY over a column that actually contains NULLs (a NULL key would
+    // group under the 0 placeholder; a NULL aggregate value would fold a phantom 0) is a CLEAN ERROR —
+    // never a silent wrong answer — until the two-count key+value-validity hash-agg kernel lands. A
+    // nullable-TYPED column with no NULLs still runs (no validity bitmap).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT, h INT)").unwrap();
+    // g has a NULL (row 2); v has a NULL (row 3); h has none.
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v,h) VALUES (1,10,7),(NULL,20,7),(2,30,8),(1,NULL,8)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // GROUP BY a NULL-bearing KEY -> clean error.
+    let err = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("GROUP BY over a column that contains NULLs"),
+        "GROUP BY a nullable key must clean-error, got: {err}"
+    );
+
+    // Aggregate a NULL-bearing VALUE (key h has no NULLs) -> clean error.
+    let err = e
+        .execute_resident_expr_select_sql("SELECT h, SUM(v) FROM t GROUP BY h")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("GROUP BY over a column that contains NULLs"),
+        "aggregating a nullable value must clean-error, got: {err}"
+    );
+
+    // Control: GROUP BY h (no NULLs) with COUNT(*) (no value column) still runs on the GPU.
+    let ok = e
+        .execute_resident_expr_select_sql("SELECT h, COUNT(*) FROM t GROUP BY h")
+        .expect("GROUP BY a non-NULL key must still run");
+    assert_eq!(
+        ok.rows,
+        vec![
+            vec![SqlValue::Int4(7), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(8), SqlValue::Int8(2)],
+        ],
+        "GROUP BY a NULL-free key is unaffected by the guard"
+    );
+    assert_eq!(ok.executed_target, DeviceTarget::Gpu(0));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_runs_group_by() {
     // GROUP BY an int4 key on the general GPU executor (hash aggregation): COUNT/SUM/AVG per group,
     // results sorted by key for determinism. Groups: g=1 -> v{10,20,30}, g=2 -> v{5,15}, g=3 -> v{100}.
