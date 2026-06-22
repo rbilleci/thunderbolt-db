@@ -958,28 +958,45 @@ thesis pays off second.
 > the gap is widening); the **GPU write path is simulated**; the **commit-path WAL
 > flush is a no-op**; **NULL is unrepresented**; the **Phase-5 perf harness** is unbuilt.
 >
-> **Re-sequenced immediate-next order (2026-06-22):**
-> 1. **NULL (M3) — the next foundational thrust.** Cross-cutting: it gates outer
->    joins, the latent NULL-key join-correctness gate, AVG-over-empty, any real
->    nullable schema, the wire-server unification (golden scenarios use NULL), and a
->    NULL-correct catalog/function engine. It is a representational change that gets
->    *more expensive the more features assume non-null* — do it before more breadth.
-> 2. **Catalog-as-relations + function engine** (doc 20), now NULL-correct — closes
->    the `\d`/`pg_dump`/introspection story; `format_type` etc. become GPU intrinsics.
-> 3. **Incremental wire-server unification (§9.1)** — route a growing subset of
->    queries through the engine behind a flag (not a big-bang guts-swap), expanding as
->    coverage grows. This converts engine capability into product and stops the §1.1
->    divergence. Now unblockable (the engine has types/joins/catalog; NULL closes the rest).
-> 4. **Real GPU write path + durable WAL group-commit** — "banking OLTP" is gated on
->    durable, real, transactional writes, not on more read features. Reads/execution
->    have lapped the write/durability axis; rebalance toward it here.
+> **Re-sequenced thrust (2026-06-22): UNIFICATION is the organizing goal; NULL is its
+> critical-path first task; the integration plumbing runs in parallel.**
+>
+> This is framed as a converging effort, NOT a linear list, because the §1.1
+> three-systems gap is the weight worth shedding soonest — *and* a coherent
+> unification cannot precede NULL. A stateful DB cannot run two stores coherently, so
+> unification means the **engine's store becomes the single source of truth**; but the
+> engine's `SqlValue` has **no `Null` variant** (verified), the legacy server (352
+> golden) represents NULL, and the wire protocol itself requires it (`DataRow` length
+> `-1`, bound NULL params). Flipping the store before NULL would regress every
+> NULL-using golden scenario. So the unification effort **starts now**, organized as:
+>
+> 1. **NULL *representation* (M3) — the critical-path unblock.** `SqlValue::Null` +
+>    nullable storage + the wire NULL codec. This is the *minimal* unblock (smaller
+>    than full 3-valued-logic semantics, which follow) and is the gate to a
+>    non-regressing store-flip. NULL is cross-cutting beyond unification too (outer
+>    joins, the latent NULL-key join gate, AVG-over-empty, the catalog/function
+>    engine) and is cheapest before more features assume non-null.
+> 2. **Integration plumbing — IN PARALLEL (NULL-independent).** Grow the
+>    engine-backed serving path (`crates/server` already exists): engine-result→wire
+>    encoding, transaction mapping, error-code mapping, and golden coverage on the
+>    non-NULL subset. None of this waits on NULL; it is the long pole that de-risks
+>    the swap and surfaces the real protocol/driver integration bugs early.
+> 3. **Flip the store to the engine the instant NULL representation lands**, then
+>    expand coverage and retire the legacy server in stages: full NULL 3VL semantics →
+>    **catalog-as-relations + function engine** (doc 20 — `format_type` etc. become
+>    GPU intrinsics, closing `\d`/`pg_dump`) → the remaining **protocol surface** the
+>    legacy server has (COPY, extended protocol, SCRAM, TLS).
+> 4. **Real GPU write path + durable WAL group-commit.** The flip makes the engine's
+>    (functional but non-durable) write path the *product's* — "banking OLTP" is gated
+>    on durable, transactional writes, and reads/execution have lapped the
+>    write/durability axis. Bring it up as the store-flip exposes it.
 > 5. **Phase-5 open-loop / p99.9 / steady-state harness + perf-tuning to targets** —
 >    the prerequisite for *trusting any perf number* (§1.3's targets are still "not yet
->    measurable"). New operators (joins, executor breadth) shipped **correctness-gated**
->    (independent audits + golden + isolation), not perf-gated — that is the right call
->    for landing an operator, so the gating policy is two-tier: **correctness-gate to
->    land, perf-gate before a hot path / before claiming a target** (amends §5.7's
->    "every milestone is benchmark-gated").
+>    measurable"); run alongside, not as a gate ahead.
+>
+> Gating is two-tier (amends §5.7): **correctness-gate to *land* an operator, perf-gate
+> before a hot path / before claiming a target** — matching how the joins + executor
+> breadth shipped (independent audits + golden + isolation, perf-tuned later).
 >
 > --- *(historical 2026-06-15 handoff follows)* ---
 
