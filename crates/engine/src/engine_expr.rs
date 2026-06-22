@@ -1232,6 +1232,98 @@ fn boolean_op_code(op: ResidentBinaryOp) -> Option<u32> {
     }
 }
 
+/// Collect the (distinct, first-seen order) column indices a predicate-leaf operand references. Literals
+/// and `IS NULL` contribute no value-operand column (an `IS NULL` leaf is its own validity test, never an
+/// arithmetic operand).
+fn collect_expr_columns(expr: &ResidentExpr, out: &mut Vec<usize>) {
+    match expr {
+        ResidentExpr::Column(idx) => {
+            if !out.contains(idx) {
+                out.push(*idx);
+            }
+        }
+        ResidentExpr::Binary { lhs, rhs, .. } => {
+            collect_expr_columns(lhs, out);
+            collect_expr_columns(rhs, out);
+        }
+        _ => {}
+    }
+}
+
+/// 3VL (M3 — doc 21): AND a comparison-leaf mask (on top of the VM stack) with column `col`'s NULL
+/// VALIDITY mask, so a NULL operand makes the leaf UNKNOWN ⇒ mask 0 ⇒ the row is not selected. A column
+/// with NO validity bitmap (it holds no NULLs) is all-valid, so this is a no-op (skipped) and the
+/// non-null predicate program stays byte-identical. Pushes `BoolMask(validity, negate=false)` then
+/// `MaskBinary(AND)` (the validity bit is 1 when the row is present). Correct for WHERE under AND/OR
+/// because UNKNOWN and FALSE both exclude the row; this predicate path carries no logical NOT (which
+/// would distinguish them — `<>`/`!=` is a value comparison, itself UNKNOWN on a NULL operand).
+fn push_column_validity_and(
+    col: usize,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+) -> Result<(), ExecuteError> {
+    if let Some(bitmap_byte_offset) = resident_device_null_column_offset(snapshot, table, col)? {
+        program.push(ExprStep::BoolMask {
+            bitmap_byte_offset,
+            negate: false,
+        });
+        program.push(ExprStep::MaskBinary { op: 0 }); // 0 = AND
+    }
+    Ok(())
+}
+
+/// Apply [`push_column_validity_and`] for every nullable column referenced across `operands` (a
+/// comparison leaf's arithmetic operand expressions), so the leaf's mask excludes any row in which ANY
+/// operand column is NULL (an arithmetic result is NULL if any input is NULL).
+fn push_leaf_validity_and(
+    operands: &[&ResidentExpr],
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+) -> Result<(), ExecuteError> {
+    let mut cols = Vec::new();
+    for operand in operands {
+        collect_expr_columns(operand, &mut cols);
+    }
+    for col in cols {
+        push_column_validity_and(col, table, snapshot, program)?;
+    }
+    Ok(())
+}
+
+/// True if any VALUE-operand column the predicate references has a NULL validity bitmap (holds ≥1 NULL).
+/// `IS NULL` operands are excluded (an `IS NULL` test is always defined — it needs no 3VL routing).
+fn predicate_references_nullable_column(
+    predicate: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+) -> Result<bool, ExecuteError> {
+    let mut cols = Vec::new();
+    collect_expr_columns(predicate, &mut cols);
+    for col in cols {
+        if resident_device_null_column_offset(snapshot, table, col)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// True if every VALUE-operand column the predicate references is a type the general mask VM
+/// (`compile_predicate_program`) can lower with NULL 3VL: int4 (incl. int4 arithmetic) / text / bool.
+/// A nullable int8/numeric/date/timestamp/uuid/int2 predicate is a clean-error follow-up (those compare
+/// kernels are not yet validity-bitmap-aware), so it must NOT be routed to the VM.
+fn predicate_value_columns_vm_lowerable(predicate: &ResidentExpr, table: &RelationalTable) -> bool {
+    let mut cols = Vec::new();
+    collect_expr_columns(predicate, &mut cols);
+    cols.iter().all(|&col| {
+        matches!(
+            table.columns.get(col).map(|column| column.ty),
+            Some(SqlType::Int4 | SqlType::Text | SqlType::Bool)
+        )
+    })
+}
+
 /// Compile a boolean predicate expression into postfix [`ExprStep`] bytecode that leaves one MASK on
 /// the VM stack. Recurses: `AND`/`OR` compile both operand predicates then a `MaskBinary`; a
 /// comparison compiles its arithmetic operand(s) (via [`compile_arith_program`]) then a
@@ -1313,7 +1405,7 @@ fn compile_predicate_program(
                 scalar: *scalar,
                 scalar_on_left: false,
             });
-            Ok(())
+            push_leaf_validity_and(&[value], table, snapshot, program)
         }
         (ResidentExpr::Int4Literal(scalar), value) if !is_int4_literal(value) => {
             compile_arith_program(value, table, snapshot, program)?;
@@ -1322,13 +1414,13 @@ fn compile_predicate_program(
                 scalar: *scalar,
                 scalar_on_left: true,
             });
-            Ok(())
+            push_leaf_validity_and(&[value], table, snapshot, program)
         }
         (lhs_expr, rhs_expr) if !is_int4_literal(lhs_expr) && !is_int4_literal(rhs_expr) => {
             compile_arith_program(lhs_expr, table, snapshot, program)?;
             compile_arith_program(rhs_expr, table, snapshot, program)?;
             program.push(ExprStep::CompareBuffers { cmp });
-            Ok(())
+            push_leaf_validity_and(&[lhs_expr, rhs_expr], table, snapshot, program)
         }
         _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "resident predicate comparison cannot be literal-vs-literal (constant-folding pending)"
@@ -1387,7 +1479,9 @@ fn compile_text_eq_leaf(
         needle_idx,
         negate,
     });
-    Ok(())
+    // 3VL: a NULL text operand makes `=`/`<>` UNKNOWN ⇒ the row is not selected (its placeholder is an
+    // empty span, which would otherwise mis-match `= ''` / mis-pass `<> 'x'`).
+    push_column_validity_and(col, table, snapshot, program)
 }
 
 /// Compile a BOOL comparison leaf (`boolcol =/<> true|false`, either operand order) into a `BoolMask` VM
@@ -1427,7 +1521,10 @@ fn compile_bool_leaf(
         bitmap_byte_offset: offset,
         negate,
     });
-    Ok(())
+    // 3VL: a NULL bool operand makes `=`/`<>` UNKNOWN ⇒ not selected. The value-bitmap bit of a NULL row
+    // is the 0 placeholder, so `= false` / `<> true` would otherwise wrongly select it; AND with the
+    // validity mask excludes it.
+    push_column_validity_and(col, table, snapshot, program)
 }
 
 impl Engine {
@@ -4243,26 +4340,57 @@ impl Engine {
             };
             projected_columns.push(column);
         }
+        // M3 (doc 21): per projected column, the NULL validity of each surviving row (1 = present). A
+        // nullable column's device value is a 0/empty PLACEHOLDER for a NULL row, so the result must emit
+        // SqlValue::Null there. The validity bitmap is 1-bit-per-row like a bool column, so the bool
+        // projector gathers it at the surviving indices. `None` = the column holds no NULLs (all valid),
+        // so non-nullable projections are unchanged. (Text already reads SqlValue::Null from host_rows;
+        // the override below is idempotent for it.)
+        let projected_validity: Vec<Option<Vec<bool>>> = bound
+            .selected_indexes
+            .iter()
+            .map(|&col| -> Result<Option<Vec<bool>>, ExecuteError> {
+                match resident_device_null_column_offset(&snapshot, table, col)? {
+                    Some(off) => Ok(Some(
+                        device_memory
+                            .project_bool_rows_from_payload(off, &indices_u64)
+                            .map_err(|err| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                            })?,
+                    )),
+                    None => Ok(None),
+                }
+            })
+            .collect::<Result<_, _>>()?;
         let mut rows: Vec<Vec<SqlValue>> = (0..indices_u64.len())
             .map(|row| {
                 projected_columns
                     .iter()
-                    .map(|column| match column {
-                        ProjectedColumn::Int4(values) => SqlValue::Int4(values[row]),
-                        ProjectedColumn::Int8(values) => SqlValue::Int8(values[row]),
-                        ProjectedColumn::Numeric(values, scale) => {
-                            SqlValue::Numeric(Decimal128::new(values[row], *scale))
+                    .enumerate()
+                    .map(|(c, column)| {
+                        // A NULL row (validity bit 0) projects as SQL NULL regardless of its placeholder.
+                        if let Some(validity) = &projected_validity[c] {
+                            if !validity[row] {
+                                return SqlValue::Null;
+                            }
                         }
-                        ProjectedColumn::Date(values) => SqlValue::Date(values[row]),
-                        ProjectedColumn::Timestamp(values) => SqlValue::Timestamp(values[row]),
-                        ProjectedColumn::Uuid(values) => {
-                            SqlValue::Uuid(values[row].to_le_bytes())
+                        match column {
+                            ProjectedColumn::Int4(values) => SqlValue::Int4(values[row]),
+                            ProjectedColumn::Int8(values) => SqlValue::Int8(values[row]),
+                            ProjectedColumn::Numeric(values, scale) => {
+                                SqlValue::Numeric(Decimal128::new(values[row], *scale))
+                            }
+                            ProjectedColumn::Date(values) => SqlValue::Date(values[row]),
+                            ProjectedColumn::Timestamp(values) => SqlValue::Timestamp(values[row]),
+                            ProjectedColumn::Uuid(values) => {
+                                SqlValue::Uuid(values[row].to_le_bytes())
+                            }
+                            // The stored i32 is a widened i16, so the narrowing is exact.
+                            ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
+                            ProjectedColumn::Bool(values) => SqlValue::Bool(values[row]),
+                            // Already a SqlValue::Text from host_rows; clone it through.
+                            ProjectedColumn::Text(values) => values[row].clone(),
                         }
-                        // The stored i32 is a widened i16, so the narrowing is exact.
-                        ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
-                        ProjectedColumn::Bool(values) => SqlValue::Bool(values[row]),
-                        // Already a SqlValue::Text from host_rows; clone it through.
-                        ProjectedColumn::Text(values) => values[row].clone(),
                     })
                     .collect()
             })
@@ -5129,6 +5257,34 @@ impl Engine {
                 device_memory,
                 row_count,
             );
+        }
+
+        // M3 (doc 21) WHERE 3VL: a predicate over a NULLABLE column routes through the general mask VM
+        // (`compile_predicate_program`), which AND's each comparison leaf with the column's validity mask
+        // so a NULL operand evaluates to UNKNOWN (the row is excluded). The typed peephole kernels below
+        // read the column's placeholder bytes (0 / empty) and would mis-select NULL rows. Only int4 /
+        // text / bool leaves are validity-aware in the VM today; a nullable int8/numeric/date/timestamp/
+        // uuid/int2 predicate is a clean-error follow-up (no silent mis-answer). A no-NULL table never
+        // enters here, so existing (non-nullable) plans keep their peephole fast paths byte-identically.
+        if predicate_references_nullable_column(predicate, table, snapshot)? {
+            if !predicate_value_columns_vm_lowerable(predicate, table) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "WHERE over a nullable non-(int4/text/bool) column is not yet supported on the GPU \
+                     (M3 3VL follow-up)"
+                        .to_string(),
+                )));
+            }
+            let mut program = Vec::new();
+            let mut needles: Vec<Vec<u8>> = Vec::new();
+            compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
+            return device_memory
+                .run_expr_predicate_filter_with_text(
+                    &program,
+                    &needles,
+                    row_count,
+                    ResidentElemType::I32,
+                )
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
         }
 
         let ResidentExpr::Binary {

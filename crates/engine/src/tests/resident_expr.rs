@@ -88,6 +88,94 @@ fn gpu_resident_expr_select_evaluates_arithmetic_predicate_and_materializes_rows
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_where_excludes_null_operands_and_projection_carries_null() {
+    // M3 (doc 21) Slice D + C: a WHERE comparison over a NULLABLE column evaluates to UNKNOWN for a NULL
+    // operand ON THE GPU (the leaf mask is AND'd with the column's validity bitmap) -> the row is NOT
+    // selected; and a projected nullable column carries SqlValue::Null through the gather. Column a is
+    // nullable (NULL at i%4==0), b is the constant 100 (non-null). a[i]=i for the non-null rows.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    const N: i32 = 12;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        if i % 4 == 0 {
+            values.push_str("(NULL, 100)");
+        } else {
+            values.push_str(&format!("({i}, 100)"));
+        }
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let Command::Select(select) = parse_command("SELECT a FROM t").unwrap() else {
+        unreachable!()
+    };
+    let is_null = |i: i32| i % 4 == 0;
+
+    // (1) WHERE a < 5: only the NON-NULL a in {1,2,3} qualify. The NULL rows (placeholder 0) would pass
+    //     0 < 5 WITHOUT the validity AND — so this asserts the 3VL exclusion is load-bearing.
+    let a_lt_5 = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Lt,
+        lhs: Box::new(ResidentExpr::Column(0)),
+        rhs: Box::new(ResidentExpr::Int4Literal(5)),
+    };
+    let r = e.execute_resident_expr_select(&select, &a_lt_5).unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]],
+        "WHERE a < 5 must exclude NULL rows (3VL), not fold their placeholder 0"
+    );
+    assert_eq!(r.fallback_reason, None);
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+
+    // (2) WHERE b >= 0: b is non-null and constant 100, so EVERY row qualifies; projecting a then carries
+    //     SqlValue::Null for the NULL rows (the gather reads host_rows). Tests projection-carries-NULL.
+    let b_ge_0 = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Ge,
+        lhs: Box::new(ResidentExpr::Column(1)),
+        rhs: Box::new(ResidentExpr::Int4Literal(0)),
+    };
+    let r = e.execute_resident_expr_select(&select, &b_ge_0).unwrap();
+    let expected_all: Vec<Vec<SqlValue>> = (0..N)
+        .map(|i| {
+            vec![if is_null(i) {
+                SqlValue::Null
+            } else {
+                SqlValue::Int4(i)
+            }]
+        })
+        .collect();
+    assert_eq!(
+        r.rows, expected_all,
+        "projecting a nullable column must carry SqlValue::Null for the NULL rows"
+    );
+
+    // (3) col-vs-col `a < b` (b = 100): every NON-NULL a < 100 qualifies; the NULL rows are excluded even
+    //     though their placeholder 0 < 100. Result a-values = the non-null i in row order.
+    let a_lt_b = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Lt,
+        lhs: Box::new(ResidentExpr::Column(0)),
+        rhs: Box::new(ResidentExpr::Column(1)),
+    };
+    let r = e.execute_resident_expr_select(&select, &a_lt_b).unwrap();
+    let expected_non_null: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|&i| !is_null(i))
+        .map(|i| vec![SqlValue::Int4(i)])
+        .collect();
+    assert_eq!(
+        r.rows, expected_non_null,
+        "col-vs-col `a < b` must exclude NULL-a rows (3VL), not fold the placeholder 0"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_select_evaluates_deep_arithmetic_tree_via_vm() {
     // A DEEPER arithmetic tree than the 2-col fast-path — `WHERE (a + b) * 2 - 5 > K` — routes
     // through the engine's Expr compiler -> device bytecode VM (not the peephole), evaluated and
