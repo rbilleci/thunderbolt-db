@@ -8,7 +8,10 @@ use super::*;
 pub(crate) fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
     matches!(
         (value, ty),
-        (SqlValue::Int4(_), SqlType::Int4)
+        // NULL is the typeless SQL null — valid for a column of ANY type (every column is nullable;
+        // `NOT NULL` is not accepted by the parser). Coercion passes it through unchanged.
+        (SqlValue::Null, _)
+            | (SqlValue::Int4(_), SqlType::Int4)
             | (SqlValue::Int8(_), SqlType::Int8)
             | (SqlValue::Numeric(_), SqlType::Numeric { .. })
             | (SqlValue::Bool(_), SqlType::Bool)

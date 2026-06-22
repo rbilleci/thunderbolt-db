@@ -3364,6 +3364,10 @@ fn parse_typed_column_default(
         // on a NUMERIC column is stored as a `Numeric` (not the inferred `Int4`), and
         // `DEFAULT TRUE` on a BOOL column is a `Bool`. We re-parse from the rendered
         // literal text rather than trusting the inferred variant.
+        // A NULL default is the typeless SQL null — it stays NULL for a column of ANY type, so it
+        // skips the type re-coercion (which would otherwise round-trip it through its rendered text
+        // "NULL" and mis-parse it as e.g. the text value 'NULL').
+        ColumnDefault::Literal(SqlValue::Null) => Ok(ColumnDefault::Literal(SqlValue::Null)),
         ColumnDefault::Literal(value) => {
             let rendered = render_default_literal_for_coercion(&value);
             let coerced = parse_typed_value_from_str(&rendered, ty)?;
@@ -6325,6 +6329,11 @@ fn parse_typed_value_from_str(text: &str, ty: SqlType) -> Result<SqlValue, Parse
 /// Infer a [`SqlValue`] from an unquoted, uncast literal. Preserves the pre-existing
 /// rule that a bare integer is `Int4`; widens only to the genuinely new shapes.
 fn parse_inferred_unquoted_literal(s: &str) -> Result<SqlValue, ParseError> {
+    // The unquoted `NULL` keyword is the typeless SQL null (a quoted `'NULL'` is the text value,
+    // handled on the quoted path). Valid for any column type; coercion passes it through unchanged.
+    if s.eq_ignore_ascii_case("NULL") {
+        return Ok(SqlValue::Null);
+    }
     if s.eq_ignore_ascii_case("TRUE") {
         return Ok(SqlValue::Bool(true));
     }
