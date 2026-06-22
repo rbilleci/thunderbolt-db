@@ -56,7 +56,25 @@ different place, and the places do not talk to each other**:
 into one unified engine.** Until that happens, every "the database does X" claim
 is true of one of the three halves and false of the product.
 
+> **Update (2026-06-22):** this finding is still accurate, and the gap is now
+> *widening*. The GPU-engine half has advanced enormously (full general executor,
+> a feature-complete inner-join engine, typed columns, catalog joins — see §8), but
+> the feature-rich wire server **still has zero engine-execute calls** (verified) —
+> so every new engine capability is unreachable by a real client. Closing this pivot
+> (incremental §9.1 unification) is therefore now a *priority*, not deferred cleanup;
+> see the re-sequenced order in §8.
+
 ### 1.2 The GPU thesis is real but barely exercised — building the real parallel GPU engine is now THE priority thrust
+
+> **Update (2026-06-22):** the "barely exercised" premises below describe the
+> *prototype baseline* and have since been **discharged** by Phase-2 work: kernels
+> are parallel (grid-stride scans + reductions), the executor is a general
+> `Expr`/operator interpreter over every scalar type with a feature-complete GPU
+> inner-join engine, streams/async/pinned/pooled device paths exist, and real SQL
+> binds via `libpg_query`. The GPU thesis is now *well* exercised. The still-shallow
+> parts are the **GPU write path** (simulated) and the **GPU-resident catalog**
+> (synthesis stepping-stone). Read the bullets below as the historical starting point;
+> see §8 for current state.
 
 The GPU path is **not a mock**. The engine dynamically loads the CUDA driver
 (`libloading` → `libcuda.so.1`, `execution/lib.rs:1309`), allocates real device
@@ -188,6 +206,12 @@ remaining program is:
    (step 1.6) is crash-safe. Where a CPU type/catalog/join implementation lands
    first, it is an explicit **stepping-stone / parity-reference**, tracked as
    GPU-parity debt with a milestone — never the optimized hot path.
+   > **NULL is the cross-cutting enabler to sequence first among these (2026-06-22).**
+   > It is not "one more type" — it gates outer joins, the latent NULL-key join
+   > correctness gate, AVG-over-empty, any real nullable schema, the wire-server
+   > unification (golden scenarios use NULL), and a NULL-correct catalog/function
+   > engine (doc 20). As a representational change it is cheapest *before* more
+   > features assume non-null; it is the next foundational thrust (§8).
 
 > **Test-oracle hygiene is part of this debt (added 2026-06-16).** The charter
 > permits CPU relational execution only as clause-(a) "reference semantics for
@@ -396,10 +420,19 @@ open, the engine boundary is **protocol-neutral from Phase 0 onward**:
 - **Catalog is engine-native metadata**; `pg_catalog` and `information_schema`
   become *views/adapters* over it (P3), not the source of truth.
 
-### 5.7 Benchmark discipline (every milestone is benchmark-gated)
+### 5.7 Benchmark discipline (two-tier gating)
 
 Each major milestone below ships with a dated run report under
 `docs/testing/reports/series/` and may not be marked complete until it does.
+
+> **Two-tier gating (clarified 2026-06-22).** "Every milestone is benchmark-gated"
+> applies to *performance* milestones. New **operators / correctness breadth** (e.g.
+> the GPU join engine, executor type/operator coverage) land **correctness-gated** —
+> independent adversarial audit + golden + isolation tests, perf-tuned later — which
+> is the right way to land a new operator (build it correct first). The rule is
+> therefore: **correctness-gate to *land* an operator; perf-gate (a dated run report)
+> before it is on a hot path or before claiming a target.** Perf numbers remain
+> untrustworthy until the Phase-5 open-loop / p99.9 / steady-state harness lands.
 
 - **Baseline first.** Before any P0 change, capture and commit a baseline run on
   the current honest cache-off path (the `order_line` COUNT and point-lookup
@@ -890,6 +923,65 @@ waiting on the other side of that substrate. Build the foundation first; the GPU
 thesis pays off second.
 
 ## 8. Current state & immediate next step (session handoff)
+
+> ### Current state (updated 2026-06-22) — supersedes the 2026-06-15 handoff below
+>
+> The 2026-06-15 record below ("immediate next: the write-half") is **historical**.
+> Since then the engine has advanced well past it; the authoritative ordering is the
+> §1.4 GPU-native spine, and the phases (§5) are thematic buckets, not a strict
+> sequence — the work has been a spiral (Phase-2 executor and Phase-3 types/catalog
+> done together, because the executor needs the types and the joins need the catalog).
+>
+> **Landed since 2026-06-15 (all independently audited, on `origin/main`):**
+> - **Write-half complete** — `imbl` structural-sharing store, lock-free reads,
+>   `RwLock<Engine>` dropped, O(log n) by-key reads, jemalloc. Read-under-write no
+>   longer regresses.
+> - **General GPU executor (Charter rule 2) built out broadly** — every scalar type
+>   (int2/4/8, date, timestamp, numeric, uuid, text, bool) with checked arithmetic,
+>   comparisons, col-vs-col, **AND/OR**, **IN/NOT IN**, text & bool mask combinators;
+>   **GROUP BY** + aggregates (COUNT/SUM/AVG/MIN/MAX, COUNT DISTINCT, composite keys);
+>   **ORDER BY/LIMIT/OFFSET as a GPU sort** (single + on joins). Real SQL binds via
+>   **`libpg_query`** (the Phase-3 parser swap is effectively done for the read path).
+> - **GPU INNER-join engine FEATURE-COMPLETE** — left-deep N-way; keys int2/4/8/date/
+>   timestamp + text + numeric + uuid; composite (2-col) ON; comma joins; NATURAL/USING
+>   with coalescing; **N:N many-to-many** (all key types); per-side WHERE pushdown;
+>   `*`/`alias.*`; catalog joins. All on the GPU hash-join path, no CPU nested loop.
+>   Remaining join work is **entirely NULL-blocked** (outer joins + the NULL-key gate).
+> - **Catalog `\d` charter-clean closure** — golden scenarios 23/29 (relation metadata)
+>   run end-to-end on the GPU; the function-free `\d <table>` column-listing structure
+>   works. Catalog-as-relations + a GPU function engine are designed in
+>   `docs/architecture/20-gpu-resident-catalog-and-function-engine.md`.
+>
+> **Still simulated / not started (the gap that now matters most):** the **production
+> wire server still bypasses the engine entirely** (`gpu-db-server.rs` has zero
+> engine-execute calls — verified; the §1.1 "three systems" pivot is unaddressed and
+> the gap is widening); the **GPU write path is simulated**; the **commit-path WAL
+> flush is a no-op**; **NULL is unrepresented**; the **Phase-5 perf harness** is unbuilt.
+>
+> **Re-sequenced immediate-next order (2026-06-22):**
+> 1. **NULL (M3) — the next foundational thrust.** Cross-cutting: it gates outer
+>    joins, the latent NULL-key join-correctness gate, AVG-over-empty, any real
+>    nullable schema, the wire-server unification (golden scenarios use NULL), and a
+>    NULL-correct catalog/function engine. It is a representational change that gets
+>    *more expensive the more features assume non-null* — do it before more breadth.
+> 2. **Catalog-as-relations + function engine** (doc 20), now NULL-correct — closes
+>    the `\d`/`pg_dump`/introspection story; `format_type` etc. become GPU intrinsics.
+> 3. **Incremental wire-server unification (§9.1)** — route a growing subset of
+>    queries through the engine behind a flag (not a big-bang guts-swap), expanding as
+>    coverage grows. This converts engine capability into product and stops the §1.1
+>    divergence. Now unblockable (the engine has types/joins/catalog; NULL closes the rest).
+> 4. **Real GPU write path + durable WAL group-commit** — "banking OLTP" is gated on
+>    durable, real, transactional writes, not on more read features. Reads/execution
+>    have lapped the write/durability axis; rebalance toward it here.
+> 5. **Phase-5 open-loop / p99.9 / steady-state harness + perf-tuning to targets** —
+>    the prerequisite for *trusting any perf number* (§1.3's targets are still "not yet
+>    measurable"). New operators (joins, executor breadth) shipped **correctness-gated**
+>    (independent audits + golden + isolation), not perf-gated — that is the right call
+>    for landing an operator, so the gating policy is two-tier: **correctness-gate to
+>    land, perf-gate before a hot path / before claiming a target** (amends §5.7's
+>    "every milestone is benchmark-gated").
+>
+> --- *(historical 2026-06-15 handoff follows)* ---
 
 **Branch:** `phase0-m1-engine-facade` (pushed to origin). **Last updated:**
 2026-06-15.
