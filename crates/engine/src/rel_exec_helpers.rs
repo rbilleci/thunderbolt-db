@@ -224,8 +224,18 @@ pub(crate) fn relational_key_prefix(table: &str) -> String {
     format!("rel/{table}/")
 }
 
+/// The reserved, prefix-free storage/index token for SQL `NULL`. No typed value can
+/// produce it (every typed encoding is type-prefixed, e.g. `t:`/`i:`), so it is an
+/// unambiguous sentinel shared by the value-index key, the stored-row encoding, and the
+/// decode path — kept in one place so those three can't drift apart.
+pub(crate) const NULL_TOKEN: &str = "null";
+
 pub(crate) fn relational_index_value(value: &SqlValue) -> String {
     match value {
+        // NULL keys to the reserved prefix-free token. `WHERE col = NULL` is never TRUE in
+        // SQL, so this key is not consulted by equality lookups; it exists for storage
+        // symmetry and a future `IS NULL` index probe.
+        SqlValue::Null => NULL_TOKEN.to_string(),
         SqlValue::Int2(value) => format!("i2:{value}"),
         SqlValue::Int4(value) => format!("i:{value}"),
         SqlValue::Int8(value) => format!("n:{value}"),
@@ -294,7 +304,8 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
         SqlValue::Int2(value) => Ok(value.to_string()),
         SqlValue::Int4(value) => Ok(value.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
-        SqlValue::Int8(_)
+        SqlValue::Null
+        | SqlValue::Int8(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Date(_)
@@ -309,6 +320,9 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
 
 pub(crate) fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
     match value {
+        // NULL occupies a null-bitmap bit (slice 2), not typed payload bytes; this is only the
+        // `resident_bytes` accounting metric, so a NULL cell contributes 0 typed bytes.
+        SqlValue::Null => 0,
         // int2 rides the int4 device section widened to 4 bytes.
         SqlValue::Int2(_) => 4,
         SqlValue::Int4(_) => 4,
@@ -682,6 +696,9 @@ pub(crate) fn encode_relational_row(values: &[SqlValue]) -> String {
     values
         .iter()
         .map(|value| match value {
+            // Stored type-independently as the reserved prefix-free token; decodes back to
+            // `SqlValue::Null` regardless of column type (see `decode_relational_value`).
+            SqlValue::Null => NULL_TOKEN.to_string(),
             SqlValue::Int2(value) => format!("i2:{value}"),
             SqlValue::Int4(value) => format!("i:{value}"),
             SqlValue::Int8(value) => format!("n:{value}"),
@@ -730,6 +747,12 @@ pub(crate) fn decode_relational_value(
             column.name
         )))
     };
+    // A stored NULL is the reserved prefix-free token (see `encode_relational_row`),
+    // type-independent: it decodes to `SqlValue::Null` for any column type. Real text never
+    // collides — text is stored with a `t:` prefix, so a bare `null` can only be a stored NULL.
+    if part == NULL_TOKEN {
+        return Ok(SqlValue::Null);
+    }
     match column.ty {
         SqlType::Int2 => {
             let value = part.strip_prefix("i2:").ok_or_else(wrong_type)?;
@@ -843,6 +866,13 @@ pub(crate) fn split_escaped_row(input: &str) -> Vec<String> {
 
 pub(crate) fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
     match (left, right) {
+        // NULL sorts lowest in this INTERNAL total order (value-index/dedup only). SQL 3VL —
+        // where a comparison to NULL is UNKNOWN, never an ordering — is enforced one level up in
+        // `select_filter_matches` (which excludes any row whose operand is NULL); this arm only
+        // keeps the comparator total so internal ordered structures never panic on a NULL cell.
+        (SqlValue::Null, SqlValue::Null) => Ordering::Equal,
+        (SqlValue::Null, _) => Ordering::Less,
+        (_, SqlValue::Null) => Ordering::Greater,
         // smallint widens to int4 for every comparison (PG's numeric tower); recurse with it widened
         // so the existing integer/numeric cross-type arms apply -- no per-pair int2 spread.
         (SqlValue::Int2(left), right) => {
@@ -952,6 +982,12 @@ pub(crate) fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering 
 }
 
 pub(crate) fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) -> bool {
+    // SQL three-valued logic: any comparison with a NULL operand is UNKNOWN, and a WHERE
+    // predicate that is UNKNOWN excludes the row (it is not TRUE). `IS NULL`/`IS NOT NULL` are
+    // separate operators (not modeled here), so for every comparison op a NULL operand → false.
+    if matches!(left, SqlValue::Null) || matches!(right, SqlValue::Null) {
+        return false;
+    }
     match op {
         // Eq is scale/type-aware like the ordering ops, so `numeric = int` matches across
         // the numeric tower. Bound filter literals are pre-coerced to the column type, but
@@ -1931,7 +1967,8 @@ pub(crate) fn int4_aggregate_value(
 ) -> Result<i32, ExecuteError> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int2(_)
+        SqlValue::Null
+        | SqlValue::Int2(_)
         | SqlValue::Int8(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)

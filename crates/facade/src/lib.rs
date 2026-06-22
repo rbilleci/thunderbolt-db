@@ -59,6 +59,10 @@ pub enum LogicalType {
 /// numeric wire codec is a later milestone).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbValue {
+    /// SQL `NULL` — the typeless absence of a value. The wire adapter maps it to the
+    /// protocol's `-1` field length via [`pg_adapter::db_value_text_opt`]. Mirrors
+    /// [`gpu_db_sql::SqlValue::Null`].
+    Null,
     Int4(i32),
     Int8(i64),
     Numeric(Decimal128),
@@ -661,6 +665,7 @@ fn map_column(column: &RelationalColumn) -> ColumnMeta {
 
 fn map_value(value: SqlValue) -> DbValue {
     match value {
+        SqlValue::Null => DbValue::Null,
         SqlValue::Int4(value) => DbValue::Int4(value),
         SqlValue::Int8(value) => DbValue::Int8(value),
         SqlValue::Numeric(value) => DbValue::Numeric(value),
@@ -687,6 +692,25 @@ fn command_tag(command: &Command) -> CommandTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_maps_through_the_value_model_to_a_wire_null() {
+        // M3 slice 1: SqlValue::Null → DbValue::Null → the wire boundary returns `None`
+        // (the protocol's `-1` DataRow field length), while every typed value still
+        // renders to `Some(text)`. This closes the engine→wire NULL path.
+        assert_eq!(map_value(SqlValue::Null), DbValue::Null);
+        assert_eq!(pg_adapter::db_value_text_opt(&DbValue::Null), None);
+        assert_eq!(
+            pg_adapter::db_value_text_opt(&DbValue::Int4(42)),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            pg_adapter::db_value_text_opt(&DbValue::Text("x".to_string())),
+            Some("x".to_string())
+        );
+        // A non-null value's text encoding is unchanged by the new boundary.
+        assert_eq!(pg_adapter::db_value_text(&DbValue::Bool(true)), "t");
+    }
 
     #[test]
     fn relational_lifecycle_round_trips_through_facade() {

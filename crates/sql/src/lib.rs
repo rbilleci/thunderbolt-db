@@ -990,6 +990,13 @@ pub struct UpdateAssignment {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SqlValue {
+    /// SQL `NULL` — the typeless absence of a value. Placed first so the *derived*
+    /// `Ord`/`Eq` (used only for internal value-index keys and dedup, never for SQL
+    /// truth) gives a deterministic total order with `Null` sorting lowest. SQL
+    /// semantics (where `NULL = NULL` is UNKNOWN and a comparison to NULL is never
+    /// TRUE) route through `compare_sql_values`/`select_filter_matches`, never the
+    /// derived traits. See `docs/architecture/21-null-representation-and-three-valued-logic.md`.
+    Null,
     Int4(i32),
     Int8(i64),
     /// A fixed-point decimal (`numeric`). Equality and ordering are scale-aligned via
@@ -3372,6 +3379,7 @@ fn parse_typed_column_default(
 /// expects, so it can be re-parsed at the column's declared type.
 fn render_default_literal_for_coercion(value: &SqlValue) -> String {
     match value {
+        SqlValue::Null => "NULL".to_string(),
         SqlValue::Int2(value) => value.to_string(),
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
@@ -5994,7 +6002,8 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
-        SqlValue::Int8(_)
+        SqlValue::Null
+        | SqlValue::Int8(_)
         | SqlValue::Int2(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
@@ -6011,7 +6020,8 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeOffset),
-        SqlValue::Int8(_)
+        SqlValue::Null
+        | SqlValue::Int8(_)
         | SqlValue::Int2(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)

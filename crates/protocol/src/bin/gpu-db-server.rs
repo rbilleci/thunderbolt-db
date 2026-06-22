@@ -160,6 +160,11 @@ fn column_default_matches_type(value: &ColumnDefault, ty: gpu_db_protocol::SqlTy
 fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
     use gpu_db_protocol::Decimal128;
     match (left, right) {
+        // NULL sorts lowest in this internal total order (this server does not produce NULL
+        // values; the arm only keeps the comparator total now that SqlValue has a Null variant).
+        (SqlValue::Null, SqlValue::Null) => std::cmp::Ordering::Equal,
+        (SqlValue::Null, _) => std::cmp::Ordering::Less,
+        (_, SqlValue::Null) => std::cmp::Ordering::Greater,
         // smallint widens to int4 for every comparison (PG's numeric tower); recurse widened.
         (SqlValue::Int2(left), right) => {
             compare_sql_values(&SqlValue::Int4(i32::from(*left)), right)
@@ -1527,7 +1532,8 @@ fn int4_value(value: &SqlValue) -> Result<i32, ErrorField> {
 fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result<i32, ErrorField> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int2(_)
+        SqlValue::Null
+        | SqlValue::Int2(_)
         | SqlValue::Int8(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
@@ -1584,6 +1590,9 @@ fn compare_averages(
 
 fn format_sql_value(value: &SqlValue) -> String {
     match value {
+        // Dead arm (this server does not produce NULL); NULL reaches the wire as a `-1` field
+        // length via the `Option<String>` result rows, not through this text renderer.
+        SqlValue::Null => "NULL".to_string(),
         SqlValue::Int2(value) => value.to_string(),
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
@@ -2776,6 +2785,7 @@ fn add_unique_constraint_to_session(
 
 fn format_default_expr(value: &SqlValue) -> String {
     match value {
+        SqlValue::Null => "NULL".to_string(),
         SqlValue::Int2(value) => format!("{value}::smallint"),
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Text(value) => format!("'{}'::text", value.replace('\'', "''")),
@@ -15107,6 +15117,8 @@ fn compat_table_heap_size_bytes(table: &Table) -> u64 {
 
 fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
     match value {
+        // NULL is sent as a `-1` field length (no bytes); 0 here keeps the size estimate honest.
+        SqlValue::Null => 0,
         SqlValue::Int2(_) => 2,
         SqlValue::Int4(_) => 4,
         SqlValue::Text(value) => value.len() as u64,

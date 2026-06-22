@@ -37,11 +37,15 @@ pub fn logical_type_size(ty: LogicalType) -> i16 {
     }
 }
 
-/// Text-format wire encoding of a neutral value. A `Numeric` renders via its
-/// fixed-point decimal string (with the decimal point); a `Bool` renders as the
-/// PostgreSQL `t`/`f` text form.
+/// Text-format wire encoding of a *non-null* neutral value. A `Numeric` renders via
+/// its fixed-point decimal string (with the decimal point); a `Bool` renders as the
+/// PostgreSQL `t`/`f` text form. NULL is represented out-of-band on the wire (a `-1`
+/// `DataRow` field length), so callers at the wire boundary must use
+/// [`db_value_text_opt`], which returns `None` for [`DbValue::Null`]; this function's
+/// `Null` arm renders `NULL` only as a defensive textual fallback for direct callers.
 pub fn db_value_text(value: &DbValue) -> String {
     match value {
+        DbValue::Null => "NULL".to_string(),
         DbValue::Int2(value) => value.to_string(),
         DbValue::Int4(value) => value.to_string(),
         DbValue::Int8(value) => value.to_string(),
@@ -51,6 +55,17 @@ pub fn db_value_text(value: &DbValue) -> String {
         DbValue::Date(value) => gpu_db_sql::datetime::format_date(*value),
         DbValue::Timestamp(value) => gpu_db_sql::datetime::format_timestamp(*value),
         DbValue::Uuid(value) => gpu_db_sql::uuid::format_uuid(value),
+    }
+}
+
+/// Wire-boundary encoding of a neutral value: [`DbValue::Null`] maps to `None` (the
+/// PostgreSQL `DataRow` `-1` field length), every other value to `Some(text)`. This is
+/// the encoder the engine→wire path uses so that a NULL cell is emitted as a NULL field
+/// rather than as the text `"NULL"`.
+pub fn db_value_text_opt(value: &DbValue) -> Option<String> {
+    match value {
+        DbValue::Null => None,
+        other => Some(db_value_text(other)),
     }
 }
 

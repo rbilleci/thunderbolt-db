@@ -264,7 +264,7 @@ fn encode_outcome(outcome: Result<QueryOutcome, DbError>) -> io::Result<Vec<u8>>
                     for row in rows {
                         let values: Vec<Option<String>> = row
                             .iter()
-                            .map(|value| Some(pg_adapter::db_value_text(value)))
+                            .map(pg_adapter::db_value_text_opt)
                             .collect();
                         writer.data_row(&values)?;
                     }

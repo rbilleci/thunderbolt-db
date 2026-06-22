@@ -17,6 +17,7 @@ static NEXT_TEST_WAL_PATH_ID: AtomicU64 = AtomicU64::new(1);
 // roughly follows the engine: read path, write path, then catalog/durability.
 mod concurrency; // &self read path, stage-3 reader/writer + value-index
 mod mvcc_bundles; // provenance frames + bundle/occurrence filters
+mod null_representation; // M3 NULL slice 1: SqlValue::Null value-model foundation
 mod mvcc_joins; // labeled-branch + join-side projection/ordering
 mod mvcc_provenance; // provenance + source-composition + value-chain queries
 mod mvcc_query; // MVCC query basics: scan/first-cuda-slice/cuda-native/composition
