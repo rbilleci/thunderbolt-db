@@ -1393,8 +1393,10 @@ fn decode_single_copy_option_char(raw_value: &str) -> Option<char> {
 }
 
 fn parse_copy_text_value(input: &str, ty: SqlType) -> Result<SqlValue, CopyParseError> {
+    // COPY TEXT format: the default NULL marker is the unquoted `\N` (M3 — doc 21). It ingests as a SQL
+    // NULL for any column type (a literal backslash-N text value arrives escaped as `\\N`, decoded below).
     if input == r"\N" {
-        return Err(CopyParseError::NullNotSupported);
+        return Ok(SqlValue::Null);
     }
     let text = decode_copy_text(input)?;
     parse_copy_typed_value(&text, ty)
@@ -1537,6 +1539,10 @@ fn parse_copy_csv_row(
                     text: std::mem::take(&mut field),
                     quoted,
                 });
+                // Reset BOTH per-field flags: `quoted` must reflect only THIS field, else an unquoted
+                // empty field following a quoted one is mis-classified as a quoted empty string (Text(""))
+                // instead of the NULL marker (M3 — doc 21). `after_quote` gates the post-close error.
+                quoted = false;
                 after_quote = false;
             }
             _ if after_quote => return Err(CopyParseError::MalformedCsvQuotedField),
@@ -1555,8 +1561,10 @@ fn parse_copy_csv_row(
 }
 
 fn parse_copy_csv_value(field: &CopyCsvField, ty: SqlType) -> Result<SqlValue, CopyParseError> {
+    // COPY CSV format: an UNQUOTED empty field is the default NULL marker and ingests as a SQL NULL (M3 —
+    // doc 21). A QUOTED empty field (`""`) is the empty STRING, not NULL — so the `!quoted` guard matters.
     if !field.quoted && field.text.is_empty() {
-        return Err(CopyParseError::NullNotSupported);
+        return Ok(SqlValue::Null);
     }
     parse_copy_typed_value(&field.text, ty)
 }

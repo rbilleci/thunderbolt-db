@@ -307,8 +307,10 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
         SqlValue::Int2(value) => Ok(value.to_string()),
         SqlValue::Int4(value) => Ok(value.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
-        SqlValue::Null
-        | SqlValue::Int8(_)
+        // M3 (doc 21): a NULL cell (e.g. a COPY `\N` field) renders as the SQL NULL keyword; the
+        // re-parsed INSERT recognizes the unquoted `NULL` literal and stores a SqlValue::Null.
+        SqlValue::Null => Ok("NULL".to_string()),
+        SqlValue::Int8(_)
         | SqlValue::Numeric(_)
         | SqlValue::Bool(_)
         | SqlValue::Date(_)

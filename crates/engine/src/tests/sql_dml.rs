@@ -177,6 +177,75 @@ fn relational_copy_rows_commit_through_engine_wal_mvcc() {
 }
 
 #[test]
+fn relational_copy_ingests_null_marker_and_selects_back_null() {
+    // M3 (doc 21) Slice G: the COPY NULL marker ingests as a SQL NULL. TEXT format: the unquoted `\N`.
+    // CSV format: an UNQUOTED empty field (a QUOTED empty field is the empty STRING, not NULL).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)").unwrap();
+
+    // TEXT format: row 1's name is `\N` (NULL); row 2's name is a real value.
+    let copy = gpu_db_sql::parse_copy_from_stdin("COPY t (id, name) FROM STDIN").unwrap();
+    let cols = e.relational_copy_columns(&copy.table).unwrap();
+    let text_rows = ["1\t\\N", "2\tAda"]
+        .into_iter()
+        .map(|line| {
+            gpu_db_sql::parse_copy_row(&cols, copy.columns.as_deref().unwrap(), copy.options, line)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_rows[0],
+        vec![SqlValue::Int4(1), SqlValue::Null],
+        "COPY TEXT \\N ingests as NULL"
+    );
+    assert_eq!(
+        text_rows[1],
+        vec![SqlValue::Int4(2), SqlValue::Text("Ada".to_string())]
+    );
+    assert_eq!(e.execute_relational_copy_rows(2, &copy, text_rows).unwrap(), 2);
+
+    // CSV format: `3,` -> unquoted empty name -> NULL; `4,""` -> quoted empty name -> the empty string.
+    let csv =
+        gpu_db_sql::parse_copy_from_stdin("COPY t (id, name) FROM STDIN WITH (FORMAT csv)").unwrap();
+    // `3,` unquoted empty -> NULL; `4,""` quoted empty -> empty string; `"5",` a QUOTED first field then
+    // an UNQUOTED empty -> NULL (regression: the per-field `quoted` flag must reset across the delimiter,
+    // else the empty field after a quoted one is mis-read as a quoted empty string).
+    let csv_rows = ["3,", "4,\"\"", "\"5\","]
+        .into_iter()
+        .map(|line| {
+            gpu_db_sql::parse_copy_row(&cols, csv.columns.as_deref().unwrap(), csv.options, line)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        csv_rows[0],
+        vec![SqlValue::Int4(3), SqlValue::Null],
+        "an UNQUOTED empty CSV field is NULL"
+    );
+    assert_eq!(
+        csv_rows[1],
+        vec![SqlValue::Int4(4), SqlValue::Text(String::new())],
+        "a QUOTED empty CSV field is the empty string, not NULL"
+    );
+    assert_eq!(
+        csv_rows[2],
+        vec![SqlValue::Int4(5), SqlValue::Null],
+        "an UNQUOTED empty field after a QUOTED field is still NULL (per-field quoted reset)"
+    );
+    assert_eq!(e.execute_relational_copy_rows(3, &csv, csv_rows).unwrap(), 3);
+
+    // The \N-ingested row selects back as NULL (the store round-trips it).
+    let Command::Select(select) = parse_command("SELECT name FROM t WHERE id = 1").unwrap() else {
+        panic!("expected SELECT plan");
+    };
+    assert_eq!(
+        e.execute_relational_select(&select).unwrap().rows,
+        vec![vec![SqlValue::Null]],
+        "COPY \\N stored and selects back as NULL"
+    );
+}
+
+#[test]
 fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
     let e = Engine::new_local();
     e.execute_text(
