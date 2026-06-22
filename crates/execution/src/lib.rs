@@ -13107,6 +13107,10 @@ pub enum ExprStep {
         bitmap_byte_offset: u64,
         negate: bool,
     },
+    /// Push a CONSTANT per-row mask (every row `value ? 1 : 0`), filled with a device memset (no kernel).
+    /// Used by `col IS NULL` / `IS NOT NULL` on a column with no NULL validity bitmap (M3 -- doc 21): the
+    /// column holds no NULLs, so every row is valid -- IS NOT NULL is all-1, IS NULL all-0.
+    ConstMask { value: bool },
 }
 
 /// Compare an int4 value buffer (absolute device ptr) to `needle` and return the matching row
@@ -13857,6 +13861,21 @@ fn run_resident_arith_program<'r>(
                     (&mut a4 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::ConstMask { value } => {
+                // A constant per-row i32 mask (no kernel) -- `col IS NULL`/`IS NOT NULL` on a column with
+                // no validity bitmap (no NULLs). Fill a fresh buffer from the host: each VM launch syncs
+                // and this buffer is only read by a later (syncing) MaskBinary / compaction step, so the
+                // blocking HtoD is correctly ordered (same idiom as the overflow flag's zero-init above).
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mask_bytes = n_usize
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+                let fill = vec![i32::from(value); n_usize];
+                check_cuda(unsafe {
+                    cu_memcpy_htod(out.ptr, fill.as_ptr().cast::<c_void>(), mask_bytes)
+                })?;
                 stack.push(out);
             }
         }

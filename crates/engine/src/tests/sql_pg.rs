@@ -195,6 +195,32 @@ fn execute_resident_expr_select_sql_maps_supported_predicate_and_reaches_gpu_dis
 }
 
 #[test]
+fn execute_resident_expr_select_sql_maps_is_null_predicate_and_reaches_gpu_dispatch() {
+    // `WHERE v IS NULL` / `IS NOT NULL` (a libpg_query NullTest node) maps to `ResidentExpr::IsNull` and
+    // binds, reaching the GPU residency stage (PAST parse/map/bind) -- not a mapper "unsupported node"
+    // rejection. With no residency populated it stops at the residency error, which is deterministic on
+    // any box. (The GPU e2e validity-bitmap test in resident_expr.rs runs it through end to end.)
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    for sql in [
+        "SELECT id FROM t WHERE v IS NULL",
+        "SELECT id FROM t WHERE v IS NOT NULL",
+    ] {
+        match e.execute_resident_expr_select_sql(sql) {
+            Ok(_) => panic!("no residency snapshot populated, so `{sql}` cannot return rows"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("resident"),
+                    "`{sql}` must map (NullTest -> IsNull) and reach the residency stage, not a mapper \
+                     rejection; got: {msg}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_execute_resident_expr_select_sql_runs_predicate_from_sql_text() {
     // The whole loop: a SQL STRING -> libpg_query -> ResidentExpr -> general GPU executor, end to end.

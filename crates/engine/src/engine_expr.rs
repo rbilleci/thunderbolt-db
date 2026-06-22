@@ -60,6 +60,12 @@ pub(crate) enum ResidentExpr {
     /// (the type matrix, doc 19). A bool column is a bitmap, so the comparison lowers to the
     /// bitmap->mask kernel with the appropriate `negate`.
     BoolLiteral(bool),
+    /// `col IS NULL` / `col IS NOT NULL` (`is_not_null` selects which). A unary predicate LEAF over a
+    /// column's NULL validity bitmap (M3 -- doc 21): it lowers to the SAME `gpu_db_resident_bool_to_mask`
+    /// kernel as a bool column, pointed at the column's validity bitmap (1 = valid/present), with
+    /// `negate = !is_not_null`. A column with no validity bitmap (no NULLs) lowers to an all-constant
+    /// mask. Not an arithmetic operand -- the arith/compare paths reject it.
+    IsNull { col: usize, is_not_null: bool },
     Binary {
         op: ResidentBinaryOp,
         lhs: Box<ResidentExpr>,
@@ -458,6 +464,9 @@ fn expr_mentions_int8(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
+        // IS NULL is a type-neutral validity test (it lowers to a bitmap mask), not a typed value
+        // operand -- it never drives element-type routing.
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int8(lhs, table) || expr_mentions_int8(rhs, table)
         }
@@ -475,6 +484,7 @@ fn expr_mentions_int4_column(expr: &ResidentExpr, table: &RelationalTable) -> bo
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int4_column(lhs, table) || expr_mentions_int4_column(rhs, table)
         }
@@ -509,6 +519,7 @@ fn expr_mentions_numeric(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::TextLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_numeric(lhs, table) || expr_mentions_numeric(rhs, table)
         }
@@ -546,6 +557,7 @@ fn expr_mentions_text(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ResidentExpr::Int4Literal(_)
         | ResidentExpr::NumericLiteral(_)
         | ResidentExpr::BoolLiteral(_) => false,
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table)
         }
@@ -585,6 +597,7 @@ fn expr_mentions_date(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Date)
         }
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_date(lhs, table) || expr_mentions_date(rhs, table)
         }
@@ -630,6 +643,7 @@ fn expr_mentions_timestamp(expr: &ResidentExpr, table: &RelationalTable) -> bool
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Timestamp)
         }
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_timestamp(lhs, table) || expr_mentions_timestamp(rhs, table)
         }
@@ -677,6 +691,7 @@ fn expr_mentions_uuid(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Uuid)
         }
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table)
         }
@@ -720,6 +735,7 @@ fn expr_mentions_int2(expr: &ResidentExpr, table: &RelationalTable) -> bool {
         ResidentExpr::Column(idx) => {
             table.columns.get(*idx).map(|column| column.ty) == Some(SqlType::Int2)
         }
+        ResidentExpr::IsNull { .. } => false,
         ResidentExpr::Binary { lhs, rhs, .. } => {
             expr_mentions_int2(lhs, table) || expr_mentions_int2(rhs, table)
         }
@@ -864,6 +880,10 @@ fn numeric_arith_scale(expr: &ResidentExpr, table: &RelationalTable) -> Result<u
                 "a text/bool literal is not a numeric arithmetic operand".to_string(),
             )))
         }
+        // IS NULL is a predicate leaf, never an arithmetic operand (the parser never produces it here).
+        ResidentExpr::IsNull { .. } => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "IS NULL is not a numeric arithmetic operand".to_string(),
+        ))),
         ResidentExpr::Binary { op, lhs, rhs } => {
             let lhs_scale = numeric_arith_scale(lhs, table)?;
             let rhs_scale = numeric_arith_scale(rhs, table)?;
@@ -924,6 +944,10 @@ fn compile_numeric_arith(
             program.push(ExprStep::LoadColumn { byte_offset });
             Ok(scale)
         }
+        // IS NULL is a predicate leaf, never an arithmetic operand (the parser never produces it here).
+        ResidentExpr::IsNull { .. } => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "IS NULL is not a numeric arithmetic operand".to_string(),
+        ))),
         ResidentExpr::Binary { op, lhs, rhs } => {
             let op_code = arith_op_code(*op).ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1117,6 +1141,10 @@ fn compile_arith_program(
             program.push(ExprStep::LoadColumn { byte_offset });
             Ok(())
         }
+        // IS NULL is a predicate leaf, never an arithmetic operand (the parser never produces it here).
+        ResidentExpr::IsNull { .. } => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "IS NULL is not an arithmetic operand".to_string(),
+        ))),
         ResidentExpr::Binary { op, lhs, rhs } => {
             let op_code = arith_op_code(*op).ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
@@ -1217,6 +1245,23 @@ fn compile_predicate_program(
             "a bare column predicate leaf must be a bool column (argument of WHERE must be boolean)"
                 .to_string(),
         )));
+    }
+    // `col IS NULL` / `col IS NOT NULL` (M3 -- doc 21): the column's NULL validity bitmap as a mask,
+    // reusing the bool bitmap->mask kernel. The bitmap bit is 1 when the row is VALID (present), so
+    // `IS NOT NULL` reads it as-is and `IS NULL` complements it (`negate = !is_not_null`). A column with
+    // no validity bitmap holds no NULLs -> every row valid -> a constant mask (all-1 for IS NOT NULL,
+    // all-0 for IS NULL), needing no kernel.
+    if let ResidentExpr::IsNull { col, is_not_null } = expr {
+        match resident_device_null_column_offset(snapshot, table, *col)? {
+            Some(bitmap_byte_offset) => program.push(ExprStep::BoolMask {
+                bitmap_byte_offset,
+                negate: !is_not_null,
+            }),
+            None => program.push(ExprStep::ConstMask {
+                value: *is_not_null,
+            }),
+        }
+        return Ok(());
     }
     let ResidentExpr::Binary { op, lhs, rhs } = expr else {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -4846,6 +4891,36 @@ impl Engine {
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))
     }
 
+    /// Lower a standalone `col IS NULL` / `IS NOT NULL` to surviving row indices (M3 -- doc 21). The
+    /// column's NULL validity bitmap (1 = valid/present) feeds the same bitmap->mask kernel as a bool
+    /// column: `IS NOT NULL` reads it as-is, `IS NULL` complements it (`negate = !is_not_null`). A column
+    /// with NO validity bitmap holds no NULLs, so every row is valid -- IS NOT NULL is all rows, IS NULL
+    /// none -- returned directly without a kernel.
+    fn lower_is_null_predicate(
+        &self,
+        col: usize,
+        is_not_null: bool,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Vec<u32>, ExecuteError> {
+        match resident_device_null_column_offset(snapshot, table, col)? {
+            Some(offset) => device_memory
+                .expr_bool_to_mask_filter(offset, !is_not_null, row_count)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))),
+            None if is_not_null => {
+                let n = u32::try_from(row_count).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident row count exceeds u32".to_string(),
+                    ))
+                })?;
+                Ok((0..n).collect())
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Try to lower `bool_col = true` / `bool_col = false` (and `<>`, either operand order) to
     /// surviving row indices via the bitmap->mask kernel (the type matrix, doc 19): `= true` selects
     /// the set bits, `= false` (and `NOT flag`, which the mapper rewrites to `= false`) the clear bits
@@ -4906,6 +4981,20 @@ impl Engine {
         // boolean"), so it hard-errors rather than mis-answering.
         if let ResidentExpr::Column(col) = predicate {
             return self.lower_bool_column_predicate(*col, table, snapshot, device_memory, row_count);
+        }
+
+        // A standalone `col IS NULL` / `IS NOT NULL` (M3 -- doc 19/21): its NULL validity bitmap straight
+        // to the row mask via the SAME bitmap->mask kernel as a bool column, pointed at the validity
+        // bitmap. (Inside AND/OR it instead rides the general mask VM via `compile_predicate_program`.)
+        if let ResidentExpr::IsNull { col, is_not_null } = predicate {
+            return self.lower_is_null_predicate(
+                *col,
+                *is_not_null,
+                table,
+                snapshot,
+                device_memory,
+                row_count,
+            );
         }
 
         let ResidentExpr::Binary {

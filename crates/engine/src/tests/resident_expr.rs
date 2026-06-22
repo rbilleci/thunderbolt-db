@@ -6469,3 +6469,186 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
     }
     eprintln!();
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_select_evaluates_is_null_and_is_not_null_via_validity_bitmap() {
+    // `WHERE v IS NULL` / `IS NOT NULL` runs ON THE GPU (M3 -- doc 21): the column's NULL validity
+    // bitmap (slice 2a) feeds the SAME bitmap->mask kernel as a bool column, pointed at the validity
+    // bitmap. GPU-native oracle = CONSTRUCTION (we know which rows are NULL by the insert rule). Projects
+    // `id` (which has no NULLs) for the surviving rows.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+
+    const N: i32 = 300;
+    let is_null = |i: i32| i % 3 == 0; // v is NULL when i % 3 == 0, else i
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        if is_null(i) {
+            values.push_str(&format!("({i}, NULL)"));
+        } else {
+            values.push_str(&format!("({i}, {i})"));
+        }
+    }
+    e.execute_text(2, &format!("INSERT INTO t (id, v) VALUES {values}"))
+        .unwrap();
+
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
+        unreachable!()
+    };
+
+    // IS NULL: surviving ids are exactly those where v is NULL.
+    let is_null_pred = ResidentExpr::IsNull {
+        col: 1,
+        is_not_null: false,
+    };
+    let res_null = e
+        .execute_resident_expr_select(&select, &is_null_pred)
+        .expect("IS NULL on GPU");
+    let expected_null: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|&i| is_null(i))
+        .map(|i| vec![SqlValue::Int4(i)])
+        .collect();
+    assert_eq!(
+        res_null.rows, expected_null,
+        "WHERE v IS NULL must return exactly the NULL-v rows' ids, evaluated on the GPU bitmap"
+    );
+    assert_eq!(res_null.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(res_null.fallback_reason, None);
+
+    // IS NOT NULL: the complement.
+    let not_null_pred = ResidentExpr::IsNull {
+        col: 1,
+        is_not_null: true,
+    };
+    let res_not_null = e
+        .execute_resident_expr_select(&select, &not_null_pred)
+        .expect("IS NOT NULL on GPU");
+    let expected_not_null: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|&i| !is_null(i))
+        .map(|i| vec![SqlValue::Int4(i)])
+        .collect();
+    assert_eq!(
+        res_not_null.rows, expected_not_null,
+        "WHERE v IS NOT NULL must return exactly the non-NULL rows' ids"
+    );
+    assert_eq!(res_not_null.executed_target, DeviceTarget::Gpu(0));
+
+    // Non-vacuity: the two results partition all rows, both non-empty, and disjoint.
+    assert_eq!(res_null.rows.len() + res_not_null.rows.len(), N as usize);
+    assert!(!res_null.rows.is_empty() && !res_not_null.rows.is_empty());
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_is_null_on_a_column_with_no_nulls_uses_a_constant_mask() {
+    // The all-valid case (M3 -- doc 21): a column with NO NULLs has no validity bitmap, so inside AND/OR
+    // `IS NULL`/`IS NOT NULL` lowers to a CONSTANT mask in the predicate VM (a device memset, no kernel) --
+    // IS NOT NULL is all-1, IS NULL all-0. Combined with `id < K` to prove the constant is real (not just
+    // "all rows" / "no rows" by accident).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE u (id INT, w INT)").unwrap();
+    const N: i32 = 200;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        values.push_str(&format!("({i}, {i})")); // w is never NULL
+    }
+    e.execute_text(2, &format!("INSERT INTO u (id, w) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("u").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // w has no NULLs -> no validity bitmap -> exercises the ConstMask path (not BoolMask).
+    assert!(snapshot.resident_device_null_columns.is_empty());
+
+    let Command::Select(select) = parse_command("SELECT id FROM u").unwrap() else {
+        unreachable!()
+    };
+    const K: i32 = 50;
+    let lt_k = || ResidentExpr::Binary {
+        op: ResidentBinaryOp::Lt,
+        lhs: Box::new(ResidentExpr::Column(0)),
+        rhs: Box::new(ResidentExpr::Int4Literal(K)),
+    };
+
+    // `w IS NOT NULL AND id < K`: ConstMask{true} (all valid) AND (id<K) -> id in [0, K). If ConstMask
+    // were wrongly all-0, this would be empty.
+    let pred_not_null = ResidentExpr::Binary {
+        op: ResidentBinaryOp::And,
+        lhs: Box::new(ResidentExpr::IsNull {
+            col: 1,
+            is_not_null: true,
+        }),
+        rhs: Box::new(lt_k()),
+    };
+    let res = e
+        .execute_resident_expr_select(&select, &pred_not_null)
+        .expect("ConstMask(true) AND on GPU");
+    let expected: Vec<Vec<SqlValue>> = (0..K).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(
+        res.rows, expected,
+        "w IS NOT NULL (all valid) AND id<K must be id in [0,K)"
+    );
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+
+    // `w IS NULL AND id < K`: ConstMask{false} AND (...) -> empty. If ConstMask were wrongly all-1, this
+    // would be id<K (non-empty).
+    let pred_null = ResidentExpr::Binary {
+        op: ResidentBinaryOp::And,
+        lhs: Box::new(ResidentExpr::IsNull {
+            col: 1,
+            is_not_null: false,
+        }),
+        rhs: Box::new(lt_k()),
+    };
+    let res_null = e
+        .execute_resident_expr_select(&select, &pred_null)
+        .expect("ConstMask(false) AND on GPU");
+    assert!(
+        res_null.rows.is_empty(),
+        "w IS NULL on a no-NULL column matches nothing"
+    );
+    assert_eq!(res_null.executed_target, DeviceTarget::Gpu(0));
+
+    // STANDALONE (not in AND/OR) over the no-NULL column exercises `lower_is_null_predicate`'s no-bitmap
+    // arm: IS NOT NULL returns all rows, IS NULL none -- directly, without a kernel.
+    let res_all = e
+        .execute_resident_expr_select(
+            &select,
+            &ResidentExpr::IsNull {
+                col: 1,
+                is_not_null: true,
+            },
+        )
+        .expect("standalone IS NOT NULL no-bitmap");
+    let all_ids: Vec<Vec<SqlValue>> = (0..N).map(|i| vec![SqlValue::Int4(i)]).collect();
+    assert_eq!(
+        res_all.rows, all_ids,
+        "standalone w IS NOT NULL over a no-NULL column = all rows"
+    );
+    let res_none = e
+        .execute_resident_expr_select(
+            &select,
+            &ResidentExpr::IsNull {
+                col: 1,
+                is_not_null: false,
+            },
+        )
+        .expect("standalone IS NULL no-bitmap");
+    assert!(
+        res_none.rows.is_empty(),
+        "standalone w IS NULL over a no-NULL column = empty"
+    );
+}

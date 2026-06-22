@@ -1214,10 +1214,39 @@ fn map_predicate_node(
         },
         NodeEnum::AExpr(a_expr) => map_a_expr(a_expr, table, qualifier),
         NodeEnum::BoolExpr(bool_expr) => map_bool_expr(bool_expr, table, qualifier),
+        NodeEnum::NullTest(null_test) => map_null_test(null_test, table, qualifier),
         _ => Err(sql_pg_error(
             "unsupported expression node for the general GPU executor".to_string(),
         )),
     }
+}
+
+/// Map a `col IS NULL` / `col IS NOT NULL` (`NullTest`) node to the general IR (M3 -- doc 21). The
+/// argument must be a bare column reference (a NULL test over an expression is a follow-up); the
+/// `nulltesttype` selects IS NULL (`IsNull`) vs IS NOT NULL (`IsNotNull`).
+fn map_null_test(
+    null_test: &pg_query::protobuf::NullTest,
+    table: &RelationalTable,
+    qualifier: &str,
+) -> Result<ResidentExpr, ExecuteError> {
+    let arg = null_test
+        .arg
+        .as_deref()
+        .ok_or_else(|| sql_pg_error("IS NULL is missing its argument".to_string()))?;
+    let NodeEnum::ColumnRef(column_ref) = node_enum(arg)? else {
+        return Err(sql_pg_error(
+            "IS NULL / IS NOT NULL is supported only on a column reference".to_string(),
+        ));
+    };
+    let col = relational_column_index(table, resolve_column_name(column_ref, qualifier)?)?;
+    let is_not_null = match null_test.nulltesttype() {
+        pg_query::protobuf::NullTestType::IsNull => false,
+        pg_query::protobuf::NullTestType::IsNotNull => true,
+        pg_query::protobuf::NullTestType::Undefined => {
+            return Err(sql_pg_error("malformed IS NULL test".to_string()));
+        }
+    };
+    Ok(ResidentExpr::IsNull { col, is_not_null })
 }
 
 /// Map a `BoolExpr` (`AND` / `OR` / `NOT`) to the general IR. `AND` / `OR` left-fold their operands
