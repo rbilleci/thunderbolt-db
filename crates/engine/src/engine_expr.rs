@@ -2012,19 +2012,60 @@ impl Engine {
         let mut work_idx: Vec<Vec<u32>> = vec![survivors_all[0].clone()];
         for (k, conjuncts) in step_keys.iter().enumerate() {
             let new_rel = k + 1;
+            // NULL-key gate (M3 -- doc 21): in an equi-join `NULL = x` is UNKNOWN, so a row whose join key
+            // is NULL (ANY conjunct member, either side) matches nothing and must be excluded BEFORE the
+            // hash join -- else two NULLs would spuriously match (int keys share the 0 placeholder) or the
+            // text/b128 gather would error. host_rows carries `SqlValue::Null`; we drop the offending
+            // carried tuples + new-relation survivors. When nothing is NULL we keep the ORIGINAL vectors
+            // (no clone), so the common no-NULL join path is byte-identical and never regresses.
+            let key_present = |ri: usize, col: usize, row: u32| {
+                !matches!(sides[ri].0.host_rows[row as usize][col], SqlValue::Null)
+            };
+            let tuple_count = work_idx[0].len();
+            let acc_keep: Vec<usize> = (0..tuple_count)
+                .filter(|&p| {
+                    conjuncts
+                        .iter()
+                        .all(|&(acc_rel, acc_col, _)| key_present(acc_rel, acc_col, work_idx[acc_rel][p]))
+                })
+                .collect();
+            let new_keep: Vec<usize> = (0..survivors_all[new_rel].len())
+                .filter(|&q| {
+                    conjuncts
+                        .iter()
+                        .all(|&(_, _, new_col)| key_present(new_rel, new_col, survivors_all[new_rel][q]))
+                })
+                .collect();
+            let drops_acc = acc_keep.len() != tuple_count;
+            let drops_new = new_keep.len() != survivors_all[new_rel].len();
+            // `acc_idx` = the carried index vectors (all relations) to join on; `new_idx` = the new
+            // relation's survivors. Borrow the originals when no NULL key is excluded; otherwise own the
+            // NULL-filtered copies. The hash-join positions map back to THESE, so the extension uses them.
+            let acc_idx_owned: Vec<Vec<u32>>;
+            let new_idx_owned: Vec<u32>;
+            let (acc_idx, new_idx): (&Vec<Vec<u32>>, &[u32]) = if drops_acc || drops_new {
+                acc_idx_owned = work_idx
+                    .iter()
+                    .map(|col| acc_keep.iter().map(|&p| col[p]).collect())
+                    .collect();
+                new_idx_owned = new_keep.iter().map(|&q| survivors_all[new_rel][q]).collect();
+                (&acc_idx_owned, new_idx_owned.as_slice())
+            } else {
+                (&work_idx, survivors_all[new_rel].as_slice())
+            };
             let (acc_is_build, build_idxs, probe_idxs) = if step_is_text[k] {
                 // TEXT key (a single conjunct, validated). Gather both sides' key bytes from host_rows and
                 // run the GPU text hash join (FNV-hash + byte-verify).
                 let (acc_rel, acc_col, new_col) = conjuncts[0];
-                let acc_texts = key_texts(acc_rel, acc_col, &work_idx[acc_rel])?;
-                let new_texts = key_texts(new_rel, new_col, &survivors_all[new_rel])?;
+                let acc_texts = key_texts(acc_rel, acc_col, &acc_idx[acc_rel])?;
+                let new_texts = key_texts(new_rel, new_col, new_idx)?;
                 text_hash_join(sides[new_rel].1.mem(), &acc_texts, &new_texts)?
             } else if step_is_b128[k] {
                 // NUMERIC/UUID key: gather each side's 16-byte canonical value and run the SAME text/byte
                 // hash join over it (a 16-byte "text" -> FNV + 16-byte verify = exact 128-bit equality).
                 let (acc_rel, acc_col, new_col) = conjuncts[0];
-                let acc_vals = key_b128(acc_rel, acc_col, &work_idx[acc_rel])?;
-                let new_vals = key_b128(new_rel, new_col, &survivors_all[new_rel])?;
+                let acc_vals = key_b128(acc_rel, acc_col, &acc_idx[acc_rel])?;
+                let new_vals = key_b128(new_rel, new_col, new_idx)?;
                 let acc_refs: Vec<&[u8]> = acc_vals.iter().map(|v| v.as_slice()).collect();
                 let new_refs: Vec<&[u8]> = new_vals.iter().map(|v| v.as_slice()).collect();
                 text_hash_join(sides[new_rel].1.mem(), &acc_refs, &new_refs)?
@@ -2034,11 +2075,11 @@ impl Engine {
                 // relations; all share the tuple count, so the packed columns align row-for-row.
                 let acc_members: Vec<Vec<i64>> = conjuncts
                     .iter()
-                    .map(|&(acc_rel, acc_col, _)| key_i64(acc_rel, acc_col, &work_idx[acc_rel]))
+                    .map(|&(acc_rel, acc_col, _)| key_i64(acc_rel, acc_col, &acc_idx[acc_rel]))
                     .collect::<Result<_, _>>()?;
                 let new_members: Vec<Vec<i64>> = conjuncts
                     .iter()
-                    .map(|&(_, _, new_col)| key_i64(new_rel, new_col, &survivors_all[new_rel]))
+                    .map(|&(_, _, new_col)| key_i64(new_rel, new_col, new_idx))
                     .collect::<Result<_, _>>()?;
                 let acc_keys = pack_keys(&acc_members);
                 let new_keys = pack_keys(&new_members);
@@ -2051,12 +2092,12 @@ impl Engine {
                 (&probe_idxs, &build_idxs)
             };
             // Extend the carried indices: keep each matched tuple's prior rows, append the new relation's
-            // matched ABSOLUTE survivor row.
+            // matched ABSOLUTE survivor row. Indexed into the (possibly NULL-filtered) acc_idx/new_idx.
             let mut next: Vec<Vec<u32>> = Vec::with_capacity(new_rel + 1);
-            for col in &work_idx {
+            for col in acc_idx {
                 next.push(acc_match.iter().map(|&p| col[p as usize]).collect());
             }
-            next.push(new_match.iter().map(|&p| survivors_all[new_rel][p as usize]).collect());
+            next.push(new_match.iter().map(|&p| new_idx[p as usize]).collect());
             work_idx = next;
         }
         // Gather: for each surviving tuple, read each projected column from its relation's host_rows at

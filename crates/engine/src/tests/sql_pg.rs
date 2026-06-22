@@ -637,6 +637,126 @@ fn gpu_inner_join_two_relations_int_key() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
+    // M3 NULL-key gate (doc 21): in an equi-join `NULL = x` is UNKNOWN, so a row whose join key is NULL
+    // matches NOTHING -- on BOTH sides. INT keys would otherwise share the 0 placeholder and SPURIOUSLY
+    // match each other; TEXT/b128 keys would otherwise ERROR in the key gather. Both NULL-key rows drop.
+    let mut e = Engine::new_local();
+    let pairs = |res: &RelationalSelectResult| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let s = |c: &SqlValue| match c {
+                    SqlValue::Text(t) => t.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                (s(&r[0]), s(&r[1]))
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // --- INT key: without the gate, the two NULL ids share the 0 placeholder and spuriously pair. ---
+    e.execute_text(1, "CREATE TABLE p (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE c (pid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO p (id, name) VALUES (1,'a'),(2,'b'),(NULL,'pnull')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO c (pid, label) VALUES (1,'x'),(2,'z'),(NULL,'cnull')")
+        .unwrap();
+    let ps = e.populate_relational_residency_snapshot("p").unwrap();
+    let cs = e.populate_relational_residency_snapshot("c").unwrap();
+    if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
+        return;
+    }
+    let int_join = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM p JOIN c ON p.id = c.pid")
+        .expect("int join with NULL keys");
+    assert_eq!(int_join.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        pairs(&int_join),
+        vec![
+            ("a".to_string(), "x".to_string()),
+            ("b".to_string(), "z".to_string())
+        ],
+        "NULL int keys match nothing -- no spurious ('pnull','cnull') pair"
+    );
+
+    // --- TEXT key: without the gate, the key-bytes gather would ERROR on a NULL cell. ---
+    e.execute_text(5, "CREATE TABLE s (k TEXT, x TEXT)").unwrap();
+    e.execute_text(6, "CREATE TABLE u (k TEXT, y TEXT)").unwrap();
+    e.execute_text(7, "INSERT INTO s (k, x) VALUES ('m','sm'),(NULL,'snull')")
+        .unwrap();
+    e.execute_text(8, "INSERT INTO u (k, y) VALUES ('m','tm'),(NULL,'tnull')")
+        .unwrap();
+    let ss = e.populate_relational_residency_snapshot("s").unwrap();
+    let us = e.populate_relational_residency_snapshot("u").unwrap();
+    if ss.device_memory_proof.is_none() || us.device_memory_proof.is_none() {
+        return;
+    }
+    let text_join = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM s JOIN u ON s.k = u.k")
+        .expect("text join with NULL keys must not error");
+    assert_eq!(
+        pairs(&text_join),
+        vec![("sm".to_string(), "tm".to_string())],
+        "NULL text keys match nothing (and the gather does not error)"
+    );
+
+    // --- COMPOSITE int key (a.k1=b.k1 AND a.k2=b.k2): a row with ANY member NULL is excluded (else the
+    // NULL member's 0 placeholder would pack to the same composite key and spuriously match). ---
+    e.execute_text(9, "CREATE TABLE ca (k1 INT, k2 INT, x TEXT)")
+        .unwrap();
+    e.execute_text(10, "CREATE TABLE cb (k1 INT, k2 INT, y TEXT)")
+        .unwrap();
+    e.execute_text(11, "INSERT INTO ca (k1, k2, x) VALUES (1,1,'ca1'),(2,NULL,'canull')")
+        .unwrap();
+    e.execute_text(12, "INSERT INTO cb (k1, k2, y) VALUES (1,1,'cb1'),(2,NULL,'cbnull')")
+        .unwrap();
+    let cas = e.populate_relational_residency_snapshot("ca").unwrap();
+    let cbs = e.populate_relational_residency_snapshot("cb").unwrap();
+    if cas.device_memory_proof.is_none() || cbs.device_memory_proof.is_none() {
+        return;
+    }
+    let comp_join = e
+        .execute_resident_expr_select_sql(
+            "SELECT x, y FROM ca JOIN cb ON ca.k1 = cb.k1 AND ca.k2 = cb.k2",
+        )
+        .expect("composite int join with a NULL member");
+    assert_eq!(
+        pairs(&comp_join),
+        vec![("ca1".to_string(), "cb1".to_string())],
+        "a NULL composite-key member excludes the row -- no ('canull','cbnull')"
+    );
+
+    // --- NUMERIC (b128) key: a NULL numeric key is excluded (and the 16-byte gather does not error). ---
+    e.execute_text(13, "CREATE TABLE na (k NUMERIC(10,2), x TEXT)")
+        .unwrap();
+    e.execute_text(14, "CREATE TABLE nb (k NUMERIC(10,2), y TEXT)")
+        .unwrap();
+    e.execute_text(15, "INSERT INTO na (k, x) VALUES (1.50,'na1'),(NULL,'nanull')")
+        .unwrap();
+    e.execute_text(16, "INSERT INTO nb (k, y) VALUES (1.50,'nb1'),(NULL,'nbnull')")
+        .unwrap();
+    let nas = e.populate_relational_residency_snapshot("na").unwrap();
+    let nbs = e.populate_relational_residency_snapshot("nb").unwrap();
+    if nas.device_memory_proof.is_none() || nbs.device_memory_proof.is_none() {
+        return;
+    }
+    let num_join = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM na JOIN nb ON na.k = nb.k")
+        .expect("numeric join with NULL keys must not error");
+    assert_eq!(
+        pairs(&num_join),
+        vec![("na1".to_string(), "nb1".to_string())],
+        "NULL numeric keys match nothing (the b128 gather does not error)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     // The SMALLER side (s, the left/probe-by-size) has a DUPLICATE join key, so build-on-smaller hits
     // DuplicateBuildKey -> the executor falls back to building on the LARGER (unique) side. This
