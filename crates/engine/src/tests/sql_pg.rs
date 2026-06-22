@@ -853,15 +853,73 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
         "text-key LEFT join NULL-pads the unmatched left row"
     );
 
-    // RIGHT/FULL and a WHERE on a LEFT join are clean errors (follow-ups), not mis-answers.
-    assert!(e
-        .execute_resident_expr_select_sql("SELECT name, label FROM lp RIGHT JOIN lc ON lp.id = lc.pid")
-        .is_err());
+    // A WHERE on a LEFT join is a clean error (the per-side pushdown is not filter-commutative for an
+    // outer join) -- a follow-up, not a mis-answer. (RIGHT/FULL are tested separately now.)
     assert!(e
         .execute_resident_expr_select_sql(
             "SELECT name, label FROM lp LEFT JOIN lc ON lp.id = lc.pid WHERE lc.label = 'x'"
         )
         .is_err());
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_right_and_full_outer_join_null_pad_the_correct_side() {
+    // RIGHT keeps every RIGHT (new) row (unmatched -> the left columns NULL-padded); FULL keeps both
+    // sides' unmatched rows (M3 -- doc 21). rl 2 'b' is left-only; rr 3 'z' is right-only.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE rl (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE rr (rid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO rl (id, name) VALUES (1,'a'),(2,'b')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO rr (rid, label) VALUES (1,'x'),(3,'z')")
+        .unwrap();
+    let ls = e.populate_relational_residency_snapshot("rl").unwrap();
+    let rs = e.populate_relational_residency_snapshot("rr").unwrap();
+    if ls.device_memory_proof.is_none() || rs.device_memory_proof.is_none() {
+        return;
+    }
+    let opt_pairs = |res: &RelationalSelectResult| -> Vec<(Option<String>, Option<String>)> {
+        let opt = |c: &SqlValue| match c {
+            SqlValue::Text(t) => Some(t.clone()),
+            SqlValue::Null => None,
+            o => panic!("expected text/null, got {o:?}"),
+        };
+        let mut v: Vec<(Option<String>, Option<String>)> =
+            res.rows.iter().map(|r| (opt(&r[0]), opt(&r[1]))).collect();
+        v.sort();
+        v
+    };
+
+    // RIGHT: every rr row appears; (3,'z') is right-only -> name NULL. rl's left-only 'b' is DROPPED.
+    let right = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM rl RIGHT JOIN rr ON rl.id = rr.rid")
+        .expect("right outer join");
+    assert_eq!(right.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        opt_pairs(&right),
+        vec![
+            (None, Some("z".to_string())), // right-only -> left columns NULL
+            (Some("a".to_string()), Some("x".to_string())),
+        ],
+        "RIGHT JOIN keeps every right row; left-only 'b' dropped"
+    );
+
+    // FULL: the match + BOTH unmatched sides.
+    let full = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM rl FULL JOIN rr ON rl.id = rr.rid")
+        .expect("full outer join");
+    assert_eq!(
+        opt_pairs(&full),
+        vec![
+            (None, Some("z".to_string())),                  // right-only
+            (Some("a".to_string()), Some("x".to_string())), // match
+            (Some("b".to_string()), None),                  // left-only
+        ],
+        "FULL JOIN keeps the match + both unmatched sides"
+    );
 }
 
 #[test]
@@ -1146,9 +1204,17 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
         left.contains("resident snapshot") || left.contains("join path"),
         "LEFT JOIN routes to the join path now, got: {left}"
     );
+    // RIGHT/FULL JOIN are SUPPORTED now (2-relation, ON-only) -- they route to the join path too.
+    let right = reject("SELECT x, y FROM a RIGHT JOIN b ON a.k = b.k");
     assert!(
-        reject("SELECT x, y FROM a RIGHT JOIN b ON a.k = b.k").contains("right"),
-        "RIGHT JOIN rejected (a follow-up)"
+        right.contains("resident snapshot") || right.contains("join path"),
+        "RIGHT JOIN routes to the join path now, got: {right}"
+    );
+    // An OUTER JOIN with NATURAL/USING is still a follow-up -> clean parser rejection.
+    assert!(
+        reject("SELECT x, y FROM a NATURAL LEFT JOIN b").contains("natural")
+            || reject("SELECT x, y FROM a NATURAL LEFT JOIN b").contains("using"),
+        "OUTER NATURAL/USING rejected (a follow-up)"
     );
     assert!(
         reject("SELECT x, y FROM a JOIN b ON a.k > b.k").contains("equality")

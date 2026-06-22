@@ -398,20 +398,23 @@ fn flatten_join_chain(
     relations: &mut Vec<JoinRelationRef>,
     steps: &mut Vec<JoinStep>,
 ) -> Result<(), ExecuteError> {
-    // INNER and 2-relation LEFT OUTER (ON only) are supported; RIGHT/FULL are a follow-up.
-    let outer_left = if join.jointype == JoinType::JoinInner as i32 {
-        false
+    // INNER / LEFT / RIGHT / FULL (2-relation, ON only) -> the (outer_left, outer_right) flag pair.
+    let (outer_left, outer_right) = if join.jointype == JoinType::JoinInner as i32 {
+        (false, false)
     } else if join.jointype == JoinType::JoinLeft as i32 {
-        true
+        (true, false)
+    } else if join.jointype == JoinType::JoinRight as i32 {
+        (false, true)
+    } else if join.jointype == JoinType::JoinFull as i32 {
+        (true, true)
     } else {
         return Err(sql_pg_error(
-            "only INNER and LEFT JOIN are on the join path yet (RIGHT/FULL are a follow-up)"
-                .to_string(),
+            "unsupported JOIN type (only INNER/LEFT/RIGHT/FULL are on the join path)".to_string(),
         ));
     };
-    if outer_left && (join.is_natural || !join.using_clause.is_empty()) {
+    if (outer_left || outer_right) && (join.is_natural || !join.using_clause.is_empty()) {
         return Err(sql_pg_error(
-            "LEFT JOIN with NATURAL/USING is a follow-up; use LEFT JOIN ... ON".to_string(),
+            "an OUTER JOIN with NATURAL/USING is a follow-up; use OUTER JOIN ... ON".to_string(),
         ));
     }
     let larg = join
@@ -461,6 +464,7 @@ fn flatten_join_chain(
             natural: true,
             coalesce: Vec::new(),
             outer_left,
+            outer_right,
         }
     } else if !join.using_clause.is_empty() {
         // USING(cols): desugar to qualified `left.c = right.c` conjuncts + record the coalesce columns.
@@ -486,6 +490,7 @@ fn flatten_join_chain(
             natural: false,
             coalesce: cols,
             outer_left,
+            outer_right,
         }
     } else {
         // ON: a single `=` equi-join, or a top-level AND of `=` equi-joins (a composite key).
@@ -498,6 +503,7 @@ fn flatten_join_chain(
             natural: false,
             coalesce: Vec::new(),
             outer_left,
+            outer_right,
         }
     };
     steps.push(step);
@@ -792,6 +798,7 @@ fn plan_comma_join_where(
             coalesce: Vec::new(),
             // A comma join (`FROM a, b WHERE a.k=b.k`) is always INNER.
             outer_left: false,
+            outer_right: false,
         });
     }
     let predicates = filters

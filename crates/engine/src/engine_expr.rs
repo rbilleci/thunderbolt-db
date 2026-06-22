@@ -118,10 +118,13 @@ pub(crate) struct JoinStep {
     pub natural: bool,
     /// USING/NATURAL join column names -- emitted ONCE in `*` and resolvable unqualified (else empty).
     pub coalesce: Vec<String>,
-    /// `true` for a LEFT OUTER join (M3 -- doc 21): every accumulated (left) row is kept; an unmatched
-    /// one gets the new relation's columns NULL-padded. `false` = INNER (only matched pairs survive).
-    /// Currently 2-relation LEFT ON only (RIGHT/FULL, multi-way LEFT, LEFT NATURAL/USING are follow-ups).
+    /// OUTER-join flags (M3 -- doc 21), as a pair: `(outer_left, outer_right)` = (F,F) INNER, (T,F) LEFT,
+    /// (F,T) RIGHT, (T,T) FULL. `outer_left` keeps every ACCUMULATED (left) row -- unmatched ones get the
+    /// NEW relation NULL-padded; `outer_right` keeps every NEW (right) row -- unmatched ones get the
+    /// accumulated relations NULL-padded. Currently 2-relation ON only (multi-way / OUTER NATURAL-USING /
+    /// a WHERE on an outer join are follow-ups).
     pub outer_left: bool,
+    pub outer_right: bool,
 }
 
 /// A LEFT-DEEP chain of INNER equi-joins parsed from the libpg_query FROM clause (M5). `relations` are in
@@ -1622,20 +1625,20 @@ impl Engine {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
         let n_rel = plan.relations.len();
-        // LEFT OUTER (M3 -- doc 21) is currently a 2-relation, ON-only join with no WHERE. A multi-way
-        // LEFT (NULL-padding an intermediate result) and a WHERE on a LEFT join (the per-side WHERE
-        // pushdown is NOT filter-commutative for an outer join -- a filter on the inner side would change
-        // which rows are NULL-padded) are follow-ups, rejected here rather than mis-answered.
-        if plan.steps.iter().any(|s| s.outer_left) {
+        // OUTER joins (LEFT/RIGHT/FULL, M3 -- doc 21) are currently 2-relation, ON-only, with no WHERE. A
+        // multi-way outer (NULL-padding an intermediate result) and a WHERE on an outer join (the per-side
+        // WHERE pushdown is NOT filter-commutative for an outer join -- a filter on the NULL-padded side
+        // would change which rows are padded) are follow-ups, rejected here rather than mis-answered.
+        if plan.steps.iter().any(|s| s.outer_left || s.outer_right) {
             if plan.steps.len() != 1 {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "multi-way LEFT JOIN is a follow-up (only a 2-relation LEFT JOIN is supported)"
+                    "multi-way OUTER JOIN is a follow-up (only a 2-relation OUTER JOIN is supported)"
                         .to_string(),
                 )));
             }
             if predicates.iter().any(Option::is_some) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "a WHERE clause on a LEFT JOIN is a follow-up".to_string(),
+                    "a WHERE clause on an OUTER JOIN is a follow-up".to_string(),
                 )));
             }
         }
@@ -2153,6 +2156,30 @@ impl Engine {
                             next[rel].push(col[o]);
                         }
                         next[new_rel].push(JOIN_NULL_ROW);
+                    }
+                }
+            }
+            // RIGHT OUTER (the mirror; FULL runs both): every NEW (right) survivor must appear. An
+            // UNMATCHED new row -- including a NULL-key right row, which matches nothing -- is appended
+            // with the ACCUMULATED relations NULL-padded (the matched-new set maps `new_match` back
+            // through the NULL-key filter to the original new-survivor positions).
+            if plan.steps[k].outer_right {
+                let new_count = survivors_all[new_rel].len();
+                let mut matched_new = vec![false; new_count];
+                for &p in new_match {
+                    let orig = if drops_acc || drops_new {
+                        new_keep[p as usize]
+                    } else {
+                        p as usize
+                    };
+                    matched_new[orig] = true;
+                }
+                for (o, &is_matched) in matched_new.iter().enumerate() {
+                    if !is_matched {
+                        for col in next.iter_mut().take(new_rel) {
+                            col.push(JOIN_NULL_ROW);
+                        }
+                        next[new_rel].push(survivors_all[new_rel][o]);
                     }
                 }
             }
