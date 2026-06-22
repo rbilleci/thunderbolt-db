@@ -29,6 +29,8 @@ pub(crate) fn build_relational_device_payload(
         // (column name, byte-offset) of each numeric/uuid 16-byte section -- so a non-table caller
         // (the GPU grouped-sort) can address them without recomputing the layout by formula.
         Vec<(String, u64)>,
+        // Per-column NULL validity bitmaps (M3 — doc 21), one per column that contains a NULL.
+        Vec<ResidentDeviceNullBitmapLayout>,
     ),
     ExecuteError,
 > {
@@ -38,6 +40,7 @@ pub(crate) fn build_relational_device_payload(
     let mut resident_device_bool_columns = Vec::new();
     let mut resident_device_int4_column_stats = Vec::new();
     let mut resident_device_b128_columns: Vec<(String, u64)> = Vec::new();
+    let mut resident_device_null_columns: Vec<ResidentDeviceNullBitmapLayout> = Vec::new();
 
     // int4 / date / int2 share the i32 section (a date is i32 days; a smallint widens to i32).
     for col_idx in column_types
@@ -49,9 +52,13 @@ pub(crate) fn build_relational_device_payload(
         let mut min = i32::MAX;
         let mut max = i32::MIN;
         for row in rows {
+            // A NULL writes a don't-care 0 placeholder (the validity bitmap marks the row; the kernels
+            // skip it) and is EXCLUDED from min/max so it can't pull the stats toward 0.
+            let is_null = matches!(row[col_idx], SqlValue::Null);
             let value: i32 = match row[col_idx] {
                 SqlValue::Int4(value) | SqlValue::Date(value) => value,
                 SqlValue::Int2(value) => i32::from(value),
+                SqlValue::Null => 0,
                 _ => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "resident snapshot int4/date/int2 payload encountered a non-i32 value"
@@ -59,8 +66,10 @@ pub(crate) fn build_relational_device_payload(
                     )));
                 }
             };
-            min = min.min(value);
-            max = max.max(value);
+            if !is_null {
+                min = min.min(value);
+                max = max.max(value);
+            }
             device_payload.extend_from_slice(&value.to_le_bytes());
         }
         resident_device_int4_column_stats.push(ResidentDeviceInt4ColumnStats {
@@ -77,11 +86,16 @@ pub(crate) fn build_relational_device_payload(
         .map(|(i, _)| i)
     {
         for row in rows {
-            let (SqlValue::Int8(value) | SqlValue::Timestamp(value)) = row[col_idx] else {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident snapshot int8/timestamp payload encountered a non-i64 value"
-                        .to_string(),
-                )));
+            // NULL → a don't-care 0 placeholder (the validity bitmap marks the row).
+            let value: i64 = match row[col_idx] {
+                SqlValue::Int8(value) | SqlValue::Timestamp(value) => value,
+                SqlValue::Null => 0,
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot int8/timestamp payload encountered a non-i64 value"
+                            .to_string(),
+                    )));
+                }
             };
             device_payload.extend_from_slice(&value.to_le_bytes());
         }
@@ -100,6 +114,8 @@ pub(crate) fn build_relational_device_payload(
                     device_payload.extend_from_slice(&value.mantissa.to_le_bytes());
                 }
                 SqlValue::Uuid(bytes) => device_payload.extend_from_slice(bytes),
+                // NULL → 16 don't-care zero bytes (the validity bitmap marks the row).
+                SqlValue::Null => device_payload.extend_from_slice(&[0u8; 16]),
                 _ => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                         "resident snapshot numeric/uuid payload encountered a wrong-typed value"
@@ -120,13 +136,15 @@ pub(crate) fn build_relational_device_payload(
         let bitmap_byte_offset = device_payload.len() as u64;
         let mut words = vec![0u32; row_count.div_ceil(32)];
         for (i, row) in rows.iter().enumerate() {
-            let SqlValue::Bool(value) = row[col_idx] else {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident snapshot bool payload encountered a non-bool value".to_string(),
-                )));
-            };
-            if value {
-                words[i / 32] |= 1u32 << (i % 32);
+            match row[col_idx] {
+                // NULL leaves the value bit 0 (don't-care; the validity bitmap marks the row).
+                SqlValue::Bool(true) => words[i / 32] |= 1u32 << (i % 32),
+                SqlValue::Bool(false) | SqlValue::Null => {}
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot bool payload encountered a non-bool value".to_string(),
+                    )));
+                }
             }
         }
         for word in &words {
@@ -134,6 +152,32 @@ pub(crate) fn build_relational_device_payload(
         }
         resident_device_bool_columns.push(ResidentDeviceBoolColumnLayout {
             name: column_names[col_idx].clone(),
+            bitmap_byte_offset,
+        });
+    }
+    // NULL validity bitmaps (M3 — doc 21): ONE 1-bit-per-row bitmap (1 = valid/present, 0 = NULL,
+    // LSB-first u32 words like bool) per column that actually contains a NULL. A no-NULL column emits
+    // nothing — absence ⇒ all-valid — so existing non-null payloads stay byte-identical. Placed after
+    // the bool section (every preceding section is a multiple of 4 bytes ⇒ this section start is
+    // 4-aligned, so the u32 words load safely) and before text (text records its own offset, so it just
+    // starts later). Iterates ALL columns in catalog order — a NULL can appear in any type, its value
+    // riding the don't-care placeholder its own typed section wrote above.
+    for (col_idx, name) in column_names.iter().enumerate() {
+        if !rows.iter().any(|row| matches!(row[col_idx], SqlValue::Null)) {
+            continue;
+        }
+        let bitmap_byte_offset = device_payload.len() as u64;
+        let mut words = vec![0u32; row_count.div_ceil(32)];
+        for (i, row) in rows.iter().enumerate() {
+            if !matches!(row[col_idx], SqlValue::Null) {
+                words[i / 32] |= 1u32 << (i % 32); // 1 = valid/present
+            }
+        }
+        for word in &words {
+            device_payload.extend_from_slice(&word.to_le_bytes());
+        }
+        resident_device_null_columns.push(ResidentDeviceNullBitmapLayout {
+            name: name.clone(),
             bitmap_byte_offset,
         });
     }
@@ -152,12 +196,16 @@ pub(crate) fn build_relational_device_payload(
         let mut text_bytes = Vec::new();
         text_offsets.push(0_u64);
         for row in rows {
-            let SqlValue::Text(value) = &row[col_idx] else {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident snapshot text payload encountered non-text value".to_string(),
-                )));
-            };
-            text_bytes.extend_from_slice(value.as_bytes());
+            match &row[col_idx] {
+                SqlValue::Text(value) => text_bytes.extend_from_slice(value.as_bytes()),
+                // NULL → an empty (zero-length) placeholder span; the validity bitmap marks the row.
+                SqlValue::Null => {}
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot text payload encountered non-text value".to_string(),
+                    )));
+                }
+            }
             text_offsets.push(text_bytes.len() as u64);
         }
         for offset in &text_offsets {
@@ -180,6 +228,7 @@ pub(crate) fn build_relational_device_payload(
         resident_device_bool_columns,
         resident_device_int4_column_stats,
         resident_device_b128_columns,
+        resident_device_null_columns,
     ))
 }
 
@@ -284,6 +333,7 @@ impl Engine {
             resident_device_bool_columns,
             resident_device_int4_column_stats,
             _resident_device_b128_columns,
+            resident_device_null_columns,
         ) = build_relational_device_payload(&column_names, &column_types, &resident_rows)?;
         // The MVCC tuple bytes (key + value per row) ride after the columnar sections (unchanged).
         device_payload.extend_from_slice(&raw_device_tail);
@@ -315,6 +365,7 @@ impl Engine {
             resident_device_numeric_columns,
             resident_device_bool_columns,
             resident_device_text_columns,
+            resident_device_null_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
@@ -529,6 +580,7 @@ impl Engine {
             resident_device_bool_columns,
             resident_device_int4_column_stats,
             _resident_device_b128_columns,
+            resident_device_null_columns,
         ) = build_relational_device_payload(&column_names, &column_types, rows)?;
         let runtime = self.cuda_driver_probe_runtime();
         let device_memory = runtime
@@ -548,6 +600,7 @@ impl Engine {
             resident_device_numeric_columns,
             resident_device_bool_columns,
             resident_device_text_columns,
+            resident_device_null_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
@@ -678,6 +731,7 @@ impl Engine {
             resident_device_numeric_columns: Vec::new(),
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
+            resident_device_null_columns: Vec::new(),
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
@@ -799,6 +853,7 @@ impl Engine {
             resident_device_numeric_columns: Vec::new(),
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: install.resident_device_text_columns,
+            resident_device_null_columns: Vec::new(),
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,

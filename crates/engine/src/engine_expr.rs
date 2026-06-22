@@ -220,7 +220,7 @@ pub(crate) fn gpu_sort_result_rows(
             .iter()
             .map(|r| non_int.iter().map(|&(idx, _)| r[idx].clone()).collect())
             .collect();
-        let (payload, text_layouts, _bool, _int4, b128_layouts) =
+        let (payload, text_layouts, _bool, _int4, b128_layouts, _null) =
             crate::engine_residency::build_relational_device_payload(&names, &types, &payload_rows)?;
         // Walk ORDER BY order: int -> next matrix slot; text/numeric/uuid -> the next section in its type
         // group (the helper lays them out in passed-column order per group).

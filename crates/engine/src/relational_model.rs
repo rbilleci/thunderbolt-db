@@ -223,6 +223,11 @@ pub struct RelationalResidencySnapshot {
     /// Self-describing: each carries its bitmap's byte offset. Empty for installs not retaining bool.
     pub resident_device_bool_columns: Vec<ResidentDeviceBoolColumnLayout>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    /// Per-column NULL validity bitmaps (M3 — doc 21), one entry per column that contains a NULL
+    /// (1 = valid, 0 = NULL). Empty when no column has a NULL — the common case today, since ingest of
+    /// NULL is a later slice — so existing payloads/descriptors are unchanged. See
+    /// [`ResidentDeviceNullBitmapLayout`].
+    pub resident_device_null_columns: Vec<ResidentDeviceNullBitmapLayout>,
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
     pub invalidated_at_index: Option<Index>,
@@ -357,10 +362,25 @@ pub struct ResidentDeviceTextColumnLayout {
 /// A `bool` column retained in the device payload as a 1-bit-per-row BITMAP (the type matrix, doc 19):
 /// `ceil(row_count / 32)` little-endian u32 words, bit `i` (LSB-first within its word) = row `i`'s
 /// value. 1 bit/row -- 32x denser than the i32 sections, and a near-ready predicate mask. NULLs are a
-/// separate validity bitmap (the engine is non-null until M3), so this stores only the value bit.
-/// The section is self-describing (like text): the bitmap's byte offset is recorded at build time.
+/// separate VALIDITY bitmap ([`ResidentDeviceNullBitmapLayout`], M3 — doc 21), so this stores only the
+/// value bit. The section is self-describing (like text): the bitmap's byte offset is recorded at build
+/// time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidentDeviceBoolColumnLayout {
+    pub name: String,
+    pub bitmap_byte_offset: u64,
+}
+
+/// A column's per-row NULL VALIDITY bitmap in the device payload (M3 — doc 21):
+/// `ceil(row_count / 32)` little-endian u32 words, bit `i` (LSB-first) = row `i`, where **1 = valid
+/// (present), 0 = NULL** (Arrow / PostgreSQL convention). One layout is emitted ONLY for a column that
+/// actually contains a NULL; a column with no NULLs has NO bitmap (absence ⇒ all-valid), so non-nullable
+/// columns and pre-M3 payloads stay byte-identical. The kernels read it on-device to honor three-valued
+/// logic. Self-describing like the bool/text layouts: the byte offset is recorded at build time, and the
+/// section starts 4-aligned (every preceding section is a multiple of 4 bytes) so the u32 words load
+/// safely. Applies to any column type (the value lives in its own typed section).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentDeviceNullBitmapLayout {
     pub name: String,
     pub bitmap_byte_offset: u64,
 }
