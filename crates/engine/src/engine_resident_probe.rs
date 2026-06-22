@@ -397,9 +397,10 @@ impl Engine {
             }
             ResidentPredicate::Int4Equal { col, needle } => {
                 let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+                let null_bitmap_offset = resident_device_null_column_offset(snapshot, table, col)?;
                 let row_count = resident_snapshot_row_count(snapshot)?;
                 let matched = device_memory
-                    .count_i32_equal_from_payload(byte_offset, row_count, needle)
+                    .count_i32_equal_from_payload(byte_offset, row_count, needle, null_bitmap_offset)
                     .map_err(|err| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                     })?;
@@ -882,7 +883,9 @@ impl Engine {
             })?;
             let lookup_started = Instant::now();
             let matched_count = device_memory
-                .count_i32_equal_from_payload(byte_offset, row_count, needle)
+                // Partitioned/benchmark residency has no NULL validity bitmap (it admits no NULLs),
+                // so the column is all-valid: pass None.
+                .count_i32_equal_from_payload(byte_offset, row_count, needle, None)
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
             lookup_micros = lookup_micros.saturating_add(
                 lookup_started
@@ -2405,6 +2408,7 @@ impl Engine {
                 )))
             })?;
         let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let null_bitmap_offset = resident_device_null_column_offset(&snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -2413,7 +2417,7 @@ impl Engine {
         })?;
         let needles = needles.into_iter().collect::<Vec<_>>();
         let membership_count = device_memory
-            .count_i32_in_from_payload(byte_offset, row_count, &needles)
+            .count_i32_in_from_payload(byte_offset, row_count, &needles, null_bitmap_offset)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let count = i64::try_from(membership_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -3500,6 +3504,7 @@ impl Engine {
                 )))
             })?;
         let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let null_bitmap_offset = resident_device_null_column_offset(&snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -3508,7 +3513,7 @@ impl Engine {
         })?;
         let lookup_started = Instant::now();
         let matched_count = device_memory
-            .count_i32_equal_from_payload(byte_offset, row_count, needle)
+            .count_i32_equal_from_payload(byte_offset, row_count, needle, null_bitmap_offset)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let lookup_micros = lookup_started
             .elapsed()

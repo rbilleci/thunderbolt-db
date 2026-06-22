@@ -712,6 +712,29 @@ pub(crate) fn resident_device_bool_column_offset(
         })
 }
 
+/// Byte offset of column `column_idx`'s NULL VALIDITY bitmap within the retained device payload (M3 —
+/// doc 21), or `None` if the column has NO bitmap, which means it contains no NULLs ⇒ **all rows valid**.
+/// Unlike the bool/int4 helpers, a missing entry is the NORMAL all-valid case (not an error): a column
+/// only gets a bitmap when it actually holds a NULL. A kernel reads `Some(offset)` as the validity
+/// bitmap (1 = valid, 0 = NULL) and `None` as "every row valid". Applies to any column type. Errors only
+/// if `column_idx` is outside the catalog table.
+pub(crate) fn resident_device_null_column_offset(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    column_idx: usize,
+) -> Result<Option<u64>, ExecuteError> {
+    let column = table.columns.get(column_idx).ok_or_else(|| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is outside the catalog table".to_string(),
+        ))
+    })?;
+    Ok(snapshot
+        .resident_device_null_columns
+        .iter()
+        .find(|layout| layout.name == column.name)
+        .map(|layout| layout.bitmap_byte_offset))
+}
+
 /// Byte offset of int8 column `column_idx` within the retained device payload (the type matrix, doc
 /// 19). Layout: header (u64) + the WHOLE int4 section (`int4_columns * row_count * 4`) + the int8
 /// columns before this one (`int8_ordinal * row_count * 8`). Validates the column is int8 and present

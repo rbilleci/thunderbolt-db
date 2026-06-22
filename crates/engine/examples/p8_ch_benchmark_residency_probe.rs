@@ -347,7 +347,7 @@ fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     )?;
     let row_count = resident.count_rows_from_header()?;
     let amount_17_count =
-        resident.count_i32_equal_from_payload(layout.amount_byte_offset, row_count, 17)?;
+        resident.count_i32_equal_from_payload(layout.amount_byte_offset, row_count, 17, None)?;
     let alpha_prefix_count = resident.count_text_prefix_from_payload(
         layout.dist_offsets_byte_offset,
         layout.dist_bytes_byte_offset,

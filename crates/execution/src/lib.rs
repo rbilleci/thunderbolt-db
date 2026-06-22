@@ -1325,8 +1325,11 @@ impl CudaResidentDeviceMemory {
         byte_offset: u64,
         row_count: u64,
         needle: i32,
+        // M3 (doc 21): the filter column's NULL validity bitmap byte offset, or `None` if the column
+        // has no NULLs (all rows valid). NULL rows never match the needle (three-valued logic).
+        null_bitmap_offset: Option<u64>,
     ) -> Result<u64, CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_equal_count(self, byte_offset, row_count, needle)
+        launch_cuda_resident_i32_equal_count(self, byte_offset, row_count, needle, null_bitmap_offset)
     }
 
     pub fn count_i32_in_from_payload(
@@ -1334,6 +1337,7 @@ impl CudaResidentDeviceMemory {
         byte_offset: u64,
         row_count: u64,
         needles: &[i32],
+        null_bitmap_offset: Option<u64>,
     ) -> Result<u64, CudaRuntimeProbeError> {
         let mut total = 0_u64;
         for needle in needles {
@@ -1343,6 +1347,7 @@ impl CudaResidentDeviceMemory {
                     byte_offset,
                     row_count,
                     *needle,
+                    null_bitmap_offset,
                 )?)
                 .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         }
@@ -4158,6 +4163,31 @@ fn launch_cuda_bitonic_sort_hetero(
         .collect())
 }
 
+/// Map a column's optional NULL validity-bitmap byte offset to the `u64` the resident count kernels
+/// expect (M3 — doc 21): `None` ⇒ the sentinel `u64::MAX` ("no bitmap, every row valid"); `Some(off)`
+/// ⇒ `off`, after bounds-checking the bitmap region (`off + ceil(row_count/32) * 4`) fits the
+/// allocation so the kernel's `ld.global.u32` can never read out of bounds.
+fn validity_bitmap_kernel_arg(
+    null_bitmap_offset: Option<u64>,
+    row_count: u64,
+    resident: &CudaResidentDeviceMemory,
+) -> Result<u64, CudaRuntimeProbeError> {
+    match null_bitmap_offset {
+        None => Ok(u64::MAX),
+        Some(off) => {
+            let end = row_count
+                .div_ceil(32)
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .and_then(|bitmap_bytes| off.checked_add(bitmap_bytes))
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if end > resident.metadata().allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
+            }
+            Ok(off)
+        }
+    }
+}
+
 /// Single-thread `(1,1,1)` serial filtered-count — retained ONLY as the A/B baseline for
 /// the P2-M2 parallel-scan spike. The production route is the parallel
 /// `launch_cuda_resident_i32_equal_count`.
@@ -4167,6 +4197,9 @@ fn launch_cuda_resident_i32_equal_count_serial(
     byte_offset: u64,
     row_count: u64,
     needle: i32,
+    // M3 (doc 21): `Some(off)` = the column's NULL validity bitmap byte offset (1 = valid, 0 = NULL);
+    // `None` = no bitmap ⇒ all rows valid. NULL rows never match the needle (3VL).
+    null_bitmap_offset: Option<u64>,
 ) -> Result<u64, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
@@ -4200,11 +4233,14 @@ fn launch_cuda_resident_i32_equal_count_serial(
     .param .u64 byte_offset,
     .param .u64 row_count,
     .param .s32 needle,
-    .param .u64 out_ptr
+    .param .u64 out_ptr,
+    .param .u64 null_bitmap_offset
 )
 {
     .reg .pred %p_done;
     .reg .pred %p_match;
+    .reg .pred %p_no_bitmap;
+    .reg .pred %p_valid;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
@@ -4213,6 +4249,13 @@ fn launch_cuda_resident_i32_equal_count_serial(
     .reg .u64 %idx;
     .reg .u64 %addr;
     .reg .u64 %matches;
+    .reg .u64 %null_off;
+    .reg .u64 %sentinel;
+    .reg .u64 %word_byte;
+    .reg .u64 %bitmap_addr;
+    .reg .u32 %bitmap_word;
+    .reg .u32 %bit_pos;
+    .reg .u32 %valid_bit;
     .reg .s32 %needle;
     .reg .s32 %r_value;
 
@@ -4221,10 +4264,12 @@ fn launch_cuda_resident_i32_equal_count_serial(
     ld.param.u64 %rows, [row_count];
     ld.param.s32 %needle, [needle];
     ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %null_off, [null_bitmap_offset];
 
     add.u64 %base, %resident, %offset;
     mov.u64 %idx, 0;
     mov.u64 %matches, 0;
+    mov.u64 %sentinel, 0xFFFFFFFFFFFFFFFF;
 
 loop:
     setp.ge.u64 %p_done, %idx, %rows;
@@ -4234,6 +4279,22 @@ loop:
     ld.global.s32 %r_value, [%addr];
     setp.eq.s32 %p_match, %r_value, %needle;
     @!%p_match bra next;
+    // The value matches the needle; in 3VL a NULL operand can never match, so exclude NULL rows.
+    // null_off == 0xFFFF... (sentinel) means the column has no validity bitmap => every row valid.
+    setp.eq.u64 %p_no_bitmap, %null_off, %sentinel;
+    @%p_no_bitmap bra count;
+    shr.u64 %word_byte, %idx, 5;          // idx / 32 (the validity word index)
+    mul.lo.u64 %word_byte, %word_byte, 4; // * 4 bytes per u32 word
+    add.u64 %bitmap_addr, %resident, %null_off;
+    add.u64 %bitmap_addr, %bitmap_addr, %word_byte;
+    ld.global.u32 %bitmap_word, [%bitmap_addr];
+    cvt.u32.u64 %bit_pos, %idx;
+    and.b32 %bit_pos, %bit_pos, 31;       // idx % 32
+    bfe.u32 %valid_bit, %bitmap_word, %bit_pos, 1;
+    setp.eq.u32 %p_valid, %valid_bit, 1;  // 1 = valid/present, 0 = NULL
+    @!%p_valid bra next;                   // NULL => does not match, skip
+
+count:
     add.u64 %matches, %matches, 1;
 
 next:
@@ -4338,12 +4399,14 @@ done:
     let mut rows_arg = row_count;
     let mut needle_arg = needle;
     let mut output_arg = allocation_guard.ptr;
+    let mut null_bitmap_arg = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
     let mut args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut offset_arg as *mut u64).cast::<c_void>(),
         (&mut rows_arg as *mut u64).cast::<c_void>(),
         (&mut needle_arg as *mut i32).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut null_bitmap_arg as *mut u64).cast::<c_void>(),
     ];
     launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
@@ -4385,6 +4448,9 @@ fn launch_cuda_resident_i32_equal_count(
     byte_offset: u64,
     row_count: u64,
     needle: i32,
+    // M3 (doc 21): `Some(off)` = the column's NULL validity bitmap (1 = valid, 0 = NULL); `None` = no
+    // bitmap ⇒ all rows valid. A NULL operand never matches the needle (three-valued logic).
+    null_bitmap_offset: Option<u64>,
 ) -> Result<u64, CudaRuntimeProbeError> {
     type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
@@ -4411,11 +4477,14 @@ fn launch_cuda_resident_i32_equal_count(
     .param .u64 byte_offset,
     .param .u64 row_count,
     .param .s32 needle,
-    .param .u64 out_ptr
+    .param .u64 out_ptr,
+    .param .u64 null_bitmap_offset
 )
 {
     .reg .pred %p_done;
     .reg .pred %p_match;
+    .reg .pred %p_no_bitmap;
+    .reg .pred %p_valid;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -4431,6 +4500,13 @@ fn launch_cuda_resident_i32_equal_count(
     .reg .u64 %addr;
     .reg .u64 %off_bytes;
     .reg .u64 %matches;
+    .reg .u64 %null_off;
+    .reg .u64 %sentinel;
+    .reg .u64 %word_byte;
+    .reg .u64 %bitmap_addr;
+    .reg .u32 %bitmap_word;
+    .reg .u32 %bit_pos;
+    .reg .u32 %valid_bit;
     .reg .s32 %needle;
     .reg .s32 %r_value;
 
@@ -4439,8 +4515,10 @@ fn launch_cuda_resident_i32_equal_count(
     ld.param.u64 %rows, [row_count];
     ld.param.s32 %needle, [needle];
     ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %null_off, [null_bitmap_offset];
 
     add.u64 %base, %resident, %offset;
+    mov.u64 %sentinel, 0xFFFFFFFFFFFFFFFF;
 
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4461,6 +4539,21 @@ loop:
     ld.global.s32 %r_value, [%addr];
     setp.eq.s32 %p_match, %r_value, %needle;
     @!%p_match bra next;
+    // 3VL: a NULL operand never matches. null_off == sentinel => no bitmap => every row valid.
+    setp.eq.u64 %p_no_bitmap, %null_off, %sentinel;
+    @%p_no_bitmap bra count;
+    shr.u64 %word_byte, %idx, 5;          // idx / 32
+    mul.lo.u64 %word_byte, %word_byte, 4; // * 4 bytes/word
+    add.u64 %bitmap_addr, %resident, %null_off;
+    add.u64 %bitmap_addr, %bitmap_addr, %word_byte;
+    ld.global.u32 %bitmap_word, [%bitmap_addr];
+    cvt.u32.u64 %bit_pos, %idx;
+    and.b32 %bit_pos, %bit_pos, 31;       // idx % 32
+    bfe.u32 %valid_bit, %bitmap_word, %bit_pos, 1;
+    setp.eq.u32 %p_valid, %valid_bit, 1;  // 1 = valid, 0 = NULL
+    @!%p_valid bra next;                   // NULL => skip
+
+count:
     add.u64 %matches, %matches, 1;
 
 next:
@@ -4500,6 +4593,7 @@ done:
     let function = resident
         .primary()
         .cached_function(c"gpu_db_resident_i32_equal_count_parallel", &ptx)?;
+    let null_bitmap_kernel_arg = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
 
     // The grid-stride loop covers any row_count regardless of grid size, so clamping the
     // grid is correctness-safe (extra rows are handled by wrapping). The kernel computes
@@ -4523,12 +4617,14 @@ done:
         let mut rows_arg = row_count;
         let mut needle_arg = needle;
         let mut output_arg = output_ptr;
+        let mut null_bitmap_arg = null_bitmap_kernel_arg;
         let mut args = [
             (&mut resident_arg as *mut u64).cast::<c_void>(),
             (&mut offset_arg as *mut u64).cast::<c_void>(),
             (&mut rows_arg as *mut u64).cast::<c_void>(),
             (&mut needle_arg as *mut i32).cast::<c_void>(),
             (&mut output_arg as *mut u64).cast::<c_void>(),
+            (&mut null_bitmap_arg as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
@@ -24939,9 +25035,9 @@ mod tests {
             // Correctness (also warms each kernel's module load): the parallel kernel must EQUAL
             // the previously-shipped serial (1,1,1) scan ON THE GPU — the serial scan is the
             // GPU-native oracle (no CPU re-implementation of the count operator as the expected).
-            let serial = launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle)
+            let serial = launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle, None)
                 .expect("serial count");
-            let parallel = launch_cuda_resident_i32_equal_count(&resident, offset, n, needle)
+            let parallel = launch_cuda_resident_i32_equal_count(&resident, offset, n, needle, None)
                 .expect("parallel count");
             assert_eq!(
                 parallel, serial,
@@ -24953,10 +25049,10 @@ mod tests {
             let mut parallel_ms = f64::MAX;
             for _ in 0..3 {
                 let t = Instant::now();
-                launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle).unwrap();
+                launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle, None).unwrap();
                 serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 let t = Instant::now();
-                launch_cuda_resident_i32_equal_count(&resident, offset, n, needle).unwrap();
+                launch_cuda_resident_i32_equal_count(&resident, offset, n, needle, None).unwrap();
                 parallel_ms = parallel_ms.min(t.elapsed().as_secs_f64() * 1e3);
             }
             let speedup = if parallel_ms > 0.0 {
@@ -24974,6 +25070,91 @@ mod tests {
             "parallel kernel ({largest_parallel_ms:.3} ms) did not beat the serial (1,1,1) \
              kernel ({largest_serial_ms:.3} ms) on the largest table — milestone premise unmet"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_resident_i32_equal_count_excludes_null_rows_via_validity_bitmap() {
+        // M3 (doc 21): the resident equal-count kernels honor the per-column NULL VALIDITY bitmap
+        // (1 = valid, 0 = NULL) ON THE GPU — a NULL operand never matches (three-valued logic), even
+        // though its value-section bytes are a 0 placeholder. GPU-native oracle: serial == parallel
+        // (no CPU re-implementation of the operator), plus a construction count, plus a control that
+        // shows the bitmap is what does the excluding.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let n: u64 = 200;
+        // NULL every 7th row. Non-null values are (i % 5) + 1 ∈ {1,2,3,4,5}, so 0 is NEVER a real
+        // value — it can only appear as a NULL row's placeholder.
+        let is_null = |i: u64| i.is_multiple_of(7);
+        let values: Vec<i32> = (0..n)
+            .map(|i| if is_null(i) { 0 } else { (i % 5) as i32 + 1 })
+            .collect();
+        // Validity bitmap: ceil(n/32) little-endian u32 words, bit i = row i, 1 = valid.
+        let mut bitmap = vec![0u32; (n as usize).div_ceil(32)];
+        for i in 0..n as usize {
+            if !is_null(i as u64) {
+                bitmap[i / 32] |= 1u32 << (i % 32);
+            }
+        }
+        // Payload: header(8) + int4 column (n*4) + validity bitmap (words*4). The bitmap is the
+        // section build_relational_device_payload emits after the columns (slice 2a).
+        let header = n.to_le_bytes();
+        // SAFETY: i32/u32 are plain-old-data; viewing the Vecs as native (little-endian) bytes
+        // matches the kernels' `ld.global.s32`/`ld.global.u32`, and both outlive this borrow.
+        let column_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) };
+        let bitmap_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(bitmap.as_ptr().cast::<u8>(), bitmap.len() * 4) };
+        let header_len = std::mem::size_of::<u64>() as u64;
+        let null_offset = header_len + column_bytes.len() as u64;
+        let allocated = null_offset + bitmap_bytes.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated,
+                &[
+                    CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+                    CudaDeviceMemoryChunk { byte_offset: header_len, bytes: column_bytes },
+                    CudaDeviceMemoryChunk { byte_offset: null_offset, bytes: bitmap_bytes },
+                ],
+            )
+            .expect("retain resident column + validity bitmap");
+        let offset = header_len;
+        let n_null = (0..n).filter(|&i| is_null(i)).count() as u64;
+        assert!(n_null > 0);
+
+        // (1) needle 0 collides with the NULL placeholder: WITH the bitmap, count(col == 0) must be 0
+        //     (no non-null row has value 0), and serial must equal parallel ON THE GPU.
+        let serial0 =
+            launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, 0, Some(null_offset))
+                .expect("serial count with bitmap");
+        let parallel0 =
+            launch_cuda_resident_i32_equal_count(&resident, offset, n, 0, Some(null_offset))
+                .expect("parallel count with bitmap");
+        assert_eq!(serial0, parallel0, "serial == parallel (GPU oracle) at needle=0");
+        assert_eq!(serial0, 0, "NULL rows (placeholder 0) must NOT match WHERE col = 0");
+
+        // Control: WITHOUT the bitmap (None), the 0 placeholders DO leak as matches — proving the
+        // setup is real and the bitmap is precisely what excludes the NULL rows.
+        let serial0_no_bitmap =
+            launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, 0, None)
+                .expect("serial count without bitmap");
+        assert_eq!(
+            serial0_no_bitmap, n_null,
+            "without the validity bitmap, every NULL placeholder leaks as a 0 match"
+        );
+
+        // (2) needle 3: non-null matching is preserved alongside the bitmap. Expected = non-null rows
+        //     whose value is 3, i.e. (i % 5) + 1 == 3.
+        let expected3 = (0..n).filter(|&i| !is_null(i) && (i % 5) + 1 == 3).count() as u64;
+        let serial3 =
+            launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, 3, Some(null_offset))
+                .expect("serial count needle=3");
+        let parallel3 =
+            launch_cuda_resident_i32_equal_count(&resident, offset, n, 3, Some(null_offset))
+                .expect("parallel count needle=3");
+        assert_eq!(serial3, parallel3, "serial == parallel (GPU oracle) at needle=3");
+        assert_eq!(serial3, expected3, "construction count excludes NULL rows");
     }
 
     #[test]
