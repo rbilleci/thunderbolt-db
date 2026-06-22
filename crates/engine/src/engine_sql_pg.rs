@@ -398,9 +398,20 @@ fn flatten_join_chain(
     relations: &mut Vec<JoinRelationRef>,
     steps: &mut Vec<JoinStep>,
 ) -> Result<(), ExecuteError> {
-    if join.jointype != JoinType::JoinInner as i32 {
+    // INNER and 2-relation LEFT OUTER (ON only) are supported; RIGHT/FULL are a follow-up.
+    let outer_left = if join.jointype == JoinType::JoinInner as i32 {
+        false
+    } else if join.jointype == JoinType::JoinLeft as i32 {
+        true
+    } else {
         return Err(sql_pg_error(
-            "only INNER JOIN is on the join path yet (LEFT/RIGHT/FULL are a follow-up)".to_string(),
+            "only INNER and LEFT JOIN are on the join path yet (RIGHT/FULL are a follow-up)"
+                .to_string(),
+        ));
+    };
+    if outer_left && (join.is_natural || !join.using_clause.is_empty()) {
+        return Err(sql_pg_error(
+            "LEFT JOIN with NATURAL/USING is a follow-up; use LEFT JOIN ... ON".to_string(),
         ));
     }
     let larg = join
@@ -449,6 +460,7 @@ fn flatten_join_chain(
             conjuncts: Vec::new(),
             natural: true,
             coalesce: Vec::new(),
+            outer_left,
         }
     } else if !join.using_clause.is_empty() {
         // USING(cols): desugar to qualified `left.c = right.c` conjuncts + record the coalesce columns.
@@ -473,6 +485,7 @@ fn flatten_join_chain(
             conjuncts,
             natural: false,
             coalesce: cols,
+            outer_left,
         }
     } else {
         // ON: a single `=` equi-join, or a top-level AND of `=` equi-joins (a composite key).
@@ -484,6 +497,7 @@ fn flatten_join_chain(
             conjuncts: parse_on_conjuncts(quals)?,
             natural: false,
             coalesce: Vec::new(),
+            outer_left,
         }
     };
     steps.push(step);
@@ -776,6 +790,8 @@ fn plan_comma_join_where(
             conjuncts: relation_edges,
             natural: false,
             coalesce: Vec::new(),
+            // A comma join (`FROM a, b WHERE a.k=b.k`) is always INNER.
+            outer_left: false,
         });
     }
     let predicates = filters

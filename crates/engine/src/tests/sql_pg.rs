@@ -757,6 +757,115 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
+    // 2-relation LEFT OUTER join (M3 -- doc 21): every LEFT row appears; an unmatched left row -- the
+    // CHILDLESS parent 3, AND the NULL-key left row 'nokey' (which matches nothing, 3VL) -- is kept with
+    // the right relation's columns NULL-padded.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE lp (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE lc (pid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO lp (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(NULL,'nokey')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO lc (pid, label) VALUES (1,'x'),(1,'y'),(2,'z')")
+        .unwrap();
+    let ps = e.populate_relational_residency_snapshot("lp").unwrap();
+    let cs = e.populate_relational_residency_snapshot("lc").unwrap();
+    if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM lp LEFT JOIN lc ON lp.id = lc.pid")
+        .expect("left outer join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let mut got: Vec<(String, Option<String>)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            let name = match &r[0] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("name: {o:?}"),
+            };
+            let label = match &r[1] {
+                SqlValue::Text(t) => Some(t.clone()),
+                SqlValue::Null => None,
+                o => panic!("label: {o:?}"),
+            };
+            (name, label)
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("a".to_string(), Some("x".to_string())),
+            ("a".to_string(), Some("y".to_string())),
+            ("b".to_string(), Some("z".to_string())),
+            ("c".to_string(), None),     // childless parent 3 -> NULL-padded right columns
+            ("nokey".to_string(), None), // NULL-key left row matches nothing -> NULL-padded
+        ],
+        "LEFT JOIN keeps every left row; unmatched (incl. NULL-key) rows are NULL-padded"
+    );
+
+    // TEXT-key LEFT join: the NULL pad maps over the GPU text hash join too (a different build/probe
+    // orientation than int). 'z' has no match -> NULL-padded.
+    e.execute_text(5, "CREATE TABLE tp (k TEXT, name TEXT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE tc (k TEXT, label TEXT)")
+        .unwrap();
+    e.execute_text(7, "INSERT INTO tp (k, name) VALUES ('a','pa'),('b','pb'),('z','pz')")
+        .unwrap();
+    e.execute_text(8, "INSERT INTO tc (k, label) VALUES ('a','ca'),('b','cb')")
+        .unwrap();
+    let tps = e.populate_relational_residency_snapshot("tp").unwrap();
+    let tcs = e.populate_relational_residency_snapshot("tc").unwrap();
+    if tps.device_memory_proof.is_none() || tcs.device_memory_proof.is_none() {
+        return;
+    }
+    let tres = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM tp LEFT JOIN tc ON tp.k = tc.k")
+        .expect("text-key left join");
+    let mut tgot: Vec<(String, Option<String>)> = tres
+        .rows
+        .iter()
+        .map(|r| {
+            let name = match &r[0] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("name: {o:?}"),
+            };
+            let label = match &r[1] {
+                SqlValue::Text(t) => Some(t.clone()),
+                SqlValue::Null => None,
+                o => panic!("label: {o:?}"),
+            };
+            (name, label)
+        })
+        .collect();
+    tgot.sort();
+    assert_eq!(
+        tgot,
+        vec![
+            ("pa".to_string(), Some("ca".to_string())),
+            ("pb".to_string(), Some("cb".to_string())),
+            ("pz".to_string(), None), // 'z' has no match -> NULL-padded
+        ],
+        "text-key LEFT join NULL-pads the unmatched left row"
+    );
+
+    // RIGHT/FULL and a WHERE on a LEFT join are clean errors (follow-ups), not mis-answers.
+    assert!(e
+        .execute_resident_expr_select_sql("SELECT name, label FROM lp RIGHT JOIN lc ON lp.id = lc.pid")
+        .is_err());
+    assert!(e
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM lp LEFT JOIN lc ON lp.id = lc.pid WHERE lc.label = 'x'"
+        )
+        .is_err());
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     // The SMALLER side (s, the left/probe-by-size) has a DUPLICATE join key, so build-on-smaller hits
     // DuplicateBuildKey -> the executor falls back to building on the LARGER (unique) side. This
@@ -1030,9 +1139,16 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
             .unwrap_or_else(|| panic!("expected a rejection for: {sql}"));
         format!("{err:?}").to_lowercase()
     };
+    // LEFT JOIN is SUPPORTED now (2-relation, ON-only) -- it routes to the join path (the residency
+    // check here, since a/b are not resident), NOT a parser rejection. RIGHT/FULL remain follow-ups.
+    let left = reject("SELECT x, y FROM a LEFT JOIN b ON a.k = b.k");
     assert!(
-        reject("SELECT x, y FROM a LEFT JOIN b ON a.k = b.k").contains("inner"),
-        "LEFT JOIN rejected"
+        left.contains("resident snapshot") || left.contains("join path"),
+        "LEFT JOIN routes to the join path now, got: {left}"
+    );
+    assert!(
+        reject("SELECT x, y FROM a RIGHT JOIN b ON a.k = b.k").contains("right"),
+        "RIGHT JOIN rejected (a follow-up)"
     );
     assert!(
         reject("SELECT x, y FROM a JOIN b ON a.k > b.k").contains("equality")

@@ -99,6 +99,11 @@ pub(crate) struct JoinRelationRef {
     pub alias: String,
 }
 
+/// Sentinel carried in a join's per-relation index vectors meaning "no row -> emit NULL for this
+/// relation's columns" -- a LEFT OUTER join's NULL pad for an unmatched left row (M3 -- doc 21). A real
+/// absolute row index can never be `u32::MAX` (residency row counts are far smaller), so it is unambiguous.
+const JOIN_NULL_ROW: u32 = u32::MAX;
+
 /// One INNER-join step in a left-deep chain. Its condition is one of: explicit ON `conjuncts`
 /// (`a.k1=b.k1 [AND a.k2=b.k2]` -- in each pair one operand resolves to the newly joined relation
 /// `relations[k+1]`, the other to an accumulated one); `USING(cols)`, which the parser desugars to
@@ -113,6 +118,10 @@ pub(crate) struct JoinStep {
     pub natural: bool,
     /// USING/NATURAL join column names -- emitted ONCE in `*` and resolvable unqualified (else empty).
     pub coalesce: Vec<String>,
+    /// `true` for a LEFT OUTER join (M3 -- doc 21): every accumulated (left) row is kept; an unmatched
+    /// one gets the new relation's columns NULL-padded. `false` = INNER (only matched pairs survive).
+    /// Currently 2-relation LEFT ON only (RIGHT/FULL, multi-way LEFT, LEFT NATURAL/USING are follow-ups).
+    pub outer_left: bool,
 }
 
 /// A LEFT-DEEP chain of INNER equi-joins parsed from the libpg_query FROM clause (M5). `relations` are in
@@ -1613,6 +1622,23 @@ impl Engine {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
         let n_rel = plan.relations.len();
+        // LEFT OUTER (M3 -- doc 21) is currently a 2-relation, ON-only join with no WHERE. A multi-way
+        // LEFT (NULL-padding an intermediate result) and a WHERE on a LEFT join (the per-side WHERE
+        // pushdown is NOT filter-commutative for an outer join -- a filter on the inner side would change
+        // which rows are NULL-padded) are follow-ups, rejected here rather than mis-answered.
+        if plan.steps.iter().any(|s| s.outer_left) {
+            if plan.steps.len() != 1 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "multi-way LEFT JOIN is a follow-up (only a 2-relation LEFT JOIN is supported)"
+                        .to_string(),
+                )));
+            }
+            if predicates.iter().any(Option::is_some) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "a WHERE clause on a LEFT JOIN is a follow-up".to_string(),
+                )));
+            }
+        }
         // Resolve a JOIN column reference to (relation index, column index) against relations[0..=upto]:
         // a qualifier must name exactly one of them; an unqualified column must be in exactly one (PG's
         // "ambiguous" / "does not exist"). `upto` bounds an ON operand to the relations joined so far.
@@ -1857,6 +1883,14 @@ impl Engine {
         {
             sides.push(self.resolve_join_side(&relation.table, table, row_opt)?);
         }
+        // The `JOIN_NULL_ROW` sentinel (LEFT-pad) must be distinguishable from every real absolute row
+        // index -- it is, because residency never holds anywhere near u32::MAX rows. Make it explicit.
+        debug_assert!(
+            sides
+                .iter()
+                .all(|s| s.0.host_rows.len() < JOIN_NULL_ROW as usize),
+            "a join relation has too many rows to distinguish the LEFT-join NULL-pad sentinel"
+        );
         let gpu_id = sides[0].0.descriptor.gpu_id;
         // Pre-filter each relation by its per-relation WHERE on the GPU -> the surviving ABSOLUTE row
         // indices (inner join is filter-commutative on per-side predicates). No predicate -> all rows.
@@ -2098,6 +2132,30 @@ impl Engine {
                 next.push(acc_match.iter().map(|&p| col[p as usize]).collect());
             }
             next.push(new_match.iter().map(|&p| new_idx[p as usize]).collect());
+            // LEFT OUTER (M3 -- doc 21): every accumulated (left) row must appear. An UNMATCHED left tuple
+            // -- including a NULL-key left row, which matches nothing -- is appended with the new relation
+            // NULL-padded via the `JOIN_NULL_ROW` sentinel (the gather emits NULL for its columns). The
+            // matched-left set maps `acc_match` positions back through the NULL-key filter to the original
+            // carried-tuple positions; the rest are NULL-padded.
+            if plan.steps[k].outer_left {
+                let mut matched_orig = vec![false; tuple_count];
+                for &p in acc_match {
+                    let orig = if drops_acc || drops_new {
+                        acc_keep[p as usize]
+                    } else {
+                        p as usize
+                    };
+                    matched_orig[orig] = true;
+                }
+                for (o, &is_matched) in matched_orig.iter().enumerate() {
+                    if !is_matched {
+                        for (rel, col) in work_idx.iter().enumerate() {
+                            next[rel].push(col[o]);
+                        }
+                        next[new_rel].push(JOIN_NULL_ROW);
+                    }
+                }
+            }
             work_idx = next;
         }
         // Gather: for each surviving tuple, read each projected column from its relation's host_rows at
@@ -2106,7 +2164,15 @@ impl Engine {
         let mut result_rows: Vec<Vec<SqlValue>> = (0..work_n)
             .map(|t| {
                 proj.iter()
-                    .map(|&(ri, ci)| sides[ri].0.host_rows[work_idx[ri][t] as usize][ci].clone())
+                    .map(|&(ri, ci)| {
+                        // A `JOIN_NULL_ROW` sentinel (LEFT-join NULL pad) -> the column is NULL.
+                        let row = work_idx[ri][t];
+                        if row == JOIN_NULL_ROW {
+                            SqlValue::Null
+                        } else {
+                            sides[ri].0.host_rows[row as usize][ci].clone()
+                        }
+                    })
                     .collect()
             })
             .collect();
