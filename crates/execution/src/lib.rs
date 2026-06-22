@@ -2095,6 +2095,31 @@ impl CudaResidentDeviceMemory {
         .map(|(rows, _)| rows)
     }
 
+    /// NULL-aware filtered scalar-aggregate stats (M3 — doc 21): a *self-grouped* filtered reduction over
+    /// one nullable int4 column (group == value == filter == `byte_offset`). The filter `<col> <cmp>
+    /// needle` runs on-device AND a NULL value (per `null_bitmap_offset`, 1 = valid) is skipped, so the
+    /// reduction covers only the surviving non-NULL matches. The caller reduces the returned groups; zero
+    /// groups ⇒ SQL NULL. `None` reduces to the plain filtered path.
+    pub fn filtered_grouped_stats_i32_nullable_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        needle: i32,
+        comparison: CudaI32Comparison,
+        null_bitmap_offset: Option<u64>,
+    ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_grouped_stats(
+            self,
+            byte_offset,
+            byte_offset,
+            Some((byte_offset, needle, comparison)),
+            row_count,
+            null_bitmap_offset,
+            None,
+        )
+        .map(|(rows, _)| rows)
+    }
+
     pub fn filtered_stats_i32_compare_from_payload(
         &self,
         byte_offset: u64,
@@ -2128,6 +2153,31 @@ impl CudaResidentDeviceMemory {
             row_count,
             lower_inclusive,
             upper_inclusive,
+            None,
+        )
+    }
+
+    /// NULL-aware BETWEEN stats (M3 — doc 21): like [`Self::stats_i32_between_from_payload`] but a NULL
+    /// value (per `null_bitmap_offset`, 1 = valid) never satisfies the range, so it is excluded from
+    /// count/sum/min/max. `None` reduces to the plain path. The caller maps a zero `count` to SQL NULL.
+    pub fn stats_i32_between_nullable_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        lower_inclusive: i32,
+        upper_inclusive: i32,
+        null_bitmap_offset: Option<u64>,
+    ) -> Result<CudaI32Stats, CudaRuntimeProbeError> {
+        if lower_inclusive > upper_inclusive {
+            return Ok(CudaI32Stats::from_values(&[]));
+        }
+        launch_cuda_resident_i32_between_stats(
+            self,
+            byte_offset,
+            row_count,
+            lower_inclusive,
+            upper_inclusive,
+            null_bitmap_offset,
         )
     }
 
@@ -10594,6 +10644,9 @@ fn launch_cuda_resident_i32_between_stats(
     row_count: u64,
     lower_inclusive: i32,
     upper_inclusive: i32,
+    // M3 (doc 21): `Some(off)` = the column's NULL validity bitmap byte offset (1 = valid); `None` = no
+    // bitmap ⇒ every row valid. A NULL value never satisfies BETWEEN (3VL).
+    null_bitmap_offset: Option<u64>,
 ) -> Result<CudaI32Stats, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -10629,13 +10682,23 @@ fn launch_cuda_resident_i32_between_stats(
     .param .u64 row_count,
     .param .s32 lower_inclusive,
     .param .s32 upper_inclusive,
-    .param .u64 out_ptr
+    .param .u64 out_ptr,
+    .param .u64 null_bitmap_offset
 )
 {
     .reg .pred %p_done;
     .reg .pred %p_ge_lower;
     .reg .pred %p_le_upper;
     .reg .pred %p_match;
+    .reg .pred %p_no_bitmap;
+    .reg .pred %p_valid;
+    .reg .u64 %null_off;
+    .reg .u64 %sentinel;
+    .reg .u64 %word_byte;
+    .reg .u64 %bitmap_addr;
+    .reg .u32 %bitmap_word;
+    .reg .u32 %bit_pos;
+    .reg .u32 %valid_bit;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
@@ -10674,8 +10737,10 @@ fn launch_cuda_resident_i32_between_stats(
     ld.param.s32 %lower, [lower_inclusive];
     ld.param.s32 %upper, [upper_inclusive];
     ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %null_off, [null_bitmap_offset];
 
     add.u64 %base, %resident, %offset;
+    mov.u64 %sentinel, 0xFFFFFFFFFFFFFFFF;
     mov.u32 %r_block, %ctaid.x;
     mov.u32 %r_block_dim, %ntid.x;
     mov.u32 %thread, %tid.x;
@@ -10702,7 +10767,22 @@ loop:
     setp.le.s32 %p_le_upper, %r_value, %upper;
     and.pred %p_match, %p_ge_lower, %p_le_upper;
     @!%p_match bra next;
+    // M3 3VL: a NULL value never satisfies BETWEEN (its bytes are a 0 placeholder). null_off ==
+    // sentinel (0xFFFF...) => no validity bitmap => every row valid (skip the load).
+    setp.eq.u64 %p_no_bitmap, %null_off, %sentinel;
+    @%p_no_bitmap bra accumulate;
+    shr.u64 %word_byte, %idx, 5;          // idx / 32 (validity word index)
+    mul.lo.u64 %word_byte, %word_byte, 4; // * 4 bytes per u32 word
+    add.u64 %bitmap_addr, %resident, %null_off;
+    add.u64 %bitmap_addr, %bitmap_addr, %word_byte;
+    ld.global.u32 %bitmap_word, [%bitmap_addr];
+    cvt.u32.u64 %bit_pos, %idx;
+    and.b32 %bit_pos, %bit_pos, 31;       // idx % 32
+    bfe.u32 %valid_bit, %bitmap_word, %bit_pos, 1;
+    setp.eq.u32 %p_valid, %valid_bit, 1;  // 1 = valid/present, 0 = NULL
+    @!%p_valid bra next;                  // NULL => not a match, skip
 
+accumulate:
     cvt.s64.s32 %wide, %r_value;
     add.s64 %sum, %sum, %wide;
     add.u64 %count, %count, 1;
@@ -10757,6 +10837,9 @@ ret_done:
         .primary()
         .cached_function(c"gpu_db_resident_i32_between_stats", &ptx)?;
 
+    // u64::MAX sentinel when there is no validity bitmap; otherwise the bounds-checked byte offset.
+    let null_off_value = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
+
     let block_dim = 256_u32;
     let grid_dim = if row_count == 0 {
         1
@@ -10792,6 +10875,7 @@ ret_done:
         let mut lower_arg = lower_inclusive;
         let mut upper_arg = upper_inclusive;
         let mut output_arg = output_ptr;
+        let mut null_off_arg = null_off_value;
         let mut args = [
             (&mut resident_arg as *mut u64).cast::<c_void>(),
             (&mut offset_arg as *mut u64).cast::<c_void>(),
@@ -10799,6 +10883,7 @@ ret_done:
             (&mut lower_arg as *mut i32).cast::<c_void>(),
             (&mut upper_arg as *mut i32).cast::<c_void>(),
             (&mut output_arg as *mut u64).cast::<c_void>(),
+            (&mut null_off_arg as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
@@ -25395,6 +25480,82 @@ mod tests {
                 .0;
         assert!(serial_an.is_empty(), "all-NULL column must yield no serial groups");
         assert!(parallel_an.is_empty(), "all-NULL column must yield no parallel groups");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_resident_i32_between_stats_skips_null_values_via_validity_bitmap() {
+        // M3 (doc 21): the BETWEEN stats kernel excludes NULL values ON THE GPU via the validity bitmap
+        // (a NULL never satisfies a range; its bytes are a 0 placeholder). GPU-native oracle: a
+        // construction check against hand-computed non-NULL-in-range stats, plus a control over a range
+        // that INCLUDES the 0 placeholder so that without the bitmap the placeholders demonstrably leak.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let n: u64 = 200;
+        let is_null = |i: u64| i.is_multiple_of(7);
+        // Non-null values (i % 5) + 1 ∈ {1,2,3,4,5}; 0 is only ever a NULL row's placeholder.
+        let values: Vec<i32> = (0..n)
+            .map(|i| if is_null(i) { 0 } else { (i % 5) as i32 + 1 })
+            .collect();
+        let mut bitmap = vec![0u32; (n as usize).div_ceil(32)];
+        for i in 0..n as usize {
+            if !is_null(i as u64) {
+                bitmap[i / 32] |= 1u32 << (i % 32);
+            }
+        }
+        // SAFETY: i32/u32 are POD; native LE bytes match the kernel loads; the Vecs outlive the retain.
+        let column_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) };
+        let bitmap_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(bitmap.as_ptr().cast::<u8>(), bitmap.len() * 4) };
+        let header = n.to_le_bytes();
+        let header_len = std::mem::size_of::<u64>() as u64;
+        let null_off = header_len + column_bytes.len() as u64;
+        let allocated = null_off + bitmap_bytes.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated,
+                &[
+                    CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+                    CudaDeviceMemoryChunk { byte_offset: header_len, bytes: column_bytes },
+                    CudaDeviceMemoryChunk { byte_offset: null_off, bytes: bitmap_bytes },
+                ],
+            )
+            .expect("retain resident column + validity bitmap");
+        let off = header_len;
+
+        // Range [0,4] INCLUDES the placeholder 0. WITH the bitmap, only non-null values in [0,4] count
+        // (i.e. {1,2,3,4}; value 5 excluded). Hand-computed construction over the non-null rows.
+        let (mut exp_count, mut exp_sum, mut exp_min, mut exp_max) = (0u64, 0i64, i32::MAX, i32::MIN);
+        for i in 0..n {
+            if !is_null(i) {
+                let v = (i % 5) as i32 + 1;
+                if (0..=4).contains(&v) {
+                    exp_count += 1;
+                    exp_sum += i64::from(v);
+                    exp_min = exp_min.min(v);
+                    exp_max = exp_max.max(v);
+                }
+            }
+        }
+        let stats = resident
+            .stats_i32_between_nullable_from_payload(off, n, 0, 4, Some(null_off))
+            .expect("nullable between stats");
+        assert_eq!(stats.count, exp_count, "between count excludes NULL");
+        assert_eq!(stats.sum, exp_sum, "between sum excludes NULL");
+        assert_eq!(stats.min, Some(exp_min), "between min excludes NULL (not the 0 placeholder)");
+        assert_eq!(stats.max, Some(exp_max), "between max excludes NULL");
+
+        // Control: WITHOUT the bitmap, the NULL placeholder 0s satisfy [0,4] and leak — count rises by
+        // n_null and min drops to 0 — proving the construction is non-vacuous and the bitmap excludes.
+        let n_null = (0..n).filter(|&i| is_null(i)).count() as u64;
+        assert!(n_null > 0);
+        let leaked = resident
+            .stats_i32_between_from_payload(off, n, 0, 4)
+            .expect("between stats without bitmap");
+        assert_eq!(leaked.count, exp_count + n_null, "without bitmap the 0 placeholders leak in");
+        assert_eq!(leaked.min, Some(0), "without bitmap min collapses to the 0 placeholder");
     }
 
     #[test]

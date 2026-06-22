@@ -1446,23 +1446,65 @@ fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
         );
     }
 
-    // A FILTERED aggregate over a nullable column is a clean error (M3 follow-up: the filtered-stats
-    // kernels are not yet NULL-aware), NOT a wrong answer that folds the 0 placeholder in. The `<= 10`
-    // predicate is deliberately one the 0 placeholders WOULD pass — so without the guard a NULL row's
-    // phantom 0 would corrupt MIN/SUM/count — making the guard's necessity concrete, not coincidental.
+    // A FILTERED aggregate over a nullable column now runs on-device (Slice A): the `<= 10` predicate is
+    // one the 0 placeholders WOULD pass, so the kernel's NULL-skip (not the filter) is what excludes the
+    // NULL rows — MIN(amount) over the non-NULL rows ≤ 10 is {10, 5} ⇒ 5, never the phantom 0.
     let Command::Select(filtered) =
         parse_command("SELECT MIN(amount) FROM events WHERE amount <= 10").unwrap()
     else {
         unreachable!()
     };
-    let err = e
-        .execute_resident_plan(&filtered)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("filtered scalar aggregate over a nullable column"),
-        "expected the nullable-filtered clean error, got: {err}"
+    let resident = e.execute_resident_plan(&filtered).unwrap();
+    assert_eq!(
+        resident.rows,
+        vec![vec![SqlValue::Int4(5)]],
+        "filtered MIN over a nullable column excludes the NULL placeholder 0"
     );
+}
+
+#[test]
+fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
+    // M3 Slice A: filtered (compare + BETWEEN) SUM/AVG/MIN/MAX over a NULLABLE int4 column skip NULL rows
+    // ON THE GPU, and a no-surviving-row result is SQL NULL. Closed-form construction oracle (not CPU).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE events (amount INT)").unwrap();
+    // amount: 10, NULL, 30, NULL, 20, 5  -> non-NULL {10, 30, 20, 5}.
+    e.execute_text(
+        2,
+        "INSERT INTO events (amount) VALUES (10), (NULL), (30), (NULL), (20), (5)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    let cases: [(&str, SqlValue); 8] = [
+        // compare-nullable: non-NULL rows passing the filter, NULL placeholders excluded by the kernel.
+        ("SELECT SUM(amount) FROM events WHERE amount >= 20", SqlValue::Int8(50)), // {30,20}
+        ("SELECT MIN(amount) FROM events WHERE amount >= 20", SqlValue::Int4(20)),
+        ("SELECT MAX(amount) FROM events WHERE amount <= 10", SqlValue::Int4(10)), // {10,5}
+        (
+            "SELECT AVG(amount) FROM events WHERE amount <= 10",
+            crate::rel_exec_helpers::average_sql_value(15, 2),
+        ),
+        // no surviving non-NULL row ⇒ SQL NULL (PG: aggregate of no rows is NULL).
+        ("SELECT SUM(amount) FROM events WHERE amount >= 100", SqlValue::Null),
+        ("SELECT MAX(amount) FROM events WHERE amount >= 100", SqlValue::Null),
+        // BETWEEN-nullable: the [0,10] lower bound would admit the 0 placeholder, but the kernel's
+        // NULL-skip excludes it, so MIN is 5 (a real value), not 0.
+        ("SELECT MIN(amount) FROM events WHERE amount BETWEEN 0 AND 10", SqlValue::Int4(5)),
+        ("SELECT SUM(amount) FROM events WHERE amount BETWEEN 100 AND 200", SqlValue::Null),
+    ];
+    for (sql, expected) in cases {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let resident = e.execute_resident_plan(&select).unwrap();
+        assert_eq!(resident.rows, vec![vec![expected]], "{sql}");
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(resident.fallback_reason, None, "{sql}");
+    }
 }
 
 #[test]

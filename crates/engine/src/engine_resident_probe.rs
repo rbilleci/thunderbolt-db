@@ -297,6 +297,74 @@ fn materialize_resident_scalar_stats(
     })
 }
 
+/// Reduce the NULL-aware self-grouped stats (M3 — doc 21) of a scalar SUM/AVG/MIN/MAX into one value.
+/// The groups cover only the surviving non-NULL (and, when filtered, matching) rows, so a zero-survivor
+/// result is SQL NULL for every aggregate (PG: an aggregate of no rows is NULL — never 0 or the
+/// empty-text sentinel). Shared by the unfiltered-nullable and filtered-compare-nullable paths. COUNT is
+/// not on this path (it routes to `run_resident_count`).
+fn reduce_nullable_grouped_stats(
+    aggregate: ResidentScalarAggregate,
+    grouped_stats: &[CudaI32GroupedStats],
+) -> Result<SqlValue, ExecuteError> {
+    let total_count = grouped_stats.iter().map(|group| group.count).sum::<u64>();
+    let total_sum = grouped_stats.iter().map(|group| group.sum).sum::<i64>();
+    Ok(match aggregate {
+        ResidentScalarAggregate::Sum { .. } => {
+            if total_count == 0 {
+                SqlValue::Null
+            } else {
+                SqlValue::Int8(total_sum)
+            }
+        }
+        ResidentScalarAggregate::Avg { .. } => {
+            if total_count == 0 {
+                SqlValue::Null
+            } else {
+                average_sql_value(
+                    i128::from(total_sum),
+                    usize::try_from(total_count).map_err(|_| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "resident device-memory scalar aggregate count {total_count} exceeds AVG result range"
+                        )))
+                    })?,
+                )
+            }
+        }
+        ResidentScalarAggregate::Min { .. } => grouped_stats
+            .iter()
+            .map(|group| group.min)
+            .min()
+            .map(SqlValue::Int4)
+            .unwrap_or(SqlValue::Null),
+        ResidentScalarAggregate::Max { .. } => grouped_stats
+            .iter()
+            .map(|group| group.max)
+            .max()
+            .map(SqlValue::Int4)
+            .unwrap_or(SqlValue::Null),
+        ResidentScalarAggregate::Count => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident COUNT routed to scalar path".to_string(),
+            )));
+        }
+    })
+}
+
+/// D2H byte estimate for a `grouped_stats` reduction: the group columns (i32 group + u64 count + i64 sum
+/// + 2×i32 min/max) per group plus the u64 group-count header. Shared by the nullable scalar paths.
+fn nullable_grouped_stats_d2h_bytes(copied_group_count: usize) -> u64 {
+    copied_group_count
+        .checked_mul(
+            std::mem::size_of::<i32>()
+                + std::mem::size_of::<u64>()
+                + std::mem::size_of::<i64>()
+                + (2 * std::mem::size_of::<i32>()),
+        )
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(u64::MAX)
+}
+
 impl Engine {
     /// Plan->kernel driver for the resident scalar-aggregate family (P0 spine 1.3): ONE path for
     /// every resident `COUNT(*)`/`SUM`/`AVG`/`MIN`/`MAX` shape. Binds the select, compiles it into a
@@ -469,24 +537,12 @@ impl Engine {
         // path below. A NULL value's payload bytes are a 0 placeholder, so an unaware kernel would fold
         // a phantom 0 into MIN/AVG/SUM — the bitmap is read ON-DEVICE to exclude those rows.
         let agg_null_offset = resident_device_null_column_offset(snapshot, table, agg_col)?;
-        // Filtered/BETWEEN aggregates still route through the non-NULL-aware filtered-stats kernels, so a
-        // nullable filter/aggregate column would leak the 0 placeholder. Clean-error it (M3 follow-up)
-        // rather than return a wrong answer; the filter targets the aggregate column by construction.
-        if agg_null_offset.is_some()
-            && matches!(
-                predicate,
-                ResidentPredicate::Int4Compare { .. } | ResidentPredicate::Int4Between { .. }
-            )
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident filtered scalar aggregate over a nullable column is not yet supported"
-                    .to_string(),
-            )));
-        }
 
         // MAX over a provably-empty int4 compare domain: the retained column stats already prove the
         // result is empty, so answer from them with no kernel launch (matches the pre-unification
-        // filtered probe's fast path; only the D2H of the i64 result counter is charged).
+        // filtered probe's fast path; only the D2H of the i64 result counter is charged). Non-nullable
+        // only — a nullable column routes through the NULL-aware filtered kernel below (which finalizes
+        // an empty result to SQL NULL, not the empty-text sentinel).
         if let (
             ResidentScalarAggregate::Max { col },
             ResidentPredicate::Int4Compare {
@@ -494,8 +550,9 @@ impl Engine {
             },
         ) = (aggregate, predicate)
         {
-            if resident_device_int4_column_stats(snapshot, table, col)
-                .is_some_and(|stats| resident_i32_comparison_domain_is_empty(stats, *needle, *comparison))
+            if agg_null_offset.is_none()
+                && resident_device_int4_column_stats(snapshot, table, col)
+                    .is_some_and(|stats| resident_i32_comparison_domain_is_empty(stats, *needle, *comparison))
             {
                 self.metrics
                     .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
@@ -621,60 +678,34 @@ impl Engine {
                     )
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
                 let elapsed = started.elapsed();
-                let copied_group_count = grouped_stats.len();
-                let total_count = grouped_stats.iter().map(|group| group.count).sum::<u64>();
-                let total_sum = grouped_stats.iter().map(|group| group.sum).sum::<i64>();
-                let result_value = match aggregate {
-                    ResidentScalarAggregate::Sum { .. } => {
-                        if total_count == 0 {
-                            SqlValue::Null
-                        } else {
-                            SqlValue::Int8(total_sum)
-                        }
-                    }
-                    ResidentScalarAggregate::Avg { .. } => {
-                        if total_count == 0 {
-                            SqlValue::Null
-                        } else {
-                            average_sql_value(
-                                i128::from(total_sum),
-                                usize::try_from(total_count).map_err(|_| {
-                                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                        "resident device-memory scalar aggregate count {total_count} exceeds AVG result range"
-                                    )))
-                                })?,
-                            )
-                        }
-                    }
-                    ResidentScalarAggregate::Min { .. } => grouped_stats
-                        .iter()
-                        .map(|group| group.min)
-                        .min()
-                        .map(SqlValue::Int4)
-                        .unwrap_or(SqlValue::Null),
-                    ResidentScalarAggregate::Max { .. } => grouped_stats
-                        .iter()
-                        .map(|group| group.max)
-                        .max()
-                        .map(SqlValue::Int4)
-                        .unwrap_or(SqlValue::Null),
-                    ResidentScalarAggregate::Count => {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "resident COUNT routed to scalar path".to_string(),
-                        )));
-                    }
-                };
-                let result_d2h_bytes = copied_group_count
-                    .checked_mul(
-                        std::mem::size_of::<i32>()
-                            + std::mem::size_of::<u64>()
-                            + std::mem::size_of::<i64>()
-                            + (2 * std::mem::size_of::<i32>()),
+                let result_value = reduce_nullable_grouped_stats(aggregate, &grouped_stats)?;
+                self.metrics
+                    .observe_d2h_bytes(nullable_grouped_stats_d2h_bytes(grouped_stats.len()));
+                self.metrics.observe_kernel_exec_ms(
+                    elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                );
+                Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
+            }
+            // M3 filtered-nullable (compare): the filter `<value> <cmp> needle` runs on-device AND NULL
+            // values are skipped, so the self-grouped stats cover only the surviving non-NULL matches;
+            // zero survivors ⇒ SQL NULL. Reuses the already-NULL-aware grouped kernel (no new kernel).
+            ResidentPredicate::Int4Compare {
+                needle, comparison, ..
+            } if agg_null_offset.is_some() => {
+                let started = Instant::now();
+                let grouped_stats = device_memory
+                    .filtered_grouped_stats_i32_nullable_from_payload(
+                        byte_offset,
+                        row_count,
+                        *needle,
+                        *comparison,
+                        agg_null_offset,
                     )
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .unwrap_or(u64::MAX);
-                self.metrics.observe_d2h_bytes(result_d2h_bytes);
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                let elapsed = started.elapsed();
+                let result_value = reduce_nullable_grouped_stats(aggregate, &grouped_stats)?;
+                self.metrics
+                    .observe_d2h_bytes(nullable_grouped_stats_d2h_bytes(grouped_stats.len()));
                 self.metrics.observe_kernel_exec_ms(
                     elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
                 );
@@ -701,6 +732,42 @@ impl Engine {
                 self.metrics.observe_d2h_bytes(result_d2h_bytes);
                 self.metrics
                     .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+                Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
+            }
+            // M3 filtered-nullable (BETWEEN): the NULL-aware between-stats kernel excludes NULL values
+            // (a NULL never satisfies the range); a zero-count result ⇒ SQL NULL for every aggregate.
+            ResidentPredicate::Int4Between { lower, upper, .. } if agg_null_offset.is_some() => {
+                let (lower, upper) = (*lower, *upper);
+                let started = Instant::now();
+                let stats = device_memory
+                    .stats_i32_between_nullable_from_payload(
+                        byte_offset,
+                        row_count,
+                        lower,
+                        upper,
+                        agg_null_offset,
+                    )
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                let elapsed = started.elapsed();
+                let result_value = if stats.count == 0 {
+                    SqlValue::Null
+                } else {
+                    materialize_resident_scalar_stats(aggregate, &stats)?
+                };
+                let result_d2h_bytes = if lower > upper {
+                    0
+                } else {
+                    (std::mem::size_of::<u64>()
+                        + std::mem::size_of::<i64>()
+                        + (2 * std::mem::size_of::<i32>())
+                        + std::mem::size_of::<u64>()) as u64
+                };
+                self.metrics.observe_d2h_bytes(result_d2h_bytes);
+                if lower <= upper {
+                    self.metrics.observe_kernel_exec_ms(
+                        elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                    );
+                }
                 Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
             }
             ResidentPredicate::Int4Between { lower, upper, .. } => {
