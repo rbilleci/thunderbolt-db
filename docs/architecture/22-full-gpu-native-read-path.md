@@ -61,17 +61,20 @@ is optional; each line is struck through only when it runs on the device.
   **Host sites to eliminate:** pass-alignment sort (`3961`); default-order sorts (`4116/4130`);
   text materialization (`3924/3987/3997/3998/4080/4085`).
   **Design (deferral-free sub-slices, each GPU-native + verified + audited):**
-  - **S2.1** — single-aggregate path (`passes.len()==1`, the common case): no cross-pass
-    alignment needed; materialize the (possibly text, via `project_text_rows_from_payload`
-    rep-index gather) key + the one aggregate into result rows, and order them with the existing
-    on-device `gpu_sort_result_rows` (default key order + any ORDER BY). Removes #30 + the
-    default-order host sorts + the text reads for this path.
-  - **S2.2** — multi-aggregate cross-pass alignment on-device: give every pass ONE canonical
-    group order without a host sort. Preferred = a single multi-aggregate hash-agg pass (one slot
-    carries all value cols' accumulators → one group array, no alignment); fallback = sort each
-    pass's groups by key on-device via a per-pass key payload + `bitonic_sort_hetero_on_payload`
-    permutation. COUNT(DISTINCT) passes align by the same mechanism.
-  - **S2.3** — composite / wide-key text members on-device (the remaining rep-index host reads).
+  - [x] **S2.1 — GROUP BY ordering on-device (default + explicit) + bool keys.** Both the explicit
+    ORDER BY and the deterministic default order (full key tuple, ASC, NULL group first) now route
+    through the on-device `gpu_sort_result_rows`; it gained bool-as-int (0/1) classification and is
+    now exhaustive over every result-column type. The host pass-alignment sort (#30) is skipped for
+    `passes.len()<=1`. **DONE `407f69bb`** (suite 234/0; independent audit running). No kernel change.
+  - [ ] **S2.2 — GROUP BY text key/value materialization on-device.** Replace the rep-index
+    `host_rows` reads in `materialize_key` + the result builder (`3924/3987/3997/3998/4080/4085`)
+    with `project_text_rows_from_payload` over the per-group representative row indices (one batched
+    gather). De-hosts the text DATA the grouped path still reads (single + multi pass).
+  - [ ] **S2.3 — multi-aggregate #30 alignment on-device.** Eliminate the host pass-alignment sort
+    that still runs for `passes.len()>1`. Preferred = a single multi-aggregate hash-agg pass (one slot
+    carries all value cols' accumulators → one group array, no alignment); fallback = sort each pass
+    by key on-device via a per-pass key payload + `bitonic_sort_hetero_on_payload` permutation.
+    COUNT(DISTINCT) passes align by the same mechanism.
 
 ### Result-stage operators on the general executor
 - [ ] **S3 — HAVING on-device.** `engine_expr.rs:4168` `rows.retain(...)` → device mask over the
