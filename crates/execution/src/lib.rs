@@ -1830,6 +1830,9 @@ impl CudaResidentDeviceMemory {
     /// doc 19). The column is 16 raw bytes/row in the i128 section; `needle` is the literal's 16 bytes.
     /// Comparison is an unsigned big-endian 16-byte memcmp (PG's uuid order). `cmp`: 0=eq/1=lt/2=le/
     /// 3=gt/4=ge/5=ne; `scalar_on_left` reverses the operand order.
+    /// `validity_offsets` (M3 — doc 21): the NULL validity bitmap byte offset of the uuid column when it
+    /// is nullable (empty when not). A NULL operand is UNKNOWN ⇒ excluded (the mask is AND'd with the
+    /// validity mask before compaction). Empty ⇒ byte-identical to the no-NULL path.
     pub fn expr_uuid_compare_scalar_filter(
         &self,
         byte_offset: u64,
@@ -1837,6 +1840,7 @@ impl CudaResidentDeviceMemory {
         scalar_on_left: bool,
         comparison: u32,
         row_count: u64,
+        validity_offsets: &[u64],
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_resident_uuid_compare_scalar_filter(
             self,
@@ -1845,17 +1849,20 @@ impl CudaResidentDeviceMemory {
             scalar_on_left,
             comparison,
             row_count,
+            validity_offsets,
         )
     }
 
     /// Surviving row indices of `a <cmp> b` over two resident UUID columns (the type matrix, doc 19),
-    /// each 16 raw bytes/row; unsigned big-endian 16-byte memcmp.
+    /// each 16 raw bytes/row; unsigned big-endian 16-byte memcmp. `validity_offsets` (M3 — doc 21) holds
+    /// the validity bitmap offset of each NULLABLE operand (a NULL in either ⇒ the row is excluded).
     pub fn expr_uuid_compare_columns_filter(
         &self,
         a_byte_offset: u64,
         b_byte_offset: u64,
         comparison: u32,
         row_count: u64,
+        validity_offsets: &[u64],
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_resident_uuid_compare_columns_filter(
             self,
@@ -1863,6 +1870,7 @@ impl CudaResidentDeviceMemory {
             b_byte_offset,
             comparison,
             row_count,
+            validity_offsets,
         )
     }
 
@@ -5900,6 +5908,113 @@ fn launch_cuda_resident_text_eq_scalar_filter(
 /// Evaluate `uuid[i] <cmp> needle` over a resident UUID column (16 raw bytes/row) to surviving row
 /// indices (the type matrix, doc 19): copy the 16 needle bytes H2D, run the byte-wise compare kernel
 /// to a mask, then the shared compactor.
+/// AND each nullable operand's NULL validity mask (1 = valid) into the i32 comparison `mask` ON THE GPU,
+/// then compact to surviving indices. For M3 (doc 21) WHERE 3VL over a nullable column whose compare
+/// kernel writes a plain mask but has no VM step (uuid memcmp): a NULL operand has validity bit 0, so the
+/// AND clears its mask bit and the row is excluded (UNKNOWN ⇒ not selected). `validity_offsets` holds the
+/// byte offset of each NULLABLE operand's validity bitmap (the caller omits non-nullable operands); EMPTY
+/// ⇒ just compact, byte-identical to the no-NULL path. The compare that wrote `mask` ran under a
+/// `launch_on_pooled_stream` whose covering sync completed it, so this separate stream is ordered after
+/// it; the bitmap→mask + mask-AND kernels are the same the predicate VM uses (NO new/changed kernel).
+fn compact_mask_with_validity(
+    resident: &CudaResidentDeviceMemory,
+    mask_ptr: u64,
+    validity_offsets: &[u64],
+    n: u64,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    if validity_offsets.is_empty() || n == 0 {
+        return compact_mask_i32_to_indices(resident, mask_ptr, n);
+    }
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mask_bytes = n_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    // `gpu_db_resident_bool_to_mask` reads the validity bitmap (1=valid) -> an i32 0/1 mask;
+    // `gpu_db_mask_binary` op 0 = AND, elementwise (in-place out==lhs is safe: each thread reads lhs[i]
+    // before writing out[i], no cross-index dependency).
+    let bool_mask_fn = primary.cached_function(c"gpu_db_resident_bool_to_mask", &ptx)?;
+    let mask_binary_fn = primary.cached_function(c"gpu_db_mask_binary", &ptx)?;
+    let validity_mask = primary.lease_device_buffer(mask_bytes)?;
+    const BLOCK: u32 = 256;
+    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let base = resident.device_ptr();
+    launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        for &off in validity_offsets {
+            // validity_mask = bitmap[off] expanded (negate=false: valid->1, NULL->0)
+            let mut b0 = base;
+            let mut b1 = off;
+            let mut b2 = 0u32;
+            let mut b3 = n;
+            let mut b4 = validity_mask.ptr;
+            let mut bargs = [
+                (&mut b0 as *mut u64).cast::<c_void>(),
+                (&mut b1 as *mut u64).cast::<c_void>(),
+                (&mut b2 as *mut u32).cast::<c_void>(),
+                (&mut b3 as *mut u64).cast::<c_void>(),
+                (&mut b4 as *mut u64).cast::<c_void>(),
+            ];
+            let rc = unsafe {
+                cu_launch_kernel(
+                    bool_mask_fn, grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                    bargs.as_mut_ptr(), std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+            // mask = mask AND validity_mask (in-place)
+            let mut m0 = mask_ptr;
+            let mut m1 = validity_mask.ptr;
+            let mut m2 = 0u32; // op 0 = AND
+            let mut m3 = n;
+            let mut m4 = mask_ptr;
+            let mut margs = [
+                (&mut m0 as *mut u64).cast::<c_void>(),
+                (&mut m1 as *mut u64).cast::<c_void>(),
+                (&mut m2 as *mut u32).cast::<c_void>(),
+                (&mut m3 as *mut u64).cast::<c_void>(),
+                (&mut m4 as *mut u64).cast::<c_void>(),
+            ];
+            let rc = unsafe {
+                cu_launch_kernel(
+                    mask_binary_fn, grid, 1, 1, BLOCK, 1, 1, 0, stream,
+                    margs.as_mut_ptr(), std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
+        0
+    })?;
+    compact_mask_i32_to_indices(resident, mask_ptr, n)
+}
+
 fn launch_cuda_resident_uuid_compare_scalar_filter(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
@@ -5907,6 +6022,7 @@ fn launch_cuda_resident_uuid_compare_scalar_filter(
     scalar_on_left: bool,
     comparison: u32,
     n: u64,
+    validity_offsets: &[u64],
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5997,7 +6113,7 @@ fn launch_cuda_resident_uuid_compare_scalar_filter(
             )
         }
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_with_validity(resident, mask.ptr, validity_offsets, n)
 }
 
 /// Evaluate `a <cmp> b` over two resident UUID columns (16 raw bytes/row each) to surviving row
@@ -6008,6 +6124,7 @@ fn launch_cuda_resident_uuid_compare_columns_filter(
     b_byte_offset: u64,
     comparison: u32,
     n: u64,
+    validity_offsets: &[u64],
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -6078,7 +6195,7 @@ fn launch_cuda_resident_uuid_compare_columns_filter(
             std::ptr::null_mut(),
         )
     })?;
-    compact_mask_i32_to_indices(resident, mask.ptr, n)
+    compact_mask_with_validity(resident, mask.ptr, validity_offsets, n)
 }
 
 /// Expand a resident bool column's 1-bit-per-row bitmap to surviving row indices (the type matrix,

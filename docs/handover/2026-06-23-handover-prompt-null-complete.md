@@ -39,12 +39,15 @@ Run `git checkout main && git pull` for the latest.
   same-scale col-vs-col) via I128 VM programs with validity steps; added `ExprStep::CompareScalarI128`
   (reuses the i128 compare-scalar kernel, no PTX change). Cross-scale (finer literal) / different-scale
   col-vs-col / numeric arithmetic / AND-OR stay clean-error.
+- **WHERE 3VL uuid** — nullable UUID simple comparisons (scalar both orders + col-vs-col) via a launcher-level
+  validity-AND (`compact_mask_with_validity`: bool_to_mask + mask_binary AND before compaction, no PTX change;
+  uuid is a dedicated memcmp kernel, not a VM step). `try_lower_uuid_predicate` made validity-aware + called
+  from the nullable block. **WHERE 3VL now covers nullable int4/int8/text/bool/date/timestamp/numeric/uuid.**
 **REMAINING Track A:** A.2 (nullable composite/text/uuid GROUP BY KEY — kernel change, most-audited path);
 A.4 (text/numeric/uuid ORDER BY key NULLs + explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field
 through ~20 ctors incl. the legacy protocol crate] + nullable sort expr); A.5 (N-way multi-way OUTER joins);
-and the rest of WHERE 3VL — nullable **uuid** (the dedicated uuid memcmp launcher `expr_uuid_compare_*` needs
-a validity-AND — a launcher change, not a VM step, since uuid compares by unsigned BE memcmp not signed i128)
-and nullable numeric **cross-scale / arithmetic / AND-OR**.
+and the WHERE-3VL tail — nullable **int2** (smallint; route like int4 — needs Int2 in predicate_vm_elem_type +
+the int4 offset in compile_arith_program) and nullable numeric **cross-scale / arithmetic / AND-OR**.
 
 **What landed last session (2026-06-23) — NULL (M3) is now substantially complete, ~12 independently-audited
 slices merged.** Representation + storage + ingest + the GPU 3VL data path:

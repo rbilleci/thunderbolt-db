@@ -439,6 +439,74 @@ fn gpu_resident_expr_where_3vl_over_nullable_numeric() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_where_3vl_over_nullable_uuid() {
+    // M3 (doc 21): a WHERE over a nullable UUID column excludes NULL rows on the GPU. UUID compares by an
+    // unsigned big-endian memcmp (a dedicated kernel, NOT a VM step), so the compare mask is AND'd with
+    // the column's validity mask in the launcher (compact_mask_with_validity). The NULL placeholder is 16
+    // zero bytes (= uuid ...00), so `u = ...00` and `u < ...0a` would WRONGLY include NULL rows without
+    // the validity AND -> the assertions are load-bearing.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tu (id INT, u UUID, u2 UUID)").unwrap();
+    let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
+    let peer = uuid_for(10);
+    // u nullable = [..05, NULL, ..0f, NULL, ..14]; u2 = ..0a (non-null) for col-vs-col.
+    e.execute_text(
+        2,
+        &format!(
+            "INSERT INTO tu (id,u,u2) VALUES \
+             (1,'{}','{peer}'),(2,NULL,'{peer}'),(3,'{}','{peer}'),(4,NULL,'{peer}'),(5,'{}','{peer}')",
+            uuid_for(5),
+            uuid_for(15),
+            uuid_for(20),
+        ),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tu").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // `u < ..0a` -> u in {..05} -> id 1. NULLs (placeholder ..00 < ..0a) excluded.
+    let r = e
+        .execute_resident_expr_select_sql(&format!("SELECT id FROM tu WHERE u < '{}'", uuid_for(10)))
+        .expect("WHERE over a nullable uuid runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)]],
+        "WHERE u < uuid must exclude NULL rows (3VL), not fold the placeholder ..00"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // `u = ..00`: no real u is ..00, and the NULL placeholder IS ..00 -> WITHOUT the validity AND the
+    // NULL rows would match. With it, the result is EMPTY. The decisive equality test.
+    let r = e
+        .execute_resident_expr_select_sql(&format!("SELECT id FROM tu WHERE u = '{}'", uuid_for(0)))
+        .expect("uuid equality over a nullable uuid runs on the GPU");
+    assert!(
+        r.rows.is_empty(),
+        "u = ..00 must be EMPTY: no real u is ..00 and NULL rows (placeholder ..00) are excluded, got {:?}",
+        r.rows
+    );
+    // `u > ..0a` -> u in {..0f, ..14} -> id 3, 5. NULLs excluded.
+    let r = e
+        .execute_resident_expr_select_sql(&format!("SELECT id FROM tu WHERE u > '{}'", uuid_for(10)))
+        .expect("uuid > over a nullable uuid runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(5)]],
+        "WHERE u > uuid must exclude NULL rows (3VL)"
+    );
+    // col-vs-col `u < u2` (u2 = ..0a): u < 10 -> id 1. NULLs excluded (validity AND on u only).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tu WHERE u < u2")
+        .expect("col-vs-col over a nullable uuid runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)]],
+        "col-vs-col u < u2 must exclude NULL-u rows (3VL)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_order_by_places_nulls_per_pg_default() {
     // M3 (doc 21) Slice E: ORDER BY a NULLABLE int column places NULLs at PG's DEFAULT end ON THE GPU
     // sort — last under ASC, first under DESC (the i64::MAX sentinel realizes both). Without it the sort

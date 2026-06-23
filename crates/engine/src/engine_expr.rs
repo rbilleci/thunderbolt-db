@@ -5141,12 +5141,20 @@ impl Engine {
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
+        // M3 (doc 21): a NULLABLE uuid operand's validity bitmap offset (None when the column holds no
+        // NULL); the launcher AND's it with the compare mask so a NULL operand is UNKNOWN ⇒ excluded. A
+        // non-nullable column contributes nothing (the no-NULL path stays byte-identical).
+        let validity = |col: usize| -> Result<Vec<u64>, ExecuteError> {
+            Ok(resident_device_null_column_offset(snapshot, table, col)?
+                .into_iter()
+                .collect())
+        };
         match (uuid_column_index(lhs, table), uuid_column_index(rhs, table)) {
             (Some(col), None) => {
                 let needle = uuid_literal_bytes(rhs)?;
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
                 device_memory
-                    .expr_uuid_compare_scalar_filter(offset, &needle, false, cmp, row_count)
+                    .expr_uuid_compare_scalar_filter(offset, &needle, false, cmp, row_count, &validity(col)?)
                     .map(Some)
                     .map_err(map_err)
             }
@@ -5154,15 +5162,17 @@ impl Engine {
                 let needle = uuid_literal_bytes(lhs)?;
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
                 device_memory
-                    .expr_uuid_compare_scalar_filter(offset, &needle, true, cmp, row_count)
+                    .expr_uuid_compare_scalar_filter(offset, &needle, true, cmp, row_count, &validity(col)?)
                     .map(Some)
                     .map_err(map_err)
             }
             (Some(a), Some(b)) => {
                 let a_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
                 let b_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
+                let mut validity_offsets = validity(a)?;
+                validity_offsets.extend(validity(b)?);
                 device_memory
-                    .expr_uuid_compare_columns_filter(a_offset, b_offset, cmp, row_count)
+                    .expr_uuid_compare_columns_filter(a_offset, b_offset, cmp, row_count, &validity_offsets)
                     .map(Some)
                     .map_err(map_err)
             }
@@ -5700,11 +5710,27 @@ impl Engine {
                 )? {
                     return Ok(indices);
                 }
+                // A nullable uuid SIMPLE comparison: the uuid memcmp peephole resolves the operand's
+                // validity bitmap and AND's it with the compare mask (uuid has no VM step). A uuid AND/OR
+                // is its own clean error from inside the helper.
+                if expr_mentions_uuid(lhs, table) || expr_mentions_uuid(rhs, table) {
+                    if let Some(indices) = self.try_lower_uuid_predicate(
+                        *op,
+                        lhs,
+                        rhs,
+                        table,
+                        snapshot,
+                        device_memory,
+                        row_count,
+                    )? {
+                        return Ok(indices);
+                    }
+                }
             }
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "WHERE over a nullable column of this type/shape is not yet supported on the GPU \
-                 (M3 3VL follow-up: e.g. uuid, a cross-scale or arithmetic numeric, a compound or \
-                 mixed-type temporal/numeric predicate)"
+                 (M3 3VL follow-up: e.g. a cross-scale or arithmetic numeric, a compound or \
+                 mixed-type temporal/numeric/uuid predicate)"
                     .to_string(),
             )));
         }
