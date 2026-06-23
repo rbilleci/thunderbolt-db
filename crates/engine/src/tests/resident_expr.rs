@@ -176,6 +176,111 @@ fn gpu_resident_expr_where_excludes_null_operands_and_projection_carries_null() 
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_where_3vl_over_nullable_bigint() {
+    // M3 (doc 21) Track A.3: a WHERE over a NULLABLE int8 (BIGINT) column evaluates to UNKNOWN for a NULL
+    // operand ON THE GPU and excludes the row — routed to the i64 mask VM (elem I64), the same VM the
+    // non-null int8 AND/OR path uses, with each comparison leaf AND'd with the column's validity bitmap.
+    // No kernel change: the validity AND is a type-independent i32 BoolMask. v is nullable; w is non-null.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tb (id INT, v BIGINT, w BIGINT)").unwrap();
+    // v = [100, NULL, 300, NULL, 5000000000, 250]; w = 1000 (non-null). v=5e9 exceeds i32 -> proves the
+    // i64 read is not truncated to i32. The NULL placeholder is 0, which passes `0 < 300` WITHOUT the
+    // validity AND, so the NULL exclusions below are load-bearing.
+    e.execute_text(
+        2,
+        "INSERT INTO tb (id,v,w) VALUES \
+         (1,100,1000),(2,NULL,1000),(3,300,1000),(4,NULL,1000),(5,5000000000,1000),(6,250,1000)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tb").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // (1) simple scalar `v < 300`: non-NULL v in {100, 250} -> ids 1, 6 (index order). NULL rows excluded;
+    //     5e9 not < 300.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tb WHERE v < 300")
+        .expect("WHERE over a nullable bigint runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(6)]],
+        "WHERE v < 300 must exclude NULL rows (3VL), not fold the placeholder 0"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+
+    // (2) compound AND `v > 50 AND v < 400`: v in {100, 300, 250} -> ids 1, 3, 6. The i64 VM combines two
+    //     i64 comparison leaves with AND, each validity-masked. NULLs excluded.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tb WHERE v > 50 AND v < 400")
+        .expect("compound AND over a nullable bigint runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(6)]],
+        "compound AND over a nullable bigint must exclude NULL rows"
+    );
+
+    // (3) col-vs-col `v < w` (w = 1000): non-NULL v < 1000 -> ids 1, 3, 6 (5e9 not < 1000). NULLs excluded.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tb WHERE v < w")
+        .expect("col-vs-col over a nullable bigint runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(6)]],
+        "col-vs-col v < w must exclude NULL-v rows (3VL)"
+    );
+
+    // (4) large-value `v > 1000000000`: only id 5 (5e9). Proves the i64 storage/read is exact (a truncated
+    //     i32 read of 5000000000 = 705032704 would mis-answer), and the NULL placeholder 0 is excluded.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tb WHERE v > 1000000000")
+        .expect("large-value bigint compare runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(5)]],
+        "WHERE v > 1e9 must match only the 5e9 row (i64 read, not truncated), NULLs excluded"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_where_nullable_unsupported_type_clean_errors() {
+    // M3 (doc 21) Track A.3: a WHERE over a nullable NON-(int4/int8/text/bool) column, or a MIXED-width
+    // predicate, still clean-errors (the compare kernels aren't validity-aware) — never a silent
+    // mis-answer. Here a nullable NUMERIC column and a mixed int4+int8 predicate.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tm (a INT, big BIGINT, n NUMERIC(10,2))").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tm (a,big,n) VALUES (1,10,1.50),(2,NULL,NULL),(3,30,3.50)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tm").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // Nullable NUMERIC predicate -> clean error.
+    let err = e
+        .execute_resident_expr_select_sql("SELECT a FROM tm WHERE n < 3.00")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("not yet supported on the GPU"),
+        "nullable numeric WHERE must clean-error, got: {err}"
+    );
+    // Mixed int4 + nullable int8 predicate -> clean error (the VM is mono-typed).
+    let err = e
+        .execute_resident_expr_select_sql("SELECT a FROM tm WHERE big > 5 AND a < 3")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("not yet supported") || err.contains("mixed"),
+        "mixed int4/int8 nullable WHERE must clean-error, got: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_order_by_places_nulls_per_pg_default() {
     // M3 (doc 21) Slice E: ORDER BY a NULLABLE int column places NULLs at PG's DEFAULT end ON THE GPU
     // sort — last under ASC, first under DESC (the i64::MAX sentinel realizes both). Without it the sort

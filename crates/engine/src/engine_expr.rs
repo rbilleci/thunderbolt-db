@@ -1333,19 +1333,32 @@ fn predicate_references_nullable_column(
     Ok(false)
 }
 
-/// True if every VALUE-operand column the predicate references is a type the general mask VM
-/// (`compile_predicate_program`) can lower with NULL 3VL: int4 (incl. int4 arithmetic) / text / bool.
-/// A nullable int8/numeric/date/timestamp/uuid/int2 predicate is a clean-error follow-up (those compare
-/// kernels are not yet validity-bitmap-aware), so it must NOT be routed to the VM.
-fn predicate_value_columns_vm_lowerable(predicate: &ResidentExpr, table: &RelationalTable) -> bool {
+/// The general mask-VM element type that lowers `predicate` with NULL 3VL, or `None` if the VM cannot
+/// lower it (a clean-error follow-up). The VM is MONO-TYPED — one element width for the whole program —
+/// and the NULL validity AND (`push_column_validity_and`) is a type-independent 1-bit mask, so the only
+/// constraint is that every value-operand column shares a VM width class. `I32` = all columns int4 / text
+/// / bool (text+bool are i32-compatible mask leaves). `I64` = all columns int8 (BIGINT): the i64 buffer
+/// VM the non-null int8 AND/OR path already uses (`run_expr_predicate_filter(elem=I64)`), where the
+/// validity BoolMask composes as an i32 mask. A MIXED-width predicate (int4+int8, or int8+text/bool), or a
+/// nullable numeric/uuid/date/timestamp/int2 column, returns `None` (those compare kernels are not yet
+/// validity-aware), so it must NOT route here.
+fn predicate_vm_elem_type(
+    predicate: &ResidentExpr,
+    table: &RelationalTable,
+) -> Option<ResidentElemType> {
     let mut cols = Vec::new();
     collect_expr_columns(predicate, &mut cols);
-    cols.iter().all(|&col| {
-        matches!(
-            table.columns.get(col).map(|column| column.ty),
-            Some(SqlType::Int4 | SqlType::Text | SqlType::Bool)
-        )
-    })
+    let ty = |col: usize| table.columns.get(col).map(|column| column.ty);
+    if cols
+        .iter()
+        .all(|&col| matches!(ty(col), Some(SqlType::Int4 | SqlType::Text | SqlType::Bool)))
+    {
+        Some(ResidentElemType::I32)
+    } else if cols.iter().all(|&col| matches!(ty(col), Some(SqlType::Int8))) {
+        Some(ResidentElemType::I64)
+    } else {
+        None
+    }
 }
 
 /// Compile a boolean predicate expression into postfix [`ExprStep`] bytecode that leaves one MASK on
@@ -5450,28 +5463,25 @@ impl Engine {
         // M3 (doc 21) WHERE 3VL: a predicate over a NULLABLE column routes through the general mask VM
         // (`compile_predicate_program`), which AND's each comparison leaf with the column's validity mask
         // so a NULL operand evaluates to UNKNOWN (the row is excluded). The typed peephole kernels below
-        // read the column's placeholder bytes (0 / empty) and would mis-select NULL rows. Only int4 /
-        // text / bool leaves are validity-aware in the VM today; a nullable int8/numeric/date/timestamp/
-        // uuid/int2 predicate is a clean-error follow-up (no silent mis-answer). A no-NULL table never
-        // enters here, so existing (non-nullable) plans keep their peephole fast paths byte-identically.
+        // read the column's placeholder bytes (0 / empty) and would mis-select NULL rows. The VM lowers an
+        // int4/text/bool predicate (elem I32) or an int8 predicate (elem I64, the same i64 buffer VM the
+        // non-null int8 AND/OR path uses — the validity AND is a type-independent i32 mask); a nullable
+        // numeric/uuid/date/timestamp/int2 or MIXED-width predicate is a clean-error follow-up (no silent
+        // mis-answer). A no-NULL table never enters here, so existing (non-nullable) plans keep their
+        // peephole fast paths byte-identically.
         if predicate_references_nullable_column(predicate, table, snapshot)? {
-            if !predicate_value_columns_vm_lowerable(predicate, table) {
+            let Some(elem) = predicate_vm_elem_type(predicate, table) else {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "WHERE over a nullable non-(int4/text/bool) column is not yet supported on the GPU \
-                     (M3 3VL follow-up)"
+                    "WHERE over a nullable non-(int4/int8/text/bool) or mixed-width column is not yet \
+                     supported on the GPU (M3 3VL follow-up)"
                         .to_string(),
                 )));
-            }
+            };
             let mut program = Vec::new();
             let mut needles: Vec<Vec<u8>> = Vec::new();
             compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
             return device_memory
-                .run_expr_predicate_filter_with_text(
-                    &program,
-                    &needles,
-                    row_count,
-                    ResidentElemType::I32,
-                )
+                .run_expr_predicate_filter_with_text(&program, &needles, row_count, elem)
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
         }
 
