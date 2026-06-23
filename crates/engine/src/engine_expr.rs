@@ -3872,11 +3872,10 @@ impl Engine {
             // A TEXT key/value's string -- and a wide-key composite's member values -- live host-side: the
             // kernel stored each group's representative ABSOLUTE row index; read it from the same
             // residency_entry generation as the GPU result.
-            let any_text_value = passes.iter().any(|p| p.value_is_text);
             // text_host_rows (a host_rows clone) is needed ONLY for the text reads still done host-side:
-            // composite (fixed,text) / wide-key members, and MIN/MAX text values (S2.2b). A PLAIN text KEY
-            // is materialized ON-DEVICE via key_text_map below, so it no longer needs the clone.
-            let text_host_rows = if any_text_value || composite_is_widekey || composite_is_text {
+            // composite (fixed,text) / wide-key MEMBERS (S2.2b-ii). A PLAIN text KEY (key_text_map, S2.2a)
+            // and MIN/MAX text VALUES (text_value_minmax, S2.2b-i) are materialized ON-DEVICE below.
+            let text_host_rows = if composite_is_widekey || composite_is_text {
                 Some(residency_entry.host_rows.clone())
             } else {
                 None
@@ -4006,6 +4005,43 @@ impl Engine {
                         .sort_by(|a, b| key_cmp(&materialize_key(a), &materialize_key(b)));
                 }
             }
+            // S2.2b-i: MIN/MAX over a TEXT value, materialized ON-DEVICE. For each text value pass, gather
+            // the result string at every group's g.min / g.max ROW INDEX (project_text_rows_from_payload),
+            // not from host_rows. A count==0 (all-NULL) group's min/max is unused (its result is NULL), so
+            // it gets a 0 placeholder rep. Passes are #30-aligned here, so [i] matches reference.groups[i].
+            let text_value_minmax: std::collections::HashMap<usize, (Vec<String>, Vec<String>)> = {
+                let mut m = std::collections::HashMap::new();
+                for pass in &passes {
+                    if pass.value_is_text && !pass.is_count_distinct {
+                        let layout =
+                            resident_device_text_column_layout(&snapshot, table, pass.value_idx)?;
+                        let gather = |reps: &[u64]| -> Result<Vec<String>, ExecuteError> {
+                            device_memory
+                                .project_text_rows_from_payload(
+                                    layout.offsets_byte_offset,
+                                    layout.bytes_byte_offset,
+                                    layout.bytes_len,
+                                    reps,
+                                )
+                                .map_err(map_err)
+                        };
+                        let min_reps: Vec<u64> = pass
+                            .groups
+                            .iter()
+                            .map(|g| if g.count == 0 { 0 } else { g.min as u64 })
+                            .collect();
+                        let max_reps: Vec<u64> = pass
+                            .groups
+                            .iter()
+                            .map(|g| if g.count == 0 { 0 } else { g.max as u64 })
+                            .collect();
+                        let min_txt = gather(&min_reps)?;
+                        let max_txt = gather(&max_reps)?;
+                        m.insert(pass.value_idx, (min_txt, max_txt));
+                    }
+                }
+                m
+            };
             // Merge the (now key-aligned) passes by group index into N+1 columns [key, agg_1, .., agg_N].
             // COUNT reads the group's row count from the reference pass; each other aggregate projects
             // from its value column's pass with the per-type narrowing (SUM/AVG widen, MIN/MAX narrow).
@@ -4120,16 +4156,14 @@ impl Engine {
                                 GroupedAggKind::Max if pass.value_is_uuid => {
                                     SqlValue::Uuid(g.max_uuid)
                                 }
-                                GroupedAggKind::Min if pass.value_is_text => text_host_rows
-                                    .as_ref()
-                                    .expect("text_host_rows is Some when value_is_text")
-                                    [g.min as u64 as usize][pass.value_idx]
-                                    .clone(),
-                                GroupedAggKind::Max if pass.value_is_text => text_host_rows
-                                    .as_ref()
-                                    .expect("text_host_rows is Some when value_is_text")
-                                    [g.max as u64 as usize][pass.value_idx]
-                                    .clone(),
+                                // S2.2b-i: device-gathered MIN/MAX text (text_value_minmax), aligned with
+                                // reference.groups by index i. count==0 was handled above (returns NULL).
+                                GroupedAggKind::Min if pass.value_is_text => {
+                                    SqlValue::Text(text_value_minmax[&pass.value_idx].0[i].clone())
+                                }
+                                GroupedAggKind::Max if pass.value_is_text => {
+                                    SqlValue::Text(text_value_minmax[&pass.value_idx].1[i].clone())
+                                }
                                 GroupedAggKind::Min => narrow_ordered_value(
                                     pass.value_ty,
                                     g.min,
