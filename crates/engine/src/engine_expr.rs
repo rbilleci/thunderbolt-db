@@ -3872,14 +3872,8 @@ impl Engine {
             // A TEXT key/value's string -- and a wide-key composite's member values -- live host-side: the
             // kernel stored each group's representative ABSOLUTE row index; read it from the same
             // residency_entry generation as the GPU result.
-            // text_host_rows (a host_rows clone) is needed ONLY for the text reads still done host-side:
-            // composite (fixed,text) / wide-key MEMBERS (S2.2b-ii). A PLAIN text KEY (key_text_map, S2.2a)
-            // and MIN/MAX text VALUES (text_value_minmax, S2.2b-i) are materialized ON-DEVICE below.
-            let text_host_rows = if composite_is_widekey || composite_is_text {
-                Some(residency_entry.host_rows.clone())
-            } else {
-                None
-            };
+            // GROUP BY result key/value/member materialization is now fully ON-DEVICE (key_text_map S2.2a,
+            // text_value_minmax S2.2b-i, member_cell S2.2b-ii) -- no host_rows clone for the grouped path.
             // S2.2a: a PLAIN text group KEY, materialized ON-DEVICE. One rep_idx -> key-string map gathered
             // from the resident payload (project_text_rows_from_payload) over EVERY pass's group rep indices
             // (materialize_key runs per-pass in #30), instead of reading host_rows. NULL-key groups are
@@ -3909,6 +3903,149 @@ impl Engine {
                 } else {
                     None
                 };
+            // S2.2b-ii: composite (fixed,text) / wide-key MEMBER values, materialized ON-DEVICE into a
+            // sparse (rep_row, col) -> SqlValue map -- replacing the text_host_rows host_rows clone reads.
+            // Members may be ANY type, so gather each column by type (mirrors the S1 projection) with NULL
+            // validity (a nullable member is SqlValue::Null), at every group's key rep index across ALL
+            // passes (covers materialize_key in #30 AND the result builder, incl. NULL-key groups whose
+            // members the result builder reads from the rep row).
+            let materialize_col_at = |col: usize, reps: &[u64]| -> Result<Vec<SqlValue>, ExecuteError> {
+                if reps.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let validity: Option<Vec<bool>> =
+                    match resident_device_null_column_offset(&snapshot, table, col)? {
+                        Some(off) => Some(
+                            device_memory
+                                .project_bool_rows_from_payload(off, reps)
+                                .map_err(map_err)?,
+                        ),
+                        None => None,
+                    };
+                let base: Vec<SqlValue> = match table.columns[col].ty {
+                    SqlType::Int8 => device_memory
+                        .project_i64_rows_from_payload(
+                            resident_device_int8_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Int8)
+                        .collect(),
+                    SqlType::Timestamp => device_memory
+                        .project_i64_rows_from_payload(
+                            resident_device_int8_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Timestamp)
+                        .collect(),
+                    SqlType::Numeric { scale, .. } => device_memory
+                        .project_i128_rows_from_payload(
+                            resident_device_numeric_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(|v| SqlValue::Numeric(Decimal128::new(v, scale)))
+                        .collect(),
+                    SqlType::Uuid => device_memory
+                        .project_i128_rows_from_payload(
+                            resident_device_numeric_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(|v| SqlValue::Uuid(v.to_le_bytes()))
+                        .collect(),
+                    SqlType::Date => device_memory
+                        .project_i32_rows_from_payload(
+                            resident_device_int4_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Date)
+                        .collect(),
+                    SqlType::Int2 => device_memory
+                        .project_i32_rows_from_payload(
+                            resident_device_int4_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(|v| SqlValue::Int2(v as i16))
+                        .collect(),
+                    SqlType::Bool => device_memory
+                        .project_bool_rows_from_payload(
+                            resident_device_bool_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Bool)
+                        .collect(),
+                    SqlType::Text => {
+                        let layout = resident_device_text_column_layout(&snapshot, table, col)?;
+                        device_memory
+                            .project_text_rows_from_payload(
+                                layout.offsets_byte_offset,
+                                layout.bytes_byte_offset,
+                                layout.bytes_len,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(SqlValue::Text)
+                            .collect()
+                    }
+                    SqlType::Int4 => device_memory
+                        .project_i32_rows_from_payload(
+                            resident_device_int4_column_offset(&snapshot, table, col)?,
+                            reps,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Int4)
+                        .collect(),
+                };
+                Ok(base
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| match &validity {
+                        Some(val) if !val[i] => SqlValue::Null,
+                        _ => v,
+                    })
+                    .collect())
+            };
+            let member_cell: std::collections::HashMap<(usize, usize), SqlValue> = {
+                let member_cols: Vec<usize> = if let Some(m) = &widekey_cols {
+                    m.iter().map(|&(c, _)| c).collect()
+                } else if composite_is_text {
+                    let (c0, _, c1, _) =
+                        composite_cols.expect("composite_is_text implies composite_cols");
+                    vec![c0, c1]
+                } else {
+                    Vec::new()
+                };
+                let mut cells = std::collections::HashMap::new();
+                if !member_cols.is_empty() {
+                    let mut reps: Vec<u64> = passes
+                        .iter()
+                        .flat_map(|p| p.groups.iter().map(|g| g.key_i128 as u64))
+                        .collect();
+                    reps.sort_unstable();
+                    reps.dedup();
+                    for &col in &member_cols {
+                        let vals = materialize_col_at(col, &reps)?;
+                        for (r, v) in reps.iter().zip(vals) {
+                            cells.insert((*r as usize, col), v);
+                        }
+                    }
+                }
+                cells
+            };
             // The kernel's hash-slot / compaction order is RACE-dependent: the cas.b64 linear-probe
             // resolves bucket ownership differently per launch, so two passes do NOT share a group
             // order (proven: an int8 i64::MIN-key query misaligned only on the 6th launch). Re-sort
@@ -3927,10 +4064,7 @@ impl Engine {
                     // FULL member tuple, so this lone value need only be consistent + non-panicking.
                     let rep_idx = gk.key_i128 as u64 as usize;
                     let m0 = widekey_cols.as_ref().expect("composite_is_widekey")[0].0;
-                    text_host_rows
-                        .as_ref()
-                        .expect("text_host_rows is Some when composite_is_widekey")[rep_idx][m0]
-                        .clone()
+                    member_cell[&(rep_idx, m0)].clone()
                 } else if is_composite_key {
                     // The result row UNPACKS the key into the two columns; here we only need a
                     // CONSISTENT representation for pass-alignment + ordering. i64 pack -> Int8(key);
@@ -3942,11 +4076,7 @@ impl Engine {
                         let rep_idx = gk.key_i128 as u64 as usize;
                         let (cc0, ct0, cc1, _) = composite_cols.unwrap();
                         let text_col = if matches!(ct0, SqlType::Text) { cc0 } else { cc1 };
-                        text_host_rows
-                            .as_ref()
-                            .expect("text_host_rows is Some when composite_is_text")[rep_idx]
-                            [text_col]
-                            .clone()
+                        member_cell[&(rep_idx, text_col)].clone()
                     } else if composite_is_i128 {
                         SqlValue::Numeric(Decimal128::new(gk.key_i128, 0))
                     } else {
@@ -4060,24 +4190,18 @@ impl Engine {
                     Vec::with_capacity(aggregates.len() + n_group_cols);
                 if let Some(members) = &widekey_cols {
                     // Wide-key: the b128 slot's lo = the representative row index -- read EACH member from
-                    // the rep row (host_rows), in DECLARED order. host_rows holds the typed SqlValue.
+                    // the rep row, materialized ON-DEVICE into member_cell, in DECLARED order.
                     let rep_idx = gk.key_i128 as u64 as usize;
-                    let host = text_host_rows
-                        .as_ref()
-                        .expect("text_host_rows is Some when composite_is_widekey");
                     for &(idx, _) in members {
-                        row.push(host[rep_idx][idx].clone());
+                        row.push(member_cell[&(rep_idx, idx)].clone());
                     }
                 } else if let Some((c0, t0, c1, t1)) = composite_cols {
                     if composite_is_text {
                         // (fixed, text): the b128 slot holds the rep row index -- read BOTH members from
-                        // the rep row (host_rows), in DECLARED order, narrowed to their real types.
+                        // the rep row, materialized ON-DEVICE into member_cell, in DECLARED order.
                         let rep_idx = gk.key_i128 as u64 as usize;
-                        let host = text_host_rows
-                            .as_ref()
-                            .expect("text_host_rows is Some when composite_is_text");
-                        row.push(host[rep_idx][c0].clone());
-                        row.push(host[rep_idx][c1].clone());
+                        row.push(member_cell[&(rep_idx, c0)].clone());
+                        row.push(member_cell[&(rep_idx, c1)].clone());
                     } else {
                         // Two-fixed composite: UNPACK the packed key into the two columns, narrowed to
                         // their real SqlType. i64 pack -> col0 = high 32 bits, col1 = low 32 (`as u32 as
