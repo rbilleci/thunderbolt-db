@@ -13371,6 +13371,14 @@ pub enum ExprStep {
         scalar: i32,
         scalar_on_left: bool,
     },
+    /// Like `CompareScalar` but with a full-width i64 scalar — for an i64 literal that exceeds `i32`
+    /// (a timestamp's microseconds, or a large int8 literal). ONLY valid in an I64 program (it launches
+    /// the i64 compare-scalar-to-mask kernel, which reads an s64 scalar). The dispatch errors otherwise.
+    CompareScalarI64 {
+        cmp: u32,
+        scalar: i64,
+        scalar_on_left: bool,
+    },
     /// Pop b, pop a (values), push the mask `(a <cmp> b) ? 1 : 0`.
     CompareBuffers { cmp: u32 },
     /// Pop b, pop a (masks), push `op==0 ? a&&b : a||b` (0/1).
@@ -14032,6 +14040,38 @@ fn run_resident_arith_program<'r>(
                         launch(compare_scalar_mask_fn, &mut args)?;
                     }
                 }
+                stack.push(out);
+            }
+            ExprStep::CompareScalarI64 {
+                cmp,
+                scalar,
+                scalar_on_left,
+            } => {
+                // A full-width i64 scalar (timestamp micros / large int8 literal). The i64
+                // compare-scalar-to-mask kernel reads an s64 scalar, so this is valid ONLY for an I64
+                // program; reject any other elem (an i32/i128 kernel would mis-read the 8-byte arg).
+                if elem != ResidentElemType::I64 {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+                }
+                let value = stack
+                    .pop()
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = value.ptr;
+                let mut a1 = scalar;
+                let mut a2 = u32::from(scalar_on_left);
+                let mut a3 = cmp;
+                let mut a4 = n;
+                let mut a5 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut i64).cast::<c_void>(),
+                    (&mut a2 as *mut u32).cast::<c_void>(),
+                    (&mut a3 as *mut u32).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
+                ];
+                launch(compare_scalar_mask_fn, &mut args)?;
                 stack.push(out);
             }
             ExprStep::CompareBuffers { cmp } => {

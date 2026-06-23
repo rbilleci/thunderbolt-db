@@ -4916,6 +4916,106 @@ impl Engine {
         }
     }
 
+    /// M3 (doc 21) WHERE 3VL for a SIMPLE comparison over a nullable DATE or TIMESTAMP column (scalar,
+    /// either operand order, or col-vs-col). The generic mask VM (`predicate_vm_elem_type`) cannot lower
+    /// these: a date/timestamp literal is not an `Int4Literal`, and a timestamp's i64 microseconds exceed
+    /// the VM's i32 `CompareScalar` scalar. So build the VM program directly — DATE: I32 + `CompareScalar`
+    /// over the i32 days; TIMESTAMP: I64 + `CompareScalarI64` over the i64 micros; col-vs-col:
+    /// `CompareBuffers` — then append the validity-AND (`push_column_validity_and` = `BoolMask` +
+    /// `MaskBinary` AND) for each nullable operand, so a NULL operand is UNKNOWN ⇒ the row is excluded
+    /// (correct at the top level / under no-NOT). Returns `None` for a non-date/timestamp predicate or a
+    /// shape the peephole doesn't support (AND/OR / arithmetic), so the caller clean-errors. NO kernel
+    /// change: the i64 compare-scalar / compare-buffers / bool-to-mask / mask-binary kernels already exist.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_nullable_temporal_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        // Only a simple comparison (eq/ne/lt/le/gt/ge); AND/OR yield None -> caller clean-errors.
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Ok(None);
+        };
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        // DATE: i32 days in the int4 section -> the I32 VM (CompareScalar fits the i32 days literal).
+        if expr_mentions_date(lhs, table) || expr_mentions_date(rhs, table) {
+            let mut program = Vec::new();
+            match (date_column_index(lhs, table), date_column_index(rhs, table)) {
+                (Some(col), None) => {
+                    let days = date_literal_days(rhs)?;
+                    let off = resident_device_int4_column_offset(snapshot, table, col)?;
+                    program.push(ExprStep::LoadColumn { byte_offset: off });
+                    program.push(ExprStep::CompareScalar { cmp, scalar: days, scalar_on_left: false });
+                    push_column_validity_and(col, table, snapshot, &mut program)?;
+                }
+                (None, Some(col)) => {
+                    let days = date_literal_days(lhs)?;
+                    let off = resident_device_int4_column_offset(snapshot, table, col)?;
+                    program.push(ExprStep::LoadColumn { byte_offset: off });
+                    program.push(ExprStep::CompareScalar { cmp, scalar: days, scalar_on_left: true });
+                    push_column_validity_and(col, table, snapshot, &mut program)?;
+                }
+                (Some(a), Some(b)) => {
+                    let a_off = resident_device_int4_column_offset(snapshot, table, a)?;
+                    let b_off = resident_device_int4_column_offset(snapshot, table, b)?;
+                    program.push(ExprStep::LoadColumn { byte_offset: a_off });
+                    program.push(ExprStep::LoadColumn { byte_offset: b_off });
+                    program.push(ExprStep::CompareBuffers { cmp });
+                    push_column_validity_and(a, table, snapshot, &mut program)?;
+                    push_column_validity_and(b, table, snapshot, &mut program)?;
+                }
+                (None, None) => return Ok(None),
+            }
+            return device_memory
+                .run_expr_predicate_filter(&program, row_count, ResidentElemType::I32)
+                .map(Some)
+                .map_err(map_err);
+        }
+        // TIMESTAMP: i64 micros in the int8 section -> the I64 VM with CompareScalarI64 (the micros
+        // literal exceeds the i32 CompareScalar scalar).
+        if expr_mentions_timestamp(lhs, table) || expr_mentions_timestamp(rhs, table) {
+            let mut program = Vec::new();
+            match (timestamp_column_index(lhs, table), timestamp_column_index(rhs, table)) {
+                (Some(col), None) => {
+                    let micros = timestamp_literal_micros(rhs)?;
+                    let off = resident_device_int8_column_offset(snapshot, table, col)?;
+                    program.push(ExprStep::LoadColumn { byte_offset: off });
+                    program.push(ExprStep::CompareScalarI64 { cmp, scalar: micros, scalar_on_left: false });
+                    push_column_validity_and(col, table, snapshot, &mut program)?;
+                }
+                (None, Some(col)) => {
+                    let micros = timestamp_literal_micros(lhs)?;
+                    let off = resident_device_int8_column_offset(snapshot, table, col)?;
+                    program.push(ExprStep::LoadColumn { byte_offset: off });
+                    program.push(ExprStep::CompareScalarI64 { cmp, scalar: micros, scalar_on_left: true });
+                    push_column_validity_and(col, table, snapshot, &mut program)?;
+                }
+                (Some(a), Some(b)) => {
+                    let a_off = resident_device_int8_column_offset(snapshot, table, a)?;
+                    let b_off = resident_device_int8_column_offset(snapshot, table, b)?;
+                    program.push(ExprStep::LoadColumn { byte_offset: a_off });
+                    program.push(ExprStep::LoadColumn { byte_offset: b_off });
+                    program.push(ExprStep::CompareBuffers { cmp });
+                    push_column_validity_and(a, table, snapshot, &mut program)?;
+                    push_column_validity_and(b, table, snapshot, &mut program)?;
+                }
+                (None, None) => return Ok(None),
+            }
+            return device_memory
+                .run_expr_predicate_filter(&program, row_count, ResidentElemType::I64)
+                .map(Some)
+                .map_err(map_err);
+        }
+        Ok(None)
+    }
+
     /// Try to lower a SIMPLE uuid comparison (`id <cmp> 'uuid-literal'`, either operand order, or
     /// `id <cmp> id2`) to surviving row indices via the byte-wise uuid compare kernel (the type matrix,
     /// doc 19): a `uuid` is 16 raw bytes in the i128 section; PG compares uuids by an unsigned
@@ -5470,19 +5570,35 @@ impl Engine {
         // mis-answer). A no-NULL table never enters here, so existing (non-nullable) plans keep their
         // peephole fast paths byte-identically.
         if predicate_references_nullable_column(predicate, table, snapshot)? {
-            let Some(elem) = predicate_vm_elem_type(predicate, table) else {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "WHERE over a nullable non-(int4/int8/text/bool) or mixed-width column is not yet \
-                     supported on the GPU (M3 3VL follow-up)"
-                        .to_string(),
-                )));
-            };
-            let mut program = Vec::new();
-            let mut needles: Vec<Vec<u8>> = Vec::new();
-            compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
-            return device_memory
-                .run_expr_predicate_filter_with_text(&program, &needles, row_count, elem)
-                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
+            if let Some(elem) = predicate_vm_elem_type(predicate, table) {
+                let mut program = Vec::new();
+                let mut needles: Vec<Vec<u8>> = Vec::new();
+                compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
+                return device_memory
+                    .run_expr_predicate_filter_with_text(&program, &needles, row_count, elem)
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
+            }
+            // A nullable DATE/TIMESTAMP simple comparison: the generic VM can't lower the temporal literal,
+            // so build the program directly (date I32 / timestamp I64) with the validity-AND appended.
+            if let ResidentExpr::Binary { op, lhs, rhs } = predicate {
+                if let Some(indices) = self.try_lower_nullable_temporal_predicate(
+                    *op,
+                    lhs,
+                    rhs,
+                    table,
+                    snapshot,
+                    device_memory,
+                    row_count,
+                )? {
+                    return Ok(indices);
+                }
+            }
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "WHERE over a nullable non-(int4/int8/text/bool/date/timestamp) column, or a mixed-width \
+                 or compound non-int4/text/bool predicate, is not yet supported on the GPU (M3 3VL \
+                 follow-up)"
+                    .to_string(),
+            )));
         }
 
         let ResidentExpr::Binary {

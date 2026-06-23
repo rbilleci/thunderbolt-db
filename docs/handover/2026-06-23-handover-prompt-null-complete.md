@@ -20,8 +20,26 @@ You're continuing a **GPU-native database engine** (Rust + CUDA PTX) on a Blackw
 
 Don't start coding until you've read `memory/gpu-null-m3.md` and plan §8.
 
-**State:** branch `phase0-m1-engine-facade`, tree clean, `main == branch == origin/main` at **`8b5fbc44`**.
+**State:** branch `phase0-m1-engine-facade`, tree clean, `main == branch == origin/main` at **`991e9500`**.
 Run `git checkout main && git pull` for the latest.
+
+**PROGRESS 2026-06-23 (this session, 3 Track-A slices, each independently audited SHIP + merged to main):**
+- **A.1 (`3ba2b4af`)** — GROUP BY nullable NUMERIC aggregate VALUE now runs (pass 2
+  `gpu_db_group_by_numeric_minmax_lo` made NULL-aware; kernel change, HAZARD passed).
+- **A.3 (`70bb2f54`)** — WHERE 3VL over a nullable BIGINT (int8), incl. AND/OR + col-vs-col. ENGINE-ONLY
+  routing to the existing I64 mask VM (no kernel change). Mixed-width / numeric/uuid/date/timestamp/int2 still
+  clean-error.
+- **A.6 (`991e9500`)** — COPY ingests every column type + `\N` per type (int8/numeric/bool/date/timestamp/uuid
+  rendering in the COPY-to-engine bridge). HOST-ONLY.
+- **WHERE 3VL timestamp/date** — nullable timestamp + date simple comparisons (scalar both orders + col-vs-col)
+  via VM programs with validity steps appended; added `ExprStep::CompareScalarI64` (reuses the i64
+  compare-scalar kernel, no PTX change) so the i64 timestamp-micros literal fits the VM. Non-null peepholes
+  untouched.
+**REMAINING Track A:** A.2 (nullable composite/text/uuid GROUP BY KEY — kernel change, most-audited path);
+A.4 (text/numeric/uuid ORDER BY key NULLs + explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field
+through ~20 ctors incl. the legacy protocol crate] + nullable sort expr); A.5 (N-way multi-way OUTER joins);
+and the rest of WHERE 3VL — nullable **numeric/uuid** (the i128 compare-to-mask kernel needs validity-awareness,
+or a CompareScalarI128 VM step like CompareScalarI64).
 
 **What landed last session (2026-06-23) — NULL (M3) is now substantially complete, ~12 independently-audited
 slices merged.** Representation + storage + ingest + the GPU 3VL data path:

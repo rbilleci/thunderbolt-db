@@ -281,6 +281,103 @@ fn gpu_resident_expr_where_nullable_unsupported_type_clean_errors() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_where_3vl_over_nullable_date() {
+    // M3 (doc 21): a WHERE over a nullable DATE column evaluates to UNKNOWN for a NULL operand on the GPU
+    // and excludes the row. A date is i32 days, so it routes to the I32 mask VM (CompareScalar over the
+    // days literal) with the column's validity AND'd in. The NULL placeholder is day 0 (< any real date),
+    // so it would pass `d < '2024-01-20'` WITHOUT the validity AND -> the exclusions below are load-bearing.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE td (id INT, d DATE)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO td (id,d) VALUES \
+         (1,'2024-01-05'),(2,NULL),(3,'2024-01-15'),(4,NULL),(5,'2024-01-25')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("td").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // d < '2024-01-20' -> id 1 (05), 3 (15). NULLs excluded.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM td WHERE d < '2024-01-20'")
+        .expect("WHERE over a nullable date runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)]],
+        "WHERE d < date must exclude NULL rows (3VL), not fold the placeholder day 0"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // literal on the LEFT: '2024-01-10' < d -> id 3 (15), 5 (25). NULLs excluded.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM td WHERE '2024-01-10' < d")
+        .expect("date-literal-on-left over a nullable date runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(5)]],
+        "WHERE date < d must exclude NULL rows (3VL)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_where_3vl_over_nullable_timestamp() {
+    // M3 (doc 21): a WHERE over a nullable TIMESTAMP column excludes NULL rows on the GPU. A timestamp is
+    // i64 microseconds whose literal exceeds the VM's i32 CompareScalar, so it routes to the I64 VM via
+    // the new CompareScalarI64 step (scalar) or CompareBuffers (col-vs-col), with the validity AND'd in.
+    // The NULL placeholder is micros 0 (< any 2024 timestamp), so the exclusions are load-bearing.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tts (id INT, ts TIMESTAMP, ts2 TIMESTAMP)").unwrap();
+    // ts nullable; ts2 = noon (non-null) for the col-vs-col case.
+    e.execute_text(
+        2,
+        "INSERT INTO tts (id,ts,ts2) VALUES \
+         (1,'2024-01-15 09:00:00','2024-01-15 12:00:00'),\
+         (2,NULL,'2024-01-15 12:00:00'),\
+         (3,'2024-01-15 15:00:00','2024-01-15 12:00:00'),\
+         (4,NULL,'2024-01-15 12:00:00'),\
+         (5,'2024-01-15 11:00:00','2024-01-15 12:00:00')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tts").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // scalar `ts < '2024-01-15 12:00:00'` -> ts before noon: id 1 (09:00), 5 (11:00). NULLs excluded.
+    // Exercises CompareScalarI64 (the i64 micros literal).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tts WHERE ts < '2024-01-15 12:00:00'")
+        .expect("WHERE over a nullable timestamp runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
+        "WHERE ts < timestamp must exclude NULL rows (3VL), not fold the placeholder micros 0"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // col-vs-col `ts < ts2` (ts2 = noon): same survivors id 1, 5. Exercises CompareBuffers (I64) + validity.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tts WHERE ts < ts2")
+        .expect("col-vs-col over a nullable timestamp runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(5)]],
+        "col-vs-col ts < ts2 must exclude NULL-ts rows (3VL)"
+    );
+    // A COMPOUND nullable timestamp predicate is still a clean error (the temporal peephole is simple-only).
+    let err = e
+        .execute_resident_expr_select_sql(
+            "SELECT id FROM tts WHERE ts < '2024-01-15 12:00:00' AND ts2 > '2024-01-15 06:00:00'",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("not yet supported"),
+        "compound nullable timestamp WHERE must clean-error, got: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_order_by_places_nulls_per_pg_default() {
     // M3 (doc 21) Slice E: ORDER BY a NULLABLE int column places NULLs at PG's DEFAULT end ON THE GPU
     // sort — last under ASC, first under DESC (the i64::MAX sentinel realizes both). Without it the sort
