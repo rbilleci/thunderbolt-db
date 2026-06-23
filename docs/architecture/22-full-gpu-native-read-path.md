@@ -49,16 +49,29 @@ is optional; each line is struck through only when it runs on the device.
 ### Keystone — TEXT materialization + deterministic GROUP BY ordering
 - [x] **S1 — resident SELECT projection TEXT on-device.** `engine_expr.rs:4837` read
   `host_rows` for text; now uses `project_text_rows_from_payload`. **DONE `0fcd9e09`** (GPU
-  suite 234/0; independent audit in progress).
-- [ ] **S2 — GROUP BY result on-device (text + ordering + the pass-alignment merge).** Move:
-  the host pass-alignment re-sort ("charter debt #30", `engine_expr.rs:3961`); the default-order
-  host sorts (`4116`/`4130`); and all GROUP BY text materialization from `host_rows` via rep-row
-  index (`3924` single text key, `3987` wide-key members, `3997/3998` composite text, `4080/4085`
-  MIN/MAX text). Approach: materialize group key/value columns into a device payload (text via
-  rep-index gather through `project_text_rows_from_payload`); make group output order
-  deterministic on-device (single canonical ordering across passes so alignment needs no host
-  sort — e.g. sort each pass by key on-device, or a single multi-aggregate pass) and reuse
-  `gpu_sort_result_rows` for default + ORDER BY order.
+  suite 234/0; independent adversarial audit **SHIP** — NULL/empty-string, UTF-8, reordered gather).
+- [ ] **S2 — GROUP BY result on-device (text + ordering + pass-alignment).** The keystone core.
+  **Root cause (read 2026-06-23):** each aggregate's value column runs a SEPARATE hash-agg pass
+  (`engine_expr.rs` builds one `Pass` per value col); the kernel writes sparse slots and the
+  LAUNCHER host-compacts occupied slots (`execution/lib.rs:~7198`), and linear-probe placement is
+  race-dependent per launch, so two passes don't share a group order. The host fixes this by
+  re-sorting every pass by the MATERIALIZED key (#30, `engine_expr.rs:3877-3962`) — which for a
+  TEXT key reads `host_rows` via the per-pass rep-row index inside `materialize_key`. So #30 and
+  the text reads are entangled: can't move text off `host_rows` without also killing #30.
+  **Host sites to eliminate:** pass-alignment sort (`3961`); default-order sorts (`4116/4130`);
+  text materialization (`3924/3987/3997/3998/4080/4085`).
+  **Design (deferral-free sub-slices, each GPU-native + verified + audited):**
+  - **S2.1** — single-aggregate path (`passes.len()==1`, the common case): no cross-pass
+    alignment needed; materialize the (possibly text, via `project_text_rows_from_payload`
+    rep-index gather) key + the one aggregate into result rows, and order them with the existing
+    on-device `gpu_sort_result_rows` (default key order + any ORDER BY). Removes #30 + the
+    default-order host sorts + the text reads for this path.
+  - **S2.2** — multi-aggregate cross-pass alignment on-device: give every pass ONE canonical
+    group order without a host sort. Preferred = a single multi-aggregate hash-agg pass (one slot
+    carries all value cols' accumulators → one group array, no alignment); fallback = sort each
+    pass's groups by key on-device via a per-pass key payload + `bitonic_sort_hetero_on_payload`
+    permutation. COUNT(DISTINCT) passes align by the same mechanism.
+  - **S2.3** — composite / wide-key text members on-device (the remaining rep-index host reads).
 
 ### Result-stage operators on the general executor
 - [ ] **S3 — HAVING on-device.** `engine_expr.rs:4168` `rows.retain(...)` → device mask over the
