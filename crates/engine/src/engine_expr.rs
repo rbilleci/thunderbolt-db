@@ -297,10 +297,14 @@ pub(crate) fn gpu_sort_result_rows(
             }
         }
         let indices: Vec<u64> = (0..n as u64).collect();
+        // This post-result path takes PG's DEFAULT NULL placement (explicit NULLS FIRST/LAST on the
+        // GROUP BY / join result is clean-errored by the callers): the effective nulls_first bit = the
+        // key's DESC, so passing `desc_mask` reproduces NULLs-last-ASC / first-DESC (and the int keys
+        // encode their NULL as the i64::MAX host sentinel, which the value compare already places).
         device_memory
             .bitonic_sort_hetero_on_payload(
                 &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols, &key_plan, desc_mask,
-                &null_offs,
+                &null_offs, desc_mask,
             )
             .map_err(map_sort_err)?
     };
@@ -1602,6 +1606,7 @@ impl Engine {
             copin_s,
             Some(predicate),
             &[],
+            &[],
             None,
             &[],
         )
@@ -2409,6 +2414,10 @@ impl Engine {
         // Parallel to `select.order_by`: `Some(expr)` = a SORT EXPRESSION key (`ORDER BY a+b`),
         // evaluated on-device into an i64 key column; `None` = a plain column key. Empty = no ORDER BY.
         order_by_exprs: &[Option<ResidentExpr>],
+        // Parallel to `select.order_by`: the explicit NULLS FIRST/LAST override per key (`Some(true)` =
+        // NULLS FIRST, `Some(false)` = NULLS LAST, `None` = PG default = NULLS LAST under ASC / FIRST under
+        // DESC). Honored ON-DEVICE in the GPU sort comparator via the per-key nulls_first bitmask.
+        order_by_nulls_first: &[Option<bool>],
         // `Some(expr)` = GROUP BY an EXPRESSION (`GROUP BY a+b`): materialized on-device into a derived
         // int key column the grouped kernel groups by (via key_base_override). `None` = a plain column
         // GROUP BY (the matrix path) or no GROUP BY.
@@ -2644,8 +2653,10 @@ impl Engine {
                             &[],
                             &key_plan,
                             0,
-                            // COUNT(DISTINCT) (g, text_v) reps: both keys are non-NULL by construction.
+                            // COUNT(DISTINCT) (g, text_v) reps: both keys are non-NULL by construction, so
+                            // there is no NULL bitmap and the nulls_first mask is irrelevant.
                             &[],
+                            0,
                         )
                         .map_err(map_err)?;
                     device_memory
@@ -3946,6 +3957,17 @@ impl Engine {
             // build_relational_device_payload) from just those result columns, which the hetero
             // comparator reads on-device. Single- and multi-key are the same path (k=1 is K=1).
             if !select.order_by.is_empty() && rows.len() > 1 {
+                // Explicit NULLS FIRST/LAST on a GROUP BY result column is a follow-up on this post-result
+                // sort path (its int keys carry NULL as an i64::MAX host sentinel, not a validity bitmap,
+                // so the comparator's nulls_first bit can't reach them). Clean-error rather than silently
+                // ignore the override; the DEFAULT placement is on-device and correct.
+                if order_by_nulls_first.iter().any(Option::is_some) {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "explicit NULLS FIRST/LAST on a GROUP BY result column is a follow-up (the \
+                         default NULL placement is supported)"
+                            .to_string(),
+                    )));
+                }
                 // Resolve each ORDER BY key to its result-column index, then sort the grouped rows on the
                 // GPU (the shared helper; int matrix vs hetero payload by key type).
                 let order: Vec<(usize, bool)> = select
@@ -4330,10 +4352,21 @@ impl Engine {
             let mut b128_cols: Vec<u64> = Vec::new();
             let mut key_plan: Vec<u32> = Vec::with_capacity(k);
             let mut desc_mask: u64 = 0;
+            // Per-key effective NULLS FIRST bit: the explicit override, else the key's DESC (PG default).
+            // The comparator reads it to place NULLs ON-DEVICE, decoupled from the value-compare direction.
+            let mut nulls_first_mask: u64 = 0;
             let mut int_key_slots: Vec<(usize, usize)> = Vec::new();
             for (ki, order) in select.order_by.iter().enumerate() {
                 if order.descending {
                     desc_mask |= 1u64 << ki;
+                }
+                if order_by_nulls_first
+                    .get(ki)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(order.descending)
+                {
+                    nulls_first_mask |= 1u64 << ki;
                 }
                 // A sort EXPRESSION is an int-valued key -> the next int slot (materialized below).
                 if order_by_exprs.get(ki).is_some_and(|e| e.is_some()) {
@@ -4408,6 +4441,7 @@ impl Engine {
                     &key_plan,
                     desc_mask,
                     &key_null_offs,
+                    nulls_first_mask,
                 )
                 .map_err(map_err)?;
             perm.iter().map(|&p| indices_u64[p as usize]).collect()

@@ -1073,10 +1073,11 @@ impl CudaResidentDeviceMemory {
         key_plan: &[u32],
         desc_mask: u64,
         null_offs: &[u64],
+        nulls_first_mask: u64,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_bitonic_sort_hetero(
             self, indices, int_keys, num_int, text_cols, b128_cols, key_plan, desc_mask, null_offs,
-            None,
+            nulls_first_mask, None,
         )
     }
 
@@ -1096,6 +1097,7 @@ impl CudaResidentDeviceMemory {
         key_plan: &[u32],
         desc_mask: u64,
         null_offs: &[u64],
+        nulls_first_mask: u64,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_bitonic_sort_hetero(
             self,
@@ -1107,6 +1109,7 @@ impl CudaResidentDeviceMemory {
             key_plan,
             desc_mask,
             null_offs,
+            nulls_first_mask,
             Some(payload),
         )
     }
@@ -3999,9 +4002,13 @@ fn launch_cuda_bitonic_sort_hetero(
     key_plan: &[u32],
     desc_mask: u64,
     // M3 (doc 21): one NULL validity bitmap byte offset per key (u64::MAX = the key holds no NULL). The
-    // comparator reads it ON-DEVICE; a NULL key sorts as greatest (PG default placement via the desc
-    // reversal). Empty ⇒ treated as all-sentinel (no NULL handling). Offsets are into `resident_base`.
+    // comparator reads it ON-DEVICE. Empty ⇒ treated as all-sentinel (no NULL handling). Offsets are into
+    // `resident_base`.
     null_offs: &[u64],
+    // M3 (doc 21): per-key effective "NULLS FIRST" bitmask (bit k = key k places NULLs first). The engine
+    // sets it to the explicit NULLS FIRST/LAST override, or the key's DESC bit (PG default: NULLS LAST ASC,
+    // NULLS FIRST DESC) when unspecified, so the NULL placement is direction-resolved in the comparator.
+    nulls_first_mask: u64,
     // When Some, the text/numeric/uuid legs read from THIS uploaded payload (a resident-LIKE buffer
     // built from a non-resident result, e.g. a grouped result) instead of `resident`'s own columns;
     // `resident` is then used only for the CUDA context/stream. text_cols/b128_cols offsets are into it.
@@ -4230,6 +4237,7 @@ fn launch_cuda_bitonic_sort_hetero(
                 let mut p13 = jj;
                 let mut p14 = b128_offs_dev.ptr;
                 let mut p15 = null_offs_dev.ptr;
+                let mut p16 = nulls_first_mask;
                 let mut args = [
                     (&mut p0 as *mut u64).cast::<c_void>(),
                     (&mut p1 as *mut u64).cast::<c_void>(),
@@ -4247,6 +4255,7 @@ fn launch_cuda_bitonic_sort_hetero(
                     (&mut p13 as *mut u64).cast::<c_void>(),
                     (&mut p14 as *mut u64).cast::<c_void>(),
                     (&mut p15 as *mut u64).cast::<c_void>(),
+                    (&mut p16 as *mut u64).cast::<c_void>(),
                 ];
                 let rc = unsafe {
                     cu_launch_kernel(

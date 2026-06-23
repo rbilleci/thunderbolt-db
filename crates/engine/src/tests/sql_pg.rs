@@ -1041,6 +1041,66 @@ fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
+    // M3 (doc 21): explicit NULLS FIRST / NULLS LAST OVERRIDES PG's default placement, honored ON-DEVICE
+    // in the GPU sort comparator (the per-key nulls_first bitmask), DECOUPLED from ASC/DESC. Without an
+    // override ASC = NULLS LAST and DESC = NULLS FIRST (the default, covered elsewhere).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b) VALUES (3,100),(NULL,100),(1,100),(NULL,100),(2,100)")
+        .unwrap();
+    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let ints = |rows: &[Vec<SqlValue>]| -> Vec<Option<i32>> {
+        rows.iter()
+            .map(|row| match row[0] {
+                SqlValue::Int4(v) => Some(v),
+                SqlValue::Null => None,
+                ref o => panic!("unexpected {o:?}"),
+            })
+            .collect()
+    };
+    // ASC NULLS FIRST: NULLs first, then ascending (overrides the ASC default of NULLS LAST).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE b >= 0 ORDER BY a ASC NULLS FIRST")
+        .unwrap();
+    assert_eq!(ints(&r.rows), vec![None, None, Some(1), Some(2), Some(3)], "ASC NULLS FIRST");
+    // DESC NULLS LAST: descending, then NULLs last (overrides the DESC default of NULLS FIRST).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE b >= 0 ORDER BY a DESC NULLS LAST")
+        .unwrap();
+    assert_eq!(ints(&r.rows), vec![Some(3), Some(2), Some(1), None, None], "DESC NULLS LAST");
+    // Sanity: the default is unchanged (ASC => NULLS LAST) when no override is given.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT a FROM t WHERE b >= 0 ORDER BY a")
+        .unwrap();
+    assert_eq!(ints(&r.rows), vec![Some(1), Some(2), Some(3), None, None], "ASC default = NULLS LAST");
+    // Explicit NULLS FIRST/LAST on the GROUP BY result path is clean-errored, not silently ignored.
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT a, COUNT(*) FROM t WHERE b >= 0 GROUP BY a ORDER BY a NULLS FIRST"
+        )
+        .is_err(),
+        "explicit NULLS FIRST on a GROUP BY result is a clean error (default placement is supported)"
+    );
+}
+
+#[test]
+fn join_order_by_explicit_nulls_first_last_is_a_clean_error() {
+    // Explicit NULLS FIRST/LAST on a join ORDER BY is clean-errored at parse (not silently dropped); the
+    // default placement is supported. Parse-time, so no GPU needed.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE a (id INT, n TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE b (id INT, m TEXT)").unwrap();
+    let err = e.execute_resident_expr_select_sql(
+        "SELECT a.n FROM a JOIN b ON a.id = b.id ORDER BY a.id NULLS FIRST",
+    );
+    assert!(err.is_err(), "explicit NULLS FIRST on a join ORDER BY is a clean error");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     // The SMALLER side (s, the left/probe-by-size) has a DUPLICATE join key, so build-on-smaller hits
     // DuplicateBuildKey -> the executor falls back to building on the LARGER (unique) side. This

@@ -13,7 +13,7 @@ use super::*;
 
 use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, JoinType, Node, SelectStmt,
-    SetOperation, SortByDir,
+    SetOperation, SortByDir, SortByNulls,
 };
 use pg_query::NodeEnum;
 
@@ -129,6 +129,11 @@ impl Engine {
         // SAME mapper the WHERE uses, which the executor evaluates on-device into an i64 key column.
         let mut order_by_exprs: Vec<Option<ResidentExpr>> =
             Vec::with_capacity(stmt.sort_clause.len());
+        // Parallel to order_by_exprs: the explicit NULLS FIRST/LAST override per ORDER BY key (honored
+        // ON-DEVICE in the GPU sort comparator; None = PG default placement). Carried alongside rather
+        // than on SelectOrder so the legacy protocol crate's SelectOrder is untouched (charter).
+        let mut order_by_nulls_first: Vec<Option<bool>> =
+            Vec::with_capacity(stmt.sort_clause.len());
         for item in &stmt.sort_clause {
             let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
                 return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
@@ -142,6 +147,15 @@ impl Engine {
             } else {
                 order_by_exprs.push(Some(map_predicate_node(node, &table, &qualifier)?));
             }
+            order_by_nulls_first.push(
+                if sort_by.sortby_nulls == SortByNulls::SortbyNullsFirst as i32 {
+                    Some(true)
+                } else if sort_by.sortby_nulls == SortByNulls::SortbyNullsLast as i32 {
+                    Some(false)
+                } else {
+                    None
+                },
+            );
         }
         // GROUP BY <expression>: a bare ColumnRef -> None (the plain-column matrix path); any other
         // expression (`a+b`, `a*2`) -> a ResidentExpr the executor materializes on-device into a derived
@@ -172,6 +186,7 @@ impl Engine {
             copin_s,
             predicate.as_ref(),
             &order_by_exprs,
+            &order_by_nulls_first,
             group_key_expr.as_ref(),
             &group_key_columns,
         )
@@ -626,7 +641,8 @@ fn reject_unsupported_join_clauses(stmt: &SelectStmt) -> Result<(), ExecuteError
 /// Parse a join's ORDER BY / LIMIT / OFFSET. ORDER BY keys are PLAIN columns only (qualified or not -- the
 /// executor resolves them to a projected result column and sorts on the GPU); an arithmetic / aggregate
 /// sort expression on the join path is a follow-up. LIMIT / OFFSET are non-negative integer literals.
-/// NULLS FIRST/LAST is ignored (join data is non-null until M3). Shared by explicit + comma joins.
+/// Explicit NULLS FIRST/LAST on the join result is a follow-up (clean-errored, not silently ignored; the
+/// default placement is on-device). Shared by explicit + comma joins.
 #[allow(clippy::type_complexity)] // (ORDER BY keys, LIMIT, OFFSET) -- a plain 3-tuple, naming it adds noise
 fn parse_join_order_by_limit(
     stmt: &SelectStmt,
@@ -640,6 +656,15 @@ fn parse_join_order_by_limit(
             .node
             .as_deref()
             .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
+        if sort_by.sortby_nulls == SortByNulls::SortbyNullsFirst as i32
+            || sort_by.sortby_nulls == SortByNulls::SortbyNullsLast as i32
+        {
+            return Err(sql_pg_error(
+                "explicit NULLS FIRST/LAST on a join ORDER BY is a follow-up (the default NULL \
+                 placement is supported)"
+                    .to_string(),
+            ));
+        }
         let descending = sort_by.sortby_dir == SortByDir::SortbyDesc as i32;
         order_by.push((parse_join_col_ref(node)?, descending));
     }

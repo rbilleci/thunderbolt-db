@@ -6288,10 +6288,14 @@ mk_done:
     .param .u64 jj,
     .param .u64 b128_offs_ptr,
     // M3 (doc 21): per-key NULL validity bitmap byte offset (1 = valid, 0 = NULL), u64::MAX = no bitmap
-    // (the key holds no NULL). A NULL key compares as GREATER than every non-NULL key, so with the per-key
-    // desc reversal it lands at PG's default end (last ASC / first DESC). Read ON-DEVICE per row -> the
-    // ORDER BY NULL placement is GPU-native (no host partition / sentinel).
-    .param .u64 null_offs_ptr
+    // (the key holds no NULL). A NULL key's placement is read ON-DEVICE per row -> the ORDER BY NULL
+    // placement is GPU-native (no host partition / sentinel).
+    .param .u64 null_offs_ptr,
+    // M3 (doc 21): per-key effective "NULLS FIRST" bitmask (bit k = key k places NULLs FIRST). The engine
+    // sets it to the explicit NULLS FIRST/LAST override, or to the key's DESC bit when unspecified (PG
+    // default: NULLS LAST under ASC, NULLS FIRST under DESC). The NULL placement is direction-resolved
+    // here, so it bypasses the value-compare desc reversal.
+    .param .u64 nulls_first_mask
 )
 {
     .reg .pred %p;
@@ -6303,6 +6307,7 @@ mk_done:
     .reg .pred %ptext;
     .reg .pred %pva;
     .reg .pred %pvb;
+    .reg .pred %pnf;
     .reg .u32 %vsh;
     .reg .u32 %va;
     .reg .u32 %vb;
@@ -6333,6 +6338,7 @@ mk_done:
     .reg .u64 %planp;
     .reg .u64 %numkeys;
     .reg .u64 %descmask;
+    .reg .u64 %nfmask;
     .reg .u64 %n;
     .reg .u64 %npot;
     .reg .u64 %kk;
@@ -6383,6 +6389,7 @@ mk_done:
     ld.param.u64 %jj, [jj];
     ld.param.u64 %b128p, [b128_offs_ptr];
     ld.param.u64 %nulloffp, [null_offs_ptr];
+    ld.param.u64 %nfmask, [nulls_first_mask];
     mov.u64 %nullsent, 0xFFFFFFFFFFFFFFFF;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -6458,9 +6465,15 @@ het_key_loop:
     @%p bra het_keytype;                 // both valid -> value compare
     or.pred %p, %pva, %pvb;
     @!%p bra het_key_next;               // both NULL -> equal -> next key
-    // exactly one NULL: a valid (b NULL) -> a < b (cmp=-1); a NULL -> a > b (cmp=+1).
-    selp.s64 %cmp, -1, 1, %pva;
-    bra het_havecmp;
+    // exactly one NULL: place per the key's effective NULLS FIRST bit (nfmask). The engine bakes the
+    // explicit NULLS FIRST/LAST override -- or the key's DESC (PG default) -- into the bit, so the
+    // placement is direction-resolved here: pafter ("a sorts after b") = !(a_valid XOR nulls_first).
+    // Bypass the value-compare desc reversal (het_havecmp) -- desc is already accounted for.
+    and.b64 %tmp, %nfmask, %maskbit;
+    setp.ne.u64 %pnf, %tmp, 0;
+    xor.pred %pafter, %pva, %pnf;
+    not.pred %pafter, %pafter;
+    bra het_adone;
 het_keytype:
     shr.u32 %t32, %plan, 30;
     and.b32 %w0, %plan, 1073741823;
