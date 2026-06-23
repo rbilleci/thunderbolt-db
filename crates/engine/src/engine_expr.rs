@@ -3873,11 +3873,43 @@ impl Engine {
             // kernel stored each group's representative ABSOLUTE row index; read it from the same
             // residency_entry generation as the GPU result.
             let any_text_value = passes.iter().any(|p| p.value_is_text);
-            let text_host_rows = if key_is_text || any_text_value || composite_is_widekey {
+            // text_host_rows (a host_rows clone) is needed ONLY for the text reads still done host-side:
+            // composite (fixed,text) / wide-key members, and MIN/MAX text values (S2.2b). A PLAIN text KEY
+            // is materialized ON-DEVICE via key_text_map below, so it no longer needs the clone.
+            let text_host_rows = if any_text_value || composite_is_widekey || composite_is_text {
                 Some(residency_entry.host_rows.clone())
             } else {
                 None
             };
+            // S2.2a: a PLAIN text group KEY, materialized ON-DEVICE. One rep_idx -> key-string map gathered
+            // from the resident payload (project_text_rows_from_payload) over EVERY pass's group rep indices
+            // (materialize_key runs per-pass in #30), instead of reading host_rows. NULL-key groups are
+            // excluded (they render SqlValue::Null directly, never via a rep row).
+            let key_text_map: Option<std::collections::HashMap<usize, String>> =
+                if key_is_text && !is_composite_key && !composite_is_widekey {
+                    let mut reps: Vec<u64> = Vec::new();
+                    for pass in &passes {
+                        for g in &pass.groups {
+                            if !g.key_is_null {
+                                reps.push(g.key_i128 as u64);
+                            }
+                        }
+                    }
+                    reps.sort_unstable();
+                    reps.dedup();
+                    let layout = resident_device_text_column_layout(&snapshot, table, group_idx)?;
+                    let texts = device_memory
+                        .project_text_rows_from_payload(
+                            layout.offsets_byte_offset,
+                            layout.bytes_byte_offset,
+                            layout.bytes_len,
+                            &reps,
+                        )
+                        .map_err(map_err)?;
+                    Some(reps.iter().map(|&r| r as usize).zip(texts).collect())
+                } else {
+                    None
+                };
             // The kernel's hash-slot / compaction order is RACE-dependent: the cas.b64 linear-probe
             // resolves bucket ownership differently per launch, so two passes do NOT share a group
             // order (proven: an int8 i64::MIN-key query misaligned only on the 6th launch). Re-sort
@@ -3922,11 +3954,14 @@ impl Engine {
                         SqlValue::Int8(gk.key)
                     }
                 } else if key_is_text {
+                    // S2.2a: plain text key, looked up from the ON-DEVICE-gathered map (no host_rows read).
                     let rep_idx = gk.key_i128 as u64 as usize;
-                    text_host_rows
-                        .as_ref()
-                        .expect("text_host_rows is Some when key_is_text")[rep_idx][group_idx]
-                        .clone()
+                    SqlValue::Text(
+                        key_text_map
+                            .as_ref()
+                            .expect("key_text_map is Some for a plain text key")[&rep_idx]
+                            .clone(),
+                    )
                 } else if key_is_i128 {
                     match key_ty {
                         SqlType::Numeric { .. } => {
