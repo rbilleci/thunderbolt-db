@@ -221,6 +221,10 @@ impl JoinDeviceMemory {
 pub(crate) fn gpu_sort_result_rows(
     rows: Vec<Vec<SqlValue>>,
     order: &[(usize, bool)],
+    // Parallel to `order`: the explicit NULLS FIRST/LAST override per key (None = PG default). Empty =
+    // every key default. Honored ON-DEVICE: a non-int key via the comparator's nulls_first bitmask; an
+    // int key by choosing its NULL sentinel value (i64::MIN vs MAX) to land at the requested end.
+    nulls_first: &[Option<bool>],
     col_types: &[SqlType],
     device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
 ) -> Result<Vec<Vec<SqlValue>>, ExecuteError> {
@@ -247,25 +251,46 @@ pub(crate) fn gpu_sort_result_rows(
         };
         classified.push((idx, kind));
     }
+    // M3 (doc 21): per-key effective NULLS FIRST (explicit override, else the key's desc = PG default) and,
+    // for an int key, the NULL sentinel value that realizes it: i64::MIN sorts first under ASC / last under
+    // DESC, i64::MAX the reverse. The default (eff == desc) keeps i64::MAX (byte-identical). An int8/
+    // timestamp key with an EXPLICIT override clean-errors: a genuine i64::MIN/MAX value would tie with the
+    // sentinel and mis-place. int4/int2/date can't reach the sentinel, so they are exact.
+    let mut nulls_first_mask: u64 = 0;
+    let mut int_null_sentinel: Vec<i64> = Vec::with_capacity(order.len());
+    for (ki, &(idx, desc)) in order.iter().enumerate() {
+        let explicit = nulls_first.get(ki).copied().flatten();
+        let eff_nf = explicit.unwrap_or(desc);
+        if eff_nf {
+            nulls_first_mask |= 1u64 << ki;
+        }
+        if explicit.is_some()
+            && classified[ki].1 == 0
+            && matches!(col_types[idx], SqlType::Int8 | SqlType::Timestamp)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "explicit NULLS FIRST/LAST on a bigint/timestamp result column is a follow-up (the \
+                 i64 NULL sentinel could tie with a real value)"
+                    .to_string(),
+            )));
+        }
+        int_null_sentinel.push(if eff_nf ^ desc { i64::MIN } else { i64::MAX });
+    }
     let num_int = classified.iter().filter(|&&(_, k)| k == 0).count();
     // INT key matrix, row-major by row position (matches the 0..n index order).
     let mut int_keys: Vec<i64> = Vec::with_capacity(n * num_int);
     for row in &rows {
-        for &(idx, kind) in &classified {
+        for (ki, &(idx, kind)) in classified.iter().enumerate() {
             if kind == 0 {
                 int_keys.push(match row[idx] {
                     SqlValue::Int4(v) | SqlValue::Date(v) => i64::from(v),
                     SqlValue::Int2(v) => i64::from(v),
                     SqlValue::Int8(v) | SqlValue::Timestamp(v) => v,
-                    // M3 (doc 21): a NULL sort key takes PG's DEFAULT placement — NULLs sort as if larger
-                    // than every non-NULL value, i.e. last under ASC and first under DESC (the per-key
-                    // `desc_mask` reversal below turns "largest" into "first" for a DESC key). Mapping NULL
-                    // to i64::MAX realizes both: ASC -> MAX sorts last, DESC -> MAX reverses to first. For
-                    // int2/int4/date no real value reaches i64::MAX, so it is an unambiguous sentinel;
-                    // for int8/timestamp a genuine i64::MAX would tie with NULL (an unspecified order
-                    // among them, acceptable per SQL). Explicit NULLS FIRST/LAST is a clean parse error
-                    // today (a follow-up), so this never silently overrides an explicit request.
-                    SqlValue::Null => i64::MAX,
+                    // M3 (doc 21): a NULL int sort key maps to a per-key sentinel (int_null_sentinel[ki])
+                    // chosen so it lands at the requested end under the key's direction — the PG default
+                    // (i64::MAX) when no override, else i64::MIN/MAX per the explicit NULLS FIRST/LAST. The
+                    // value compare then places it (no bitmap needed for an int matrix key).
+                    SqlValue::Null => int_null_sentinel[ki],
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "ORDER BY int key encountered a non-int value".to_string(),
@@ -345,14 +370,13 @@ pub(crate) fn gpu_sort_result_rows(
             }
         }
         let indices: Vec<u64> = (0..n as u64).collect();
-        // This post-result path takes PG's DEFAULT NULL placement (explicit NULLS FIRST/LAST on the
-        // GROUP BY / join result is clean-errored by the callers): the effective nulls_first bit = the
-        // key's DESC, so passing `desc_mask` reproduces NULLs-last-ASC / first-DESC (and the int keys
-        // encode their NULL as the i64::MAX host sentinel, which the value compare already places).
+        // NULL placement is honored ON-DEVICE: a non-int key via `nulls_first_mask` (its payload validity
+        // bitmap + the comparator), an int key via its chosen sentinel value already in `int_keys` (its
+        // null_off is u64::MAX -> pure value compare). The default mask == desc, reproducing the PG default.
         device_memory
             .bitonic_sort_hetero_on_payload(
                 &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols, &key_plan, desc_mask,
-                &null_offs, desc_mask,
+                &null_offs, nulls_first_mask,
             )
             .map_err(map_sort_err)?
     };
@@ -2484,7 +2508,9 @@ impl Engine {
                 order.push((idx, *descending));
             }
             let col_types: Vec<SqlType> = columns.iter().map(|col| col.ty).collect();
-            result_rows = gpu_sort_result_rows(result_rows, &order, &col_types, sides[0].1.mem())?;
+            // The join path takes PG's DEFAULT NULL placement (explicit NULLS FIRST/LAST on a join ORDER BY
+            // is clean-errored at parse): no per-key override.
+            result_rows = gpu_sort_result_rows(result_rows, &order, &[], &col_types, sides[0].1.mem())?;
         }
         if plan.offset.is_some() || plan.limit.is_some() {
             let start = plan.offset.unwrap_or(0).min(result_rows.len());
@@ -4159,19 +4185,10 @@ impl Engine {
             // build_relational_device_payload) from just those result columns, which the hetero
             // comparator reads on-device. Single- and multi-key are the same path (k=1 is K=1).
             if !select.order_by.is_empty() && rows.len() > 1 {
-                // Explicit NULLS FIRST/LAST on a GROUP BY result column is a follow-up on this post-result
-                // sort path (its int keys carry NULL as an i64::MAX host sentinel, not a validity bitmap,
-                // so the comparator's nulls_first bit can't reach them). Clean-error rather than silently
-                // ignore the override; the DEFAULT placement is on-device and correct.
-                if order_by_nulls_first.iter().any(Option::is_some) {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "explicit NULLS FIRST/LAST on a GROUP BY result column is a follow-up (the \
-                         default NULL placement is supported)"
-                            .to_string(),
-                    )));
-                }
                 // Resolve each ORDER BY key to its result-column index, then sort the grouped rows on the
-                // GPU (the shared helper; int matrix vs hetero payload by key type).
+                // GPU (the shared helper; int matrix vs hetero payload by key type). Explicit NULLS
+                // FIRST/LAST is honored ON-DEVICE (order_by_nulls_first threaded through; an int8/timestamp
+                // result column with an explicit override clean-errors inside the helper).
                 let order: Vec<(usize, bool)> = select
                     .order_by
                     .iter()
@@ -4179,7 +4196,13 @@ impl Engine {
                     .collect::<Result<_, _>>()?;
                 let col_types: Vec<SqlType> =
                     bound.selected_columns.iter().map(|c| c.ty).collect();
-                rows = gpu_sort_result_rows(rows, &order, &col_types, &device_memory)?;
+                rows = gpu_sort_result_rows(
+                    rows,
+                    &order,
+                    order_by_nulls_first,
+                    &col_types,
+                    &device_memory,
+                )?;
             }
             if select.offset.is_some() || select.limit.is_some() {
                 let start = select.offset.unwrap_or(0).min(rows.len());

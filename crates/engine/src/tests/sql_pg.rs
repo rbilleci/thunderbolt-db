@@ -1099,13 +1099,17 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
         .execute_resident_expr_select_sql("SELECT a FROM t WHERE b >= 0 ORDER BY a")
         .unwrap();
     assert_eq!(ints(&r.rows), vec![Some(1), Some(2), Some(3), None, None], "ASC default = NULLS LAST");
-    // Explicit NULLS FIRST/LAST on the GROUP BY result path is clean-errored, not silently ignored.
-    assert!(
-        e.execute_resident_expr_select_sql(
-            "SELECT a, COUNT(*) FROM t WHERE b >= 0 GROUP BY a ORDER BY a NULLS FIRST"
+    // Explicit NULLS FIRST/LAST is now ALSO honored on the GROUP BY result path. a=[3,NULL,1,NULL,2] ->
+    // groups {1,2,3,NULL}; ORDER BY a NULLS FIRST -> NULL first, then ascending.
+    let r = e
+        .execute_resident_expr_select_sql(
+            "SELECT a, COUNT(*) FROM t WHERE b >= 0 GROUP BY a ORDER BY a NULLS FIRST",
         )
-        .is_err(),
-        "explicit NULLS FIRST on a GROUP BY result is a clean error (default placement is supported)"
+        .expect("grouped ORDER BY a NULLS FIRST");
+    assert_eq!(
+        ints(&r.rows),
+        vec![None, Some(1), Some(2), Some(3)],
+        "explicit NULLS FIRST on a GROUP BY result places the NULL group first"
     );
 }
 
@@ -1292,6 +1296,58 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
         e.execute_resident_expr_select_sql("SELECT id FROM t ORDER BY a + b NULLS FIRST").is_err(),
         "explicit NULLS FIRST on a nullable expression clean-errors"
     );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
+    // M3 (doc 21): explicit NULLS FIRST/LAST on a GROUP BY result ORDER BY, honored ON-DEVICE in
+    // gpu_sort_result_rows (an int result key's NULL sentinel value is chosen per the request). The NULL
+    // group's key renders SqlValue::Null and places per the override.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g,v) VALUES (1,10),(NULL,10),(2,10),(NULL,10)").unwrap();
+    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let keys = |rows: &[Vec<SqlValue>]| -> Vec<Option<i32>> {
+        rows.iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(x) => Some(x),
+                SqlValue::Null => None,
+                ref o => panic!("unexpected {o:?}"),
+            })
+            .collect()
+    };
+    // groups {1, 2, NULL}. ORDER BY g NULLS FIRST overrides the ASC default (NULLS LAST) -> NULL first.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g NULLS FIRST")
+        .expect("grouped ORDER BY NULLS FIRST");
+    assert_eq!(keys(&r.rows), vec![None, Some(1), Some(2)], "grouped ORDER BY g NULLS FIRST");
+    // Default ASC = NULLS LAST.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g")
+        .expect("grouped ORDER BY default");
+    assert_eq!(keys(&r.rows), vec![Some(1), Some(2), None], "grouped ORDER BY g default = NULLS LAST");
+    // DESC NULLS LAST overrides the DESC default (NULLS FIRST) -> descending then NULL last.
+    let r = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC NULLS LAST",
+        )
+        .expect("grouped ORDER BY DESC NULLS LAST");
+    assert_eq!(keys(&r.rows), vec![Some(2), Some(1), None], "grouped ORDER BY g DESC NULLS LAST");
+    // A bigint result column with an explicit override clean-errors (sentinel collision risk).
+    e.execute_text(3, "CREATE TABLE t8 (g BIGINT, v INT)").unwrap();
+    e.execute_text(4, "INSERT INTO t8 (g,v) VALUES (1,10),(NULL,10)").unwrap();
+    if e.populate_relational_residency_snapshot("t8").unwrap().device_memory_proof.is_some() {
+        assert!(
+            e.execute_resident_expr_select_sql(
+                "SELECT g, COUNT(*) FROM t8 GROUP BY g ORDER BY g NULLS FIRST"
+            )
+            .is_err(),
+            "explicit NULLS FIRST on a bigint grouped result column clean-errors"
+        );
+    }
 }
 
 #[test]
