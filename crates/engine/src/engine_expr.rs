@@ -221,8 +221,12 @@ impl JoinDeviceMemory {
 /// columns (`build_relational_device_payload`) that the hetero comparator reads on-device. `col_types[i]`
 /// is result column `i`'s type. A no-op for <=1 row or empty `order`. `device_memory` supplies the CUDA
 /// context. SHARED by the grouped result + the join result (both gather host rows then sort them on-device).
-pub(crate) fn gpu_sort_result_rows(
-    rows: Vec<Vec<SqlValue>>,
+/// The ON-DEVICE sort PERMUTATION for `rows` by `order` ((result-column index, descending)) -- the index
+/// vector `perm` such that `rows[perm[0]], rows[perm[1]], ...` is sorted. Used by `gpu_sort_result_rows`
+/// (final result order) AND by the GROUP BY multi-pass alignment (S2.3) to reorder per-pass group arrays
+/// on-device (a TOTAL key order aligns every pass by index -- no host sort).
+pub(crate) fn gpu_sort_permutation(
+    rows: &[Vec<SqlValue>],
     order: &[(usize, bool)],
     // Parallel to `order`: the explicit NULLS FIRST/LAST override per key (None = PG default). Empty =
     // every key default. Honored ON-DEVICE for EVERY key type via the comparator's per-key validity bitmap
@@ -230,9 +234,9 @@ pub(crate) fn gpu_sort_result_rows(
     nulls_first: &[Option<bool>],
     col_types: &[SqlType],
     device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
-) -> Result<Vec<Vec<SqlValue>>, ExecuteError> {
+) -> Result<Vec<u32>, ExecuteError> {
     if order.is_empty() || rows.len() <= 1 {
-        return Ok(rows);
+        return Ok((0..rows.len() as u32).collect());
     }
     let n = rows.len();
     let map_sort_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
@@ -272,7 +276,7 @@ pub(crate) fn gpu_sort_result_rows(
     // NULL from the validity bitmap (built below) BEFORE the value compare, so the placeholder is never
     // compared -- the NULL placement decision is on-device, not a host sentinel value.
     let mut int_keys: Vec<i64> = Vec::with_capacity(n * num_int);
-    for row in &rows {
+    for row in rows {
         for &(idx, kind) in &classified {
             if kind == 0 {
                 int_keys.push(match row[idx] {
@@ -372,6 +376,19 @@ pub(crate) fn gpu_sort_result_rows(
             )
             .map_err(map_sort_err)?
     };
+    Ok(perm)
+}
+
+/// Reorder `rows` into sorted result order via the on-device sort permutation (`gpu_sort_permutation`).
+/// The relational ordering decision is on the GPU; the host only applies the returned index vector.
+pub(crate) fn gpu_sort_result_rows(
+    rows: Vec<Vec<SqlValue>>,
+    order: &[(usize, bool)],
+    nulls_first: &[Option<bool>],
+    col_types: &[SqlType],
+    device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
+) -> Result<Vec<Vec<SqlValue>>, ExecuteError> {
+    let perm = gpu_sort_permutation(rows.as_slice(), order, nulls_first, col_types, device_memory)?;
     Ok(perm.iter().map(|&p| rows[p as usize].clone()).collect())
 }
 
@@ -4103,36 +4120,71 @@ impl Engine {
                     narrow_ordered_value(key_ty, gk.key, 0, 0)
                 }
             };
-            let key_cmp = |a: &SqlValue, b: &SqlValue| -> std::cmp::Ordering {
-                let i64_key = |v: &SqlValue| match v {
-                    SqlValue::Int4(k) | SqlValue::Date(k) => i64::from(*k),
-                    SqlValue::Int2(k) => i64::from(*k),
-                    SqlValue::Int8(k) | SqlValue::Timestamp(k) => *k,
-                    SqlValue::Bool(b) => i64::from(*b), // false(0) < true(1)
-                    _ => i64::MIN,
-                };
-                match (a, b) {
-                    // M3 (doc 21): the NULL-KEY group sorts FIRST, distinctly — `i64_key` maps NULL to
-                    // i64::MIN, which would TIE it with a literal i64::MIN int8 key and misalign the
-                    // passes; these arms keep the null group's pass-alignment position unambiguous.
-                    (SqlValue::Null, SqlValue::Null) => std::cmp::Ordering::Equal,
-                    (SqlValue::Null, _) => std::cmp::Ordering::Less,
-                    (_, SqlValue::Null) => std::cmp::Ordering::Greater,
-                    (SqlValue::Numeric(x), SqlValue::Numeric(y)) => x.cmp(y),
-                    (SqlValue::Uuid(x), SqlValue::Uuid(y)) => x.cmp(y),
-                    (SqlValue::Text(x), SqlValue::Text(y)) => x.cmp(y),
-                    _ => i64_key(a).cmp(&i64_key(b)),
+            // The FULL group-key tuple for a group (all key columns/members, in declared order) -- the
+            // device-materialized values (key_text_map / member_cell / the packed-int unpack / the typed
+            // struct). Used to align passes ON-DEVICE below.
+            let full_key = |gk: &gpu_db_execution::GroupByI32Row| -> Vec<SqlValue> {
+                if let Some(members) = &widekey_cols {
+                    let rep_idx = gk.key_i128 as u64 as usize;
+                    members
+                        .iter()
+                        .map(|&(idx, _)| member_cell[&(rep_idx, idx)].clone())
+                        .collect()
+                } else if let Some((c0, t0, c1, t1)) = composite_cols {
+                    if composite_is_text {
+                        let rep_idx = gk.key_i128 as u64 as usize;
+                        vec![
+                            member_cell[&(rep_idx, c0)].clone(),
+                            member_cell[&(rep_idx, c1)].clone(),
+                        ]
+                    } else {
+                        let (col0, col1) = if composite_is_i128 {
+                            let k = gk.key_i128;
+                            ((k >> 64) as i64, k as u64 as i64)
+                        } else {
+                            let col0 = ((((gk.key as u64) >> 32) as u32) as i32) as i64;
+                            let col1 = (((gk.key as u64) as u32) as i32) as i64;
+                            (col0, col1)
+                        };
+                        vec![
+                            narrow_ordered_value(t0, col0, 0, 0),
+                            narrow_ordered_value(t1, col1, 0, 0),
+                        ]
+                    }
+                } else {
+                    vec![materialize_key(gk)]
                 }
             };
-            // Pass-alignment (charter debt #30): the ONLY purpose of this host re-sort is to align
-            // MULTIPLE passes by group, because each pass's race-dependent compaction order differs. A
-            // single pass needs no alignment -- its groups are internally consistent -- and the result
-            // order is decided ON-DEVICE below (gpu_sort_result_rows). So skip the host sort for <=1 pass.
-            // Multi-pass alignment moves on-device in S2.2; until then it stays here for >1 pass.
+            // Pass-alignment (was charter debt #30, NOW ON-DEVICE -- S2.3): each aggregate's hash-agg pass
+            // compacts groups in a RACE-dependent order, so MULTIPLE passes don't share a group order; the
+            // merge below indexes pass[k][i] expecting the same group. Give every pass ONE shared order by
+            // sorting each by the FULL group key ON THE GPU (gpu_sort_permutation). The full key is UNIQUE
+            // per group, so this is a TOTAL order -> all passes align by index with no host sort and no
+            // sort-stability dependence. #30 needs only CONSISTENT alignment (the FINAL result order is
+            // gpu_sort_result_rows below), so any one deterministic order works; ASC / NULL-first is fine.
+            // A single pass needs no alignment (its groups are internally consistent), so skip it there.
             if passes.len() > 1 {
-                for pass in &mut passes {
-                    pass.groups
-                        .sort_by(|a, b| key_cmp(&materialize_key(a), &materialize_key(b)));
+                let key_types: Vec<SqlType> = if let Some(members) = &widekey_cols {
+                    members.iter().map(|&(_, t)| t).collect()
+                } else if let Some((_, t0, _, t1)) = composite_cols {
+                    vec![t0, t1]
+                } else {
+                    vec![key_ty]
+                };
+                let key_order: Vec<(usize, bool)> =
+                    (0..key_types.len()).map(|c| (c, false)).collect();
+                let key_nulls: Vec<Option<bool>> = vec![Some(true); key_types.len()];
+                for pass in passes.iter_mut() {
+                    let key_rows: Vec<Vec<SqlValue>> =
+                        pass.groups.iter().map(|g| full_key(g)).collect();
+                    let perm = gpu_sort_permutation(
+                        &key_rows,
+                        &key_order,
+                        &key_nulls,
+                        &key_types,
+                        &device_memory,
+                    )?;
+                    pass.groups = perm.iter().map(|&p| pass.groups[p as usize].clone()).collect();
                 }
             }
             // S2.2b-i: MIN/MAX over a TEXT value, materialized ON-DEVICE. For each text value pass, gather
