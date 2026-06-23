@@ -93,10 +93,21 @@ is optional; each line is struck through only when it runs on the device.
     FULLY on-device.**
 
 ### Result-stage operators on the general executor
-- [ ] **S3 — HAVING on-device.** `engine_expr.rs:4168` `rows.retain(...)` → device mask over the
-  group payload.
-- [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:4201` and `4916` host `drain/truncate` →
-  device-side window (truncate the index vector before final readback).
+- [ ] **S3 — HAVING on-device.** Currently a host `rows.retain(...)` over the grouped result
+  (`engine_expr.rs:~4405`): a DNF (`having_groups`, OR of AND-groups) of `(result_col, SelectFilterOp,
+  SqlValue)` comparisons via `select_filter_matches`. Move on-device by building the result rows into a
+  transient device relation (`build_transient_relation_residency`) and evaluating the predicate, OR a
+  direct build_payload + per-type compare→mask + DNF-combine + compact. **TRAP (verified 2026-06-24):**
+  reusing `lower_resident_predicate`/`ResidentExpr` is NOT a clean drop-in — `ResidentExpr` has
+  `Int4Literal`/`NumericLiteral`/`TextLiteral`/`BoolLiteral` but **no `Int8Literal`**, and the predicate
+  VM clean-errors mixed-type comparisons; HAVING compares `COUNT(*)`→`Int8` and `SUM`→`Int8/Numeric`
+  results, so the conversion needs an `Int8Literal` (+ the i64 compare path) or per-column-type value
+  encoding. Also NULL aggregate results need HAVING 3VL (a NULL aggregate fails the predicate). A real
+  slice, not a quick reuse.
+- [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:~4205` and `~4955` host `drain/truncate`. Note:
+  the rows are sorted on-device (`gpu_sort_permutation` now returns the index vector), so LIMIT/OFFSET is
+  best applied to the PERMUTATION before the final gather — materialize only the kept window. (Slicing an
+  index vector is control-plane; the win is not gathering rows that are then dropped.)
 
 ### Join (the original charter-audit finding)
 - [ ] **S5 — join NULL-key skip in the kernels (V1).** `key_present` reads `host_rows`
