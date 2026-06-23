@@ -93,17 +93,16 @@ is optional; each line is struck through only when it runs on the device.
     FULLY on-device.**
 
 ### Result-stage operators on the general executor
-- [ ] **S3 — HAVING on-device.** Currently a host `rows.retain(...)` over the grouped result
-  (`engine_expr.rs:~4405`): a DNF (`having_groups`, OR of AND-groups) of `(result_col, SelectFilterOp,
-  SqlValue)` comparisons via `select_filter_matches`. Move on-device by building the result rows into a
-  transient device relation (`build_transient_relation_residency`) and evaluating the predicate, OR a
-  direct build_payload + per-type compare→mask + DNF-combine + compact. **TRAP (verified 2026-06-24):**
-  reusing `lower_resident_predicate`/`ResidentExpr` is NOT a clean drop-in — `ResidentExpr` has
-  `Int4Literal`/`NumericLiteral`/`TextLiteral`/`BoolLiteral` but **no `Int8Literal`**, and the predicate
-  VM clean-errors mixed-type comparisons; HAVING compares `COUNT(*)`→`Int8` and `SUM`→`Int8/Numeric`
-  results, so the conversion needs an `Int8Literal` (+ the i64 compare path) or per-column-type value
-  encoding. Also NULL aggregate results need HAVING 3VL (a NULL aggregate fails the predicate). A real
-  slice, not a quick reuse.
+- [x] **S3 — HAVING on-device.** **DONE `488083ea`** (suite 234/0; independent audit running). The host
+  `rows.retain` is gone: the grouped result is materialized as a TRANSIENT device relation
+  (`build_transient_relation_residency`, columns = the SELECT result columns), the HAVING DNF is converted
+  to a `ResidentExpr` (leaf `Column(idx) <op> literal`, AND within a group, OR across), and evaluated by
+  the SAME device predicate VM as WHERE (`lower_resident_predicate`) → survivor indices. The
+  `Int4Literal` covers `COUNT(*)`→Int8 / group-key compares (the int8 path sign-extends a small literal);
+  `NumericLiteral`/`TextLiteral`/`BoolLiteral`/Date cover the rest. **NARROW OPEN GAP (S3.1):** a
+  **timestamp/uuid HAVING CONSTANT** clean-errors (predicate IR has no i64/uuid literal) — charter-aligned
+  (correct-or-clean-error, NOT a host fallback), no general-path test hits it; close by adding
+  `Int8Literal`/uuid-literal + compare lowering to the WHERE predicate IR.
 - [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:~4205` and `~4955` host `drain/truncate`. Note:
   the rows are sorted on-device (`gpu_sort_permutation` now returns the index vector), so LIMIT/OFFSET is
   best applied to the PERMUTATION before the final gather — materialize only the kept window. (Slicing an
