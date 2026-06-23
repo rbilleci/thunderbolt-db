@@ -65,11 +65,17 @@ is optional; each line is struck through only when it runs on the device.
     ORDER BY and the deterministic default order (full key tuple, ASC, NULL group first) now route
     through the on-device `gpu_sort_result_rows`; it gained bool-as-int (0/1) classification and is
     now exhaustive over every result-column type. The host pass-alignment sort (#30) is skipped for
-    `passes.len()<=1`. **DONE `407f69bb`** (suite 234/0; independent audit running). No kernel change.
-  - [ ] **S2.2 — GROUP BY text key/value materialization on-device.** Replace the rep-index
-    `host_rows` reads in `materialize_key` + the result builder (`3924/3987/3997/3998/4080/4085`)
-    with `project_text_rows_from_payload` over the per-group representative row indices (one batched
-    gather). De-hosts the text DATA the grouped path still reads (single + multi pass).
+    `passes.len()<=1`. **DONE `407f69bb`** (suite 234/0 + 4 adversarial; independent audit **SHIP** —
+    default order byte-identical to the old host `key_cmp`). No kernel change.
+  - [x] **S2.2a — plain text group KEY on-device.** A `rep_idx → key-string` map built via
+    `project_text_rows_from_payload` over every pass's group rep indices (covers #30's per-pass
+    `materialize_key`); the `host_rows` clone is dropped when nothing else needs it; NULL-key groups
+    render `SqlValue::Null` directly. **DONE `592bdcff`** (suite 234/0; independent audit running). No
+    kernel change.
+  - [ ] **S2.2b — composite/wide-key MEMBERS + MIN/MAX text VALUES on-device.** The remaining
+    `text_host_rows` reads: wide-key/composite members (multi-type — per-member device projection by
+    type at the key rep indices, `3987/3997/3998`) and MIN/MAX text values (text gather at
+    `g.min`/`g.max`, `4080/4085`). Removes `text_host_rows` entirely.
   - [ ] **S2.3 — multi-aggregate #30 alignment on-device.** Eliminate the host pass-alignment sort
     that still runs for `passes.len()>1`. Preferred = a single multi-aggregate hash-agg pass (one slot
     carries all value cols' accumulators → one group array, no alignment); fallback = sort each pass
