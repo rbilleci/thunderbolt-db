@@ -1172,6 +1172,29 @@ fn gpu_group_by_nullable_composite_key_per_member_null_on_device() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_count_distinct_over_a_nullable_value_clean_errors() {
+    // M3 (doc 21): COUNT(DISTINCT v) over a NULLABLE value must EXCLUDE NULLs (PG); the sort-based reps
+    // pass has no value validity (it would over-count NULL as a distinct value), so clean-error rather than
+    // silently mis-count. (A non-null COUNT(DISTINCT) is unaffected -- covered by the count_distinct suite.)
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g,v) VALUES (1,10),(1,NULL),(1,10),(2,20)").unwrap();
+    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g")
+            .is_err(),
+        "grouped COUNT(DISTINCT) over a nullable value clean-errors (no silent over-count)"
+    );
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t").is_err(),
+        "scalar COUNT(DISTINCT) over a nullable value clean-errors (no silent over-count)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
     // M3 (doc 21): GROUP BY a NULLABLE int4 EXPRESSION (`a + b`, b non-null) -- the rows where a is NULL
     // (so a+b is NULL) form their OWN group, rendered SqlValue::Null. Reuses the single-column NULL-key

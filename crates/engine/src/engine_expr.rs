@@ -3498,6 +3498,26 @@ impl Engine {
                         .to_string(),
                 )));
             }
+            // M3 (doc 21): COUNT(DISTINCT v) over a NULLABLE VALUE column. PG counts distinct NON-NULL
+            // values, but the sort-based reps pass groups by (g, v) WITHOUT value validity -- it would fold
+            // NULL v into a (deterministic-or-stale) value and count it as a distinct value (an over-count),
+            // and an all-NULL-v group would vanish from the pass (misaligning the by-index merge). The value
+            // column is NOT in `value_indices` (it skips COUNT(DISTINCT)) so `any_value_nullable` misses it;
+            // check it here. Clean-error rather than silently mis-count (excluding NULL v + keeping the
+            // all-NULL-v group at 0 is the follow-up).
+            for (aggregate, value_idx) in aggregates.iter().zip(&agg_value_indices) {
+                if aggregate.kind == GroupedAggKind::CountDistinct {
+                    if let Some(idx) = value_idx {
+                        if resident_device_null_column_offset(&snapshot, table, *idx)?.is_some() {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "COUNT(DISTINCT) over a nullable column is not yet supported on the GPU \
+                                 (M3 3VL follow-up: excluding NULL values from the distinct count)"
+                                    .to_string(),
+                            )));
+                        }
+                    }
+                }
+            }
             let run_pass =
                 |value_idx_opt: Option<usize>, has_minmax: bool| -> Result<Pass, ExecuteError> {
                     // A None value column is the COUNT(*)-only pass: group over the key, read .count.
@@ -4364,6 +4384,17 @@ impl Engine {
                 // filtered set returns 0 (the lone exception to the SUM/AVG empty-set NULL hard-error).
                 SelectProjection::CountDistinct { column } => {
                     let value_idx = relational_column_index(table, column)?;
+                    // M3 (doc 21): COUNT(DISTINCT v) counts distinct NON-NULL values (PG). The sort/mark/SUM
+                    // pass has no value validity, so a NULL v would be counted as a distinct value (an
+                    // over-count). Clean-error a nullable value rather than silently mis-count (the grouped
+                    // path guards this too); excluding NULL v is the follow-up.
+                    if resident_device_null_column_offset(&snapshot, table, value_idx)?.is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "COUNT(DISTINCT) over a nullable column is not yet supported on the GPU \
+                             (M3 3VL follow-up: excluding NULL values from the distinct count)"
+                                .to_string(),
+                        )));
+                    }
                     if indices_u64.is_empty() {
                         SqlValue::Int8(0)
                     } else {
