@@ -853,13 +853,36 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
         "text-key LEFT join NULL-pads the unmatched left row"
     );
 
-    // A WHERE on a LEFT join is a clean error (the per-side pushdown is not filter-commutative for an
-    // outer join) -- a follow-up, not a mis-answer. (RIGHT/FULL are tested separately now.)
-    assert!(e
+    // A WHERE on a LEFT join filters the JOINED RESULT (PG semantics), not a per-side pushdown. The
+    // predicate runs on the GPU; only lc row (1,'x') passes `lc.label = 'x'`, so every other tuple --
+    // including the NULL-padded (c) / (nokey) rows whose lc.label is NULL (UNKNOWN) -- is dropped.
+    let wres = e
         .execute_resident_expr_select_sql(
-            "SELECT name, label FROM lp LEFT JOIN lc ON lp.id = lc.pid WHERE lc.label = 'x'"
+            "SELECT name, label FROM lp LEFT JOIN lc ON lp.id = lc.pid WHERE lc.label = 'x'",
         )
-        .is_err());
+        .expect("LEFT JOIN with WHERE on the inner side filters the result");
+    let mut wgot: Vec<(String, Option<String>)> = wres
+        .rows
+        .iter()
+        .map(|r| {
+            let name = match &r[0] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("name: {o:?}"),
+            };
+            let label = match &r[1] {
+                SqlValue::Text(t) => Some(t.clone()),
+                SqlValue::Null => None,
+                o => panic!("label: {o:?}"),
+            };
+            (name, label)
+        })
+        .collect();
+    wgot.sort();
+    assert_eq!(
+        wgot,
+        vec![("a".to_string(), Some("x".to_string()))],
+        "WHERE on the inner side of a LEFT join drops the non-matching + NULL-padded tuples"
+    );
 }
 
 #[test]
@@ -1097,6 +1120,85 @@ fn join_order_by_explicit_nulls_first_last_is_a_clean_error() {
         "SELECT a.n FROM a JOIN b ON a.id = b.id ORDER BY a.id NULLS FIRST",
     );
     assert!(err.is_err(), "explicit NULLS FIRST on a join ORDER BY is a clean error");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_outer_join_with_where_filters_the_result_not_the_inputs() {
+    // M3 (doc 21): a WHERE on an OUTER join filters the JOINED RESULT (PG semantics), NOT a per-side
+    // pushdown (which is not filter-commutative for an outer join). The predicate runs on the GPU
+    // (lower_resident_predicate); its survivor set post-filters the padded result: a JOIN_NULL_ROW pad
+    // means the relation's columns are NULL -> the predicate is UNKNOWN -> the tuple is dropped.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,x) VALUES (1,5),(2,7)").unwrap();
+    for t in ["l", "r"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let rows = |res: &RelationalSelectResult| -> Vec<(String, Option<i32>)> {
+        let mut v: Vec<(String, Option<i32>)> = res
+            .rows
+            .iter()
+            .map(|row| {
+                let name = match &row[0] {
+                    SqlValue::Text(t) => t.clone(),
+                    o => panic!("unexpected {o:?}"),
+                };
+                let x = match row[1] {
+                    SqlValue::Int4(v) => Some(v),
+                    SqlValue::Null => None,
+                    ref o => panic!("unexpected {o:?}"),
+                };
+                (name, x)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // WHERE on the INNER (padded) side: `r.x = 5` drops the NULL-padded row (c) AND the non-matching
+    // matched row (b, x=7) -- effectively inner on that condition. Only (a, 5) survives.
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, x FROM l LEFT JOIN r ON l.id = r.rid WHERE r.x = 5",
+        )
+        .expect("LEFT JOIN with WHERE on the inner side");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        rows(&res),
+        vec![("a".into(), Some(5))],
+        "WHERE on the padded side filters the result (UNKNOWN on the NULL pad drops it)"
+    );
+
+    // WHERE on the PRESERVED (left) side: `l.id >= 2` keeps id 2 (matched, x=7) and id 3 (padded, NULL),
+    // dropping id 1 -- the padding is preserved for the surviving left rows.
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, x FROM l LEFT JOIN r ON l.id = r.rid WHERE l.id >= 2",
+        )
+        .expect("LEFT JOIN with WHERE on the preserved side");
+    assert_eq!(
+        rows(&res),
+        vec![("b".into(), Some(7)), ("c".into(), None)],
+        "WHERE on the preserved side keeps the NULL pad for surviving left rows"
+    );
+
+    // ANTI-JOIN: `WHERE r.x IS NULL` is TRUE on the NULL pad, so the post-filter must KEEP the padded
+    // (unmatched-left) rows -- and drop every matched row (whose r.x is non-NULL). l=3 has no r match.
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, x FROM l LEFT JOIN r ON l.id = r.rid WHERE r.x IS NULL",
+        )
+        .expect("LEFT JOIN anti-join (WHERE inner IS NULL)");
+    assert_eq!(
+        rows(&res),
+        vec![("c".into(), None)],
+        "anti-join: WHERE inner.col IS NULL keeps the NULL-padded (unmatched) left rows"
+    );
 }
 
 #[test]

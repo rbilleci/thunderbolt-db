@@ -104,6 +104,54 @@ pub(crate) struct JoinRelationRef {
 /// absolute row index can never be `u32::MAX` (residency row counts are far smaller), so it is unambiguous.
 const JOIN_NULL_ROW: u32 = u32::MAX;
 
+/// 3-valued AND/OR (`None` = UNKNOWN), used to fold a WHERE predicate's truth on an outer join's NULL pad.
+fn null_pad_and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+fn null_pad_or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// The 3-valued truth of a per-relation WHERE predicate when EVERY column it references is NULL -- i.e.
+/// its value on an OUTER join's synthetic NULL-pad row (M3 -- doc 21). `Some(true)` = the predicate HOLDS
+/// on the pad (e.g. `col IS NULL`, the anti-join), so the padded tuple must be KEPT; `Some(false)` / `None`
+/// (UNKNOWN) = dropped (SQL WHERE keeps only TRUE). `Err` = a predicate shape whose pad truth this does not
+/// model, surfaced as a clean error rather than risk a silent mis-answer. (The actual DATA rows are still
+/// evaluated on the GPU; only the synthetic pad -- which the join creates host-side -- is resolved here.)
+fn predicate_truth_on_null_pad(expr: &ResidentExpr) -> Result<Option<bool>, ExecuteError> {
+    use ResidentBinaryOp::{And, Eq, Ge, Gt, Le, Like, Lt, Ne, Or};
+    match expr {
+        // IS NULL is TRUE on a NULL column (the anti-join idiom); IS NOT NULL is FALSE.
+        ResidentExpr::IsNull { is_not_null, .. } => Ok(Some(!is_not_null)),
+        ResidentExpr::BoolLiteral(b) => Ok(Some(*b)),
+        ResidentExpr::Binary { op: And, lhs, rhs } => Ok(null_pad_and3(
+            predicate_truth_on_null_pad(lhs)?,
+            predicate_truth_on_null_pad(rhs)?,
+        )),
+        ResidentExpr::Binary { op: Or, lhs, rhs } => Ok(null_pad_or3(
+            predicate_truth_on_null_pad(lhs)?,
+            predicate_truth_on_null_pad(rhs)?,
+        )),
+        // Any comparison / LIKE references a column that is NULL on the pad -> UNKNOWN.
+        ResidentExpr::Binary { op: Eq | Ne | Lt | Le | Gt | Ge | Like, .. } => Ok(None),
+        // A bare column used as a boolean predicate (`WHERE flag`) is NULL on the pad -> UNKNOWN.
+        ResidentExpr::Column(_) => Ok(None),
+        // Arithmetic / scalar literals are not top-level predicates; surface rather than guess.
+        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "a WHERE clause of this shape on the NULL-padded side of an OUTER JOIN is a follow-up"
+                .to_string(),
+        ))),
+    }
+}
+
 /// One INNER-join step in a left-deep chain. Its condition is one of: explicit ON `conjuncts`
 /// (`a.k1=b.k1 [AND a.k2=b.k2]` -- in each pair one operand resolves to the newly joined relation
 /// `relations[k+1]`, the other to an accumulated one); `USING(cols)`, which the parser desugars to
@@ -1778,17 +1826,18 @@ impl Engine {
         let n_rel = plan.relations.len();
         // OUTER joins (LEFT/RIGHT/FULL, M3 -- doc 21). N-way (multi-step) OUTER is supported: a prior step's
         // NULL pad carries a `JOIN_NULL_ROW` sentinel that `key_present` reads as a NULL key (matches
-        // nothing; a LEFT step re-pads it), and the final gather emits SqlValue::Null for it. A WHERE on an
-        // OUTER join is still a follow-up: the per-side WHERE pushdown is NOT filter-commutative for an outer
-        // join (a filter on the NULL-padded side would change which rows are padded) -- rejected, not
-        // mis-answered.
-        if plan.steps.iter().any(|s| s.outer_left || s.outer_right)
-            && predicates.iter().any(Option::is_some)
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "a WHERE clause on an OUTER JOIN is a follow-up".to_string(),
-            )));
-        }
+        // nothing; a LEFT step re-pads it), and the final gather emits SqlValue::Null for it.
+        //
+        // A WHERE on an OUTER join is NOT filter-commutative: pushing a per-side predicate down before the
+        // join would drop rows the outer join must NULL-pad, and a predicate on the padded side would
+        // change which rows are padded. So for an outer join the per-side predicates are NOT pushed down
+        // (the join sees ALL rows); instead each predicate's GPU-computed survivor set becomes a POST-join
+        // membership filter applied to the result below: a tuple survives only if, for every predicated
+        // relation, its carried row is REAL (a JOIN_NULL_ROW pad means that relation's columns are NULL ->
+        // the predicate is UNKNOWN -> drop) AND that row passed the predicate on-device. This matches PG
+        // (a WHERE on the inner side of a LEFT join effectively makes it inner on that condition).
+        let outer_where = plan.steps.iter().any(|s| s.outer_left || s.outer_right)
+            && predicates.iter().any(Option::is_some);
         // Resolve a JOIN column reference to (relation index, column index) against relations[0..=upto]:
         // a qualifier must name exactly one of them; an unqualified column must be in exactly one (PG's
         // "ambiguous" / "does not exist"). `upto` bounds an ON operand to the relations joined so far.
@@ -2042,9 +2091,19 @@ impl Engine {
             "a join relation has too many rows to distinguish the LEFT-join NULL-pad sentinel"
         );
         let gpu_id = sides[0].0.descriptor.gpu_id;
-        // Pre-filter each relation by its per-relation WHERE on the GPU -> the surviving ABSOLUTE row
-        // indices (inner join is filter-commutative on per-side predicates). No predicate -> all rows.
+        // Filter each relation by its per-relation WHERE on the GPU -> the surviving ABSOLUTE row indices.
+        // INNER join: this is a pre-filter pushed into the join inputs (filter-commutative). OUTER join
+        // (outer_where): the join must see ALL rows, so `survivors_all` stays 0..n and the GPU survivor
+        // set is recorded as a per-relation post-filter keep-mask (applied to the result after the join).
         let mut survivors_all: Vec<Vec<u32>> = Vec::with_capacity(n_rel);
+        // keep_masks[i] = Some(mask over 0..n_i) when relation i has a predicate AND this is an outer join
+        // (else None = no post-filter for that relation). mask[row] = the row passed the predicate.
+        let mut keep_masks: Vec<Option<Vec<bool>>> = vec![None; n_rel];
+        // pad_survives[i] = does relation i's predicate hold on a NULL pad (a tuple where relation i is
+        // NULL-padded)? `col IS NULL` (the anti-join) holds -> such tuples are KEPT; comparisons are
+        // UNKNOWN -> dropped. Resolved from the predicate's truth on an all-NULL row (a per-relation
+        // constant). Only consulted for outer_where relations.
+        let mut pad_survives: Vec<bool> = vec![false; n_rel];
         for (i, (entry, dm, n)) in sides.iter().enumerate() {
             let surv = match &predicates[i] {
                 Some(p) if *n > 0 => self.lower_resident_predicate(
@@ -2056,7 +2115,20 @@ impl Engine {
                 )?,
                 _ => (0..*n as u32).collect(),
             };
-            survivors_all.push(surv);
+            if outer_where && predicates[i].is_some() {
+                pad_survives[i] = matches!(
+                    predicate_truth_on_null_pad(predicates[i].as_ref().unwrap())?,
+                    Some(true)
+                );
+                let mut mask = vec![false; *n];
+                for &r in &surv {
+                    mask[r as usize] = true;
+                }
+                keep_masks[i] = Some(mask);
+                survivors_all.push((0..*n as u32).collect());
+            } else {
+                survivors_all.push(surv);
+            }
         }
         // Project relation `ri`'s integer key column `col_idx` to host i64 at the given ABSOLUTE rows:
         // int8/timestamp from the i64 section; int2/int4/date from the i32 section, sign-extended.
@@ -2336,6 +2408,33 @@ impl Engine {
                 }
             }
             work_idx = next;
+        }
+        // OUTER + WHERE post-filter (M3 -- doc 21): apply each predicated relation's GPU-computed survivor
+        // keep-mask to the joined result. A tuple survives only if, for every predicated relation: a REAL
+        // carried row passed the predicate on-device (in the keep-mask); a JOIN_NULL_ROW pad survives iff
+        // the predicate holds on an all-NULL row (`pad_survives` -- TRUE for `col IS NULL`, the anti-join;
+        // FALSE/UNKNOWN for a comparison, which drops the pad). (INNER joins never set keep_masks; they
+        // pre-filtered the inputs, so this is a no-op for them.)
+        if outer_where {
+            let kept: Vec<usize> = (0..work_idx[0].len())
+                .filter(|&t| {
+                    keep_masks.iter().enumerate().all(|(i, mask)| match mask {
+                        Some(mask) => {
+                            let row = work_idx[i][t];
+                            if row == JOIN_NULL_ROW {
+                                pad_survives[i]
+                            } else {
+                                mask[row as usize]
+                            }
+                        }
+                        None => true,
+                    })
+                })
+                .collect();
+            work_idx = work_idx
+                .iter()
+                .map(|col| kept.iter().map(|&t| col[t]).collect())
+                .collect();
         }
         // Gather: for each surviving tuple, read each projected column from its relation's host_rows at
         // the carried ABSOLUTE row -- the control-plane gather; the join ran on the GPU.
