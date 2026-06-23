@@ -429,7 +429,7 @@ fn composite_group_count_reps(
     let groups = device_memory
         .group_by_i32_count_sum_minmax_from_payload(
             0, 0, indices, false, false, false, false, false, false, 0, 0, false, 0, 0,
-            key_base_override, 0, comp_w, n_text, text_desc_ptr,
+            key_base_override, 0, comp_w, n_text, text_desc_ptr, None,
         )
         .map_err(map_err)?;
     Ok(groups.iter().map(|g| g.key_i128 as u64 as u32).collect())
@@ -2664,6 +2664,7 @@ impl Engine {
                     0, // comp_w (not a wide-key composite)
                     0, // n_text (no text members)
                     0, // text_desc_ptr
+                    None, // value_null_off (COUNT(DISTINCT) over the marked tuple matrix)
                 )
                 .map_err(map_err)?;
             drop((g_sorted, new_distinct));
@@ -2710,29 +2711,53 @@ impl Engine {
                     }
                 }
             }
-            // M3 (doc 21) GROUP BY 3VL guard: a NULL group KEY must form its OWN group (distinct from any
-            // real value), and a NULL aggregate VALUE must be SKIPPED from SUM/AVG/MIN/MAX/COUNT(col)
-            // while COUNT(*) still counts the row. The multi-type hash-agg kernel does neither yet — it
-            // reads the 0/empty PLACEHOLDER, so it would group NULL keys under 0 and fold a phantom 0 into
-            // the value aggregate. Until the (two-count, key+value-validity) kernel redesign lands, detect
-            // a key/value column that ACTUALLY contains a NULL and CLEAN-ERROR rather than mis-answer. A
-            // nullable-TYPED column with no NULLs has no validity bitmap, so it still runs unchanged.
-            let mut group_by_null_check: Vec<usize> = agg_value_indices.iter().flatten().copied().collect();
+            // M3 (doc 21) GROUP BY 3VL: a NULL aggregate VALUE is now SKIPPED from SUM/AVG/MIN/MAX on the
+            // GPU (the single-level kernel's value-skip; `any_value_nullable` forces single-level and a
+            // dedicated total-count pass below). What remains a CLEAN ERROR is a NULL group KEY — it must
+            // form its OWN group (distinct from any real value), but the kernel reads the 0/empty
+            // PLACEHOLDER, so a NULL key would group under 0. Detect a KEY column that ACTUALLY contains a
+            // NULL and clean-error rather than mis-answer (a NULL-free nullable-typed key has no bitmap, so
+            // it still runs). The full NULL-key-as-own-group is a kernel-reserved-slot / host-partition
+            // follow-up.
+            let mut group_by_key_check: Vec<usize> = Vec::new();
             if let Some(expr) = group_key_expr {
-                collect_expr_columns(expr, &mut group_by_null_check);
+                collect_expr_columns(expr, &mut group_by_key_check);
             } else if !group_key_columns.is_empty() {
                 for name in group_key_columns {
-                    group_by_null_check.push(relational_column_index(table, name)?);
+                    group_by_key_check.push(relational_column_index(table, name)?);
                 }
             } else if let Ok(idx) = relational_column_index(table, group_name) {
-                group_by_null_check.push(idx);
+                group_by_key_check.push(idx);
             }
-            for col in group_by_null_check {
+            for col in group_by_key_check {
                 if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "GROUP BY over a column that contains NULLs is not yet supported on the GPU \
-                         (M3 3VL follow-up): a NULL key must form its own group and a NULL aggregate \
-                         value must be skipped"
+                        "GROUP BY over a KEY column that contains NULLs is not yet supported on the GPU \
+                         (M3 3VL follow-up): a NULL key must form its own group. (A nullable aggregate \
+                         VALUE is supported — its NULLs are skipped.)"
+                            .to_string(),
+                    )));
+                }
+            }
+            // M3 (doc 21): a nullable NUMERIC value runs the numeric TWO-PASS min/max kernel — pass 1
+            // records every row's claimed slot into a POOLED `row_slots` scratch (deliberately
+            // un-initialized: pass 1 is assumed to write every row), pass 2 reads it and folds the i128
+            // low limb. The value-skip gate skips a NULL row's pass-1 slot write, leaving a STALE pooled
+            // slot index from a PRIOR query that pass 2 then reads — folding the placeholder into the wrong
+            // group AND risking an out-of-bounds slot write (a 700 hazard) when the stale index exceeds the
+            // current table. This runs for SUM/AVG too (they discard min/max but still launch pass 2), so
+            // clean-error ANY nullable numeric value until the two-pass is made NULL-aware (a follow-up).
+            // int2/int4/int8/date/timestamp/uuid/text values are single-pass (no row_slots) and stay
+            // supported (NULLs skipped correctly).
+            for vidx in agg_value_indices.iter().flatten() {
+                if matches!(table.columns[*vidx].ty, SqlType::Numeric { .. })
+                    && resident_device_null_column_offset(&snapshot, table, *vidx)?.is_some()
+                {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "GROUP BY aggregate over a nullable NUMERIC value is not yet supported on the GPU \
+                         (M3 3VL follow-up: the numeric two-pass min/max kernel reuses a pooled row-slot \
+                         scratch the value-skip leaves stale); int/uuid/text aggregate values over \
+                         nullable columns are supported"
                             .to_string(),
                     )));
                 }
@@ -3207,12 +3232,28 @@ impl Engine {
                 }
             }
             // An expression key is read via key_base_override, which only the single-level kernel honors.
-            let force_single = value_indices.len() > 1 || is_expr_key;
+            // M3 (doc 21): a nullable VALUE column also forces single-level — only that kernel has the
+            // NULL-value skip. (A column with no NULLs has no bitmap, so this never triggers for it.)
+            let any_value_nullable = value_indices.iter().try_fold(false, |acc, &vidx| {
+                Ok::<bool, ExecuteError>(
+                    acc || resident_device_null_column_offset(&snapshot, table, vidx)?.is_some(),
+                )
+            })?;
+            let force_single = value_indices.len() > 1 || is_expr_key || any_value_nullable;
             let run_pass =
                 |value_idx_opt: Option<usize>, has_minmax: bool| -> Result<Pass, ExecuteError> {
                     // A None value column is the COUNT(*)-only pass: group over the key, read .count.
                     let value_idx = value_idx_opt.unwrap_or(group_idx);
                     let value_ty = table.columns[value_idx].ty;
+                    // M3 (doc 21) 3VL: a value pass over a NULLABLE column skips NULL values ON-DEVICE so
+                    // its count/sum/min/max are over only the non-NULL rows (COUNT(*) passes None and
+                    // counts every row). `None` = no bitmap (no NULLs) ⇒ byte-identical. Only the
+                    // single-level kernel honors it, so a nullable value forces single-level (below).
+                    let pass_value_null_off = if value_idx_opt.is_some() {
+                        resident_device_null_column_offset(&snapshot, table, value_idx)?
+                    } else {
+                        None
+                    };
                     let value_scale: u8 = match value_ty {
                         SqlType::Numeric { scale, .. } => scale,
                         _ => 0,
@@ -3304,6 +3345,7 @@ impl Engine {
                             widekey_w,
                             widekey_n_text,
                             widekey_text_desc_ptr,
+                            pass_value_null_off,
                         )
                     } else {
                         device_memory.group_by_i32_count_sum_from_payload(
@@ -3329,7 +3371,17 @@ impl Engine {
                 // COUNT(*) only: a single pass over the key column.
                 vec![run_pass(None, false)?]
             } else {
-                let mut passes = Vec::with_capacity(value_indices.len());
+                let mut passes = Vec::with_capacity(value_indices.len() + 1);
+                // M3 (doc 21): a nullable value pass's `count` is the NON-NULL count, but COUNT(*) needs
+                // the TOTAL (the merge reads COUNT(*) from passes[0].count). So when a value is nullable
+                // AND the query has a COUNT(*), prepend a dedicated total-count pass (value_null_off=None,
+                // every row counted) as the reference. All passes claim a slot for every row, so they
+                // share one compaction order; the value passes only skip NULL from their count/sum/min/max.
+                // (Without a COUNT(*), passes[0] = the first value pass already carries the full key set.)
+                let has_count_star = aggregates.iter().any(|a| a.kind == GroupedAggKind::Count);
+                if any_value_nullable && has_count_star {
+                    passes.push(run_pass(None, false)?);
+                }
                 for &value_idx in &value_indices {
                     let has_minmax = aggregates.iter().zip(&agg_value_indices).any(|(a, vi)| {
                         *vi == Some(value_idx)
@@ -3426,6 +3478,7 @@ impl Engine {
                                         widekey_w,
                                         widekey_n_text,
                                         widekey_text_desc_ptr,
+                                        None, // value_null_off (COUNT(DISTINCT) marked-tuple pass)
                                     )
                                     .map_err(map_err)?
                             };
@@ -3674,6 +3727,14 @@ impl Engine {
                                 .find(|p| p.value_idx == value_idx && !p.is_count_distinct)
                                 .expect("a pass exists for every value column");
                             let g = &pass.groups[i];
+                            // M3 (doc 21): a value pass's `count` is the NON-NULL count (the kernel skips
+                            // NULL values), so count == 0 means EVERY value in this group is NULL -> the
+                            // aggregate over zero non-NULL rows is SQL NULL (PG: SUM/AVG/MIN/MAX of no
+                            // rows). A non-nullable value never yields count 0 for an existing group, so
+                            // this is a no-op for the non-NULL path. COUNT(*) reads the total-count pass.
+                            if g.count == 0 {
+                                SqlValue::Null
+                            } else {
                             // For int8/numeric the SUM is the i128 (sum_hi:sum); else sign-extend.
                             let sum_i128 = if pass.value_is_int8 || pass.value_is_numeric {
                                 (i128::from(g.sum_hi) << 64) | i128::from(g.sum as u64)
@@ -3728,6 +3789,7 @@ impl Engine {
                                 GroupedAggKind::CountDistinct => {
                                     unreachable!("count distinct handled above")
                                 }
+                            }
                             }
                         }
                     };

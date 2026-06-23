@@ -2343,17 +2343,19 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_group_by_over_a_nullable_column_is_a_clean_error_not_a_wrong_answer() {
-    // M3 (doc 21) Slice B guard: GROUP BY over a column that actually contains NULLs (a NULL key would
-    // group under the 0 placeholder; a NULL aggregate value would fold a phantom 0) is a CLEAN ERROR —
-    // never a silent wrong answer — until the two-count key+value-validity hash-agg kernel lands. A
-    // nullable-TYPED column with no NULLs still runs (no validity bitmap).
+fn gpu_group_by_skips_null_aggregate_values_and_clean_errors_a_null_key() {
+    // M3 (doc 21): GROUP BY over a nullable aggregate VALUE now runs on the GPU with full 3VL — a NULL
+    // value is SKIPPED from SUM/AVG/MIN/MAX (the single-level kernel's value-skip), while COUNT(*) still
+    // counts the row (a dedicated total-count pass), and an all-NULL group's aggregate is SQL NULL. A
+    // NULL group KEY still CLEAN-ERRORS (its own-group handling is a follow-up). A NULL-free nullable
+    // column is unchanged (no validity bitmap).
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT, h INT)").unwrap();
-    // g has a NULL (row 2); v has a NULL (row 3); h has none.
+    // g has a NULL (row 2); v has a NULL (rows 4 and 6); h has none.
+    // h=7 -> v{10, 20}; h=8 -> v{30, NULL}; h=9 -> v{NULL} (an all-NULL group).
     e.execute_text(
         2,
-        "INSERT INTO t (g,v,h) VALUES (1,10,7),(NULL,20,7),(2,30,8),(1,NULL,8)",
+        "INSERT INTO t (g,v,h) VALUES (1,10,7),(NULL,20,7),(2,30,8),(1,NULL,8),(2,NULL,9)",
     )
     .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
@@ -2361,39 +2363,149 @@ fn gpu_group_by_over_a_nullable_column_is_a_clean_error_not_a_wrong_answer() {
         return;
     }
 
-    // GROUP BY a NULL-bearing KEY -> clean error.
+    // GROUP BY a NULL-bearing KEY -> clean error (own-group handling is a follow-up).
     let err = e
         .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("GROUP BY over a column that contains NULLs"),
+        err.contains("GROUP BY over a KEY column that contains NULLs"),
         "GROUP BY a nullable key must clean-error, got: {err}"
     );
 
-    // Aggregate a NULL-bearing VALUE (key h has no NULLs) -> clean error.
-    let err = e
+    // SUM over a nullable VALUE: NULLs skipped. h=7 -> 30, h=8 -> 30 (NULL skipped), h=9 -> NULL (all-NULL).
+    let s = e
         .execute_resident_expr_select_sql("SELECT h, SUM(v) FROM t GROUP BY h")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("GROUP BY over a column that contains NULLs"),
-        "aggregating a nullable value must clean-error, got: {err}"
+        .expect("SUM over a nullable value runs");
+    assert_eq!(
+        s.rows,
+        vec![
+            vec![SqlValue::Int4(7), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(8), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(9), SqlValue::Null],
+        ],
+        "SUM skips NULL values; an all-NULL group is NULL"
+    );
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+
+    // COUNT(*) + SUM together: COUNT(*) counts EVERY row (incl. NULL-v), SUM skips NULLs. h=8 -> (2, 30);
+    // h=9 -> (1, NULL). Exercises the dedicated total-count pass alongside the value-skip pass.
+    let cs = e
+        .execute_resident_expr_select_sql("SELECT h, COUNT(*), SUM(v) FROM t GROUP BY h")
+        .expect("COUNT(*) + SUM over a nullable value");
+    assert_eq!(
+        cs.rows,
+        vec![
+            vec![SqlValue::Int4(7), SqlValue::Int8(2), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(8), SqlValue::Int8(2), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(9), SqlValue::Int8(1), SqlValue::Null],
+        ],
+        "COUNT(*) counts NULL-valued rows; SUM skips them"
     );
 
-    // Control: GROUP BY h (no NULLs) with COUNT(*) (no value column) still runs on the GPU.
+    // MIN / MAX / AVG over the nullable value: NULLs skipped; all-NULL group -> NULL.
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT h, MIN(v) FROM t GROUP BY h")
+        .expect("MIN over a nullable value");
+    assert_eq!(
+        mn.rows,
+        vec![
+            vec![SqlValue::Int4(7), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(8), SqlValue::Int4(30)],
+            vec![SqlValue::Int4(9), SqlValue::Null],
+        ],
+        "MIN skips NULLs (not the 0 placeholder); all-NULL group is NULL"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_skips_null_int8_values() {
+    // M3 (doc 21): the value-skip is type-agnostic (it gates the accumulate before the per-type sum), so
+    // a nullable BIGINT value also skips NULLs on the GPU (the i64 value / i128-carry sum path). MIN(v)
+    // returns int8; an all-NULL group is NULL.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t8 (g INT, v BIGINT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t8 (g,v) VALUES (1,100),(1,NULL),(2,9999999999),(3,NULL)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t8").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // g=1 -> {100, NULL} -> MIN 100; g=2 -> {9999999999} -> MIN 9999999999; g=3 -> {NULL} -> NULL.
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v) FROM t8 GROUP BY g")
+        .expect("MIN over a nullable bigint");
+    assert_eq!(
+        mn.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(100)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(9999999999)],
+            vec![SqlValue::Int4(3), SqlValue::Null],
+        ],
+        "MIN(bigint) skips NULLs; all-NULL group is NULL"
+    );
+    // COUNT(*) counts every row (incl. the NULL-v rows).
+    let c = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t8 GROUP BY g")
+        .expect("COUNT(*) over a nullable bigint table");
+    assert_eq!(
+        c.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1)],
+        ],
+        "COUNT(*) counts NULL-valued rows"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_nullable_numeric_value_clean_errors_but_non_null_numeric_runs() {
+    // M3 (doc 21): ANY aggregate over a nullable NUMERIC value is a clean-error follow-up — the numeric
+    // two-pass min/max kernel (launched even for SUM/AVG) reuses a pooled row-slot scratch the value-skip
+    // leaves stale (a 700/OOB hazard). A clean error, never a silent wrong answer. A NON-nullable numeric
+    // value is unaffected (no validity bitmap), so it must still run.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tn (g INT, v NUMERIC(10,2), w NUMERIC(10,2))").unwrap();
+    // v has a NULL (rows 2, 4); w has none.
+    e.execute_text(
+        2,
+        "INSERT INTO tn (g,v,w) VALUES (1,10.50,1.00),(1,NULL,2.00),(2,5.00,3.00),(3,NULL,4.00)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tn").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // Nullable numeric SUM and MIN both clean-error (the kernel hazard runs for both).
+    for sql in [
+        "SELECT g, SUM(v) FROM tn GROUP BY g",
+        "SELECT g, MIN(v) FROM tn GROUP BY g",
+    ] {
+        let err = e.execute_resident_expr_select_sql(sql).unwrap_err().to_string();
+        assert!(
+            err.contains("aggregate over a nullable NUMERIC value"),
+            "nullable numeric aggregate must clean-error, got: {err} (for {sql})"
+        );
+    }
+    // A NON-nullable numeric value (w has no NULLs) still runs on the GPU (no over-rejection).
     let ok = e
-        .execute_resident_expr_select_sql("SELECT h, COUNT(*) FROM t GROUP BY h")
-        .expect("GROUP BY a non-NULL key must still run");
+        .execute_resident_expr_select_sql("SELECT g, SUM(w) FROM tn GROUP BY g")
+        .expect("SUM over a NON-nullable numeric value still runs");
     assert_eq!(
         ok.rows,
         vec![
-            vec![SqlValue::Int4(7), SqlValue::Int8(2)],
-            vec![SqlValue::Int4(8), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(1), SqlValue::Numeric(Decimal128::new(300, 2))],
+            vec![SqlValue::Int4(2), SqlValue::Numeric(Decimal128::new(300, 2))],
+            vec![SqlValue::Int4(3), SqlValue::Numeric(Decimal128::new(400, 2))],
         ],
-        "GROUP BY a NULL-free key is unaffected by the guard"
+        "non-nullable numeric SUM is unaffected by the nullable-numeric guard"
     );
-    assert_eq!(ok.executed_target, DeviceTarget::Gpu(0));
 }
 
 #[test]

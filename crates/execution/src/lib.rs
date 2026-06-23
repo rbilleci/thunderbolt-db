@@ -1542,6 +1542,7 @@ impl CudaResidentDeviceMemory {
             0,     // comp_w (not a wide-key composite)
             0,     // n_text (no text members)
             0,     // text_desc_ptr
+            None,  // value_null_off (bench: non-nullable)
         )
     }
 
@@ -1576,6 +1577,9 @@ impl CudaResidentDeviceMemory {
         // in text_desc_ptr (a device buffer the caller holds alive). 0 = no text members.
         n_text: u64,
         text_desc_ptr: u64,
+        // M3 (doc 21): `Some(off)` = the VALUE column's NULL validity bitmap — a NULL value is skipped
+        // from count/sum/min/max (3VL); `None` = every value valid. Uses the single-level kernel.
+        value_null_off: Option<u64>,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1599,6 +1603,7 @@ impl CudaResidentDeviceMemory {
             comp_w,
             n_text,
             text_desc_ptr,
+            value_null_off,
         )
     }
 
@@ -1639,6 +1644,7 @@ impl CudaResidentDeviceMemory {
             0, // comp_w (not a wide-key composite)
             0, // n_text (no text members)
             0, // text_desc_ptr
+            None, // value_null_off (bench: non-nullable)
         )
     }
 
@@ -7021,6 +7027,12 @@ fn launch_cuda_group_by_i32_count_sum(
     // text_desc_ptr (a device buffer the CALLER holds alive). 0 = no text members.
     n_text: u64,
     text_desc_ptr: u64,
+    // M3 (doc 21) 3VL: `Some(off)` = the VALUE column's NULL validity bitmap byte offset (1 = valid) —
+    // a NULL value is skipped from this pass's count/sum/min/max (the slot is still claimed by the key,
+    // so the group still appears) ⇒ non-NULL aggregate semantics. `None` = no bitmap ⇒ every value valid
+    // (the COUNT(*) pass + every non-nullable pass). Only the single-level kernel honors it; the engine
+    // forces single-level for a nullable value, and the twolevel kernel ignores the (extra) arg.
+    value_null_off: Option<u64>,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -7208,6 +7220,26 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut a32 = comp_w;
     let mut a33 = n_text;
     let mut a34 = text_desc_ptr;
+    // M3 3VL: u64::MAX sentinel when there is no value validity bitmap; otherwise the bounds-checked
+    // offset. The kernel reads bit `idx` for each idx in `indices`, so the bitmap must cover the max
+    // index (< the table's resident row count). Appended LAST so the twolevel kernel (fewer params)
+    // ignores it.
+    let mut a35 = match value_null_off {
+        None => u64::MAX,
+        Some(off) => {
+            let max_idx = indices.iter().copied().max().unwrap_or(0) as u64;
+            let words_bytes = (max_idx / 32 + 1)
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let end = off
+                .checked_add(words_bytes)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if end > resident.metadata().allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
+            }
+            off
+        }
+    };
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -7255,6 +7287,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a32 as *mut u64).cast::<c_void>(),
         (&mut a33 as *mut u64).cast::<c_void>(),
         (&mut a34 as *mut u64).cast::<c_void>(),
+        (&mut a35 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -7702,6 +7735,7 @@ fn launch_cuda_group_by_kernel_timed(
         0, // comp_w = 0: the timed bench is not a wide-key composite
         0, // n_text = 0: the timed bench has no text members
         0, // text_desc_ptr = 0
+        u64::MAX, // M3 value_null_off = sentinel (the timed bench is non-nullable -> no value skip)
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();

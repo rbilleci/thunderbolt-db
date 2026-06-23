@@ -6634,9 +6634,23 @@ het_done:
     // byte-identical). comp_w may be 0 here (a pure all-text composite, e.g. two-text), so the wide-key
     // path is entered on comp_w>0 OR n_text>0.
     .param .u64 n_text,
-    .param .u64 text_desc_ptr
+    .param .u64 text_desc_ptr,
+    // M3 (doc 21) 3VL: the VALUE column's NULL validity bitmap byte offset (1 = valid, 0 = NULL), or the
+    // sentinel u64::MAX = no bitmap => every value valid. A NULL value is SKIPPED from count/sum/min/max
+    // (the slot is still claimed by the KEY above, so the group still appears) -> non-NULL aggregate
+    // semantics; COUNT(*) passes the sentinel so it counts every row.
+    .param .u64 value_null_off
 )
 {
+    .reg .u64 %m3vnoff;
+    .reg .u64 %m3vsent;
+    .reg .u64 %m3vwd;
+    .reg .u64 %m3vaddr;
+    .reg .u32 %m3vbw;
+    .reg .u32 %m3vbt;
+    .reg .u32 %m3vbp;
+    .reg .pred %m3pnob;
+    .reg .pred %m3pnul;
     .reg .pred %pvt;
     .reg .pred %plt;
     .reg .pred %pgt;
@@ -6802,6 +6816,8 @@ het_done:
     ld.param.u64 %vuu, [value_is_uuid];
     ld.param.u64 %mnuptr, [slot_min_uuid_ptr];
     ld.param.u64 %mxuptr, [slot_max_uuid_ptr];
+    ld.param.u64 %m3vnoff, [value_null_off];
+    mov.u64 %m3vsent, 0xFFFFFFFFFFFFFFFF;
     ld.param.u64 %ki128, [key_is_i128];
     ld.param.u64 %ski128, [slot_keys_i128_ptr];
     ld.param.u64 %ktext, [key_is_text];
@@ -7356,6 +7372,23 @@ wkey_probe_next:
     and.b64 %h, %h, %mask;
     bra probe_loop_widekey;
 do_agg:
+    // M3 (doc 21) 3VL: skip a NULL aggregate value. The slot was already claimed by the KEY above, so
+    // the group still appears (its COUNT(*) is from the count-pass / its slot exists); we just don't fold
+    // the 0/empty PLACEHOLDER into this pass's count/sum/min/max -> the pass count is the NON-NULL count.
+    // m3vnoff == sentinel (no validity bitmap) => every value valid (no skip, byte-identical fast path).
+    setp.eq.u64 %m3pnob, %m3vnoff, %m3vsent;
+    @%m3pnob bra m3_val_ok;
+    shr.u32 %m3vbp, %idx, 5;            // validity word index = idx / 32
+    mul.lo.u32 %m3vbp, %m3vbp, 4;       // * 4 bytes per u32 word
+    cvt.u64.u32 %m3vwd, %m3vbp;
+    add.u64 %m3vaddr, %base, %m3vnoff;
+    add.u64 %m3vaddr, %m3vaddr, %m3vwd;
+    ld.global.u32 %m3vbw, [%m3vaddr];
+    and.b32 %m3vbp, %idx, 31;           // bit = idx % 32
+    bfe.u32 %m3vbt, %m3vbw, %m3vbp, 1;
+    setp.eq.u32 %m3pnul, %m3vbt, 0;     // 0 = NULL
+    @%m3pnul bra gb_mmdone;             // NULL value -> skip count/sum/min/max (slot stays claimed)
+m3_val_ok:
     mul.lo.u64 %off, %h, 8;
     add.u64 %addr, %cptr, %off;
     atom.global.add.u64 %tmp, [%addr], 1;
