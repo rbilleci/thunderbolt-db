@@ -49,7 +49,14 @@ Run `git checkout main && git pull` for the latest.
   routed through it for the non-simple shapes). No PTX change. **WHERE 3VL is now COMPLETE for every nullable
   scalar type (int2/int4/int8/text/bool/date/timestamp/numeric/uuid) + AND/OR/arith/cross-scale; only
   mixed-type predicates clean-error.**
-**REMAINING Track A:** A.2 (nullable composite/text/uuid GROUP BY KEY — kernel change, most-audited path);
+- **GROUP BY nullable text/numeric/uuid KEY** — a single-column nullable text/numeric/uuid key now forms its
+  own NULL group (kernel: hoisted the NULL-key check before the type dispatch so a NULL key of ANY type routes
+  to the reserved slot; engine: broadened the allowed key set + pass_key_null_off). Also fixed a pre-existing
+  panic: COUNT(DISTINCT) over a nullable key now clean-errors (its sub-passes don't route the NULL key). HAZARD
+  passed (3× + concurrent). **A nullable COMPOSITE / EXPRESSION key + COUNT(DISTINCT)-over-nullable-key still
+  clean-error.**
+**REMAINING Track A:** A.2 tail (nullable COMPOSITE / EXPRESSION GROUP BY key — per-member/derived NULL encoding,
+not one reserved slot; + route the NULL key through the COUNT(DISTINCT) sub-passes);
 A.4 (text/numeric/uuid ORDER BY key NULLs + explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field
 through ~20 ctors incl. the legacy protocol crate] + nullable sort expr); A.5 (N-way multi-way OUTER joins).
 

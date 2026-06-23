@@ -2963,6 +2963,139 @@ fn gpu_group_by_skips_null_int8_values() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_nullable_key_with_count_distinct_clean_errors() {
+    // M3 (doc 21): COUNT(DISTINCT v) over a NULLABLE group key is a clean-error follow-up. The
+    // COUNT(DISTINCT) sub-passes don't route the NULL key to the reserved slot, so they'd merge NULL-key
+    // rows into the placeholder group -> fewer groups than the reference pass -> by-index merge panic.
+    // Reject cleanly rather than panic / mis-answer. (Pre-existing for int keys; this guard fixes that
+    // too.) A NON-nullable key with COUNT(DISTINCT) is unaffected.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tcd (g INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tcd (g,v) VALUES (1,10),(NULL,20),(0,30),(NULL,20),(1,10),(0,40)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tcd").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let err = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(DISTINCT v) FROM tcd GROUP BY g")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("nullable key with COUNT(DISTINCT)") || err.contains("not yet supported"),
+        "COUNT(DISTINCT) over a nullable key must clean-error (not panic), got: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_nullable_text_key_forms_null_group() {
+    // M3 (doc 21): GROUP BY a nullable TEXT key — a NULL key forms its OWN group (rendered SqlValue::Null,
+    // sorts first), distinct from real keys, via the kernel's hoisted NULL-key check routing to the
+    // reserved slot BEFORE the text claim. A NULL text key is NOT folded into the empty-string group.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tgt (k TEXT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tgt (k,v) VALUES ('a',10),(NULL,20),('b',30),(NULL,40),('a',50)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tgt").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // k: 'a'->{10,50}=2/60, 'b'->{30}=1/30, NULL->{20,40}=2/60. NULL sorts first.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k, COUNT(*), SUM(v) FROM tgt GROUP BY k")
+        .expect("GROUP BY a nullable text key runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![SqlValue::Text("a".to_string()), SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![SqlValue::Text("b".to_string()), SqlValue::Int8(1), SqlValue::Int8(30)],
+        ],
+        "NULL text key forms its own group (sorts first), not folded into a real/empty-string group"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_nullable_numeric_key_forms_null_group() {
+    // M3 (doc 21): GROUP BY a nullable NUMERIC key — a NULL key forms its own group (the i128 claim path
+    // now sees only non-NULL keys; NULLs route to the reserved slot). A NULL is NOT folded into 0.00.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tgn (k NUMERIC(10,2), v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tgn (k,v) VALUES (1.50,10),(NULL,20),(2.50,30),(NULL,40),(1.50,50)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tgn").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // k: 1.50->2/60, 2.50->1/30, NULL->2/60. NULL sorts first.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k, COUNT(*), SUM(v) FROM tgn GROUP BY k")
+        .expect("GROUP BY a nullable numeric key runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![SqlValue::Numeric(Decimal128::new(150, 2)), SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![SqlValue::Numeric(Decimal128::new(250, 2)), SqlValue::Int8(1), SqlValue::Int8(30)],
+        ],
+        "NULL numeric key forms its own group (sorts first), not folded into 0.00"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_nullable_uuid_key_forms_null_group() {
+    // M3 (doc 21): GROUP BY a nullable UUID key — a NULL key forms its own group (the i128/b128 claim sees
+    // only non-NULL keys). A NULL is NOT folded into the all-zero uuid.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tgu (k UUID, v INT)").unwrap();
+    let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
+    e.execute_text(
+        2,
+        &format!(
+            "INSERT INTO tgu (k,v) VALUES ('{}',10),(NULL,20),('{}',30),(NULL,40),('{}',50)",
+            uuid_for(5),
+            uuid_for(15),
+            uuid_for(5),
+        ),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tgu").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // k: uuid5->2/60, uuid15->1/30, NULL->2/60. NULL sorts first, then uuid5, uuid15 (byte order).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k, COUNT(*), SUM(v) FROM tgu GROUP BY k")
+        .expect("GROUP BY a nullable uuid key runs on the GPU");
+    let uuid = |i: i64| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(&uuid_for(i)).expect("valid uuid"));
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![uuid(5), SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![uuid(15), SqlValue::Int8(1), SqlValue::Int8(30)],
+        ],
+        "NULL uuid key forms its own group (sorts first), not folded into the all-zero uuid"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_nullable_numeric_value_skips_nulls() {
     // M3 (doc 21): GROUP BY over a nullable NUMERIC value now runs full 3VL on the GPU. The numeric
     // MIN/MAX is a TWO-PASS kernel: pass 1 finalizes the i128 HIGH limb + records each NON-NULL row's

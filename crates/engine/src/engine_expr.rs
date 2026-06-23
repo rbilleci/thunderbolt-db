@@ -2734,17 +2734,17 @@ impl Engine {
                 }
             }
             // M3 (doc 21) GROUP BY 3VL: a NULL group KEY forms its OWN group (NULLs group together,
-            // distinct from real keys). The kernel routes a NULL key to a dedicated reserved slot — but
-            // ONLY in the int4/i64 claim path, so this is supported for a SINGLE PLAIN fixed-int COLUMN key
-            // (int2/4/8/date/timestamp). A nullable COMPOSITE / EXPRESSION / TEXT / NUMERIC / UUID key is a
-            // clean-error follow-up (its claim path has no NULL route). A NULL-free key has no bitmap, so it
-            // runs unchanged either way.
+            // distinct from real keys). The kernel routes a NULL key (of ANY single-column type) to a
+            // dedicated reserved slot. Supported for a SINGLE COLUMN key of int2/4/8/date/timestamp / text /
+            // numeric / uuid. A nullable COMPOSITE / EXPRESSION key is still a clean-error follow-up: its
+            // per-member NULL semantics ((NULL,5) ≠ (NULL,6) ≠ (1,5)) need NULL encoded into the key, not
+            // one reserved slot. A NULL-free key has no bitmap, so it runs unchanged either way.
             let single_key_col = if group_key_expr.is_none() && group_key_columns.len() < 2 {
                 relational_column_index(table, group_name).ok()
             } else {
                 None
             };
-            let key_is_plain_fixed_int_column = single_key_col.is_some_and(|idx| {
+            let key_is_single_nullable_column = single_key_col.is_some_and(|idx| {
                 matches!(
                     table.columns.get(idx).map(|column| column.ty),
                     Some(
@@ -2753,10 +2753,13 @@ impl Engine {
                             | SqlType::Int8
                             | SqlType::Date
                             | SqlType::Timestamp
+                            | SqlType::Text
+                            | SqlType::Numeric { .. }
+                            | SqlType::Uuid
                     )
                 )
             });
-            if !key_is_plain_fixed_int_column {
+            if !key_is_single_nullable_column {
                 let mut group_by_key_check: Vec<usize> = Vec::new();
                 if let Some(expr) = group_key_expr {
                     collect_expr_columns(expr, &mut group_by_key_check);
@@ -2770,9 +2773,10 @@ impl Engine {
                 for col in group_by_key_check {
                     if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "GROUP BY over a nullable composite/expression/text/numeric/uuid KEY is not \
-                             yet supported on the GPU (M3 3VL follow-up: a NULL key must form its own \
-                             group; only a single plain int/date/timestamp column key is supported)"
+                            "GROUP BY over a nullable COMPOSITE or EXPRESSION (or bool) KEY is not yet \
+                             supported on the GPU (M3 3VL follow-up: a composite/expression NULL key needs \
+                             per-member NULL encoding, not a single reserved slot; a single int/date/\
+                             timestamp/text/numeric/uuid column key is supported)"
                                 .to_string(),
                         )));
                     }
@@ -3262,11 +3266,12 @@ impl Engine {
                     acc || resident_device_null_column_offset(&snapshot, table, vidx)?.is_some(),
                 )
             })?;
-            // M3 (doc 21): the group key's NULL validity offset, for a single plain fixed-int column key
-            // ONLY (the kernel's NULL-key route is in the int4/i64 claim path) — a NULL key forms its own
-            // group. `None` (no bitmap / not that key shape) leaves grouping unchanged. Forces single-level
-            // (only that kernel honors the route).
-            let pass_key_null_off = if key_is_plain_fixed_int_column {
+            // M3 (doc 21): the group key's NULL validity offset, for a SINGLE-COLUMN key (int2/4/8/date/
+            // timestamp/text/numeric/uuid) — the kernel's NULL-key check (now hoisted before the type
+            // dispatch) routes a NULL key of any of these to the reserved slot, forming its own group.
+            // `None` (no bitmap / a composite/expression key) leaves grouping unchanged. Forces
+            // single-level (only that kernel honors the route).
+            let pass_key_null_off = if key_is_single_nullable_column {
                 resident_device_null_column_offset(&snapshot, table, group_idx)?
             } else {
                 None
@@ -3275,6 +3280,24 @@ impl Engine {
                 || is_expr_key
                 || any_value_nullable
                 || pass_key_null_off.is_some();
+            // M3 (doc 21): COUNT(DISTINCT v) over a NULLABLE group key is a clean-error follow-up. The
+            // COUNT(DISTINCT) sub-passes (composite_group_count_reps + the step-2 GROUP BY /
+            // count_distinct_groups) do NOT route the NULL key to the reserved slot, so they merge NULL-key
+            // rows into the placeholder group -> fewer groups than the reference (direct) pass, whose null
+            // group IS routed -> the by-index pass merge mis-aligns / panics. Reject cleanly rather than
+            // panic or mis-answer. (This guard also covers the pre-existing nullable-INT-key case.)
+            if pass_key_null_off.is_some()
+                && aggregates
+                    .iter()
+                    .any(|a| a.kind == GroupedAggKind::CountDistinct)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "GROUP BY a nullable key with COUNT(DISTINCT) is not yet supported on the GPU \
+                     (M3 3VL follow-up: the COUNT(DISTINCT) sub-pass does not yet route the NULL key to \
+                     its own group)"
+                        .to_string(),
+                )));
+            }
             let run_pass =
                 |value_idx_opt: Option<usize>, has_minmax: bool| -> Result<Pass, ExecuteError> {
                     // A None value column is the COUNT(*)-only pass: group over the key, read .count.
