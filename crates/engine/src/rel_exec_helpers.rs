@@ -303,23 +303,26 @@ pub(crate) fn render_relational_insert(insert: &Insert) -> Result<String, Engine
 }
 
 pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, EngineError> {
+    // The COPY-to-engine bridge renders each parsed cell back to a SQL literal that `parse_sql_value` +
+    // `coerce_insert_value` re-parse to the SAME value at the column's type. Integers/numerics/bool are
+    // unquoted literals (inferred directly); date/timestamp/uuid are QUOTED strings the INSERT coercion
+    // converts to the column type (Text -> Date/Timestamp/Uuid, exactly like a user INSERT of a string
+    // literal into such a column). None of these renderings contain a `'`, so no extra escaping is needed.
     match value {
         SqlValue::Int2(value) => Ok(value.to_string()),
         SqlValue::Int4(value) => Ok(value.to_string()),
+        SqlValue::Int8(value) => Ok(value.to_string()),
+        SqlValue::Numeric(value) => Ok(value.to_decimal_string()),
+        SqlValue::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+        SqlValue::Date(value) => Ok(format!("'{}'", gpu_db_sql::datetime::format_date(*value))),
+        SqlValue::Timestamp(value) => {
+            Ok(format!("'{}'", gpu_db_sql::datetime::format_timestamp(*value)))
+        }
+        SqlValue::Uuid(value) => Ok(format!("'{}'", gpu_db_sql::uuid::format_uuid(value))),
         // M3 (doc 21): a NULL cell (e.g. a COPY `\N` field) renders as the SQL NULL keyword; the
         // re-parsed INSERT recognizes the unquoted `NULL` literal and stores a SqlValue::Null.
         SqlValue::Null => Ok("NULL".to_string()),
-        SqlValue::Int8(_)
-        | SqlValue::Numeric(_)
-        | SqlValue::Bool(_)
-        | SqlValue::Date(_)
-        | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => {
-            Err(EngineError::ApplyFailed(
-                "COPY-to-engine ingestion supports int4/text rows only".to_string(),
-            ))
-        }
     }
 }
 

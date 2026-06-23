@@ -246,6 +246,107 @@ fn relational_copy_ingests_null_marker_and_selects_back_null() {
 }
 
 #[test]
+fn relational_copy_round_trips_all_column_types_and_null() {
+    // M3 (doc 21) Track A.6: COPY into a table with int8/numeric/bool/date/timestamp/uuid columns
+    // round-trips every value AND a `\N` NULL per type through the COPY-to-engine bridge
+    // (render_sql_value_literal -> re-parsed INSERT -> store). Previously the render errored on any
+    // non-int4/text/Null column ("supports int4/text rows only").
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE tt (id INT, big BIGINT, amt NUMERIC(12,2), flag BOOL, d DATE, ts TIMESTAMP, u UUID)",
+    )
+    .unwrap();
+    let copy =
+        gpu_db_sql::parse_copy_from_stdin("COPY tt (id, big, amt, flag, d, ts, u) FROM STDIN").unwrap();
+    let cols = e.relational_copy_columns(&copy.table).unwrap();
+    // Row 1: real values for every type (big > i32 to prove the int8 round-trip; numeric scale 2;
+    // timestamp with sub-second precision). Row 2: `\N` (NULL) for every typed column.
+    let lines = [
+        "1\t5000000000\t1234.56\tt\t2024-01-15\t2024-01-15 10:30:00.123456\t00000000-0000-0000-0000-000000000001",
+        "2\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N",
+    ];
+    let rows = lines
+        .into_iter()
+        .map(|line| {
+            gpu_db_sql::parse_copy_row(&cols, copy.columns.as_deref().unwrap(), copy.options, line)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    // The COPY parse produced the expected typed values (row 1) and a NULL per typed column (row 2).
+    let parsed_row1 = rows[0].clone();
+    assert_eq!(parsed_row1[1], SqlValue::Int8(5_000_000_000), "big parses as int8 (> i32)");
+    assert_eq!(
+        parsed_row1[2],
+        SqlValue::Numeric(Decimal128::new(123_456, 2)),
+        "amt parses as numeric(.,2)"
+    );
+    assert_eq!(parsed_row1[3], SqlValue::Bool(true), "flag parses as bool");
+    let all_null_row2 = vec![
+        SqlValue::Int4(2),
+        SqlValue::Null,
+        SqlValue::Null,
+        SqlValue::Null,
+        SqlValue::Null,
+        SqlValue::Null,
+        SqlValue::Null,
+    ];
+    assert_eq!(rows[1], all_null_row2, "row 2 \\N -> NULL for every typed column");
+
+    // Ingest through the engine (render_relational_insert -> render_sql_value_literal per cell).
+    assert_eq!(e.execute_relational_copy_rows(3, &copy, rows).unwrap(), 2);
+
+    // SELECT back: the render -> re-parse -> store round-trip preserves every value and every NULL.
+    let select_row = |id: i32| {
+        let Command::Select(select) = parse_command(&format!(
+            "SELECT id, big, amt, flag, d, ts, u FROM tt WHERE id = {id}"
+        ))
+        .unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        e.execute_relational_select(&select).unwrap().rows
+    };
+    assert_eq!(
+        select_row(1),
+        vec![parsed_row1.clone()],
+        "row 1 round-trips through COPY render -> INSERT -> store (every type)"
+    );
+    assert_eq!(
+        select_row(2),
+        vec![all_null_row2.clone()],
+        "row 2 round-trips as all-NULL (a \\N per type)"
+    );
+
+    // WAL-REPLAY round trip — the path this slice actually feeds. The COPY's WAL payload is the RENDERED
+    // INSERT (render_sql_value_literal per cell); recovery RE-PARSES it (parse_sql_value + coerce). So a
+    // persist+recover proves the rendered literal for every type re-parses to the identical stored value
+    // (the live apply uses the original typed row and would mask a wrong render).
+    let path = test_wal_path("copy_all_types_roundtrip");
+    e.persist_durable_wal_to_file(&path).unwrap();
+    let recovered = Engine::recover_from_durable_wal_file(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let recovered_row = |id: i32| {
+        let Command::Select(select) = parse_command(&format!(
+            "SELECT id, big, amt, flag, d, ts, u FROM tt WHERE id = {id}"
+        ))
+        .unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        recovered.execute_relational_select(&select).unwrap().rows
+    };
+    assert_eq!(
+        recovered_row(1),
+        vec![parsed_row1],
+        "WAL replay re-parses the rendered literals to the identical values (every type)"
+    );
+    assert_eq!(
+        recovered_row(2),
+        vec![all_null_row2],
+        "WAL replay re-parses the rendered \\N to NULL for every type"
+    );
+}
+
+#[test]
 fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
     let e = Engine::new_local();
     e.execute_text(
