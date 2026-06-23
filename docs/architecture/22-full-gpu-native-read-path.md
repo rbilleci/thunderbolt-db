@@ -70,12 +70,16 @@ is optional; each line is struck through only when it runs on the device.
   - [x] **S2.2a — plain text group KEY on-device.** A `rep_idx → key-string` map built via
     `project_text_rows_from_payload` over every pass's group rep indices (covers #30's per-pass
     `materialize_key`); the `host_rows` clone is dropped when nothing else needs it; NULL-key groups
-    render `SqlValue::Null` directly. **DONE `592bdcff`** (suite 234/0; independent audit running). No
-    kernel change.
-  - [ ] **S2.2b — composite/wide-key MEMBERS + MIN/MAX text VALUES on-device.** The remaining
-    `text_host_rows` reads: wide-key/composite members (multi-type — per-member device projection by
-    type at the key rep indices, `3987/3997/3998`) and MIN/MAX text values (text gather at
-    `g.min`/`g.max`, `4080/4085`). Removes `text_host_rows` entirely.
+    render `SqlValue::Null` directly. **DONE `592bdcff`** (suite 235/0; independent audit **SHIP** —
+    completeness/parity/NULL-key proven, non-vacuous). No kernel change.
+  - [x] **S2.2b-i — MIN/MAX over a TEXT value on-device.** Per text value pass, gather the result
+    string at each group's `g.min`/`g.max` row index (`count==0` → NULL via a placeholder rep). **DONE
+    `3dc4500e`** (suite 234/0). No kernel change.
+  - [x] **S2.2b-ii — composite/wide-key MEMBERS on-device; `text_host_rows` REMOVED.** A multi-type
+    gather `materialize_col_at` (per-type `project_*` + NULL validity) builds a `(rep_row,col)→value`
+    map for any member type; the last `host_rows` reader of the grouped path is gone. **DONE
+    `581833a5`** (suite 234/0; combined S2.2b independent audit running). No kernel change. **GROUP BY
+    result key/value/member materialization is now FULLY on-device.**
   - [ ] **S2.3 — multi-aggregate #30 alignment on-device.** Eliminate the host pass-alignment sort
     that still runs for `passes.len()>1`. Preferred = a single multi-aggregate hash-agg pass (one slot
     carries all value cols' accumulators → one group array, no alignment); fallback = sort each pass
