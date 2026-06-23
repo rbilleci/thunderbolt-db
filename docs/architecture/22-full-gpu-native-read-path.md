@@ -78,13 +78,28 @@ is optional; each line is struck through only when it runs on the device.
   - [x] **S2.2b-ii — composite/wide-key MEMBERS on-device; `text_host_rows` REMOVED.** A multi-type
     gather `materialize_col_at` (per-type `project_*` + NULL validity) builds a `(rep_row,col)→value`
     map for any member type; the last `host_rows` reader of the grouped path is gone. **DONE
-    `581833a5`** (suite 234/0; combined S2.2b independent audit running). No kernel change. **GROUP BY
-    result key/value/member materialization is now FULLY on-device.**
-  - [ ] **S2.3 — multi-aggregate #30 alignment on-device.** Eliminate the host pass-alignment sort
-    that still runs for `passes.len()>1`. Preferred = a single multi-aggregate hash-agg pass (one slot
-    carries all value cols' accumulators → one group array, no alignment); fallback = sort each pass
-    by key on-device via a per-pass key payload + `bitonic_sort_hetero_on_payload` permutation.
-    COUNT(DISTINCT) passes align by the same mechanism.
+    `581833a5`** (suite 234/0; combined S2.2b independent audit **SHIP** — 5 adversarial tests, full
+    member-type matrix + NULL members + count==0 + multi-pass COUNT(DISTINCT), 239/0). No kernel change.
+    **GROUP BY result key/value/member materialization is now FULLY on-device.**
+  - [ ] **S2.3 — multi-aggregate #30 alignment on-device (the hard core).** Eliminate the host
+    pass-alignment `sort_by` that still runs for `passes.len()>1` (`engine_expr.rs`, the
+    `if passes.len() > 1` block). Two routes:
+    - **(A) single multi-aggregate hash-agg pass** — one slot carries ALL value cols' accumulators →
+      one group array, no alignment, no sort at all. Cleanest end-state but a real KERNEL + slot-layout
+      + launcher redesign (700/716/717 hazard class). COUNT(DISTINCT) stays a separate sort-mark-sum
+      pass, so it still needs (B) to align with the multi-agg pass.
+    - **(B) on-device per-pass key sort** — sort each pass's groups by key on the GPU so all passes
+      share one canonical order (aligned by index). Reuses the sort machinery; needs a
+      PERMUTATION-returning helper (extract from `gpu_sort_result_rows`) to reorder the host group
+      structs. **Key design point I verified:** #30 only needs CONSISTENT alignment, NOT a specific
+      order (the FINAL order is S2.1's `gpu_sort_result_rows`). So sort each pass by the FULL group key
+      (all members) → a TOTAL order (groups are distinct) → robust alignment with NO sort-stability
+      dependence. (The current host #30 sorts wide-key by member[0] ONLY and leans on `sort_by`
+      stability — a device bitonic sort is NOT stable, so a naive member[0]-only device sort could
+      MISALIGN wide-key groups sharing member[0]; the full-key sort sidesteps this entirely.) The
+      device key values already exist (`key_text_map` / `member_cell` / the int/numeric/uuid structs).
+    Recommended: (B) first (lower risk, no kernel change, reuses S1/S2.1 machinery); (A) later as a
+    perf/architecture upgrade if multi-pass overhead matters.
 
 ### Result-stage operators on the general executor
 - [ ] **S3 — HAVING on-device.** `engine_expr.rs:4168` `rows.retain(...)` → device mask over the
