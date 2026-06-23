@@ -2758,28 +2758,12 @@ impl Engine {
                 }
             }
             // M3 (doc 21): a nullable NUMERIC value runs the numeric TWO-PASS min/max kernel — pass 1
-            // records every row's claimed slot into a POOLED `row_slots` scratch (deliberately
-            // un-initialized: pass 1 is assumed to write every row), pass 2 reads it and folds the i128
-            // low limb. The value-skip gate skips a NULL row's pass-1 slot write, leaving a STALE pooled
-            // slot index from a PRIOR query that pass 2 then reads — folding the placeholder into the wrong
-            // group AND risking an out-of-bounds slot write (a 700 hazard) when the stale index exceeds the
-            // current table. This runs for SUM/AVG too (they discard min/max but still launch pass 2), so
-            // clean-error ANY nullable numeric value until the two-pass is made NULL-aware (a follow-up).
-            // int2/int4/int8/date/timestamp/uuid/text values are single-pass (no row_slots) and stay
-            // supported (NULLs skipped correctly).
-            for vidx in agg_value_indices.iter().flatten() {
-                if matches!(table.columns[*vidx].ty, SqlType::Numeric { .. })
-                    && resident_device_null_column_offset(&snapshot, table, *vidx)?.is_some()
-                {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "GROUP BY aggregate over a nullable NUMERIC value is not yet supported on the GPU \
-                         (M3 3VL follow-up: the numeric two-pass min/max kernel reuses a pooled row-slot \
-                         scratch the value-skip leaves stale); int/uuid/text aggregate values over \
-                         nullable columns are supported"
-                            .to_string(),
-                    )));
-                }
-            }
+            // records each NON-NULL row's claimed slot into a POOLED `row_slots` scratch and skips NULL
+            // rows (the value-skip gate at do_agg), pass 2 (gpu_db_group_by_numeric_minmax_lo) folds the
+            // i128 low limb. BOTH passes now read the value validity bitmap and skip NULL rows, so a NULL
+            // row's stale pooled slot is never folded (pass 2 gained `value_null_off`, matching pass 1).
+            // All-NULL group → count 0 → SqlValue::Null at finalization (shared with int/int8). So a
+            // nullable numeric aggregate value is supported, like int2/4/8/date/timestamp/uuid/text.
             // GROUP BY <expression> (`a+b`): the key is a DERIVED int buffer materialized on-device
             // below (grouped via key_base_override), NOT a column -- so group_idx is only a placeholder
             // for the COUNT(*) pass (which reads no value), and key_ty is the expression result type.

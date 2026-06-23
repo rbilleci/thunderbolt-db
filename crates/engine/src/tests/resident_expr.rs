@@ -2550,46 +2550,98 @@ fn gpu_group_by_skips_null_int8_values() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_group_by_nullable_numeric_value_clean_errors_but_non_null_numeric_runs() {
-    // M3 (doc 21): ANY aggregate over a nullable NUMERIC value is a clean-error follow-up — the numeric
-    // two-pass min/max kernel (launched even for SUM/AVG) reuses a pooled row-slot scratch the value-skip
-    // leaves stale (a 700/OOB hazard). A clean error, never a silent wrong answer. A NON-nullable numeric
-    // value is unaffected (no validity bitmap), so it must still run.
+fn gpu_group_by_nullable_numeric_value_skips_nulls() {
+    // M3 (doc 21): GROUP BY over a nullable NUMERIC value now runs full 3VL on the GPU. The numeric
+    // MIN/MAX is a TWO-PASS kernel: pass 1 finalizes the i128 HIGH limb + records each NON-NULL row's
+    // claimed slot into a pooled row_slots scratch; pass 2 (gpu_db_group_by_numeric_minmax_lo) resolves
+    // the LOW limb. BOTH passes now read the value validity bitmap and skip NULL rows — so a NULL row's
+    // STALE pooled row_slots slot is never folded (the prior 700/OOB hazard). SUM/MIN/MAX skip NULLs;
+    // COUNT(*) counts every row; an all-NULL group's aggregate is SQL NULL.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE tn (g INT, v NUMERIC(10,2), w NUMERIC(10,2))").unwrap();
-    // v has a NULL (rows 2, 4); w has none.
+    // g=1 -> v{10.50, 30.25, NULL}: real MIN/MAX distinction (10.50 vs 30.25) + a NULL skip, SUM 40.75.
+    // g=2 -> v{5.00, NULL}: one non-NULL + a NULL skip. g=3 -> v{NULL}: an all-NULL group -> NULL. w: none.
     e.execute_text(
         2,
-        "INSERT INTO tn (g,v,w) VALUES (1,10.50,1.00),(1,NULL,2.00),(2,5.00,3.00),(3,NULL,4.00)",
+        "INSERT INTO tn (g,v,w) VALUES \
+         (1,10.50,1.00),(1,30.25,2.00),(1,NULL,3.00),(2,5.00,4.00),(2,NULL,5.00),(3,NULL,6.00)",
     )
     .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("tn").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    // Nullable numeric SUM and MIN both clean-error (the kernel hazard runs for both).
-    for sql in [
-        "SELECT g, SUM(v) FROM tn GROUP BY g",
-        "SELECT g, MIN(v) FROM tn GROUP BY g",
-    ] {
-        let err = e.execute_resident_expr_select_sql(sql).unwrap_err().to_string();
-        assert!(
-            err.contains("aggregate over a nullable NUMERIC value"),
-            "nullable numeric aggregate must clean-error, got: {err} (for {sql})"
-        );
-    }
-    // A NON-nullable numeric value (w has no NULLs) still runs on the GPU (no over-rejection).
+    // Dirty the pooled row_slots buffer FIRST with a non-NULL numeric GROUP BY of a DIFFERENT shape, so a
+    // stale-slot read in pass 2 (the bug this slice fixes) would surface as a wrong answer below.
+    let _ = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(w), MAX(w) FROM tn GROUP BY g")
+        .expect("non-nullable numeric MIN/MAX runs (dirties row_slots)");
+
+    // SUM(v): NULLs skipped. g=1 -> 40.75 (10.50+30.25), g=2 -> 5.00, g=3 -> NULL (all-NULL).
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM tn GROUP BY g")
+        .expect("SUM over a nullable numeric value runs");
+    assert_eq!(
+        s.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Numeric(Decimal128::new(4075, 2))],
+            vec![SqlValue::Int4(2), SqlValue::Numeric(Decimal128::new(500, 2))],
+            vec![SqlValue::Int4(3), SqlValue::Null],
+        ],
+        "SUM(numeric) skips NULLs; an all-NULL group is NULL"
+    );
+    assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
+
+    // MIN(v) + MAX(v): the TWO-PASS path. g=1 -> MIN 10.50 / MAX 30.25 (NULL skipped, not folded as 0);
+    // g=2 -> 5.00 / 5.00; g=3 -> NULL / NULL.
+    let mm = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(v), MAX(v) FROM tn GROUP BY g")
+        .expect("MIN/MAX over a nullable numeric value runs");
+    assert_eq!(
+        mm.rows,
+        vec![
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Numeric(Decimal128::new(1050, 2)),
+                SqlValue::Numeric(Decimal128::new(3025, 2)),
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Numeric(Decimal128::new(500, 2)),
+                SqlValue::Numeric(Decimal128::new(500, 2)),
+            ],
+            vec![SqlValue::Int4(3), SqlValue::Null, SqlValue::Null],
+        ],
+        "MIN/MAX(numeric) skip NULLs (never the 0 placeholder); all-NULL group is NULL"
+    );
+
+    // COUNT(*) + MIN(v): COUNT(*) counts EVERY row (incl. NULL-v), MIN skips NULLs. g=1 -> (3, 10.50);
+    // g=3 -> (1, NULL). Exercises the total-count pass alongside the two-pass numeric MIN.
+    let cm = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*), MIN(v) FROM tn GROUP BY g")
+        .expect("COUNT(*) + MIN over a nullable numeric value");
+    assert_eq!(
+        cm.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(3), SqlValue::Numeric(Decimal128::new(1050, 2))],
+            vec![SqlValue::Int4(2), SqlValue::Int8(2), SqlValue::Numeric(Decimal128::new(500, 2))],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1), SqlValue::Null],
+        ],
+        "COUNT(*) counts NULL-valued numeric rows; MIN skips them"
+    );
+
+    // A NON-nullable numeric value (w has no NULLs) is unaffected — no validity bitmap, byte-identical path.
     let ok = e
         .execute_resident_expr_select_sql("SELECT g, SUM(w) FROM tn GROUP BY g")
         .expect("SUM over a NON-nullable numeric value still runs");
     assert_eq!(
         ok.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Numeric(Decimal128::new(300, 2))],
-            vec![SqlValue::Int4(2), SqlValue::Numeric(Decimal128::new(300, 2))],
-            vec![SqlValue::Int4(3), SqlValue::Numeric(Decimal128::new(400, 2))],
+            vec![SqlValue::Int4(1), SqlValue::Numeric(Decimal128::new(600, 2))],
+            vec![SqlValue::Int4(2), SqlValue::Numeric(Decimal128::new(900, 2))],
+            vec![SqlValue::Int4(3), SqlValue::Numeric(Decimal128::new(600, 2))],
         ],
-        "non-nullable numeric SUM is unaffected by the nullable-numeric guard"
+        "non-nullable numeric SUM is unchanged"
     );
 }
 

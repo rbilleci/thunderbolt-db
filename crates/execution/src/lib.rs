@@ -7342,6 +7342,9 @@ fn launch_cuda_group_by_i32_count_sum(
     let mut q6 = slot_max.ptr;
     let mut q7 = slot_min_hi.ptr;
     let mut q8 = slot_max_hi.ptr;
+    // M3 (doc 21) 3VL: pass 2 reads the SAME value validity bitmap as pass 1 (a35, already bounds-checked)
+    // and skips NULL rows -- so it never folds a stale pooled row_slots slot for a NULL value.
+    let mut q9 = a35;
     let mut pass2_args = [
         (&mut q0 as *mut u64).cast::<c_void>(),
         (&mut q1 as *mut u64).cast::<c_void>(),
@@ -7352,6 +7355,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut q6 as *mut u64).cast::<c_void>(),
         (&mut q7 as *mut u64).cast::<c_void>(),
         (&mut q8 as *mut u64).cast::<c_void>(),
+        (&mut q9 as *mut u64).cast::<c_void>(),
     ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
@@ -7410,7 +7414,8 @@ fn launch_cuda_group_by_i32_count_sum(
                 return rc;
             }
         }
-        // (row_slots needs no init: pass 1 writes every row's slot before pass 2 reads it.)
+        // (row_slots needs no init: pass 1 writes every NON-NULL row's slot before pass 2 reads it; a NULL
+        // row's slot is left stale but pass 2 skips NULL rows via the value validity bitmap, never reading it.)
         // fill slot_keys = EMPTY
         let rc = unsafe {
             cu_launch_kernel(
