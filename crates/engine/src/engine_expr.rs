@@ -225,8 +225,8 @@ pub(crate) fn gpu_sort_result_rows(
     rows: Vec<Vec<SqlValue>>,
     order: &[(usize, bool)],
     // Parallel to `order`: the explicit NULLS FIRST/LAST override per key (None = PG default). Empty =
-    // every key default. Honored ON-DEVICE: a non-int key via the comparator's nulls_first bitmask; an
-    // int key by choosing its NULL sentinel value (i64::MIN vs MAX) to land at the requested end.
+    // every key default. Honored ON-DEVICE for EVERY key type via the comparator's per-key validity bitmap
+    // (built from the result rows into the payload) + the nulls_first bitmask -- no host NULL sentinel.
     nulls_first: &[Option<bool>],
     col_types: &[SqlType],
     device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
@@ -254,46 +254,29 @@ pub(crate) fn gpu_sort_result_rows(
         };
         classified.push((idx, kind));
     }
-    // M3 (doc 21): per-key effective NULLS FIRST (explicit override, else the key's desc = PG default) and,
-    // for an int key, the NULL sentinel value that realizes it: i64::MIN sorts first under ASC / last under
-    // DESC, i64::MAX the reverse. The default (eff == desc) keeps i64::MAX (byte-identical). An int8/
-    // timestamp key with an EXPLICIT override clean-errors: a genuine i64::MIN/MAX value would tie with the
-    // sentinel and mis-place. int4/int2/date can't reach the sentinel, so they are exact.
+    // M3 (doc 21): per-key effective NULLS FIRST bit (explicit override, else the key's desc = PG default).
+    // The NULL placement is decided ON-DEVICE by the sort comparator reading each key's validity bitmap --
+    // INT keys included (their bitmap rides the payload, their value the int matrix), so there is NO host
+    // NULL sentinel and int8/timestamp need no special-casing.
     let mut nulls_first_mask: u64 = 0;
-    let mut int_null_sentinel: Vec<i64> = Vec::with_capacity(order.len());
-    for (ki, &(idx, desc)) in order.iter().enumerate() {
-        let explicit = nulls_first.get(ki).copied().flatten();
-        let eff_nf = explicit.unwrap_or(desc);
-        if eff_nf {
+    for (ki, &(_, desc)) in order.iter().enumerate() {
+        if nulls_first.get(ki).copied().flatten().unwrap_or(desc) {
             nulls_first_mask |= 1u64 << ki;
         }
-        if explicit.is_some()
-            && classified[ki].1 == 0
-            && matches!(col_types[idx], SqlType::Int8 | SqlType::Timestamp)
-        {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "explicit NULLS FIRST/LAST on a bigint/timestamp result column is a follow-up (the \
-                 i64 NULL sentinel could tie with a real value)"
-                    .to_string(),
-            )));
-        }
-        int_null_sentinel.push(if eff_nf ^ desc { i64::MIN } else { i64::MAX });
     }
     let num_int = classified.iter().filter(|&&(_, k)| k == 0).count();
-    // INT key matrix, row-major by row position (matches the 0..n index order).
+    // INT key matrix, row-major by row position. A NULL writes a 0 PLACEHOLDER; the comparator detects the
+    // NULL from the validity bitmap (built below) BEFORE the value compare, so the placeholder is never
+    // compared -- the NULL placement decision is on-device, not a host sentinel value.
     let mut int_keys: Vec<i64> = Vec::with_capacity(n * num_int);
     for row in &rows {
-        for (ki, &(idx, kind)) in classified.iter().enumerate() {
+        for &(idx, kind) in &classified {
             if kind == 0 {
                 int_keys.push(match row[idx] {
                     SqlValue::Int4(v) | SqlValue::Date(v) => i64::from(v),
                     SqlValue::Int2(v) => i64::from(v),
                     SqlValue::Int8(v) | SqlValue::Timestamp(v) => v,
-                    // M3 (doc 21): a NULL int sort key maps to a per-key sentinel (int_null_sentinel[ki])
-                    // chosen so it lands at the requested end under the key's direction — the PG default
-                    // (i64::MAX) when no override, else i64::MIN/MAX per the explicit NULLS FIRST/LAST. The
-                    // value compare then places it (no bitmap needed for an int matrix key).
-                    SqlValue::Null => int_null_sentinel[ki],
+                    SqlValue::Null => 0,
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "ORDER BY int key encountered a non-int value".to_string(),
@@ -309,57 +292,60 @@ pub(crate) fn gpu_sort_result_rows(
             desc_mask |= 1u64 << ki;
         }
     }
+    // A NULL in ANY key column routes to the hetero comparator (it reads each key's validity bitmap from the
+    // payload ON-DEVICE). An all-int, NULL-FREE sort keeps the fast int-matrix path (no bitmaps needed).
+    let has_null_key = classified
+        .iter()
+        .any(|&(idx, _)| rows.iter().any(|r| matches!(r[idx], SqlValue::Null)));
     let non_int: Vec<(usize, u8)> = classified.iter().copied().filter(|&(_, k)| k != 0).collect();
-    let perm: Vec<u32> = if non_int.is_empty() {
+    let perm: Vec<u32> = if non_int.is_empty() && !has_null_key {
         device_memory
             .bitonic_sort_multikey(&int_keys, n, num_int, desc_mask)
             .map_err(map_sort_err)?
     } else {
-        // A resident-like payload over ONLY the non-int key columns; the helper returns the text
-        // (offsets,bytes) + numeric/uuid section offsets + the per-column NULL validity bitmaps the hetero
-        // comparator reads on-device.
-        let names: Vec<String> = (0..non_int.len()).map(|i| format!("__gsk{i}")).collect();
-        let types: Vec<SqlType> = non_int.iter().map(|&(idx, _)| col_types[idx]).collect();
+        // A resident-like payload over EVERY key column (M3 -- doc 21): build_relational_device_payload emits
+        // a validity bitmap for any column holding a NULL, so an INT key's NULL placement is read ON-DEVICE
+        // from its payload bitmap (the int VALUE still rides `int_keys`; the int value section in the payload
+        // is unused, but its presence keeps every later section's offset correct). Non-int keys read both
+        // value + validity from the payload. No host NULL sentinel on any key.
+        let names: Vec<String> = (0..classified.len()).map(|i| format!("__gsk{i}")).collect();
+        let types: Vec<SqlType> = classified.iter().map(|&(idx, _)| col_types[idx]).collect();
         let payload_rows: Vec<Vec<SqlValue>> = rows
             .iter()
-            .map(|r| non_int.iter().map(|&(idx, _)| r[idx].clone()).collect())
+            .map(|r| classified.iter().map(|&(idx, _)| r[idx].clone()).collect())
             .collect();
         let (payload, text_layouts, _bool, _int4, b128_layouts, null_layouts) =
             crate::engine_residency::build_relational_device_payload(&names, &types, &payload_rows)?;
-        // Walk ORDER BY order: int -> next matrix slot; text/numeric/uuid -> the next section in its type
-        // group (the helper lays them out in passed-column order per group). Build per-key null_offs: an int
-        // key uses the host i64::MAX sentinel in `int_keys` (this path sorts already-host rows; the int
-        // values come from the SqlValues, not a resident column) -> sentinel null_off; a non-int key reads
-        // its validity bitmap in the payload ON-DEVICE (so the comparator places its NULLs, multi-key too).
-        let mut int_slot = 0u32;
-        let mut text_idx = 0usize;
-        let mut b128_idx = 0usize;
-        let mut non_int_pos = 0usize;
-        let mut text_cols: Vec<(u64, u64)> = Vec::new();
-        let mut b128_cols: Vec<u64> = Vec::new();
-        let mut key_plan: Vec<u32> = Vec::with_capacity(order.len());
-        let mut null_offs: Vec<u64> = Vec::with_capacity(order.len());
-        let hetero_null_off = |pos: usize| -> u64 {
-            let name = format!("__gsk{pos}");
+        // null_offs[ki] = key ki's validity-bitmap byte offset in the payload (u64::MAX = the column has no
+        // NULL ⇒ pure value compare). Found by the key's own name, so an int key gets its bitmap too.
+        let null_off_of = |ki: usize| -> u64 {
+            let name = format!("__gsk{ki}");
             null_layouts
                 .iter()
                 .find(|l| l.name == name)
                 .map_or(u64::MAX, |l| l.bitmap_byte_offset)
         };
-        for &(_, kind) in &classified {
+        // Walk ORDER BY order: int -> the next int-matrix slot; text/numeric/uuid -> the next section in its
+        // type group (the helper lays each group out in passed-column order). The validity bitmap (all key
+        // types) is read on-device via null_offs.
+        let mut int_slot = 0u32;
+        let mut text_idx = 0usize;
+        let mut b128_idx = 0usize;
+        let mut text_cols: Vec<(u64, u64)> = Vec::new();
+        let mut b128_cols: Vec<u64> = Vec::new();
+        let mut key_plan: Vec<u32> = Vec::with_capacity(order.len());
+        let mut null_offs: Vec<u64> = Vec::with_capacity(order.len());
+        for (ki, &(_, kind)) in classified.iter().enumerate() {
             match kind {
                 0 => {
                     key_plan.push(int_slot);
                     int_slot += 1;
-                    null_offs.push(u64::MAX);
                 }
                 1 => {
                     let tl = &text_layouts[text_idx];
                     key_plan.push(0x4000_0000_u32 | text_cols.len() as u32);
                     text_cols.push((tl.offsets_byte_offset, tl.bytes_byte_offset));
                     text_idx += 1;
-                    null_offs.push(hetero_null_off(non_int_pos));
-                    non_int_pos += 1;
                 }
                 k => {
                     let off = b128_layouts[b128_idx].1;
@@ -367,15 +353,14 @@ pub(crate) fn gpu_sort_result_rows(
                     key_plan.push(tag | b128_cols.len() as u32);
                     b128_cols.push(off);
                     b128_idx += 1;
-                    null_offs.push(hetero_null_off(non_int_pos));
-                    non_int_pos += 1;
                 }
             }
+            null_offs.push(null_off_of(ki));
         }
         let indices: Vec<u64> = (0..n as u64).collect();
-        // NULL placement is honored ON-DEVICE: a non-int key via `nulls_first_mask` (its payload validity
-        // bitmap + the comparator), an int key via its chosen sentinel value already in `int_keys` (its
-        // null_off is u64::MAX -> pure value compare). The default mask == desc, reproducing the PG default.
+        // NULL placement is honored ON-DEVICE for EVERY key: the comparator reads the key's validity bitmap
+        // (null_offs) and places NULL per the per-key nulls_first bit (nulls_first_mask). An int key reads
+        // its value from `int_keys` but its NULL-ness from the payload bitmap -- no host sentinel.
         device_memory
             .bitonic_sort_hetero_on_payload(
                 &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols, &key_plan, desc_mask,
@@ -2511,8 +2496,8 @@ impl Engine {
                 order.push((idx, *descending));
             }
             let col_types: Vec<SqlType> = columns.iter().map(|col| col.ty).collect();
-            // Explicit NULLS FIRST/LAST on a join ORDER BY is honored on-device (an int8/timestamp result
-            // column with an explicit override clean-errors inside the helper, as for the grouped path).
+            // Explicit NULLS FIRST/LAST on a join ORDER BY is honored on-device (every key type, incl. int,
+            // reads its NULL validity bitmap in the sort comparator -- no host sentinel).
             result_rows = gpu_sort_result_rows(
                 result_rows,
                 &order,
@@ -4196,8 +4181,8 @@ impl Engine {
             if !select.order_by.is_empty() && rows.len() > 1 {
                 // Resolve each ORDER BY key to its result-column index, then sort the grouped rows on the
                 // GPU (the shared helper; int matrix vs hetero payload by key type). Explicit NULLS
-                // FIRST/LAST is honored ON-DEVICE (order_by_nulls_first threaded through; an int8/timestamp
-                // result column with an explicit override clean-errors inside the helper).
+                // FIRST/LAST is honored ON-DEVICE (order_by_nulls_first threaded through; every key type,
+                // incl. int, reads its NULL validity bitmap in the comparator -- no host sentinel).
                 let order: Vec<(usize, bool)> = select
                     .order_by
                     .iter()

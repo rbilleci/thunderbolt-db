@@ -1336,17 +1336,26 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
         )
         .expect("grouped ORDER BY DESC NULLS LAST");
     assert_eq!(keys(&r.rows), vec![Some(2), Some(1), None], "grouped ORDER BY g DESC NULLS LAST");
-    // A bigint result column with an explicit override clean-errors (sentinel collision risk).
+    // A BIGINT result key is now exact too: its NULL is marked by an on-device validity bitmap (not a
+    // value sentinel), so explicit NULLS FIRST is honored with no collision risk. g8=[1,NULL] -> NULL first.
     e.execute_text(3, "CREATE TABLE t8 (g BIGINT, v INT)").unwrap();
     e.execute_text(4, "INSERT INTO t8 (g,v) VALUES (1,10),(NULL,10)").unwrap();
     if e.populate_relational_residency_snapshot("t8").unwrap().device_memory_proof.is_some() {
-        assert!(
-            e.execute_resident_expr_select_sql(
-                "SELECT g, COUNT(*) FROM t8 GROUP BY g ORDER BY g NULLS FIRST"
+        let r8 = e
+            .execute_resident_expr_select_sql(
+                "SELECT g, COUNT(*) FROM t8 GROUP BY g ORDER BY g NULLS FIRST",
             )
-            .is_err(),
-            "explicit NULLS FIRST on a bigint grouped result column clean-errors"
-        );
+            .expect("bigint grouped ORDER BY g NULLS FIRST");
+        let g8: Vec<Option<i64>> = r8
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                SqlValue::Int8(x) => Some(x),
+                SqlValue::Null => None,
+                ref o => panic!("unexpected {o:?}"),
+            })
+            .collect();
+        assert_eq!(g8, vec![None, Some(1)], "bigint grouped ORDER BY g NULLS FIRST: NULL group first");
     }
 }
 
