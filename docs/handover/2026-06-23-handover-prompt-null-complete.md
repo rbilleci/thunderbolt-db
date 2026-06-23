@@ -64,10 +64,15 @@ Run `git checkout main && git pull` for the latest.
   host sentinel (their values are host SqlValues from a prior join/groupby materialization, not a resident
   column). HAZARD passed. STILL CLEAN-ERROR: a nullable sort EXPRESSION (needs a derived validity bitmap) +
   explicit NULLS FIRST/LAST.
+- **A.5 N-way (multi-step) OUTER joins** — DONE (engine-only, no kernel). A prior OUTER step's NULL pad carries
+  a `JOIN_NULL_ROW` sentinel; `key_present` now reads it as a NULL key (matches nothing; a LEFT step re-pads
+  it) instead of OOB-reading host_rows. Removed the multi-step clean-error. Covers LEFT/RIGHT/FULL chains incl.
+  a carried-NULL used as a later step's key + a RIGHT step padding a multi-relation accumulated side. OUTER+WHERE
+  still clean-errors (per-side WHERE pushdown is not filter-commutative for an outer join — a separate follow-up).
 **REMAINING Track A:** A.2 tail (nullable COMPOSITE / EXPRESSION GROUP BY key — per-member/derived NULL encoding,
 not one reserved slot; + route the NULL key through the COUNT(DISTINCT) sub-passes);
-A.4 tail (explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field through ~20 ctors incl. the legacy
-protocol crate] + nullable sort EXPRESSION + multi-key NULL hetero placement); A.5 (N-way multi-way OUTER joins).
+A.4 tail (nullable ORDER BY EXPRESSION [on-device derived validity bitmap] + explicit NULLS FIRST/LAST [threads
+a SelectOrder.nulls_first field through ~20 ctors incl. the legacy protocol crate]); OUTER+WHERE.
 
 **What landed last session (2026-06-23) — NULL (M3) is now substantially complete, ~12 independently-audited
 slices merged.** Representation + storage + ingest + the GPU 3VL data path:

@@ -924,6 +924,123 @@ fn gpu_right_and_full_outer_join_null_pad_the_correct_side() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
+    // N-way (multi-step) OUTER join (M3 -- doc 21): a prior step's NULL pad carries a JOIN_NULL_ROW
+    // sentinel; the next step reads it as a NULL key (matches nothing; a LEFT step re-pads it) instead of
+    // OOB-reading host_rows. Two cases: (1) the carried NULL is in a relation NOT used as the next key (the
+    // tuple still participates via a non-padded key); (2) the carried NULL IS the next key (the tuple is
+    // re-padded). All on the GPU join pipeline.
+    let mut e = Engine::new_local();
+    // Case 1: A LEFT JOIN B (on A.id) LEFT JOIN C (on A.id). A=3 has no B (B NULL-padded) but matches C=3.
+    e.execute_text(1, "CREATE TABLE a3 (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE b3 (aid INT, bl TEXT)").unwrap();
+    e.execute_text(3, "CREATE TABLE c3 (aid INT, cl TEXT)").unwrap();
+    e.execute_text(4, "INSERT INTO a3 (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(5, "INSERT INTO b3 (aid,bl) VALUES (1,'b1'),(2,'b2')").unwrap();
+    e.execute_text(6, "INSERT INTO c3 (aid,cl) VALUES (1,'c1'),(3,'c3')").unwrap();
+    for t in ["a3", "b3", "c3"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let opt = |v: &SqlValue| match v {
+        SqlValue::Text(t) => Some(t.clone()),
+        SqlValue::Null => None,
+        o => panic!("unexpected {o:?}"),
+    };
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, bl, cl FROM a3 LEFT JOIN b3 ON a3.id = b3.aid LEFT JOIN c3 ON a3.id = c3.aid",
+        )
+        .expect("N-way LEFT-LEFT join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let mut got: Vec<(String, Option<String>, Option<String>)> = res
+        .rows
+        .iter()
+        .map(|r| (opt(&r[0]).unwrap(), opt(&r[1]), opt(&r[2])))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("a".into(), Some("b1".into()), Some("c1".into())),
+            ("b".into(), Some("b2".into()), None), // B match, no C
+            ("c".into(), None, Some("c3".into())), // B NULL-padded (step 1), still matches C on A.id
+        ],
+        "N-way LEFT-LEFT: a carried NULL in a non-key relation still joins on a non-padded key"
+    );
+
+    // Case 2: A LEFT JOIN B (on A.id) LEFT JOIN C (on B.cid). A=3's B is NULL-padded, so B.cid is a carried
+    // NULL key at step 2 -> A=3 matches no C -> C re-padded (would OOB-read host_rows without the fix).
+    e.execute_text(7, "CREATE TABLE a4 (id INT, name TEXT)").unwrap();
+    e.execute_text(8, "CREATE TABLE b4 (aid INT, cid INT, bl TEXT)").unwrap();
+    e.execute_text(9, "CREATE TABLE c4 (id INT, cl TEXT)").unwrap();
+    e.execute_text(10, "INSERT INTO a4 (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(11, "INSERT INTO b4 (aid,cid,bl) VALUES (1,100,'b1'),(2,200,'b2')").unwrap();
+    e.execute_text(12, "INSERT INTO c4 (id,cl) VALUES (100,'c1'),(200,'c2'),(300,'c3')").unwrap();
+    for t in ["a4", "b4", "c4"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT name, bl, cl FROM a4 LEFT JOIN b4 ON a4.id = b4.aid LEFT JOIN c4 ON b4.cid = c4.id",
+        )
+        .expect("N-way LEFT-LEFT join keyed on a previously-padded relation");
+    let mut got: Vec<(String, Option<String>, Option<String>)> = res
+        .rows
+        .iter()
+        .map(|r| (opt(&r[0]).unwrap(), opt(&r[1]), opt(&r[2])))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("a".into(), Some("b1".into()), Some("c1".into())),
+            ("b".into(), Some("b2".into()), Some("c2".into())),
+            ("c".into(), None, None), // B NULL-padded -> B.cid NULL key at step 2 -> C re-padded
+        ],
+        "N-way: a carried NULL used AS the next join key matches nothing and is re-padded (no OOB)"
+    );
+
+    // Case 3: a RIGHT step over a MULTI-relation accumulated side -- A JOIN B (inner) RIGHT JOIN C. An
+    // unmatched C row pads the ENTIRE accumulated side (BOTH A and B), exercising the RIGHT pad's
+    // `take(new_rel)` over >1 accumulated relations.
+    e.execute_text(13, "CREATE TABLE a5 (id INT, an TEXT)").unwrap();
+    e.execute_text(14, "CREATE TABLE b5 (aid INT, bn TEXT)").unwrap();
+    e.execute_text(15, "CREATE TABLE c5 (cx INT, cn TEXT)").unwrap();
+    e.execute_text(16, "INSERT INTO a5 (id,an) VALUES (1,'a1'),(2,'a2')").unwrap();
+    e.execute_text(17, "INSERT INTO b5 (aid,bn) VALUES (1,'b1'),(2,'b2')").unwrap();
+    e.execute_text(18, "INSERT INTO c5 (cx,cn) VALUES (1,'c1'),(3,'c3')").unwrap();
+    for t in ["a5", "b5", "c5"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT an, bn, cn FROM a5 JOIN b5 ON a5.id = b5.aid RIGHT JOIN c5 ON b5.aid = c5.cx",
+        )
+        .expect("RIGHT JOIN over a multi-relation accumulated side");
+    let mut got: Vec<(Option<String>, Option<String>, Option<String>)> = res
+        .rows
+        .iter()
+        .map(|r| (opt(&r[0]), opt(&r[1]), opt(&r[2])))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (None, None, Some("c3".into())), // right-only C row pads BOTH accumulated relations (A and B)
+            (Some("a1".into()), Some("b1".into()), Some("c1".into())),
+        ],
+        "RIGHT step over a 2-relation accumulated side pads the WHOLE accumulated tuple (A and B)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     // The SMALLER side (s, the left/probe-by-size) has a DUPLICATE join key, so build-on-smaller hits
     // DuplicateBuildKey -> the executor falls back to building on the LARGER (unique) side. This

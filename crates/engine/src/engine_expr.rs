@@ -1771,22 +1771,18 @@ impl Engine {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
         let n_rel = plan.relations.len();
-        // OUTER joins (LEFT/RIGHT/FULL, M3 -- doc 21) are currently 2-relation, ON-only, with no WHERE. A
-        // multi-way outer (NULL-padding an intermediate result) and a WHERE on an outer join (the per-side
-        // WHERE pushdown is NOT filter-commutative for an outer join -- a filter on the NULL-padded side
-        // would change which rows are padded) are follow-ups, rejected here rather than mis-answered.
-        if plan.steps.iter().any(|s| s.outer_left || s.outer_right) {
-            if plan.steps.len() != 1 {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "multi-way OUTER JOIN is a follow-up (only a 2-relation OUTER JOIN is supported)"
-                        .to_string(),
-                )));
-            }
-            if predicates.iter().any(Option::is_some) {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "a WHERE clause on an OUTER JOIN is a follow-up".to_string(),
-                )));
-            }
+        // OUTER joins (LEFT/RIGHT/FULL, M3 -- doc 21). N-way (multi-step) OUTER is supported: a prior step's
+        // NULL pad carries a `JOIN_NULL_ROW` sentinel that `key_present` reads as a NULL key (matches
+        // nothing; a LEFT step re-pads it), and the final gather emits SqlValue::Null for it. A WHERE on an
+        // OUTER join is still a follow-up: the per-side WHERE pushdown is NOT filter-commutative for an outer
+        // join (a filter on the NULL-padded side would change which rows are padded) -- rejected, not
+        // mis-answered.
+        if plan.steps.iter().any(|s| s.outer_left || s.outer_right)
+            && predicates.iter().any(Option::is_some)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "a WHERE clause on an OUTER JOIN is a follow-up".to_string(),
+            )));
         }
         // Resolve a JOIN column reference to (relation index, column index) against relations[0..=upto]:
         // a qualifier must name exactly one of them; an unqualified column must be in exactly one (PG's
@@ -2202,7 +2198,12 @@ impl Engine {
             // carried tuples + new-relation survivors. When nothing is NULL we keep the ORIGINAL vectors
             // (no clone), so the common no-NULL join path is byte-identical and never regresses.
             let key_present = |ri: usize, col: usize, row: u32| {
-                !matches!(sides[ri].0.host_rows[row as usize][col], SqlValue::Null)
+                // M3 (doc 21): a carried `JOIN_NULL_ROW` (a PRIOR OUTER step's NULL pad for this relation)
+                // is a NULL key here — in an equi-join `NULL = x` is UNKNOWN, so it matches nothing (and a
+                // LEFT step re-pads it). Reading host_rows at the u32::MAX sentinel would be out of bounds;
+                // treat it as not-present. This is what unblocks N-way (multi-step) OUTER joins.
+                row != JOIN_NULL_ROW
+                    && !matches!(sides[ri].0.host_rows[row as usize][col], SqlValue::Null)
             };
             let tuple_count = work_idx[0].len();
             let acc_keep: Vec<usize> = (0..tuple_count)
