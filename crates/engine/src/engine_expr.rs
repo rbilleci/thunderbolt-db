@@ -429,7 +429,7 @@ fn composite_group_count_reps(
     let groups = device_memory
         .group_by_i32_count_sum_minmax_from_payload(
             0, 0, indices, false, false, false, false, false, false, 0, 0, false, 0, 0,
-            key_base_override, 0, comp_w, n_text, text_desc_ptr, None,
+            key_base_override, 0, comp_w, n_text, text_desc_ptr, None, None,
         )
         .map_err(map_err)?;
     Ok(groups.iter().map(|g| g.key_i128 as u64 as u32).collect())
@@ -2665,6 +2665,7 @@ impl Engine {
                     0, // n_text (no text members)
                     0, // text_desc_ptr
                     None, // value_null_off (COUNT(DISTINCT) over the marked tuple matrix)
+                    None, // key_null_off (the marked-tuple matrix key is non-null by construction)
                 )
                 .map_err(map_err)?;
             drop((g_sorted, new_distinct));
@@ -2711,32 +2712,49 @@ impl Engine {
                     }
                 }
             }
-            // M3 (doc 21) GROUP BY 3VL: a NULL aggregate VALUE is now SKIPPED from SUM/AVG/MIN/MAX on the
-            // GPU (the single-level kernel's value-skip; `any_value_nullable` forces single-level and a
-            // dedicated total-count pass below). What remains a CLEAN ERROR is a NULL group KEY — it must
-            // form its OWN group (distinct from any real value), but the kernel reads the 0/empty
-            // PLACEHOLDER, so a NULL key would group under 0. Detect a KEY column that ACTUALLY contains a
-            // NULL and clean-error rather than mis-answer (a NULL-free nullable-typed key has no bitmap, so
-            // it still runs). The full NULL-key-as-own-group is a kernel-reserved-slot / host-partition
-            // follow-up.
-            let mut group_by_key_check: Vec<usize> = Vec::new();
-            if let Some(expr) = group_key_expr {
-                collect_expr_columns(expr, &mut group_by_key_check);
-            } else if !group_key_columns.is_empty() {
-                for name in group_key_columns {
-                    group_by_key_check.push(relational_column_index(table, name)?);
+            // M3 (doc 21) GROUP BY 3VL: a NULL group KEY forms its OWN group (NULLs group together,
+            // distinct from real keys). The kernel routes a NULL key to a dedicated reserved slot — but
+            // ONLY in the int4/i64 claim path, so this is supported for a SINGLE PLAIN fixed-int COLUMN key
+            // (int2/4/8/date/timestamp). A nullable COMPOSITE / EXPRESSION / TEXT / NUMERIC / UUID key is a
+            // clean-error follow-up (its claim path has no NULL route). A NULL-free key has no bitmap, so it
+            // runs unchanged either way.
+            let single_key_col = if group_key_expr.is_none() && group_key_columns.len() < 2 {
+                relational_column_index(table, group_name).ok()
+            } else {
+                None
+            };
+            let key_is_plain_fixed_int_column = single_key_col.is_some_and(|idx| {
+                matches!(
+                    table.columns.get(idx).map(|column| column.ty),
+                    Some(
+                        SqlType::Int2
+                            | SqlType::Int4
+                            | SqlType::Int8
+                            | SqlType::Date
+                            | SqlType::Timestamp
+                    )
+                )
+            });
+            if !key_is_plain_fixed_int_column {
+                let mut group_by_key_check: Vec<usize> = Vec::new();
+                if let Some(expr) = group_key_expr {
+                    collect_expr_columns(expr, &mut group_by_key_check);
+                } else if !group_key_columns.is_empty() {
+                    for name in group_key_columns {
+                        group_by_key_check.push(relational_column_index(table, name)?);
+                    }
+                } else if let Ok(idx) = relational_column_index(table, group_name) {
+                    group_by_key_check.push(idx);
                 }
-            } else if let Ok(idx) = relational_column_index(table, group_name) {
-                group_by_key_check.push(idx);
-            }
-            for col in group_by_key_check {
-                if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "GROUP BY over a KEY column that contains NULLs is not yet supported on the GPU \
-                         (M3 3VL follow-up): a NULL key must form its own group. (A nullable aggregate \
-                         VALUE is supported — its NULLs are skipped.)"
-                            .to_string(),
-                    )));
+                for col in group_by_key_check {
+                    if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "GROUP BY over a nullable composite/expression/text/numeric/uuid KEY is not \
+                             yet supported on the GPU (M3 3VL follow-up: a NULL key must form its own \
+                             group; only a single plain int/date/timestamp column key is supported)"
+                                .to_string(),
+                        )));
+                    }
                 }
             }
             // M3 (doc 21): a nullable NUMERIC value runs the numeric TWO-PASS min/max kernel — pass 1
@@ -3239,7 +3257,19 @@ impl Engine {
                     acc || resident_device_null_column_offset(&snapshot, table, vidx)?.is_some(),
                 )
             })?;
-            let force_single = value_indices.len() > 1 || is_expr_key || any_value_nullable;
+            // M3 (doc 21): the group key's NULL validity offset, for a single plain fixed-int column key
+            // ONLY (the kernel's NULL-key route is in the int4/i64 claim path) — a NULL key forms its own
+            // group. `None` (no bitmap / not that key shape) leaves grouping unchanged. Forces single-level
+            // (only that kernel honors the route).
+            let pass_key_null_off = if key_is_plain_fixed_int_column {
+                resident_device_null_column_offset(&snapshot, table, group_idx)?
+            } else {
+                None
+            };
+            let force_single = value_indices.len() > 1
+                || is_expr_key
+                || any_value_nullable
+                || pass_key_null_off.is_some();
             let run_pass =
                 |value_idx_opt: Option<usize>, has_minmax: bool| -> Result<Pass, ExecuteError> {
                     // A None value column is the COUNT(*)-only pass: group over the key, read .count.
@@ -3346,6 +3376,7 @@ impl Engine {
                             widekey_n_text,
                             widekey_text_desc_ptr,
                             pass_value_null_off,
+                            pass_key_null_off,
                         )
                     } else {
                         device_memory.group_by_i32_count_sum_from_payload(
@@ -3479,6 +3510,7 @@ impl Engine {
                                         widekey_n_text,
                                         widekey_text_desc_ptr,
                                         None, // value_null_off (COUNT(DISTINCT) marked-tuple pass)
+                                        None, // key_null_off (marked-tuple key non-null by construction)
                                     )
                                     .map_err(map_err)?
                             };
@@ -3581,6 +3613,11 @@ impl Engine {
             // passes (and the merged output ends up key-ordered). A TEXT key must sort by the
             // materialized string -- there key_i128 is a per-pass representative row index, not the key.
             let materialize_key = |gk: &gpu_db_execution::GroupByI32Row| -> SqlValue {
+                // M3 (doc 21): the NULL-KEY group (every NULL key grouped together) renders its key as SQL
+                // NULL — for BOTH the pass-alignment sort (NULLs sort consistently) and the result row.
+                if gk.key_is_null {
+                    return SqlValue::Null;
+                }
                 if composite_is_widekey {
                     // Wide-key: the b128 slot's lo = the representative row index. Return the FIRST
                     // member's value for the (single-pass) alignment sort; the result rows re-sort by the
@@ -3639,6 +3676,12 @@ impl Engine {
                     _ => i64::MIN,
                 };
                 match (a, b) {
+                    // M3 (doc 21): the NULL-KEY group sorts FIRST, distinctly — `i64_key` maps NULL to
+                    // i64::MIN, which would TIE it with a literal i64::MIN int8 key and misalign the
+                    // passes; these arms keep the null group's pass-alignment position unambiguous.
+                    (SqlValue::Null, SqlValue::Null) => std::cmp::Ordering::Equal,
+                    (SqlValue::Null, _) => std::cmp::Ordering::Less,
+                    (_, SqlValue::Null) => std::cmp::Ordering::Greater,
                     (SqlValue::Numeric(x), SqlValue::Numeric(y)) => x.cmp(y),
                     (SqlValue::Uuid(x), SqlValue::Uuid(y)) => x.cmp(y),
                     (SqlValue::Text(x), SqlValue::Text(y)) => x.cmp(y),

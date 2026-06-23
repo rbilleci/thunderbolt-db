@@ -6639,7 +6639,11 @@ het_done:
     // sentinel u64::MAX = no bitmap => every value valid. A NULL value is SKIPPED from count/sum/min/max
     // (the slot is still claimed by the KEY above, so the group still appears) -> non-NULL aggregate
     // semantics; COUNT(*) passes the sentinel so it counts every row.
-    .param .u64 value_null_off
+    .param .u64 value_null_off,
+    // M3 (doc 21) 3VL: the KEY column's NULL validity bitmap byte offset (1 = valid), or sentinel
+    // u64::MAX = no bitmap => every key valid. A NULL key routes to the dedicated NULL-KEY slot
+    // (index nslots+1 = mask+2), forming ONE group (NULLs group together, distinct from real keys).
+    .param .u64 key_null_off
 )
 {
     .reg .u64 %m3vnoff;
@@ -6651,6 +6655,14 @@ het_done:
     .reg .u32 %m3vbp;
     .reg .pred %m3pnob;
     .reg .pred %m3pnul;
+    .reg .u64 %m3knoff;
+    .reg .u64 %m3kwd;
+    .reg .u64 %m3kaddr;
+    .reg .u32 %m3kbw;
+    .reg .u32 %m3kbt;
+    .reg .u32 %m3kbp;
+    .reg .pred %m3pknob;
+    .reg .pred %m3pknul;
     .reg .pred %pvt;
     .reg .pred %plt;
     .reg .pred %pgt;
@@ -6817,6 +6829,7 @@ het_done:
     ld.param.u64 %mnuptr, [slot_min_uuid_ptr];
     ld.param.u64 %mxuptr, [slot_max_uuid_ptr];
     ld.param.u64 %m3vnoff, [value_null_off];
+    ld.param.u64 %m3knoff, [key_null_off];
     mov.u64 %m3vsent, 0xFFFFFFFFFFFFFFFF;
     ld.param.u64 %ki128, [key_is_i128];
     ld.param.u64 %ski128, [slot_keys_i128_ptr];
@@ -7123,6 +7136,24 @@ gb_vdone:
     @%pgen bra gb_kwidekeyclaim;
     @%pkt bra gb_ktextclaim;
     @%pki bra gb_ki128claim;
+    // M3 (doc 21): a NULL key (per key_null_off, validity bit 0 at row %idx) routes to the dedicated
+    // NULL-KEY slot (index nslots+1 = mask+2) -- one group for all NULL keys, no hash, no claim, distinct
+    // from real key 0. key_null_off == sentinel (0xFFFF...) => no key bitmap => every key valid (the only
+    // path that passes a real offset is the plain int4/int8 COLUMN key; expr/composite/text/i128 keys
+    // branch away above or pass the sentinel).
+    setp.eq.u64 %m3pknob, %m3knoff, %m3vsent;
+    @%m3pknob bra gb_knull_done;
+    shr.u32 %m3kbp, %idx, 5;            // key validity word index = idx / 32
+    mul.lo.u32 %m3kbp, %m3kbp, 4;       // * 4 bytes per u32 word
+    cvt.u64.u32 %m3kwd, %m3kbp;
+    add.u64 %m3kaddr, %base, %m3knoff;
+    add.u64 %m3kaddr, %m3kaddr, %m3kwd;
+    ld.global.u32 %m3kbw, [%m3kaddr];
+    and.b32 %m3kbp, %idx, 31;           // bit = idx % 32
+    bfe.u32 %m3kbt, %m3kbw, %m3kbp, 1;
+    setp.eq.u32 %m3pknul, %m3kbt, 0;    // 0 = NULL key
+    @%m3pknul bra gb_nullkey;
+gb_knull_done:
     // The key i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table. Route
     // it to a dedicated slot at index nslots (= mask+1, outside the hash range) -- no hash, no claim.
     setp.eq.s64 %pmin, %key, %empty;
@@ -7150,6 +7181,24 @@ probe_loop:
     bra probe_loop;
 gb_minkey:
     add.u64 %h, %mask, 1;
+    // M3 (doc 21): mark the reserved slot as USED (slot_keys = 0, != EMPTY = i64::MIN) so the launcher
+    // emits it on `keys[slot] != EMPTY` -- NOT on count > 0. The reserved slots are never CLAIMED via
+    // CAS, so a count-0 reserved group (all-NULL aggregate values) must still be emitted, consistently
+    // across EVERY pass, or the by-index pass merge mis-aligns. (do_agg recomputes %off/%addr/%tmp.)
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    mov.u64 %tmp, 0;
+    st.global.u64 [%addr], %tmp;
+    bra do_agg;
+gb_nullkey:
+    // The dedicated NULL-KEY slot (index nslots+1 = mask+2). do_agg's value-skip still applies, so a
+    // NULL-key row with a NULL value is counted in COUNT(*) but skipped from the value aggregate. Mark
+    // it USED (slot_keys = 0) like gb_minkey so a count-0 null group is still emitted (pass alignment).
+    add.u64 %h, %mask, 2;
+    mul.lo.u64 %off, %h, 8;
+    add.u64 %addr, %kptr, %off;
+    mov.u64 %tmp, 0;
+    st.global.u64 [%addr], %tmp;
     bra do_agg;
 gb_ki128claim:
     // i128 key (numeric mantissa OR uuid bytes): claim via native 128-bit CAS. EMPTY128 = i128::MIN =

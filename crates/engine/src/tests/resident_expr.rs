@@ -2343,12 +2343,11 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_group_by_skips_null_aggregate_values_and_clean_errors_a_null_key() {
-    // M3 (doc 21): GROUP BY over a nullable aggregate VALUE now runs on the GPU with full 3VL — a NULL
-    // value is SKIPPED from SUM/AVG/MIN/MAX (the single-level kernel's value-skip), while COUNT(*) still
-    // counts the row (a dedicated total-count pass), and an all-NULL group's aggregate is SQL NULL. A
-    // NULL group KEY still CLEAN-ERRORS (its own-group handling is a follow-up). A NULL-free nullable
-    // column is unchanged (no validity bitmap).
+fn gpu_group_by_skips_null_values_and_groups_null_keys() {
+    // M3 (doc 21): GROUP BY full 3VL on the GPU — a NULL aggregate VALUE is SKIPPED from SUM/AVG/MIN/MAX
+    // (the single-level kernel's value-skip) while COUNT(*) still counts the row (a dedicated total-count
+    // pass), an all-NULL group's aggregate is SQL NULL, AND a NULL group KEY forms its OWN group (the
+    // kernel's reserved NULL-key slot) rendered SqlValue::Null. A NULL-free nullable column is unchanged.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT, h INT)").unwrap();
     // g has a NULL (row 2); v has a NULL (rows 4 and 6); h has none.
@@ -2363,14 +2362,19 @@ fn gpu_group_by_skips_null_aggregate_values_and_clean_errors_a_null_key() {
         return;
     }
 
-    // GROUP BY a NULL-bearing KEY -> clean error (own-group handling is a follow-up).
-    let err = e
+    // GROUP BY a NULL-bearing KEY: the NULL keys form their OWN group (rendered SqlValue::Null), which
+    // sorts first. g: 1,NULL,2,1,2 -> g=1 count 2, g=2 count 2, g=NULL count 1.
+    let gc = e
         .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("GROUP BY over a KEY column that contains NULLs"),
-        "GROUP BY a nullable key must clean-error, got: {err}"
+        .expect("GROUP BY a nullable key forms a NULL group");
+    assert_eq!(
+        gc.rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Int8(1)],
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(2)],
+        ],
+        "NULL keys form their own group (COUNT(*) counts them); it sorts first"
     );
 
     // SUM over a nullable VALUE: NULLs skipped. h=7 -> 30, h=8 -> 30 (NULL skipped), h=9 -> NULL (all-NULL).
@@ -2415,6 +2419,87 @@ fn gpu_group_by_skips_null_aggregate_values_and_clean_errors_a_null_key() {
             vec![SqlValue::Int4(9), SqlValue::Null],
         ],
         "MIN skips NULLs (not the 0 placeholder); all-NULL group is NULL"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_null_key_group_with_null_values() {
+    // M3 (doc 21): the NULL-KEY group + the value-skip + the total-count pass interact correctly. Every
+    // NULL-key row groups together (distinct from real key 0); COUNT(*) counts ALL of them (incl. a NULL-
+    // value one); SUM skips the NULL value AMONG the null-key rows. k: 1,NULL,2,NULL,1,NULL.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tk (k INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tk (k,v) VALUES (1,10),(NULL,20),(2,30),(NULL,40),(1,50),(NULL,NULL)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tk").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // k=1 -> v{10,50}: count 2, sum 60. k=2 -> v{30}: count 1, sum 30.
+    // k=NULL -> rows (NULL,20),(NULL,40),(NULL,NULL): count 3 (ALL), sum 60 (the NULL value skipped).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k, COUNT(*), SUM(v) FROM tk GROUP BY k")
+        .expect("GROUP BY a nullable key with nullable values");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Int8(3), SqlValue::Int8(60)],
+            vec![SqlValue::Int4(1), SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(1), SqlValue::Int8(30)],
+        ],
+        "NULL keys group together; COUNT(*) counts all (incl. the NULL-value row); SUM skips the NULL"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_null_key_group_with_all_null_values() {
+    // M3 (doc 21) regression: a NULL-key group whose aggregate values are ALL NULL. The value pass's
+    // reserved null slot then has count 0 — but the group MUST still appear (COUNT(*) counts the rows;
+    // SUM is NULL). The reserved slot is emitted on its CLAIMED MARKER (slot_keys != EMPTY), not count,
+    // so it appears CONSISTENTLY in every pass and the by-index merge stays aligned (else: panic / the
+    // null row silently vanishes).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tp (k INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tp (k,v) VALUES (1,10),(NULL,NULL),(2,30),(NULL,NULL),(1,50),(NULL,NULL)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tp").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // k=NULL -> 3 rows, all v NULL: COUNT(*) 3, SUM NULL. The multi-pass query is the panic case.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k, COUNT(*), SUM(v) FROM tp GROUP BY k")
+        .expect("COUNT(*)+SUM with an all-NULL-value NULL-key group");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Int8(3), SqlValue::Null],
+            vec![SqlValue::Int4(1), SqlValue::Int8(2), SqlValue::Int8(60)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(1), SqlValue::Int8(30)],
+        ],
+        "the all-NULL-value NULL-key group still appears (COUNT(*)=3, SUM=NULL), aligned across passes"
+    );
+    // SUM only (no COUNT*): the null group must NOT silently vanish.
+    let s = e
+        .execute_resident_expr_select_sql("SELECT k, SUM(v) FROM tp GROUP BY k")
+        .expect("SUM with an all-NULL-value NULL-key group");
+    assert_eq!(
+        s.rows,
+        vec![
+            vec![SqlValue::Null, SqlValue::Null],
+            vec![SqlValue::Int4(1), SqlValue::Int8(60)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(30)],
+        ],
+        "the all-NULL-value NULL-key group still appears with SUM NULL (not dropped)"
     );
 }
 

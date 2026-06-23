@@ -1543,6 +1543,7 @@ impl CudaResidentDeviceMemory {
             0,     // n_text (no text members)
             0,     // text_desc_ptr
             None,  // value_null_off (bench: non-nullable)
+            None,  // key_null_off (bench: non-nullable)
         )
     }
 
@@ -1580,6 +1581,9 @@ impl CudaResidentDeviceMemory {
         // M3 (doc 21): `Some(off)` = the VALUE column's NULL validity bitmap — a NULL value is skipped
         // from count/sum/min/max (3VL); `None` = every value valid. Uses the single-level kernel.
         value_null_off: Option<u64>,
+        // M3 (doc 21): `Some(off)` = the KEY column's NULL validity bitmap — a NULL key forms its own
+        // NULL-KEY group (rendered SqlValue::Null); `None` = every key valid.
+        key_null_off: Option<u64>,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1604,6 +1608,7 @@ impl CudaResidentDeviceMemory {
             n_text,
             text_desc_ptr,
             value_null_off,
+            key_null_off,
         )
     }
 
@@ -1645,6 +1650,7 @@ impl CudaResidentDeviceMemory {
             0, // n_text (no text members)
             0, // text_desc_ptr
             None, // value_null_off (bench: non-nullable)
+            None, // key_null_off (bench: non-nullable)
         )
     }
 
@@ -6990,6 +6996,11 @@ pub struct GroupByI32Row {
     /// `atom.cas.b128`). The engine reconstructs `SqlValue::Numeric` (mantissa = this) or
     /// `SqlValue::Uuid` (`this.to_le_bytes()` = canonical bytes). `0` for i64-key paths.
     pub key_i128: i128,
+    /// M3 (doc 21): this group is the NULL-KEY group — every row whose GROUP BY key is NULL forms ONE
+    /// group (3VL: NULLs group together, distinct from any real value). The kernel routes NULL-key rows
+    /// to a dedicated reserved slot; the engine renders this group's key as `SqlValue::Null`. `key`/
+    /// `key_i128` are a don't-care placeholder for it. `false` for every real-keyed group.
+    pub key_is_null: bool,
 }
 
 /// GROUP BY an int4 `key` column, aggregating COUNT(*) and SUM(int4 `sum`) over a filtered set of row
@@ -7033,6 +7044,11 @@ fn launch_cuda_group_by_i32_count_sum(
     // (the COUNT(*) pass + every non-nullable pass). Only the single-level kernel honors it; the engine
     // forces single-level for a nullable value, and the twolevel kernel ignores the (extra) arg.
     value_null_off: Option<u64>,
+    // M3 (doc 21) 3VL: `Some(off)` = the KEY column's NULL validity bitmap byte offset (1 = valid) — a
+    // NULL key routes to the dedicated NULL-KEY slot, forming one group rendered as SqlValue::Null.
+    // `None` = no bitmap ⇒ every key valid. Only the single-level kernel honors it; the engine passes
+    // it only for a plain int4/int8 COLUMN key (sentinel for expr/composite/text/i128 keys).
+    key_null_off: Option<u64>,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -7066,10 +7082,12 @@ fn launch_cuda_group_by_i32_count_sum(
         .and_then(usize::checked_next_power_of_two)
         .map(|n| n.max(16))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(count))?;
-    // One extra slot beyond the power-of-two hash range, dedicated to the i64::MIN key (which
-    // collides with the EMPTY sentinel and so cannot live in the hash table). The single-level kernel
-    // routes that key to index nslots; for int4 keys (no i64::MIN) it stays empty. Always allocated.
-    let alloc_slots = nslots + 1;
+    // TWO extra slots beyond the power-of-two hash range: index nslots is the dedicated i64::MIN-key slot
+    // (i64::MIN collides with the EMPTY sentinel, so it cannot live in the hash table), and index nslots+1
+    // is the M3 (doc 21) dedicated NULL-KEY group slot (the single-level kernel routes a NULL key here via
+    // `key_null_off`, forming one group). Both stay empty when unused (int4 keys / no key bitmap). Always
+    // allocated so the init/D2H cover them.
+    let alloc_slots = nslots + 2;
     let alloc_slots_u64 = alloc_slots as u64;
     let slot_bytes = alloc_slots
         .checked_mul(std::mem::size_of::<i64>())
@@ -7240,6 +7258,24 @@ fn launch_cuda_group_by_i32_count_sum(
             off
         }
     };
+    // M3 (doc 21): the KEY column's NULL validity bitmap arg, same sentinel + bounds-check as the value
+    // bitmap (the kernel reads bit `idx` for each idx in `indices`).
+    let mut a36 = match key_null_off {
+        None => u64::MAX,
+        Some(off) => {
+            let max_idx = indices.iter().copied().max().unwrap_or(0) as u64;
+            let words_bytes = (max_idx / 32 + 1)
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let end = off
+                .checked_add(words_bytes)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if end > resident.metadata().allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
+            }
+            off
+        }
+    };
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -7288,6 +7324,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a33 as *mut u64).cast::<c_void>(),
         (&mut a34 as *mut u64).cast::<c_void>(),
         (&mut a35 as *mut u64).cast::<c_void>(),
+        (&mut a36 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -7559,12 +7596,16 @@ fn launch_cuda_group_by_i32_count_sum(
                 } else {
                     0
                 },
+                key_is_null: false,
             });
         }
     }
     // The dedicated slot (index nslots) holds the i64::MIN key (== EMPTY, so it can't be detected by
     // the sentinel test above); it is occupied iff its count > 0. Empty for int4 keys.
-    if counts[nslots] > 0 {
+    // Occupied iff the kernel routed a key here and marked it USED (slot_keys = 0, != EMPTY). NOT
+    // `counts > 0`: the slot is never CAS-claimed, so a count-0 reserved group (all-NULL aggregate
+    // values) must still be emitted — consistently across EVERY pass — or the by-index merge mis-aligns.
+    if keys[nslots] != EMPTY {
         groups.push(GroupByI32Row {
             key: i64::MIN,
             count: counts[nslots],
@@ -7579,6 +7620,29 @@ fn launch_cuda_group_by_i32_count_sum(
             // The dedicated slot's i128 key (when key_is_i128) is EMPTY128 itself = i128::MIN (the
             // kernel routes that key here without writing slot_keys_i128). 0 for the i64-key paths.
             key_i128: if key_is_i128 { i128::MIN } else { 0 },
+            key_is_null: false,
+        });
+    }
+    // M3 (doc 21): the SECOND dedicated slot (index nslots+1) is the NULL-KEY group — the kernel routes
+    // every row whose GROUP BY key is NULL here (via `key_null_off`), forming ONE group. Occupied iff the
+    // kernel marked it USED (slot_keys = 0, != EMPTY) — NOT count > 0, so an all-NULL-value null group is
+    // still emitted consistently across passes. `key`/`key_i128` are a placeholder; the engine renders the
+    // key as SqlValue::Null via `key_is_null`.
+    let null_slot = nslots + 1;
+    if keys[null_slot] != EMPTY {
+        groups.push(GroupByI32Row {
+            key: 0,
+            count: counts[null_slot],
+            sum: sums[null_slot],
+            sum_hi: sum_his[null_slot],
+            min: mins[null_slot],
+            max: maxs[null_slot],
+            min_hi: min_his[null_slot],
+            max_hi: max_his[null_slot],
+            min_uuid: uuid_at(&mins_uuid, null_slot),
+            max_uuid: uuid_at(&maxs_uuid, null_slot),
+            key_i128: 0,
+            key_is_null: true,
         });
     }
     // A numeric SUM that overflowed i128 in any group/thread set this flag on-device -> PG numeric
@@ -7736,6 +7800,7 @@ fn launch_cuda_group_by_kernel_timed(
         0, // n_text = 0: the timed bench has no text members
         0, // text_desc_ptr = 0
         u64::MAX, // M3 value_null_off = sentinel (the timed bench is non-nullable -> no value skip)
+        u64::MAX, // M3 key_null_off = sentinel (the timed bench is non-nullable -> no NULL-key group)
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
@@ -7786,7 +7851,7 @@ fn launch_cuda_group_by_kernel_timed(
         if keys[i] != EMPTY {
             // min/max are placeholders here -- the timed bench only validates COUNT/SUM (the two
             // kernels intentionally differ on min/max: single-level computes them, two-level doesn't).
-            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0, min_hi: 0, max_hi: 0, min_uuid: [0u8; 16], max_uuid: [0u8; 16], key_i128: 0 });
+            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0, min_hi: 0, max_hi: 0, min_uuid: [0u8; 16], max_uuid: [0u8; 16], key_i128: 0, key_is_null: false });
         }
     }
     Ok((groups, best))
