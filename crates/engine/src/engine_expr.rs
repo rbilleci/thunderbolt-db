@@ -4758,9 +4758,11 @@ impl Engine {
             Int2(Vec<i32>),
             // Gathered straight from the 1-bit-per-row bool bitmap.
             Bool(Vec<bool>),
-            // The text VALUE is materialized host-side (the SqlValue::Text from host_rows), like the
-            // GROUP BY text result -- the GPU did the filter + the sort; this gathers the result strings.
-            Text(Vec<SqlValue>),
+            // The text VALUE is gathered ON-DEVICE from the resident payload's offsets+bytes sections
+            // (project_text_rows_from_payload) at the GPU-sorted surviving indices -- no host_rows read
+            // (the host is control plane only). A NULL/empty cell returns ""; the validity override below
+            // restores SqlValue::Null for a NULL row.
+            Text(Vec<String>),
         }
         let mut projected_columns: Vec<ProjectedColumn> =
             Vec::with_capacity(bound.selected_indexes.len());
@@ -4835,14 +4837,21 @@ impl Engine {
                     ProjectedColumn::Uuid(values)
                 }
                 SqlType::Text => {
-                    // The text VALUE is materialized host-side from the residency_entry's host rows (the
-                    // SAME generation as the GPU residency, like the GROUP BY text result), gathered at
-                    // the GPU-sorted surviving indices. The GPU did the hot path (filter + sort).
-                    let host_rows = &residency_entry.host_rows;
-                    let values: Vec<SqlValue> = indices_u64
-                        .iter()
-                        .map(|&row| host_rows[row as usize][col].clone())
-                        .collect();
+                    // Gather the text VALUE ON-DEVICE from the resident payload's offsets+bytes sections at
+                    // the GPU-sorted surviving indices -- no host_rows read (the host is control plane
+                    // only; the GPU did the filter + sort AND now materializes the strings). A NULL/empty
+                    // cell returns ""; the projected_validity override below restores SqlValue::Null.
+                    let layout = resident_device_text_column_layout(&snapshot, table, col)?;
+                    let values = device_memory
+                        .project_text_rows_from_payload(
+                            layout.offsets_byte_offset,
+                            layout.bytes_byte_offset,
+                            layout.bytes_len,
+                            &indices_u64,
+                        )
+                        .map_err(|err| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                        })?;
                     ProjectedColumn::Text(values)
                 }
                 _ => {
@@ -4861,8 +4870,8 @@ impl Engine {
         // nullable column's device value is a 0/empty PLACEHOLDER for a NULL row, so the result must emit
         // SqlValue::Null there. The validity bitmap is 1-bit-per-row like a bool column, so the bool
         // projector gathers it at the surviving indices. `None` = the column holds no NULLs (all valid),
-        // so non-nullable projections are unchanged. (Text already reads SqlValue::Null from host_rows;
-        // the override below is idempotent for it.)
+        // so non-nullable projections are unchanged. (Text's device gather returns "" for a NULL cell, so
+        // this override is what restores its SqlValue::Null.)
         let projected_validity: Vec<Option<Vec<bool>>> = bound
             .selected_indexes
             .iter()
@@ -4905,8 +4914,9 @@ impl Engine {
                             // The stored i32 is a widened i16, so the narrowing is exact.
                             ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
                             ProjectedColumn::Bool(values) => SqlValue::Bool(values[row]),
-                            // Already a SqlValue::Text from host_rows; clone it through.
-                            ProjectedColumn::Text(values) => values[row].clone(),
+                            // Device-gathered String; a NULL row was already handled by the validity
+                            // override above, so a bare value here is a real (possibly empty) string.
+                            ProjectedColumn::Text(values) => SqlValue::Text(values[row].clone()),
                         }
                     })
                     .collect()
