@@ -648,6 +648,98 @@ fn gpu_resident_expr_order_by_places_nulls_per_pg_default() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_order_by_nullable_text_numeric_uuid_keys_place_nulls() {
+    // M3 (doc 21): ORDER BY a SOLE nullable TEXT / NUMERIC / UUID key places NULLs at PG's default end
+    // (last ASC, first DESC) — the host-partition wrapper pulls NULL rows out, the on-device hetero sort
+    // orders the rest, then NULLs are placed. Without it the hetero comparator would mis-place NULLs (it
+    // reads the placeholder, not the validity bitmap).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tonull (k TEXT, n NUMERIC(10,2), u UUID)").unwrap();
+    let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
+    e.execute_text(
+        2,
+        &format!(
+            "INSERT INTO tonull (k,n,u) VALUES \
+             ('b',2.50,'{}'),(NULL,NULL,NULL),('a',1.50,'{}'),(NULL,NULL,NULL),('c',3.50,'{}')",
+            uuid_for(2),
+            uuid_for(1),
+            uuid_for(3),
+        ),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tonull").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let uuid = |i: i64| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(&uuid_for(i)).expect("uuid"));
+
+    // TEXT ASC: 'a','b','c' then NULLs last.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k FROM tonull ORDER BY k")
+        .expect("ORDER BY nullable text ASC");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Text("a".to_string())],
+            vec![SqlValue::Text("b".to_string())],
+            vec![SqlValue::Text("c".to_string())],
+            vec![SqlValue::Null],
+            vec![SqlValue::Null],
+        ],
+        "ORDER BY nullable text ASC: non-NULL ascending then NULLs last"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // TEXT DESC: NULLs first then 'c','b','a'.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT k FROM tonull ORDER BY k DESC")
+        .expect("ORDER BY nullable text DESC");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null],
+            vec![SqlValue::Null],
+            vec![SqlValue::Text("c".to_string())],
+            vec![SqlValue::Text("b".to_string())],
+            vec![SqlValue::Text("a".to_string())],
+        ],
+        "ORDER BY nullable text DESC: NULLs first then non-NULL descending"
+    );
+
+    // NUMERIC ASC: 1.50, 2.50, 3.50 then NULLs last.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT n FROM tonull ORDER BY n")
+        .expect("ORDER BY nullable numeric ASC");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Numeric(Decimal128::new(150, 2))],
+            vec![SqlValue::Numeric(Decimal128::new(250, 2))],
+            vec![SqlValue::Numeric(Decimal128::new(350, 2))],
+            vec![SqlValue::Null],
+            vec![SqlValue::Null],
+        ],
+        "ORDER BY nullable numeric ASC: non-NULL ascending then NULLs last"
+    );
+
+    // UUID DESC: NULLs first then ..03, ..02, ..01.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT u FROM tonull ORDER BY u DESC")
+        .expect("ORDER BY nullable uuid DESC");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Null],
+            vec![SqlValue::Null],
+            vec![uuid(3)],
+            vec![uuid(2)],
+            vec![uuid(1)],
+        ],
+        "ORDER BY nullable uuid DESC: NULLs first then non-NULL descending"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_select_evaluates_deep_arithmetic_tree_via_vm() {
     // A DEEPER arithmetic tree than the 2-col fast-path — `WHERE (a + b) * 2 - 5 > K` — routes
     // through the engine's Expr compiler -> device bytecode VM (not the peephole), evaluated and

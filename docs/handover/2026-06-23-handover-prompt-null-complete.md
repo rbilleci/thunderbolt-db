@@ -55,10 +55,14 @@ Run `git checkout main && git pull` for the latest.
   panic: COUNT(DISTINCT) over a nullable key now clean-errors (its sub-passes don't route the NULL key). HAZARD
   passed (3× + concurrent). **A nullable COMPOSITE / EXPRESSION key + COUNT(DISTINCT)-over-nullable-key still
   clean-error.**
+- **ORDER BY nullable text/numeric/uuid key** — a SOLE nullable text/numeric/uuid sort key now places NULLs at
+  PG's default end (last ASC / first DESC) via a host-partition (pull NULL rows out, GPU-sort the rest, place
+  NULLs). Both paths (resident `execute_resident_expr_select_with_binding` + host `gpu_sort_result_rows`).
+  HOST-ONLY. Multi-key NULL hetero + nullable sort EXPRESSION + explicit NULLS FIRST/LAST still clean-error.
 **REMAINING Track A:** A.2 tail (nullable COMPOSITE / EXPRESSION GROUP BY key — per-member/derived NULL encoding,
 not one reserved slot; + route the NULL key through the COUNT(DISTINCT) sub-passes);
-A.4 (text/numeric/uuid ORDER BY key NULLs + explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field
-through ~20 ctors incl. the legacy protocol crate] + nullable sort expr); A.5 (N-way multi-way OUTER joins).
+A.4 tail (explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field through ~20 ctors incl. the legacy
+protocol crate] + nullable sort EXPRESSION + multi-key NULL hetero placement); A.5 (N-way multi-way OUTER joins).
 
 **What landed last session (2026-06-23) — NULL (M3) is now substantially complete, ~12 independently-audited
 slices merged.** Representation + storage + ingest + the GPU 3VL data path:
