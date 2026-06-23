@@ -1234,8 +1234,20 @@ impl CudaResidentDeviceMemory {
         // A separate per-row buffer for a DERIVED wide-key member (the expression group key), read by
         // descriptor kinds 4 (i32) / 5 (i64). 0 when the wide key has only column members.
         derived_ptr: u64,
+        // M3 (doc 21) per-member NULL validity (nullable composite GROUP BY key). EMPTY = no validity (the
+        // wide key has no trailing validity word; byte-identical to the pre-M3 path). Else one u64 per
+        // member: u64::MAX = a non-nullable member; otherwise the member's validity-bitmap byte offset.
+        // The caller must size `wbytes` to include the trailing 8-byte validity word when this is non-empty.
+        validity_descs: &[u64],
     ) -> Result<DeviceArithBuffer<'_>, CudaRuntimeProbeError> {
-        launch_cuda_build_wide_key_device(self, descriptors, wbytes, n_rows, derived_ptr)
+        launch_cuda_build_wide_key_device(
+            self,
+            descriptors,
+            wbytes,
+            n_rows,
+            derived_ptr,
+            validity_descs,
+        )
     }
 
     /// Upload a small u64 array to device for the general-composite GROUP BY claim's TEXT-member
@@ -14911,6 +14923,8 @@ fn launch_cuda_build_wide_key_device<'r>(
     // A separate per-row buffer for a DERIVED member (the expression group key); read by descriptor
     // kinds 4 (i32) / 5 (i64). 0 when the wide key has only column members.
     derived_ptr: u64,
+    // M3 (doc 21): per-member NULL validity offsets (EMPTY = none). See the wrapper's doc.
+    validity_descs: &[u64],
 ) -> Result<DeviceArithBuffer<'r>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -14961,6 +14975,15 @@ fn launch_cuda_build_wide_key_device<'r>(
     ptx.push(0);
     let kernel_fn = primary.cached_function(c"gpu_db_build_wide_key", &ptx)?;
     let desc_dev = primary.lease_device_buffer(desc_bytes)?;
+    // M3 (doc 21): the per-member validity offsets (one u64 per member). Leased + uploaded only when
+    // present (nullable composite); else `vdesc_ptr` stays 0 (the kernel skips all validity handling).
+    let vdesc_bytes = std::mem::size_of_val(validity_descs);
+    let vdesc_dev = if vdesc_bytes > 0 {
+        Some(primary.lease_device_buffer(vdesc_bytes)?)
+    } else {
+        None
+    };
+    let vdesc_ptr = vdesc_dev.as_ref().map_or(0, |b| b.ptr);
     let out = primary.lease_device_buffer(out_bytes)?;
     const BLOCK: u32 = 256;
     let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -14976,6 +14999,19 @@ fn launch_cuda_build_wide_key_device<'r>(
         if rc != 0 {
             return rc;
         }
+        if let Some(vdev) = &vdesc_dev {
+            let rc = unsafe {
+                htod_async(
+                    vdev.ptr,
+                    validity_descs.as_ptr().cast::<c_void>(),
+                    vdesc_bytes,
+                    stream,
+                )
+            };
+            if rc != 0 {
+                return rc;
+            }
+        }
         let mut a0 = resident.device_ptr();
         let mut a1 = desc_dev.ptr;
         let mut a2 = n_members;
@@ -14983,6 +15019,7 @@ fn launch_cuda_build_wide_key_device<'r>(
         let mut a4 = n;
         let mut a5 = out.ptr;
         let mut a6 = derived_ptr;
+        let mut a7 = vdesc_ptr;
         let mut args = [
             (&mut a0 as *mut u64).cast::<c_void>(),
             (&mut a1 as *mut u64).cast::<c_void>(),
@@ -14991,6 +15028,7 @@ fn launch_cuda_build_wide_key_device<'r>(
             (&mut a4 as *mut u64).cast::<c_void>(),
             (&mut a5 as *mut u64).cast::<c_void>(),
             (&mut a6 as *mut u64).cast::<c_void>(),
+            (&mut a7 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(

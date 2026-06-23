@@ -1111,6 +1111,67 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_nullable_composite_key_per_member_null_on_device() {
+    // M3 (doc 21): GROUP BY a COMPOSITE key (`a, b`) with nullable members. Per-member NULL is encoded in
+    // the wide key (a trailing validity word written ON-DEVICE by gpu_db_build_wide_key), so (NULL,5),
+    // (1,5), (NULL,6), (NULL,NULL), (1,NULL) are all DISTINCT groups, each member rendered SqlValue::Null
+    // from the representative row. A nullable composite routes to the wide-key path (the i64 pack has no
+    // room for validity).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES (1,5),(NULL,5),(1,5),(NULL,6),(NULL,NULL),(1,NULL)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let groups = |rows: &[Vec<SqlValue>]| -> Vec<(Option<i32>, Option<i32>, i64)> {
+        let opt = |v: &SqlValue| match v {
+            SqlValue::Int4(x) => Some(*x),
+            SqlValue::Null => None,
+            o => panic!("unexpected key {o:?}"),
+        };
+        let mut v: Vec<(Option<i32>, Option<i32>, i64)> = rows
+            .iter()
+            .map(|r| {
+                let c = match r[2] {
+                    SqlValue::Int8(x) => x,
+                    SqlValue::Int4(x) => i64::from(x),
+                    ref o => panic!("unexpected count {o:?}"),
+                };
+                (opt(&r[0]), opt(&r[1]), c)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let r = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b")
+        .expect("GROUP BY a nullable composite key");
+    assert_eq!(
+        groups(&r.rows),
+        vec![
+            (None, None, 1),       // (NULL, NULL)
+            (None, Some(5), 1),    // (NULL, 5)
+            (None, Some(6), 1),    // (NULL, 6)
+            (Some(1), None, 1),    // (1, NULL)
+            (Some(1), Some(5), 2), // (1, 5) x2
+        ],
+        "composite NULL members form distinct groups: (NULL,5) != (1,5) != (NULL,6) != (NULL,NULL) != (1,NULL)"
+    );
+    // COUNT(DISTINCT) over a nullable composite key clean-errors (its dedup sub-pass builds the wide key
+    // without validity, so it would merge NULL with a real value) -- a clean error, not a wrong answer.
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a, b")
+            .is_err(),
+        "COUNT(DISTINCT) over a nullable composite key clean-errors"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
     // M3 (doc 21): GROUP BY a NULLABLE int4 EXPRESSION (`a + b`, b non-null) -- the rows where a is NULL
     // (so a+b is NULL) form their OWN group, rendered SqlValue::Null. Reuses the single-column NULL-key

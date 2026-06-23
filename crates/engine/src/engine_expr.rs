@@ -454,7 +454,9 @@ fn composite_group_count_reps(
     let _kbuf;
     let key_base_override = if comp_w > 0 {
         let buf = device_memory
-            .build_wide_key_device(&descriptors, comp_w, row_count, derived_ptr)
+            // COUNT(DISTINCT) reps are over non-NULL keys (a nullable group key with COUNT(DISTINCT)
+            // clean-errors upstream), so no per-member validity here.
+            .build_wide_key_device(&descriptors, comp_w, row_count, derived_ptr, &[])
             .map_err(map_err)?;
         let ptr = buf.device_ptr();
         _kbuf = Some(buf);
@@ -2876,6 +2878,30 @@ impl Engine {
                     )
                 )
             });
+            // M3 (doc 21): a COMPOSITE GROUP BY key (`GROUP BY a, b`) with a nullable member groups via the
+            // general wide-key path with PER-MEMBER NULL validity (gpu_db_build_wide_key writes a trailing
+            // validity word; the claim hashes + memcmps it, so (NULL,5) != (0,5) != (NULL,6) are distinct).
+            // A nullable TEXT member is a clean-error follow-up (text NULL in the wide key needs the text
+            // descriptor's verify to be NULL-aware). Detected here so the routing + clean-error below agree.
+            let composite_key_has_null = if group_key_columns.len() >= 2 {
+                let mut any = false;
+                for name in group_key_columns {
+                    let idx = relational_column_index(table, name)?;
+                    if resident_device_null_column_offset(&snapshot, table, idx)?.is_some() {
+                        if matches!(table.columns[idx].ty, SqlType::Text) {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "GROUP BY a composite key with a nullable TEXT member is a follow-up on \
+                                 the GPU (M3 3VL; a nullable fixed-width member is supported)"
+                                    .to_string(),
+                            )));
+                        }
+                        any = true;
+                    }
+                }
+                any
+            } else {
+                false
+            };
             // M3 (doc 21): an EXPRESSION group key (`a + b`) is NULL exactly when an operand is NULL. If it
             // references EXACTLY ONE nullable operand column, the expression's NULL group IS that column's
             // NULL rows, so reuse the single-column NULL-key reserved slot (pass_key_null_off = that
@@ -2901,7 +2927,10 @@ impl Engine {
             } else {
                 None
             };
-            if !key_is_single_nullable_column && expr_key_single_null_off.is_none() {
+            if !key_is_single_nullable_column
+                && expr_key_single_null_off.is_none()
+                && !composite_key_has_null
+            {
                 let mut group_by_key_check: Vec<usize> = Vec::new();
                 if let Some(expr) = group_key_expr {
                     collect_expr_columns(expr, &mut group_by_key_check);
@@ -2915,11 +2944,11 @@ impl Engine {
                 for col in group_by_key_check {
                     if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "GROUP BY over a nullable COMPOSITE KEY (or an EXPRESSION key over >1 nullable \
-                             operand, or a bool key) is not yet supported on the GPU (M3 3VL follow-up: it \
-                             needs per-member / derived NULL encoding, not a single reserved slot; a single \
-                             int/date/timestamp/text/numeric/uuid column key, or an expression over exactly \
-                             one nullable operand, is supported)"
+                            "GROUP BY over an EXPRESSION key with >1 nullable operand (or a bool key) is \
+                             not yet supported on the GPU (M3 3VL follow-up: it needs a DERIVED NULL \
+                             encoding; a single int/date/timestamp/text/numeric/uuid column key, a \
+                             composite of fixed-width members, or an expression over exactly one nullable \
+                             operand, is supported)"
                                 .to_string(),
                         )));
                     }
@@ -2978,9 +3007,11 @@ impl Engine {
             } else {
                 None
             };
-            // 2-member fast path: both fixed-int, OR exactly one text + one fixed-int.
+            // 2-member fast path: both fixed-int, OR exactly one text + one fixed-int. A NULLABLE composite
+            // takes the general WIDE-KEY path instead (composite_cols = None) -- the i64/i128 pack has no
+            // room for a per-member validity bit, but the wide key carries a validity word.
             let composite_cols: Option<(usize, SqlType, usize, SqlType)> = match &composite_members {
-                Some(m) if m.len() == 2 => {
+                Some(m) if m.len() == 2 && !composite_key_has_null => {
                     let (c0, t0) = m[0];
                     let (c1, t1) = m[1];
                     let two_fixed = is_fixed_int(t0) && is_fixed_int(t1);
@@ -3160,13 +3191,17 @@ impl Engine {
             // the fixed buffer). 0 when not a wide-key composite OR a pure all-text composite. Drives
             // comp_w on the GROUP BY launch + the build descriptors.
             let widekey_w: u64 = widekey_cols.as_ref().map_or(0, |m| {
-                m.iter()
+                let fixed: u64 = m
+                    .iter()
                     .map(|&(_, t)| match t {
                         SqlType::Numeric { .. } | SqlType::Uuid => 16,
                         SqlType::Text => 0,
                         _ => 8,
                     })
-                    .sum()
+                    .sum();
+                // M3 (doc 21): a nullable composite reserves a trailing 8-byte validity word (bit per fixed
+                // member). gpu_db_build_wide_key writes it at widekey_w-8; the claim memcmps all widekey_w.
+                fixed + if composite_key_has_null { 8 } else { 0 }
             });
             // GROUP BY <expression>: materialize the expr ONCE over all rows into a resident device key
             // buffer (checked overflow -> PG error) + hold it alive across EVERY pass; key_base_override
@@ -3281,6 +3316,9 @@ impl Engine {
                     // (comp_w = widekey_w). The result reads each member from the rep row.
                     let members = widekey_cols.as_ref().expect("composite_is_widekey");
                     let mut descriptors: Vec<(u64, u64, u64)> = Vec::with_capacity(members.len());
+                    // M3 (doc 21): per-FIXED-member NULL validity offsets, lockstep with `descriptors`
+                    // (text members are skipped in both). Empty unless the composite is nullable.
+                    let mut validity_descs: Vec<u64> = Vec::new();
                     let mut dst_off: u64 = 0;
                     for &(idx, ty) in members {
                         let (kind, src_off, w) = match ty {
@@ -3309,10 +3347,22 @@ impl Engine {
                             ),
                         };
                         descriptors.push((kind, src_off, dst_off));
+                        if composite_key_has_null {
+                            validity_descs.push(
+                                resident_device_null_column_offset(&snapshot, table, idx)?
+                                    .unwrap_or(u64::MAX),
+                            );
+                        }
                         dst_off += w;
                     }
                     let buf = device_memory
-                        .build_wide_key_device(&descriptors, widekey_w, row_count, 0)
+                        .build_wide_key_device(
+                            &descriptors,
+                            widekey_w,
+                            row_count,
+                            0,
+                            &validity_descs,
+                        )
                         .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
                     let ptr = buf.device_ptr();
                     _derived_key_buf = Some(buf);
@@ -3431,8 +3481,12 @@ impl Engine {
             // count_distinct_groups) do NOT route the NULL key to the reserved slot, so they merge NULL-key
             // rows into the placeholder group -> fewer groups than the reference (direct) pass, whose null
             // group IS routed -> the by-index pass merge mis-aligns / panics. Reject cleanly rather than
-            // panic or mis-answer. (This guard also covers the pre-existing nullable-INT-key case.)
-            if pass_key_null_off.is_some()
+            // panic or mis-answer. (This guard also covers the pre-existing nullable-INT-key case.) A
+            // nullable COMPOSITE key has the same hole: composite_group_count_reps builds its step-1 dedup
+            // wide key with NO validity (it would merge (NULL,5) with (0,5)) while step-2 re-groups with the
+            // validity-bearing wide key -> a misaligned / dropped group. So clean-error it too (the
+            // non-DISTINCT nullable-composite aggregates above are fully supported).
+            if (pass_key_null_off.is_some() || composite_key_has_null)
                 && aggregates
                     .iter()
                     .any(|a| a.kind == GroupedAggKind::CountDistinct)

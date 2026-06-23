@@ -3587,7 +3587,14 @@ done_widen:
     // A SEPARATE per-row buffer for a DERIVED member (the expression group key, materialized into its
     // own i32/i64 buffer): kind 4 reads it as i32 (sign-extend -> i64), kind 5 as i64. 0 = no derived
     // member (every column-only wide key). src_off is unused for kinds 4/5 (the base is derived_ptr).
-    .param .u64 derived_ptr
+    .param .u64 derived_ptr,
+    // M3 (doc 21): per-member NULL validity. 0 = no validity (every member valid -- byte-identical to the
+    // pre-M3 wide key, wbytes unchanged). Else n_members u64 entries: u64::MAX = a non-nullable member;
+    // otherwise the member's validity-bitmap byte offset in the resident payload. A NULL member's value
+    // bytes are zeroed and its bit left clear; a per-row validity WORD (bit m = member m valid) is written
+    // at out[row*wbytes + wbytes-8] (the caller reserves that trailing 8-byte slot). The wide-key claim
+    // hashes + memcmps all wbytes, so the validity word makes (NULL,5) != (0,5) != (NULL,6) distinct.
+    .param .u64 validity_desc_ptr
 )
 {
     .reg .pred %p;
@@ -3620,6 +3627,10 @@ done_widen:
     .reg .u64 %dst;
     .reg .u64 %v;
     .reg .u64 %vhi;
+    .reg .u64 %vdp;
+    .reg .u64 %voff;
+    .reg .u64 %vword;
+    .reg .u64 %vsent;
 
     ld.param.u64 %rp, [resident_ptr];
     ld.param.u64 %descp, [desc_ptr];
@@ -3628,6 +3639,8 @@ done_widen:
     ld.param.u64 %n, [n];
     ld.param.u64 %out, [out_ptr];
     ld.param.u64 %derived, [derived_ptr];
+    ld.param.u64 %vdp, [validity_desc_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
     mov.u32 %bid, %ctaid.x;
@@ -3641,6 +3654,7 @@ loop_widekey:
     @%p bra done_widekey;
     mul.lo.u64 %rowbase, %i, %wb;
     add.u64 %rowbase, %out, %rowbase;
+    mov.u64 %vword, 0;
     mov.u64 %m, 0;
 wk_member:
     setp.ge.u64 %p, %m, %nm;
@@ -3652,6 +3666,41 @@ wk_member:
     ld.global.u64 %srcoff, [%dbase+8];
     ld.global.u64 %dstoff, [%dbase+16];
     add.u64 %dst, %rowbase, %dstoff;
+    // M3 (doc 21): per-member NULL validity (only when validity_desc_ptr != 0). A NULL member zeroes its
+    // value bytes and leaves bit m clear; a valid (or non-nullable) member sets bit m in %vword.
+    setp.eq.u64 %p, %vdp, 0;
+    @%p bra wk_dispatch;
+    mul.lo.u64 %o, %m, 8;
+    add.u64 %src, %vdp, %o;
+    ld.global.u64 %voff, [%src];
+    setp.eq.u64 %p, %voff, %vsent;
+    @%p bra wk_setvalid;                // non-nullable member -> valid
+    shr.u64 %o, %i, 5;
+    mul.lo.u64 %o, %o, 4;
+    add.u64 %src, %rp, %voff;
+    add.u64 %src, %src, %o;
+    ld.global.u32 %w0, [%src];
+    and.b64 %o, %i, 31;
+    cvt.u32.u64 %w1, %o;
+    shr.u32 %w0, %w0, %w1;
+    and.b32 %w0, %w0, 1;
+    setp.eq.u32 %p, %w0, 0;
+    @%p bra wk_nullmember;              // validity bit 0 -> NULL member
+wk_setvalid:
+    cvt.u32.u64 %w1, %m;
+    mov.u64 %v, 1;
+    shl.b64 %v, %v, %w1;
+    or.b64 %vword, %vword, %v;
+    bra wk_dispatch;
+wk_nullmember:
+    // NULL member: write zeroed value bytes (16 for kind 2 numeric/uuid, else 8); bit m stays clear.
+    mov.u64 %v, 0;
+    st.global.u64 [%dst], %v;
+    setp.eq.u64 %p, %kind, 2;
+    @!%p bra wk_member_next;
+    st.global.u64 [%dst+8], %v;
+    bra wk_member_next;
+wk_dispatch:
     setp.eq.u64 %p, %kind, 5;
     @%p bra wk_dervi64;
     setp.eq.u64 %p, %kind, 4;
@@ -3731,6 +3780,14 @@ wk_member_next:
     add.u64 %m, %m, 1;
     bra wk_member;
 wk_member_done:
+    // M3 (doc 21): write the per-row validity WORD into the reserved trailing slot (only when validity is
+    // tracked). It is part of the wbytes the claim hashes + memcmps, so NULL/non-NULL members are distinct.
+    setp.eq.u64 %p, %vdp, 0;
+    @%p bra wk_no_vword;
+    sub.u64 %o, %wb, 8;
+    add.u64 %addr, %rowbase, %o;
+    st.global.u64 [%addr], %vword;
+wk_no_vword:
     add.u64 %i, %i, %stride;
     bra loop_widekey;
 done_widekey:
