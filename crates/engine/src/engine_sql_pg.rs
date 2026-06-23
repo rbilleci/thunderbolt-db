@@ -104,12 +104,13 @@ impl Engine {
             let aliases: Vec<&str> = relations.iter().map(|r| r.alias.as_str()).collect();
             let (steps, predicates) =
                 plan_comma_join_where(stmt.where_clause.as_deref(), &relations, &tables, &aliases)?;
-            let (order_by, limit, offset) = parse_join_order_by_limit(&stmt)?;
+            let (order_by, order_by_nulls_first, limit, offset) = parse_join_order_by_limit(&stmt)?;
             let plan = JoinPlan {
                 relations,
                 steps,
                 projection,
                 order_by,
+                order_by_nulls_first,
                 limit,
                 offset,
             };
@@ -608,12 +609,13 @@ fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
         ));
     }
     let projection = parse_join_projection(stmt)?;
-    let (order_by, limit, offset) = parse_join_order_by_limit(stmt)?;
+    let (order_by, order_by_nulls_first, limit, offset) = parse_join_order_by_limit(stmt)?;
     Ok(JoinPlan {
         relations,
         steps,
         projection,
         order_by,
+        order_by_nulls_first,
         limit,
         offset,
     })
@@ -641,13 +643,22 @@ fn reject_unsupported_join_clauses(stmt: &SelectStmt) -> Result<(), ExecuteError
 /// Parse a join's ORDER BY / LIMIT / OFFSET. ORDER BY keys are PLAIN columns only (qualified or not -- the
 /// executor resolves them to a projected result column and sorts on the GPU); an arithmetic / aggregate
 /// sort expression on the join path is a follow-up. LIMIT / OFFSET are non-negative integer literals.
-/// Explicit NULLS FIRST/LAST on the join result is a follow-up (clean-errored, not silently ignored; the
-/// default placement is on-device). Shared by explicit + comma joins.
-#[allow(clippy::type_complexity)] // (ORDER BY keys, LIMIT, OFFSET) -- a plain 3-tuple, naming it adds noise
+/// Explicit NULLS FIRST/LAST is captured per key (`nulls_first`) and honored on-device by the join-result
+/// GPU sort. Shared by explicit + comma joins.
+#[allow(clippy::type_complexity)] // (keys, nulls_first, LIMIT, OFFSET) -- a plain tuple, naming it adds noise
 fn parse_join_order_by_limit(
     stmt: &SelectStmt,
-) -> Result<(Vec<(JoinColRef, bool)>, Option<usize>, Option<usize>), ExecuteError> {
+) -> Result<
+    (
+        Vec<(JoinColRef, bool)>,
+        Vec<Option<bool>>,
+        Option<usize>,
+        Option<usize>,
+    ),
+    ExecuteError,
+> {
     let mut order_by = Vec::with_capacity(stmt.sort_clause.len());
+    let mut nulls_first = Vec::with_capacity(stmt.sort_clause.len());
     for item in &stmt.sort_clause {
         let NodeEnum::SortBy(sort_by) = node_enum(item)? else {
             return Err(sql_pg_error("malformed ORDER BY clause".to_string()));
@@ -656,21 +667,21 @@ fn parse_join_order_by_limit(
             .node
             .as_deref()
             .ok_or_else(|| sql_pg_error("ORDER BY key has no expression".to_string()))?;
-        if sort_by.sortby_nulls == SortByNulls::SortbyNullsFirst as i32
-            || sort_by.sortby_nulls == SortByNulls::SortbyNullsLast as i32
-        {
-            return Err(sql_pg_error(
-                "explicit NULLS FIRST/LAST on a join ORDER BY is a follow-up (the default NULL \
-                 placement is supported)"
-                    .to_string(),
-            ));
-        }
         let descending = sort_by.sortby_dir == SortByDir::SortbyDesc as i32;
         order_by.push((parse_join_col_ref(node)?, descending));
+        nulls_first.push(
+            if sort_by.sortby_nulls == SortByNulls::SortbyNullsFirst as i32 {
+                Some(true)
+            } else if sort_by.sortby_nulls == SortByNulls::SortbyNullsLast as i32 {
+                Some(false)
+            } else {
+                None
+            },
+        );
     }
     let limit = parse_limit(&stmt.limit_count)?;
     let offset = parse_limit(&stmt.limit_offset)?;
-    Ok((order_by, limit, offset))
+    Ok((order_by, nulls_first, limit, offset))
 }
 
 /// Parse the SELECT target list into join projection items (plain columns / `*` / `alias.*`); non-empty.

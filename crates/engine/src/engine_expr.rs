@@ -190,6 +190,9 @@ pub(crate) struct JoinPlan {
     /// ORDER BY keys (plain columns only, each `(column, descending)`) applied to the join RESULT via a
     /// GPU sort. Every key must appear in `projection` (a non-projected ORDER BY key is a follow-up).
     pub order_by: Vec<(JoinColRef, bool)>,
+    /// Parallel to `order_by`: the explicit NULLS FIRST/LAST override per key (M3 -- doc 21; `None` = PG
+    /// default). Honored ON-DEVICE by the join-result GPU sort.
+    pub order_by_nulls_first: Vec<Option<bool>>,
     /// LIMIT / OFFSET sliced off the (sorted) join result. `None` = unbounded / from row 0.
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -2508,9 +2511,15 @@ impl Engine {
                 order.push((idx, *descending));
             }
             let col_types: Vec<SqlType> = columns.iter().map(|col| col.ty).collect();
-            // The join path takes PG's DEFAULT NULL placement (explicit NULLS FIRST/LAST on a join ORDER BY
-            // is clean-errored at parse): no per-key override.
-            result_rows = gpu_sort_result_rows(result_rows, &order, &[], &col_types, sides[0].1.mem())?;
+            // Explicit NULLS FIRST/LAST on a join ORDER BY is honored on-device (an int8/timestamp result
+            // column with an explicit override clean-errors inside the helper, as for the grouped path).
+            result_rows = gpu_sort_result_rows(
+                result_rows,
+                &order,
+                &plan.order_by_nulls_first,
+                &col_types,
+                sides[0].1.mem(),
+            )?;
         }
         if plan.offset.is_some() || plan.limit.is_some() {
             let start = plan.offset.unwrap_or(0).min(result_rows.len());

@@ -1351,16 +1351,58 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
 }
 
 #[test]
-fn join_order_by_explicit_nulls_first_last_is_a_clean_error() {
-    // Explicit NULLS FIRST/LAST on a join ORDER BY is clean-errored at parse (not silently dropped); the
-    // default placement is supported. Parse-time, so no GPU needed.
-    let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE a (id INT, n TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE b (id INT, m TEXT)").unwrap();
-    let err = e.execute_resident_expr_select_sql(
-        "SELECT a.n FROM a JOIN b ON a.id = b.id ORDER BY a.id NULLS FIRST",
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_join_order_by_explicit_nulls_first_last_on_device() {
+    // M3 (doc 21): explicit NULLS FIRST/LAST on a JOIN-result ORDER BY, honored ON-DEVICE via
+    // gpu_sort_result_rows (the override is threaded through JoinPlan.order_by_nulls_first). A LEFT join
+    // pads the unmatched row's x to NULL; the override places it.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, n TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id,n) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,x) VALUES (1,5),(2,7)").unwrap();
+    for t in ["l", "r"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let rows = |res: &RelationalSelectResult| -> Vec<(String, Option<i32>)> {
+        res.rows
+            .iter()
+            .map(|r| {
+                let n = match &r[0] {
+                    SqlValue::Text(t) => t.clone(),
+                    o => panic!("unexpected {o:?}"),
+                };
+                let x = match r[1] {
+                    SqlValue::Int4(v) => Some(v),
+                    SqlValue::Null => None,
+                    ref o => panic!("unexpected {o:?}"),
+                };
+                (n, x)
+            })
+            .collect()
+    };
+    // result: (a,5),(b,7),(c,NULL). ORDER BY x NULLS FIRST overrides the ASC default -> NULL (c) first.
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT n, x FROM l LEFT JOIN r ON l.id = r.rid ORDER BY x NULLS FIRST",
+        )
+        .expect("join ORDER BY x NULLS FIRST");
+    assert_eq!(
+        rows(&res),
+        vec![("c".into(), None), ("a".into(), Some(5)), ("b".into(), Some(7))],
+        "join ORDER BY x NULLS FIRST places the NULL-padded row first"
     );
-    assert!(err.is_err(), "explicit NULLS FIRST on a join ORDER BY is a clean error");
+    // Default ASC = NULLS LAST.
+    let res = e
+        .execute_resident_expr_select_sql("SELECT n, x FROM l LEFT JOIN r ON l.id = r.rid ORDER BY x")
+        .expect("join ORDER BY x default");
+    assert_eq!(
+        rows(&res),
+        vec![("a".into(), Some(5)), ("b".into(), Some(7)), ("c".into(), None)],
+        "join ORDER BY x default = NULLS LAST"
+    );
 }
 
 #[test]
