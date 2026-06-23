@@ -242,15 +242,18 @@ pub(crate) fn gpu_sort_result_rows(
     let mut classified: Vec<(usize, u8)> = Vec::with_capacity(order.len());
     for &(idx, _desc) in order {
         let kind = match col_types[idx] {
-            SqlType::Int4 | SqlType::Int8 | SqlType::Int2 | SqlType::Date | SqlType::Timestamp => 0u8,
+            // Bool sorts as its 0/1 ordinal in the int matrix (false < true), like the host key_cmp did.
+            SqlType::Int4
+            | SqlType::Int8
+            | SqlType::Int2
+            | SqlType::Date
+            | SqlType::Timestamp
+            | SqlType::Bool => 0u8,
             SqlType::Text => 1,
             SqlType::Numeric { .. } => 2,
             SqlType::Uuid => 3,
-            other => {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "ORDER BY on a {other:?} result column is not yet supported"
-                ))));
-            }
+            // Exhaustive over SqlType: every result-column type is now sortable on-device. A new SqlType
+            // must be classified here (compile error otherwise) rather than silently falling through.
         };
         classified.push((idx, kind));
     }
@@ -276,6 +279,7 @@ pub(crate) fn gpu_sort_result_rows(
                     SqlValue::Int4(v) | SqlValue::Date(v) => i64::from(v),
                     SqlValue::Int2(v) => i64::from(v),
                     SqlValue::Int8(v) | SqlValue::Timestamp(v) => v,
+                    SqlValue::Bool(b) => i64::from(b),
                     SqlValue::Null => 0,
                     _ => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -3956,9 +3960,16 @@ impl Engine {
                     _ => i64_key(a).cmp(&i64_key(b)),
                 }
             };
-            for pass in &mut passes {
-                pass.groups
-                    .sort_by(|a, b| key_cmp(&materialize_key(a), &materialize_key(b)));
+            // Pass-alignment (charter debt #30): the ONLY purpose of this host re-sort is to align
+            // MULTIPLE passes by group, because each pass's race-dependent compaction order differs. A
+            // single pass needs no alignment -- its groups are internally consistent -- and the result
+            // order is decided ON-DEVICE below (gpu_sort_result_rows). So skip the host sort for <=1 pass.
+            // Multi-pass alignment moves on-device in S2.2; until then it stays here for >1 pass.
+            if passes.len() > 1 {
+                for pass in &mut passes {
+                    pass.groups
+                        .sort_by(|a, b| key_cmp(&materialize_key(a), &materialize_key(b)));
+                }
             }
             // Merge the (now key-aligned) passes by group index into N+1 columns [key, agg_1, .., agg_N].
             // COUNT reads the group's row count from the reference pass; each other aggregate projects
@@ -4108,30 +4119,11 @@ impl Engine {
                 }
                 rows.push(row);
             }
-            // Deterministic default order. A single-key result is already key-sorted (the pass sort
-            // above); a COMPOSITE result orders by the FULL tuple (both group columns) -- necessary for
-            // a (fixed, text) composite whose per-pass order is rep-row (race) based, and natural for
-            // packed composites too.
-            if is_composite_key {
-                rows.sort_by(|a, b| key_cmp(&a[0], &b[0]).then_with(|| key_cmp(&a[1], &b[1])));
-            } else if let Some(members) = &widekey_cols {
-                // Wide-key: order by the FULL member tuple (the per-pass order is rep-row/race based).
-                let ncols = members.len();
-                rows.sort_by(|a, b| {
-                    for c in 0..ncols {
-                        let ord = key_cmp(&a[c], &b[c]);
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            } else {
-                rows.sort_by(|a, b| key_cmp(&a[0], &b[0]));
-            }
-            // Apply the grouped query's HAVING (filter), ORDER BY (re-sort), and LIMIT/OFFSET (slice)
-            // HOST-SIDE over the materialized group rows, mapping each clause's referenced result column
-            // name to its index. All four are empty/None for a bare GROUP BY, so this is a no-op there.
+            // The deterministic default order is applied ON THE GPU below (gpu_sort_result_rows), not by a
+            // host sort -- so the merged rows stay in raw group order here. HAVING (filter) and LIMIT/OFFSET
+            // (slice) are still applied host-side (S3/S4 move them on-device); ORDER BY and the default
+            // order are GPU sorts. Each clause maps its referenced result column name to an index. All are
+            // empty/None for a bare GROUP BY, so only the default GPU order runs there.
             let col_index = |name: &str| -> Result<usize, ExecuteError> {
                 let mut hits = bound
                     .selected_columns
@@ -4173,30 +4165,45 @@ impl Engine {
                     })
                 });
             }
-            // The grouped result is sorted ON THE GPU (charter: every relational sort is a GPU sort,
-            // regardless of result size -- no host-side finalization). INT keys feed an i64 matrix by
-            // group position; TEXT/NUMERIC/UUID keys feed a resident-like payload built (via
-            // build_relational_device_payload) from just those result columns, which the hetero
-            // comparator reads on-device. Single- and multi-key are the same path (k=1 is K=1).
-            if !select.order_by.is_empty() && rows.len() > 1 {
-                // Resolve each ORDER BY key to its result-column index, then sort the grouped rows on the
-                // GPU (the shared helper; int matrix vs hetero payload by key type). Explicit NULLS
-                // FIRST/LAST is honored ON-DEVICE (order_by_nulls_first threaded through; every key type,
-                // incl. int, reads its NULL validity bitmap in the comparator -- no host sentinel).
-                let order: Vec<(usize, bool)> = select
-                    .order_by
-                    .iter()
-                    .map(|o| Ok::<_, ExecuteError>((col_index(&o.column)?, o.descending)))
-                    .collect::<Result<_, _>>()?;
+            // The grouped result is ordered ON THE GPU (charter: every relational sort is a GPU sort, no
+            // host-side finalization) -- both the explicit ORDER BY and, in its absence, the deterministic
+            // DEFAULT order. INT/bool keys feed an i64 matrix by group position; TEXT/NUMERIC/UUID keys feed
+            // a resident-like payload built (build_relational_device_payload) from just those result
+            // columns, which the hetero comparator reads on-device. Single- and multi-key share the path.
+            if rows.len() > 1 {
                 let col_types: Vec<SqlType> =
                     bound.selected_columns.iter().map(|c| c.ty).collect();
-                rows = gpu_sort_result_rows(
-                    rows,
-                    &order,
-                    order_by_nulls_first,
-                    &col_types,
-                    &device_memory,
-                )?;
+                if select.order_by.is_empty() {
+                    // DEFAULT order: by the full group-key tuple (result columns 0..n_group_cols, keys are
+                    // emitted first by the merge), ASC, with the NULL group FIRST -- matching the prior host
+                    // key order (PG leaves a bare GROUP BY unordered; this is our stable choice).
+                    let n_group_cols = if is_composite_key {
+                        2
+                    } else if let Some(members) = &widekey_cols {
+                        members.len()
+                    } else {
+                        1
+                    };
+                    let order: Vec<(usize, bool)> = (0..n_group_cols).map(|c| (c, false)).collect();
+                    let nulls_first = vec![Some(true); n_group_cols];
+                    rows = gpu_sort_result_rows(rows, &order, &nulls_first, &col_types, &device_memory)?;
+                } else {
+                    // Explicit ORDER BY: resolve each key to its result-column index; explicit NULLS
+                    // FIRST/LAST honored ON-DEVICE (order_by_nulls_first threaded through; every key type,
+                    // incl. int, reads its NULL validity bitmap in the comparator -- no host sentinel).
+                    let order: Vec<(usize, bool)> = select
+                        .order_by
+                        .iter()
+                        .map(|o| Ok::<_, ExecuteError>((col_index(&o.column)?, o.descending)))
+                        .collect::<Result<_, _>>()?;
+                    rows = gpu_sort_result_rows(
+                        rows,
+                        &order,
+                        order_by_nulls_first,
+                        &col_types,
+                        &device_memory,
+                    )?;
+                }
             }
             if select.offset.is_some() || select.limit.is_some() {
                 let start = select.offset.unwrap_or(0).min(rows.len());
