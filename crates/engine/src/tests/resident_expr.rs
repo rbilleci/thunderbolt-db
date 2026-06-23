@@ -245,9 +245,10 @@ fn gpu_resident_expr_where_3vl_over_nullable_bigint() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_where_nullable_unsupported_type_clean_errors() {
-    // M3 (doc 21) Track A.3: a WHERE over a nullable NON-(int4/int8/text/bool) column, or a MIXED-width
-    // predicate, still clean-errors (the compare kernels aren't validity-aware) — never a silent
-    // mis-answer. Here a nullable NUMERIC column and a mixed int4+int8 predicate.
+    // M3 (doc 21): a WHERE over a nullable predicate SHAPE that the GPU 3VL paths don't yet cover still
+    // clean-errors — never a silent mis-answer. Covered today (run, not error): int4/int8/text/bool,
+    // date/timestamp, and a SAME-OR-COARSER-scale numeric scalar/col-vs-col. Still clean-error: a
+    // mixed-width predicate, and a FINER cross-scale numeric literal (needs a column rescale, a follow-up).
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE tm (a INT, big BIGINT, n NUMERIC(10,2))").unwrap();
     e.execute_text(
@@ -259,14 +260,14 @@ fn gpu_resident_expr_where_nullable_unsupported_type_clean_errors() {
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    // Nullable NUMERIC predicate -> clean error.
+    // A FINER cross-scale numeric literal (scale 3 > column scale 2) -> clean error (column-rescale follow-up).
     let err = e
-        .execute_resident_expr_select_sql("SELECT a FROM tm WHERE n < 3.00")
+        .execute_resident_expr_select_sql("SELECT a FROM tm WHERE n < 3.005")
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("not yet supported on the GPU"),
-        "nullable numeric WHERE must clean-error, got: {err}"
+        err.contains("not yet supported"),
+        "cross-scale nullable numeric WHERE must clean-error, got: {err}"
     );
     // Mixed int4 + nullable int8 predicate -> clean error (the VM is mono-typed).
     let err = e
@@ -373,6 +374,66 @@ fn gpu_resident_expr_where_3vl_over_nullable_timestamp() {
     assert!(
         err.contains("not yet supported"),
         "compound nullable timestamp WHERE must clean-error, got: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_where_3vl_over_nullable_numeric() {
+    // M3 (doc 21): a WHERE over a nullable NUMERIC column excludes NULL rows on the GPU. A numeric is an
+    // i128 mantissa whose value exceeds the VM's i32 CompareScalar, so a same-or-coarser-scale comparison
+    // routes to the I128 VM via the new CompareScalarI128 step (scalar) or CompareBuffers (col-vs-col),
+    // with the validity AND'd in. The NULL placeholder is mantissa 0 (= 0.00, < 100.00), so the
+    // exclusions are load-bearing.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tn2 (id INT, amt NUMERIC(10,2), amt2 NUMERIC(10,2))").unwrap();
+    // amt nullable = [10.50, NULL, 30.25, NULL, 250.75]; amt2 = 100.00 (non-null) for col-vs-col.
+    e.execute_text(
+        2,
+        "INSERT INTO tn2 (id,amt,amt2) VALUES \
+         (1,10.50,100.00),(2,NULL,100.00),(3,30.25,100.00),(4,NULL,100.00),(5,250.75,100.00)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tn2").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // scalar `amt < 100.00` -> 10.50, 30.25 -> id 1, 3. NULLs excluded (CompareScalarI128).
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tn2 WHERE amt < 100.00")
+        .expect("WHERE over a nullable numeric runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)]],
+        "WHERE amt < numeric must exclude NULL rows (3VL), not fold the placeholder 0.00"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+    // coarser INTEGER literal `amt < 100` (scale 0 <= column scale 2, rescaled up) -> same id 1, 3.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tn2 WHERE amt < 100")
+        .expect("nullable numeric vs an integer literal runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)]],
+        "amt < 100 (int literal coerced to numeric) excludes NULLs"
+    );
+    // literal on the LEFT `100 < amt` -> amt > 100 -> id 5 (250.75). NULLs excluded.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tn2 WHERE 100 < amt")
+        .expect("numeric-literal-on-left over a nullable numeric runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(5)]],
+        "100 < amt must exclude NULL rows (3VL)"
+    );
+    // col-vs-col `amt < amt2` (amt2 = 100.00, same scale) -> id 1, 3. CompareBuffers (I128) + validity.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM tn2 WHERE amt < amt2")
+        .expect("col-vs-col over a nullable numeric runs on the GPU");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)]],
+        "col-vs-col amt < amt2 must exclude NULL-amt rows (3VL)"
     );
 }
 

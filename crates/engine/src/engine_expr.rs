@@ -5016,6 +5016,102 @@ impl Engine {
         Ok(None)
     }
 
+    /// M3 (doc 21) WHERE 3VL for a SIMPLE comparison over a nullable NUMERIC column. The generic mask VM
+    /// can't lower it (a numeric literal is not an Int4Literal, and the i128 mantissa exceeds the VM's
+    /// i32 CompareScalar). So build the I128 VM program directly — scalar (coarser-or-equal literal,
+    /// rescaled UP to the column scale): `CompareScalarI128` over the mantissa; same-scale col-vs-col:
+    /// `CompareBuffers` — then append the validity-AND (`push_column_validity_and`) for each nullable
+    /// operand, so a NULL operand is UNKNOWN ⇒ the row is excluded. Returns `None` for a non-numeric
+    /// predicate, or for the shapes still scoped out (a FINER cross-scale literal / different-scale
+    /// col-vs-col / numeric arithmetic / AND-OR), so the caller clean-errors — never a silent mis-answer.
+    /// NO kernel change: the i128 compare-scalar / compare-buffers / bool-to-mask / mask-binary kernels
+    /// already exist; `CompareScalarI128` reuses `gpu_db_buffer_i128_compare_scalar_to_mask`.
+    #[allow(clippy::too_many_arguments)]
+    fn try_lower_nullable_numeric_predicate(
+        &self,
+        compare: ResidentBinaryOp,
+        lhs: &ResidentExpr,
+        rhs: &ResidentExpr,
+        table: &RelationalTable,
+        snapshot: &RelationalResidencySnapshot,
+        device_memory: &CudaResidentDeviceMemory,
+        row_count: u64,
+    ) -> Result<Option<Vec<u32>>, ExecuteError> {
+        if !(expr_mentions_numeric(lhs, table) || expr_mentions_numeric(rhs, table)) {
+            return Ok(None);
+        }
+        // Only a simple comparison; AND/OR (and numeric arithmetic) are clean-error follow-ons -> None.
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Ok(None);
+        };
+        let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+        };
+        let run = |program: &[ExprStep]| {
+            device_memory
+                .run_expr_predicate_filter(program, row_count, ResidentElemType::I128)
+                .map(Some)
+                .map_err(map_err)
+        };
+        // A scalar comparison `numcol <cmp> literal` (either order) where the literal is coarser-or-equal
+        // scale (rescaled UP to the column scale). A FINER literal (cross-scale) needs a column rescale --
+        // a follow-up; return None -> clean-error.
+        let scalar_program = |col: usize,
+                              literal: Decimal128,
+                              scalar_on_left: bool|
+         -> Result<Option<Vec<ExprStep>>, ExecuteError> {
+            let col_scale = column_numeric_scale(table, col).expect("numeric column has a scale");
+            let literal = literal.canonical();
+            if literal.scale > col_scale {
+                return Ok(None); // finer cross-scale literal -> clean-error follow-up
+            }
+            let mantissa = rescale_numeric_literal(literal, col_scale)?;
+            let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
+            let mut program = vec![
+                ExprStep::LoadColumn { byte_offset: offset },
+                ExprStep::CompareScalarI128 { cmp, scalar: mantissa, scalar_on_left },
+            ];
+            push_column_validity_and(col, table, snapshot, &mut program)?;
+            Ok(Some(program))
+        };
+        match (
+            numeric_column_index(lhs, table),
+            numeric_column_index(rhs, table),
+        ) {
+            (Some(col), None) if numeric_literal_value(rhs).is_some() => {
+                match scalar_program(col, numeric_literal_value(rhs).expect("checked"), false)? {
+                    Some(program) => run(&program),
+                    None => Ok(None),
+                }
+            }
+            (None, Some(col)) if numeric_literal_value(lhs).is_some() => {
+                match scalar_program(col, numeric_literal_value(lhs).expect("checked"), true)? {
+                    Some(program) => run(&program),
+                    None => Ok(None),
+                }
+            }
+            (Some(a), Some(b)) => {
+                let a_scale = column_numeric_scale(table, a).expect("numeric column has a scale");
+                let b_scale = column_numeric_scale(table, b).expect("numeric column has a scale");
+                if a_scale != b_scale {
+                    return Ok(None); // different-scale col-vs-col -> clean-error follow-up
+                }
+                let a_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
+                let b_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
+                let mut program = vec![
+                    ExprStep::LoadColumn { byte_offset: a_offset },
+                    ExprStep::LoadColumn { byte_offset: b_offset },
+                    ExprStep::CompareBuffers { cmp },
+                ];
+                push_column_validity_and(a, table, snapshot, &mut program)?;
+                push_column_validity_and(b, table, snapshot, &mut program)?;
+                run(&program)
+            }
+            // numeric vs a non-numeric column / arithmetic / etc. -> clean-error follow-up.
+            _ => Ok(None),
+        }
+    }
+
     /// Try to lower a SIMPLE uuid comparison (`id <cmp> 'uuid-literal'`, either operand order, or
     /// `id <cmp> id2`) to surviving row indices via the byte-wise uuid compare kernel (the type matrix,
     /// doc 19): a `uuid` is 16 raw bytes in the i128 section; PG compares uuids by an unsigned
@@ -5578,8 +5674,9 @@ impl Engine {
                     .run_expr_predicate_filter_with_text(&program, &needles, row_count, elem)
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
             }
-            // A nullable DATE/TIMESTAMP simple comparison: the generic VM can't lower the temporal literal,
-            // so build the program directly (date I32 / timestamp I64) with the validity-AND appended.
+            // A nullable DATE/TIMESTAMP/NUMERIC simple comparison: the generic VM can't lower the literal
+            // (temporal/numeric), so build the program directly (date I32 / timestamp+numeric I128/I64)
+            // with the validity-AND appended.
             if let ResidentExpr::Binary { op, lhs, rhs } = predicate {
                 if let Some(indices) = self.try_lower_nullable_temporal_predicate(
                     *op,
@@ -5592,11 +5689,22 @@ impl Engine {
                 )? {
                     return Ok(indices);
                 }
+                if let Some(indices) = self.try_lower_nullable_numeric_predicate(
+                    *op,
+                    lhs,
+                    rhs,
+                    table,
+                    snapshot,
+                    device_memory,
+                    row_count,
+                )? {
+                    return Ok(indices);
+                }
             }
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "WHERE over a nullable non-(int4/int8/text/bool/date/timestamp) column, or a mixed-width \
-                 or compound non-int4/text/bool predicate, is not yet supported on the GPU (M3 3VL \
-                 follow-up)"
+                "WHERE over a nullable column of this type/shape is not yet supported on the GPU \
+                 (M3 3VL follow-up: e.g. uuid, a cross-scale or arithmetic numeric, a compound or \
+                 mixed-type temporal/numeric predicate)"
                     .to_string(),
             )));
         }

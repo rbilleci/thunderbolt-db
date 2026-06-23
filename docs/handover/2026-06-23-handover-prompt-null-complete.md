@@ -35,11 +35,16 @@ Run `git checkout main && git pull` for the latest.
   via VM programs with validity steps appended; added `ExprStep::CompareScalarI64` (reuses the i64
   compare-scalar kernel, no PTX change) so the i64 timestamp-micros literal fits the VM. Non-null peepholes
   untouched.
+- **WHERE 3VL numeric** — nullable NUMERIC simple comparisons (same-or-coarser-scale scalar both orders +
+  same-scale col-vs-col) via I128 VM programs with validity steps; added `ExprStep::CompareScalarI128`
+  (reuses the i128 compare-scalar kernel, no PTX change). Cross-scale (finer literal) / different-scale
+  col-vs-col / numeric arithmetic / AND-OR stay clean-error.
 **REMAINING Track A:** A.2 (nullable composite/text/uuid GROUP BY KEY — kernel change, most-audited path);
 A.4 (text/numeric/uuid ORDER BY key NULLs + explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field
 through ~20 ctors incl. the legacy protocol crate] + nullable sort expr); A.5 (N-way multi-way OUTER joins);
-and the rest of WHERE 3VL — nullable **numeric/uuid** (the i128 compare-to-mask kernel needs validity-awareness,
-or a CompareScalarI128 VM step like CompareScalarI64).
+and the rest of WHERE 3VL — nullable **uuid** (the dedicated uuid memcmp launcher `expr_uuid_compare_*` needs
+a validity-AND — a launcher change, not a VM step, since uuid compares by unsigned BE memcmp not signed i128)
+and nullable numeric **cross-scale / arithmetic / AND-OR**.
 
 **What landed last session (2026-06-23) — NULL (M3) is now substantially complete, ~12 independently-audited
 slices merged.** Representation + storage + ingest + the GPU 3VL data path:
