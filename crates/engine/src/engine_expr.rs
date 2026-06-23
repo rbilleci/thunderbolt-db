@@ -1099,7 +1099,10 @@ fn compile_numeric_compare(
                 scalar: needle(literal, common)?,
                 scalar_on_left: true,
             });
-            Ok(())
+            // M3 (doc 21) 3VL: AND the leaf mask with the arith operand columns' validity (a NULL operand
+            // is UNKNOWN ⇒ excluded). No-op when no operand column has a validity bitmap (non-null path
+            // stays byte-identical). Correct for WHERE under AND/OR (no NOT) — same rule as the int4 leaf.
+            push_leaf_validity_and(&[rhs], table, snapshot, program)
         }
         (None, Some(literal)) => {
             let arith_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
@@ -1110,7 +1113,7 @@ fn compile_numeric_compare(
                 scalar: needle(literal, common)?,
                 scalar_on_left: false,
             });
-            Ok(())
+            push_leaf_validity_and(&[lhs], table, snapshot, program)
         }
         (None, None) => {
             // arith <cmp> arith: bring both sides to the common = max scale.
@@ -1120,7 +1123,7 @@ fn compile_numeric_compare(
             let rhs_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
             push_numeric_rescale(rhs_scale, common, program)?;
             program.push(ExprStep::CompareBuffers { cmp });
-            Ok(())
+            push_leaf_validity_and(&[lhs, rhs], table, snapshot, program)
         }
         (Some(_), Some(_)) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "the general GPU executor does not evaluate literal-only numeric comparisons".to_string(),
@@ -1349,10 +1352,15 @@ fn predicate_vm_elem_type(
     let mut cols = Vec::new();
     collect_expr_columns(predicate, &mut cols);
     let ty = |col: usize| table.columns.get(col).map(|column| column.ty);
-    if cols
-        .iter()
-        .all(|&col| matches!(ty(col), Some(SqlType::Int4 | SqlType::Text | SqlType::Bool)))
-    {
+    // int2 (smallint) is stored WIDENED to i32 in the int4 section, so it lowers on the I32 VM exactly
+    // like int4 (its literal is an i32 that fits CompareScalar). compile_arith_program resolves its offset
+    // via resident_device_int_column_offset (Int2 -> the int4 section).
+    if cols.iter().all(|&col| {
+        matches!(
+            ty(col),
+            Some(SqlType::Int4 | SqlType::Int2 | SqlType::Text | SqlType::Bool)
+        )
+    }) {
         Some(ResidentElemType::I32)
     } else if cols.iter().all(|&col| matches!(ty(col), Some(SqlType::Int8))) {
         Some(ResidentElemType::I64)
@@ -5016,16 +5024,16 @@ impl Engine {
         Ok(None)
     }
 
-    /// M3 (doc 21) WHERE 3VL for a SIMPLE comparison over a nullable NUMERIC column. The generic mask VM
-    /// can't lower it (a numeric literal is not an Int4Literal, and the i128 mantissa exceeds the VM's
-    /// i32 CompareScalar). So build the I128 VM program directly — scalar (coarser-or-equal literal,
-    /// rescaled UP to the column scale): `CompareScalarI128` over the mantissa; same-scale col-vs-col:
-    /// `CompareBuffers` — then append the validity-AND (`push_column_validity_and`) for each nullable
-    /// operand, so a NULL operand is UNKNOWN ⇒ the row is excluded. Returns `None` for a non-numeric
-    /// predicate, or for the shapes still scoped out (a FINER cross-scale literal / different-scale
-    /// col-vs-col / numeric arithmetic / AND-OR), so the caller clean-errors — never a silent mis-answer.
-    /// NO kernel change: the i128 compare-scalar / compare-buffers / bool-to-mask / mask-binary kernels
-    /// already exist; `CompareScalarI128` reuses `gpu_db_buffer_i128_compare_scalar_to_mask`.
+    /// M3 (doc 21) WHERE 3VL over a nullable NUMERIC column. The generic mask VM can't lower numeric (a
+    /// numeric literal is not an Int4Literal; the i128 mantissa exceeds the i32 CompareScalar). Two routes,
+    /// both on the I128 VM, each AND'ing the operand columns' validity (a NULL operand is UNKNOWN, excluded
+    /// — correct for WHERE under AND/OR since there is no NOT). (a) A SIMPLE same-or-coarser-scale scalar /
+    /// same-scale col-vs-col uses a direct `CompareScalarI128` / `CompareBuffers` program (handles a LARGE
+    /// mantissa the i32-needle path can't). (b) AND/OR, numeric arithmetic, a FINER cross-scale literal, or
+    /// a different-scale col-vs-col uses the shared `compile_numeric_predicate_program` /
+    /// `compile_numeric_compare` VM path, now validity-aware (`push_leaf_validity_and` per leaf; same
+    /// i32-needle limit as the non-null path). Returns `None` only for a non-numeric predicate; a mixed
+    /// numeric/integer predicate is a clean error. NO kernel change.
     #[allow(clippy::too_many_arguments)]
     fn try_lower_nullable_numeric_predicate(
         &self,
@@ -5040,10 +5048,18 @@ impl Engine {
         if !(expr_mentions_numeric(lhs, table) || expr_mentions_numeric(rhs, table)) {
             return Ok(None);
         }
-        // Only a simple comparison; AND/OR (and numeric arithmetic) are clean-error follow-ons -> None.
-        let Some(cmp) = predicate_compare_code(compare) else {
-            return Ok(None);
-        };
+        // Mixed numeric/integer is a clean error (compile_numeric_arith expects numeric operands) — mirror
+        // the non-null path's guard so the message is clear rather than an opaque compile failure.
+        if expr_mentions_int4_column(lhs, table)
+            || expr_mentions_int4_column(rhs, table)
+            || expr_mentions_int8(lhs, table)
+            || expr_mentions_int8(rhs, table)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "the general GPU executor does not support mixed numeric/integer expressions yet"
+                    .to_string(),
+            )));
+        }
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
         };
@@ -5053,9 +5069,20 @@ impl Engine {
                 .map(Some)
                 .map_err(map_err)
         };
-        // A scalar comparison `numcol <cmp> literal` (either order) where the literal is coarser-or-equal
-        // scale (rescaled UP to the column scale). A FINER literal (cross-scale) needs a column rescale --
-        // a follow-up; return None -> clean-error.
+        // numeric AND/OR -> the validity-aware compile path (each comparison leaf via compile_numeric_compare,
+        // which now AND's the operand validity; MaskBinary combines).
+        if let Some(bool_op) = boolean_op_code(compare) {
+            let mut program = Vec::new();
+            compile_numeric_predicate_program(lhs, table, snapshot, &mut program)?;
+            compile_numeric_predicate_program(rhs, table, snapshot, &mut program)?;
+            program.push(ExprStep::MaskBinary { op: bool_op });
+            return run(&program);
+        }
+        let Some(cmp) = predicate_compare_code(compare) else {
+            return Ok(None);
+        };
+        // SIMPLE same-or-coarser-scale scalar / same-scale col-vs-col -> the CompareScalarI128 fast path
+        // (handles a large mantissa). `None` here means "not this fast shape" -> fall to compile_numeric_compare.
         let scalar_program = |col: usize,
                               literal: Decimal128,
                               scalar_on_left: bool|
@@ -5063,7 +5090,7 @@ impl Engine {
             let col_scale = column_numeric_scale(table, col).expect("numeric column has a scale");
             let literal = literal.canonical();
             if literal.scale > col_scale {
-                return Ok(None); // finer cross-scale literal -> clean-error follow-up
+                return Ok(None); // finer cross-scale literal -> the compile_numeric_compare fallback
             }
             let mantissa = rescale_numeric_literal(literal, col_scale)?;
             let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
@@ -5074,28 +5101,19 @@ impl Engine {
             push_column_validity_and(col, table, snapshot, &mut program)?;
             Ok(Some(program))
         };
-        match (
+        let fast: Option<Vec<ExprStep>> = match (
             numeric_column_index(lhs, table),
             numeric_column_index(rhs, table),
         ) {
             (Some(col), None) if numeric_literal_value(rhs).is_some() => {
-                match scalar_program(col, numeric_literal_value(rhs).expect("checked"), false)? {
-                    Some(program) => run(&program),
-                    None => Ok(None),
-                }
+                scalar_program(col, numeric_literal_value(rhs).expect("checked"), false)?
             }
             (None, Some(col)) if numeric_literal_value(lhs).is_some() => {
-                match scalar_program(col, numeric_literal_value(lhs).expect("checked"), true)? {
-                    Some(program) => run(&program),
-                    None => Ok(None),
-                }
+                scalar_program(col, numeric_literal_value(lhs).expect("checked"), true)?
             }
-            (Some(a), Some(b)) => {
-                let a_scale = column_numeric_scale(table, a).expect("numeric column has a scale");
-                let b_scale = column_numeric_scale(table, b).expect("numeric column has a scale");
-                if a_scale != b_scale {
-                    return Ok(None); // different-scale col-vs-col -> clean-error follow-up
-                }
+            (Some(a), Some(b))
+                if column_numeric_scale(table, a) == column_numeric_scale(table, b) =>
+            {
                 let a_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
                 let b_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
                 let mut program = vec![
@@ -5105,11 +5123,18 @@ impl Engine {
                 ];
                 push_column_validity_and(a, table, snapshot, &mut program)?;
                 push_column_validity_and(b, table, snapshot, &mut program)?;
-                run(&program)
+                Some(program)
             }
-            // numeric vs a non-numeric column / arithmetic / etc. -> clean-error follow-up.
-            _ => Ok(None),
+            _ => None,
+        };
+        if let Some(program) = fast {
+            return run(&program);
         }
+        // Fallback: a FINER cross-scale literal / different-scale col-vs-col / numeric arithmetic -> the
+        // validity-aware shared compile path (compile_numeric_compare appends push_leaf_validity_and).
+        let mut program = Vec::new();
+        compile_numeric_compare(lhs, rhs, cmp, table, snapshot, &mut program)?;
+        run(&program)
     }
 
     /// Try to lower a SIMPLE uuid comparison (`id <cmp> 'uuid-literal'`, either operand order, or

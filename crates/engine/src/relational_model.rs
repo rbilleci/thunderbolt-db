@@ -879,10 +879,13 @@ pub(crate) fn resident_device_int_column_offset(
     column_idx: usize,
 ) -> Result<u64, ExecuteError> {
     match table.columns.get(column_idx).map(|column| column.ty) {
-        Some(SqlType::Int4) => resident_device_int4_column_offset(snapshot, table, column_idx),
+        // int2 (smallint) is stored WIDENED to i32 in the int4 section, so it reads as an int4 column.
+        Some(SqlType::Int4 | SqlType::Int2) => {
+            resident_device_int4_column_offset(snapshot, table, column_idx)
+        }
         Some(SqlType::Int8) => resident_device_int8_column_offset(snapshot, table, column_idx),
         _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident device-memory column is neither int4 nor int8".to_string(),
+            "resident device-memory column is neither int2/int4 nor int8".to_string(),
         ))),
     }
 }
