@@ -1110,6 +1110,53 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_order_by_nullable_expression_places_null_results_on_device() {
+    // M3 (doc 21): ORDER BY a NULLABLE int4 EXPRESSION (`a + b`). A NULL result (any operand NULL) becomes
+    // the i64::MAX default-end sentinel, blended ON-DEVICE (a validity-mask VM run + the blend kernel), so
+    // NULL-expression rows sort to PG's default end. No host NULL decision.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id INT, a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (id,a,b) VALUES (1,5,1),(2,NULL,1),(3,2,1),(4,NULL,1)")
+        .unwrap();
+    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let ids = |rows: &[Vec<SqlValue>]| -> Vec<i32> {
+        rows.iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(v) => v,
+                ref o => panic!("unexpected {o:?}"),
+            })
+            .collect()
+    };
+    // a+b: id1=6, id2=NULL, id3=3, id4=NULL. ASC default = NULLS LAST; the secondary `id` orders the
+    // (tied) NULL-result group deterministically -> [3 (=3), 1 (=6), 2 (NULL), 4 (NULL)].
+    let r = e
+        .execute_resident_expr_select_sql("SELECT id FROM t ORDER BY a + b, id")
+        .expect("nullable int4 expression ORDER BY");
+    assert_eq!(
+        ids(&r.rows),
+        vec![3, 1, 2, 4],
+        "nullable a+b: non-NULL ascending, then NULL results last (PG default), on-device"
+    );
+    // A nullable int8 expression clean-errors (the i64::MAX NULL sentinel could collide with a real bigint).
+    e.execute_text(3, "CREATE TABLE t8 (id INT, a BIGINT, b BIGINT)").unwrap();
+    e.execute_text(4, "INSERT INTO t8 (id,a,b) VALUES (1,5,1),(2,NULL,1)").unwrap();
+    if e.populate_relational_residency_snapshot("t8").unwrap().device_memory_proof.is_some() {
+        assert!(
+            e.execute_resident_expr_select_sql("SELECT id FROM t8 ORDER BY a + b").is_err(),
+            "nullable int8 expression ORDER BY clean-errors (sentinel collision)"
+        );
+    }
+    // Explicit NULLS FIRST/LAST on a nullable expression clean-errors (value-sentinel only does default).
+    assert!(
+        e.execute_resident_expr_select_sql("SELECT id FROM t ORDER BY a + b NULLS FIRST").is_err(),
+        "explicit NULLS FIRST on a nullable expression clean-errors"
+    );
+}
+
+#[test]
 fn join_order_by_explicit_nulls_first_last_is_a_clean_error() {
     // Explicit NULLS FIRST/LAST on a join ORDER BY is clean-errored at parse (not silently dropped); the
     // default placement is supported. Parse-time, so no GPU needed.

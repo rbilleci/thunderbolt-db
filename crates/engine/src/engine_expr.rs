@@ -4331,6 +4331,24 @@ impl Engine {
                 } else {
                     ResidentElemType::I32
                 };
+                // M3 (doc 21): a NULLABLE int4 expression blends the i64::MAX default-end sentinel
+                // ON-DEVICE where any operand is NULL (a validity mask VM run + the on-device blend). int8
+                // nullable + explicit NULLS FIRST/LAST are clean-errored at the routing loop below; a
+                // non-nullable expression keeps the plain (no-validity) path.
+                if elem == ResidentElemType::I32
+                    && predicate_references_nullable_column(expr, table, &snapshot)?
+                {
+                    let mut validity_program = vec![ExprStep::ConstMask { value: true }];
+                    push_leaf_validity_and(&[expr], table, &snapshot, &mut validity_program)?;
+                    return device_memory
+                        .arith_value_column_at_indices_nullable(
+                            &program,
+                            &validity_program,
+                            row_count,
+                            &idx32,
+                        )
+                        .map_err(map_err);
+                }
                 return device_memory
                     .arith_value_column_at_indices(&program, row_count, &idx32, elem)
                     .map_err(map_err);
@@ -4379,13 +4397,23 @@ impl Engine {
         let mut key_null_offs: Vec<u64> = vec![u64::MAX; select.order_by.len()];
         for (ki, order) in select.order_by.iter().enumerate() {
             if let Some(Some(expr)) = order_by_exprs.get(ki) {
-                let mut expr_cols = Vec::new();
-                collect_expr_columns(expr, &mut expr_cols);
-                for col in expr_cols {
-                    if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
+                // A NULLABLE int4 expression is supported via the on-device value-sentinel
+                // (materialize_int_key_column): a NULL result becomes the i64::MAX default-end sentinel,
+                // so key_null_offs stays u64::MAX (no validity bitmap -- the NULL is value-encoded). Two
+                // cases still clean-error: an int8 expression (i64::MAX could collide with a real result)
+                // and an explicit NULLS FIRST/LAST (the value-sentinel only realizes the PG default).
+                if predicate_references_nullable_column(expr, table, &snapshot)? {
+                    if expr_mentions_int8(expr, table) {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "ORDER BY an expression over a nullable column is not yet supported on the \
-                             GPU (M3 3VL follow-up); ORDER BY the plain column places NULLs (PG default)"
+                            "ORDER BY a nullable int8 expression is a follow-up (the i64::MAX NULL \
+                             sentinel could collide with a real bigint result)"
+                                .to_string(),
+                        )));
+                    }
+                    if order_by_nulls_first.get(ki).copied().flatten().is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "explicit NULLS FIRST/LAST on a nullable ORDER BY expression is a follow-up \
+                             (the default NULL placement is supported)"
                                 .to_string(),
                         )));
                     }

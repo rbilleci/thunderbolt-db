@@ -1128,6 +1128,27 @@ impl CudaResidentDeviceMemory {
         launch_cuda_arith_value_column_at_indices(self, program, n_rows, indices, elem)
     }
 
+    /// Like [`Self::arith_value_column_at_indices`] (I32 arith only) but the expression is NULLABLE: an
+    /// extra `validity_program` (a mask VM program that yields 1 where every operand column is non-NULL,
+    /// 0 otherwise) is run on the GPU, and the i64 sort key is `i64::MAX` (PG's default-end sentinel, which
+    /// no widened int4 value can equal) wherever the expression is NULL, else the sign-extended value --
+    /// blended ON-DEVICE (M3 -- doc 21). Returns the gathered i64 keys at `indices`.
+    pub fn arith_value_column_at_indices_nullable(
+        &self,
+        program: &[ExprStep],
+        validity_program: &[ExprStep],
+        n_rows: u64,
+        indices: &[u32],
+    ) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+        launch_cuda_arith_value_column_at_indices_nullable(
+            self,
+            program,
+            validity_program,
+            n_rows,
+            indices,
+        )
+    }
+
     /// Like [`Self::arith_value_column_at_indices`] but keeps the arith result RESIDENT: runs the
     /// program over all `n_rows`, returns the device value buffer (+ its pooled lease) instead of
     /// D2H-gathering. cuCtxSynchronize'd so a LATER kernel launch (the GROUP BY group-key read via
@@ -16343,6 +16364,121 @@ fn launch_cuda_arith_value_column_at_indices(
             drop(value);
             return Err(CudaRuntimeProbeError::InvalidInputLength(0));
         }
+    }
+    Ok(out)
+}
+
+/// As [`launch_cuda_arith_value_column_at_indices`] (I32 arith) but the expression is NULLABLE: run the
+/// arith program (value buffer) AND a `validity_program` (a mask VM program yielding 1 where every
+/// operand column is non-NULL), then blend ON-DEVICE into an i64 key buffer -- `i64::MAX` (PG's
+/// default-end sentinel; no widened int4 value can equal it) where NULL, else the sign-extended value.
+/// D2H the i64 keys and gather at `indices` (M3 -- doc 21).
+fn launch_cuda_arith_value_column_at_indices_nullable(
+    resident: &CudaResidentDeviceMemory,
+    program: &[ExprStep],
+    validity_program: &[ExprStep],
+    n_rows: u64,
+    indices: &[u32],
+) -> Result<Vec<i64>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = usize::try_from(n_rows).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if n == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    // The arith VALUE (I32) and the VALIDITY mask (I32, 0/1) -- two independent VM runs over all rows; each
+    // top-of-stack buffer is the single result and must stay alive through the blend.
+    let mut value_stack = run_resident_arith_program(resident, program, &[], n_rows, ResidentElemType::I32)?;
+    let value = value_stack.pop().ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !value_stack.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
+    }
+    let mut mask_stack =
+        run_resident_arith_program(resident, validity_program, &[], n_rows, ResidentElemType::I32)?;
+    let mask = mask_stack.pop().ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    if !mask_stack.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(validity_program.len()));
+    }
+    // Blend ON-DEVICE: out_i64[i] = mask[i] ? sign_extend(value[i]) : i64::MAX.
+    let out_bytes = n
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+    let out_buf = primary.lease_device_buffer(out_bytes)?;
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let blend_fn = primary.cached_function(c"gpu_db_blend_widen_null_sentinel", &ptx)?;
+    const BLOCK: u32 = 256;
+    let grid = n_rows.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = value.ptr;
+    let mut a1 = mask.ptr;
+    let mut a2 = out_buf.ptr;
+    let mut a3 = n_rows;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            blend_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    let mut host = vec![0i64; n];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(host.as_mut_ptr().cast::<c_void>(), out_buf.ptr, out_bytes)
+    })?;
+    drop(out_buf);
+    drop(mask);
+    drop(value);
+    let mut out = Vec::with_capacity(indices.len());
+    for &i in indices {
+        let v = *host
+            .get(i as usize)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(i as usize))?;
+        out.push(v);
     }
     Ok(out)
 }
