@@ -81,25 +81,15 @@ is optional; each line is struck through only when it runs on the device.
     `581833a5`** (suite 234/0; combined S2.2b independent audit **SHIP** — 5 adversarial tests, full
     member-type matrix + NULL members + count==0 + multi-pass COUNT(DISTINCT), 239/0). No kernel change.
     **GROUP BY result key/value/member materialization is now FULLY on-device.**
-  - [ ] **S2.3 — multi-aggregate #30 alignment on-device (the hard core).** Eliminate the host
-    pass-alignment `sort_by` that still runs for `passes.len()>1` (`engine_expr.rs`, the
-    `if passes.len() > 1` block). Two routes:
-    - **(A) single multi-aggregate hash-agg pass** — one slot carries ALL value cols' accumulators →
-      one group array, no alignment, no sort at all. Cleanest end-state but a real KERNEL + slot-layout
-      + launcher redesign (700/716/717 hazard class). COUNT(DISTINCT) stays a separate sort-mark-sum
-      pass, so it still needs (B) to align with the multi-agg pass.
-    - **(B) on-device per-pass key sort** — sort each pass's groups by key on the GPU so all passes
-      share one canonical order (aligned by index). Reuses the sort machinery; needs a
-      PERMUTATION-returning helper (extract from `gpu_sort_result_rows`) to reorder the host group
-      structs. **Key design point I verified:** #30 only needs CONSISTENT alignment, NOT a specific
-      order (the FINAL order is S2.1's `gpu_sort_result_rows`). So sort each pass by the FULL group key
-      (all members) → a TOTAL order (groups are distinct) → robust alignment with NO sort-stability
-      dependence. (The current host #30 sorts wide-key by member[0] ONLY and leans on `sort_by`
-      stability — a device bitonic sort is NOT stable, so a naive member[0]-only device sort could
-      MISALIGN wide-key groups sharing member[0]; the full-key sort sidesteps this entirely.) The
-      device key values already exist (`key_text_map` / `member_cell` / the int/numeric/uuid structs).
-    Recommended: (B) first (lower risk, no kernel change, reuses S1/S2.1 machinery); (A) later as a
-    perf/architecture upgrade if multi-pass overhead matters.
+  - [x] **S2.3 — multi-aggregate #30 alignment on-device (the hard core).** Route B: extracted a
+    PERMUTATION-returning `gpu_sort_permutation` from `gpu_sort_result_rows`, and the `passes.len()>1`
+    alignment now sorts EACH pass by its FULL group key on the GPU (a TOTAL order over distinct groups →
+    aligned by index, no host sort, no sort-stability dependence — the wide-key member[0] trap is
+    sidestepped). `key_cmp` deleted; single-pass still skips alignment. **DONE `42138340`** (suite 234/0;
+    35 multi-pass/cross-pass/COUNT(DISTINCT) tests pass 5× under the compaction race; independent audit
+    running). No kernel change. Route A (single multi-aggregate kernel) recorded as a later perf upgrade.
+    **▶ S2 COMPLETE: the GROUP BY result path — materialization, ordering, AND pass alignment — is now
+    FULLY on-device.**
 
 ### Result-stage operators on the general executor
 - [ ] **S3 — HAVING on-device.** `engine_expr.rs:4168` `rows.retain(...)` → device mask over the
