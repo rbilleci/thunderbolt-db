@@ -87,7 +87,8 @@ is optional; each line is struck through only when it runs on the device.
     aligned by index, no host sort, no sort-stability dependence — the wide-key member[0] trap is
     sidestepped). `key_cmp` deleted; single-pass still skips alignment. **DONE `42138340`** (suite 234/0;
     35 multi-pass/cross-pass/COUNT(DISTINCT) tests pass 5× under the compaction race; independent audit
-    running). No kernel change. Route A (single multi-aggregate kernel) recorded as a later perf upgrade.
+    **SHIP** — extraction byte-identical, full-key alignment proven over wide-key+COUNT(DISTINCT) 25×,
+    sabotage-verified load-bearing). No kernel change. Route A (single multi-aggregate kernel) = later perf upgrade.
     **▶ S2 COMPLETE: the GROUP BY result path — materialization, ordering, AND pass alignment — is now
     FULLY on-device.**
 
