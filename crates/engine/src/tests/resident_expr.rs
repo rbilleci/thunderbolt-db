@@ -648,9 +648,45 @@ fn gpu_resident_expr_order_by_places_nulls_per_pg_default() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_order_by_multikey_nullable_placement_on_device() {
+    // M3 (doc 21): a MULTI-key ORDER BY with NULLs in BOTH a nullable int key and a nullable text key,
+    // placed entirely ON-DEVICE — the hetero sort comparator reads each key's validity bitmap per row and
+    // orders NULL as greatest (PG default: last ASC / first DESC), per key. No host partition / overwrite.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tmk (na INT, t TEXT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tmk (na,t) VALUES (1,'b'),(NULL,'a'),(1,NULL),(NULL,NULL),(2,'a')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tmk").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // ORDER BY na, t (ASC, ASC): na groups 1,2,NULL (NULL last); within na, t ASC with NULL last.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT na, t FROM tmk ORDER BY na, t")
+        .expect("multi-key nullable ORDER BY runs on the GPU");
+    let txt = |s: &str| SqlValue::Text(s.to_string());
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int4(1), txt("b")],
+            vec![SqlValue::Int4(1), SqlValue::Null],
+            vec![SqlValue::Int4(2), txt("a")],
+            vec![SqlValue::Null, txt("a")],
+            vec![SqlValue::Null, SqlValue::Null],
+        ],
+        "multi-key (nullable int, nullable text) places NULLs per key at PG default, on-device"
+    );
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_order_by_nullable_text_numeric_uuid_keys_place_nulls() {
     // M3 (doc 21): ORDER BY a SOLE nullable TEXT / NUMERIC / UUID key places NULLs at PG's default end
-    // (last ASC, first DESC) — the host-partition wrapper pulls NULL rows out, the on-device hetero sort
+    // (last ASC, first DESC) — the on-device hetero sort comparator reads the key's validity bitmap and
     // orders the rest, then NULLs are placed. Without it the hetero comparator would mis-place NULLs (it
     // reads the placeholder, not the validity bitmap).
     let mut e = Engine::new_local();

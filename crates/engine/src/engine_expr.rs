@@ -179,29 +179,6 @@ pub(crate) fn gpu_sort_result_rows(
     if order.is_empty() || rows.len() <= 1 {
         return Ok(rows);
     }
-    // M3 (doc 21): a SOLE nullable TEXT/NUMERIC/UUID sort key — partition the NULL rows out, sort the
-    // non-NULL rows (the recursion sees no NULL in the key, so the on-device hetero sort runs cleanly),
-    // then place the NULL rows at PG's DEFAULT end (last ASC / first DESC). The hetero comparator can't
-    // read a validity bitmap; this host-partition gives PG-correct NULL placement while real values still
-    // sort on the GPU. (Int/date/timestamp keys place NULLs via the i64::MAX sentinel below, multi-key too.)
-    if order.len() == 1 {
-        let (key_idx, desc) = order[0];
-        let is_hetero = matches!(
-            col_types[key_idx],
-            SqlType::Text | SqlType::Numeric { .. } | SqlType::Uuid
-        );
-        if is_hetero && rows.iter().any(|r| matches!(r[key_idx], SqlValue::Null)) {
-            let (non_null, nulls): (Vec<_>, Vec<_>) = rows
-                .into_iter()
-                .partition(|r| !matches!(r[key_idx], SqlValue::Null));
-            let sorted = gpu_sort_result_rows(non_null, order, col_types, device_memory)?;
-            return Ok(if desc {
-                nulls.into_iter().chain(sorted).collect()
-            } else {
-                sorted.into_iter().chain(nulls).collect()
-            });
-        }
-    }
     let n = rows.len();
     let map_sort_err = |e: gpu_db_execution::CudaRuntimeProbeError| {
         ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
@@ -257,56 +234,56 @@ pub(crate) fn gpu_sort_result_rows(
         }
     }
     let non_int: Vec<(usize, u8)> = classified.iter().copied().filter(|&(_, k)| k != 0).collect();
-    // M3 (doc 21): a SOLE nullable text/numeric/uuid key is handled by the host-partition wrapper above. A
-    // MULTI-key ORDER BY with a NULL in a hetero key is still a clean-error follow-up — the on-device hetero
-    // comparator reads the column placeholder (empty span / 0), and the partition doesn't compose with
-    // secondary keys. (The int-key path places NULLs via the i64::MAX sentinel, multi-key included.)
-    if !non_int.is_empty()
-        && rows
-            .iter()
-            .any(|row| non_int.iter().any(|&(idx, _)| matches!(row[idx], SqlValue::Null)))
-    {
-        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "ORDER BY with a NULL in a text/numeric/uuid key is supported only as the SOLE sort key on \
-             the GPU (M3 3VL follow-up: multi-key NULL hetero placement is pending); int/date/timestamp \
-             keys place NULLs in any position (PG default ordering)"
-                .to_string(),
-        )));
-    }
     let perm: Vec<u32> = if non_int.is_empty() {
         device_memory
             .bitonic_sort_multikey(&int_keys, n, num_int, desc_mask)
             .map_err(map_sort_err)?
     } else {
         // A resident-like payload over ONLY the non-int key columns; the helper returns the text
-        // (offsets,bytes) + numeric/uuid section offsets the hetero comparator reads on-device.
+        // (offsets,bytes) + numeric/uuid section offsets + the per-column NULL validity bitmaps the hetero
+        // comparator reads on-device.
         let names: Vec<String> = (0..non_int.len()).map(|i| format!("__gsk{i}")).collect();
         let types: Vec<SqlType> = non_int.iter().map(|&(idx, _)| col_types[idx]).collect();
         let payload_rows: Vec<Vec<SqlValue>> = rows
             .iter()
             .map(|r| non_int.iter().map(|&(idx, _)| r[idx].clone()).collect())
             .collect();
-        let (payload, text_layouts, _bool, _int4, b128_layouts, _null) =
+        let (payload, text_layouts, _bool, _int4, b128_layouts, null_layouts) =
             crate::engine_residency::build_relational_device_payload(&names, &types, &payload_rows)?;
         // Walk ORDER BY order: int -> next matrix slot; text/numeric/uuid -> the next section in its type
-        // group (the helper lays them out in passed-column order per group).
+        // group (the helper lays them out in passed-column order per group). Build per-key null_offs: an int
+        // key uses the host i64::MAX sentinel in `int_keys` (this path sorts already-host rows; the int
+        // values come from the SqlValues, not a resident column) -> sentinel null_off; a non-int key reads
+        // its validity bitmap in the payload ON-DEVICE (so the comparator places its NULLs, multi-key too).
         let mut int_slot = 0u32;
         let mut text_idx = 0usize;
         let mut b128_idx = 0usize;
+        let mut non_int_pos = 0usize;
         let mut text_cols: Vec<(u64, u64)> = Vec::new();
         let mut b128_cols: Vec<u64> = Vec::new();
         let mut key_plan: Vec<u32> = Vec::with_capacity(order.len());
+        let mut null_offs: Vec<u64> = Vec::with_capacity(order.len());
+        let hetero_null_off = |pos: usize| -> u64 {
+            let name = format!("__gsk{pos}");
+            null_layouts
+                .iter()
+                .find(|l| l.name == name)
+                .map_or(u64::MAX, |l| l.bitmap_byte_offset)
+        };
         for &(_, kind) in &classified {
             match kind {
                 0 => {
                     key_plan.push(int_slot);
                     int_slot += 1;
+                    null_offs.push(u64::MAX);
                 }
                 1 => {
                     let tl = &text_layouts[text_idx];
                     key_plan.push(0x4000_0000_u32 | text_cols.len() as u32);
                     text_cols.push((tl.offsets_byte_offset, tl.bytes_byte_offset));
                     text_idx += 1;
+                    null_offs.push(hetero_null_off(non_int_pos));
+                    non_int_pos += 1;
                 }
                 k => {
                     let off = b128_layouts[b128_idx].1;
@@ -314,6 +291,8 @@ pub(crate) fn gpu_sort_result_rows(
                     key_plan.push(tag | b128_cols.len() as u32);
                     b128_cols.push(off);
                     b128_idx += 1;
+                    null_offs.push(hetero_null_off(non_int_pos));
+                    non_int_pos += 1;
                 }
             }
         }
@@ -321,6 +300,7 @@ pub(crate) fn gpu_sort_result_rows(
         device_memory
             .bitonic_sort_hetero_on_payload(
                 &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols, &key_plan, desc_mask,
+                &null_offs,
             )
             .map_err(map_sort_err)?
     };
@@ -2663,6 +2643,8 @@ impl Engine {
                             &[],
                             &key_plan,
                             0,
+                            // COUNT(DISTINCT) (g, text_v) reps: both keys are non-NULL by construction.
+                            &[],
                         )
                         .map_err(map_err)?;
                     device_memory
@@ -4233,7 +4215,7 @@ impl Engine {
             }
             let order = &select.order_by[ki];
             let order_idx = relational_column_index(table, &order.column)?;
-            let mut keys: Vec<i64> = match table.columns[order_idx].ty {
+            let keys: Vec<i64> = match table.columns[order_idx].ty {
                 SqlType::Int4 | SqlType::Int2 | SqlType::Date => device_memory
                     .project_i32_rows_from_payload(
                         resident_device_int4_column_offset(&snapshot, table, order_idx)?,
@@ -4255,20 +4237,11 @@ impl Engine {
                     )))
                 }
             };
-            // M3 (doc 21): a NULL key row's projected value is the 0 PLACEHOLDER; override it with the
-            // i64::MAX sentinel so the GPU sort places NULLs at PG's DEFAULT end (last ASC / first DESC,
-            // via the per-key desc reversal). The validity bitmap is read by the bool projector (same
-            // 1-bit-per-row layout). No bitmap => the column holds no NULLs (keys unchanged).
-            if let Some(null_off) = resident_device_null_column_offset(&snapshot, table, order_idx)? {
-                let validity = device_memory
-                    .project_bool_rows_from_payload(null_off, indices)
-                    .map_err(map_err)?;
-                for (key, valid) in keys.iter_mut().zip(validity) {
-                    if !valid {
-                        *key = i64::MAX;
-                    }
-                }
-            }
+            // M3 (doc 21): NULL placement is done ON-DEVICE by the sort comparator (it reads the per-key
+            // validity bitmap and orders NULL keys to the PG-default end), so the key VALUES here are raw —
+            // a NULL row's placeholder value is never compared. (A nullable key always routes to the
+            // validity-aware hetero comparator below; this raw matrix only feeds that path or the non-null
+            // pure-int path.) No host-side NULL overwrite.
             Ok(keys)
         };
         // A sort EXPRESSION is int-valued. has_text_key (TEXT only) gates the single-text fast path;
@@ -4276,13 +4249,14 @@ impl Engine {
         // heterogeneous comparator.
         let mut has_text_key = false;
         let mut has_hetero_key = false;
+        // M3 (doc 21): per-key NULL validity bitmap byte offset (sentinel u64::MAX = the key holds no NULL).
+        // The hetero sort comparator reads this ON-DEVICE and orders NULL keys to the PG-default end (last
+        // ASC / first DESC) — GPU-native, no host partition / sentinel. A nullable key of ANY type routes
+        // to that comparator (below). A nullable sort EXPRESSION stays a clean-error follow-up (an
+        // expression has no single column validity bitmap; a derived one is a follow-up).
+        let mut key_null_offs: Vec<u64> = vec![u64::MAX; select.order_by.len()];
         for (ki, order) in select.order_by.iter().enumerate() {
             if let Some(Some(expr)) = order_by_exprs.get(ki) {
-                // M3 (doc 21): a sort EXPRESSION over a NULLABLE column would be evaluated on-device from
-                // the placeholder bytes (an arith result is NULL if any operand is NULL, but the VM folds
-                // the 0 placeholder) and then mis-placed by the i64 sort. The int-COLUMN key path places
-                // NULLs via the validity bitmap, but an expression has no single column bitmap — so a
-                // nullable sort expression is a clean-error follow-up, never a silent mis-order.
                 let mut expr_cols = Vec::new();
                 collect_expr_columns(expr, &mut expr_cols);
                 for col in expr_cols {
@@ -4305,59 +4279,15 @@ impl Engine {
                 SqlType::Numeric { .. } | SqlType::Uuid => has_hetero_key = true,
                 _ => {}
             }
-            // M3 (doc 21): NULL placement for a TEXT/NUMERIC/UUID sort key. A SINGLE such key is handled by
-            // host-partitioning the NULL rows out before the on-device sort and placing them at the PG-default
-            // end (below). A MULTI-key ORDER BY with a NULL in a hetero key is still a clean-error follow-up:
-            // the on-device hetero comparator reads the column placeholder (not the validity bitmap), and the
-            // partition doesn't compose with secondary keys. (int/date/timestamp keys place NULLs via the
-            // i64::MAX sentinel in materialize_int_key_column, multi-key included.)
-            if select.order_by.len() > 1
-                && matches!(
-                    table.columns[order_idx].ty,
-                    SqlType::Text | SqlType::Numeric { .. } | SqlType::Uuid
-                )
-                && resident_device_null_column_offset(&snapshot, table, order_idx)?.is_some()
-            {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "ORDER BY with a NULL in a text/numeric/uuid key is supported only as the SOLE sort key \
-                     on the GPU (M3 3VL follow-up: a multi-key NULL hetero placement is pending); \
-                     int/date/timestamp keys place NULLs in any position (PG default ordering)"
-                        .to_string(),
-                )));
+            if let Some(off) = resident_device_null_column_offset(&snapshot, table, order_idx)? {
+                key_null_offs[ki] = off;
             }
         }
-        let single_text_key = select.order_by.len() == 1 && has_text_key;
-        // M3 (doc 21): a SOLE nullable TEXT/NUMERIC/UUID sort key — partition the NULL rows out (via the
-        // validity bitmap) so the on-device sort runs over only the non-NULL rows; the NULL rows are placed
-        // at the PG-default end after the sort (last ASC / first DESC). The hetero comparator can't read the
-        // validity bitmap, so this host-partition is how a hetero NULL key gets PG-correct placement while
-        // the actual ordering of real values stays a GPU sort. `null_tail` empty ⇒ no nullable hetero key.
-        let mut null_tail: Vec<u64> = Vec::new();
-        let mut indices_u64 = indices_u64;
-        if select.order_by.len() == 1 && has_hetero_key {
-            let order = &select.order_by[0];
-            if order_by_exprs.first().is_none_or(Option::is_none) {
-                let order_idx = relational_column_index(table, &order.column)?;
-                if let Some(null_off) =
-                    resident_device_null_column_offset(&snapshot, table, order_idx)?
-                {
-                    let validity = device_memory
-                        .project_bool_rows_from_payload(null_off, &indices_u64)
-                        .map_err(|err| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
-                        })?;
-                    let mut non_null = Vec::with_capacity(indices_u64.len());
-                    for (&idx, valid) in indices_u64.iter().zip(validity) {
-                        if valid {
-                            non_null.push(idx);
-                        } else {
-                            null_tail.push(idx);
-                        }
-                    }
-                    indices_u64 = non_null;
-                }
-            }
-        }
+        // A nullable key (any type) must route to the validity-aware hetero comparator. A non-null single
+        // text key keeps the dedicated text fast path; non-null int-only keys keep the int matrix/radix path.
+        let any_nullable_key = key_null_offs.iter().any(|&o| o != u64::MAX);
+        let single_text_key = select.order_by.len() == 1 && has_text_key && !any_nullable_key;
+        let use_hetero = has_hetero_key || any_nullable_key;
         let indices_u64 = if select.order_by.is_empty() {
             indices_u64
         } else if single_text_key {
@@ -4376,7 +4306,7 @@ impl Engine {
                 )
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
             perm.iter().map(|&p| indices_u64[p as usize]).collect()
-        } else if has_hetero_key {
+        } else if use_hetero {
             // A key tuple with a TEXT/NUMERIC/UUID key (`ORDER BY name /*text*/, age /*int*/`, or a
             // single numeric/uuid key): the heterogeneous GPU comparator dispatches each key to the s64
             // compare (int, from a row-major by-position matrix), the byte compare (text, in place), or
@@ -4476,6 +4406,7 @@ impl Engine {
                     &b128_cols,
                     &key_plan,
                     desc_mask,
+                    &key_null_offs,
                 )
                 .map_err(map_err)?;
             perm.iter().map(|&p| indices_u64[p as usize]).collect()
@@ -4519,16 +4450,6 @@ impl Engine {
                     .map_err(map_err)?
             };
             perm.iter().map(|&p| indices_u64[p as usize]).collect()
-        };
-        // M3 (doc 21): place the partitioned-out NULL-key rows (a SOLE nullable text/numeric/uuid key) at
-        // PG's DEFAULT end — last under ASC, first under DESC. LIMIT/OFFSET is applied to the final result
-        // rows AFTER projection, so the NULLs participate in the window correctly.
-        let indices_u64 = if null_tail.is_empty() {
-            indices_u64
-        } else if select.order_by[0].descending {
-            null_tail.into_iter().chain(indices_u64).collect()
-        } else {
-            indices_u64.into_iter().chain(null_tail).collect()
         };
         // Materialize: gather each projected column at the surviving row indices on the GPU, by type
         // (int4 -> i32 gather, int8 -> i64 gather; the type matrix, doc 19).

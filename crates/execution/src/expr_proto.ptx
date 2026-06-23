@@ -6286,7 +6286,12 @@ mk_done:
     .param .u64 npot,
     .param .u64 kk,
     .param .u64 jj,
-    .param .u64 b128_offs_ptr
+    .param .u64 b128_offs_ptr,
+    // M3 (doc 21): per-key NULL validity bitmap byte offset (1 = valid, 0 = NULL), u64::MAX = no bitmap
+    // (the key holds no NULL). A NULL key compares as GREATER than every non-NULL key, so with the per-key
+    // desc reversal it lands at PG's default end (last ASC / first DESC). Read ON-DEVICE per row -> the
+    // ORDER BY NULL placement is GPU-native (no host partition / sentinel).
+    .param .u64 null_offs_ptr
 )
 {
     .reg .pred %p;
@@ -6296,6 +6301,14 @@ mk_done:
     .reg .pred %pbp;
     .reg .pred %pdesc;
     .reg .pred %ptext;
+    .reg .pred %pva;
+    .reg .pred %pvb;
+    .reg .u32 %vsh;
+    .reg .u32 %va;
+    .reg .u32 %vb;
+    .reg .u64 %nulloffp;
+    .reg .u64 %nulloff;
+    .reg .u64 %nullsent;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -6369,6 +6382,8 @@ mk_done:
     ld.param.u64 %kk, [kk];
     ld.param.u64 %jj, [jj];
     ld.param.u64 %b128p, [b128_offs_ptr];
+    ld.param.u64 %nulloffp, [null_offs_ptr];
+    mov.u64 %nullsent, 0xFFFFFFFFFFFFFFFF;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
     mov.u32 %bid, %ctaid.x;
@@ -6411,6 +6426,42 @@ het_key_loop:
     mul.lo.u64 %off, %kidx, 4;
     add.u64 %addr, %planp, %off;
     ld.global.u32 %plan, [%addr];
+    // M3 (doc 21): NULL check for this key FIRST. null_offs[kidx] == sentinel => no bitmap => both valid
+    // (skip to the value compare). Else read the validity bit at rowa/rowb ON-DEVICE; a NULL key sorts as
+    // GREATER (cmp=+1) than a non-NULL one; both NULL => equal (next key); both valid => value compare.
+    mul.lo.u64 %off, %kidx, 8;
+    add.u64 %addr, %nulloffp, %off;
+    ld.global.u64 %nulloff, [%addr];
+    setp.eq.u64 %p, %nulloff, %nullsent;
+    @%p bra het_keytype;
+    add.u64 %addr, %resb, %nulloff;
+    shr.u64 %tmp, %rowa, 5;
+    mul.lo.u64 %tmp, %tmp, 4;
+    add.u64 %addr, %addr, %tmp;
+    ld.global.u32 %va, [%addr];
+    cvt.u32.u64 %vsh, %rowa;
+    and.b32 %vsh, %vsh, 31;
+    shr.u32 %va, %va, %vsh;
+    and.b32 %va, %va, 1;
+    add.u64 %addr, %resb, %nulloff;
+    shr.u64 %tmp, %rowb, 5;
+    mul.lo.u64 %tmp, %tmp, 4;
+    add.u64 %addr, %addr, %tmp;
+    ld.global.u32 %vb, [%addr];
+    cvt.u32.u64 %vsh, %rowb;
+    and.b32 %vsh, %vsh, 31;
+    shr.u32 %vb, %vb, %vsh;
+    and.b32 %vb, %vb, 1;
+    setp.ne.u32 %pva, %va, 0;
+    setp.ne.u32 %pvb, %vb, 0;
+    and.pred %p, %pva, %pvb;
+    @%p bra het_keytype;                 // both valid -> value compare
+    or.pred %p, %pva, %pvb;
+    @!%p bra het_key_next;               // both NULL -> equal -> next key
+    // exactly one NULL: a valid (b NULL) -> a < b (cmp=-1); a NULL -> a > b (cmp=+1).
+    selp.s64 %cmp, -1, 1, %pva;
+    bra het_havecmp;
+het_keytype:
     shr.u32 %t32, %plan, 30;
     and.b32 %w0, %plan, 1073741823;
     cvt.u64.u32 %idx, %w0;

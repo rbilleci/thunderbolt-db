@@ -1072,9 +1072,11 @@ impl CudaResidentDeviceMemory {
         b128_cols: &[u64],
         key_plan: &[u32],
         desc_mask: u64,
+        null_offs: &[u64],
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_bitonic_sort_hetero(
-            self, indices, int_keys, num_int, text_cols, b128_cols, key_plan, desc_mask, None,
+            self, indices, int_keys, num_int, text_cols, b128_cols, key_plan, desc_mask, null_offs,
+            None,
         )
     }
 
@@ -1093,6 +1095,7 @@ impl CudaResidentDeviceMemory {
         b128_cols: &[u64],
         key_plan: &[u32],
         desc_mask: u64,
+        null_offs: &[u64],
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_bitonic_sort_hetero(
             self,
@@ -1103,6 +1106,7 @@ impl CudaResidentDeviceMemory {
             b128_cols,
             key_plan,
             desc_mask,
+            null_offs,
             Some(payload),
         )
     }
@@ -3994,6 +3998,10 @@ fn launch_cuda_bitonic_sort_hetero(
     b128_cols: &[u64],
     key_plan: &[u32],
     desc_mask: u64,
+    // M3 (doc 21): one NULL validity bitmap byte offset per key (u64::MAX = the key holds no NULL). The
+    // comparator reads it ON-DEVICE; a NULL key sorts as greatest (PG default placement via the desc
+    // reversal). Empty ⇒ treated as all-sentinel (no NULL handling). Offsets are into `resident_base`.
+    null_offs: &[u64],
     // When Some, the text/numeric/uuid legs read from THIS uploaded payload (a resident-LIKE buffer
     // built from a non-resident result, e.g. a grouped result) instead of `resident`'s own columns;
     // `resident` is then used only for the CUDA context/stream. text_cols/b128_cols offsets are into it.
@@ -4043,6 +4051,14 @@ fn launch_cuda_bitonic_sort_hetero(
     let plan_bytes = std::mem::size_of_val(key_plan).max(4);
     let num_b128 = b128_cols.len();
     let b128_meta_bytes = std::mem::size_of_val(b128_cols).max(8);
+    // M3 (doc 21): one validity offset per key (sentinel u64::MAX when no NULL handling). Normalize so a
+    // caller that passes none gets all-sentinel (byte-identical to the no-NULL behavior).
+    let null_offs_vec: Vec<u64> = if null_offs.len() == num_keys {
+        null_offs.to_vec()
+    } else {
+        vec![u64::MAX; num_keys]
+    };
+    let null_offs_bytes = std::mem::size_of_val(null_offs_vec.as_slice()).max(8);
     let n_u64 = n as u64;
     let npot_u64 = npot as u64;
     let num_int_u64 = num_int as u64;
@@ -4077,6 +4093,7 @@ fn launch_cuda_bitonic_sort_hetero(
     let text_bytes_dev = primary.lease_device_buffer(text_meta_bytes)?;
     let plan_dev = primary.lease_device_buffer(plan_bytes)?;
     let b128_offs_dev = primary.lease_device_buffer(b128_meta_bytes)?;
+    let null_offs_dev = primary.lease_device_buffer(null_offs_bytes)?;
     // The text/numeric/uuid legs read `resident_base`: default to `resident`'s own columns, or a leased
     // copy of `resident_base_payload` (a grouped result's resident-like buffer) when provided.
     let payload_dev = match resident_base_payload {
@@ -4182,6 +4199,17 @@ fn launch_cuda_bitonic_sort_hetero(
         if rc != 0 {
             return rc;
         }
+        let rc = unsafe {
+            htod_async(
+                null_offs_dev.ptr,
+                null_offs_vec.as_ptr().cast::<c_void>(),
+                std::mem::size_of_val(null_offs_vec.as_slice()),
+                stream,
+            )
+        };
+        if rc != 0 {
+            return rc;
+        }
         let mut kk = 2_u64;
         while kk <= npot_u64 {
             let mut jj = kk >> 1;
@@ -4201,6 +4229,7 @@ fn launch_cuda_bitonic_sort_hetero(
                 let mut p12 = kk;
                 let mut p13 = jj;
                 let mut p14 = b128_offs_dev.ptr;
+                let mut p15 = null_offs_dev.ptr;
                 let mut args = [
                     (&mut p0 as *mut u64).cast::<c_void>(),
                     (&mut p1 as *mut u64).cast::<c_void>(),
@@ -4217,6 +4246,7 @@ fn launch_cuda_bitonic_sort_hetero(
                     (&mut p12 as *mut u64).cast::<c_void>(),
                     (&mut p13 as *mut u64).cast::<c_void>(),
                     (&mut p14 as *mut u64).cast::<c_void>(),
+                    (&mut p15 as *mut u64).cast::<c_void>(),
                 ];
                 let rc = unsafe {
                     cu_launch_kernel(

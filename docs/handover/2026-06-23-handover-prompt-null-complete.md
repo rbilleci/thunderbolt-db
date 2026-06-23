@@ -55,10 +55,15 @@ Run `git checkout main && git pull` for the latest.
   panic: COUNT(DISTINCT) over a nullable key now clean-errors (its sub-passes don't route the NULL key). HAZARD
   passed (3× + concurrent). **A nullable COMPOSITE / EXPRESSION key + COUNT(DISTINCT)-over-nullable-key still
   clean-error.**
-- **ORDER BY nullable text/numeric/uuid key** — a SOLE nullable text/numeric/uuid sort key now places NULLs at
-  PG's default end (last ASC / first DESC) via a host-partition (pull NULL rows out, GPU-sort the rest, place
-  NULLs). Both paths (resident `execute_resident_expr_select_with_binding` + host `gpu_sort_result_rows`).
-  HOST-ONLY. Multi-key NULL hetero + nullable sort EXPRESSION + explicit NULLS FIRST/LAST still clean-error.
+- **ORDER BY NULL placement — ON-DEVICE (charter rework)** — the GPU sort comparator (`gpu_db_bitonic_sort_hetero_step`)
+  now reads each key's NULL validity bitmap ON-DEVICE (new per-key `null_offs` param) and orders NULL as
+  greatest → PG default (last ASC / first DESC). REPLACED the earlier host-partition AND the pre-existing int
+  host i64::MAX overwrite. Covers int/int2/date/timestamp/text/numeric/uuid keys, SINGLE + MULTI-key, on-device.
+  Any nullable-key ORDER BY routes to the hetero comparator; non-null keeps the fast paths byte-identically.
+  `gpu_sort_result_rows` (host-result sort): hetero keys on-device via the payload validity; int keys keep the
+  host sentinel (their values are host SqlValues from a prior join/groupby materialization, not a resident
+  column). HAZARD passed. STILL CLEAN-ERROR: a nullable sort EXPRESSION (needs a derived validity bitmap) +
+  explicit NULLS FIRST/LAST.
 **REMAINING Track A:** A.2 tail (nullable COMPOSITE / EXPRESSION GROUP BY key — per-member/derived NULL encoding,
 not one reserved slot; + route the NULL key through the COUNT(DISTINCT) sub-passes);
 A.4 tail (explicit NULLS FIRST/LAST [threads a SelectOrder.nulls_first field through ~20 ctors incl. the legacy
