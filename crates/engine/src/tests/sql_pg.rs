@@ -1111,6 +1111,60 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
+    // M3 (doc 21): GROUP BY a NULLABLE int4 EXPRESSION (`a + b`, b non-null) -- the rows where a is NULL
+    // (so a+b is NULL) form their OWN group, rendered SqlValue::Null. Reuses the single-column NULL-key
+    // reserved slot via the one nullable operand's validity bitmap (ZERO kernel change).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b) VALUES (1,10),(NULL,10),(1,10),(2,10),(NULL,10)")
+        .unwrap();
+    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+        return;
+    }
+    let groups = |rows: &[Vec<SqlValue>]| -> Vec<(Option<i32>, i64)> {
+        let mut v: Vec<(Option<i32>, i64)> = rows
+            .iter()
+            .map(|r| {
+                let k = match r[0] {
+                    SqlValue::Int4(x) => Some(x),
+                    SqlValue::Null => None,
+                    ref o => panic!("unexpected key {o:?}"),
+                };
+                let c = match r[1] {
+                    SqlValue::Int8(x) => x,
+                    SqlValue::Int4(x) => i64::from(x),
+                    ref o => panic!("unexpected count {o:?}"),
+                };
+                (k, c)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    // a+b: 11, NULL, 11, 12, NULL -> groups {11:2, 12:1, NULL:2}.
+    let r = e
+        .execute_resident_expr_select_sql("SELECT a + b, COUNT(*) FROM t GROUP BY a + b")
+        .expect("GROUP BY nullable int4 expression");
+    assert_eq!(
+        groups(&r.rows),
+        vec![(None, 2), (Some(11), 2), (Some(12), 1)],
+        "GROUP BY a+b: the NULL-result rows form their own group (rendered NULL)"
+    );
+    // GROUP BY over an expression with TWO nullable operands clean-errors (needs a derived validity AND).
+    e.execute_text(3, "CREATE TABLE t2 (a INT, b INT)").unwrap();
+    e.execute_text(4, "INSERT INTO t2 (a,b) VALUES (1,2),(NULL,NULL)").unwrap();
+    if e.populate_relational_residency_snapshot("t2").unwrap().device_memory_proof.is_some() {
+        assert!(
+            e.execute_resident_expr_select_sql("SELECT a + b, COUNT(*) FROM t2 GROUP BY a + b")
+                .is_err(),
+            "GROUP BY an expression over two nullable operands clean-errors"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_order_by_nullable_expression_places_null_results_on_device() {
     // M3 (doc 21): ORDER BY a NULLABLE int4 EXPRESSION (`a + b`). A NULL result (any operand NULL) becomes
     // the i64::MAX default-end sentinel, blended ON-DEVICE (a validity-mask VM run + the blend kernel), so

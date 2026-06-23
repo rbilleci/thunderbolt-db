@@ -2876,7 +2876,32 @@ impl Engine {
                     )
                 )
             });
-            if !key_is_single_nullable_column {
+            // M3 (doc 21): an EXPRESSION group key (`a + b`) is NULL exactly when an operand is NULL. If it
+            // references EXACTLY ONE nullable operand column, the expression's NULL group IS that column's
+            // NULL rows, so reuse the single-column NULL-key reserved slot (pass_key_null_off = that
+            // column's validity bitmap). The kernel routes by validity BEFORE reading the derived key, so a
+            // NULL row's garbage derived value is never used, and the NULL group renders SqlValue::Null via
+            // the existing key_is_null path -- ZERO kernel change, int4 or int8 expression alike. Two+
+            // nullable operands need a DERIVED validity (the AND of the operand bitmaps): a clean-error
+            // follow-up.
+            let expr_key_single_null_off: Option<u64> = if let Some(expr) = group_key_expr {
+                let mut cols = Vec::new();
+                collect_expr_columns(expr, &mut cols);
+                cols.sort_unstable();
+                cols.dedup();
+                let mut nullable_offs = Vec::new();
+                for c in cols {
+                    if let Some(off) = resident_device_null_column_offset(&snapshot, table, c)? {
+                        nullable_offs.push(off);
+                    }
+                }
+                // exactly one nullable operand -> its bitmap is the expression's validity; 0 = no NULLs
+                // (unchanged); >1 -> None here, caught by the clean-error loop below.
+                (nullable_offs.len() == 1).then(|| nullable_offs[0])
+            } else {
+                None
+            };
+            if !key_is_single_nullable_column && expr_key_single_null_off.is_none() {
                 let mut group_by_key_check: Vec<usize> = Vec::new();
                 if let Some(expr) = group_key_expr {
                     collect_expr_columns(expr, &mut group_by_key_check);
@@ -2890,10 +2915,11 @@ impl Engine {
                 for col in group_by_key_check {
                     if resident_device_null_column_offset(&snapshot, table, col)?.is_some() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "GROUP BY over a nullable COMPOSITE or EXPRESSION (or bool) KEY is not yet \
-                             supported on the GPU (M3 3VL follow-up: a composite/expression NULL key needs \
-                             per-member NULL encoding, not a single reserved slot; a single int/date/\
-                             timestamp/text/numeric/uuid column key is supported)"
+                            "GROUP BY over a nullable COMPOSITE KEY (or an EXPRESSION key over >1 nullable \
+                             operand, or a bool key) is not yet supported on the GPU (M3 3VL follow-up: it \
+                             needs per-member / derived NULL encoding, not a single reserved slot; a single \
+                             int/date/timestamp/text/numeric/uuid column key, or an expression over exactly \
+                             one nullable operand, is supported)"
                                 .to_string(),
                         )));
                     }
@@ -3391,7 +3417,10 @@ impl Engine {
             let pass_key_null_off = if key_is_single_nullable_column {
                 resident_device_null_column_offset(&snapshot, table, group_idx)?
             } else {
-                None
+                // An expression key over exactly one nullable operand reuses that operand's validity bitmap
+                // (see expr_key_single_null_off): the kernel routes the expression's NULL rows to the NULL
+                // reserved slot, forming their own group, rendered SqlValue::Null.
+                expr_key_single_null_off
             };
             let force_single = value_indices.len() > 1
                 || is_expr_key
