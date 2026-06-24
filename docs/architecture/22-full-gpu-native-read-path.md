@@ -127,9 +127,16 @@ is optional; each line is struck through only when it runs on the device.
   then dropped). **GROUP BY path** (was `~4655`): switched `gpu_sort_result_rows` + host `drain/truncate` to
   `gpu_sort_permutation` + window the permutation + gather only the window from the materialized group rows
   (no-LIMIT window = full range ⇒ byte-identical to the prior reorder). No kernel change (reuses the audited
-  S2.3 `gpu_sort_permutation`). Suite 239/0; grouped windowing tests stable 10×. Edge cases pinned by
+  S2.3 `gpu_sort_permutation`). Suite 248/0; grouped windowing tests stable 10×. Edge cases pinned by
   `gpu_resident_select_limit_offset_window_edges` + `gpu_grouped_limit_offset_window_edges` (OFFSET past end,
-  LIMIT 0, OFFSET+LIMIT past end clamped, DESC window). **Independent adversarial audit: pending.**
+  LIMIT 0, OFFSET+LIMIT past end clamped, DESC window) plus 10 `audit_s4_*` tests adopted from the audit
+  (composite/text single-group guard, HAVING-empties+LIMIT, multi-aggregate #30 alignment under window,
+  NULLS-override under window, LIMIT-without-ORDER-BY index-order preserved, and an EXHAUSTIVE pure-math proof
+  that the windowing formula ≡ the old drain/truncate over `len×offset×limit` incl. `usize::MAX` overflow).
+  **Independent adversarial audit (`237f3e34`): SHIP** — verified the windowing math non-vacuously (fault
+  injection), the `rows.len()>1` guard widening, the default-vs-explicit branch refactor, empty/≤1-group
+  cases, and that the join `drain/truncate` is untouched (S7 deferral intact). No divergence from the old
+  drain/truncate found on any input.
   **The join LIMIT/OFFSET site (`engine_expr.rs` join executor, `result_rows.drain/truncate`) is NOT in S4 —
   it is folded into S7** (the join result is still host-materialized from `host_rows` today, the violation S7
   fixes; LIMIT-windowing of the carried index vectors is the natural GPU-native form there). Tracked, not

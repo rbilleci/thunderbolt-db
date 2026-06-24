@@ -4213,7 +4213,8 @@ impl Engine {
             // sorting each by the FULL group key ON THE GPU (gpu_sort_permutation). The full key is UNIQUE
             // per group, so this is a TOTAL order -> all passes align by index with no host sort and no
             // sort-stability dependence. #30 needs only CONSISTENT alignment (the FINAL result order is
-            // gpu_sort_result_rows below), so any one deterministic order works; ASC / NULL-first is fine.
+            // the gpu_sort_permutation window below), so any one deterministic order works; ASC / NULL-first
+            // is fine.
             // A single pass needs no alignment (its groups are internally consistent), so skip it there.
             if passes.len() > 1 {
                 let key_types: Vec<SqlType> = if let Some(members) = &widekey_cols {
@@ -4416,11 +4417,12 @@ impl Engine {
                 }
                 rows.push(row);
             }
-            // The deterministic default order is applied ON THE GPU below (gpu_sort_result_rows), not by a
-            // host sort -- so the merged rows stay in raw group order here. HAVING (filter) and LIMIT/OFFSET
-            // (slice) are still applied host-side (S3/S4 move them on-device); ORDER BY and the default
-            // order are GPU sorts. Each clause maps its referenced result column name to an index. All are
-            // empty/None for a bare GROUP BY, so only the default GPU order runs there.
+            // The deterministic default order is applied ON THE GPU below (the gpu_sort_permutation window),
+            // not by a host sort -- so the merged rows stay in raw group order here. HAVING (S3: a transient
+            // device relation + the predicate VM) and LIMIT/OFFSET (S4: a control-plane window of the device
+            // sort permutation) are both ON-DEVICE now; ORDER BY and the default order are GPU sorts. Each
+            // clause maps its referenced result column name to an index. All are empty/None for a bare GROUP
+            // BY, so only the default GPU order runs there.
             let col_index = |name: &str| -> Result<usize, ExecuteError> {
                 let mut hits = bound
                     .selected_columns

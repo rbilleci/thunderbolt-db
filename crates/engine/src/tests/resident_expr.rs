@@ -8028,3 +8028,401 @@ fn gpu_resident_expr_is_null_on_a_column_with_no_nulls_uses_a_constant_mask() {
         "standalone w IS NULL over a no-NULL column = empty"
     );
 }
+
+// ===========================================================================
+// S4 AUDIT (audit-237f3e34): adversarial LIMIT/OFFSET windowing tests.
+// These probe the corners the shipped tests miss. SAFE TO DELETE after audit.
+// ===========================================================================
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_grouped_single_group_default_limit() {
+    // RISK: the GROUP BY guard changed `rows.len() > 1` -> `... || offset.is_some() || limit.is_some()`.
+    // With EXACTLY ONE group + a LIMIT, the OLD code SKIPPED the sort entirely (rows.len() <= 1) and ran
+    // drain/truncate on the 1 row. The NEW code now ENTERS the block and calls gpu_sort_permutation on a
+    // 1-row payload (which must return identity, not error). Verify the single group still comes back.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g, v) VALUES (7,1),(7,2),(7,3)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let r = |g: i32, c: i64| vec![SqlValue::Int4(g), SqlValue::Int8(c)];
+
+    // default order (no ORDER BY) + LIMIT 1 over a single group.
+    let lim = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 1")
+        .expect("single-group default-order LIMIT 1 must run");
+    assert_eq!(lim.rows, vec![r(7, 3)], "single group, default order, LIMIT 1");
+
+    // default order + OFFSET 1 over a single group -> empty.
+    let off = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g OFFSET 1")
+        .expect("single-group OFFSET 1 must run");
+    assert!(off.rows.is_empty(), "OFFSET 1 over 1 group -> empty");
+
+    // explicit ORDER BY + LIMIT 1 over a single group (forces gpu_sort_permutation on 1 row).
+    let ord = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC LIMIT 1")
+        .expect("single-group ORDER BY LIMIT 1 must run");
+    assert_eq!(ord.rows, vec![r(7, 3)], "single group, ORDER BY DESC, LIMIT 1");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_grouped_single_text_group_order_limit() {
+    // RISK (claim #2): a single TEXT group + ORDER BY + LIMIT 1 now builds the hetero payload over a
+    // 1-row result and calls gpu_sort_permutation. gpu_sort_permutation short-circuits rows.len()<=1 to
+    // identity BEFORE building any payload, so this must NOT error and must return the one group.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g TEXT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g, v) VALUES ('apple',10),('apple',20)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let want = vec![vec![SqlValue::Text("apple".to_string()), SqlValue::Int8(2)]];
+
+    let lim = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 1")
+        .expect("single text group default LIMIT 1");
+    assert_eq!(lim.rows, want, "single text group, default order, LIMIT 1");
+
+    let ord = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g LIMIT 5")
+        .expect("single text group ORDER BY LIMIT 5");
+    assert_eq!(ord.rows, want, "single text group, ORDER BY, LIMIT > 1");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_grouped_composite_single_group_limit() {
+    // RISK (claim #2): a single COMPOSITE-key group + LIMIT now enters the windowing block. The default
+    // branch computes n_group_cols=2 for the composite key; gpu_sort_permutation identity-short-circuits
+    // at 1 row so the 2-col order is never evaluated. Verify the group survives.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (1,2,10),(1,2,20),(1,2,30)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let want = vec![vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int8(3)]];
+    let lim = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b LIMIT 1")
+        .expect("single composite group LIMIT 1");
+    assert_eq!(lim.rows, want, "single composite group, default order, LIMIT 1");
+    let off0 = e
+        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b OFFSET 0 LIMIT 1")
+        .expect("OFFSET 0 LIMIT 1");
+    assert_eq!(off0.rows, want, "OFFSET 0 LIMIT 1 over 1 composite group");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_grouped_having_empties_then_limit() {
+    // RISK (claim #4): HAVING filters EVERYTHING -> rows is empty, but LIMIT is present so the windowing
+    // block is entered with an EMPTY perm. perm[start..end] must be the empty slice (no panic), result
+    // empty. Then a HAVING that leaves exactly ONE group + LIMIT (the 1-row windowing path post-HAVING).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}")).unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // No group has COUNT(*) > 100 -> HAVING empties the result; LIMIT present -> empty perm window.
+    let empty = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 100 ORDER BY g LIMIT 3",
+        )
+        .expect("HAVING-empty + LIMIT must not panic");
+    assert!(empty.rows.is_empty(), "HAVING removed all groups -> empty, no panic");
+
+    // HAVING leaves exactly ONE group (g4 has COUNT 4) -> single-row windowing post-HAVING.
+    let one = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 3 ORDER BY g LIMIT 5",
+        )
+        .expect("HAVING-one + LIMIT");
+    assert_eq!(
+        one.rows,
+        vec![vec![SqlValue::Int4(4), SqlValue::Int8(4)]],
+        "HAVING leaves 1 group; window keeps it"
+    );
+
+    // HAVING-empty + OFFSET only (no LIMIT) -> empty, no panic.
+    let empty_off = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 100 OFFSET 2",
+        )
+        .expect("HAVING-empty + OFFSET must not panic");
+    assert!(empty_off.rows.is_empty(), "HAVING-empty + OFFSET -> empty");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_grouped_multi_aggregate_order_limit_offset() {
+    // RISK (claim #6, #30 alignment): a MULTI-aggregate GROUP BY (SUM + MIN + MAX) where the multi-pass
+    // alignment built `rows`, then ORDER BY an AGGREGATE + LIMIT + OFFSET windows the permutation. Verify
+    // the windowed rows are exactly the right groups with the right (cross-pass-aligned) aggregate values.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}")).unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // Per group: g1 sum=60 min=10 max=30; g2 sum=5 min=5 max=5; g3 sum=15 min=7 max=8;
+    //            g4 sum=10 min=1 max=4; g5 sum=99 min=99 max=99.
+    // ORDER BY SUM(v) DESC -> g5(99), g1(60), g3(15), g4(10), g2(5). OFFSET 1 LIMIT 2 -> g1, g3.
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, SUM(v), MIN(v), MAX(v) FROM t GROUP BY g ORDER BY SUM(v) DESC LIMIT 2 OFFSET 1",
+        )
+        .expect("multi-agg ORDER BY agg LIMIT OFFSET");
+    let row = |g: i32, s: i64, mn: i32, mx: i32| {
+        vec![
+            SqlValue::Int4(g),
+            SqlValue::Int8(s),
+            SqlValue::Int4(mn),
+            SqlValue::Int4(mx),
+        ]
+    };
+    assert_eq!(
+        res.rows,
+        vec![row(1, 60, 10, 30), row(3, 15, 7, 8)],
+        "multi-agg window must keep cross-pass-aligned g1,g3"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_resident_limit_no_order_index_order_preserved() {
+    // RISK (claim #8): a LIMIT WITHOUT ORDER BY on the resident-projection path. The new code windows the
+    // UNSORTED indices_u64 (compaction output, ascending row index) BEFORE the gather. The OLD code
+    // gathered all then drained/truncated. Both must yield the SAME rows in the SAME order. With values
+    // chosen so the stored row order != value order, this distinguishes "windowed survivor indices" from
+    // any accidental sort. Insert order = stored order on a fresh table.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let col = |res: &RelationalSelectResult| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(v) => v,
+                ref o => panic!("expected Int4 got {o:?}"),
+            })
+            .collect()
+    };
+    // No ORDER BY: stored order is insert order [50,20,80,10,90,30].
+    // LIMIT 3 -> first three in stored order [50,20,80].
+    let lim3 = e
+        .execute_relational_select_text("SELECT a FROM t LIMIT 3")
+        .expect("LIMIT 3 no ORDER BY");
+    assert_eq!(col(&lim3), vec![50, 20, 80], "LIMIT 3 keeps the first 3 in stored order");
+    // OFFSET 2 LIMIT 2 -> [80,10].
+    let win = e
+        .execute_relational_select_text("SELECT a FROM t LIMIT 2 OFFSET 2")
+        .expect("LIMIT 2 OFFSET 2 no ORDER BY");
+    assert_eq!(col(&win), vec![80, 10], "OFFSET 2 LIMIT 2 in stored order");
+    // OFFSET only.
+    let off = e
+        .execute_relational_select_text("SELECT a FROM t OFFSET 4")
+        .expect("OFFSET 4 no ORDER BY");
+    assert_eq!(col(&off), vec![90, 30], "OFFSET 4 keeps stored tail");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_resident_with_where_limit_window() {
+    // RISK: LIMIT windowing interacts with a WHERE filter (indices_u64 is the SURVIVOR set). Window must
+    // slice survivors, not raw rows. WHERE a > 25 over [50,20,80,10,90,30] -> survivors [50,80,90,30]
+    // (stored order). LIMIT 2 OFFSET 1 -> [80,90].
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let col = |res: &RelationalSelectResult| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(v) => v,
+                ref o => panic!("expected Int4 got {o:?}"),
+            })
+            .collect()
+    };
+    let win = e
+        .execute_relational_select_text("SELECT a FROM t WHERE a > 25 LIMIT 2 OFFSET 1")
+        .expect("WHERE + LIMIT window");
+    assert_eq!(col(&win), vec![80, 90], "WHERE survivors windowed, not raw rows");
+    // OFFSET past the survivor count -> empty (4 survivors, OFFSET 4).
+    let beyond = e
+        .execute_relational_select_text("SELECT a FROM t WHERE a > 25 OFFSET 4")
+        .expect("WHERE + OFFSET past survivors");
+    assert!(beyond.rows.is_empty(), "OFFSET == survivor count -> empty");
+    // WHERE matches nothing + LIMIT -> empty, no panic.
+    let none = e
+        .execute_relational_select_text("SELECT a FROM t WHERE a > 1000 LIMIT 5")
+        .expect("WHERE-empty + LIMIT must not panic");
+    assert!(none.rows.is_empty(), "WHERE-empty + LIMIT -> empty");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_resident_limit_zero_and_huge() {
+    // RISK (claim #1): LIMIT 0 -> empty; a HUGE LIMIT (well past len) -> the whole (windowed) set; OFFSET
+    // exactly == len -> empty. saturating_add must keep a huge LIMIT from overflowing start+l.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (5),(2),(8),(1)").unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let col = |res: &RelationalSelectResult| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(v) => v,
+                ref o => panic!("expected Int4 got {o:?}"),
+            })
+            .collect()
+    };
+    let zero = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 0")
+        .expect("LIMIT 0");
+    assert!(zero.rows.is_empty(), "LIMIT 0 -> empty");
+    // huge LIMIT well within usize but past len -> the whole sorted set.
+    let huge = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 1000000000")
+        .expect("huge LIMIT");
+    assert_eq!(col(&huge), vec![1, 2, 5, 8], "huge LIMIT -> whole set");
+    // OFFSET == len -> empty.
+    let at_end = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a OFFSET 4")
+        .expect("OFFSET == len");
+    assert!(at_end.rows.is_empty(), "OFFSET == len -> empty");
+    // OFFSET huge + LIMIT huge -> empty (saturating_add must not overflow-panic; start clamps to len).
+    let huge_off = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 999999999 OFFSET 999999999")
+        .expect("huge OFFSET + huge LIMIT must not panic");
+    assert!(huge_off.rows.is_empty(), "huge OFFSET -> empty");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s4_grouped_nulls_override_with_limit_window() {
+    // RISK (claim #3): the explicit-ORDER-BY branch now threads `order_by_nulls_first.to_vec()` into
+    // gpu_sort_permutation instead of passing the slice into gpu_sort_result_rows. Identical contents must
+    // produce identical placement. A nullable INT group KEY forms a NULL group; with explicit NULLS LAST
+    // the NULL group must sort LAST (overriding the ASC default of FIRST), then a LIMIT window must keep
+    // the right groups. This is a MULTI-group result so the real sort runs (not the 1-row identity).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE tg (k INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO tg (k,v) VALUES (10,1),(NULL,2),(20,3),(NULL,4),(10,5),(30,6)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("tg").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // groups: NULL->2, 10->2, 20->1, 30->1.
+    let r = |k: SqlValue, c: i64| vec![k, SqlValue::Int8(c)];
+    let n = SqlValue::Null;
+    let i = SqlValue::Int4;
+
+    // ASC NULLS LAST: 10,20,30,NULL. LIMIT 2 OFFSET 1 -> [20, 30].
+    let last = e
+        .execute_resident_expr_select_sql(
+            "SELECT k, COUNT(*) FROM tg GROUP BY k ORDER BY k ASC NULLS LAST LIMIT 2 OFFSET 1",
+        )
+        .expect("grouped ASC NULLS LAST + window");
+    assert_eq!(
+        last.rows,
+        vec![r(i(20), 1), r(i(30), 1)],
+        "ASC NULLS LAST window keeps the middle two"
+    );
+
+    // ASC NULLS FIRST (default): NULL,10,20,30. LIMIT 2 -> [NULL, 10].
+    let first = e
+        .execute_resident_expr_select_sql(
+            "SELECT k, COUNT(*) FROM tg GROUP BY k ORDER BY k ASC NULLS FIRST LIMIT 2",
+        )
+        .expect("grouped ASC NULLS FIRST + window");
+    assert_eq!(
+        first.rows,
+        vec![r(n.clone(), 2), r(i(10), 2)],
+        "ASC NULLS FIRST window keeps the NULL group then 10"
+    );
+
+    // DESC NULLS LAST: 30,20,10,NULL. LIMIT 2 OFFSET 2 -> [10, NULL].
+    let desc_last = e
+        .execute_resident_expr_select_sql(
+            "SELECT k, COUNT(*) FROM tg GROUP BY k ORDER BY k DESC NULLS LAST LIMIT 2 OFFSET 2",
+        )
+        .expect("grouped DESC NULLS LAST + window");
+    assert_eq!(
+        desc_last.rows,
+        vec![r(i(10), 2), r(n, 2)],
+        "DESC NULLS LAST window keeps the tail [10, NULL]"
+    );
+}
+
+#[test]
+fn audit_s4_windowing_math_equals_drain_truncate() {
+    // NON-VACUITY + EXHAUSTIVE EQUIVALENCE (no GPU): the NEW windowing formula must equal the OLD
+    // drain/truncate for EVERY (len, offset, limit). This is a pure-math model of the production code at
+    // engine_expr.rs:5209-5217 and :4657-4663. Fault-inject the formula here (not in production) to prove
+    // this test is non-vacuous: e.g. `end = start + l` (no `.min(len)`) would diverge on overflow/clamp
+    // cases below, and `start = offset` (no `.min(len)`) would panic-slice.
+    fn windowed(len: usize, offset: Option<usize>, limit: Option<usize>) -> (usize, usize) {
+        let start = offset.unwrap_or(0).min(len);
+        let end = limit.map_or(len, |l| start.saturating_add(l).min(len));
+        (start, end) // keep [start, end)
+    }
+    // The OLD semantics, applied to a vector of `len` elements; returns the kept index RANGE [lo, hi).
+    fn drain_truncate(len: usize, offset: Option<usize>, limit: Option<usize>) -> (usize, usize) {
+        let start = offset.unwrap_or(0).min(len); // drain(..start)
+        let remaining = len - start;
+        let kept = match limit {
+            Some(l) => l.min(remaining), // truncate(l)
+            None => remaining,
+        };
+        (start, start + kept)
+    }
+    let lens = [0usize, 1, 2, 3, 5, 10];
+    let vals: [Option<usize>; 6] = [
+        None,
+        Some(0),
+        Some(1),
+        Some(3),
+        Some(usize::MAX),       // overflow probe for start+limit
+        Some(usize::MAX - 1),
+    ];
+    for &len in &lens {
+        for &offset in &vals {
+            for &limit in &vals {
+                let w = windowed(len, offset, limit);
+                let d = drain_truncate(len, offset, limit);
+                assert_eq!(
+                    w, d,
+                    "windowing != drain/truncate at len={len} offset={offset:?} limit={limit:?}"
+                );
+                // sanity: the window is a valid slice of [0, len].
+                assert!(w.0 <= w.1 && w.1 <= len, "invalid window {w:?} for len={len}");
+            }
+        }
+    }
+}
