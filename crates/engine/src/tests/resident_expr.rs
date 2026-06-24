@@ -6022,6 +6022,18 @@ fn gpu_grouped_having_avg_heterogeneous_scale_on_gpu() {
         vec![SqlValue::Int4(1), SqlValue::Int4(3)],
         "HAVING AVG(v) < 5 keeps g1(3.0), g3(1.0)"
     );
+    // 4th-audit case: a HIGH-SCALE numeric (AVG, scale ~20) leaf inside an AND/OR DNF must use the i128
+    // comparison, not the i32 `CompareScalar` fast path (whose rescaled literal overflowed i32).
+    assert_eq!(
+        keys("SELECT g, AVG(v), COUNT(*) FROM t GROUP BY g HAVING AVG(v) > 2.00 AND COUNT(*) >= 1"),
+        vec![SqlValue::Int4(1), SqlValue::Int4(2)],
+        "HAVING high-scale AVG AND int COUNT in a DNF"
+    );
+    assert_eq!(
+        keys("SELECT g, AVG(v), COUNT(*) FROM t GROUP BY g HAVING AVG(v) > 5.00 OR COUNT(*) >= 99"),
+        vec![SqlValue::Int4(2)],
+        "HAVING high-scale AVG OR int COUNT in a DNF"
+    );
 }
 
 #[test]

@@ -1228,23 +1228,18 @@ fn compile_numeric_compare(
     snapshot: &RelationalResidencySnapshot,
     program: &mut Vec<ExprStep>,
 ) -> Result<(), ExecuteError> {
-    let needle = |literal: Decimal128, scale: u8| -> Result<i32, ExecuteError> {
-        let mantissa = rescale_numeric_literal(literal, scale)?;
-        i32::try_from(mantissa).map_err(|_| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "numeric comparison literal is too large for the fast path yet".to_string(),
-            ))
-        })
-    };
+    // The numeric program runs at elem I128, so the comparison literal is a FULL i128 mantissa via
+    // CompareScalarI128 -- NOT the i32 `CompareScalar` scalar (which capped a high-scale literal, e.g. a
+    // scale-20 AVG result rescaled, at i32 and clean-errored a valid AND/OR HAVING/WHERE leaf).
     match (numeric_literal_value(lhs), numeric_literal_value(rhs)) {
         (Some(literal), None) => {
             // literal <cmp> arith: bring both to the common = max scale.
             let arith_scale = compile_numeric_arith(rhs, table, snapshot, program)?;
             let common = arith_scale.max(literal.canonical().scale);
             push_numeric_rescale(arith_scale, common, program)?;
-            program.push(ExprStep::CompareScalar {
+            program.push(ExprStep::CompareScalarI128 {
                 cmp,
-                scalar: needle(literal, common)?,
+                scalar: rescale_numeric_literal(literal, common)?,
                 scalar_on_left: true,
             });
             // M3 (doc 21) 3VL: AND the leaf mask with the arith operand columns' validity (a NULL operand
@@ -1256,9 +1251,9 @@ fn compile_numeric_compare(
             let arith_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
             let common = arith_scale.max(literal.canonical().scale);
             push_numeric_rescale(arith_scale, common, program)?;
-            program.push(ExprStep::CompareScalar {
+            program.push(ExprStep::CompareScalarI128 {
                 cmp,
-                scalar: needle(literal, common)?,
+                scalar: rescale_numeric_literal(literal, common)?,
                 scalar_on_left: false,
             });
             push_leaf_validity_and(&[lhs], table, snapshot, program)
