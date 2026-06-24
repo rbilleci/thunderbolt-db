@@ -254,8 +254,21 @@ is optional; each line is struck through only when it runs on the device.
     predicate DNF from `bound` filter_groups like the S3 HAVING DNF, + group_key_columns from `select.group_by`,
     + order_by_exprs=None for the grouped result-column keys, then call `execute_resident_expr_select_with_binding`).
     That bridge is a THIRD predicate-construction path (must be differentially re-verified) and is reusable for
-    S9/S10. **DECISION PENDING (user): build the bridge now (full retire) vs route-at-text now + fold the
-    deletion into S9/S10 (the host-path retirement that builds the bridge anyway).**
+    S9/S10. **DECISION (user, 2026-06-24): BUILD THE BRIDGE + FULLY RETIRE (do it FRESH).**
+  - **CONCRETE PLAN for the fresh start:** (1) Add `fn execute_resident_grouped_via_general(&self, select: &Select)`
+    on Engine: `bind_relational_select_for_execution(select)` → build a predicate `ResidentExpr` from `bound`'s
+    filter_groups (DNF of int4 column-vs-literal comparisons — reuse the S3 HAVING DNF→ResidentExpr construction
+    as the model; `None` when no filter), `group_key_columns = [select.group_by]`, `group_key_expr = None`,
+    `order_by_exprs = vec![None; select.order_by.len()]` (grouped ORDER BY keys are result columns, not exprs),
+    `order_by_nulls_first` from `select.order_by` → call `execute_resident_expr_select_with_binding(select,
+    &table, bound, copin_s, predicate.as_ref(), &order_by_exprs, &nulls, None, &group_key_columns)`. (2) In the
+    route dispatch (`engine_select_exec.rs:439/442`) replace the two probe-method calls with this bridge (it
+    sees `&Select`, so it covers text + CTAS + view uniformly). (3) DELETE the two probe methods + the
+    `gpu_order`/`gpu_having`/`!gpu_ordered` machinery (keep the route CLASSIFIERS so the shapes still dispatch
+    here, OR also delete them and let the general path's own routing accept grouped — decide during impl).
+    (4) **Re-run the 24-shape differential probe but bridge-vs-general (the bridge is a 3rd predicate path — must
+    match), then add asserting tests, full suite, HAZARD, independent audit.** Equivalence enum≡general is
+    already proven (0/24); the new risk is ONLY the predicate-DNF reconstruction in the bridge.
 
 ### Retire the host relational path entirely (the "incl. oracle" decision)
 - [ ] **S9 — replace CPU-oracle parity tests with GPU-native oracles** (serial-vs-parallel /
