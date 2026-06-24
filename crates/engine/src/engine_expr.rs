@@ -4617,47 +4617,50 @@ impl Engine {
             // DEFAULT order. INT/bool keys feed an i64 matrix by group position; TEXT/NUMERIC/UUID keys feed
             // a resident-like payload built (build_relational_device_payload) from just those result
             // columns, which the hetero comparator reads on-device. Single- and multi-key share the path.
-            if rows.len() > 1 {
+            // OFFSET/LIMIT is then a control-plane WINDOW of the device-produced permutation -- never a host
+            // relational drain/truncate on result data. gpu_sort_permutation returns the sort index vector
+            // (identity for <=1 row / empty order); we slice it to [OFFSET, OFFSET+LIMIT) and gather ONLY
+            // that window from the materialized group rows. With no LIMIT the window is the full range, so
+            // this is byte-identical to the prior gpu_sort_result_rows reorder.
+            if rows.len() > 1 || select.offset.is_some() || select.limit.is_some() {
                 let col_types: Vec<SqlType> =
                     bound.selected_columns.iter().map(|c| c.ty).collect();
-                if select.order_by.is_empty() {
-                    // DEFAULT order: by the full group-key tuple (result columns 0..n_group_cols, keys are
-                    // emitted first by the merge), ASC, with the NULL group FIRST -- matching the prior host
-                    // key order (PG leaves a bare GROUP BY unordered; this is our stable choice).
-                    let n_group_cols = if is_composite_key {
-                        2
-                    } else if let Some(members) = &widekey_cols {
-                        members.len()
+                let (order, nulls_first): (Vec<(usize, bool)>, Vec<Option<bool>>) =
+                    if select.order_by.is_empty() {
+                        // DEFAULT order: by the full group-key tuple (result columns 0..n_group_cols, keys
+                        // are emitted first by the merge), ASC, with the NULL group FIRST -- matching the
+                        // prior host key order (PG leaves a bare GROUP BY unordered; our stable choice).
+                        let n_group_cols = if is_composite_key {
+                            2
+                        } else if let Some(members) = &widekey_cols {
+                            members.len()
+                        } else {
+                            1
+                        };
+                        (
+                            (0..n_group_cols).map(|c| (c, false)).collect(),
+                            vec![Some(true); n_group_cols],
+                        )
                     } else {
-                        1
+                        // Explicit ORDER BY: resolve each key to its result-column index; explicit NULLS
+                        // FIRST/LAST honored ON-DEVICE (order_by_nulls_first threaded through; every key
+                        // type, incl. int, reads its NULL validity bitmap in the comparator).
+                        let order: Vec<(usize, bool)> = select
+                            .order_by
+                            .iter()
+                            .map(|o| Ok::<_, ExecuteError>((col_index(&o.column)?, o.descending)))
+                            .collect::<Result<_, _>>()?;
+                        (order, order_by_nulls_first.to_vec())
                     };
-                    let order: Vec<(usize, bool)> = (0..n_group_cols).map(|c| (c, false)).collect();
-                    let nulls_first = vec![Some(true); n_group_cols];
-                    rows = gpu_sort_result_rows(rows, &order, &nulls_first, &col_types, &device_memory)?;
-                } else {
-                    // Explicit ORDER BY: resolve each key to its result-column index; explicit NULLS
-                    // FIRST/LAST honored ON-DEVICE (order_by_nulls_first threaded through; every key type,
-                    // incl. int, reads its NULL validity bitmap in the comparator -- no host sentinel).
-                    let order: Vec<(usize, bool)> = select
-                        .order_by
-                        .iter()
-                        .map(|o| Ok::<_, ExecuteError>((col_index(&o.column)?, o.descending)))
-                        .collect::<Result<_, _>>()?;
-                    rows = gpu_sort_result_rows(
-                        rows,
-                        &order,
-                        order_by_nulls_first,
-                        &col_types,
-                        &device_memory,
-                    )?;
-                }
-            }
-            if select.offset.is_some() || select.limit.is_some() {
-                let start = select.offset.unwrap_or(0).min(rows.len());
-                rows.drain(..start);
-                if let Some(limit) = select.limit {
-                    rows.truncate(limit);
-                }
+                let perm =
+                    gpu_sort_permutation(&rows, &order, &nulls_first, &col_types, &device_memory)?;
+                let start = select.offset.unwrap_or(0).min(perm.len());
+                let end = select
+                    .limit
+                    .map_or(perm.len(), |l| start.saturating_add(l).min(perm.len()));
+                let windowed: Vec<Vec<SqlValue>> =
+                    perm[start..end].iter().map(|&p| rows[p as usize].clone()).collect();
+                rows = windowed;
             }
             return Ok(RelationalSelectResult {
                 columns: bound.selected_columns,
@@ -5198,6 +5201,20 @@ impl Engine {
             };
             perm.iter().map(|&p| indices_u64[p as usize]).collect()
         };
+        // LIMIT/OFFSET as control-plane WINDOWING of the device-ordered index vector: slice the surviving
+        // indices to the [OFFSET, OFFSET+LIMIT) window BEFORE the column gather, so only the kept rows are
+        // materialized from the device (we never gather rows that would then be dropped -- the real win).
+        // SQL clause order: ORDER BY (the GPU sort above) -> OFFSET -> LIMIT. Slicing an index vector is
+        // control-plane; the relational ordering+windowing decision rode the device sort.
+        let indices_u64 = if select.offset.is_some() || select.limit.is_some() {
+            let start = select.offset.unwrap_or(0).min(indices_u64.len());
+            let end = select
+                .limit
+                .map_or(indices_u64.len(), |l| start.saturating_add(l).min(indices_u64.len()));
+            indices_u64[start..end].to_vec()
+        } else {
+            indices_u64
+        };
         // Materialize: gather each projected column at the surviving row indices on the GPU, by type
         // (int4 -> i32 gather, int8 -> i64 gather; the type matrix, doc 19).
         enum ProjectedColumn {
@@ -5342,7 +5359,7 @@ impl Engine {
                 }
             })
             .collect::<Result<_, _>>()?;
-        let mut rows: Vec<Vec<SqlValue>> = (0..indices_u64.len())
+        let rows: Vec<Vec<SqlValue>> = (0..indices_u64.len())
             .map(|row| {
                 projected_columns
                     .iter()
@@ -5376,15 +5393,8 @@ impl Engine {
                     .collect()
             })
             .collect();
-        // OFFSET then LIMIT, applied after the GPU sort (SQL clause order: ORDER BY -> OFFSET -> LIMIT).
-        if select.offset.is_some() || select.limit.is_some() {
-            let start = select.offset.unwrap_or(0).min(rows.len());
-            rows.drain(..start);
-            if let Some(limit) = select.limit {
-                rows.truncate(limit);
-            }
-        }
-
+        // OFFSET/LIMIT was already applied as a control-plane window of `indices_u64` above (before the
+        // gather), so `rows` is the final windowed result -- no host drain/truncate on result data.
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
             rows,

@@ -119,10 +119,21 @@ is optional; each line is struck through only when it runs on the device.
   audit gate caught all THREE regressions before merge — rushing produced them, the rigor stopped them;
   uniform-width+uniform-scale promotion is the load-bearing idea for a single-width/single-scale predicate VM;
   load-bearing idea for a single-width predicate VM.**
-- [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:~4205` and `~4955` host `drain/truncate`. Note:
-  the rows are sorted on-device (`gpu_sort_permutation` now returns the index vector), so LIMIT/OFFSET is
-  best applied to the PERMUTATION before the final gather — materialize only the kept window. (Slicing an
-  index vector is control-plane; the win is not gathering rows that are then dropped.)
+- [x] **S4 — LIMIT/OFFSET on-device.** Both host `drain/truncate` sites in
+  `execute_resident_expr_select_with_binding` are gone, replaced by control-plane WINDOWING of the
+  device-produced index vector. **Resident SELECT path** (was `~5380`): `indices_u64` IS the device-ordered
+  index vector before the gather, so OFFSET/LIMIT now slices it to `[OFFSET, OFFSET+LIMIT)` BEFORE the column
+  gather — only the kept window is materialized from the device (the real win: never gather rows that are
+  then dropped). **GROUP BY path** (was `~4655`): switched `gpu_sort_result_rows` + host `drain/truncate` to
+  `gpu_sort_permutation` + window the permutation + gather only the window from the materialized group rows
+  (no-LIMIT window = full range ⇒ byte-identical to the prior reorder). No kernel change (reuses the audited
+  S2.3 `gpu_sort_permutation`). Suite 239/0; grouped windowing tests stable 10×. Edge cases pinned by
+  `gpu_resident_select_limit_offset_window_edges` + `gpu_grouped_limit_offset_window_edges` (OFFSET past end,
+  LIMIT 0, OFFSET+LIMIT past end clamped, DESC window). **Independent adversarial audit: pending.**
+  **The join LIMIT/OFFSET site (`engine_expr.rs` join executor, `result_rows.drain/truncate`) is NOT in S4 —
+  it is folded into S7** (the join result is still host-materialized from `host_rows` today, the violation S7
+  fixes; LIMIT-windowing of the carried index vectors is the natural GPU-native form there). Tracked, not
+  dropped.
 
 ### Join (the original charter-audit finding)
 - [ ] **S5 — join NULL-key skip in the kernels (V1).** `key_present` reads `host_rows`
@@ -134,7 +145,10 @@ is optional; each line is struck through only when it runs on the device.
 - [ ] **S7 — join result materialization on-device (V3 + values).** Final gather reads
   `host_rows` for all columns incl. NULL emission (`engine_expr.rs:2453-2470`) → gather columns
   (incl. text) from each relation's device payload by the carried index vectors; NULL from a
-  device validity bit; `JOIN_NULL_ROW` pad → validity 0.
+  device validity bit; `JOIN_NULL_ROW` pad → validity 0. **Also fold in the join LIMIT/OFFSET here**
+  (the `result_rows.drain/truncate` after the join sort, ~`engine_expr.rs:2582`): window the carried index
+  vectors to `[OFFSET, OFFSET+LIMIT)` before the device gather, mirroring S4's resident-SELECT windowing —
+  do NOT leave a host `drain/truncate` on the join result.
 
 ### Resident-probe fallback branches
 - [ ] **S8 — `!gpu_ordered` host finalization in resident-probe.** Host sort/HAVING/LIMIT
@@ -150,8 +164,9 @@ is optional; each line is struck through only when it runs on the device.
 
 ## 5. Sequencing
 
-S1 ✅ → **S2 (keystone, the big one)** → S3 → S4 (result-stage operators; small, mechanical) →
-S5 → S6 → S7 (join) → S8 (probe fallback) → S9 (GPU-native oracles) → S10 (delete host path).
+S1 ✅ → **S2 (keystone, the big one)** ✅ → S3 ✅ → S4 ✅ (result-stage operators; small, mechanical) →
+S5 → S6 → S7 (join; **incl. the join LIMIT/OFFSET window**) → S8 (probe fallback) → S9 (GPU-native oracles)
+→ S10 (delete host path).
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2
 is the keystone and unblocks the most queries.
 

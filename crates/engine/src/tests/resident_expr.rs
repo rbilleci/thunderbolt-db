@@ -5821,8 +5821,8 @@ const GROUPED_CLAUSE_ROWS: &str =
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_order_by_and_limit() {
-    // ORDER BY (the key DESC, and an AGGREGATE DESC) + LIMIT/OFFSET applied host-side to the grouped
-    // rows on the Expr path (previously rejected at parse).
+    // ORDER BY (the key DESC, and an AGGREGATE DESC) + LIMIT/OFFSET windowed ON-DEVICE (a slice of the
+    // gpu_sort_permutation index vector, gathering only the kept window) on the Expr path.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"))
@@ -5861,6 +5861,62 @@ fn gpu_grouped_order_by_and_limit() {
         d.rows,
         vec![r(2, 1), r(3, 2)],
         "LIMIT 2 OFFSET 1 over the default key order (skip g1, take g2,g3)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_limit_offset_window_edges() {
+    // S4: OFFSET/LIMIT on the grouped path is now a control-plane WINDOW of the on-device sort
+    // permutation (gpu_sort_permutation), gathering only the kept window -- no host drain/truncate.
+    // These edge cases pin the windowing math against the prior drain/truncate: OFFSET past the end,
+    // LIMIT 0, and OFFSET+LIMIT running past the end (clamped), plus a no-LIMIT default-order sanity.
+    // group counts (GROUPED_CLAUSE_ROWS): g1=3, g2=1, g3=2, g4=4, g5=1 -> default key order is g ASC.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let r = |g: i32, c: i64| vec![SqlValue::Int4(g), SqlValue::Int8(c)];
+
+    // OFFSET past the end -> empty (start clamps to len; nothing gathered).
+    let beyond = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g OFFSET 10",
+        )
+        .unwrap();
+    assert_eq!(beyond.executed_target, DeviceTarget::Gpu(0));
+    assert!(beyond.rows.is_empty(), "OFFSET past the end -> no rows");
+
+    // LIMIT 0 -> empty (window end == start).
+    let zero = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g LIMIT 0")
+        .unwrap();
+    assert!(zero.rows.is_empty(), "LIMIT 0 -> no rows");
+
+    // OFFSET 3 + LIMIT 100 running past the end -> clamped to the remaining tail [g4, g5].
+    let tail = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g LIMIT 100 OFFSET 3",
+        )
+        .unwrap();
+    assert_eq!(
+        tail.rows,
+        vec![r(4, 4), r(5, 1)],
+        "LIMIT past the end clamps to the tail"
+    );
+
+    // No LIMIT, default order: the window is the full range -> identical to the prior reorder.
+    let full = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .unwrap();
+    assert_eq!(
+        full.rows,
+        vec![r(1, 3), r(2, 1), r(3, 2), r(4, 4), r(5, 1)],
+        "no LIMIT -> full default-order result unchanged"
     );
 }
 
@@ -6482,6 +6538,65 @@ fn gpu_nongrouped_order_by_via_gpu_sort() {
         .unwrap();
     assert_eq!(limited.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(int4_col(&limited, 0), vec![2, 3, 5], "ORDER BY a LIMIT 3 OFFSET 1");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_select_limit_offset_window_edges() {
+    // S4: OFFSET/LIMIT on the projection path now slices `indices_u64` (the device-ordered index vector)
+    // BEFORE the column gather -- only the kept window is materialized from the device, no host
+    // drain/truncate. These edge cases pin the windowing math against the prior drain/truncate: OFFSET
+    // past the end, LIMIT 0, OFFSET+LIMIT past the end (clamped), and a DESC window. The ORDER BY makes
+    // every window deterministic.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (5),(2),(8),(1),(9),(3)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let col = |res: &RelationalSelectResult| -> Vec<i32> {
+        res.rows
+            .iter()
+            .map(|r| match r[0] {
+                SqlValue::Int4(v) => v,
+                ref other => panic!("expected Int4, got {other:?}"),
+            })
+            .collect()
+    };
+    // Sorted ascending the rows are [1,2,3,5,8,9].
+
+    // OFFSET past the end -> empty (start clamps to len).
+    let beyond = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a OFFSET 10")
+        .unwrap();
+    assert_eq!(beyond.executed_target, DeviceTarget::Gpu(0));
+    assert!(beyond.rows.is_empty(), "OFFSET past the end -> no rows");
+
+    // LIMIT 0 -> empty.
+    let zero = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 0")
+        .unwrap();
+    assert!(zero.rows.is_empty(), "LIMIT 0 -> no rows");
+
+    // OFFSET 4 + LIMIT 100 past the end -> clamped to the tail [8,9].
+    let tail = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 100 OFFSET 4")
+        .unwrap();
+    assert_eq!(col(&tail), vec![8, 9], "LIMIT past the end clamps to the tail");
+
+    // OFFSET only (no LIMIT) -> drop the first four, keep [8,9].
+    let off = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a OFFSET 4")
+        .unwrap();
+    assert_eq!(col(&off), vec![8, 9], "OFFSET only keeps the tail");
+
+    // DESC + LIMIT 2 OFFSET 1 -> from [9,8,5,3,2,1] skip 1, take 2 -> [8,5].
+    let desc = e
+        .execute_relational_select_text("SELECT a FROM t ORDER BY a DESC LIMIT 2 OFFSET 1")
+        .unwrap();
+    assert_eq!(col(&desc), vec![8, 5], "DESC LIMIT 2 OFFSET 1 window");
 }
 
 #[test]
