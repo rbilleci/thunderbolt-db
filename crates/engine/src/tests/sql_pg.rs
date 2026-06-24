@@ -757,6 +757,252 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_join_null_keys_at_scale_grid_stride_v1b() {
+    // V1b WIRE: the NULL-key skip is now ON-DEVICE (the hash-join kernel reads a per-side validity bitmap),
+    // not a host pre-filter. At SCALE (>256 rows => multiple 256-thread blocks, grid-stride) a NULL key on
+    // either side must (a) match nothing and (b) NOT spuriously match a REAL key 0 -- every NULL fixed-width
+    // cell stores a 0 placeholder on-device, so the on-device skip is the ONLY thing preventing the NULL rows
+    // from colliding with the real key 0 (which DOES exist here). bigp.id is unique on its non-NULL rows, so
+    // the unique-build kernel runs; if the skip were broken, a NULL build row (placeholder 0) would collide
+    // with real key 0 -> a spurious DuplicateBuildKey N:N fallback + wrong pairs, caught by the exact set.
+    let mut e = Engine::new_local();
+    const N: i32 = 600;
+    let mut pv = String::new();
+    let mut cv = String::new();
+    for i in 0..N {
+        if i > 0 {
+            pv.push(',');
+            cv.push(',');
+        }
+        // NULL conditions chosen so id 0 stays a REAL key on both sides.
+        if i % 13 == 5 {
+            pv.push_str(&format!("(NULL,'p{i}')"));
+        } else {
+            pv.push_str(&format!("({i},'p{i}')"));
+        }
+        if i % 17 == 3 {
+            cv.push_str(&format!("(NULL,'c{i}')"));
+        } else {
+            cv.push_str(&format!("({i},'c{i}')"));
+        }
+    }
+    e.execute_text(1, "CREATE TABLE bigp (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE bigc (pid INT, label TEXT)").unwrap();
+    e.execute_text(3, &format!("INSERT INTO bigp (id, name) VALUES {pv}")).unwrap();
+    e.execute_text(4, &format!("INSERT INTO bigc (pid, label) VALUES {cv}")).unwrap();
+    let ps = e.populate_relational_residency_snapshot("bigp").unwrap();
+    let cs = e.populate_relational_residency_snapshot("bigc").unwrap();
+    if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM bigp JOIN bigc ON bigp.id = bigc.pid")
+        .expect("scale int join with NULL keys");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let mut got: Vec<(String, String)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            let s = |c: &SqlValue| match c {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("expected text, got {o:?}"),
+            };
+            (s(&r[0]), s(&r[1]))
+        })
+        .collect();
+    got.sort();
+    let mut expected: Vec<(String, String)> = (0..N)
+        .filter(|&i| i % 13 != 5 && i % 17 != 3)
+        .map(|i| (format!("p{i}"), format!("c{i}")))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "every non-NULL key matches 1:1; NULL rows (incl. the placeholder-0 rows) match nothing"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_join_null_keys_int2_int8_uuid_v1b() {
+    // V1b: the on-device NULL-key skip works for the int2 + int8 (i64 section) widths and the uuid (b128)
+    // type (int4/text/numeric/composite are covered by gpu_inner_join_excludes_null_keys_*). int8 keys
+    // exercise the i64-section gather; key 0 is a real key on both sides, so the NULL row's 0 placeholder
+    // (a NULL int8 cell stores 0, NOT i64::MIN, so the launcher's i64::MIN reject is not tripped) must not
+    // collide with it.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE i2a (k INT2, x TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE i2b (k INT2, y TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO i2a (k,x) VALUES (0,'a0'),(7,'a7'),(NULL,'anull')").unwrap();
+    e.execute_text(4, "INSERT INTO i2b (k,y) VALUES (0,'b0'),(7,'b7'),(NULL,'bnull')").unwrap();
+    e.execute_text(5, "CREATE TABLE i8a (k INT8, x TEXT)").unwrap();
+    e.execute_text(6, "CREATE TABLE i8b (k INT8, y TEXT)").unwrap();
+    e.execute_text(7, "INSERT INTO i8a (k,x) VALUES (0,'a0'),(9000000000,'abig'),(NULL,'anull')").unwrap();
+    e.execute_text(8, "INSERT INTO i8b (k,y) VALUES (0,'b0'),(9000000000,'bbig'),(NULL,'bnull')").unwrap();
+    let u1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    e.execute_text(9, "CREATE TABLE uxa (k UUID, x TEXT)").unwrap();
+    e.execute_text(10, "CREATE TABLE uxb (k UUID, y TEXT)").unwrap();
+    e.execute_text(11, &format!("INSERT INTO uxa (k,x) VALUES ('{u1}','a1'),(NULL,'anull')")).unwrap();
+    e.execute_text(12, &format!("INSERT INTO uxb (k,y) VALUES ('{u1}','b1'),(NULL,'bnull')")).unwrap();
+    let mut ok = true;
+    for t in ["i2a", "i2b", "i8a", "i8b", "uxa", "uxb"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let pairs = |res: &RelationalSelectResult| -> Vec<(String, String)> {
+        let s = |c: &SqlValue| match c {
+            SqlValue::Text(t) => t.clone(),
+            o => panic!("expected text, got {o:?}"),
+        };
+        let mut v: Vec<(String, String)> = res.rows.iter().map(|r| (s(&r[0]), s(&r[1]))).collect();
+        v.sort();
+        v
+    };
+    let i2 = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM i2a JOIN i2b ON i2a.k = i2b.k")
+        .expect("int2 NULL-key join");
+    assert_eq!(
+        pairs(&i2),
+        vec![("a0".to_string(), "b0".to_string()), ("a7".to_string(), "b7".to_string())],
+        "int2 NULL key skipped; key 0 still matches"
+    );
+    let i8 = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM i8a JOIN i8b ON i8a.k = i8b.k")
+        .expect("int8 NULL-key join");
+    assert_eq!(
+        pairs(&i8),
+        vec![("a0".to_string(), "b0".to_string()), ("abig".to_string(), "bbig".to_string())],
+        "int8 NULL key skipped; real key 0 + the big key match (placeholder 0 != i64::MIN)"
+    );
+    let ux = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM uxa JOIN uxb ON uxa.k = uxb.k")
+        .expect("uuid NULL-key join");
+    assert_eq!(
+        pairs(&ux),
+        vec![("a1".to_string(), "b1".to_string())],
+        "uuid NULL key skipped on the b128 path"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_join_null_keys_n_to_n_int_and_text_v1b() {
+    // V1b: the N:N (many-to-many chaining) kernels skip a NULL key too -- a NULL BUILD key is never chained,
+    // a NULL PROBE key emits nothing. Both sides carry DUPLICATE keys (forcing the N:N fallback) PLUS NULLs;
+    // key 0 (int) / 'm' (text) is a real DUPLICATED key, so a broken skip would chain the placeholder-0 /
+    // empty-string NULL rows into that key's cross-product and emit spurious pairs.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE nna (k INT, x TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE nnb (k INT, y TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO nna (k,x) VALUES (0,'a0a'),(0,'a0b'),(1,'a1'),(NULL,'anull')").unwrap();
+    e.execute_text(4, "INSERT INTO nnb (k,y) VALUES (0,'b0a'),(0,'b0b'),(1,'b1'),(NULL,'bnull')").unwrap();
+    e.execute_text(5, "CREATE TABLE tta (k TEXT, x TEXT)").unwrap();
+    e.execute_text(6, "CREATE TABLE ttb (k TEXT, y TEXT)").unwrap();
+    e.execute_text(7, "INSERT INTO tta (k,x) VALUES ('m','a1'),('m','a2'),(NULL,'anull')").unwrap();
+    e.execute_text(8, "INSERT INTO ttb (k,y) VALUES ('m','b1'),('m','b2'),(NULL,'bnull')").unwrap();
+    let mut ok = true;
+    for t in ["nna", "nnb", "tta", "ttb"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let pairs = |res: &RelationalSelectResult| -> Vec<(String, String)> {
+        let s = |c: &SqlValue| match c {
+            SqlValue::Text(t) => t.clone(),
+            o => panic!("expected text, got {o:?}"),
+        };
+        let mut v: Vec<(String, String)> = res.rows.iter().map(|r| (s(&r[0]), s(&r[1]))).collect();
+        v.sort();
+        v
+    };
+    let int_nn = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM nna JOIN nnb ON nna.k = nnb.k")
+        .expect("int N:N NULL-key join");
+    assert_eq!(
+        pairs(&int_nn),
+        vec![
+            ("a0a".to_string(), "b0a".to_string()),
+            ("a0a".to_string(), "b0b".to_string()),
+            ("a0b".to_string(), "b0a".to_string()),
+            ("a0b".to_string(), "b0b".to_string()),
+            ("a1".to_string(), "b1".to_string()),
+        ],
+        "int N:N: key 0's 2x2 cross product + key 1's 1x1; NULL rows never chain/emit"
+    );
+    let text_nn = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM tta JOIN ttb ON tta.k = ttb.k")
+        .expect("text N:N NULL-key join");
+    assert_eq!(
+        pairs(&text_nn),
+        vec![
+            ("a1".to_string(), "b1".to_string()),
+            ("a1".to_string(), "b2".to_string()),
+            ("a2".to_string(), "b1".to_string()),
+            ("a2".to_string(), "b2".to_string()),
+        ],
+        "text N:N: 'm's 2x2 cross product; NULL rows never chain/emit"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_join_null_keys_right_and_full_outer_padded_v1b() {
+    // V1b: a NULL-key row in an OUTER join matches nothing (skipped on-device) and so must be PADDED on the
+    // outer side, never dropped or spuriously matched against the OTHER side's NULL-key row. RIGHT keeps
+    // every right row (its NULL-key row left-padded; the left NULL-key row is left-only -> dropped); FULL
+    // keeps both sides' unmatched rows (incl. both NULL-key rows).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE ol (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE orr (rid INT, label TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO ol (id, name) VALUES (1,'a'),(NULL,'lnull')").unwrap();
+    e.execute_text(4, "INSERT INTO orr (rid, label) VALUES (1,'x'),(NULL,'rnull')").unwrap();
+    let ls = e.populate_relational_residency_snapshot("ol").unwrap();
+    let rs = e.populate_relational_residency_snapshot("orr").unwrap();
+    if ls.device_memory_proof.is_none() || rs.device_memory_proof.is_none() {
+        return;
+    }
+    let opt_pairs = |res: &RelationalSelectResult| -> Vec<(Option<String>, Option<String>)> {
+        let opt = |c: &SqlValue| match c {
+            SqlValue::Text(t) => Some(t.clone()),
+            SqlValue::Null => None,
+            o => panic!("expected text/null, got {o:?}"),
+        };
+        let mut v: Vec<(Option<String>, Option<String>)> =
+            res.rows.iter().map(|r| (opt(&r[0]), opt(&r[1]))).collect();
+        v.sort();
+        v
+    };
+    let right = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM ol RIGHT JOIN orr ON ol.id = orr.rid")
+        .expect("right outer join with NULL keys");
+    assert_eq!(right.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        opt_pairs(&right),
+        vec![
+            (None, Some("rnull".to_string())), // right NULL-key row -> left padded (NOT matched to 'lnull')
+            (Some("a".to_string()), Some("x".to_string())),
+        ],
+        "RIGHT: the right NULL-key row is left-padded; the left NULL-key row is dropped (left-only)"
+    );
+    let full = e
+        .execute_resident_expr_select_sql("SELECT name, label FROM ol FULL JOIN orr ON ol.id = orr.rid")
+        .expect("full outer join with NULL keys");
+    assert_eq!(
+        opt_pairs(&full),
+        vec![
+            (None, Some("rnull".to_string())),              // right-only NULL-key row
+            (Some("a".to_string()), Some("x".to_string())), // the lone match
+            (Some("lnull".to_string()), None),              // left-only NULL-key row
+        ],
+        "FULL: both NULL-key rows are kept and padded; they do NOT match each other"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
     // 2-relation LEFT OUTER join (M3 -- doc 21): every LEFT row appears; an unmatched left row -- the
     // CHILDLESS parent 3, AND the NULL-key left row 'nokey' (which matches nothing, 3VL) -- is kept with

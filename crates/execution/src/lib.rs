@@ -1267,12 +1267,20 @@ impl CudaResidentDeviceMemory {
     /// returns the matched `(build_row_idx, probe_row_idx)` pairs (output <= probe_n, since the unique
     /// build key gives each probe row <=1 match). `DuplicateBuildKey` if a build key repeats (N:N is a
     /// follow-up). The join itself is on the GPU; only the resulting index pairs come to the host.
+    ///
+    /// `build_validity`/`probe_validity` are optional dense LSB-first u32 validity bitmaps (bit `i` in
+    /// `word[i>>5]` at `i & 31`, `1 = valid`) sized to `ceil(n/32)` words. A `0` bit marks a NULL join key,
+    /// which the kernel SKIPS on-device (an equi-join `NULL = x` is UNKNOWN -> matches nothing, and a
+    /// skipped build key never claims a slot, so it is invisible to the duplicate check). `None` means every
+    /// key is valid; `None` on both sides keeps the no-NULL join byte-identical to the pre-V1b sentinel path.
     pub fn hash_join_inner_i64(
         &self,
         build_keys: &[i64],
         probe_keys: &[i64],
+        build_validity: Option<&[u32]>,
+        probe_validity: Option<&[u32]>,
     ) -> Result<HashJoinOutcome, CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_i64(self, build_keys, probe_keys)
+        launch_cuda_hash_join_inner_i64(self, build_keys, probe_keys, build_validity, probe_validity)
     }
 
     /// GPU inner equi-join (M5 J4b) on a TEXT key with a UNIQUE build-side key. `build_texts`/`probe_texts`
@@ -1283,12 +1291,18 @@ impl CudaResidentDeviceMemory {
     /// Returns the matched `(build_row_idx, probe_row_idx)` pairs (output <= probe_n); `DuplicateBuildKey`
     /// if a build text repeats (N:N is a follow-up). The MATCH (hash + byte-verify) is on the GPU; only the
     /// resulting index pairs come back.
+    ///
+    /// `build_validity`/`probe_validity` are optional dense LSB-first u32 validity bitmaps (`1 = valid`,
+    /// `ceil(n/32)` words) marking each side's NULL keys, skipped on-device (see [`Self::hash_join_inner_i64`]
+    /// for the layout + semantics). `None` on both sides keeps the no-NULL join byte-identical.
     pub fn hash_join_inner_text(
         &self,
         build_texts: &[&[u8]],
         probe_texts: &[&[u8]],
+        build_validity: Option<&[u32]>,
+        probe_validity: Option<&[u32]>,
     ) -> Result<HashJoinOutcome, CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_text(self, build_texts, probe_texts)
+        launch_cuda_hash_join_inner_text(self, build_texts, probe_texts, build_validity, probe_validity)
     }
 
     /// GPU inner equi-join (M5 N:N) on an int key where BOTH sides may have DUPLICATE keys -- the general
@@ -1298,12 +1312,18 @@ impl CudaResidentDeviceMemory {
     /// matched `(build_row_idx, probe_row_idx)` pairs (output = sum over probes of its key's build count,
     /// up to build_n×probe_n). The join is on the GPU; only the index pairs come back. No DuplicateBuildKey
     /// (duplicates are the point).
+    ///
+    /// `build_validity`/`probe_validity` are optional dense LSB-first u32 validity bitmaps (`1 = valid`,
+    /// `ceil(n/32)` words): a `0` build bit skips chaining that build row, a `0` probe bit skips emitting
+    /// for that probe row (an equi-join NULL key matches nothing). `None` on both sides is byte-identical.
     pub fn hash_join_inner_i64_nn(
         &self,
         build_keys: &[i64],
         probe_keys: &[i64],
+        build_validity: Option<&[u32]>,
+        probe_validity: Option<&[u32]>,
     ) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_i64_nn(self, build_keys, probe_keys)
+        launch_cuda_hash_join_inner_i64_nn(self, build_keys, probe_keys, build_validity, probe_validity)
     }
 
     /// GPU inner equi-join (M5 N:N) on a TEXT (or 16-byte numeric/uuid) key where BOTH sides may have
@@ -1312,12 +1332,18 @@ impl CudaResidentDeviceMemory {
     /// build row prepends to its bucket's chain, and each probe emits one pair per chained build row.
     /// Returns the matched `(build_row_idx, probe_row_idx)` pairs (output = sum over probes of its key's
     /// build count). The MATCH is on the GPU; only the index pairs come back. No DuplicateBuildKey.
+    ///
+    /// `build_validity`/`probe_validity` are optional dense LSB-first u32 validity bitmaps (`1 = valid`,
+    /// `ceil(n/32)` words) marking each side's NULL keys, skipped on-device as in
+    /// [`Self::hash_join_inner_i64_nn`]. `None` on both sides is byte-identical.
     pub fn hash_join_inner_text_nn(
         &self,
         build_texts: &[&[u8]],
         probe_texts: &[&[u8]],
+        build_validity: Option<&[u32]>,
+        probe_validity: Option<&[u32]>,
     ) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_text_nn(self, build_texts, probe_texts)
+        launch_cuda_hash_join_inner_text_nn(self, build_texts, probe_texts, build_validity, probe_validity)
     }
 
     /// COUNT(DISTINCT v) mark pass: `keys` is the (key0, key1, ..) i64 tuple matrix (row-major, `k`
@@ -15065,6 +15091,8 @@ fn launch_cuda_hash_join_inner_i64(
     resident: &CudaResidentDeviceMemory,
     build_keys: &[i64],
     probe_keys: &[i64],
+    build_validity: Option<&[u32]>,
+    probe_validity: Option<&[u32]>,
 ) -> Result<HashJoinOutcome, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -15155,10 +15183,26 @@ fn launch_cuda_hash_join_inner_i64(
     let dup_flag = primary.lease_device_buffer(8)?;
     let cursor = primary.lease_device_buffer(8)?;
     let pairs = primary.lease_device_buffer(pairs_bytes)?;
+    // Optional validity bitmaps (V1b-wire): lease + (below) upload a dense LSB-first u32 bitmap per side;
+    // the kernel skips a NULL key (bit 0). An empty/None side passes the u64::MAX sentinel => no bitmap =>
+    // every key valid (byte-identical). The buffers outlive both launches (build reads build_valid in phase
+    // 1, probe reads probe_valid in phase 2 -- both are uploaded in phase 1, before the BUILD).
+    let build_valid_words = build_validity.filter(|w| !w.is_empty());
+    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
+    let build_valid_dev = match build_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let probe_valid_dev = match probe_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let build_valid_arg = build_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
+    let probe_valid_arg = probe_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
     const BLOCK: u32 = 256;
     let grid = |n: usize| (n.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
     let zero8 = [0u64];
-    // Phase 1: upload keys, zero dup_flag/cursor, fill the slot table to EMPTY128, run BUILD.
+    // Phase 1: upload keys + validity bitmaps, zero dup_flag/cursor, fill the slot table to EMPTY128, BUILD.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
             (build_dev.ptr, build_keys.as_ptr().cast::<c_void>(), build_bytes),
@@ -15169,6 +15213,17 @@ fn launch_cuda_hash_join_inner_i64(
             let rc = unsafe { htod_async(dst, src, bytes, stream) };
             if rc != 0 {
                 return rc;
+            }
+        }
+        for (dev, words) in [
+            (&build_valid_dev, build_valid_words),
+            (&probe_valid_dev, probe_valid_words),
+        ] {
+            if let (Some(d), Some(w)) = (dev, words) {
+                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                if rc != 0 {
+                    return rc;
+                }
             }
         }
         // fill_i128(slot_keys, npot, lo=0, hi=i64::MIN) -> EMPTY128
@@ -15191,14 +15246,14 @@ fn launch_cuda_hash_join_inner_i64(
         if rc != 0 {
             return rc;
         }
-        // build(build_keys, build_n, slot_keys, mask, dup_flag, build_validity). V1: u64::MAX = no validity
-        // bitmap => every key valid (byte-identical; V1b-wire passes a real bitmap to skip NULL keys).
+        // build(build_keys, build_n, slot_keys, mask, dup_flag, build_validity). build_valid_arg = u64::MAX
+        // (no bitmap => every key valid, byte-identical) or a real bitmap ptr (skip NULL build keys).
         let mut b0 = build_dev.ptr;
         let mut b1 = build_n_u64;
         let mut b2 = slot_keys.ptr;
         let mut b3 = mask;
         let mut b4 = dup_flag.ptr;
-        let mut b5 = u64::MAX;
+        let mut b5 = build_valid_arg;
         let mut bargs = [
             (&mut b0 as *mut u64).cast::<c_void>(),
             (&mut b1 as *mut u64).cast::<c_void>(),
@@ -15225,15 +15280,15 @@ fn launch_cuda_hash_join_inner_i64(
     }
     // Phase 2: PROBE -> append matched (build_idx, probe_idx) at the atomic cursor.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
-        // probe(probe_keys, probe_n, slot_keys, mask, out_pairs, out_cursor, probe_validity). V1: u64::MAX =
-        // no validity bitmap => every key valid (byte-identical; V1b-wire passes a real bitmap).
+        // probe(probe_keys, probe_n, slot_keys, mask, out_pairs, out_cursor, probe_validity). probe_valid_arg
+        // = u64::MAX (no bitmap => every key valid, byte-identical) or a real bitmap ptr (skip NULL probes).
         let mut p0 = probe_dev.ptr;
         let mut p1 = probe_n_u64;
         let mut p2 = slot_keys.ptr;
         let mut p3 = mask;
         let mut p4 = pairs.ptr;
         let mut p5 = cursor.ptr;
-        let mut p6 = u64::MAX;
+        let mut p6 = probe_valid_arg;
         let mut pargs = [
             (&mut p0 as *mut u64).cast::<c_void>(),
             (&mut p1 as *mut u64).cast::<c_void>(),
@@ -15293,6 +15348,8 @@ fn launch_cuda_hash_join_inner_text(
     resident: &CudaResidentDeviceMemory,
     build_texts: &[&[u8]],
     probe_texts: &[&[u8]],
+    build_validity: Option<&[u32]>,
+    probe_validity: Option<&[u32]>,
 ) -> Result<HashJoinOutcome, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -15402,10 +15459,24 @@ fn launch_cuda_hash_join_inner_text(
     let dup_flag = primary.lease_device_buffer(8)?;
     let cursor = primary.lease_device_buffer(8)?;
     let pairs = primary.lease_device_buffer(pairs_bytes)?;
+    // Optional validity bitmaps (V1b-wire): dense LSB-first u32 per side; a 0 bit = a NULL key the kernel
+    // skips. None/empty => u64::MAX sentinel => no bitmap => byte-identical. Both buffers upload in phase 1.
+    let build_valid_words = build_validity.filter(|w| !w.is_empty());
+    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
+    let build_valid_dev = match build_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let probe_valid_dev = match probe_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let build_valid_arg = build_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
+    let probe_valid_arg = probe_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
     const BLOCK: u32 = 256;
     let grid = |n: usize| (n.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
     let zero8 = [0u64];
-    // Phase 1: upload the dense buffer, zero dup_flag/cursor, fill the slot table to EMPTY128, run BUILD.
+    // Phase 1: upload the dense buffer + validity bitmaps, zero dup_flag/cursor, fill EMPTY128, run BUILD.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
             (payload_dev.ptr, payload.as_ptr().cast::<c_void>(), payload.len()),
@@ -15415,6 +15486,17 @@ fn launch_cuda_hash_join_inner_text(
             let rc = unsafe { htod_async(dst, src, bytes, stream) };
             if rc != 0 {
                 return rc;
+            }
+        }
+        for (dev, words) in [
+            (&build_valid_dev, build_valid_words),
+            (&probe_valid_dev, probe_valid_words),
+        ] {
+            if let (Some(d), Some(w)) = (dev, words) {
+                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                if rc != 0 {
+                    return rc;
+                }
             }
         }
         let mut f0 = slot_keys.ptr;
@@ -15437,7 +15519,7 @@ fn launch_cuda_hash_join_inner_text(
             return rc;
         }
         // build(payload, build_offsets_off, build_bytes_off, build_n, slots, mask, dup_flag, build_validity).
-        // V1: u64::MAX = no validity bitmap => every key valid (byte-identical; V1b-wire passes a real one).
+        // build_valid_arg = u64::MAX (no bitmap => valid, byte-identical) or a real bitmap ptr (skip NULLs).
         let mut b0 = payload_dev.ptr;
         let mut b1 = build_offsets_off;
         let mut b2 = build_bytes_off;
@@ -15445,7 +15527,7 @@ fn launch_cuda_hash_join_inner_text(
         let mut b4 = slot_keys.ptr;
         let mut b5 = mask;
         let mut b6 = dup_flag.ptr;
-        let mut b7 = u64::MAX;
+        let mut b7 = build_valid_arg;
         let mut bargs = [
             (&mut b0 as *mut u64).cast::<c_void>(),
             (&mut b1 as *mut u64).cast::<c_void>(),
@@ -15474,7 +15556,7 @@ fn launch_cuda_hash_join_inner_text(
     // Phase 2: PROBE -> append matched (build_idx, probe_idx) at the atomic cursor.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         // probe(payload, probe_off, probe_bytes, probe_n, build_off, build_bytes, slots, mask, out_pairs,
-        // out_cursor, probe_validity). V1: u64::MAX = no validity bitmap => every key valid (byte-identical).
+        // out_cursor, probe_validity). probe_valid_arg = u64::MAX (no bitmap, byte-identical) or a real ptr.
         let mut p0 = payload_dev.ptr;
         let mut p1 = probe_offsets_off;
         let mut p2 = probe_bytes_off;
@@ -15485,7 +15567,7 @@ fn launch_cuda_hash_join_inner_text(
         let mut p7 = mask;
         let mut p8 = pairs.ptr;
         let mut p9 = cursor.ptr;
-        let mut p10 = u64::MAX;
+        let mut p10 = probe_valid_arg;
         let mut pargs = [
             (&mut p0 as *mut u64).cast::<c_void>(),
             (&mut p1 as *mut u64).cast::<c_void>(),
@@ -15545,6 +15627,8 @@ fn launch_cuda_hash_join_inner_i64_nn(
     resident: &CudaResidentDeviceMemory,
     build_keys: &[i64],
     probe_keys: &[i64],
+    build_validity: Option<&[u32]>,
+    probe_validity: Option<&[u32]>,
 ) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -15625,11 +15709,26 @@ fn launch_cuda_hash_join_inner_i64_nn(
     let build_dev = primary.lease_device_buffer(build_bytes)?;
     let probe_dev = primary.lease_device_buffer(probe_bytes)?;
     let cursor = primary.lease_device_buffer(8)?;
+    // Optional validity bitmaps (V1b-wire): dense LSB-first u32 per side; a 0 build bit skips chaining that
+    // row, a 0 probe bit skips emitting for it. None/empty => u64::MAX sentinel (byte-identical). Both upload
+    // in phase 1; the probe bitmap is read by BOTH the count-emit (phase 1) and the real emit (phase 2).
+    let build_valid_words = build_validity.filter(|w| !w.is_empty());
+    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
+    let build_valid_dev = match build_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let probe_valid_dev = match probe_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let build_valid_arg = build_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
+    let probe_valid_arg = probe_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
     const BLOCK: u32 = 256;
     let grid = |n: usize| (n.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
     let zero8 = [0u64];
-    // Phase 1: upload keys, zero cursor, fill slot_keys -> EMPTY (i64::MIN) + slot_head -> END (u64::MAX),
-    // BUILD the chains, then a COUNT emit (cap=0) so the cursor holds the exact output size.
+    // Phase 1: upload keys + validity, zero cursor, fill slot_keys -> EMPTY (i64::MIN) + slot_head -> END
+    // (u64::MAX), BUILD the chains, then a COUNT emit (cap=0) so the cursor holds the exact output size.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
             (build_dev.ptr, build_keys.as_ptr().cast::<c_void>(), build_bytes),
@@ -15639,6 +15738,17 @@ fn launch_cuda_hash_join_inner_i64_nn(
             let rc = unsafe { htod_async(dst, src, bytes, stream) };
             if rc != 0 {
                 return rc;
+            }
+        }
+        for (dev, words) in [
+            (&build_valid_dev, build_valid_words),
+            (&probe_valid_dev, probe_valid_words),
+        ] {
+            if let (Some(d), Some(w)) = (dev, words) {
+                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                if rc != 0 {
+                    return rc;
+                }
             }
         }
         for (ptr, value) in [(slot_keys.ptr, i64::MIN as u64), (slot_head.ptr, u64::MAX)] {
@@ -15660,15 +15770,15 @@ fn launch_cuda_hash_join_inner_i64_nn(
                 return rc;
             }
         }
-        // build(..., mask, build_validity). V1: u64::MAX = no validity bitmap => every key valid
-        // (byte-identical; V1b-wire passes a real bitmap to skip NULL build keys before chaining).
+        // build(..., mask, build_validity). build_valid_arg = u64::MAX (no bitmap => valid, byte-identical)
+        // or a real bitmap ptr (skip NULL build keys before chaining).
         let mut b0 = build_dev.ptr;
         let mut b1 = build_n_u64;
         let mut b2 = slot_keys.ptr;
         let mut b3 = slot_head.ptr;
         let mut b4 = next.ptr;
         let mut b5 = mask;
-        let mut b6 = u64::MAX;
+        let mut b6 = build_valid_arg;
         let mut bargs = [
             (&mut b0 as *mut u64).cast::<c_void>(),
             (&mut b1 as *mut u64).cast::<c_void>(),
@@ -15687,8 +15797,8 @@ fn launch_cuda_hash_join_inner_i64_nn(
         if rc != 0 {
             return rc;
         }
-        // COUNT emit: cap = 0 -> every match increments the cursor, none writes. V1: e9 = u64::MAX = no
-        // validity bitmap => every probe key valid (byte-identical).
+        // COUNT emit: cap = 0 -> every match increments the cursor, none writes. probe_valid_arg = u64::MAX
+        // (no bitmap => every probe key valid, byte-identical) or a real bitmap ptr (skip NULL probe keys).
         let mut e0 = probe_dev.ptr;
         let mut e1 = probe_n_u64;
         let mut e2 = slot_keys.ptr;
@@ -15698,7 +15808,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
         let mut e6 = 0u64;
         let mut e7 = 0u64; // out_pairs (unused at cap=0)
         let mut e8 = cursor.ptr;
-        let mut e9 = u64::MAX;
+        let mut e9 = probe_valid_arg;
         let mut eargs = [
             (&mut e0 as *mut u64).cast::<c_void>(),
             (&mut e1 as *mut u64).cast::<c_void>(),
@@ -15739,7 +15849,8 @@ fn launch_cuda_hash_join_inner_i64_nn(
         if rc != 0 {
             return rc;
         }
-        // Real emit: cap = total -> every match writes. V1: e9 = u64::MAX = no validity (byte-identical).
+        // Real emit: cap = total -> every match writes. probe_valid_arg = u64::MAX (no bitmap => valid,
+        // byte-identical) or a real bitmap ptr (skip NULL probe keys); same value as the COUNT pass.
         let mut e0 = probe_dev.ptr;
         let mut e1 = probe_n_u64;
         let mut e2 = slot_keys.ptr;
@@ -15749,7 +15860,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
         let mut e6 = total_u64;
         let mut e7 = pairs.ptr;
         let mut e8 = cursor.ptr;
-        let mut e9 = u64::MAX;
+        let mut e9 = probe_valid_arg;
         let mut eargs = [
             (&mut e0 as *mut u64).cast::<c_void>(),
             (&mut e1 as *mut u64).cast::<c_void>(),
@@ -15793,6 +15904,8 @@ fn launch_cuda_hash_join_inner_text_nn(
     resident: &CudaResidentDeviceMemory,
     build_texts: &[&[u8]],
     probe_texts: &[&[u8]],
+    build_validity: Option<&[u32]>,
+    probe_validity: Option<&[u32]>,
 ) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -15899,6 +16012,21 @@ fn launch_cuda_hash_join_inner_text_nn(
     let next = primary.lease_device_buffer(next_bytes)?;
     let payload_dev = primary.lease_device_buffer(payload.len())?;
     let cursor = primary.lease_device_buffer(8)?;
+    // Optional validity bitmaps (V1b-wire): dense LSB-first u32 per side; a 0 build bit skips chaining, a 0
+    // probe bit skips emitting. None/empty => u64::MAX sentinel (byte-identical). Both upload in phase 1; the
+    // probe bitmap is read by BOTH the count emit (phase 1) and the real emit (phase 2) via emit_launch.
+    let build_valid_words = build_validity.filter(|w| !w.is_empty());
+    let probe_valid_words = probe_validity.filter(|w| !w.is_empty());
+    let build_valid_dev = match build_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let probe_valid_dev = match probe_valid_words {
+        Some(w) => Some(primary.lease_device_buffer(w.len() * 4)?),
+        None => None,
+    };
+    let build_valid_arg = build_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
+    let probe_valid_arg = probe_valid_dev.as_ref().map_or(u64::MAX, |d| d.ptr);
     const BLOCK: u32 = 256;
     let grid = |n: usize| (n.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
     let zero8 = [0u64];
@@ -15918,8 +16046,9 @@ fn launch_cuda_hash_join_inner_text_nn(
         let mut e10 = cap;
         let mut e11 = out;
         let mut e12 = cursor.ptr;
-        // V1: e13 = u64::MAX = no validity bitmap => every probe key valid (byte-identical).
-        let mut e13 = u64::MAX;
+        // probe_valid_arg = u64::MAX (no bitmap => every probe key valid, byte-identical) or a real bitmap
+        // ptr (skip NULL probe keys); the same value drives both the count and the real emit pass.
+        let mut e13 = probe_valid_arg;
         let mut eargs = [
             (&mut e0 as *mut u64).cast::<c_void>(),
             (&mut e1 as *mut u64).cast::<c_void>(),
@@ -15943,7 +16072,8 @@ fn launch_cuda_hash_join_inner_text_nn(
             )
         }
     };
-    // Phase 1: upload payload, zero cursor, fill slot_keys EMPTY128 + slot_head END, BUILD, COUNT (cap=0).
+    // Phase 1: upload payload + validity, zero cursor, fill slot_keys EMPTY128 + slot_head END, BUILD,
+    // COUNT (cap=0).
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
             (payload_dev.ptr, payload.as_ptr().cast::<c_void>(), payload.len()),
@@ -15952,6 +16082,17 @@ fn launch_cuda_hash_join_inner_text_nn(
             let rc = unsafe { htod_async(dst, src, bytes, stream) };
             if rc != 0 {
                 return rc;
+            }
+        }
+        for (dev, words) in [
+            (&build_valid_dev, build_valid_words),
+            (&probe_valid_dev, probe_valid_words),
+        ] {
+            if let (Some(d), Some(w)) = (dev, words) {
+                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                if rc != 0 {
+                    return rc;
+                }
             }
         }
         let mut f0 = slot_keys.ptr;
@@ -15991,7 +16132,7 @@ fn launch_cuda_hash_join_inner_text_nn(
             return rc;
         }
         // build(payload, build_off, build_bytes, build_n, slots, slot_head, next, mask, build_validity).
-        // V1: u64::MAX = no validity bitmap => every key valid (byte-identical).
+        // build_valid_arg = u64::MAX (no bitmap => valid, byte-identical) or a real bitmap ptr (skip NULLs).
         let mut b0 = payload_dev.ptr;
         let mut b1 = build_offsets_off;
         let mut b2 = build_bytes_off;
@@ -16000,7 +16141,7 @@ fn launch_cuda_hash_join_inner_text_nn(
         let mut b5 = slot_head.ptr;
         let mut b6 = next.ptr;
         let mut b7 = mask;
-        let mut b8 = u64::MAX;
+        let mut b8 = build_valid_arg;
         let mut bargs = [
             (&mut b0 as *mut u64).cast::<c_void>(),
             (&mut b1 as *mut u64).cast::<c_void>(),
@@ -22714,7 +22855,7 @@ mod tests {
         assert_eq!(
             sorted(
                 resident
-                    .hash_join_inner_i64(&[10, 20, 30], &[20, 10, 20, 40])
+                    .hash_join_inner_i64(&[10, 20, 30], &[20, 10, 20, 40], None, None)
                     .unwrap()
             ),
             vec![(0, 1), (1, 0), (1, 2)],
@@ -22722,13 +22863,13 @@ mod tests {
         );
         // (b) 1:N fan-out: one build row, three matching probe rows.
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[5], &[5, 5, 5]).unwrap()),
+            sorted(resident.hash_join_inner_i64(&[5], &[5, 5, 5], None, None).unwrap()),
             vec![(0, 0), (0, 1), (0, 2)],
             "1:N fan-out (unique build, repeated probe)"
         );
         // (c) no matches at all.
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[1, 2], &[3, 4]).unwrap()),
+            sorted(resident.hash_join_inner_i64(&[1, 2], &[3, 4], None, None).unwrap()),
             Vec::<(u32, u32)>::new(),
             "disjoint key sets -> no pairs"
         );
@@ -22737,7 +22878,7 @@ mod tests {
         assert_eq!(
             sorted(
                 resident
-                    .hash_join_inner_i64(&[-5, 100], &[100, -5, 7])
+                    .hash_join_inner_i64(&[-5, 100], &[100, -5, 7], None, None)
                     .unwrap()
             ),
             vec![(0, 1), (1, 0)],
@@ -22745,18 +22886,18 @@ mod tests {
         );
         // (e) duplicate build key -> reject (N:N is a follow-up).
         assert_eq!(
-            resident.hash_join_inner_i64(&[10, 10], &[10]).unwrap(),
+            resident.hash_join_inner_i64(&[10, 10], &[10], None, None).unwrap(),
             HashJoinOutcome::DuplicateBuildKey,
             "a repeated build key is rejected"
         );
         // (f) empty sides -> no matches.
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[], &[1, 2]).unwrap()),
+            sorted(resident.hash_join_inner_i64(&[], &[1, 2], None, None).unwrap()),
             Vec::<(u32, u32)>::new(),
             "empty build -> no pairs"
         );
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[1, 2], &[]).unwrap()),
+            sorted(resident.hash_join_inner_i64(&[1, 2], &[], None, None).unwrap()),
             Vec::<(u32, u32)>::new(),
             "empty probe -> no pairs"
         );
@@ -22774,7 +22915,7 @@ mod tests {
         }
         expected.sort_unstable();
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&build, &probe).unwrap()),
+            sorted(resident.hash_join_inner_i64(&build, &probe, None, None).unwrap()),
             expected,
             "200 unique build keys probed by all 200 (forces collision walks) + 2 misses"
         );
@@ -22808,7 +22949,7 @@ mod tests {
         }
         let join = |build: &[&str], probe: &[&str]| -> Vec<(u32, u32)> {
             let (b, p) = (bytes(build), bytes(probe));
-            sorted(resident.hash_join_inner_text(&refs(&b), &refs(&p)).unwrap())
+            sorted(resident.hash_join_inner_text(&refs(&b), &refs(&p), None, None).unwrap())
         };
         // (a) unique build texts, matches + a non-matching probe.
         assert_eq!(
@@ -22833,7 +22974,7 @@ mod tests {
         assert_eq!(
             {
                 let (b, p) = (bytes(&["k", "k"]), bytes(&["k"]));
-                resident.hash_join_inner_text(&refs(&b), &refs(&p)).unwrap()
+                resident.hash_join_inner_text(&refs(&b), &refs(&p), None, None).unwrap()
             },
             HashJoinOutcome::DuplicateBuildKey,
             "a repeated build text is rejected"
@@ -22852,7 +22993,7 @@ mod tests {
         let mut expected: Vec<(u32, u32)> = (0..200).map(|i| (i, i)).collect();
         expected.sort_unstable();
         assert_eq!(
-            sorted(resident.hash_join_inner_text(&refs(&build_b), &refs(&probe_b)).unwrap()),
+            sorted(resident.hash_join_inner_text(&refs(&build_b), &refs(&probe_b), None, None).unwrap()),
             expected,
             "200 unique build texts probed by all 200 + 2 misses"
         );
@@ -22866,7 +23007,7 @@ mod tests {
             .retain_device_memory_copy(0, &0_u64.to_le_bytes())
             .expect("resident device memory");
         let join = |build: &[i64], probe: &[i64]| -> Vec<(u32, u32)> {
-            let (b, p) = resident.hash_join_inner_i64_nn(build, probe).unwrap();
+            let (b, p) = resident.hash_join_inner_i64_nn(build, probe, None, None).unwrap();
             let mut v: Vec<(u32, u32)> = b.into_iter().zip(p).collect();
             v.sort_unstable();
             v
@@ -22925,7 +23066,7 @@ mod tests {
         let bytes = |t: &[&str]| -> Vec<Vec<u8>> { t.iter().map(|s| s.as_bytes().to_vec()).collect() };
         let join = |build: &[&str], probe: &[&str]| -> Vec<(u32, u32)> {
             let (b, p) = (bytes(build), bytes(probe));
-            let (bi, pi) = resident.hash_join_inner_text_nn(&refs(&b), &refs(&p)).unwrap();
+            let (bi, pi) = resident.hash_join_inner_text_nn(&refs(&b), &refs(&p), None, None).unwrap();
             let mut v: Vec<(u32, u32)> = bi.into_iter().zip(pi).collect();
             v.sort_unstable();
             v
@@ -22958,7 +23099,7 @@ mod tests {
         probe_strs.extend(["miss-1".to_string(), "miss-2".to_string()]);
         let bb: Vec<Vec<u8>> = build_strs.iter().map(|s| s.as_bytes().to_vec()).collect();
         let pb: Vec<Vec<u8>> = probe_strs.iter().map(|s| s.as_bytes().to_vec()).collect();
-        let (bi, pi) = resident.hash_join_inner_text_nn(&refs(&bb), &refs(&pb)).unwrap();
+        let (bi, pi) = resident.hash_join_inner_text_nn(&refs(&bb), &refs(&pb), None, None).unwrap();
         assert_eq!(bi.len(), 300, "50 keys x (3 build x 2 probe) = 300 pairs");
         for (b, p) in bi.iter().zip(&pi) {
             assert_eq!(build_strs[*b as usize], probe_strs[*p as usize], "a pair must match on the text");

@@ -1900,8 +1900,9 @@ impl Engine {
         };
         let n_rel = plan.relations.len();
         // OUTER joins (LEFT/RIGHT/FULL, M3 -- doc 21). N-way (multi-step) OUTER is supported: a prior step's
-        // NULL pad carries a `JOIN_NULL_ROW` sentinel that `key_present` reads as a NULL key (matches
-        // nothing; a LEFT step re-pads it), and the final gather emits SqlValue::Null for it.
+        // NULL pad carries a `JOIN_NULL_ROW` sentinel whose validity is gathered as 0, so the hash-join
+        // kernel skips it as a NULL key (matches nothing; a LEFT step re-pads it), and the final gather
+        // emits SqlValue::Null for it.
         //
         // A WHERE on an OUTER join is NOT filter-commutative: pushing a per-side predicate down before the
         // join would drop rows the outer join must NULL-pad, and a predicate on the padded side would
@@ -2211,8 +2212,15 @@ impl Engine {
             if abs.is_empty() {
                 return Ok(Vec::new());
             }
-            let (entry, dm, _) = &sides[ri];
-            let idxs: Vec<u64> = abs.iter().map(|&i| u64::from(i)).collect();
+            let (entry, dm, row_count) = &sides[ri];
+            // V1b: a carried JOIN_NULL_ROW (a prior OUTER pad) is a NULL key the kernel skips on-device, so
+            // gather a 0 PLACEHOLDER for it (the value is never used -- the validity bitmap marks it invalid).
+            // A 0-row relation has no payload to read; every carried row is then a pad -> all placeholders.
+            if *row_count == 0 {
+                return Ok(vec![0; abs.len()]);
+            }
+            let idxs: Vec<u64> =
+                abs.iter().map(|&i| if i == JOIN_NULL_ROW { 0 } else { u64::from(i) }).collect();
             match tables[ri].columns[col_idx].ty {
                 SqlType::Int8 | SqlType::Timestamp => {
                     let off =
@@ -2237,22 +2245,28 @@ impl Engine {
         // N:N (a follow-up). `ctx` only supplies the CUDA context (the kernel uploads the host keys); the
         // result is independent of which relation's memory hosts it. Returns (left_is_build, build, probe).
         use gpu_db_execution::HashJoinOutcome;
+        // `left_valid`/`right_valid` are the optional per-side NULL-key validity bitmaps (V1b); they SWAP in
+        // lockstep with the keys whenever build/probe swap, so the kernel always pairs each key array with
+        // its own bitmap. The N:N path builds the chain on the LEFT (acc) side -> build_validity = left.
         let hash_join = |ctx: &gpu_db_execution::CudaResidentDeviceMemory,
                          left_keys: &[i64],
-                         right_keys: &[i64]|
+                         right_keys: &[i64],
+                         left_valid: Option<&[u32]>,
+                         right_valid: Option<&[u32]>|
          -> Result<(bool, Vec<u32>, Vec<u32>), ExecuteError> {
             let smaller_is_left = left_keys.len() <= right_keys.len();
-            let (first_build, first_probe) = if smaller_is_left {
-                (left_keys, right_keys)
+            let (first_build, first_probe, first_bv, first_pv) = if smaller_is_left {
+                (left_keys, right_keys, left_valid, right_valid)
             } else {
-                (right_keys, left_keys)
+                (right_keys, left_keys, right_valid, left_valid)
             };
-            match ctx.hash_join_inner_i64(first_build, first_probe).map_err(map_err)? {
+            match ctx.hash_join_inner_i64(first_build, first_probe, first_bv, first_pv).map_err(map_err)? {
                 HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
                     Ok((smaller_is_left, build_idxs, probe_idxs))
                 }
                 HashJoinOutcome::DuplicateBuildKey => {
-                    match ctx.hash_join_inner_i64(first_probe, first_build).map_err(map_err)? {
+                    // Retry building the OTHER side -- swap keys AND their bitmaps.
+                    match ctx.hash_join_inner_i64(first_probe, first_build, first_pv, first_bv).map_err(map_err)? {
                         HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
                             Ok((!smaller_is_left, build_idxs, probe_idxs))
                         }
@@ -2260,8 +2274,9 @@ impl Engine {
                             // N:N: both sides have duplicate keys -> the chaining many-to-many join
                             // (each key's build rows x probe rows). Build the chain on the LEFT (acc)
                             // side, so the result is (acc position, new position) directly.
-                            let (build_idxs, probe_idxs) =
-                                ctx.hash_join_inner_i64_nn(left_keys, right_keys).map_err(map_err)?;
+                            let (build_idxs, probe_idxs) = ctx
+                                .hash_join_inner_i64_nn(left_keys, right_keys, left_valid, right_valid)
+                                .map_err(map_err)?;
                             Ok((true, build_idxs, probe_idxs))
                         }
                     }
@@ -2273,24 +2288,31 @@ impl Engine {
         // mis-joins or spuriously reports a duplicate. Returns (left_is_build, build, probe).
         let text_hash_join = |ctx: &gpu_db_execution::CudaResidentDeviceMemory,
                               left: &[&[u8]],
-                              right: &[&[u8]]|
+                              right: &[&[u8]],
+                              left_valid: Option<&[u32]>,
+                              right_valid: Option<&[u32]>|
          -> Result<(bool, Vec<u32>, Vec<u32>), ExecuteError> {
             let smaller_is_left = left.len() <= right.len();
-            let (first_build, first_probe) = if smaller_is_left { (left, right) } else { (right, left) };
-            match ctx.hash_join_inner_text(first_build, first_probe).map_err(map_err)? {
+            let (first_build, first_probe, first_bv, first_pv) = if smaller_is_left {
+                (left, right, left_valid, right_valid)
+            } else {
+                (right, left, right_valid, left_valid)
+            };
+            match ctx.hash_join_inner_text(first_build, first_probe, first_bv, first_pv).map_err(map_err)? {
                 HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
                     Ok((smaller_is_left, build_idxs, probe_idxs))
                 }
                 HashJoinOutcome::DuplicateBuildKey => {
-                    match ctx.hash_join_inner_text(first_probe, first_build).map_err(map_err)? {
+                    match ctx.hash_join_inner_text(first_probe, first_build, first_pv, first_bv).map_err(map_err)? {
                         HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
                             Ok((!smaller_is_left, build_idxs, probe_idxs))
                         }
                         HashJoinOutcome::DuplicateBuildKey => {
                             // N:N: both sides have duplicate text/numeric/uuid keys -> the chaining
                             // many-to-many text join (build the chain on the LEFT/acc side -> (acc, new)).
-                            let (build_idxs, probe_idxs) =
-                                ctx.hash_join_inner_text_nn(left, right).map_err(map_err)?;
+                            let (build_idxs, probe_idxs) = ctx
+                                .hash_join_inner_text_nn(left, right, left_valid, right_valid)
+                                .map_err(map_err)?;
                             Ok((true, build_idxs, probe_idxs))
                         }
                     }
@@ -2300,15 +2322,20 @@ impl Engine {
         // Gather relation `ri`'s TEXT key bytes from its DEVICE payload at the given ABSOLUTE rows (charter:
         // the keys come from device memory, not a host_rows copy -- like the i64 projection `key_i64`).
         // Returns OWNED strings (the caller borrows them into &[u8] for the GPU text hash join). The
-        // precompute validated the column is TEXT; the NULL-key gate excludes NULL-key rows BEFORE this, so
-        // `abs` holds only non-NULL keys (a NULL cell would project as "" -- never reached here).
+        // precompute validated the column is TEXT. V1b: `abs` may include a carried JOIN_NULL_ROW (a prior
+        // OUTER pad) or a NULL-key row -> the gather uses a 0 placeholder index (the kernel skips it via the
+        // validity bitmap); a NULL cell at a real row projects as "" but is likewise skipped.
         let key_texts = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<String>, ExecuteError> {
             if abs.is_empty() {
                 return Ok(Vec::new());
             }
-            let (entry, dm, _) = &sides[ri];
+            let (entry, dm, row_count) = &sides[ri];
+            if *row_count == 0 {
+                return Ok(vec![String::new(); abs.len()]);
+            }
             let layout = resident_device_text_column_layout(&entry.descriptor, &tables[ri], col_idx)?;
-            let idxs: Vec<u64> = abs.iter().map(|&r| u64::from(r)).collect();
+            let idxs: Vec<u64> =
+                abs.iter().map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) }).collect();
             dm.mem()
                 .project_text_rows_from_payload(
                     layout.offsets_byte_offset,
@@ -2322,14 +2349,19 @@ impl Engine {
         // section): the i128's LE bytes ARE the uuid raw bytes / the numeric mantissa LE (the precompute
         // requires equal scale on both sides, so the mantissa compares value-for-value). Returns OWNED
         // 16-byte values (the caller borrows them into &[u8] for the SAME text hash join: a 16-byte "text"
-        // -> FNV + 16-byte verify = b128 equality). NULL-key rows are excluded upstream by the NULL gate.
+        // -> FNV + 16-byte verify = b128 equality). V1b: a carried JOIN_NULL_ROW / NULL-key row uses a 0
+        // placeholder index (the kernel skips it via the validity bitmap).
         let key_b128 = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<[u8; 16]>, ExecuteError> {
             if abs.is_empty() {
                 return Ok(Vec::new());
             }
-            let (entry, dm, _) = &sides[ri];
+            let (entry, dm, row_count) = &sides[ri];
+            if *row_count == 0 {
+                return Ok(vec![[0u8; 16]; abs.len()]);
+            }
             let off = resident_device_numeric_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
-            let idxs: Vec<u64> = abs.iter().map(|&r| u64::from(r)).collect();
+            let idxs: Vec<u64> =
+                abs.iter().map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) }).collect();
             Ok(dm
                 .mem()
                 .project_i128_rows_from_payload(off, &idxs)
@@ -2337,6 +2369,51 @@ impl Engine {
                 .into_iter()
                 .map(|v| v.to_le_bytes())
                 .collect())
+        };
+        // Gather relation `ri`'s NULL validity (`true` = the value is present) for key column `col` at the
+        // carried ABSOLUTE rows, READ FROM THE DEVICE payload (charter: the NULL decision comes from device
+        // memory via the same validity bitmap the result gather uses, never a host host_rows inspection). A
+        // carried JOIN_NULL_ROW (a prior OUTER pad) is a NULL key -> invalid (placeholder index 0); a column
+        // with no validity bitmap (no nullable values) -> every real row valid. A 0-row relation contributes
+        // only pads here (carried from a prior OUTER step) -> all invalid, with no device read.
+        let key_validity = |ri: usize, col: usize, abs: &[u32]| -> Result<Vec<bool>, ExecuteError> {
+            let n = abs.len();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            let (entry, dm, row_count) = &sides[ri];
+            if *row_count == 0 {
+                return Ok(vec![false; n]);
+            }
+            let is_pad: Vec<bool> = abs.iter().map(|&r| r == JOIN_NULL_ROW).collect();
+            let idxs: Vec<u64> =
+                abs.iter().map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) }).collect();
+            let mut valid = match resident_device_null_column_offset(&entry.descriptor, &tables[ri], col)? {
+                Some(off) => dm.mem().project_bool_rows_from_payload(off, &idxs).map_err(map_err)?,
+                None => vec![true; n],
+            };
+            for (v, &pad) in valid.iter_mut().zip(is_pad.iter()) {
+                if pad {
+                    *v = false;
+                }
+            }
+            Ok(valid)
+        };
+        // Pack a per-row validity vector (`true` = the key is non-NULL) into a dense LSB-first u32 bitmap:
+        // bit `i` lives in `word[i>>5]` at `i & 31`, `1 = valid` -- exactly what the hash-join kernels read
+        // (`shr 5` word, `bfe ...,1` bit). All-valid -> None -> the kernel's u64::MAX sentinel fast path,
+        // keeping the common no-NULL join byte-identical to the pre-V1b host-filter path.
+        let pack_validity = |valid: &[bool]| -> Option<Vec<u32>> {
+            if valid.iter().all(|&v| v) {
+                return None;
+            }
+            let mut words = vec![0u32; valid.len().div_ceil(32)];
+            for (i, &v) in valid.iter().enumerate() {
+                if v {
+                    words[i >> 5] |= 1u32 << (i & 31);
+                }
+            }
+            Some(words)
         };
         // Pack a step's per-conjunct host i64 key columns into one i64 per row: a single conjunct is the
         // key itself; a 2-conjunct composite puts member 0 in the HIGH 32 bits and member 1 in the LOW
@@ -2356,52 +2433,32 @@ impl Engine {
         let mut work_idx: Vec<Vec<u32>> = vec![survivors_all[0].clone()];
         for (k, conjuncts) in step_keys.iter().enumerate() {
             let new_rel = k + 1;
-            // NULL-key gate (M3 -- doc 21): in an equi-join `NULL = x` is UNKNOWN, so a row whose join key
-            // is NULL (ANY conjunct member, either side) matches nothing and must be excluded BEFORE the
-            // hash join -- else two NULLs would spuriously match (int keys share the 0 placeholder) or the
-            // text/b128 gather would error. host_rows carries `SqlValue::Null`; we drop the offending
-            // carried tuples + new-relation survivors. When nothing is NULL we keep the ORIGINAL vectors
-            // (no clone), so the common no-NULL join path is byte-identical and never regresses.
-            let key_present = |ri: usize, col: usize, row: u32| {
-                // M3 (doc 21): a carried `JOIN_NULL_ROW` (a PRIOR OUTER step's NULL pad for this relation)
-                // is a NULL key here — in an equi-join `NULL = x` is UNKNOWN, so it matches nothing (and a
-                // LEFT step re-pads it). Reading host_rows at the u32::MAX sentinel would be out of bounds;
-                // treat it as not-present. This is what unblocks N-way (multi-step) OUTER joins.
-                row != JOIN_NULL_ROW
-                    && !matches!(sides[ri].0.host_rows[row as usize][col], SqlValue::Null)
-            };
+            // V1b NULL-key skip ON-DEVICE (charter: the NULL decision lives in the kernel, NEVER a host
+            // host_rows filter). In an equi-join `NULL = x` is UNKNOWN, so a row whose join key is NULL (ANY
+            // conjunct member, either side) matches nothing. The FULL carried index vectors are joined (no
+            // host pre-filter); each side's per-key validity is gathered from the DEVICE payload, AND'd
+            // across composite members (every member must be present), with a carried JOIN_NULL_ROW pad
+            // marked invalid, and passed as a dense bitmap to the hash join -- the kernel SKIPS a 0-bit key
+            // (a build key never claims a slot, so it is invisible to the duplicate check; a probe key emits
+            // no match). A kernel-skipped NULL key simply ends up unmatched (an OUTER step then NULL-pads
+            // it). All-valid -> None -> the kernel's sentinel fast path keeps the no-NULL join byte-identical.
             let tuple_count = work_idx[0].len();
-            let acc_keep: Vec<usize> = (0..tuple_count)
-                .filter(|&p| {
-                    conjuncts
-                        .iter()
-                        .all(|&(acc_rel, acc_col, _)| key_present(acc_rel, acc_col, work_idx[acc_rel][p]))
-                })
-                .collect();
-            let new_keep: Vec<usize> = (0..survivors_all[new_rel].len())
-                .filter(|&q| {
-                    conjuncts
-                        .iter()
-                        .all(|&(_, _, new_col)| key_present(new_rel, new_col, survivors_all[new_rel][q]))
-                })
-                .collect();
-            let drops_acc = acc_keep.len() != tuple_count;
-            let drops_new = new_keep.len() != survivors_all[new_rel].len();
-            // `acc_idx` = the carried index vectors (all relations) to join on; `new_idx` = the new
-            // relation's survivors. Borrow the originals when no NULL key is excluded; otherwise own the
-            // NULL-filtered copies. The hash-join positions map back to THESE, so the extension uses them.
-            let acc_idx_owned: Vec<Vec<u32>>;
-            let new_idx_owned: Vec<u32>;
-            let (acc_idx, new_idx): (&Vec<Vec<u32>>, &[u32]) = if drops_acc || drops_new {
-                acc_idx_owned = work_idx
-                    .iter()
-                    .map(|col| acc_keep.iter().map(|&p| col[p]).collect())
-                    .collect();
-                new_idx_owned = new_keep.iter().map(|&q| survivors_all[new_rel][q]).collect();
-                (&acc_idx_owned, new_idx_owned.as_slice())
-            } else {
-                (&work_idx, survivors_all[new_rel].as_slice())
-            };
+            let acc_idx: &Vec<Vec<u32>> = &work_idx;
+            let new_idx: &[u32] = survivors_all[new_rel].as_slice();
+            let mut acc_valid = vec![true; tuple_count];
+            for &(acc_rel, acc_col, _) in conjuncts {
+                for (a, v) in acc_valid.iter_mut().zip(key_validity(acc_rel, acc_col, &work_idx[acc_rel])?) {
+                    *a &= v;
+                }
+            }
+            let mut new_valid = vec![true; new_idx.len()];
+            for &(_, _, new_col) in conjuncts {
+                for (a, v) in new_valid.iter_mut().zip(key_validity(new_rel, new_col, new_idx)?) {
+                    *a &= v;
+                }
+            }
+            let acc_bitmap = pack_validity(&acc_valid);
+            let new_bitmap = pack_validity(&new_valid);
             let (acc_is_build, build_idxs, probe_idxs) = if step_is_text[k] {
                 // TEXT key (a single conjunct, validated). Gather both sides' key bytes from the DEVICE
                 // payload and run the GPU text hash join (FNV-hash + byte-verify).
@@ -2410,7 +2467,13 @@ impl Engine {
                 let new_texts = key_texts(new_rel, new_col, new_idx)?;
                 let acc_refs: Vec<&[u8]> = acc_texts.iter().map(|s| s.as_bytes()).collect();
                 let new_refs: Vec<&[u8]> = new_texts.iter().map(|s| s.as_bytes()).collect();
-                text_hash_join(sides[new_rel].1.mem(), &acc_refs, &new_refs)?
+                text_hash_join(
+                    sides[new_rel].1.mem(),
+                    &acc_refs,
+                    &new_refs,
+                    acc_bitmap.as_deref(),
+                    new_bitmap.as_deref(),
+                )?
             } else if step_is_b128[k] {
                 // NUMERIC/UUID key: gather each side's 16-byte canonical value and run the SAME text/byte
                 // hash join over it (a 16-byte "text" -> FNV + 16-byte verify = exact 128-bit equality).
@@ -2419,7 +2482,13 @@ impl Engine {
                 let new_vals = key_b128(new_rel, new_col, new_idx)?;
                 let acc_refs: Vec<&[u8]> = acc_vals.iter().map(|v| v.as_slice()).collect();
                 let new_refs: Vec<&[u8]> = new_vals.iter().map(|v| v.as_slice()).collect();
-                text_hash_join(sides[new_rel].1.mem(), &acc_refs, &new_refs)?
+                text_hash_join(
+                    sides[new_rel].1.mem(),
+                    &acc_refs,
+                    &new_refs,
+                    acc_bitmap.as_deref(),
+                    new_bitmap.as_deref(),
+                )?
             } else {
                 // INT key (incl. composite). Project each conjunct's accumulated-side + new-side key on
                 // the GPU, then pack into one i64. Conjuncts may project from different accumulated
@@ -2434,7 +2503,13 @@ impl Engine {
                     .collect::<Result<_, _>>()?;
                 let acc_keys = pack_keys(&acc_members);
                 let new_keys = pack_keys(&new_members);
-                hash_join(sides[new_rel].1.mem(), &acc_keys, &new_keys)?
+                hash_join(
+                    sides[new_rel].1.mem(),
+                    &acc_keys,
+                    &new_keys,
+                    acc_bitmap.as_deref(),
+                    new_bitmap.as_deref(),
+                )?
             };
             // build/probe positions -> (accumulated tuple position, new-relation survivor position).
             let (acc_match, new_match): (&[u32], &[u32]) = if acc_is_build {
@@ -2443,26 +2518,21 @@ impl Engine {
                 (&probe_idxs, &build_idxs)
             };
             // Extend the carried indices: keep each matched tuple's prior rows, append the new relation's
-            // matched ABSOLUTE survivor row. Indexed into the (possibly NULL-filtered) acc_idx/new_idx.
+            // matched ABSOLUTE survivor row. The kernel returns match positions over the FULL acc_idx/new_idx
+            // arrays (V1b: no host pre-filter), so each position indexes directly into them.
             let mut next: Vec<Vec<u32>> = Vec::with_capacity(new_rel + 1);
             for col in acc_idx {
                 next.push(acc_match.iter().map(|&p| col[p as usize]).collect());
             }
             next.push(new_match.iter().map(|&p| new_idx[p as usize]).collect());
             // LEFT OUTER (M3 -- doc 21): every accumulated (left) row must appear. An UNMATCHED left tuple
-            // -- including a NULL-key left row, which matches nothing -- is appended with the new relation
-            // NULL-padded via the `JOIN_NULL_ROW` sentinel (the gather emits NULL for its columns). The
-            // matched-left set maps `acc_match` positions back through the NULL-key filter to the original
-            // carried-tuple positions; the rest are NULL-padded.
+            // -- including a NULL-key left row, which the kernel skips so it matches nothing -- is appended
+            // with the new relation NULL-padded via the `JOIN_NULL_ROW` sentinel (the gather emits NULL for
+            // its columns). `acc_match` positions index the FULL carried array directly; the rest are padded.
             if plan.steps[k].outer_left {
                 let mut matched_orig = vec![false; tuple_count];
                 for &p in acc_match {
-                    let orig = if drops_acc || drops_new {
-                        acc_keep[p as usize]
-                    } else {
-                        p as usize
-                    };
-                    matched_orig[orig] = true;
+                    matched_orig[p as usize] = true;
                 }
                 for (o, &is_matched) in matched_orig.iter().enumerate() {
                     if !is_matched {
@@ -2474,19 +2544,14 @@ impl Engine {
                 }
             }
             // RIGHT OUTER (the mirror; FULL runs both): every NEW (right) survivor must appear. An
-            // UNMATCHED new row -- including a NULL-key right row, which matches nothing -- is appended
-            // with the ACCUMULATED relations NULL-padded (the matched-new set maps `new_match` back
-            // through the NULL-key filter to the original new-survivor positions).
+            // UNMATCHED new row -- including a NULL-key right row, which the kernel skips so it matches
+            // nothing -- is appended with the ACCUMULATED relations NULL-padded. `new_match` positions index
+            // the FULL new-survivor array directly (V1b: no host pre-filter).
             if plan.steps[k].outer_right {
                 let new_count = survivors_all[new_rel].len();
                 let mut matched_new = vec![false; new_count];
                 for &p in new_match {
-                    let orig = if drops_acc || drops_new {
-                        new_keep[p as usize]
-                    } else {
-                        p as usize
-                    };
-                    matched_new[orig] = true;
+                    matched_new[p as usize] = true;
                 }
                 for (o, &is_matched) in matched_new.iter().enumerate() {
                     if !is_matched {
