@@ -15653,12 +15653,15 @@ fn launch_cuda_hash_join_inner_i64_nn(
                 return rc;
             }
         }
+        // build(..., mask, build_validity). V1: u64::MAX = no validity bitmap => every key valid
+        // (byte-identical; V1b-wire passes a real bitmap to skip NULL build keys before chaining).
         let mut b0 = build_dev.ptr;
         let mut b1 = build_n_u64;
         let mut b2 = slot_keys.ptr;
         let mut b3 = slot_head.ptr;
         let mut b4 = next.ptr;
         let mut b5 = mask;
+        let mut b6 = u64::MAX;
         let mut bargs = [
             (&mut b0 as *mut u64).cast::<c_void>(),
             (&mut b1 as *mut u64).cast::<c_void>(),
@@ -15666,6 +15669,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
             (&mut b3 as *mut u64).cast::<c_void>(),
             (&mut b4 as *mut u64).cast::<c_void>(),
             (&mut b5 as *mut u64).cast::<c_void>(),
+            (&mut b6 as *mut u64).cast::<c_void>(),
         ];
         let rc = unsafe {
             cu_launch_kernel(
@@ -15676,7 +15680,8 @@ fn launch_cuda_hash_join_inner_i64_nn(
         if rc != 0 {
             return rc;
         }
-        // COUNT emit: cap = 0 -> every match increments the cursor, none writes.
+        // COUNT emit: cap = 0 -> every match increments the cursor, none writes. V1: e9 = u64::MAX = no
+        // validity bitmap => every probe key valid (byte-identical).
         let mut e0 = probe_dev.ptr;
         let mut e1 = probe_n_u64;
         let mut e2 = slot_keys.ptr;
@@ -15686,6 +15691,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
         let mut e6 = 0u64;
         let mut e7 = 0u64; // out_pairs (unused at cap=0)
         let mut e8 = cursor.ptr;
+        let mut e9 = u64::MAX;
         let mut eargs = [
             (&mut e0 as *mut u64).cast::<c_void>(),
             (&mut e1 as *mut u64).cast::<c_void>(),
@@ -15696,6 +15702,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
             (&mut e6 as *mut u64).cast::<c_void>(),
             (&mut e7 as *mut u64).cast::<c_void>(),
             (&mut e8 as *mut u64).cast::<c_void>(),
+            (&mut e9 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
@@ -15725,6 +15732,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
         if rc != 0 {
             return rc;
         }
+        // Real emit: cap = total -> every match writes. V1: e9 = u64::MAX = no validity (byte-identical).
         let mut e0 = probe_dev.ptr;
         let mut e1 = probe_n_u64;
         let mut e2 = slot_keys.ptr;
@@ -15734,6 +15742,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
         let mut e6 = total_u64;
         let mut e7 = pairs.ptr;
         let mut e8 = cursor.ptr;
+        let mut e9 = u64::MAX;
         let mut eargs = [
             (&mut e0 as *mut u64).cast::<c_void>(),
             (&mut e1 as *mut u64).cast::<c_void>(),
@@ -15744,6 +15753,7 @@ fn launch_cuda_hash_join_inner_i64_nn(
             (&mut e6 as *mut u64).cast::<c_void>(),
             (&mut e7 as *mut u64).cast::<c_void>(),
             (&mut e8 as *mut u64).cast::<c_void>(),
+            (&mut e9 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
