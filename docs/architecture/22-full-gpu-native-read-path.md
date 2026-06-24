@@ -223,7 +223,7 @@ is optional; each line is struck through only when it runs on the device.
   V1: source keys from the device payload, like `key_i64` already does).
 
 ### Resident-probe fallback branches
-- [x] **S8 — DONE 2026-06-25 (audit running), `47c874f3` (bridge+route+tests) + `a2bfa319` (delete probe).**
+- [x] **S8 — DONE + AUDITED SHIP 2026-06-25, `47c874f3` (bridge+route+tests) + `a2bfa319` (delete probe) + `004bc3d7` (adopt 2 audit tests).**
   Built the `&Select`->general BRIDGE (`execute_resident_grouped_via_general`, engine_expr.rs), routed the two
   grouped dispatch arms through it (engine_select_exec.rs), and DELETED the two resident-probe grouped methods +
   the `grouped_sum` wrapper + their inline `!gpu_ordered` HOST sort/HAVING/LIMIT (566 lines). Grouped int4
@@ -242,8 +242,20 @@ is optional; each line is struck through only when it runs on the device.
     a TRUE behavior-preserving drop-in (the probe-vs-default comparison tests pass unchanged).
   - **Proof:** a 65-shape bridge-vs-general differential (0 divergences; non-vacuity proven by sabotage) +
     3 asserting `audit_s8_*` tests (filtered grouped HAVING+ORDER+LIMIT; non-integer AVG; AND/OR DNF builder),
-    all in `tests/resident_expr.rs`. Suite: --ignored 282/0, non-ignored 436/0. Independent adversarial audit
-    LAUNCHED (parent `fe60e4a6` vs HEAD `a2bfa319`); awaiting SHIP before adopting audit tests + marking final.
+    all in `tests/resident_expr.rs`. Suite: --ignored 284/0, non-ignored 436/0.
+  - **✅ AUDITED SHIP** (independent adversarial fork, parent `fe60e4a6` vs HEAD `a2bfa319`): a 155-query
+    parent-vs-child LIVE-dispatch differential (probe vs bridge) was BYTE-FOR-BYTE identical (all 5 aggregates;
+    all 4 ops; negatives/boundaries; whole-group-drop + empty-result filters; a WHERE on a THIRD column;
+    ORDER BY group/aggregate ASC/DESC; LIMIT at tie boundaries; HAVING; non-int AVG; col name/type/oid/size).
+    Grouped MATERIALIZED VIEW + REFRESH (the CTAS/view deliverable) byte-identical to parent. Non-vacuity
+    fault-injection-confirmed. 2 audit tests adopted `004bc3d7` (tie-break-at-LIMIT regression — closed the
+    gap that the shipped suite missed; grouped-matview-via-bridge). NON-BLOCKING NOTES: (F2) the tie-break
+    lives in the SHARED `execute_resident_expr_select_with_binding`, so off-bridge SQL->Expr grouped queries
+    (composite GROUP BY, multi-aggregate) also gain it — it only makes previously-nondeterministic TIED-row
+    order deterministic (group-ASC); never reorders non-tied rows, never a wrong value. (F3) one cosmetic
+    HAVING error-message text change (both parent+child error; PG would too). (Pre-existing, NOT S8: grouped
+    `CREATE TABLE AS SELECT ... GROUP BY` fails to parse in the hand-rolled parser; plain `CREATE VIEW` reads
+    via the CPU `GpuMvccReadParityGap` — both unchanged by S8.)
   - _(historical scoping below, kept for context)_
 
   **ORIGINAL SCOPE (user, 2026-06-24): ROUTE to the general executor + RETIRE the legacy path** (NOT
@@ -304,9 +316,9 @@ is optional; each line is struck through only when it runs on the device.
 S1 ✅ → **S2 (keystone, the big one)** ✅ → S3 ✅ → S4 ✅ (result-stage operators; small, mechanical) →
 S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 V1a ✅ + V1b PLUMB ✅ + V1b WIRE
 ✅ `5724bf55` (audit running) — the HAZARD-class kernel slice; the last join `host_rows` data read is GONE**
-→ S6 ✅ (V2, pad-WHERE 3VL on-device `76315706`, audited SHIP) → **S8 ✅ (probe fallback retired via the
-`&Select`->general bridge `47c874f3`+`a2bfa319`, audit running)** → **S9 (GPU-native oracles) — NEXT** →
-S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
+→ S6 ✅ (V2, pad-WHERE 3VL on-device `76315706`, audited SHIP) → **S8 ✅ AUDITED SHIP (probe fallback retired
+via the `&Select`->general bridge `47c874f3`+`a2bfa319`, 2 audit tests `004bc3d7`)** → **S9 (GPU-native
+oracles) — NEXT** → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
 no-kernel first, then the kernel work fresh.)_
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2
 is the keystone and unblocks the most queries.
