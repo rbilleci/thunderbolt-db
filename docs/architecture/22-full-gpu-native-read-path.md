@@ -93,16 +93,19 @@ is optional; each line is struck through only when it runs on the device.
     FULLY on-device.**
 
 ### Result-stage operators on the general executor
-- [x] **S3 — HAVING on-device.** **DONE `488083ea`** (suite 234/0; independent audit running). The host
-  `rows.retain` is gone: the grouped result is materialized as a TRANSIENT device relation
-  (`build_transient_relation_residency`, columns = the SELECT result columns), the HAVING DNF is converted
-  to a `ResidentExpr` (leaf `Column(idx) <op> literal`, AND within a group, OR across), and evaluated by
-  the SAME device predicate VM as WHERE (`lower_resident_predicate`) → survivor indices. The
-  `Int4Literal` covers `COUNT(*)`→Int8 / group-key compares (the int8 path sign-extends a small literal);
-  `NumericLiteral`/`TextLiteral`/`BoolLiteral`/Date cover the rest. **NARROW OPEN GAP (S3.1):** a
-  **timestamp/uuid HAVING CONSTANT** clean-errors (predicate IR has no i64/uuid literal) — charter-aligned
-  (correct-or-clean-error, NOT a host fallback), no general-path test hits it; close by adding
-  `Int8Literal`/uuid-literal + compare lowering to the WHERE predicate IR.
+- [ ] **S3 — HAVING on-device.** First attempt (`488083ea`, transient relation + `lower_resident_predicate`)
+  was **REVERTED `4582c1d7`** — independent audit caught a **P0**: a `SUM(int2/int4)` result is *declared*
+  `Int4` in the catalog but its materialized value is `Int8` (the old host `retain` compared `SqlValue`s so
+  the skew was harmless; routing it into `build_transient_relation_residency`'s int4 payload section rejects
+  the Int8 value → `HAVING SUM(int4) > c` ERRORED). Plus a structural flaw: the WHERE predicate VM evaluates
+  a predicate at ONE type-width, but HAVING mixes widths (int4 key + int8 COUNT) → `HAVING g>=2 AND COUNT(*)>1`
+  clean-errored. **LESSON: the transient-relation + WHERE-VM reuse is the WRONG approach for HAVING.**
+  **CORRECT REDO (the direct approach):** build the result payload, evaluate EACH filter as its own device
+  compare→i32 mask at the column's ACTUAL value type (CompareScalar i32/i64/i128 / TextEqMask / BoolMask,
+  value encoded per column), then combine masks ON-DEVICE per DNF (`gpu_db_mask_binary` AND within a group,
+  OR across), then compact → survivors. Each filter is single-type (no mixed-width issue) and the column type
+  is taken from the materialized value (no declared-vs-value skew). NULL aggregate result → predicate UNKNOWN
+  → row dropped (3VL).
 - [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:~4205` and `~4955` host `drain/truncate`. Note:
   the rows are sorted on-device (`gpu_sort_permutation` now returns the index vector), so LIMIT/OFFSET is
   best applied to the PERMUTATION before the final gather — materialize only the kept window. (Slicing an
