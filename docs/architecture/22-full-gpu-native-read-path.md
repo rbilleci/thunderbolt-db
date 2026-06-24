@@ -100,11 +100,15 @@ is optional; each line is struck through only when it runs on the device.
   section); the redo (`35f60719`) PROMOTED integer-family columns/values to a uniform width (the predicate VM
   is single-width but HAVING mixes int4-key + int8-COUNT) but the 2nd audit caught a numeric+int mix still
   spanning i128+i64; the **numeric-mode fix `0eb9cde7`** promotes integers to `Numeric(scale 0)` when the
-  HAVING touches numeric (else `Int8`), so the whole predicate is one width. **DONE — suite 236/0; 3rd audit
-  running.** Tests `gpu_grouped_having_sum_and_dnf_runs_on_gpu` (int) + `gpu_grouped_having_numeric_int_mixed_dnf_runs_on_gpu`
-  (numeric+int) reproduce both audits' exact failing cases. **NARROW OPEN GAP (S3.1):** timestamp/uuid HAVING
-  CONSTANT clean-errors (parser-unreachable; predicate-IR literal gap). **LESSON: the audit gate caught BOTH
-  regressions before merge — rushing produced them, the rigor stopped them; promotion to a single width is the
+  HAVING touches numeric (else `Int8`), so the whole predicate is one width. The 3rd audit then caught a
+  SILENT WRONG ANSWER over **AVG** (per-group Numeric scales; the payload stores only mantissas at one column
+  scale) → the **scale-normalization fix `b88b0133`** normalizes each numeric column to the MAX scale across
+  its values (rescale up is exact). **THREE audit-caught regressions, ALL fixed (type skew / width / scale —
+  the three numeric-representation dimensions); suite 237/0; 4th audit running.** Tests
+  `gpu_grouped_having_{sum_and_dnf,numeric_int_mixed_dnf,avg_heterogeneous_scale}_*` reproduce all three.
+  **NARROW OPEN GAP (S3.1):** timestamp/uuid HAVING CONSTANT clean-errors (parser-unreachable). **LESSON: the
+  audit gate caught all THREE regressions before merge — rushing produced them, the rigor stopped them;
+  uniform-width+uniform-scale promotion is the load-bearing idea for a single-width/single-scale predicate VM;
   load-bearing idea for a single-width predicate VM.**
 - [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:~4205` and `~4955` host `drain/truncate`. Note:
   the rows are sorted on-device (`gpu_sort_permutation` now returns the index vector), so LIMIT/OFFSET is
