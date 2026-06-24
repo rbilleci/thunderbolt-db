@@ -4077,10 +4077,23 @@ hjp_done:
     .param .u64 build_n,
     .param .u64 slot_keys_ptr,
     .param .u64 mask,
-    .param .u64 dup_flag_ptr
+    .param .u64 dup_flag_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every key valid (byte-identical). A NULL build key matches nothing -> NOT inserted.
+    .param .u64 build_validity_ptr
 )
 {
     .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -4130,6 +4143,8 @@ hjp_done:
     ld.param.u64 %slots, [slot_keys_ptr];
     ld.param.u64 %mask, [mask];
     ld.param.u64 %dupp, [dup_flag_ptr];
+    ld.param.u64 %vptr, [build_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
     mov.u64 %empty, 0x8000000000000000;
     mov.u64 %tmp, 0;
     mov.b128 %empty128, {%tmp, %empty};
@@ -4144,6 +4159,21 @@ hjp_done:
 hjbt_loop:
     setp.ge.u64 %p, %i, %n;
     @%p bra hjbt_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // build key (bit 0) matches nothing -> skip this row (to the loop increment, NOT inserted).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjbt_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjbt_next;
+hjbt_keyok:
     // text[i]: starta = offsets[i], enda = offsets[i+1]
     mul.lo.u64 %o, %i, 8;
     add.u64 %addr, %offb, %o;
@@ -4248,10 +4278,23 @@ hjbt_done:
     .param .u64 slot_keys_ptr,
     .param .u64 mask,
     .param .u64 out_pairs_ptr,
-    .param .u64 out_cursor_ptr
+    .param .u64 out_cursor_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every probe key valid (byte-identical). A NULL probe key matches nothing -> emit no pair.
+    .param .u64 probe_validity_ptr
 )
 {
     .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -4309,6 +4352,8 @@ hjbt_done:
     ld.param.u64 %mask, [mask];
     ld.param.u64 %outp, [out_pairs_ptr];
     ld.param.u64 %curp, [out_cursor_ptr];
+    ld.param.u64 %vptr, [probe_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
     mov.u64 %empty, 0x8000000000000000;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -4321,6 +4366,21 @@ hjbt_done:
 hjpt_loop:
     setp.ge.u64 %p, %i, %n;
     @%p bra hjpt_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // probe key (bit 0) matches nothing -> emit no pair (skip to the loop increment).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjpt_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjpt_next;
+hjpt_keyok:
     mul.lo.u64 %o, %i, 8;
     add.u64 %addr, %poffb, %o;
     ld.global.u32 %w0, [%addr];
@@ -4705,10 +4765,23 @@ hjenn_done:
     .param .u64 slot_keys_ptr,
     .param .u64 slot_head_ptr,
     .param .u64 next_ptr,
-    .param .u64 mask
+    .param .u64 mask,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every key valid (byte-identical). A NULL build key matches nothing -> NOT chained.
+    .param .u64 build_validity_ptr
 )
 {
     .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -4761,6 +4834,8 @@ hjenn_done:
     ld.param.u64 %sloth, [slot_head_ptr];
     ld.param.u64 %nextp, [next_ptr];
     ld.param.u64 %mask, [mask];
+    ld.param.u64 %vptr, [build_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
     mov.u64 %empty, 0x8000000000000000;
     mov.u64 %tmp, 0;
     mov.b128 %empty128, {%tmp, %empty};
@@ -4775,6 +4850,21 @@ hjenn_done:
 hjbtn_loop:
     setp.ge.u64 %p, %i, %n;
     @%p bra hjbtn_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // build key (bit 0) matches nothing -> skip this row (to the loop increment, NOT chained).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjbtn_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjbtn_next;
+hjbtn_keyok:
     mul.lo.u64 %o, %i, 8;
     add.u64 %addr, %offb, %o;
     ld.global.u32 %w0, [%addr];
@@ -4882,10 +4972,23 @@ hjbtn_done:
     .param .u64 mask,
     .param .u64 cap,
     .param .u64 out_pairs_ptr,
-    .param .u64 out_cursor_ptr
+    .param .u64 out_cursor_ptr,
+    // V1 (doc 21) 3VL: dense per-key NULL validity bitmap (1 = valid). Sentinel u64::MAX = no bitmap =>
+    // every probe key valid (byte-identical). A NULL probe key matches nothing -> emit no pairs.
+    .param .u64 probe_validity_ptr
 )
 {
     .reg .pred %p;
+    .reg .pred %pv;
+    .reg .u32 %vidx;
+    .reg .u32 %vword;
+    .reg .u32 %vbit;
+    .reg .u32 %vbt;
+    .reg .u32 %vw;
+    .reg .u64 %vptr;
+    .reg .u64 %vsent;
+    .reg .u64 %vaddr;
+    .reg .u64 %vwd64;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -4951,6 +5054,8 @@ hjbtn_done:
     ld.param.u64 %cap, [cap];
     ld.param.u64 %outp, [out_pairs_ptr];
     ld.param.u64 %curp, [out_cursor_ptr];
+    ld.param.u64 %vptr, [probe_validity_ptr];
+    mov.u64 %vsent, 0xFFFFFFFFFFFFFFFF;
     mov.u64 %empty, 0x8000000000000000;
     mov.u64 %end, 0xffffffffffffffff;
     mov.u32 %lane, %tid.x;
@@ -4964,6 +5069,21 @@ hjbtn_done:
 hjetn_loop:
     setp.ge.u64 %p, %i, %n;
     @%p bra hjetn_done;
+    // V1 (doc 21) 3VL NULL-key skip: vptr == sentinel => valid (byte-identical). Else read bit i; a NULL
+    // probe key (bit 0) matches nothing -> emit no pairs (skip to the loop increment).
+    setp.eq.u64 %pv, %vptr, %vsent;
+    @%pv bra hjetn_keyok;
+    cvt.u32.u64 %vidx, %i;
+    shr.u32 %vword, %vidx, 5;
+    mul.lo.u32 %vword, %vword, 4;
+    cvt.u64.u32 %vwd64, %vword;
+    add.u64 %vaddr, %vptr, %vwd64;
+    ld.global.u32 %vw, [%vaddr];
+    and.b32 %vbit, %vidx, 31;
+    bfe.u32 %vbt, %vw, %vbit, 1;
+    setp.eq.u32 %pv, %vbt, 0;
+    @%pv bra hjetn_next;
+hjetn_keyok:
     mul.lo.u64 %o, %i, 8;
     add.u64 %addr, %poffb, %o;
     ld.global.u32 %w0, [%addr];

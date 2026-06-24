@@ -15436,7 +15436,8 @@ fn launch_cuda_hash_join_inner_text(
         if rc != 0 {
             return rc;
         }
-        // build(payload, build_offsets_off, build_bytes_off, build_n, slots, mask, dup_flag)
+        // build(payload, build_offsets_off, build_bytes_off, build_n, slots, mask, dup_flag, build_validity).
+        // V1: u64::MAX = no validity bitmap => every key valid (byte-identical; V1b-wire passes a real one).
         let mut b0 = payload_dev.ptr;
         let mut b1 = build_offsets_off;
         let mut b2 = build_bytes_off;
@@ -15444,6 +15445,7 @@ fn launch_cuda_hash_join_inner_text(
         let mut b4 = slot_keys.ptr;
         let mut b5 = mask;
         let mut b6 = dup_flag.ptr;
+        let mut b7 = u64::MAX;
         let mut bargs = [
             (&mut b0 as *mut u64).cast::<c_void>(),
             (&mut b1 as *mut u64).cast::<c_void>(),
@@ -15452,6 +15454,7 @@ fn launch_cuda_hash_join_inner_text(
             (&mut b4 as *mut u64).cast::<c_void>(),
             (&mut b5 as *mut u64).cast::<c_void>(),
             (&mut b6 as *mut u64).cast::<c_void>(),
+            (&mut b7 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
@@ -15470,6 +15473,8 @@ fn launch_cuda_hash_join_inner_text(
     }
     // Phase 2: PROBE -> append matched (build_idx, probe_idx) at the atomic cursor.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
+        // probe(payload, probe_off, probe_bytes, probe_n, build_off, build_bytes, slots, mask, out_pairs,
+        // out_cursor, probe_validity). V1: u64::MAX = no validity bitmap => every key valid (byte-identical).
         let mut p0 = payload_dev.ptr;
         let mut p1 = probe_offsets_off;
         let mut p2 = probe_bytes_off;
@@ -15480,6 +15485,7 @@ fn launch_cuda_hash_join_inner_text(
         let mut p7 = mask;
         let mut p8 = pairs.ptr;
         let mut p9 = cursor.ptr;
+        let mut p10 = u64::MAX;
         let mut pargs = [
             (&mut p0 as *mut u64).cast::<c_void>(),
             (&mut p1 as *mut u64).cast::<c_void>(),
@@ -15491,6 +15497,7 @@ fn launch_cuda_hash_join_inner_text(
             (&mut p7 as *mut u64).cast::<c_void>(),
             (&mut p8 as *mut u64).cast::<c_void>(),
             (&mut p9 as *mut u64).cast::<c_void>(),
+            (&mut p10 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
@@ -15911,6 +15918,8 @@ fn launch_cuda_hash_join_inner_text_nn(
         let mut e10 = cap;
         let mut e11 = out;
         let mut e12 = cursor.ptr;
+        // V1: e13 = u64::MAX = no validity bitmap => every probe key valid (byte-identical).
+        let mut e13 = u64::MAX;
         let mut eargs = [
             (&mut e0 as *mut u64).cast::<c_void>(),
             (&mut e1 as *mut u64).cast::<c_void>(),
@@ -15925,6 +15934,7 @@ fn launch_cuda_hash_join_inner_text_nn(
             (&mut e10 as *mut u64).cast::<c_void>(),
             (&mut e11 as *mut u64).cast::<c_void>(),
             (&mut e12 as *mut u64).cast::<c_void>(),
+            (&mut e13 as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
@@ -15980,6 +15990,8 @@ fn launch_cuda_hash_join_inner_text_nn(
         if rc != 0 {
             return rc;
         }
+        // build(payload, build_off, build_bytes, build_n, slots, slot_head, next, mask, build_validity).
+        // V1: u64::MAX = no validity bitmap => every key valid (byte-identical).
         let mut b0 = payload_dev.ptr;
         let mut b1 = build_offsets_off;
         let mut b2 = build_bytes_off;
@@ -15988,6 +16000,7 @@ fn launch_cuda_hash_join_inner_text_nn(
         let mut b5 = slot_head.ptr;
         let mut b6 = next.ptr;
         let mut b7 = mask;
+        let mut b8 = u64::MAX;
         let mut bargs = [
             (&mut b0 as *mut u64).cast::<c_void>(),
             (&mut b1 as *mut u64).cast::<c_void>(),
@@ -15997,6 +16010,7 @@ fn launch_cuda_hash_join_inner_text_nn(
             (&mut b5 as *mut u64).cast::<c_void>(),
             (&mut b6 as *mut u64).cast::<c_void>(),
             (&mut b7 as *mut u64).cast::<c_void>(),
+            (&mut b8 as *mut u64).cast::<c_void>(),
         ];
         let rc = unsafe {
             cu_launch_kernel(
