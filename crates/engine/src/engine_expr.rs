@@ -2297,33 +2297,46 @@ impl Engine {
                 }
             }
         };
-        // Gather relation `ri`'s TEXT key bytes from host_rows at the given ABSOLUTE rows (the keys
-        // crossing to host, like the i64 projection). Errors on a non-text value (the precompute already
-        // validated the column is TEXT, so this is a guard, not a path).
-        let key_texts = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<&[u8]>, ExecuteError> {
-            abs.iter()
-                .map(|&row| match &sides[ri].0.host_rows[row as usize][col_idx] {
-                    SqlValue::Text(text) => Ok(text.as_bytes()),
-                    _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "a text join key encountered a non-text value".to_string(),
-                    ))),
-                })
-                .collect()
+        // Gather relation `ri`'s TEXT key bytes from its DEVICE payload at the given ABSOLUTE rows (charter:
+        // the keys come from device memory, not a host_rows copy -- like the i64 projection `key_i64`).
+        // Returns OWNED strings (the caller borrows them into &[u8] for the GPU text hash join). The
+        // precompute validated the column is TEXT; the NULL-key gate excludes NULL-key rows BEFORE this, so
+        // `abs` holds only non-NULL keys (a NULL cell would project as "" -- never reached here).
+        let key_texts = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<String>, ExecuteError> {
+            if abs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let (entry, dm, _) = &sides[ri];
+            let layout = resident_device_text_column_layout(&entry.descriptor, &tables[ri], col_idx)?;
+            let idxs: Vec<u64> = abs.iter().map(|&r| u64::from(r)).collect();
+            dm.mem()
+                .project_text_rows_from_payload(
+                    layout.offsets_byte_offset,
+                    layout.bytes_byte_offset,
+                    layout.bytes_len,
+                    &idxs,
+                )
+                .map_err(map_err)
         };
-        // Gather a NUMERIC/UUID key's 16-byte canonical value from host_rows (uuid = raw bytes; numeric =
-        // the i128 mantissa LE -- the precompute requires equal scale on both sides, so the mantissa
-        // compares value-for-value). Returns OWNED 16-byte values (the caller borrows them into &[u8] for
-        // the SAME text hash join: a 16-byte "text" -> FNV + 16-byte verify = b128 equality).
+        // Gather a NUMERIC/UUID key's 16-byte canonical value from its DEVICE payload (both ride the i128
+        // section): the i128's LE bytes ARE the uuid raw bytes / the numeric mantissa LE (the precompute
+        // requires equal scale on both sides, so the mantissa compares value-for-value). Returns OWNED
+        // 16-byte values (the caller borrows them into &[u8] for the SAME text hash join: a 16-byte "text"
+        // -> FNV + 16-byte verify = b128 equality). NULL-key rows are excluded upstream by the NULL gate.
         let key_b128 = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<[u8; 16]>, ExecuteError> {
-            abs.iter()
-                .map(|&row| match &sides[ri].0.host_rows[row as usize][col_idx] {
-                    SqlValue::Uuid(bytes) => Ok(*bytes),
-                    SqlValue::Numeric(value) => Ok(value.mantissa.to_le_bytes()),
-                    _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "a numeric/uuid join key encountered a value of another type".to_string(),
-                    ))),
-                })
-                .collect()
+            if abs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let (entry, dm, _) = &sides[ri];
+            let off = resident_device_numeric_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
+            let idxs: Vec<u64> = abs.iter().map(|&r| u64::from(r)).collect();
+            Ok(dm
+                .mem()
+                .project_i128_rows_from_payload(off, &idxs)
+                .map_err(map_err)?
+                .into_iter()
+                .map(|v| v.to_le_bytes())
+                .collect())
         };
         // Pack a step's per-conjunct host i64 key columns into one i64 per row: a single conjunct is the
         // key itself; a 2-conjunct composite puts member 0 in the HIGH 32 bits and member 1 in the LOW
@@ -2390,12 +2403,14 @@ impl Engine {
                 (&work_idx, survivors_all[new_rel].as_slice())
             };
             let (acc_is_build, build_idxs, probe_idxs) = if step_is_text[k] {
-                // TEXT key (a single conjunct, validated). Gather both sides' key bytes from host_rows and
-                // run the GPU text hash join (FNV-hash + byte-verify).
+                // TEXT key (a single conjunct, validated). Gather both sides' key bytes from the DEVICE
+                // payload and run the GPU text hash join (FNV-hash + byte-verify).
                 let (acc_rel, acc_col, new_col) = conjuncts[0];
                 let acc_texts = key_texts(acc_rel, acc_col, &acc_idx[acc_rel])?;
                 let new_texts = key_texts(new_rel, new_col, new_idx)?;
-                text_hash_join(sides[new_rel].1.mem(), &acc_texts, &new_texts)?
+                let acc_refs: Vec<&[u8]> = acc_texts.iter().map(|s| s.as_bytes()).collect();
+                let new_refs: Vec<&[u8]> = new_texts.iter().map(|s| s.as_bytes()).collect();
+                text_hash_join(sides[new_rel].1.mem(), &acc_refs, &new_refs)?
             } else if step_is_b128[k] {
                 // NUMERIC/UUID key: gather each side's 16-byte canonical value and run the SAME text/byte
                 // hash join over it (a 16-byte "text" -> FNV + 16-byte verify = exact 128-bit equality).
