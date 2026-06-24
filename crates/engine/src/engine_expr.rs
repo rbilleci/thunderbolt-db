@@ -235,12 +235,31 @@ fn having_op_to_resident(op: crate::SelectFilterOp) -> ResidentBinaryOp {
 }
 
 /// A HAVING comparison constant (`SqlValue`) as a resident-predicate literal node, so the HAVING DNF can
-/// be evaluated by the SAME device predicate VM as WHERE. Int2/Int4/Date and a small Int8 (COUNT/SUM
-/// results, group keys) ride the i32 literal (the int8 compare path sign-extends it -- the HAVING
-/// transient promotes every integer-family column to Int8, so the predicate is a single i64 width); a
-/// large Int8 / Numeric ride the numeric literal; text/bool direct. (A Timestamp/Uuid HAVING constant
-/// needs an i64/uuid literal node in the predicate IR -- a narrow follow-up; no general-path test hits it.)
-fn having_value_to_resident_literal(value: &SqlValue) -> Result<ResidentExpr, ExecuteError> {
+/// be evaluated by the SAME device predicate VM as WHERE. The HAVING transient promotes every integer
+/// column to ONE width (the VM is single-width); `numeric_mode` says which: in NUMERIC mode (the DNF
+/// touches a numeric column) integer constants compare as `Numeric(scale 0)`; otherwise (all integer) they
+/// ride the i32 literal (the int8 compare path sign-extends a small one). A genuine `Numeric` constant is
+/// a numeric literal regardless. (A Timestamp/Uuid/Text/Bool HAVING constant is parser-rejected upstream;
+/// the arm exists for safety, not reach.)
+fn having_value_to_resident_literal(
+    value: &SqlValue,
+    numeric_mode: bool,
+) -> Result<ResidentExpr, ExecuteError> {
+    if numeric_mode {
+        return Ok(match value {
+            SqlValue::Int4(v) | SqlValue::Date(v) => {
+                ResidentExpr::NumericLiteral(Decimal128::new(i128::from(*v), 0))
+            }
+            SqlValue::Int2(v) => ResidentExpr::NumericLiteral(Decimal128::new(i128::from(*v), 0)),
+            SqlValue::Int8(v) => ResidentExpr::NumericLiteral(Decimal128::new(i128::from(*v), 0)),
+            SqlValue::Numeric(d) => ResidentExpr::NumericLiteral(*d),
+            other => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "HAVING comparison against a {other:?} constant is not yet on the GPU predicate path"
+                ))));
+            }
+        });
+    }
     Ok(match value {
         SqlValue::Int4(v) | SqlValue::Date(v) => ResidentExpr::Int4Literal(*v),
         SqlValue::Int2(v) => ResidentExpr::Int4Literal(i32::from(*v)),
@@ -4430,12 +4449,23 @@ impl Engine {
             if !select.having_groups.is_empty() && !rows.is_empty() {
                 // HAVING on the GPU (charter: no host relational filter). Build a TRANSIENT device relation
                 // from the grouped result and evaluate the HAVING DNF via the SAME device predicate VM as
-                // WHERE. Two corrections vs. the catalog types: (1) a `SUM(int*)` result is DECLARED Int4 but
-                // VALUED Int8 -- the declared type would mis-route it into the int4 payload section; (2) the
-                // device predicate VM evaluates ONE program at ONE width, but HAVING mixes an int4 group key
-                // with an int8 COUNT. Both are fixed by PROMOTING every integer-family column (and value) to
-                // Int8, so the result columns the predicate touches are a single i64 width.
+                // WHERE. The VM is SINGLE-WIDTH per program, and a result column's catalog type can disagree
+                // with its materialized value (a `SUM(int*)` result is DECLARED Int4 but VALUED Int8). So
+                // PROMOTE every integer-family column (and value) to ONE comparable width: if the HAVING
+                // touches a NUMERIC column/constant the whole predicate is NUMERIC (i128) -> promote integers
+                // to Numeric(scale 0); else it is INT (i64) -> promote integers to Int8. This makes int-key +
+                // int8-COUNT, and numeric-SUM + int-COUNT, a single width the VM can lower.
                 let n_cols = bound.selected_columns.len();
+                let numeric_mode = select.having_groups.iter().flatten().try_fold(
+                    false,
+                    |acc, f| -> Result<bool, ExecuteError> {
+                        let idx = col_index(&f.column)?;
+                        Ok(acc
+                            || matches!(f.value, SqlValue::Numeric(_))
+                            || matches!(bound.selected_columns[idx].ty, SqlType::Numeric { .. })
+                            || rows.iter().any(|r| matches!(r[idx], SqlValue::Numeric(_))))
+                    },
+                )?;
                 let promote_int: Vec<bool> = (0..n_cols)
                     .map(|c| {
                         rows.iter().any(|r| {
@@ -4450,6 +4480,14 @@ impl Engine {
                         })
                     })
                     .collect();
+                let promoted_int_ty = if numeric_mode {
+                    SqlType::Numeric {
+                        precision: 38,
+                        scale: 0,
+                    }
+                } else {
+                    SqlType::Int8
+                };
                 let having_columns: Vec<RelationalColumn> = bound
                     .selected_columns
                     .iter()
@@ -4457,7 +4495,7 @@ impl Engine {
                     .map(|(c, col)| {
                         let mut col = col.clone();
                         if promote_int[c] {
-                            col.ty = SqlType::Int8;
+                            col.ty = promoted_int_ty;
                         }
                         col
                     })
@@ -4468,19 +4506,19 @@ impl Engine {
                         r.iter()
                             .enumerate()
                             .map(|(c, v)| {
-                                if promote_int[c] {
-                                    match v {
-                                        SqlValue::Int2(x) => SqlValue::Int8(i64::from(*x)),
-                                        SqlValue::Int4(x) | SqlValue::Date(x) => {
-                                            SqlValue::Int8(i64::from(*x))
-                                        }
-                                        SqlValue::Int8(x) | SqlValue::Timestamp(x) => {
-                                            SqlValue::Int8(*x)
-                                        }
-                                        other => other.clone(),
-                                    }
+                                if !promote_int[c] {
+                                    return v.clone();
+                                }
+                                let as_i64 = match v {
+                                    SqlValue::Int2(x) => i64::from(*x),
+                                    SqlValue::Int4(x) | SqlValue::Date(x) => i64::from(*x),
+                                    SqlValue::Int8(x) | SqlValue::Timestamp(x) => *x,
+                                    other => return other.clone(), // NULL stays NULL
+                                };
+                                if numeric_mode {
+                                    SqlValue::Numeric(Decimal128::new(i128::from(as_i64), 0))
                                 } else {
-                                    v.clone()
+                                    SqlValue::Int8(as_i64)
                                 }
                             })
                             .collect()
@@ -4495,7 +4533,7 @@ impl Engine {
                         let leaf = ResidentExpr::Binary {
                             op: having_op_to_resident(f.op),
                             lhs: Box::new(ResidentExpr::Column(col_index(&f.column)?)),
-                            rhs: Box::new(having_value_to_resident_literal(&f.value)?),
+                            rhs: Box::new(having_value_to_resident_literal(&f.value, numeric_mode)?),
                         };
                         conj = Some(match conj {
                             None => leaf,

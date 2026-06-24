@@ -5946,6 +5946,51 @@ fn gpu_grouped_having_sum_and_dnf_runs_on_gpu() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_having_numeric_int_mixed_dnf_runs_on_gpu() {
+    // Regression coverage (2nd audit): a HAVING DNF mixing a NUMERIC aggregate with an integer COUNT must
+    // RUN on the GPU -- the integers are promoted to Numeric so the predicate is a single i128 width --
+    // rather than clean-error.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (k INT, n NUMERIC(10,2))").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (k, n) VALUES (1,2.00),(1,2.00), (2,10.00), (3,1.00),(3,1.00),(3,1.00)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // groups (default order by k): k1 sum 4.00 count 2; k2 sum 10.00 count 1; k3 sum 3.00 count 3.
+    let row = |k: i32, sum_cents: i128, c: i64| {
+        vec![
+            SqlValue::Int4(k),
+            SqlValue::Numeric(Decimal128::new(sum_cents, 2)),
+            SqlValue::Int8(c),
+        ]
+    };
+    // numeric SUM AND integer COUNT -> k1 only.
+    let a = e
+        .execute_resident_expr_select_sql(
+            "SELECT k, SUM(n), COUNT(*) FROM t GROUP BY k HAVING SUM(n) > 3.00 AND COUNT(*) >= 2",
+        )
+        .unwrap();
+    assert_eq!(a.rows, vec![row(1, 400, 2)], "numeric SUM AND int COUNT");
+    // numeric SUM OR integer COUNT -> k2, k3.
+    let b = e
+        .execute_resident_expr_select_sql(
+            "SELECT k, SUM(n), COUNT(*) FROM t GROUP BY k HAVING SUM(n) > 8.00 OR COUNT(*) >= 3",
+        )
+        .unwrap();
+    assert_eq!(
+        b.rows,
+        vec![row(2, 1000, 1), row(3, 300, 3)],
+        "numeric SUM OR int COUNT"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_duplicate_aggregate_name_is_ambiguous() {
     // Two same-function aggregates share a result-column name ("sum"); referencing it in ORDER BY or
     // HAVING is ambiguous (PG: "column reference ... is ambiguous") -> error, not silent first-match.
