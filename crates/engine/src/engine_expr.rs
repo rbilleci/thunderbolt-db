@@ -279,9 +279,10 @@ fn having_value_to_resident_literal(
 }
 
 /// The ON-DEVICE sort PERMUTATION for `rows` by `order` ((result-column index, descending)) -- the index
-/// vector `perm` such that `rows[perm[0]], rows[perm[1]], ...` is sorted. Used by `gpu_sort_result_rows`
-/// (final result order) AND by the GROUP BY multi-pass alignment (S2.3) to reorder per-pass group arrays
-/// on-device (a TOTAL key order aligns every pass by index -- no host sort).
+/// vector `perm` such that `rows[perm[0]], rows[perm[1]], ...` is sorted. Callers reorder/window their
+/// result rows by this index vector (the projection/GROUP-BY/join result order + OFFSET/LIMIT windowing)
+/// AND the GROUP BY multi-pass alignment (S2.3) reorders per-pass group arrays on-device (a TOTAL key
+/// order aligns every pass by index -- no host sort).
 pub(crate) fn gpu_sort_permutation(
     rows: &[Vec<SqlValue>],
     order: &[(usize, bool)],
@@ -434,19 +435,6 @@ pub(crate) fn gpu_sort_permutation(
             .map_err(map_sort_err)?
     };
     Ok(perm)
-}
-
-/// Reorder `rows` into sorted result order via the on-device sort permutation (`gpu_sort_permutation`).
-/// The relational ordering decision is on the GPU; the host only applies the returned index vector.
-pub(crate) fn gpu_sort_result_rows(
-    rows: Vec<Vec<SqlValue>>,
-    order: &[(usize, bool)],
-    nulls_first: &[Option<bool>],
-    col_types: &[SqlType],
-    device_memory: &gpu_db_execution::CudaResidentDeviceMemory,
-) -> Result<Vec<Vec<SqlValue>>, ExecuteError> {
-    let perm = gpu_sort_permutation(rows.as_slice(), order, nulls_first, col_types, device_memory)?;
-    Ok(perm.iter().map(|&p| rows[p as usize].clone()).collect())
 }
 
 /// Narrow a grouped MIN/MAX or GROUP BY key, which the GPU kernel computes as an i64 (or, for
@@ -2523,23 +2511,147 @@ impl Engine {
                 .map(|col| kept.iter().map(|&t| col[t]).collect())
                 .collect();
         }
-        // Gather: for each surviving tuple, read each projected column from its relation's host_rows at
-        // the carried ABSOLUTE row -- the control-plane gather; the join ran on the GPU.
+        // Gather: each projected column's VALUES come from its relation's DEVICE payload at the carried
+        // ABSOLUTE rows (charter: result values are read back from device memory, NOT a host_rows copy --
+        // host_rows is ingest-staging only). A `JOIN_NULL_ROW` sentinel (an OUTER NULL pad) emits
+        // SqlValue::Null; a real row whose value is NULL emits Null via the column's device validity bitmap.
+        // Mirrors the resident SELECT materialization (S1): the same per-type project_*_rows_from_payload
+        // matrix, here per join side. Column-major (one gather per projected column), transposed to rows.
         let work_n = work_idx[0].len();
+        // Gather ONE projected column from relation `ri`'s device payload at the carried rows. A pad row
+        // (JOIN_NULL_ROW) uses a 0 placeholder index whose gathered value is overridden to NULL; a relation
+        // with 0 rows contributes only pads -> all NULL (no device read at index 0 into an empty payload).
+        let gather_col = |ri: usize, ci: usize, rows: &[u32]| -> Result<Vec<SqlValue>, ExecuteError> {
+            let n = rows.len();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            let (entry, dm, row_count) = &sides[ri];
+            if *row_count == 0 {
+                return Ok(vec![SqlValue::Null; n]);
+            }
+            let table = &tables[ri];
+            let is_pad: Vec<bool> = rows.iter().map(|&r| r == JOIN_NULL_ROW).collect();
+            let idxs: Vec<u64> = rows
+                .iter()
+                .map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) })
+                .collect();
+            // NULL validity (None = the column holds no NULLs, so every gathered value is real).
+            let validity: Option<Vec<bool>> =
+                match resident_device_null_column_offset(&entry.descriptor, table, ci)? {
+                    Some(off) => {
+                        Some(dm.mem().project_bool_rows_from_payload(off, &idxs).map_err(map_err)?)
+                    }
+                    None => None,
+                };
+            // Per-type value gather (the type matrix; mirrors the resident SELECT projection, exhaustive
+            // over SqlType so a new type is a compile error rather than a silent fallthrough).
+            let values: Vec<SqlValue> = match table.columns[ci].ty {
+                SqlType::Int8 => {
+                    let off = resident_device_int8_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_i64_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Int8)
+                        .collect()
+                }
+                SqlType::Timestamp => {
+                    let off = resident_device_int8_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_i64_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Timestamp)
+                        .collect()
+                }
+                SqlType::Numeric { scale, .. } => {
+                    let off = resident_device_numeric_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_i128_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(|v| SqlValue::Numeric(Decimal128::new(v, scale)))
+                        .collect()
+                }
+                SqlType::Uuid => {
+                    let off = resident_device_numeric_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_i128_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(|v| SqlValue::Uuid(v.to_le_bytes()))
+                        .collect()
+                }
+                SqlType::Date => {
+                    let off = resident_device_int4_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_i32_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Date)
+                        .collect()
+                }
+                SqlType::Int2 => {
+                    let off = resident_device_int4_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_i32_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(|v| SqlValue::Int2(v as i16))
+                        .collect()
+                }
+                SqlType::Bool => {
+                    let off = resident_device_bool_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_bool_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Bool)
+                        .collect()
+                }
+                SqlType::Text => {
+                    let layout = resident_device_text_column_layout(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_text_rows_from_payload(
+                            layout.offsets_byte_offset,
+                            layout.bytes_byte_offset,
+                            layout.bytes_len,
+                            &idxs,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Text)
+                        .collect()
+                }
+                SqlType::Int4 => {
+                    let off = resident_device_int4_column_offset(&entry.descriptor, table, ci)?;
+                    dm.mem()
+                        .project_i32_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(SqlValue::Int4)
+                        .collect()
+                }
+            };
+            // A pad row (OUTER NULL pad) or a 0 validity bit -> SqlValue::Null; else the gathered value.
+            Ok((0..n)
+                .map(|t| {
+                    if is_pad[t] || validity.as_ref().is_some_and(|v| !v[t]) {
+                        SqlValue::Null
+                    } else {
+                        values[t].clone()
+                    }
+                })
+                .collect())
+        };
+        // Column-major device gather (one per projected column), transposed into result rows.
+        let proj_values: Vec<Vec<SqlValue>> = proj
+            .iter()
+            .map(|&(ri, ci)| gather_col(ri, ci, &work_idx[ri]))
+            .collect::<Result<_, _>>()?;
         let mut result_rows: Vec<Vec<SqlValue>> = (0..work_n)
-            .map(|t| {
-                proj.iter()
-                    .map(|&(ri, ci)| {
-                        // A `JOIN_NULL_ROW` sentinel (LEFT-join NULL pad) -> the column is NULL.
-                        let row = work_idx[ri][t];
-                        if row == JOIN_NULL_ROW {
-                            SqlValue::Null
-                        } else {
-                            sides[ri].0.host_rows[row as usize][ci].clone()
-                        }
-                    })
-                    .collect()
-            })
+            .map(|t| proj_values.iter().map(|col| col[t].clone()).collect())
             .collect();
         // Result schema: each projected column's RelationalColumn from its owning table, attnums 1..N.
         let mut columns = Vec::with_capacity(proj.len());
@@ -2548,10 +2660,14 @@ impl Engine {
             col.attnum = (i + 1) as i16;
             columns.push(col);
         }
-        // ORDER BY on the join result is a GPU SORT (charter: every relational sort is a GPU sort). Each key
-        // resolves to a PROJECTED result column (same resolution as the projection, incl. USING/NATURAL
-        // coalescing); a non-projected ORDER BY key on the join path is a follow-up. Then OFFSET/LIMIT slice.
-        if !plan.order_by.is_empty() && result_rows.len() > 1 {
+        // ORDER BY on the join result is a GPU SORT (charter: every relational sort is a GPU sort), then
+        // OFFSET/LIMIT WINDOWS the device sort permutation -- a control-plane index slice, never a host
+        // drain/truncate on result data (S4). gpu_sort_permutation returns the index vector (identity for
+        // <=1 row / empty order); we slice it to [OFFSET, OFFSET+LIMIT) and gather only that window. Each
+        // key resolves to a PROJECTED result column (same resolution as the projection, incl. USING/NATURAL
+        // coalescing); a non-projected ORDER BY key on the join path is a follow-up.
+        let need_window = plan.offset.is_some() || plan.limit.is_some();
+        if (!plan.order_by.is_empty() && result_rows.len() > 1) || need_window {
             let mut order: Vec<(usize, bool)> = Vec::with_capacity(plan.order_by.len());
             for (c, descending) in &plan.order_by {
                 let resolved = if c.qualifier.is_none() && is_coalesced(&c.column) {
@@ -2570,21 +2686,23 @@ impl Engine {
             }
             let col_types: Vec<SqlType> = columns.iter().map(|col| col.ty).collect();
             // Explicit NULLS FIRST/LAST on a join ORDER BY is honored on-device (every key type, incl. int,
-            // reads its NULL validity bitmap in the sort comparator -- no host sentinel).
-            result_rows = gpu_sort_result_rows(
-                result_rows,
+            // reads its NULL validity bitmap in the sort comparator -- no host sentinel). With no ORDER BY
+            // (window-only), `order` is empty -> gpu_sort_permutation returns identity, so OFFSET/LIMIT
+            // windows the rows in join order, matching the prior host drain/truncate.
+            let perm = gpu_sort_permutation(
+                &result_rows,
                 &order,
                 &plan.order_by_nulls_first,
                 &col_types,
                 sides[0].1.mem(),
             )?;
-        }
-        if plan.offset.is_some() || plan.limit.is_some() {
-            let start = plan.offset.unwrap_or(0).min(result_rows.len());
-            result_rows.drain(..start);
-            if let Some(limit) = plan.limit {
-                result_rows.truncate(limit);
-            }
+            let start = plan.offset.unwrap_or(0).min(perm.len());
+            let end = plan
+                .limit
+                .map_or(perm.len(), |l| start.saturating_add(l).min(perm.len()));
+            let windowed: Vec<Vec<SqlValue>> =
+                perm[start..end].iter().map(|&p| result_rows[p as usize].clone()).collect();
+            result_rows = windowed;
         }
         Ok(RelationalSelectResult {
             columns,

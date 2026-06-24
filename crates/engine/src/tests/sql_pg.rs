@@ -2899,6 +2899,146 @@ fn gpu_inner_join_order_by_limit_offset() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_join_result_nullable_value_columns_from_device() {
+    // S7/V3: the join result VALUES are gathered from each relation's DEVICE payload (not a host_rows
+    // copy). The critical new surface vs the prior host gather: a MATCHED row whose projected NON-KEY
+    // column is NULL must emit SqlValue::Null via the device validity bitmap -- NOT the 0/"" placeholder
+    // the device stores for a NULL cell. The existing NULL-key tests only DROP NULL-KEY rows; here the join
+    // KEY is non-null and the NULLs live in projected value columns of MATCHED rows (int, text, numeric).
+    // Plus a LEFT-outer variant where a pad-NULL (JOIN_NULL_ROW) and a value-NULL coexist.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, v INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))").unwrap();
+    // id=1: l.v NULL, matched to r.w NULL. id=2: l.name NULL, matched to r.w=2.50. id=3: unmatched (pad).
+    e.execute_text(
+        3,
+        "INSERT INTO l (id, v, name) VALUES (1, NULL, 'a'), (2, 20, NULL), (3, 30, 'c')",
+    )
+    .unwrap();
+    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (1, NULL), (2, 2.50)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    // INNER: matched rows (1, NULL, 'a', NULL) and (2, 20, NULL, 2.50). Every NULL is a projected non-key
+    // value of a MATCHED row -> it must come back as SqlValue::Null from the device validity bitmap.
+    let inner = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, l.v, l.name, r.w FROM l JOIN r ON l.id = r.rid ORDER BY l.id",
+        )
+        .expect("inner join projecting nullable value columns");
+    assert_eq!(inner.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        inner.rows,
+        vec![
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Null,
+                SqlValue::Text("a".to_string()),
+                SqlValue::Null,
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Int4(20),
+                SqlValue::Null,
+                SqlValue::Numeric(Decimal128::new(250, 2)),
+            ],
+        ],
+        "matched-row NULL values come from the device validity bitmap, not the 0/\"\" placeholder"
+    );
+    // LEFT OUTER: id=3 matches nothing -> r.w is a JOIN_NULL_ROW pad NULL; id=1's value-NULLs coexist.
+    let left = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, l.v, l.name, r.w FROM l LEFT JOIN r ON l.id = r.rid ORDER BY l.id",
+        )
+        .expect("left outer join projecting nullable value columns + a pad");
+    assert_eq!(
+        left.rows,
+        vec![
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Null,
+                SqlValue::Text("a".to_string()),
+                SqlValue::Null,
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Int4(20),
+                SqlValue::Null,
+                SqlValue::Numeric(Decimal128::new(250, 2)),
+            ],
+            vec![
+                SqlValue::Int4(3),
+                SqlValue::Int4(30),
+                SqlValue::Text("c".to_string()),
+                SqlValue::Null,
+            ],
+        ],
+        "a pad-NULL (unmatched right) and real value-NULLs both render as SqlValue::Null"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_join_limit_offset_window_edges() {
+    // S7/V3: OFFSET/LIMIT on the join result now WINDOWS the device sort permutation (gpu_sort_permutation),
+    // gathering only the kept window -- no host drain/truncate on result data. Edge cases vs the old
+    // drain/truncate: OFFSET past the end -> empty, LIMIT 0 -> empty, OFFSET+LIMIT past the end -> clamped.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, score INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid, score) VALUES (1,10),(2,20),(3,30),(4,40)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let names = |res: &RelationalSelectResult| -> Vec<String> {
+        res.rows
+            .iter()
+            .map(|r| match &r[0] {
+                SqlValue::Text(s) => s.clone(),
+                other => panic!("expected text, got {other:?}"),
+            })
+            .collect()
+    };
+    // Sorted by score ASC the join result names are [a, b, c, d].
+    // OFFSET past the end -> empty.
+    let beyond = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name, r.score FROM l JOIN r ON l.id = r.rid ORDER BY r.score OFFSET 10",
+        )
+        .expect("offset past the end");
+    assert_eq!(beyond.executed_target, DeviceTarget::Gpu(0));
+    assert!(beyond.rows.is_empty(), "OFFSET past the end -> no rows");
+    // LIMIT 0 -> empty.
+    let zero = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name, r.score FROM l JOIN r ON l.id = r.rid ORDER BY r.score LIMIT 0",
+        )
+        .expect("limit 0");
+    assert!(zero.rows.is_empty(), "LIMIT 0 -> no rows");
+    // OFFSET 2 + LIMIT 100 past the end -> clamped to the tail [c, d].
+    let tail = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.name, r.score FROM l JOIN r ON l.id = r.rid ORDER BY r.score LIMIT 100 OFFSET 2",
+        )
+        .expect("limit past the end");
+    assert_eq!(
+        names(&tail),
+        vec!["c".to_string(), "d".to_string()],
+        "LIMIT past the end clamps to the tail"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_using_and_natural() {
     // M5: USING / NATURAL joins -- the join column is COALESCED (appears once in `*`, PG order: join cols,
     // then left's rest, then right's; an unqualified ref resolves to the left copy).
