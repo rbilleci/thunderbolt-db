@@ -240,13 +240,22 @@ is optional; each line is struck through only when it runs on the device.
     route classification) so `int4_grouped_aggregate` + `int4_filtered_grouped_aggregate` on a resident table
     route to `execute_resident_expr_select_sql(text)` too; then DELETE the two probe methods + their route
     classifiers + dispatch arms + the now-dead `gpu_order`/`gpu_having` machinery.
-  - **⚠️ THE RISK (do this FRESH, audit hard).** Behavior-EQUIVALENCE between the two executors: the enumerated
-    path emits `Int8` for COUNT, `Int4` for MIN/MAX, specific column names, a group-ASC tie-break, an AVG
-    Numeric representation, and specific HAVING/ORDER BY/LIMIT semantics. The general executor must match ALL of
-    these or it is a SILENT WRONG ANSWER (this is the exact compatibility-minefield class that produced the 4
-    HAVING regressions). **Before deleting anything: a DIFFERENTIAL test (enumerated route vs general route,
-    same queries, byte-identical rows+types+names) over COUNT/SUM/AVG/MIN/MAX × {plain, HAVING, ORDER BY agg,
-    ORDER BY group, LIMIT, filtered} — like the S6 62-shape probe.** Then the independent adversarial audit.
+  - **✅ EQUIVALENCE PROVEN (2026-06-24).** A throwaway differential probe ran 24 grouped int4 queries through
+    BOTH routes (`execute_relational_select_text` = enumerated/GPU vs `execute_resident_expr_select_sql` =
+    general) — **0 divergences**, byte-identical rows+types+column-names, over COUNT/SUM/AVG/MIN/MAX ×
+    {plain, ORDER BY group/agg ASC+DESC, HAVING incl. empty result, LIMIT incl. 0, filtered, combined
+    filter+HAVING+ORDER+LIMIT}, with negatives + a non-integer AVG (3.5). The enumerated route ran on the GPU
+    (`executed_target=Gpu`) so the comparison is real. So routing grouped int4 → general is behavior-preserving.
+  - **⚠️ DELETION BLOCKER FOUND (2026-06-24).** `execute_relational_select(&Select)` is also called from
+    CTAS + view/matview (`engine_ddl_objects.rs:114/161`, `engine_select_exec.rs:162`) with a `Select` AST and
+    NO raw SQL text + NO grouped-shape rejection at creation — so a grouped view/CTAS still reaches the probe.
+    There is no `Select`→SQL nor `Select`→ResidentExpr path. So routing ONLY at the text entry does NOT make
+    the probe methods dead; **fully deleting them requires a `&Select`→general-executor BRIDGE** (rebuild the
+    predicate DNF from `bound` filter_groups like the S3 HAVING DNF, + group_key_columns from `select.group_by`,
+    + order_by_exprs=None for the grouped result-column keys, then call `execute_resident_expr_select_with_binding`).
+    That bridge is a THIRD predicate-construction path (must be differentially re-verified) and is reusable for
+    S9/S10. **DECISION PENDING (user): build the bridge now (full retire) vs route-at-text now + fold the
+    deletion into S9/S10 (the host-path retirement that builds the bridge anyway).**
 
 ### Retire the host relational path entirely (the "incl. oracle" decision)
 - [ ] **S9 — replace CPU-oracle parity tests with GPU-native oracles** (serial-vs-parallel /
