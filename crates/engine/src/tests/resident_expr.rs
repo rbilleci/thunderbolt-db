@@ -5991,6 +5991,41 @@ fn gpu_grouped_having_numeric_int_mixed_dnf_runs_on_gpu() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_having_avg_heterogeneous_scale_on_gpu() {
+    // Regression coverage (3rd audit, a SILENT WRONG ANSWER): AVG yields per-GROUP Numeric scales (PG
+    // division). The HAVING transient must normalize each value to the column's (max) scale, else a
+    // low-AVG group's mantissa is misread at a smaller scale as a huge number and wrongly KEPT.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g, v) VALUES (1,3), (2,10), (3,1)")
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // AVG: g1=3.0, g2=10.0, g3=1.0, each at PG's per-group division scale. Assert the surviving KEYS.
+    let keys = |sql: &str| -> Vec<SqlValue> {
+        e.execute_resident_expr_select_sql(sql)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r[0].clone())
+            .collect()
+    };
+    assert_eq!(
+        keys("SELECT g, AVG(v) FROM t GROUP BY g HAVING AVG(v) > 2.00"),
+        vec![SqlValue::Int4(1), SqlValue::Int4(2)],
+        "HAVING AVG(v) > 2.00 must DROP g3 (1.0), not misread its scale as huge"
+    );
+    assert_eq!(
+        keys("SELECT g, AVG(v) FROM t GROUP BY g HAVING AVG(v) < 5"),
+        vec![SqlValue::Int4(1), SqlValue::Int4(3)],
+        "HAVING AVG(v) < 5 keeps g1(3.0), g3(1.0)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_duplicate_aggregate_name_is_ambiguous() {
     // Two same-function aggregates share a result-column name ("sum"); referencing it in ORDER BY or
     // HAVING is ambiguous (PG: "column reference ... is ambiguous") -> error, not silent first-match.

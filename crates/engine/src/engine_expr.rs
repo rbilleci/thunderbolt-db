@@ -4480,50 +4480,87 @@ impl Engine {
                         })
                     })
                     .collect();
-                let promoted_int_ty = if numeric_mode {
-                    SqlType::Numeric {
-                        precision: 38,
-                        scale: 0,
-                    }
-                } else {
-                    SqlType::Int8
-                };
+                // Per result column, the transient column's target. An integer-family column is promoted
+                // (to Numeric scale 0 in numeric_mode, else Int8). A GENUINE numeric column is normalized to
+                // the MAX scale across its values: AVG yields per-GROUP scales (PG division), but
+                // build_relational_device_payload stores only mantissas at ONE column scale, so every value
+                // must share it -- rescaling UP to the max is exact (no rounding). `col_scale[c] = Some(s)`
+                // marks a numeric-target column at scale `s`.
+                let col_scale: Vec<Option<u8>> = (0..n_cols)
+                    .map(|c| {
+                        if promote_int[c] {
+                            numeric_mode.then_some(0u8)
+                        } else {
+                            rows.iter()
+                                .filter_map(|r| match &r[c] {
+                                    SqlValue::Numeric(d) => Some(d.scale),
+                                    _ => None,
+                                })
+                                .max()
+                        }
+                    })
+                    .collect();
                 let having_columns: Vec<RelationalColumn> = bound
                     .selected_columns
                     .iter()
                     .enumerate()
                     .map(|(c, col)| {
                         let mut col = col.clone();
-                        if promote_int[c] {
-                            col.ty = promoted_int_ty;
+                        if let Some(scale) = col_scale[c] {
+                            col.ty = SqlType::Numeric {
+                                precision: 38,
+                                scale,
+                            };
+                        } else if promote_int[c] {
+                            col.ty = SqlType::Int8;
                         }
                         col
                     })
                     .collect();
                 let having_rows: Vec<Vec<SqlValue>> = rows
                     .iter()
-                    .map(|r| {
+                    .map(|r| -> Result<Vec<SqlValue>, ExecuteError> {
                         r.iter()
                             .enumerate()
-                            .map(|(c, v)| {
-                                if !promote_int[c] {
-                                    return v.clone();
-                                }
-                                let as_i64 = match v {
-                                    SqlValue::Int2(x) => i64::from(*x),
-                                    SqlValue::Int4(x) | SqlValue::Date(x) => i64::from(*x),
-                                    SqlValue::Int8(x) | SqlValue::Timestamp(x) => *x,
-                                    other => return other.clone(), // NULL stays NULL
+                            .map(|(c, v)| -> Result<SqlValue, ExecuteError> {
+                                let int_as_i64 = match v {
+                                    SqlValue::Int2(x) => Some(i64::from(*x)),
+                                    SqlValue::Int4(x) | SqlValue::Date(x) => Some(i64::from(*x)),
+                                    SqlValue::Int8(x) | SqlValue::Timestamp(x) => Some(*x),
+                                    _ => None,
                                 };
-                                if numeric_mode {
-                                    SqlValue::Numeric(Decimal128::new(i128::from(as_i64), 0))
-                                } else {
-                                    SqlValue::Int8(as_i64)
-                                }
+                                Ok(match (col_scale[c], promote_int[c]) {
+                                    // int-family promoted to Numeric (scale 0; int_as_i64 is exact).
+                                    (Some(scale), true) => match int_as_i64 {
+                                        Some(x) => {
+                                            SqlValue::Numeric(Decimal128::new(i128::from(x), scale))
+                                        }
+                                        None => v.clone(),
+                                    },
+                                    // genuine numeric -> rescale UP to the column's max scale (exact).
+                                    (Some(scale), false) => match v {
+                                        SqlValue::Numeric(d) => {
+                                            SqlValue::Numeric(d.rescale(scale).map_err(|_| {
+                                                ExecuteError::Engine(EngineError::ApplyFailed(
+                                                    "HAVING numeric value overflowed normalizing scale"
+                                                        .to_string(),
+                                                ))
+                                            })?)
+                                        }
+                                        _ => v.clone(),
+                                    },
+                                    // int-family promoted to Int8 (no numeric in the predicate).
+                                    (None, true) => match int_as_i64 {
+                                        Some(x) => SqlValue::Int8(x),
+                                        None => v.clone(),
+                                    },
+                                    // text/bool/uuid (or an all-NULL numeric column) -- unchanged.
+                                    (None, false) => v.clone(),
+                                })
                             })
                             .collect()
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()?;
                 // DNF -> ResidentExpr: each filter -> `Column(idx) <op> literal`; AND within a group, OR
                 // across groups. col_index still validates each referenced name (unknown / ambiguous).
                 let mut dnf: Option<ResidentExpr> = None;
