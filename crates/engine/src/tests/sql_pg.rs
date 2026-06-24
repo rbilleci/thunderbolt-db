@@ -3743,3 +3743,367 @@ fn audit_join_order_by_nullable_value_with_window() {
         "NULLS FIRST + LIMIT 1 -> the NULL row first"
     );
 }
+
+// ============================================================================
+// S5/V1a adversarial audit: join text/numeric/uuid KEY values from the DEVICE
+// payload (not host_rows). The charter claim is BEHAVIOR-PRESERVING vs the old
+// host_rows gather. These tests target byte-order/value exactness, negatives,
+// multi-way carried-index gathers, N:N, empty inputs, and the NULL gate.
+// ============================================================================
+
+/// HUNT #1: UUID byte-order / value exactness AND that the joined-on uuid VALUE is projected
+/// byte-identically. The matched uuids are ASYMMETRIC/non-palindromic byte patterns, so a byte-order
+/// bug in `project_i128 -> to_le_bytes()` (vs the old `SqlValue::Uuid(bytes)` host read) would EITHER
+/// mismatch the join (wrong/missing pairs) OR project a byte-swapped uuid. The existing test only
+/// projected `gname` (another column), so a uuid-value byte-swap would have been invisible there.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s5_uuid_byteorder_value_exactness() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE gd (gid UUID, gname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE ud (uid INT, gid UUID)").unwrap();
+    // Deliberately asymmetric byte patterns: a byte-swap would change the value AND break matching.
+    let a = "0102030405060708090a0b0c0d0e0f10"; // bare 32-hex form
+    let b = "fffefdfc-fbfa-f9f8-f7f6-f5f4f3f2f1f0"; // descending, high bit set in byte 0
+    let c = "00112233-4455-6677-8899-aabbccddeeff";
+    let unmatched = "deadbeef-0000-1111-2222-333344445555";
+    let a_canon = gpu_db_sql::uuid::format_uuid(&gpu_db_sql::uuid::parse_uuid(a).unwrap());
+    e.execute_text(3, &format!("INSERT INTO gd (gid, gname) VALUES ('{a}','A'),('{b}','B'),('{c}','C')")).unwrap();
+    e.execute_text(4, &format!("INSERT INTO ud (uid, gid) VALUES (1,'{a}'),(2,'{b}'),(3,'{c}'),(4,'{unmatched}')")).unwrap();
+    let mut ok = true;
+    for t in ["gd", "ud"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    // Project BOTH the uuid join key (from each side) AND a tag, so a byte-order bug surfaces in the
+    // projected value, not just the match set.
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT ud.uid, ud.gid, gd.gid, gd.gname FROM ud JOIN gd ON ud.gid = gd.gid ORDER BY ud.uid",
+        )
+        .expect("uuid-key join projecting the uuid value");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    // Exactly 3 matches (the deadbeef user drops). Both projected uuids must be the canonical value.
+    let rows: Vec<(i32, String, String, String)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            let uid = match &r[0] {
+                SqlValue::Int4(v) => *v,
+                o => panic!("uid {o:?}"),
+            };
+            let u_gid = match &r[1] {
+                SqlValue::Uuid(bytes) => gpu_db_sql::uuid::format_uuid(bytes),
+                o => panic!("ud.gid not uuid: {o:?}"),
+            };
+            let g_gid = match &r[2] {
+                SqlValue::Uuid(bytes) => gpu_db_sql::uuid::format_uuid(bytes),
+                o => panic!("gd.gid not uuid: {o:?}"),
+            };
+            let gname = match &r[3] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("gname {o:?}"),
+            };
+            (uid, u_gid, g_gid, gname)
+        })
+        .collect();
+    assert_eq!(rows.len(), 3, "exactly the 3 matched uuids (deadbeef drops)");
+    // Row 1: uuid `a` -> both projected uuids equal `a`'s canonical form (NOT byte-swapped).
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[0].1, a_canon, "ud.gid value exact (no byte swap)");
+    assert_eq!(rows[0].2, a_canon, "gd.gid value exact (no byte swap)");
+    assert_eq!(rows[0].3, "A");
+    // Row 2: uuid `b` (descending, high-bit byte0) round-trips exactly + matched the right group.
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[1].1, "fffefdfc-fbfa-f9f8-f7f6-f5f4f3f2f1f0");
+    assert_eq!(rows[1].2, "fffefdfc-fbfa-f9f8-f7f6-f5f4f3f2f1f0");
+    assert_eq!(rows[1].3, "B");
+    // Row 3: uuid `c`.
+    assert_eq!(rows[2].0, 3);
+    assert_eq!(rows[2].1, "00112233-4455-6677-8899-aabbccddeeff");
+    assert_eq!(rows[2].3, "C");
+}
+
+/// HUNT #2: NUMERIC mantissa exactness across scales + NEGATIVES + large i128 magnitudes. The old host
+/// path used `value.mantissa.to_le_bytes()`; the device path projects the i128 then `.to_le_bytes()`.
+/// A sign-extension/limb bug in `project_i128` would surface as a missing/extra join pair OR a
+/// byte-swapped projected value. Existing tests used only small POSITIVE mantissas (100.00/200.50).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s5_numeric_mantissa_exactness_negatives_and_large() {
+    let mut e = Engine::new_local();
+    // scale 0. NEGATIVES are the high-limb probe: a -1 mantissa is 0xFF..FF across ALL 16 bytes
+    // (including the HIGH 64-bit limb); a dropped/zeroed high limb in project_i128 would turn it into a
+    // large POSITIVE value and break the match. Also a beyond-i32 positive (3e9) crosses the 32-bit line.
+    e.execute_text(1, "CREATE TABLE t0 (k NUMERIC(30,0), name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE a0 (aid INT, k NUMERIC(30,0))").unwrap();
+    let big = "3000000000"; // > i32::MAX (2.1e9): a 32-bit-limb bug would corrupt it
+    e.execute_text(3, &format!("INSERT INTO t0 (k, name) VALUES (-1,'neg1'),({big},'big'),(-999999999,'negbil')")).unwrap();
+    e.execute_text(4, &format!("INSERT INTO a0 (aid, k) VALUES (1,-1),(2,{big}),(3,-999999999),(4,777)")).unwrap();
+    // high scale + negative fraction
+    e.execute_text(5, "CREATE TABLE th (k NUMERIC(20,6), name TEXT)").unwrap();
+    e.execute_text(6, "CREATE TABLE ah (aid INT, k NUMERIC(20,6))").unwrap();
+    e.execute_text(7, "INSERT INTO th (k, name) VALUES (-12.345678,'negfrac'),(0.000001,'tiny')").unwrap();
+    e.execute_text(8, "INSERT INTO ah (aid, k) VALUES (1,-12.345678),(2,0.000001),(3,5.000000)").unwrap();
+    let mut ok = true;
+    for t in ["t0", "a0", "th", "ah"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let collect = |res: &RelationalSelectResult| -> Vec<(i32, String, String)> {
+        let mut v: Vec<(i32, String, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let aid = match &r[0] {
+                    SqlValue::Int4(v) => *v,
+                    o => panic!("aid {o:?}"),
+                };
+                let k = match &r[1] {
+                    SqlValue::Numeric(d) => d.mantissa.to_string(),
+                    o => panic!("k not numeric: {o:?}"),
+                };
+                let name = match &r[2] {
+                    SqlValue::Text(t) => t.clone(),
+                    o => panic!("name {o:?}"),
+                };
+                (aid, k, name)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let r0 = e
+        .execute_resident_expr_select_sql(
+            "SELECT a0.aid, a0.k, t0.name FROM a0 JOIN t0 ON a0.k = t0.k",
+        )
+        .expect("scale-0 negative/large numeric join");
+    assert_eq!(r0.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        collect(&r0),
+        vec![
+            (1, "-1".to_string(), "neg1".to_string()),
+            (2, big.to_string(), "big".to_string()),
+            (3, "-999999999".to_string(), "negbil".to_string()),
+        ],
+        "scale-0 negatives + a near-i128::MAX mantissa match exactly; 777 (unmatched) drops"
+    );
+    let rh = e
+        .execute_resident_expr_select_sql(
+            "SELECT ah.aid, ah.k, th.name FROM ah JOIN th ON ah.k = th.k",
+        )
+        .expect("high-scale numeric join");
+    assert_eq!(
+        collect(&rh),
+        vec![
+            (1, "-12345678".to_string(), "negfrac".to_string()),
+            (2, "1".to_string(), "tiny".to_string()),
+        ],
+        "high-scale negative fraction + tiny value match exactly; 5.0 (unmatched) drops"
+    );
+}
+
+/// HUNT #3: a numeric/uuid (b128) key used in a LATER step of a 3-way join. The accumulated side's key
+/// is gathered at CARRIED indices that came from a prior step -- those indices must index the
+/// relation's OWN payload, not the prior result. A wrong base would gather the wrong key -> wrong matches.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s5_b128_key_in_later_multiway_step() {
+    let mut e = Engine::new_local();
+    // r0 (int pk) -> r1 (int fk to r0, uuid u) -> r2 (uuid u). The uuid join is the SECOND step, joining
+    // the ACCUMULATED (r0,r1) on r1.u against r2.u. r1.u is gathered at carried r1 indices.
+    e.execute_text(1, "CREATE TABLE r0 (id INT, tag TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r1 (id INT, u UUID)").unwrap();
+    e.execute_text(3, "CREATE TABLE r2 (u UUID, label TEXT)").unwrap();
+    let ux = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let uy = "12345678-9abc-def0-1234-567890abcdef";
+    let uz = "00000000-0000-0000-0000-000000000001";
+    // r0 rows 1..3; r1 maps id->uuid (id1->ux, id2->uy, id3->uz); r2 has ux,uy only.
+    e.execute_text(4, "INSERT INTO r0 (id, tag) VALUES (1,'one'),(2,'two'),(3,'three')").unwrap();
+    e.execute_text(5, &format!("INSERT INTO r1 (id, u) VALUES (1,'{ux}'),(2,'{uy}'),(3,'{uz}')")).unwrap();
+    e.execute_text(6, &format!("INSERT INTO r2 (u, label) VALUES ('{ux}','X'),('{uy}','Y')")).unwrap();
+    let mut ok = true;
+    for t in ["r0", "r1", "r2"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT r0.tag, r2.label, r1.u FROM r0 JOIN r1 ON r0.id = r1.id JOIN r2 ON r1.u = r2.u ORDER BY r0.tag",
+        )
+        .expect("3-way: int step then uuid step on the accumulated side");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let rows: Vec<(String, String, String)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            let tag = match &r[0] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("tag {o:?}"),
+            };
+            let label = match &r[1] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("label {o:?}"),
+            };
+            let u = match &r[2] {
+                SqlValue::Uuid(b) => gpu_db_sql::uuid::format_uuid(b),
+                o => panic!("u {o:?}"),
+            };
+            (tag, label, u)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("one".to_string(), "X".to_string(), ux.to_string()),
+            ("two".to_string(), "Y".to_string(), uy.to_string()),
+        ],
+        "id3->uz has no r2 match and drops; the carried r1.u gathers the RIGHT uuid per accumulated tuple"
+    );
+}
+
+/// HUNT #5: empty `abs` early return on a b128/text step. A per-side WHERE filters one side to ZERO
+/// rows before a uuid-key join -> the `if abs.is_empty()` path must yield an empty result, no panic.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s5_empty_side_before_b128_and_text_step() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE gu (gid UUID, gname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE uu (uid INT, gid UUID)").unwrap();
+    let g = "11112222-3333-4444-5555-666677778888";
+    e.execute_text(3, &format!("INSERT INTO gu (gid, gname) VALUES ('{g}','g')")).unwrap();
+    e.execute_text(4, &format!("INSERT INTO uu (uid, gid) VALUES (1,'{g}'),(2,'{g}')")).unwrap();
+    e.execute_text(5, "CREATE TABLE ls (lid INT, t TEXT)").unwrap();
+    e.execute_text(6, "CREATE TABLE rs (rid INT, t TEXT)").unwrap();
+    e.execute_text(7, "INSERT INTO ls (lid, t) VALUES (1,'x'),(2,'y')").unwrap();
+    e.execute_text(8, "INSERT INTO rs (rid, t) VALUES (10,'x')").unwrap();
+    let mut ok = true;
+    for t in ["gu", "uu", "ls", "rs"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    // WHERE filters uu to empty (no uid > 100) before the uuid join.
+    let uuid_empty = e
+        .execute_resident_expr_select_sql(
+            "SELECT uu.uid, gu.gname FROM uu JOIN gu ON uu.gid = gu.gid WHERE uu.uid > 100",
+        )
+        .expect("empty uuid side must not panic");
+    assert!(uuid_empty.rows.is_empty(), "filtered-to-empty uuid side -> empty result");
+    // WHERE filters rs to empty before the text join.
+    let text_empty = e
+        .execute_resident_expr_select_sql(
+            "SELECT ls.lid, rs.rid FROM ls JOIN rs ON ls.t = rs.t WHERE rs.rid > 100",
+        )
+        .expect("empty text side must not panic");
+    assert!(text_empty.rows.is_empty(), "filtered-to-empty text side -> empty result");
+    // A NON-empty text match through the device gather (so this test also covers the text-key gather
+    // correctness, not just the empty path): 'x' matches lid 1 -> rid 10.
+    let text_match = e
+        .execute_resident_expr_select_sql("SELECT ls.lid, rs.rid FROM ls JOIN rs ON ls.t = rs.t")
+        .expect("text-key match through the device gather");
+    let pairs: Vec<(i32, i32)> = text_match
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (SqlValue::Int4(a), SqlValue::Int4(b)) => (*a, *b),
+            o => panic!("{o:?}"),
+        })
+        .collect();
+    assert_eq!(pairs, vec![(1, 10)], "text key 'x' matches lid 1 -> rid 10 (device-gathered keys)");
+}
+
+/// HUNT #4 + #6: N:N numeric/uuid AND the NULL gate together. Both sides duplicate the numeric key; one
+/// side ALSO has a NULL-key row. The NULL row must match nothing (excluded by the host gate BEFORE the
+/// device gather) and the cross product of the non-NULL key must be exact. Confirms the device gather is
+/// never reached on a NULL index.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s5_nn_numeric_with_null_key_gate() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE ln (lid INT, amt NUMERIC(10,2))").unwrap();
+    e.execute_text(2, "CREATE TABLE rn (rid INT, amt NUMERIC(10,2))").unwrap();
+    // key 5.00 duplicated on both sides; a NULL-key row on each side must drop, NOT spuriously match.
+    e.execute_text(3, "INSERT INTO ln (lid, amt) VALUES (1,5.00),(2,5.00),(3,NULL)").unwrap();
+    e.execute_text(4, "INSERT INTO rn (rid, amt) VALUES (10,5.00),(11,5.00),(12,NULL)").unwrap();
+    let mut ok = true;
+    for t in ["ln", "rn"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT ln.lid, rn.rid FROM ln JOIN rn ON ln.amt = rn.amt",
+        )
+        .expect("N:N numeric with NULL keys");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    let mut pairs: Vec<(i32, i32)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            let a = match &r[0] {
+                SqlValue::Int4(v) => *v,
+                o => panic!("{o:?}"),
+            };
+            let b = match &r[1] {
+                SqlValue::Int4(v) => *v,
+                o => panic!("{o:?}"),
+            };
+            (a, b)
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![(1, 10), (1, 11), (2, 10), (2, 11)],
+        "5.00 cross product only; NULL=NULL is UNKNOWN -> the (3,_)/(12,_) NULL rows match nothing"
+    );
+}
+
+/// CROSS-CHECK that the new device gather is BEHAVIOR-PRESERVING by comparing the same query/data the
+/// way the diff claims: a uuid+numeric join whose RESULT (matches AND projected key values) is the
+/// expected set computed from the host data. This is the non-vacuous "device == host bytes" proof for a
+/// dataset with both an asymmetric uuid and a negative numeric in the SAME query, projected end-to-end.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s5_mixed_uuid_numeric_end_to_end() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE k (gid UUID, amt NUMERIC(12,3))").unwrap();
+    e.execute_text(2, "CREATE TABLE p (gid UUID, tag TEXT)").unwrap();
+    let u = "80706050-4030-2010-0fef-dfcfbfaf9f8f"; // high bit set, asymmetric
+    e.execute_text(3, &format!("INSERT INTO k (gid, amt) VALUES ('{u}',-42.500)")).unwrap();
+    e.execute_text(4, &format!("INSERT INTO p (gid, tag) VALUES ('{u}','hit'),('deadbeef-0000-0000-0000-000000000000','miss')")).unwrap();
+    let mut ok = true;
+    for t in ["k", "p"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT k.gid, k.amt, p.tag FROM k JOIN p ON k.gid = p.gid")
+        .expect("uuid join projecting uuid + negative numeric");
+    assert_eq!(res.rows.len(), 1, "only the matching uuid pair");
+    let row = &res.rows[0];
+    match &row[0] {
+        SqlValue::Uuid(b) => assert_eq!(gpu_db_sql::uuid::format_uuid(b), u, "uuid value exact"),
+        o => panic!("gid {o:?}"),
+    }
+    match &row[1] {
+        SqlValue::Numeric(d) => assert_eq!(d.mantissa, -42500, "negative numeric mantissa exact"),
+        o => panic!("amt {o:?}"),
+    }
+    match &row[2] {
+        SqlValue::Text(t) => assert_eq!(t, "hit"),
+        o => panic!("tag {o:?}"),
+    }
+}

@@ -143,15 +143,24 @@ is optional; each line is struck through only when it runs on the device.
   dropped.
 
 ### Join (the original charter-audit finding)
-- [ ] **S5 — join NULL-key skip in the kernels (V1; the next slice, HAZARD-class).** `key_present`
-  (`engine_expr.rs:~2364`) reads `host_rows` for the NULL-key check → a validity-bitmap param on the
-  build/probe/emit kernels (`expr_proto.ptx`; 8 kernels: build/probe_i32, build/probe_text,
-  build/emit_i64_nn, build/emit_text_nn), NULL key skipped ON-DEVICE in the kernel (sentinel
-  `u64::MAX`=no-bitmap=byte-identical fast path). Per the standing NULL-in-kernel lesson
-  (`order-by-null-host-partition-debt`) the skip goes IN the kernel, NOT a host index filter.
-  **Fold in the key-VALUE gather:** `key_texts` (`~2315`) / `key_b128` (`~2329`) still read `host_rows` for
-  text/numeric/uuid KEY values — source them from the DEVICE payload (reuse the S7 `gather_col` infra;
-  `key_i64` already does). KERNEL change → HAZARD protocol (3× + concurrent, zero 700/716/717). Start FRESH.
+- [~] **S5 — join NULL-key handling on-device (V1).** Split into V1a (done) + V1b (next).
+  - [x] **V1a — text/numeric/uuid KEY values from the device payload.** DONE `610d5d38`, audited SHIP.
+    `key_texts`/`key_b128` (`engine_expr.rs`) projected the key VALUES from `host_rows`; now they project from
+    each relation's DEVICE payload (`project_text_rows_from_payload` / `project_i128_rows_from_payload` →
+    `to_le_bytes`), like the int path's `key_i64`. Behavior-preserving (the existing host NULL-key gate still
+    pre-filters NULL keys before the gather). No kernel change. Suite 265/0; 6 `audit_s5_*` tests adopted
+    (uuid byte-order exactness, numeric mantissa negatives/cross-32-bit, multi-way b128, N:N + NULL gate,
+    empty-`abs`) — fault-injection-proven non-vacuous. **After V1a the ONLY remaining join `host_rows` data
+    read is `key_present`.**
+  - [ ] **V1b — NULL-key skip IN the kernels (HAZARD-class, next).** `key_present` (`~2352`) reads
+    `host_rows` for the NULL check → an optional validity-bitmap param on the 8 build/probe/emit kernels
+    (`expr_proto.ptx`), NULL key skipped ON-DEVICE (sentinel `u64::MAX`=no-bitmap=byte-identical; mirrors the
+    grouped-agg null-skip idiom `~7619-7630`). Host: gather per-key validity from the device, pack a dense
+    bitmap, map `JOIN_NULL_ROW`→placeholder+validity0, delete the host `key_present` read + `acc_keep`/
+    `new_keep` filter, simplify OUTER remapping. Per the NULL-in-kernel lesson the skip goes IN the kernel,
+    NOT a host filter. **Sliced by path (each 2 kernels, HAZARD + audit):** V1b-1 int-unique (build/probe_i32)
+    · V1b-2 text/b128 (build/probe_text) · V1b-3 int N:N (build/emit_i64_nn) · V1b-4 text/b128 N:N
+    (build/emit_text_nn) + remove `key_present`. Host filter retained for not-yet-converted steps in transit.
 - [ ] **S6 — join pad-WHERE 3VL on-device (V2).** `predicate_truth_on_null_pad` host Kleene
   (`engine_expr.rs:108-153`) → evaluate the all-NULL pad via the device WHERE-3VL mask VM.
 - [x] **S7 — join result materialization on-device (V3 + values).** DONE `70758557`, audited SHIP. The
