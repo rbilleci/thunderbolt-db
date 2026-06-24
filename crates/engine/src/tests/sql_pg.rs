@@ -3295,3 +3295,451 @@ fn gpu_select_text_routes_arithmetic_predicate_to_general_expr_path() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
 }
+
+// ============================================================================================
+// S7/V3 INDEPENDENT ADVERSARIAL AUDIT (commit 70758557): join result materialization on-device.
+// Goal: break the device gather -- a MATCHED-row value-NULL emitting a placeholder, a pad emitting
+// row-0's value, a type-narrowing/tagging error, or a LIMIT/OFFSET window divergence.
+// ============================================================================================
+
+// Helper: pull the single (col 0) value of a one-row resident SELECT -- the "truth" produced by the
+// already-audited resident materialization path (S1), used as the expected value for the join gather.
+#[cfg(test)]
+fn audit_one_val(e: &Engine, sql: &str) -> SqlValue {
+    let r = e.execute_resident_expr_select_sql(sql).expect("reference select");
+    assert_eq!(r.rows.len(), 1, "reference select must return exactly one row: {sql}");
+    r.rows[0][0].clone()
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_matched_row_value_null_every_type() {
+    // HUNT #1: a MATCHED join row whose projected NON-KEY column is NULL must come back SqlValue::Null
+    // for EVERY nullable type -- not the device placeholder (0/""/0-mantissa/zero-uuid/false). The
+    // committed test only proves int4/text/numeric. Here: int2, int8, date, timestamp, uuid, bool,
+    // numeric@scale4. The join KEY (id) is non-null; every value column carries a NULL on the matched row.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
+    e.execute_text(
+        2,
+        "CREATE TABLE r (rid INT, s2 SMALLINT, s8 BIGINT, d DATE, ts TIMESTAMP, u UUID, b BOOLEAN, n4 NUMERIC(12,4))",
+    )
+    .unwrap();
+    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2)").unwrap();
+    // rid=1: every value column NULL. rid=2: every value column a distinctive NON-null value.
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid, s2, s8, d, ts, u, b, n4) VALUES \
+         (1, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         (2, -12345, 9000000000, '2024-03-14', '2024-03-14 13:37:00', \
+          'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', true, 1234.5678)",
+    )
+    .unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    // The non-null reference values (rid=2), from the audited resident path.
+    let v_s2 = audit_one_val(&e, "SELECT s2 FROM r WHERE rid = 2");
+    let v_s8 = audit_one_val(&e, "SELECT s8 FROM r WHERE rid = 2");
+    let v_d = audit_one_val(&e, "SELECT d FROM r WHERE rid = 2");
+    let v_ts = audit_one_val(&e, "SELECT ts FROM r WHERE rid = 2");
+    let v_u = audit_one_val(&e, "SELECT u FROM r WHERE rid = 2");
+    let v_b = audit_one_val(&e, "SELECT b FROM r WHERE rid = 2");
+    let v_n4 = audit_one_val(&e, "SELECT n4 FROM r WHERE rid = 2");
+    // sanity: the references are the real (non-Null) values and exercise the placeholder hazard.
+    assert_eq!(v_s2, SqlValue::Int2(-12345));
+    assert_eq!(v_b, SqlValue::Bool(true));
+    assert!(matches!(v_u, SqlValue::Uuid(_)));
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, r.s2, r.s8, r.d, r.ts, r.u, r.b, r.n4 \
+             FROM l JOIN r ON l.id = r.rid ORDER BY l.id",
+        )
+        .expect("inner join projecting every nullable type");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(
+        res.rows,
+        vec![
+            // rid=1 matched: EVERY value column is NULL (validity bitmap), NOT a placeholder.
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Null, // s2 (placeholder would be Int2(0))
+                SqlValue::Null, // s8 (placeholder Int8(0))
+                SqlValue::Null, // d  (placeholder Date(0))
+                SqlValue::Null, // ts (placeholder Timestamp(0))
+                SqlValue::Null, // u  (placeholder Uuid([0;16]))
+                SqlValue::Null, // b  (placeholder Bool(false))
+                SqlValue::Null, // n4 (placeholder Numeric(0))
+            ],
+            // rid=2 matched: every value column the exact non-null value (type-exact narrow/tag/bytes).
+            vec![SqlValue::Int4(2), v_s2, v_s8, v_d, v_ts, v_u, v_b, v_n4],
+        ],
+        "matched-row NULLs across all types must be SqlValue::Null, non-nulls type-exact"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
+    // HUNT #2 + #3: an OUTER pad must force NULL on a column that has NO validity bitmap (non-nullable),
+    // independent of validity -- AND must not leak row-0's value (pads use placeholder index 0). Row 0 of
+    // the padded relation holds DISTINCTIVE values for every type; the unmatched left rows must be NULL.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
+    // r has NO nullable columns (none of these ever hold a NULL -> no validity bitmap is built).
+    e.execute_text(
+        2,
+        "CREATE TABLE r (rid INT, s2 SMALLINT, s8 BIGINT, d DATE, ts TIMESTAMP, u UUID, b BOOLEAN, n NUMERIC(10,2), name TEXT)",
+    )
+    .unwrap();
+    // l has id 1,2,3. r has rid=1 (ROW 0, distinctive) and rid=2. id=3 is UNMATCHED -> a pad over r.
+    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2),(3)").unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid, s2, s8, d, ts, u, b, n, name) VALUES \
+         (1, 777, 123456789012, '2030-12-31', '2030-12-31 23:59:59', \
+          '11111111-2222-3333-4444-555555555555', true, 42.42, 'ROW0'), \
+         (2, 1, 1, '2000-01-01', '2000-01-01 00:00:00', \
+          '00000000-0000-0000-0000-000000000001', false, 1.00, 'row2')",
+    )
+    .unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, r.s2, r.s8, r.d, r.ts, r.u, r.b, r.n, r.name \
+             FROM l LEFT JOIN r ON l.id = r.rid ORDER BY l.id",
+        )
+        .expect("left outer join, pad over a fully non-nullable relation");
+    assert_eq!(res.rows.len(), 3);
+    // id=3 row: every r column is a pad -> must be NULL, NOT row-0's distinctive value (777/'ROW0'/...).
+    let pad_row = &res.rows[2];
+    assert_eq!(pad_row[0], SqlValue::Int4(3), "left id survives");
+    for (c, v) in pad_row.iter().enumerate().skip(1) {
+        assert_eq!(
+            *v,
+            SqlValue::Null,
+            "padded non-nullable column {c} must be NULL, not row-0's value (placeholder-0 leak)"
+        );
+    }
+    // And the matched id=1 row really carries row-0's distinctive values (proves the gather isn't dead).
+    assert_eq!(res.rows[0][1], SqlValue::Int2(777), "matched id=1 gets row-0 s2");
+    assert_eq!(res.rows[0][8], SqlValue::Text("ROW0".to_string()), "matched id=1 gets row-0 name");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_empty_padded_side_right_full() {
+    // HUNT #3: a relation whose row_count==0 appears as a PADDED side (RIGHT/FULL with an empty side).
+    // gather_col must early-return all-NULL (no device read at index 0 into an empty payload) -- no panic.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b')").unwrap();
+    // r is EMPTY.
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    // LEFT JOIN with empty right -> both left rows survive, r columns NULL.
+    let left = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, l.name, r.w FROM l LEFT JOIN r ON l.id = r.rid ORDER BY l.id",
+        )
+        .expect("left join over an empty right relation");
+    assert_eq!(
+        left.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Text("a".to_string()), SqlValue::Null],
+            vec![SqlValue::Int4(2), SqlValue::Text("b".to_string()), SqlValue::Null],
+        ],
+        "empty padded side -> r.w all NULL, no panic/OOB"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_limit_offset_no_orderby_matches_join_order() {
+    // HUNT #5: LIMIT/OFFSET WITHOUT ORDER BY must window the join result in JOIN ORDER (identity perm),
+    // exactly as the old drain/truncate did. We make the join order deterministic (unique 1:1 keys, build
+    // on the unique side) and verify the windowed slice is a contiguous slice of the full result.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, score INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid, score) VALUES (1,10),(2,20),(3,30),(4,40),(5,50)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let full = e
+        .execute_resident_expr_select_sql("SELECT l.name FROM l JOIN r ON l.id = r.rid")
+        .expect("full join, no window");
+    let full_names: Vec<SqlValue> = full.rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(full_names.len(), 5);
+    // OFFSET 1 LIMIT 2 (no ORDER BY) -> the contiguous slice [1..3) of the join order.
+    let win = e
+        .execute_resident_expr_select_sql("SELECT l.name FROM l JOIN r ON l.id = r.rid LIMIT 2 OFFSET 1")
+        .expect("windowed join, no order by");
+    let win_names: Vec<SqlValue> = win.rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        win_names,
+        full_names[1..3].to_vec(),
+        "LIMIT 2 OFFSET 1 with no ORDER BY must equal the contiguous join-order slice"
+    );
+    // OFFSET only (no LIMIT) -> the tail [2..].
+    let tail = e
+        .execute_resident_expr_select_sql("SELECT l.name FROM l JOIN r ON l.id = r.rid OFFSET 2")
+        .expect("offset-only join");
+    let tail_names: Vec<SqlValue> = tail.rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(tail_names, full_names[2..].to_vec(), "OFFSET 2, no LIMIT -> tail in join order");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_empty_result_no_matches() {
+    // HUNT #9: no matches -> work_n == 0 -> the gather returns empty, transpose -> 0 rows, no panic.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))").unwrap();
+    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (100, 1.00),(200, 2.00)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, l.name, r.w FROM l JOIN r ON l.id = r.rid ORDER BY l.id",
+        )
+        .expect("inner join with no matches");
+    assert!(res.rows.is_empty(), "no matches -> empty result, no panic");
+    // also with a window applied on top of empty.
+    let res2 = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id FROM l JOIN r ON l.id = r.rid LIMIT 5 OFFSET 0",
+        )
+        .expect("inner join no matches + window");
+    assert!(res2.rows.is_empty());
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_nn_and_multiway_gather_right_rows() {
+    // HUNT #8: N:N many-to-many + a 3-way chain. The carried index vectors must gather the RIGHT rows
+    // from each side's device payload (text + numeric + null values), not misaligned values.
+    let mut e = Engine::new_local();
+    // N:N on an int key: l has key 1 twice, r has key 1 twice -> 4 result rows, each a distinct (l,r) pair.
+    e.execute_text(1, "CREATE TABLE l (k INT, lv TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (k INT, rv NUMERIC(10,2))").unwrap();
+    e.execute_text(3, "INSERT INTO l (k, lv) VALUES (1,'x'),(1,'y')").unwrap();
+    e.execute_text(4, "INSERT INTO r (k, rv) VALUES (1, 1.10),(1, NULL)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let nn = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.lv, r.rv FROM l JOIN r ON l.k = r.k ORDER BY l.lv, r.rv",
+        )
+        .expect("N:N int join");
+    // 4 pairs: (x,1.10),(x,NULL),(y,1.10),(y,NULL). r.rv NULL must be Null from the validity bitmap.
+    // ORDER BY r.rv places NULL last (ASC PG default). So per lv: [1.10, NULL].
+    assert_eq!(
+        nn.rows,
+        vec![
+            vec![SqlValue::Text("x".to_string()), SqlValue::Numeric(Decimal128::new(110, 2))],
+            vec![SqlValue::Text("x".to_string()), SqlValue::Null],
+            vec![SqlValue::Text("y".to_string()), SqlValue::Numeric(Decimal128::new(110, 2))],
+            vec![SqlValue::Text("y".to_string()), SqlValue::Null],
+        ],
+        "N:N gather: each (l,r) pair's text+numeric (incl. a NULL numeric value) is correct"
+    );
+    // 3-way chain a JOIN b JOIN c. Carried indices into 3 payloads.
+    e.execute_text(10, "CREATE TABLE a (aid INT, an TEXT)").unwrap();
+    e.execute_text(11, "CREATE TABLE b (bid INT, bref INT, bn TEXT)").unwrap();
+    e.execute_text(12, "CREATE TABLE c (cid INT, cn TEXT)").unwrap();
+    e.execute_text(13, "INSERT INTO a (aid, an) VALUES (1,'a1'),(2,'a2')").unwrap();
+    e.execute_text(14, "INSERT INTO b (bid, bref, bn) VALUES (1,1,'b1'),(2,2,'b2')").unwrap();
+    e.execute_text(15, "INSERT INTO c (cid, cn) VALUES (1,'c1'),(2,'c2')").unwrap();
+    for t in ["a", "b", "c"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let threeway = e
+        .execute_resident_expr_select_sql(
+            "SELECT a.an, b.bn, c.cn FROM a JOIN b ON a.aid = b.bref JOIN c ON b.bid = c.cid ORDER BY a.an",
+        )
+        .expect("3-way chain join");
+    assert_eq!(
+        threeway.rows,
+        vec![
+            vec![
+                SqlValue::Text("a1".to_string()),
+                SqlValue::Text("b1".to_string()),
+                SqlValue::Text("c1".to_string())
+            ],
+            vec![
+                SqlValue::Text("a2".to_string()),
+                SqlValue::Text("b2".to_string()),
+                SqlValue::Text("c2".to_string())
+            ],
+        ],
+        "3-way chain: each side's text gathered from its own payload at the carried row"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_using_natural_and_star_gather() {
+    // HUNT #7: USING coalesced column (mapped to rel 0) + bare `*` gather correctly.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, lname TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (id INT, rscore INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id, lname) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(4, "INSERT INTO r (id, rscore) VALUES (1,10),(2,20)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    // USING (id): the coalesced id from rel0, then l.lname, then r.rscore.
+    let star = e
+        .execute_resident_expr_select_sql("SELECT * FROM l JOIN r USING (id) ORDER BY id")
+        .expect("USING join star");
+    assert_eq!(
+        star.rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Text("a".to_string()), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(2), SqlValue::Text("b".to_string()), SqlValue::Int4(20)],
+        ],
+        "USING star: coalesced id (rel0) + l.lname + r.rscore gathered from device"
+    );
+    // unqualified id reference resolves to the left copy.
+    let bare = e
+        .execute_resident_expr_select_sql("SELECT id, lname, rscore FROM l JOIN r USING (id) ORDER BY id")
+        .expect("USING explicit columns");
+    assert_eq!(bare.rows, star.rows, "explicit list equals star for USING");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_nonvacuity_placeholder_would_leak_without_override() {
+    // NON-VACUITY PROOF: the device DOES store a 0/false/""/zero placeholder for a NULL cell. This test
+    // asserts the placeholder values directly via a deliberately-WRONG expectation -- it MUST PANIC,
+    // proving the SqlValue::Null in the real test is the validity override doing real work (not that the
+    // device happens to be empty/absent). If this test ever PASSES, the placeholder is leaking == bug.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, b BOOLEAN, name TEXT, s2 SMALLINT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id) VALUES (1)").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid, b, name, s2) VALUES (1, NULL, NULL, NULL)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT r.b, r.name, r.s2 FROM l JOIN r ON l.id = r.rid")
+        .expect("join");
+    let row = &res.rows[0];
+    // The CORRECT result is all-Null. The placeholder (the WRONG result) would be Bool(false)/Text("")/Int2(0).
+    let placeholder = vec![SqlValue::Bool(false), SqlValue::Text(String::new()), SqlValue::Int2(0)];
+    let result = std::panic::catch_unwind(|| {
+        assert_eq!(*row, placeholder, "if this matched, the placeholder LEAKED");
+    });
+    assert!(
+        result.is_err(),
+        "NON-VACUITY: the result must NOT equal the device placeholder (got {row:?}) -- \
+         the validity override is load-bearing"
+    );
+    // Belt-and-suspenders: it IS all-Null.
+    assert_eq!(*row, vec![SqlValue::Null, SqlValue::Null, SqlValue::Null]);
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_join_order_by_nullable_value_with_window() {
+    // HUNT #5 + #1 cross: ORDER BY a device-gathered NULLABLE value column on the join, then window it.
+    // The gathered NULL must (a) render Null and (b) sort to PG default (NULLs last ASC), and the window
+    // must slice the SORTED order (not join order). A divergence would silently reorder/mis-window.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2),(3),(4)").unwrap();
+    // w values: 30, NULL, 10, 20 -> sorted ASC: 10(id3),20(id4),30(id1),NULL(id2).
+    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (1,30),(2,NULL),(3,10),(4,20)").unwrap();
+    let mut ok = true;
+    for t in ["l", "r"] {
+        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+    }
+    if !ok {
+        return;
+    }
+    let sorted = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, r.w FROM l JOIN r ON l.id = r.rid ORDER BY r.w",
+        )
+        .expect("order by nullable value");
+    assert_eq!(
+        sorted.rows,
+        vec![
+            vec![SqlValue::Int4(3), SqlValue::Int4(10)],
+            vec![SqlValue::Int4(4), SqlValue::Int4(20)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(30)],
+            vec![SqlValue::Int4(2), SqlValue::Null], // NULL last (ASC default)
+        ],
+        "ORDER BY r.w ASC: NULL sorts last, value device-gathered"
+    );
+    // Window the sorted order: OFFSET 1 LIMIT 2 -> rows [20(id4), 30(id1)].
+    let win = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, r.w FROM l JOIN r ON l.id = r.rid ORDER BY r.w LIMIT 2 OFFSET 1",
+        )
+        .expect("order by + window");
+    assert_eq!(
+        win.rows,
+        vec![
+            vec![SqlValue::Int4(4), SqlValue::Int4(20)],
+            vec![SqlValue::Int4(1), SqlValue::Int4(30)],
+        ],
+        "window slices the SORTED order, not join order"
+    );
+    // NULLS FIRST explicitly: NULL should now be the first row; window OFFSET 0 LIMIT 1 -> the NULL row.
+    let nf = e
+        .execute_resident_expr_select_sql(
+            "SELECT l.id, r.w FROM l JOIN r ON l.id = r.rid ORDER BY r.w NULLS FIRST LIMIT 1",
+        )
+        .expect("nulls first + limit 1");
+    assert_eq!(
+        nf.rows,
+        vec![vec![SqlValue::Int4(2), SqlValue::Null]],
+        "NULLS FIRST + LIMIT 1 -> the NULL row first"
+    );
+}

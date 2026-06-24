@@ -143,19 +143,31 @@ is optional; each line is struck through only when it runs on the device.
   dropped.
 
 ### Join (the original charter-audit finding)
-- [ ] **S5 — join NULL-key skip in the kernels (V1).** `key_present` reads `host_rows`
-  (`engine_expr.rs:2291-2313`) → validity-bitmap param on the build/probe/emit kernels
-  (`expr_proto.ptx`), NULL key skipped on-device (sentinel `u64::MAX`=no-bitmap=byte-identical).
-  Covers int / text+b128 / N:N variants.
+- [ ] **S5 — join NULL-key skip in the kernels (V1; the next slice, HAZARD-class).** `key_present`
+  (`engine_expr.rs:~2364`) reads `host_rows` for the NULL-key check → a validity-bitmap param on the
+  build/probe/emit kernels (`expr_proto.ptx`; 8 kernels: build/probe_i32, build/probe_text,
+  build/emit_i64_nn, build/emit_text_nn), NULL key skipped ON-DEVICE in the kernel (sentinel
+  `u64::MAX`=no-bitmap=byte-identical fast path). Per the standing NULL-in-kernel lesson
+  (`order-by-null-host-partition-debt`) the skip goes IN the kernel, NOT a host index filter.
+  **Fold in the key-VALUE gather:** `key_texts` (`~2315`) / `key_b128` (`~2329`) still read `host_rows` for
+  text/numeric/uuid KEY values — source them from the DEVICE payload (reuse the S7 `gather_col` infra;
+  `key_i64` already does). KERNEL change → HAZARD protocol (3× + concurrent, zero 700/716/717). Start FRESH.
 - [ ] **S6 — join pad-WHERE 3VL on-device (V2).** `predicate_truth_on_null_pad` host Kleene
   (`engine_expr.rs:108-153`) → evaluate the all-NULL pad via the device WHERE-3VL mask VM.
-- [ ] **S7 — join result materialization on-device (V3 + values).** Final gather reads
-  `host_rows` for all columns incl. NULL emission (`engine_expr.rs:2453-2470`) → gather columns
-  (incl. text) from each relation's device payload by the carried index vectors; NULL from a
-  device validity bit; `JOIN_NULL_ROW` pad → validity 0. **Also fold in the join LIMIT/OFFSET here**
-  (the `result_rows.drain/truncate` after the join sort, ~`engine_expr.rs:2582`): window the carried index
-  vectors to `[OFFSET, OFFSET+LIMIT)` before the device gather, mirroring S4's resident-SELECT windowing —
-  do NOT leave a host `drain/truncate` on the join result.
+- [x] **S7 — join result materialization on-device (V3 + values).** DONE `70758557`, audited SHIP. The
+  final gather no longer reads `host_rows`: a `gather_col` closure projects each result column's VALUES from
+  its relation's DEVICE payload (`sides[ri]`) at the carried rows via the per-type
+  `project_*_rows_from_payload` matrix (mirrors resident SELECT S1), column-major then transposed. A
+  `JOIN_NULL_ROW` pad → `SqlValue::Null` (placeholder index 0, overridden); a matched row whose value is NULL
+  → Null via the column's device validity bitmap; a `row_count==0` side → all-NULL (no device read). The join
+  LIMIT/OFFSET is folded in: ORDER BY + OFFSET/LIMIT now WINDOW the device sort permutation
+  (`gpu_sort_permutation`) and gather only the window (no host `drain/truncate`); dead `gpu_sort_result_rows`
+  deleted. No kernel change. Suite 259/0. **Independent adversarial audit: SHIP** — 9 `audit_join_*` tests
+  adopted (every nullable type emits Null on a MATCHED row incl. a non-vacuity placeholder-leak proof; OUTER
+  pad forces NULL on non-nullable columns of all types; empty padded side; N:N + multiway; USING/NATURAL +
+  `*`; ORDER BY a nullable value + window; LIMIT-without-ORDER-BY = join order). **Remaining join `host_rows`
+  reads, NOT in S7:** `key_present` NULL check (V1/S5) + `key_texts`/`key_b128` key-VALUE gather (fold into
+  V1: source keys from the device payload, like `key_i64` already does).
 
 ### Resident-probe fallback branches
 - [ ] **S8 — `!gpu_ordered` host finalization in resident-probe.** Host sort/HAVING/LIMIT
@@ -172,8 +184,10 @@ is optional; each line is struck through only when it runs on the device.
 ## 5. Sequencing
 
 S1 ✅ → **S2 (keystone, the big one)** ✅ → S3 ✅ → S4 ✅ (result-stage operators; small, mechanical) →
-S5 → S6 → S7 (join; **incl. the join LIMIT/OFFSET window**) → S8 (probe fallback) → S9 (GPU-native oracles)
-→ S10 (delete host path).
+S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 (V1, NULL-key skip + key-value
+gather, the HAZARD-class kernel slice — NEXT)** → S6 (V2, pad-WHERE 3VL) → S8 (probe fallback) →
+S9 (GPU-native oracles) → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
+no-kernel first, then the kernel work fresh.)_
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2
 is the keystone and unblocks the most queries.
 
