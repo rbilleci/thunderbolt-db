@@ -168,9 +168,18 @@ is optional; each line is struck through only when it runs on the device.
     (build-only / probe-only skip + negative control, in a throwaway worktree). **WIRE-LAYOUT CONTRACT (audit
     validated):** the host packs the dense validity bitmap as LSB-first u32 words — `word[i>>5] bit (i&31)`,
     set 1=valid, i.e. clear a NULL via `host[i/32] &= !(1u32 << (i%32))` — to match the kernel's `bfe` read.
-    NEXT plumb:
-    int N:N (`build/emit_i64_nn`) · text/b128 (`build/probe_text`) · text/b128 N:N (`build/emit_text_nn`) →
-    then the single WIRE slice (device validity gather + dense bitmaps + delete `key_present` + simplify OUTER).
+    int N:N (`build/emit_i64_nn`) DONE `4084b32d` + text/b128 (`build/probe_text`) & text/b128 N:N
+    (`build/emit_text_nn`) DONE `32d774dd` — both byte-identical, HAZARD passed (35 join 3×+2× conc, zero
+    faults), 265/0; **combined 6-kernel audit SHIP** (byte-identical proven two ways incl. an 800×800 multi-block
+    scale test vs parent; per-kernel register safety incl. the `%vsent`-vs-`%end` separation; launcher arg
+    counts recounted; HAZARD clean on `atom.cas.b128`). **ALL 8 hash-join kernels are now PLUMBED + audited**
+    (validity param + dormant skip, sentinel passed; byte-identical). **NEXT = the single WIRE slice:** in `execute_resident_expr_inner_join`
+    gather per-key validity from the device payload (`project_bool` at the key column's null offset, ANDed
+    across composite members), pack dense LSB-first u32 bitmaps, pass real bitmaps to the kernels through the
+    `hash_join`/`text_hash_join` closures (swap with build/probe like the keys), map carried `JOIN_NULL_ROW`
+    → validity 0, DELETE the host `key_present` `host_rows` read + the `acc_keep`/`new_keep` filter, and
+    simplify the OUTER remapping (kernel-skipped NULL keys fall through as unmatched → padded). HAZARD + a
+    COMPREHENSIVE adversarial audit (this activates the skip + removes the last join `host_rows` data read).
 - [ ] **S6 — join pad-WHERE 3VL on-device (V2).** `predicate_truth_on_null_pad` host Kleene
   (`engine_expr.rs:108-153`) → evaluate the all-NULL pad via the device WHERE-3VL mask VM.
 - [x] **S7 — join result materialization on-device (V3 + values).** DONE `70758557`, audited SHIP. The
