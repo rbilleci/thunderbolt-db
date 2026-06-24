@@ -103,9 +103,13 @@ is optional; each line is struck through only when it runs on the device.
   HAVING touches numeric (else `Int8`), so the whole predicate is one width. The 3rd audit then caught a
   SILENT WRONG ANSWER over **AVG** (per-group Numeric scales; the payload stores only mantissas at one column
   scale) → the **scale-normalization fix `b88b0133`** normalizes each numeric column to the MAX scale across
-  its values (rescale up is exact). **THREE audit-caught regressions, ALL fixed (type skew / width / scale —
-  the three numeric-representation dimensions); suite 237/0; 4th audit running.** Tests
-  `gpu_grouped_having_{sum_and_dnf,numeric_int_mixed_dnf,avg_heterogeneous_scale}_*` reproduce all three.
+  its values (rescale up is exact). The 4th audit caught a clean-error regression: a HIGH-SCALE numeric leaf
+  (AVG, or SUM/MIN/MAX over a scale≥10 numeric) INSIDE an AND/OR DNF hit the i32 `CompareScalar` needle in
+  the SHARED `compile_numeric_compare` → the **i128-needle fix `ce73a74a`** emits `CompareScalarI128` (full
+  mantissa) since the numeric program runs at elem I128 — also fixing a latent WHERE high-scale-numeric bug.
+  **FOUR audit-caught regressions, ALL fixed (type skew / width / scale / i32-literal-cap); suite 237/0; 5th
+  audit running.** Tests `gpu_grouped_having_{sum_and_dnf,numeric_int_mixed_dnf,avg_heterogeneous_scale}_*`
+  (the last incl. high-scale AVG-in-DNF) reproduce all four.
   **NARROW OPEN GAP (S3.1):** timestamp/uuid HAVING CONSTANT clean-errors (parser-unreachable). **LESSON: the
   audit gate caught all THREE regressions before merge — rushing produced them, the rigor stopped them;
   uniform-width+uniform-scale promotion is the load-bearing idea for a single-width/single-scale predicate VM;
