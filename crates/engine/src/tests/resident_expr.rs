@@ -5902,6 +5902,50 @@ fn gpu_grouped_having_and_combined() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_grouped_having_sum_and_dnf_runs_on_gpu() {
+    // Regression coverage (audit-found): a HAVING over a SUM(int4) result -- DECLARED Int4 but VALUED
+    // Int8 -- and a DNF mixing an int4 group key with an int8 COUNT must RUN on the GPU, not error.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g, v) VALUES \
+         (1,10),(1,20),(1,30), (2,15), (3,5),(3,10), (4,20),(4,30),(4,40),(4,9), (5,99)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // groups (default order by g): g1 count3 sum60, g2 count1 sum15, g3 count2 sum15, g4 count4 sum99,
+    // g5 count1 sum99.
+    let rv = |g: i32, x: i64| vec![SqlValue::Int4(g), SqlValue::Int8(x)];
+
+    // HAVING over a SUM(int4) result (the P0 the first attempt regressed) -> g1, g4, g5.
+    let a = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) > 15")
+        .unwrap();
+    assert_eq!(a.rows, vec![rv(1, 60), rv(4, 99), rv(5, 99)], "HAVING SUM(int4) > 15");
+
+    // DNF mixing an int4 key AND an int8 COUNT (the mixed-width case) -> g3, g4.
+    let b = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING g >= 2 AND COUNT(*) > 1",
+        )
+        .unwrap();
+    assert_eq!(b.rows, vec![rv(3, 2), rv(4, 4)], "HAVING int4-key AND int8-count");
+
+    // DNF mixing an int4 key OR an int8 COUNT -> g1, g4.
+    let c = e
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING g = 1 OR COUNT(*) >= 3",
+        )
+        .unwrap();
+    assert_eq!(c.rows, vec![rv(1, 3), rv(4, 4)], "HAVING int4-key OR int8-count");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_grouped_duplicate_aggregate_name_is_ambiguous() {
     // Two same-function aggregates share a result-column name ("sum"); referencing it in ORDER BY or
     // HAVING is ambiguous (PG: "column reference ... is ambiguous") -> error, not silent first-match.

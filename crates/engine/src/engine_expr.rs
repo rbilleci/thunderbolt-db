@@ -221,6 +221,44 @@ impl JoinDeviceMemory {
 /// columns (`build_relational_device_payload`) that the hetero comparator reads on-device. `col_types[i]`
 /// is result column `i`'s type. A no-op for <=1 row or empty `order`. `device_memory` supplies the CUDA
 /// context. SHARED by the grouped result + the join result (both gather host rows then sort them on-device).
+/// Map a HAVING/result-filter comparison operator to the resident-predicate IR operator.
+fn having_op_to_resident(op: crate::SelectFilterOp) -> ResidentBinaryOp {
+    use crate::SelectFilterOp;
+    match op {
+        SelectFilterOp::Eq => ResidentBinaryOp::Eq,
+        SelectFilterOp::Lt => ResidentBinaryOp::Lt,
+        SelectFilterOp::Lte => ResidentBinaryOp::Le,
+        SelectFilterOp::Gt => ResidentBinaryOp::Gt,
+        SelectFilterOp::Gte => ResidentBinaryOp::Ge,
+        SelectFilterOp::LikePrefix => ResidentBinaryOp::Like,
+    }
+}
+
+/// A HAVING comparison constant (`SqlValue`) as a resident-predicate literal node, so the HAVING DNF can
+/// be evaluated by the SAME device predicate VM as WHERE. Int2/Int4/Date and a small Int8 (COUNT/SUM
+/// results, group keys) ride the i32 literal (the int8 compare path sign-extends it -- the HAVING
+/// transient promotes every integer-family column to Int8, so the predicate is a single i64 width); a
+/// large Int8 / Numeric ride the numeric literal; text/bool direct. (A Timestamp/Uuid HAVING constant
+/// needs an i64/uuid literal node in the predicate IR -- a narrow follow-up; no general-path test hits it.)
+fn having_value_to_resident_literal(value: &SqlValue) -> Result<ResidentExpr, ExecuteError> {
+    Ok(match value {
+        SqlValue::Int4(v) | SqlValue::Date(v) => ResidentExpr::Int4Literal(*v),
+        SqlValue::Int2(v) => ResidentExpr::Int4Literal(i32::from(*v)),
+        SqlValue::Int8(v) => match i32::try_from(*v) {
+            Ok(small) => ResidentExpr::Int4Literal(small),
+            Err(_) => ResidentExpr::NumericLiteral(Decimal128::new(i128::from(*v), 0)),
+        },
+        SqlValue::Numeric(d) => ResidentExpr::NumericLiteral(*d),
+        SqlValue::Text(s) => ResidentExpr::TextLiteral(s.clone()),
+        SqlValue::Bool(b) => ResidentExpr::BoolLiteral(*b),
+        other => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "HAVING comparison against a {other:?} constant is not yet on the GPU predicate path"
+            ))));
+        }
+    })
+}
+
 /// The ON-DEVICE sort PERMUTATION for `rows` by `order` ((result-column index, descending)) -- the index
 /// vector `perm` such that `rows[perm[0]], rows[perm[1]], ...` is sorted. Used by `gpu_sort_result_rows`
 /// (final result order) AND by the GROUP BY multi-pass alignment (S2.3) to reorder per-pass group arrays
@@ -4389,26 +4427,120 @@ impl Engine {
                 }
                 Ok(first)
             };
-            if !select.having_groups.is_empty() {
-                // Pre-resolve each filter's result-column index (fail fast on an unknown name); then
-                // keep a row iff ANY OR-group's ANDed comparisons all hold.
-                let resolved = select
-                    .having_groups
+            if !select.having_groups.is_empty() && !rows.is_empty() {
+                // HAVING on the GPU (charter: no host relational filter). Build a TRANSIENT device relation
+                // from the grouped result and evaluate the HAVING DNF via the SAME device predicate VM as
+                // WHERE. Two corrections vs. the catalog types: (1) a `SUM(int*)` result is DECLARED Int4 but
+                // VALUED Int8 -- the declared type would mis-route it into the int4 payload section; (2) the
+                // device predicate VM evaluates ONE program at ONE width, but HAVING mixes an int4 group key
+                // with an int8 COUNT. Both are fixed by PROMOTING every integer-family column (and value) to
+                // Int8, so the result columns the predicate touches are a single i64 width.
+                let n_cols = bound.selected_columns.len();
+                let promote_int: Vec<bool> = (0..n_cols)
+                    .map(|c| {
+                        rows.iter().any(|r| {
+                            matches!(
+                                r[c],
+                                SqlValue::Int2(_)
+                                    | SqlValue::Int4(_)
+                                    | SqlValue::Int8(_)
+                                    | SqlValue::Date(_)
+                                    | SqlValue::Timestamp(_)
+                            )
+                        })
+                    })
+                    .collect();
+                let having_columns: Vec<RelationalColumn> = bound
+                    .selected_columns
                     .iter()
-                    .map(|group| {
-                        group
-                            .iter()
-                            .map(|f| col_index(&f.column).map(|idx| (idx, f)))
-                            .collect::<Result<Vec<_>, ExecuteError>>()
+                    .enumerate()
+                    .map(|(c, col)| {
+                        let mut col = col.clone();
+                        if promote_int[c] {
+                            col.ty = SqlType::Int8;
+                        }
+                        col
                     })
-                    .collect::<Result<Vec<_>, ExecuteError>>()?;
-                rows.retain(|row| {
-                    resolved.iter().any(|group| {
-                        group
-                            .iter()
-                            .all(|(idx, f)| select_filter_matches(&row[*idx], f.op, &f.value))
+                    .collect();
+                let having_rows: Vec<Vec<SqlValue>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.iter()
+                            .enumerate()
+                            .map(|(c, v)| {
+                                if promote_int[c] {
+                                    match v {
+                                        SqlValue::Int2(x) => SqlValue::Int8(i64::from(*x)),
+                                        SqlValue::Int4(x) | SqlValue::Date(x) => {
+                                            SqlValue::Int8(i64::from(*x))
+                                        }
+                                        SqlValue::Int8(x) | SqlValue::Timestamp(x) => {
+                                            SqlValue::Int8(*x)
+                                        }
+                                        other => other.clone(),
+                                    }
+                                } else {
+                                    v.clone()
+                                }
+                            })
+                            .collect()
                     })
-                });
+                    .collect();
+                // DNF -> ResidentExpr: each filter -> `Column(idx) <op> literal`; AND within a group, OR
+                // across groups. col_index still validates each referenced name (unknown / ambiguous).
+                let mut dnf: Option<ResidentExpr> = None;
+                for group in &select.having_groups {
+                    let mut conj: Option<ResidentExpr> = None;
+                    for f in group {
+                        let leaf = ResidentExpr::Binary {
+                            op: having_op_to_resident(f.op),
+                            lhs: Box::new(ResidentExpr::Column(col_index(&f.column)?)),
+                            rhs: Box::new(having_value_to_resident_literal(&f.value)?),
+                        };
+                        conj = Some(match conj {
+                            None => leaf,
+                            Some(prev) => ResidentExpr::Binary {
+                                op: ResidentBinaryOp::And,
+                                lhs: Box::new(prev),
+                                rhs: Box::new(leaf),
+                            },
+                        });
+                    }
+                    if let Some(c) = conj {
+                        dnf = Some(match dnf {
+                            None => c,
+                            Some(prev) => ResidentExpr::Binary {
+                                op: ResidentBinaryOp::Or,
+                                lhs: Box::new(prev),
+                                rhs: Box::new(c),
+                            },
+                        });
+                    }
+                }
+                if let Some(predicate) = dnf {
+                    let having_table = RelationalTable {
+                        schema: table.schema.clone(),
+                        name: table.name.clone(),
+                        oid: table.oid,
+                        columns: having_columns,
+                        indexes: Vec::new(),
+                        check_constraints: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        acl: std::collections::BTreeMap::new(),
+                    };
+                    let (h_snapshot, h_memory) =
+                        self.build_transient_relation_residency(&having_table, &having_rows)?;
+                    let survivors = self.lower_resident_predicate(
+                        &predicate,
+                        &having_table,
+                        &h_snapshot,
+                        &h_memory,
+                        having_rows.len() as u64,
+                    )?;
+                    let kept: Vec<Vec<SqlValue>> =
+                        survivors.iter().map(|&i| rows[i as usize].clone()).collect();
+                    rows = kept;
+                }
             }
             // The grouped result is ordered ON THE GPU (charter: every relational sort is a GPU sort, no
             // host-side finalization) -- both the explicit ORDER BY and, in its absence, the deterministic
