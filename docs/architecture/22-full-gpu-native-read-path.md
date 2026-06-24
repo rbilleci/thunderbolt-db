@@ -192,8 +192,21 @@ is optional; each line is struck through only when it runs on the device.
     `02ab08e7`) — non-vacuity fault-injection-proven (skip disabled ⇒ all 10 tests fail with the exact
     spurious matches; polarity inversion confirmed load-bearing), PTX `%vsent`-vs-`%end` register-safe in both
     N:N emit kernels, charter-clean. All 9 adopted tests re-verified non-vacuous locally (fail skip-disabled).
-- [ ] **S6 — join pad-WHERE 3VL on-device (V2).** `predicate_truth_on_null_pad` host Kleene
-  (`engine_expr.rs:108-153`) → evaluate the all-NULL pad via the device WHERE-3VL mask VM.
+- [x] **S6 — join pad-WHERE 3VL on-device (V2). DONE + audited SHIP `76315706` + 2 adopted `audit_s6_*` tests.** The host Kleene
+  `predicate_truth_on_null_pad` (+ `null_pad_and3`/`or3`) is DELETED. `predicate_holds_on_null_pad` builds a
+  1-row TRANSIENT relation whose every column is NULL and runs the predicate through the SAME GPU WHERE-3VL
+  mask VM (`lower_resident_predicate`); the pad survives iff row 0 survives (`col IS NULL` reads the 0
+  validity bit → TRUE = the anti-join; a comparison leaf AND'd with the all-zero validity mask → UNKNOWN →
+  drop; AND/OR fold via the VM's Kleene masks). No kernel change (reuses the WHERE VM). Behavior-equivalent
+  to the host Kleene, proven by a 9-case parent-vs-current probe (int4/int8/numeric/uuid simple+compound, IS
+  NULL, mixed): IDENTICAL OK/ERR — every ERR fails at the real-row survivor pass (or parse) BEFORE the pad
+  eval, so it cannot regress. Suite **276/0** (+2 S6 tests: pad-survives IS NULL / IS NULL OR cmp / IS NULL
+  AND IS NULL; pad-drops IS NOT NULL / cmp compound; numeric+text pad columns; FULL join). HAZARD 42
+  join/outer 3×seq + 2×conc, zero 700/716/717. **This was the last host NULL/3VL evaluation in the join.**
+  **Independent adversarial audit: SHIP** — 62-shape parent-vs-current differential test (byte-identical,
+  zero divergence), non-vacuity proven (sabotaging the pad eval to `Ok(false)`/`Ok(true)` drops/keeps the
+  anti-join rows), charter-clean + no new kernel. 2 `audit_s6_*` tests adopted (real-NULL-matched-row mixed
+  with the synthetic pad + N-way carried JOIN_NULL_ROW; the Kleene corner folds on the all-NULL pad).
 - [x] **S7 — join result materialization on-device (V3 + values).** DONE `70758557`, audited SHIP. The
   final gather no longer reads `host_rows`: a `gather_col` closure projects each result column's VALUES from
   its relation's DEVICE payload (`sides[ri]`) at the carried rows via the per-type
@@ -226,7 +239,7 @@ is optional; each line is struck through only when it runs on the device.
 S1 ✅ → **S2 (keystone, the big one)** ✅ → S3 ✅ → S4 ✅ (result-stage operators; small, mechanical) →
 S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 V1a ✅ + V1b PLUMB ✅ + V1b WIRE
 ✅ `5724bf55` (audit running) — the HAZARD-class kernel slice; the last join `host_rows` data read is GONE**
-→ **S6 (V2, pad-WHERE 3VL) — NEXT** → S8 (probe fallback) →
+→ S6 ✅ (V2, pad-WHERE 3VL on-device `76315706`, audited SHIP) → **S8 (probe fallback) — NEXT** →
 S9 (GPU-native oracles) → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
 no-kernel first, then the kernel work fresh.)_
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2

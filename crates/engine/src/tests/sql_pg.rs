@@ -2048,6 +2048,128 @@ fn gpu_outer_join_pad_where_3vl_types_and_full_join_v2() {
     assert_eq!(names(&full), vec![Some("c".to_string())], "FULL join: the left-only pad survives IS NULL");
 }
 
+// ── S6/V2 adversarial regression net (adopted from the independent audit of `76315706`) ──────────────
+// Differential-grade (parent==child across 62 shapes) + non-vacuity-proven (sabotaging the pad eval to
+// Ok(false)/Ok(true) makes these fail with the predicted wrong rows). They isolate the subtle interaction
+// of a REAL NULL in the matched data with the synthetic all-NULL pad, an N-way OUTER carried JOIN_NULL_ROW,
+// and the Kleene corner folds on the pad.
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s6_outer_where_real_null_mixed_with_pad() {
+    // A real-NULL matched row AND the synthetic pad both satisfy `IS NULL` (the survivor pass evaluates the
+    // real NULL on-device; the pad eval evaluates the synthetic NULL on-device -- both must agree). An N-way
+    // OUTER then carries a JOIN_NULL_ROW into a SECOND pad.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)").unwrap();
+    e.execute_text(3, "CREATE TABLE s (sid INT, w INT, lbl TEXT)").unwrap();
+    e.execute_text(4, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(5, "INSERT INTO r (rid,x) VALUES (1,5),(2,NULL)").unwrap(); // r.x real NULL
+    e.execute_text(6, "INSERT INTO s (sid,w,lbl) VALUES (1,9,'x'),(2,9,'y')").unwrap();
+    for t in ["l", "r", "s"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let names = |res: &RelationalSelectResult| -> Vec<String> {
+        let mut v: Vec<String> = res
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("expected text, got {o:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let q = |e: &mut Engine, sql: &str| names(&e.execute_resident_expr_select_sql(sql).unwrap());
+    // real-NULL matched row (b) AND pad (c) both satisfy IS NULL.
+    assert_eq!(
+        q(&mut e, "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NULL"),
+        vec!["b".to_string(), "c".to_string()]
+    );
+    // only the real non-null matched row (a) survives IS NOT NULL; real-null b and pad c drop.
+    assert_eq!(
+        q(&mut e, "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NOT NULL"),
+        vec!["a".to_string()]
+    );
+    // IS NULL OR cmp: a via 5>3, b via IS NULL, c via IS NULL -> all three.
+    assert_eq!(
+        q(&mut e, "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NULL OR r.x > 3"),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+    // N-way: c's r-pad carries a JOIN_NULL_ROW into s -> s.lbl NULL only for c.
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT name FROM l LEFT JOIN r ON l.id=r.rid LEFT JOIN s ON r.rid=s.sid WHERE s.lbl IS NULL"
+        ),
+        vec!["c".to_string()]
+    );
+    assert_eq!(
+        q(
+            &mut e,
+            "SELECT name FROM l LEFT JOIN r ON l.id=r.rid LEFT JOIN s ON r.rid=s.sid WHERE s.w IS NOT NULL"
+        ),
+        vec!["a".to_string(), "b".to_string()]
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s6_pad_where_kleene_corners() {
+    // Kleene corners on the all-NULL pad (real data fully non-null so the survivor pass uses the
+    // non-nullable peephole -> the pad eval is the only 3VL difference). Each fold is checked against PG.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, xi INT, yi INT, fl BOOL, tag TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,xi,yi,fl,tag) VALUES (1,5,5,true,'p'),(2,200,50,false,'q')")
+        .unwrap();
+    for t in ["l", "r"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let q = |e: &mut Engine, whr: &str| -> Vec<String> {
+        let res = e
+            .execute_resident_expr_select_sql(&format!(
+                "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE {whr}"
+            ))
+            .unwrap();
+        let mut v: Vec<String> = res
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("expected text, got {o:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    // IS NULL(T) AND cmp(U) -> U -> pad drops; matched rows fail the cmp -> none.
+    assert!(q(&mut e, "r.xi IS NULL AND r.xi > 5").is_empty());
+    // IS NULL(T) OR cmp -> T -> pad survives (c); matched b via 200>5.
+    assert_eq!(q(&mut e, "r.xi IS NULL OR r.xi > 5"), vec!["b".to_string(), "c".to_string()]);
+    // IS NOT NULL(F) OR IS NULL(T) -> T -> all (a,b matched non-null; c pad).
+    assert_eq!(
+        q(&mut e, "r.xi IS NOT NULL OR r.yi IS NULL"),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+    // IS NOT NULL(F) AND IS NULL(T) -> F -> none.
+    assert!(q(&mut e, "r.xi IS NOT NULL AND r.yi IS NULL").is_empty());
+    // bool col on pad is UNKNOWN; `r.fl = false OR r.xi IS NULL` -> matched b (fl=false), pad c (IS NULL).
+    assert_eq!(q(&mut e, "r.fl = false OR r.xi IS NULL"), vec!["b".to_string(), "c".to_string()]);
+    // (IS NOT NULL AND cmp) OR IS NULL -> (F)OR(T) on pad -> survive c; b via (T AND 200>5).
+    assert_eq!(
+        q(&mut e, "(r.xi IS NOT NULL AND r.xi > 5) OR r.yi IS NULL"),
+        vec!["b".to_string(), "c".to_string()]
+    );
+}
+
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
