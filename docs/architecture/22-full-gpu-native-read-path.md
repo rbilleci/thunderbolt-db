@@ -93,17 +93,19 @@ is optional; each line is struck through only when it runs on the device.
     FULLY on-device.**
 
 ### Result-stage operators on the general executor
-- [x] **S3 — HAVING on-device.** First attempt (`488083ea`) was REVERTED (`4582c1d7`) after the audit caught
-  a P0. **REDO DONE `35f60719`** (suite 235/0; re-audit running). The host `rows.retain` is gone: the grouped
-  result is a TRANSIENT device relation, the HAVING DNF → a `ResidentExpr`, evaluated by the SAME device
-  predicate VM as WHERE (`lower_resident_predicate`) → survivor indices. **THE FIX (vs the reverted attempt):
-  build the HAVING transient with every INTEGER-FAMILY column + value PROMOTED to `Int8`** — this corrects
-  BOTH (1) the P0 (`SUM(int*)` is declared Int4 but valued Int8 → the catalog type mis-routed it into the int4
-  payload section) AND (2) the mixed-width wall (the predicate VM is single-width, but HAVING mixes int4-key +
-  int8-COUNT; promotion makes it a single i64 width). New test `gpu_grouped_having_sum_and_dnf_runs_on_gpu`
-  reproduces the audit's exact failing cases (`SUM(int4)`, int-key AND/OR int8-count). **NARROW OPEN GAP
-  (S3.1):** a timestamp/uuid HAVING CONSTANT clean-errors (predicate-IR literal gap; no test hits it).
-  **LESSON RECORDED: the audit gate caught the P0 before merge — rushing produced it, the rigor stopped it.**
+- [x] **S3 — HAVING on-device.** Host `rows.retain` → on-device: the grouped result is a TRANSIENT device
+  relation, the HAVING DNF → a `ResidentExpr`, evaluated by the SAME device predicate VM as WHERE
+  (`lower_resident_predicate`) → survivor indices. **TWO audit-caught regressions, both now fixed:** the 1st
+  attempt (`488083ea`) was REVERTED (P0: `SUM(int*)` declared Int4 but valued Int8 mis-routed into the int4
+  section); the redo (`35f60719`) PROMOTED integer-family columns/values to a uniform width (the predicate VM
+  is single-width but HAVING mixes int4-key + int8-COUNT) but the 2nd audit caught a numeric+int mix still
+  spanning i128+i64; the **numeric-mode fix `0eb9cde7`** promotes integers to `Numeric(scale 0)` when the
+  HAVING touches numeric (else `Int8`), so the whole predicate is one width. **DONE — suite 236/0; 3rd audit
+  running.** Tests `gpu_grouped_having_sum_and_dnf_runs_on_gpu` (int) + `gpu_grouped_having_numeric_int_mixed_dnf_runs_on_gpu`
+  (numeric+int) reproduce both audits' exact failing cases. **NARROW OPEN GAP (S3.1):** timestamp/uuid HAVING
+  CONSTANT clean-errors (parser-unreachable; predicate-IR literal gap). **LESSON: the audit gate caught BOTH
+  regressions before merge — rushing produced them, the rigor stopped them; promotion to a single width is the
+  load-bearing idea for a single-width predicate VM.**
 - [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:~4205` and `~4955` host `drain/truncate`. Note:
   the rows are sorted on-device (`gpu_sort_permutation` now returns the index vector), so LIMIT/OFFSET is
   best applied to the PERMUTATION before the final gather — materialize only the kept window. (Slicing an
