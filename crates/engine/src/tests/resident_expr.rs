@@ -8641,3 +8641,144 @@ fn audit_s8_where_and_or_dnf_matches_general() {
         assert_eq!(bridge.executed_target, DeviceTarget::Gpu(0), "{sql}");
     }
 }
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s8_grouped_order_by_aggregate_tie_break() {
+    // S8 regression (adopted from the independent audit -- closes the gap that the differential's
+    // sabotage exposed: the other s8 tests have no TIES on the ORDER BY aggregate at a LIMIT boundary,
+    // so disabling the group-key tie-break left them all green). The general grouped ORDER BY appends
+    // the group key ASC as a deterministic tie-break, matching the legacy probe/host group-ASC order.
+    // Without it, the order among groups that tie on the aggregate is implementation-defined and a LIMIT
+    // would pick a DIFFERENT group (the auditor measured [10,3] vs [20,3] for `ORDER BY count DESC
+    // LIMIT 1`). These asserts pin the group-ASC tie order, so they FAIL if the tie-break regresses.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE g3 (k INT, v INT)").unwrap();
+    // k=-5: v=-3,-3   -> cnt2 sum-6  ;  k=10: v=10,10,10 -> cnt3 sum30
+    // k=20: v=5,10,15 -> cnt3 sum30  ;  k=30: v=10       -> cnt1 sum10  ;  k=40: v=2,8 -> cnt2 sum10
+    // Deliberate ties: k=10 & k=20 both cnt3/sum30; k=30 & k=40 both sum10; k=-5 & k=40 both cnt2.
+    e.execute_text(
+        2,
+        "INSERT INTO g3 (k, v) VALUES (10,10),(10,10),(10,10),(20,5),(20,10),(20,15),(30,10),(40,2),(40,8),(-5,-3),(-5,-3)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("g3").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let run = |sql: &str| -> Vec<Vec<SqlValue>> {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        result.rows
+    };
+
+    // COUNT ties: k=10 & k=20 both 3 -> ORDER BY count DESC breaks by group ASC -> k=10 first.
+    assert_eq!(
+        run("SELECT k, COUNT(*) FROM g3 GROUP BY k ORDER BY count DESC LIMIT 1"),
+        vec![vec![SqlValue::Int4(10), SqlValue::Int8(3)]]
+    );
+    assert_eq!(
+        run("SELECT k, COUNT(*) FROM g3 GROUP BY k ORDER BY count DESC LIMIT 2"),
+        vec![
+            vec![SqlValue::Int4(10), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(20), SqlValue::Int8(3)],
+        ]
+    );
+    // SUM ties: k=10 & k=20 both 30 -> ORDER BY sum DESC LIMIT 1 -> k=10 (group ASC). SUM(int4)->Int8.
+    assert_eq!(
+        run("SELECT k, SUM(v) FROM g3 GROUP BY k ORDER BY sum DESC LIMIT 1"),
+        vec![vec![SqlValue::Int4(10), SqlValue::Int8(30)]]
+    );
+    // SUM ascending ties: -6(k-5), then 10(k=30 & k=40) -> group ASC -> k=30 before k=40. LIMIT 2.
+    assert_eq!(
+        run("SELECT k, SUM(v) FROM g3 GROUP BY k ORDER BY sum ASC LIMIT 2"),
+        vec![
+            vec![SqlValue::Int4(-5), SqlValue::Int8(-6)],
+            vec![SqlValue::Int4(30), SqlValue::Int8(10)],
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s8_grouped_materialized_view_via_bridge() {
+    // S8 regression (adopted from the independent audit -- the CTAS/view deliverable, the whole reason a
+    // `&Select`->general BRIDGE was built instead of routing only the text entry). A grouped
+    // MATERIALIZED VIEW ... WITH DATA runs its grouped SELECT through `execute_relational_select(&Select)`
+    // -> the bridge AT CREATE TIME (no raw SQL text), so this proves a grouped view/CTAS materializes
+    // correctly on the GPU. The auditor confirmed these rows are byte-identical to the parent (probe).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE base (k INT, v INT)").unwrap();
+    // k=1 {10,20} sum30 cnt2 ; k=2 {5,5,5} sum15 cnt3 ; k=3 {-7,100} sum93 cnt2 (v>=5 drops -7 -> cnt1).
+    e.execute_text(
+        2,
+        "INSERT INTO base (k, v) VALUES (1,10),(1,20),(2,5),(2,5),(3,-7),(3,100),(2,5)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("base").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let readback = |e: &Engine, sql: &str| -> Vec<Vec<SqlValue>> {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        e.execute_relational_select(&select).unwrap().rows
+    };
+
+    // Grouped matview: the SELECT runs through the bridge at create time; readback returns stored rows.
+    e.execute_text(
+        10,
+        "CREATE MATERIALIZED VIEW mg AS SELECT k, SUM(v) FROM base GROUP BY k ORDER BY k WITH DATA",
+    )
+    .unwrap();
+    assert_eq!(
+        readback(&e, "SELECT * FROM mg"),
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(15)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(93)],
+        ]
+    );
+    // Filtered grouped matview (the int4_filtered_grouped_aggregate route through the bridge).
+    e.execute_text(
+        20,
+        "CREATE MATERIALIZED VIEW mf AS SELECT k, COUNT(*) FROM base WHERE v >= 5 GROUP BY k ORDER BY k WITH DATA",
+    )
+    .unwrap();
+    assert_eq!(
+        readback(&e, "SELECT * FROM mf"),
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(3)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1)],
+        ]
+    );
+    // Grouped matview with HAVING + ORDER BY aggregate DESC -- the on-device finalization via the bridge.
+    e.execute_text(
+        30,
+        "CREATE MATERIALIZED VIEW mh AS SELECT k, SUM(v) FROM base GROUP BY k HAVING sum >= 15 ORDER BY sum DESC WITH DATA",
+    )
+    .unwrap();
+    assert_eq!(
+        readback(&e, "SELECT * FROM mh"),
+        vec![
+            vec![SqlValue::Int4(3), SqlValue::Int8(93)],
+            vec![SqlValue::Int4(1), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(15)],
+        ]
+    );
+    // REFRESH re-runs the grouped SELECT through the bridge; the stored rows are unchanged.
+    e.execute_text(40, "REFRESH MATERIALIZED VIEW mg").unwrap();
+    assert_eq!(
+        readback(&e, "SELECT * FROM mg"),
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(30)],
+            vec![SqlValue::Int4(2), SqlValue::Int8(15)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(93)],
+        ]
+    );
+}
