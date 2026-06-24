@@ -223,9 +223,31 @@ is optional; each line is struck through only when it runs on the device.
   V1: source keys from the device payload, like `key_i64` already does).
 
 ### Resident-probe fallback branches
-- [ ] **S8 — `!gpu_ordered` host finalization in resident-probe. APPROACH CHOSEN (user, 2026-06-24): ROUTE to
-  the general executor + RETIRE the legacy path (NOT reimplement-in-place — that path is slated for S9/S10
-  deletion, so in-place would be throwaway).** SCOPED 2026-06-24:
+- [x] **S8 — DONE 2026-06-25 (audit running), `47c874f3` (bridge+route+tests) + `a2bfa319` (delete probe).**
+  Built the `&Select`->general BRIDGE (`execute_resident_grouped_via_general`, engine_expr.rs), routed the two
+  grouped dispatch arms through it (engine_select_exec.rs), and DELETED the two resident-probe grouped methods +
+  the `grouped_sum` wrapper + their inline `!gpu_ordered` HOST sort/HAVING/LIMIT (566 lines). Grouped int4
+  aggregates now do ORDER BY / HAVING / LIMIT ON-DEVICE via the general executor (S2/S3/S4); the host
+  finalization is GONE. The route classifiers are kept (shapes still dispatch here, now to the bridge), so the
+  bridge covers the text entry AND CTAS AND view/matview uniformly.
+  - **Bridge mechanics:** normalize legacy GroupedCount/Sum/Avg/Min/Max -> `GroupedAggregates`; rebuild the
+    WHERE predicate from the bound's resolved filters (`resident_predicate_from_bound_filters` — a DNF, the
+    THIRD predicate path, producing the SAME ResidentExpr as `map_predicate_node`); CLEAR the bound filters so
+    the executor filters SOLELY via the predicate (matching the SQL->Expr path) -> `execute_resident_expr_select_with_binding`.
+  - **TIE-BREAK (the one behavior subtlety found):** the 0/24 "equivalence proven" MISSED tie-prone data. The
+    legacy probe/host paths break `ORDER BY <aggregate>` ties by GROUP KEY ASC (a documented cross-path
+    contract); the general grouped ORDER BY sorted by only the aggregate (a different, deterministic order).
+    FIX (user chose "preserve the order if cheap"): the general grouped ORDER BY now appends the group-key
+    columns ASC as a deterministic tie-break (negligible cost over the small grouped result) — so the bridge is
+    a TRUE behavior-preserving drop-in (the probe-vs-default comparison tests pass unchanged).
+  - **Proof:** a 65-shape bridge-vs-general differential (0 divergences; non-vacuity proven by sabotage) +
+    3 asserting `audit_s8_*` tests (filtered grouped HAVING+ORDER+LIMIT; non-integer AVG; AND/OR DNF builder),
+    all in `tests/resident_expr.rs`. Suite: --ignored 282/0, non-ignored 436/0. Independent adversarial audit
+    LAUNCHED (parent `fe60e4a6` vs HEAD `a2bfa319`); awaiting SHIP before adopting audit tests + marking final.
+  - _(historical scoping below, kept for context)_
+
+  **ORIGINAL SCOPE (user, 2026-06-24): ROUTE to the general executor + RETIRE the legacy path** (NOT
+  reimplement-in-place — that path is slated for S9/S10 deletion, so in-place would be throwaway). SCOPED:
   - **The branches.** Two legacy resident-probe grouped methods host-finalize sort/HAVING/LIMIT:
     `execute_relational_grouped_aggregate_with_resident_device_memory_probe` (`engine_resident_probe.rs:2893`;
     `!gpu_ordered` at `~3144`, reached when `use_gpu=false` = AVG ordering / non-i64 / non-translatable HAVING)
@@ -282,8 +304,9 @@ is optional; each line is struck through only when it runs on the device.
 S1 ✅ → **S2 (keystone, the big one)** ✅ → S3 ✅ → S4 ✅ (result-stage operators; small, mechanical) →
 S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 V1a ✅ + V1b PLUMB ✅ + V1b WIRE
 ✅ `5724bf55` (audit running) — the HAZARD-class kernel slice; the last join `host_rows` data read is GONE**
-→ S6 ✅ (V2, pad-WHERE 3VL on-device `76315706`, audited SHIP) → **S8 (probe fallback) — NEXT** →
-S9 (GPU-native oracles) → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
+→ S6 ✅ (V2, pad-WHERE 3VL on-device `76315706`, audited SHIP) → **S8 ✅ (probe fallback retired via the
+`&Select`->general bridge `47c874f3`+`a2bfa319`, audit running)** → **S9 (GPU-native oracles) — NEXT** →
+S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
 no-kernel first, then the kernel work fresh.)_
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2
 is the keystone and unblocks the most queries.
