@@ -8426,3 +8426,218 @@ fn audit_s4_windowing_math_equals_drain_truncate() {
         }
     }
 }
+
+/// S8 fixture: a resident `g (k INT, v INT)` with negatives, a negative group key, and a non-integer
+/// AVG (k=2 -> 3.5). Returns `None` (test skips) if the box has no GPU. Groups:
+///   k=-1 {100, 0}   cnt2 sum100 avg50    min0   max100
+///   k=1  {10,-5,2}  cnt3 sum7   avg2.33  min-5  max10
+///   k=2  {4, 3}     cnt2 sum7   avg3.5   min3   max4
+///   k=3  {-10}      cnt1 sum-10 avg-10   min-10 max-10
+fn s8_resident_g() -> Option<Engine> {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE g (k INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO g (k, v) VALUES (1, 10), (1, -5), (1, 2), (2, 4), (2, 3), (3, -10), (-1, 100), (-1, 0)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("g").unwrap();
+    snapshot.device_memory_proof.is_some().then_some(e)
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s8_bridge_matches_general_grouped_differential() {
+    // S8 PROOF: the `&Select`->general BRIDGE (`execute_resident_grouped_via_general`) must be
+    // byte-identical to the SQL->Expr general path (`execute_resident_expr_select_sql`) over the grouped
+    // int4 matrix. The bridge rebuilds the WHERE predicate from the bound's resolved filters (a THIRD
+    // predicate-construction path, vs the route classifier and `map_predicate_node`); this differential
+    // proves the reconstruction matches the general path BEFORE the legacy resident-probe grouped
+    // methods are deleted. The oracle is the general path, itself already proven == the enumerated route
+    // (0/24, doc 22 S8). Filters are single non-equality int4 comparisons (the only filtered shape the
+    // route accepts) over all four ops (>=, >, <, <=); the `v >= 0` filter drops a whole group (k=3) so
+    // the predicate is load-bearing.
+    let Some(e) = s8_resident_g() else { return };
+
+    let aggregates = [
+        ("COUNT(*)", "count"),
+        ("SUM(v)", "sum"),
+        ("AVG(v)", "avg"),
+        ("MIN(v)", "min"),
+        ("MAX(v)", "max"),
+    ];
+    let mut shapes: Vec<String> = Vec::new();
+    for (agg, name) in aggregates {
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k"));
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k"));
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k DESC"));
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY {name}"));
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY {name} DESC"));
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k HAVING {name} >= 3 ORDER BY k"));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g GROUP BY k HAVING {name} > 100000 ORDER BY k"
+        ));
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k LIMIT 2"));
+        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k LIMIT 0"));
+        shapes.push(format!("SELECT k, {agg} FROM g WHERE v >= 0 GROUP BY k ORDER BY k"));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g WHERE v > 0 GROUP BY k ORDER BY k DESC"
+        ));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g WHERE v < 50 GROUP BY k ORDER BY {name} DESC LIMIT 2"
+        ));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g WHERE v <= 10 GROUP BY k HAVING {name} >= 0 ORDER BY k"
+        ));
+    }
+
+    let mut divergences = 0usize;
+    for sql in &shapes {
+        let Command::Select(select) =
+            parse_command(sql).unwrap_or_else(|_| panic!("hand-rolled parse failed: {sql}"))
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let bridge = e
+            .execute_resident_grouped_via_general(&select)
+            .unwrap_or_else(|err| panic!("bridge failed for {sql}: {err:?}"));
+        let general = e
+            .execute_resident_expr_select_sql(sql)
+            .unwrap_or_else(|err| panic!("general failed for {sql}: {err:?}"));
+        if bridge.columns != general.columns || bridge.rows != general.rows {
+            divergences += 1;
+            eprintln!(
+                "DIVERGENCE for {sql}\n  bridge.cols={:?}\n  gen.cols   ={:?}\n  bridge.rows={:?}\n  gen.rows   ={:?}",
+                bridge.columns, general.columns, bridge.rows, general.rows
+            );
+        }
+        // Both paths must run ON THE GPU (no CPU fallback) for the comparison to be real.
+        assert_eq!(
+            bridge.executed_target,
+            DeviceTarget::Gpu(0),
+            "bridge fell off the GPU: {sql}"
+        );
+        assert_eq!(
+            general.executed_target,
+            DeviceTarget::Gpu(0),
+            "general fell off the GPU: {sql}"
+        );
+    }
+    assert_eq!(
+        divergences, 0,
+        "{divergences} bridge-vs-general divergences across {} grouped shapes",
+        shapes.len()
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s8_filtered_grouped_having_order_limit() {
+    // S8 regression (production routing): a FILTERED grouped aggregate with HAVING + ORDER BY + LIMIT
+    // reaches the bridge through the live route dispatch (`execute_relational_select`), runs ON THE GPU,
+    // and finalizes sort/HAVING/LIMIT on-device (the legacy probe did this on the HOST). Non-vacuous:
+    // the hard-coded rows pin the filtered sums, the HAVING/ORDER/LIMIT window, and SUM(int4)->Int8.
+    let Some(e) = s8_resident_g() else { return };
+    let Command::Select(select) = parse_command(
+        "SELECT k, SUM(v) FROM g WHERE v >= 0 GROUP BY k HAVING sum >= 7 ORDER BY sum DESC LIMIT 2",
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    // v>=0 drops (1,-5) and (3,-10): k=1 sum12, k=2 sum7, k=-1 sum100 (k=3 disappears). HAVING sum>=7
+    // keeps all three; ORDER BY sum DESC -> 100,12,7; LIMIT 2 -> [k=-1 100, k=1 12].
+    let result = e.execute_relational_select(&select).unwrap();
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.fallback_reason, None);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![SqlValue::Int4(-1), SqlValue::Int8(100)],
+            vec![SqlValue::Int4(1), SqlValue::Int8(12)],
+        ]
+    );
+    // The bridge produces the same result called directly as through the dispatch.
+    assert_eq!(
+        e.execute_resident_grouped_via_general(&select).unwrap().rows,
+        result.rows
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s8_avg_non_integer_result() {
+    // S8 regression: a grouped AVG with a NON-INTEGER result (k=2 -> 3.5) through the live dispatch.
+    // AVG yields numeric at AVG_RESULT_SCALE (16). Pins the exact fixed-point AVG so a scale/repr
+    // regression is caught (the differential's general oracle could drift; these are absolute).
+    let Some(e) = s8_resident_g() else { return };
+    let Command::Select(select) =
+        parse_command("SELECT k, AVG(v) FROM g GROUP BY k ORDER BY k").unwrap()
+    else {
+        unreachable!()
+    };
+    let result = e.execute_relational_select(&select).unwrap();
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.rows.len(), 4, "four groups: -1, 1, 2, 3");
+    // ORDER BY k asc -> rows[0]=k-1 (avg 50.0), rows[2]=k2 (avg 3.5). Both exact at scale 16.
+    assert_eq!(
+        result.rows[0],
+        vec![
+            SqlValue::Int4(-1),
+            SqlValue::Numeric(Decimal128::parse("50.0000000000000000").unwrap()),
+        ]
+    );
+    assert_eq!(
+        result.rows[2],
+        vec![
+            SqlValue::Int4(2),
+            SqlValue::Numeric(Decimal128::parse("3.5000000000000000").unwrap()),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_s8_where_and_or_dnf_matches_general() {
+    // S8 DNF-builder coverage: the bridge's `resident_predicate_from_bound_filters` builds an AND-group
+    // (from `bound.filters`) and an OR-of-groups (from `bound.filter_groups`). These multi-leaf filters
+    // do NOT route to the bridge in production (the grouped route accepts a single leaf only), so call
+    // the bridge DIRECTLY and diff against the general path, which builds the same predicate via
+    // `map_predicate_node`. Hard-coded expected rows make it non-vacuous (a dropped DNF group would
+    // change them). COUNT(*) -> Int8.
+    let Some(e) = s8_resident_g() else { return };
+
+    // AND: v>0 AND k<3 keeps (1,10),(1,2),(2,4),(2,3),(-1,100) -> k=-1:1, k=1:2, k=2:2.
+    let and_sql = "SELECT k, COUNT(*) FROM g WHERE v > 0 AND k < 3 GROUP BY k ORDER BY k";
+    // OR: v>50 OR v<0 keeps (1,-5),(3,-10),(-1,100) -> k=-1:1, k=1:1, k=3:1.
+    let or_sql = "SELECT k, COUNT(*) FROM g WHERE v > 50 OR v < 0 GROUP BY k ORDER BY k";
+
+    let expected = [
+        (
+            and_sql,
+            vec![
+                vec![SqlValue::Int4(-1), SqlValue::Int8(1)],
+                vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+                vec![SqlValue::Int4(2), SqlValue::Int8(2)],
+            ],
+        ),
+        (
+            or_sql,
+            vec![
+                vec![SqlValue::Int4(-1), SqlValue::Int8(1)],
+                vec![SqlValue::Int4(1), SqlValue::Int8(1)],
+                vec![SqlValue::Int4(3), SqlValue::Int8(1)],
+            ],
+        ),
+    ];
+    for (sql, want) in expected {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let bridge = e.execute_resident_grouped_via_general(&select).unwrap();
+        let general = e.execute_resident_expr_select_sql(sql).unwrap();
+        assert_eq!(bridge.columns, general.columns, "{sql}");
+        assert_eq!(bridge.rows, general.rows, "{sql}");
+        assert_eq!(bridge.rows, want, "{sql}");
+        assert_eq!(bridge.executed_target, DeviceTarget::Gpu(0), "{sql}");
+    }
+}

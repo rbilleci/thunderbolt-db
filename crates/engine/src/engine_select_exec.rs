@@ -436,13 +436,14 @@ impl Engine {
             "int4_filter_group_count" => {
                 self.execute_relational_filter_group_count_with_resident_device_memory_probe(select)
             }
-            "int4_grouped_aggregate" => {
-                self.execute_relational_grouped_aggregate_with_resident_device_memory_probe(select)
+            // S8: grouped int4 aggregates route to the general on-device executor via the
+            // `&Select`->general BRIDGE (it does ORDER BY / HAVING / LIMIT ON-DEVICE), retiring the
+            // legacy resident-probe grouped methods whose `!gpu_ordered` branch host-finalized
+            // sort/HAVING/LIMIT. Because the dispatch sees `&Select`, this covers the text entry AND
+            // CTAS AND view/matview uniformly.
+            "int4_grouped_aggregate" | "int4_filtered_grouped_aggregate" => {
+                self.execute_resident_grouped_via_general(select)
             }
-            "int4_filtered_grouped_aggregate" => self
-                .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
-                    select,
-                ),
             "int4_projection" => {
                 self.execute_relational_projection_with_resident_device_memory_probe(select)
             }

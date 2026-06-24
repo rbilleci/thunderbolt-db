@@ -186,6 +186,127 @@ fn having_op_to_resident(op: crate::SelectFilterOp) -> ResidentBinaryOp {
     }
 }
 
+/// Normalize a legacy 1-aggregate grouped projection (`GroupedCount` / `GroupedSum` / `GroupedAvg` /
+/// `GroupedMin` / `GroupedMax`, produced by the hand-rolled parser) to the general
+/// [`SelectProjection::GroupedAggregates`] form the on-device Expr executor consumes -- the S8
+/// `&Select`->general bridge. `GroupedCount { column }` groups by `column` with a COUNT(*) (no value
+/// column); the others carry `(group_column, value_column)`. Returns `None` for a projection that is
+/// not a legacy grouped form (already `GroupedAggregates`, or not grouped) -- the caller leaves it as-is.
+fn grouped_projection_to_aggregates(projection: &SelectProjection) -> Option<SelectProjection> {
+    let (group_column, aggregate) = match projection {
+        SelectProjection::GroupedCount { column } => (
+            column.clone(),
+            GroupedAggregate {
+                kind: GroupedAggKind::Count,
+                value_column: None,
+            },
+        ),
+        SelectProjection::GroupedSum {
+            group_column,
+            sum_column,
+        } => (
+            group_column.clone(),
+            GroupedAggregate {
+                kind: GroupedAggKind::Sum,
+                value_column: Some(sum_column.clone()),
+            },
+        ),
+        SelectProjection::GroupedAvg {
+            group_column,
+            avg_column,
+        } => (
+            group_column.clone(),
+            GroupedAggregate {
+                kind: GroupedAggKind::Avg,
+                value_column: Some(avg_column.clone()),
+            },
+        ),
+        SelectProjection::GroupedMin {
+            group_column,
+            min_column,
+        } => (
+            group_column.clone(),
+            GroupedAggregate {
+                kind: GroupedAggKind::Min,
+                value_column: Some(min_column.clone()),
+            },
+        ),
+        SelectProjection::GroupedMax {
+            group_column,
+            max_column,
+        } => (
+            group_column.clone(),
+            GroupedAggregate {
+                kind: GroupedAggKind::Max,
+                value_column: Some(max_column.clone()),
+            },
+        ),
+        _ => return None,
+    };
+    Some(SelectProjection::GroupedAggregates {
+        group_column,
+        aggregates: vec![aggregate],
+    })
+}
+
+/// Build the WHERE-predicate [`ResidentExpr`] DNF for the `&Select`->general grouped BRIDGE (S8) from a
+/// bound select's resolved filters. Normalizes to the canonical DNF (OR of AND-groups) exactly as the
+/// route classifiers do -- `filter_groups`, else `filters` as one AND-group, else the single `filter`,
+/// else no predicate -- then turns each `(column_idx, op, value)` leaf into `Column(idx) <op> literal`
+/// (AND within a group, OR across groups), mirroring the S3 HAVING DNF construction. This is the THIRD
+/// predicate-construction path (vs the route classifier and `map_predicate_node`); it produces the SAME
+/// `ResidentExpr` the SQL->Expr path's `map_predicate_node` builds for `WHERE col <op> 5` (an int4
+/// `Column <cmp> Int4Literal`), so routing a grouped probe shape through it is behavior-preserving.
+/// `None` = no WHERE (a full-table scan). The grouped routes only ever carry an int4 `Column <cmp>
+/// Int4Literal` leaf (`resident_route_grouped_aggregate_shape`), but the general DNF here is robust to
+/// any int4 OR-of-AND filter the bound may carry.
+fn resident_predicate_from_bound_filters(
+    bound: &BoundRelationalSelect,
+) -> Result<Option<ResidentExpr>, ExecuteError> {
+    let groups: Vec<Vec<(usize, crate::SelectFilterOp, SqlValue)>> =
+        if !bound.filter_groups.is_empty() {
+            bound.filter_groups.clone()
+        } else if !bound.filters.is_empty() {
+            vec![bound.filters.clone()]
+        } else if let Some(filter) = bound.filter.clone() {
+            vec![vec![filter]]
+        } else {
+            return Ok(None);
+        };
+    let mut dnf: Option<ResidentExpr> = None;
+    for group in &groups {
+        let mut conj: Option<ResidentExpr> = None;
+        for (idx, op, value) in group {
+            let leaf = ResidentExpr::Binary {
+                op: having_op_to_resident(*op),
+                lhs: Box::new(ResidentExpr::Column(*idx)),
+                // numeric_mode = false: a grouped-route filter constant is an int4 literal (the
+                // classifier guarantees `SqlValue::Int4`), matching `map_predicate_node`'s Int4Literal.
+                rhs: Box::new(having_value_to_resident_literal(value, false)?),
+            };
+            conj = Some(match conj {
+                None => leaf,
+                Some(prev) => ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(prev),
+                    rhs: Box::new(leaf),
+                },
+            });
+        }
+        if let Some(c) = conj {
+            dnf = Some(match dnf {
+                None => c,
+                Some(prev) => ResidentExpr::Binary {
+                    op: ResidentBinaryOp::Or,
+                    lhs: Box::new(prev),
+                    rhs: Box::new(c),
+                },
+            });
+        }
+    }
+    Ok(dnf)
+}
+
 /// A HAVING comparison constant (`SqlValue`) as a resident-predicate literal node, so the HAVING DNF can
 /// be evaluated by the SAME device predicate VM as WHERE. The HAVING transient promotes every integer
 /// column to ONE width (the VM is single-width); `numeric_mode` says which: in NUMERIC mode (the DNF
@@ -1684,6 +1805,70 @@ impl Engine {
             &[],
             None,
             &[],
+        )
+    }
+
+    /// `&Select`->general-executor BRIDGE for grouped int4 aggregates (S8). Runs a grouped aggregate
+    /// `Select` (the int4-group + int4-value shapes the route classifier accepts) through the SAME
+    /// on-device general executor as the SQL->Expr path, retiring the legacy resident-probe grouped
+    /// methods whose `!gpu_ordered` branches did a HOST sort / HAVING / LIMIT (a charter violation --
+    /// relational finalization on the host). The general executor does ORDER BY / HAVING / LIMIT
+    /// ON-DEVICE (S2/S3/S4), so this is behavior-preserving (enumerated == general proven 0/24
+    /// differential; bridge == general re-verified before the probe methods were deleted; the general
+    /// grouped ORDER BY now appends a group-key tie-break, matching the legacy group-ASC tie order).
+    ///
+    /// Unlike `execute_resident_expr_select_sql`, this sources its inputs from the engine `&Select`
+    /// (the hand-rolled parse) rather than the libpg_query parse tree, so it covers the text entry AND
+    /// the `&Select` callers with no raw SQL -- CTAS and view/matview -- uniformly. The WHERE predicate
+    /// is rebuilt from the bound's resolved filters (a `ResidentExpr` DNF -- the third predicate path),
+    /// then the bound filters are CLEARED so the executor filters SOLELY via the predicate, exactly as
+    /// the SQL->Expr path does (whose bound carries no filters -- the WHERE rides the predicate). The
+    /// grouped ORDER BY keys are RESULT columns (the group column or an aggregate), resolved by the
+    /// executor against the projection, so every `order_by_exprs` entry is `None` (a plain key, not an
+    /// expression); NULLS FIRST/LAST is `None` (PG default) since the hand-rolled `SelectOrder` carries
+    /// no explicit override -- byte-identical to the probe path it replaces.
+    pub(crate) fn execute_resident_grouped_via_general(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        // Normalize the legacy 1-aggregate grouped projection (GroupedCount / GroupedSum / GroupedAvg /
+        // GroupedMin / GroupedMax produced by the hand-rolled parser) to the general GroupedAggregates
+        // form the Expr executor consumes -- and bind against THAT, so the binding (selected columns,
+        // result schema, ORDER-BY-result-column resolution) is byte-identical to the SQL->Expr path,
+        // which always produces GroupedAggregates. The WHERE / GROUP BY / ORDER BY / HAVING / LIMIT are
+        // carried over unchanged in the clone.
+        let mut select_owned = select.clone();
+        if let Some(projection) = grouped_projection_to_aggregates(&select.projection) {
+            select_owned.projection = projection;
+        }
+        let select = &select_owned;
+        let (table, mut bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        // Rebuild the WHERE predicate from the bound filters BEFORE clearing them; then clear so the
+        // executor's filter (and the access-path planner it feeds) sees an empty-filter bound, matching
+        // the SQL->Expr path exactly. The predicate ResidentExpr is now the sole filter.
+        let predicate = resident_predicate_from_bound_filters(&bound)?;
+        bound.filter = None;
+        bound.filters.clear();
+        bound.filter_groups.clear();
+        // Single bare-column GROUP BY (the only grouped shape the route accepts); the executor packs a
+        // composite key when len()==2, but the grouped routes are single-key, so this is one column.
+        let group_key_columns: Vec<String> = match &select.group_by {
+            Some(column) => vec![column.clone()],
+            None => Vec::new(),
+        };
+        // Grouped ORDER BY keys are result columns (None = plain key); no expression GROUP BY here.
+        let order_by_exprs: Vec<Option<ResidentExpr>> = vec![None; select.order_by.len()];
+        let order_by_nulls_first: Vec<Option<bool>> = vec![None; select.order_by.len()];
+        self.execute_resident_expr_select_with_binding(
+            select,
+            &table,
+            bound,
+            copin_s,
+            predicate.as_ref(),
+            &order_by_exprs,
+            &order_by_nulls_first,
+            None,
+            &group_key_columns,
         )
     }
 
@@ -4796,18 +4981,19 @@ impl Engine {
             if rows.len() > 1 || select.offset.is_some() || select.limit.is_some() {
                 let col_types: Vec<SqlType> =
                     bound.selected_columns.iter().map(|c| c.ty).collect();
+                // The GROUP-KEY result columns (emitted first by the merge): result columns 0..n_group_cols.
+                let n_group_cols = if is_composite_key {
+                    2
+                } else if let Some(members) = &widekey_cols {
+                    members.len()
+                } else {
+                    1
+                };
                 let (order, nulls_first): (Vec<(usize, bool)>, Vec<Option<bool>>) =
                     if select.order_by.is_empty() {
-                        // DEFAULT order: by the full group-key tuple (result columns 0..n_group_cols, keys
-                        // are emitted first by the merge), ASC, with the NULL group FIRST -- matching the
-                        // prior host key order (PG leaves a bare GROUP BY unordered; our stable choice).
-                        let n_group_cols = if is_composite_key {
-                            2
-                        } else if let Some(members) = &widekey_cols {
-                            members.len()
-                        } else {
-                            1
-                        };
+                        // DEFAULT order: by the full group-key tuple, ASC, with the NULL group FIRST --
+                        // matching the prior host key order (PG leaves a bare GROUP BY unordered; our
+                        // stable choice).
                         (
                             (0..n_group_cols).map(|c| (c, false)).collect(),
                             vec![Some(true); n_group_cols],
@@ -4816,12 +5002,26 @@ impl Engine {
                         // Explicit ORDER BY: resolve each key to its result-column index; explicit NULLS
                         // FIRST/LAST honored ON-DEVICE (order_by_nulls_first threaded through; every key
                         // type, incl. int, reads its NULL validity bitmap in the comparator).
-                        let order: Vec<(usize, bool)> = select
+                        let mut order: Vec<(usize, bool)> = select
                             .order_by
                             .iter()
                             .map(|o| Ok::<_, ExecuteError>((col_index(&o.column)?, o.descending)))
                             .collect::<Result<_, _>>()?;
-                        (order, order_by_nulls_first.to_vec())
+                        let mut nulls_first = order_by_nulls_first.to_vec();
+                        // Append the GROUP-KEY columns (ASC, NULL group first) as a deterministic TIE-BREAK
+                        // so rows that tie on the explicit ORDER BY key(s) -- e.g. two groups with equal
+                        // SUM under `ORDER BY sum DESC` -- order by group key. This matches the legacy
+                        // probe/host group-ASC tie-break (a documented cross-path contract) and keeps the
+                        // result fully deterministic. The grouped result is at most one row per group, so
+                        // the extra (cheap) sort key is negligible. A group column already named as an
+                        // explicit key is skipped (it would be a redundant, no-op secondary key).
+                        for c in 0..n_group_cols {
+                            if !order.iter().any(|(idx, _)| *idx == c) {
+                                order.push((c, false));
+                                nulls_first.push(Some(true));
+                            }
+                        }
+                        (order, nulls_first)
                     };
                 let perm =
                     gpu_sort_permutation(&rows, &order, &nulls_first, &col_types, &device_memory)?;
