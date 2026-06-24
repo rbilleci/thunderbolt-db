@@ -135,40 +135,81 @@ fn p8_default_resident_route_executes_accepted_shapes() {
     }
     assert_eq!(route.h2d_bytes_if_resident, 0);
 
-    for sql in [
-            "SELECT COUNT(*) FROM events",
-            "SELECT COUNT(*) FROM events WHERE id = 2",
-            "SELECT COUNT(*) FROM events WHERE id > 1",
-            "SELECT COUNT(*) FROM events WHERE label LIKE 'al%'",
-            "SELECT COUNT(*) FROM events WHERE id = 1 OR id = 3",
-            "SELECT SUM(id) FROM events",
-            "SELECT AVG(id) FROM events",
-            "SELECT MIN(id) FROM events",
-            "SELECT MAX(id) FROM events",
-            "SELECT SUM(id) FROM events WHERE id > 1",
-            "SELECT AVG(id) FROM events WHERE id < 3",
-            "SELECT MIN(id) FROM events WHERE id >= 2",
-            "SELECT MAX(id) FROM events WHERE id <= 2",
-            "SELECT SUM(id) FROM events WHERE id BETWEEN 1 AND 2",
-            "SELECT AVG(id) FROM events WHERE id BETWEEN 2 AND 3",
-            "SELECT MIN(id) FROM events WHERE id BETWEEN 1 AND 3",
-            "SELECT MAX(id) FROM events WHERE id BETWEEN 1 AND 1",
-            "SELECT id FROM events WHERE id > 1",
+    // Closed-form construction oracles (S9): the GPU resident route AND the default (also-GPU) path are
+    // checked against explicit expected rows over events = (1,1,10,'alpha'),(2,1,20,'beta'),
+    // (3,2,30,'alpine') -- no host-finalized cuda-driver-probe re-execution as the reference. The two
+    // buckets tie at SUM(amount)=30, so `... ORDER BY sum DESC LIMIT 1` tie-breaks to bucket 1 by
+    // group-key ASC (the S8 cross-path contract). AVG uses the engine's own `average_sql_value`
+    // finalizer (closed-form sum/count), never a CPU average.
+    let avg = crate::rel_exec_helpers::average_sql_value;
+    let cases: [(&str, Vec<Vec<SqlValue>>); 26] = [
+        ("SELECT COUNT(*) FROM events", vec![vec![SqlValue::Int8(3)]]),
+        ("SELECT COUNT(*) FROM events WHERE id = 2", vec![vec![SqlValue::Int8(1)]]),
+        ("SELECT COUNT(*) FROM events WHERE id > 1", vec![vec![SqlValue::Int8(2)]]),
+        ("SELECT COUNT(*) FROM events WHERE label LIKE 'al%'", vec![vec![SqlValue::Int8(2)]]),
+        ("SELECT COUNT(*) FROM events WHERE id = 1 OR id = 3", vec![vec![SqlValue::Int8(2)]]),
+        ("SELECT SUM(id) FROM events", vec![vec![SqlValue::Int8(6)]]),
+        ("SELECT AVG(id) FROM events", vec![vec![avg(6, 3)]]),
+        ("SELECT MIN(id) FROM events", vec![vec![SqlValue::Int4(1)]]),
+        ("SELECT MAX(id) FROM events", vec![vec![SqlValue::Int4(3)]]),
+        ("SELECT SUM(id) FROM events WHERE id > 1", vec![vec![SqlValue::Int8(5)]]),
+        ("SELECT AVG(id) FROM events WHERE id < 3", vec![vec![avg(3, 2)]]),
+        ("SELECT MIN(id) FROM events WHERE id >= 2", vec![vec![SqlValue::Int4(2)]]),
+        ("SELECT MAX(id) FROM events WHERE id <= 2", vec![vec![SqlValue::Int4(2)]]),
+        ("SELECT SUM(id) FROM events WHERE id BETWEEN 1 AND 2", vec![vec![SqlValue::Int8(3)]]),
+        ("SELECT AVG(id) FROM events WHERE id BETWEEN 2 AND 3", vec![vec![avg(5, 2)]]),
+        ("SELECT MIN(id) FROM events WHERE id BETWEEN 1 AND 3", vec![vec![SqlValue::Int4(1)]]),
+        ("SELECT MAX(id) FROM events WHERE id BETWEEN 1 AND 1", vec![vec![SqlValue::Int4(1)]]),
+        ("SELECT id FROM events WHERE id > 1", vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]]),
+        (
             "SELECT id FROM events WHERE id >= 1 ORDER BY id DESC LIMIT 2 OFFSET 1",
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(1)]],
+        ),
+        (
             "SELECT DISTINCT bucket FROM events ORDER BY bucket DESC LIMIT 2 OFFSET 1",
+            vec![vec![SqlValue::Int4(1)]],
+        ),
+        (
             "SELECT DISTINCT bucket FROM events WHERE bucket >= 2 ORDER BY bucket DESC LIMIT 2 OFFSET 1",
+            Vec::new(),
+        ),
+        (
             "SELECT bucket, COUNT(*) FROM events GROUP BY bucket HAVING count >= 1 ORDER BY bucket",
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+                vec![SqlValue::Int4(2), SqlValue::Int8(1)],
+            ],
+        ),
+        (
             "SELECT bucket, SUM(amount) FROM events GROUP BY bucket HAVING sum > 20 ORDER BY sum DESC LIMIT 1",
+            vec![vec![SqlValue::Int4(1), SqlValue::Int8(30)]],
+        ),
+        (
             "SELECT bucket, AVG(amount) FROM events GROUP BY bucket ORDER BY bucket",
+            vec![
+                vec![SqlValue::Int4(1), avg(30, 2)],
+                vec![SqlValue::Int4(2), avg(30, 1)],
+            ],
+        ),
+        (
             "SELECT bucket, MIN(amount) FROM events WHERE amount >= 20 GROUP BY bucket HAVING min >= 20 ORDER BY bucket",
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Int4(20)],
+                vec![SqlValue::Int4(2), SqlValue::Int4(30)],
+            ],
+        ),
+        (
             "SELECT bucket, MAX(amount) FROM events WHERE amount > 10 GROUP BY bucket HAVING bucket = 1 OR max >= 30 ORDER BY max DESC",
-        ] {
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Int4(30)],
+                vec![SqlValue::Int4(1), SqlValue::Int4(20)],
+            ],
+        ),
+    ];
+    for (sql, expected_rows) in cases {
             let Command::Select(select) = parse_command(sql).unwrap() else {
                 unreachable!()
             };
-            let expected = e
-                .execute_relational_select_with_cuda_driver_probe(&select)
-                .unwrap();
             let resident = e
                 .execute_relational_select_with_resident_route(&select)
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
@@ -177,10 +218,11 @@ fn p8_default_resident_route_executes_accepted_shapes() {
                 .execute_relational_select(&select)
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
             let after_default_metrics = e.metrics().snapshot();
-            assert_eq!(resident.rows, expected.rows, "{sql}");
-            assert_eq!(resident.columns, expected.columns, "{sql}");
-            assert_eq!(default.rows, expected.rows, "{sql}");
-            assert_eq!(default.columns, expected.columns, "{sql}");
+            assert_eq!(resident.rows, expected_rows, "{sql}");
+            assert_eq!(default.rows, expected_rows, "{sql}");
+            // Columns: GPU-vs-GPU consistency between the resident route and the default (also-GPU)
+            // path -- no host/CPU oracle (S9).
+            assert_eq!(resident.columns, default.columns, "{sql}");
             assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
             assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
             assert_eq!(resident.fallback_reason, None, "{sql}");

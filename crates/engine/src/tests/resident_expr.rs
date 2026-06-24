@@ -2855,12 +2855,14 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
     assert_eq!(c.executed_target, DeviceTarget::Gpu(0));
 
     // SUM/MIN/MAX over the whole column.
+    // Closed-form oracles (a = [5,3,8,1,9]): SUM=26, MIN=1, MAX=9 -- explicit constants, not a host
+    // .iter() re-implementation of the aggregate (GPU-native-oracle charter, S9).
     let s = e.execute_resident_expr_select_sql("SELECT SUM(a) FROM t").expect("sum");
-    assert_eq!(s.rows, vec![vec![SqlValue::Int8(a.iter().map(|&v| i64::from(v)).sum())]], "SUM(a)=26");
+    assert_eq!(s.rows, vec![vec![SqlValue::Int8(26)]], "SUM(a)=26");
     let mn = e.execute_resident_expr_select_sql("SELECT MIN(a) FROM t").expect("min");
-    assert_eq!(mn.rows, vec![vec![SqlValue::Int4(*a.iter().min().unwrap())]], "MIN(a)=1");
+    assert_eq!(mn.rows, vec![vec![SqlValue::Int4(1)]], "MIN(a)=1");
     let mx = e.execute_resident_expr_select_sql("SELECT MAX(a) FROM t").expect("max");
-    assert_eq!(mx.rows, vec![vec![SqlValue::Int4(*a.iter().max().unwrap())]], "MAX(a)=9");
+    assert_eq!(mx.rows, vec![vec![SqlValue::Int4(9)]], "MAX(a)=9");
 
     // AVG(a) = 26/5 = 5.2 -> numeric scale 16 (fd1=26 > fd2=5, no leading-digit decrement).
     let av = e.execute_resident_expr_select_sql("SELECT AVG(a) FROM t").expect("avg");
@@ -7621,9 +7623,10 @@ fn gpu_grouped_numeric_min_max_same_high_limb_tie() {
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    // Construction oracle: per-group min/max of the i128 mantissas.
-    let g1 = [4 * unit + 10, 4 * unit + 200, 4 * unit + 50, 13 * unit];
-    let g2 = [-(4 * unit + 10), -(4 * unit + 200), -(4 * unit + 50)];
+    // Closed-form oracle: the explicit per-group tie-break winners (the i128 mantissa min/max),
+    // stated as constants rather than a host .iter().min()/.max() re-implementation (S9). g1's MIN is
+    // the smallest mantissa among the high-limb ties (4e19+10); MAX is the distinct decoy 13e19. g2 is
+    // all-negative, so MIN is the most negative (-(4e19+200)) and MAX the least negative (-(4e19+10)).
     let ds = |m: i128| Decimal128::new(m, 19).to_decimal_string();
     let got = |sql: &str| -> Vec<String> {
         e.execute_resident_expr_select_sql(sql)
@@ -7638,12 +7641,12 @@ fn gpu_grouped_numeric_min_max_same_high_limb_tie() {
     };
     assert_eq!(
         got("SELECT g, MIN(v) FROM t GROUP BY g"),
-        vec![ds(*g1.iter().min().unwrap()), ds(*g2.iter().min().unwrap())],
+        vec![ds(4 * unit + 10), ds(-(4 * unit + 200))],
         "MIN decided by the unsigned low limb among high-limb ties (decoy must not leak)"
     );
     assert_eq!(
         got("SELECT g, MAX(v) FROM t GROUP BY g"),
-        vec![ds(*g1.iter().max().unwrap()), ds(*g2.iter().max().unwrap())],
+        vec![ds(13 * unit), ds(-(4 * unit + 10))],
         "MAX decided by the unsigned low limb among high-limb ties"
     );
 }
