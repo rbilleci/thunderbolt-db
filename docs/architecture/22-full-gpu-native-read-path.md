@@ -107,9 +107,14 @@ is optional; each line is struck through only when it runs on the device.
   (AVG, or SUM/MIN/MAX over a scale≥10 numeric) INSIDE an AND/OR DNF hit the i32 `CompareScalar` needle in
   the SHARED `compile_numeric_compare` → the **i128-needle fix `ce73a74a`** emits `CompareScalarI128` (full
   mantissa) since the numeric program runs at elem I128 — also fixing a latent WHERE high-scale-numeric bug.
-  **FOUR audit-caught regressions, ALL fixed (type skew / width / scale / i32-literal-cap); suite 237/0; 5th
-  audit running.** Tests `gpu_grouped_having_{sum_and_dnf,numeric_int_mixed_dnf,avg_heterogeneous_scale}_*`
-  (the last incl. high-scale AVG-in-DNF) reproduce all four.
+  **FOUR audit-caught regressions, ALL fixed (type skew / width / scale / i32-literal-cap); 5th audit = SHIP**
+  (exhaustive: every aggregate, deep DNFs, boundaries, NULL×scale intersections, the full clause stack, the
+  shared-VM change proven WHERE-result-preserving; suite 260/0 hazard-stable). Tests
+  `gpu_grouped_having_{sum_and_dnf,numeric_int_mixed_dnf,avg_heterogeneous_scale}_*` (the last incl.
+  high-scale AVG-in-DNF) reproduce all four. **TINY OPTIONAL FOLLOW-UP:** `numeric_cross_scale_scalar`
+  (`engine_expr.rs:~5535`) keeps a sibling i32 cap (a literal FINER than the column scale whose mantissa
+  exceeds i32) — pre-existing, shared with plain WHERE, clean-errors safely (not a regression); same
+  `CompareScalarI128` fix applies.
   **NARROW OPEN GAP (S3.1):** timestamp/uuid HAVING CONSTANT clean-errors (parser-unreachable). **LESSON: the
   audit gate caught all THREE regressions before merge — rushing produced them, the rigor stopped them;
   uniform-width+uniform-scale promotion is the load-bearing idea for a single-width/single-scale predicate VM;
