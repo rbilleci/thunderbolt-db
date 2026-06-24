@@ -1937,6 +1937,119 @@ fn gpu_outer_join_with_where_filters_the_result_not_the_inputs() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_outer_join_pad_where_3vl_on_device_v2() {
+    // S6/V2 (doc 22): the OUTER-join NULL-pad's WHERE 3VL truth is decided ON-DEVICE (the all-NULL pad is
+    // run through the SAME GPU WHERE-3VL mask VM as the real rows), replacing the host Kleene
+    // `predicate_truth_on_null_pad`. Covers pad-SURVIVES (IS NULL, IS NULL OR cmp, IS NULL AND IS NULL) and
+    // pad-DROPS (IS NOT NULL, comparison compound) across the SAME query so a wrong pad decision shows up as
+    // a missing/extra row. l=3 ('c') is the unmatched (padded) left row; r1.x small, r2.x large.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT, y INT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,x,y) VALUES (1,5,5),(2,200,50)").unwrap();
+    for t in ["l", "r"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let names = |res: &RelationalSelectResult| -> Vec<String> {
+        let mut v: Vec<String> = res
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                SqlValue::Text(t) => t.clone(),
+                o => panic!("expected text, got {o:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let q = |e: &mut Engine, whr: &str| -> Vec<String> {
+        names(
+            &e.execute_resident_expr_select_sql(&format!(
+                "SELECT name FROM l LEFT JOIN r ON l.id = r.rid WHERE {whr}"
+            ))
+            .unwrap_or_else(|err| panic!("query `{whr}` failed: {err}")),
+        )
+    };
+    // pad SURVIVES: `r.x IS NULL` is TRUE on the all-NULL pad -> keep 'c'; matched rows (x non-null) drop.
+    assert_eq!(q(&mut e, "r.x IS NULL"), vec!["c".to_string()], "IS NULL: pad survives, matched drop");
+    // pad SURVIVES via the OR's IS NULL branch; matched r2 (x=200>100) also survives, r1 (x=5) drops.
+    assert_eq!(
+        q(&mut e, "r.x IS NULL OR r.x > 100"),
+        vec!["b".to_string(), "c".to_string()],
+        "IS NULL OR cmp: pad survives via IS NULL, a matched row survives via the comparison"
+    );
+    // pad SURVIVES: both leaves IS NULL -> TRUE AND TRUE on the pad; matched rows (both non-null) drop.
+    assert_eq!(
+        q(&mut e, "r.x IS NULL AND r.y IS NULL"),
+        vec!["c".to_string()],
+        "IS NULL AND IS NULL: pad survives, matched drop"
+    );
+    // pad DROPS: `IS NOT NULL` is FALSE on the all-NULL pad; matched rows (x non-null) survive.
+    assert_eq!(
+        q(&mut e, "r.x IS NOT NULL"),
+        vec!["a".to_string(), "b".to_string()],
+        "IS NOT NULL: pad drops, matched survive"
+    );
+    // pad DROPS: a comparison compound is UNKNOWN on the all-NULL pad; both matched rows satisfy it.
+    assert_eq!(
+        q(&mut e, "r.x > 1 AND r.y < 100"),
+        vec!["a".to_string(), "b".to_string()],
+        "comparison compound: pad drops (UNKNOWN), matched rows evaluated normally"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_outer_join_pad_where_3vl_types_and_full_join_v2() {
+    // S6/V2: the on-device pad eval works for a NON-int pad column (numeric / text IS NULL) and for a FULL
+    // join (both sides can be padded). A numeric/text `IS NULL` on the all-NULL pad must read the validity
+    // bit on-device (0 -> NULL -> IS NULL TRUE), not depend on a host Kleene.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, amt NUMERIC(10,2), tag TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,amt,tag) VALUES (1,10.50,'p'),(2,20.00,'q')").unwrap();
+    for t in ["l", "r"] {
+        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+            return;
+        }
+    }
+    let names = |res: &RelationalSelectResult| -> Vec<Option<String>> {
+        let mut v: Vec<Option<String>> = res
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                SqlValue::Text(t) => Some(t.clone()),
+                SqlValue::Null => None,
+                o => panic!("expected text/null, got {o:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    // numeric pad column IS NULL -> pad 'c' survives (the device reads the numeric column's 0 validity bit).
+    let num = e
+        .execute_resident_expr_select_sql("SELECT name FROM l LEFT JOIN r ON l.id = r.rid WHERE r.amt IS NULL")
+        .expect("numeric IS NULL anti-join");
+    assert_eq!(names(&num), vec![Some("c".to_string())], "numeric pad column IS NULL: pad survives");
+    // text pad column IS NULL -> pad 'c' survives.
+    let txt = e
+        .execute_resident_expr_select_sql("SELECT name FROM l LEFT JOIN r ON l.id = r.rid WHERE r.tag IS NULL")
+        .expect("text IS NULL anti-join");
+    assert_eq!(names(&txt), vec![Some("c".to_string())], "text pad column IS NULL: pad survives");
+    // FULL join: the LEFT-only pad ('c', r columns NULL) survives `r.amt IS NULL`; matched rows drop; no
+    // right-only row exists (every r matched). The pad decision is the same on-device path.
+    let full = e
+        .execute_resident_expr_select_sql("SELECT name FROM l FULL JOIN r ON l.id = r.rid WHERE r.amt IS NULL")
+        .expect("full join with IS NULL");
+    assert_eq!(names(&full), vec![Some("c".to_string())], "FULL join: the left-only pad survives IS NULL");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     // The SMALLER side (s, the left/probe-by-size) has a DUPLICATE join key, so build-on-smaller hits
     // DuplicateBuildKey -> the executor falls back to building on the LARGER (unique) side. This

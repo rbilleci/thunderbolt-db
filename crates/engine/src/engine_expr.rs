@@ -104,54 +104,6 @@ pub(crate) struct JoinRelationRef {
 /// absolute row index can never be `u32::MAX` (residency row counts are far smaller), so it is unambiguous.
 const JOIN_NULL_ROW: u32 = u32::MAX;
 
-/// 3-valued AND/OR (`None` = UNKNOWN), used to fold a WHERE predicate's truth on an outer join's NULL pad.
-fn null_pad_and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
-    match (a, b) {
-        (Some(false), _) | (_, Some(false)) => Some(false),
-        (Some(true), Some(true)) => Some(true),
-        _ => None,
-    }
-}
-fn null_pad_or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
-    match (a, b) {
-        (Some(true), _) | (_, Some(true)) => Some(true),
-        (Some(false), Some(false)) => Some(false),
-        _ => None,
-    }
-}
-
-/// The 3-valued truth of a per-relation WHERE predicate when EVERY column it references is NULL -- i.e.
-/// its value on an OUTER join's synthetic NULL-pad row (M3 -- doc 21). `Some(true)` = the predicate HOLDS
-/// on the pad (e.g. `col IS NULL`, the anti-join), so the padded tuple must be KEPT; `Some(false)` / `None`
-/// (UNKNOWN) = dropped (SQL WHERE keeps only TRUE). `Err` = a predicate shape whose pad truth this does not
-/// model, surfaced as a clean error rather than risk a silent mis-answer. (The actual DATA rows are still
-/// evaluated on the GPU; only the synthetic pad -- which the join creates host-side -- is resolved here.)
-fn predicate_truth_on_null_pad(expr: &ResidentExpr) -> Result<Option<bool>, ExecuteError> {
-    use ResidentBinaryOp::{And, Eq, Ge, Gt, Le, Like, Lt, Ne, Or};
-    match expr {
-        // IS NULL is TRUE on a NULL column (the anti-join idiom); IS NOT NULL is FALSE.
-        ResidentExpr::IsNull { is_not_null, .. } => Ok(Some(!is_not_null)),
-        ResidentExpr::BoolLiteral(b) => Ok(Some(*b)),
-        ResidentExpr::Binary { op: And, lhs, rhs } => Ok(null_pad_and3(
-            predicate_truth_on_null_pad(lhs)?,
-            predicate_truth_on_null_pad(rhs)?,
-        )),
-        ResidentExpr::Binary { op: Or, lhs, rhs } => Ok(null_pad_or3(
-            predicate_truth_on_null_pad(lhs)?,
-            predicate_truth_on_null_pad(rhs)?,
-        )),
-        // Any comparison / LIKE references a column that is NULL on the pad -> UNKNOWN.
-        ResidentExpr::Binary { op: Eq | Ne | Lt | Le | Gt | Ge | Like, .. } => Ok(None),
-        // A bare column used as a boolean predicate (`WHERE flag`) is NULL on the pad -> UNKNOWN.
-        ResidentExpr::Column(_) => Ok(None),
-        // Arithmetic / scalar literals are not top-level predicates; surface rather than guess.
-        _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "a WHERE clause of this shape on the NULL-padded side of an OUTER JOIN is a follow-up"
-                .to_string(),
-        ))),
-    }
-}
-
 /// One INNER-join step in a left-deep chain. Its condition is one of: explicit ON `conjuncts`
 /// (`a.k1=b.k1 [AND a.k2=b.k2]` -- in each pair one operand resolves to the newly joined relation
 /// `relations[k+1]`, the other to an accumulated one); `USING(cols)`, which the parser desugars to
@@ -1877,6 +1829,26 @@ impl Engine {
         }
     }
 
+    /// Whether a per-relation WHERE predicate evaluates to TRUE on an OUTER join's synthetic all-NULL pad
+    /// row -- decided ON-DEVICE (S6 -- doc 22), replacing the host Kleene `predicate_truth_on_null_pad`.
+    /// Build a 1-row TRANSIENT relation whose every column is NULL and run the predicate through the SAME
+    /// GPU WHERE-3VL mask VM as the real rows (`lower_resident_predicate`); the pad survives iff row 0
+    /// survives. On the all-NULL row a comparison/arithmetic/bare-column leaf is AND'd with the (all-zero)
+    /// validity mask -> UNKNOWN -> excluded; `col IS NULL` reads the 0 validity bit -> TRUE (the anti-join);
+    /// AND/OR fold via the VM's Kleene masks. So the host no longer evaluates 3VL -- the GPU does. A
+    /// predicate shape the VM cannot lower over a nullable column clean-errors there (the engine-wide WHERE
+    /// 3VL limitation), exactly as the real-row survivor pass would for the same shape.
+    fn predicate_holds_on_null_pad(
+        &self,
+        predicate: &ResidentExpr,
+        table: &RelationalTable,
+    ) -> Result<bool, ExecuteError> {
+        let null_row = vec![vec![SqlValue::Null; table.columns.len()]];
+        let (snapshot, memory) = self.build_transient_relation_residency(table, &null_row)?;
+        let survivors = self.lower_resident_predicate(predicate, table, &snapshot, &memory, 1)?;
+        Ok(!survivors.is_empty())
+    }
+
     /// Execute a LEFT-DEEP chain of INNER equi-joins (M5) on the GPU. `tables`/`rows`/`predicates` are
     /// parallel to `plan.relations` (one per relation, all bound at ONE catalog generation by the
     /// caller). Each step GPU-pre-filters the newly joined relation by its WHERE, projects the two
@@ -2177,8 +2149,9 @@ impl Engine {
         let mut keep_masks: Vec<Option<Vec<bool>>> = vec![None; n_rel];
         // pad_survives[i] = does relation i's predicate hold on a NULL pad (a tuple where relation i is
         // NULL-padded)? `col IS NULL` (the anti-join) holds -> such tuples are KEPT; comparisons are
-        // UNKNOWN -> dropped. Resolved from the predicate's truth on an all-NULL row (a per-relation
-        // constant). Only consulted for outer_where relations.
+        // UNKNOWN -> dropped. Resolved ON-DEVICE (S6 -- doc 22) by `predicate_holds_on_null_pad`: the
+        // predicate's truth on the all-NULL pad is a GPU WHERE-3VL decision, not a host Kleene fold. Only
+        // consulted for outer_where relations.
         let mut pad_survives: Vec<bool> = vec![false; n_rel];
         for (i, (entry, dm, n)) in sides.iter().enumerate() {
             let surv = match &predicates[i] {
@@ -2192,10 +2165,8 @@ impl Engine {
                 _ => (0..*n as u32).collect(),
             };
             if outer_where && predicates[i].is_some() {
-                pad_survives[i] = matches!(
-                    predicate_truth_on_null_pad(predicates[i].as_ref().unwrap())?,
-                    Some(true)
-                );
+                pad_survives[i] =
+                    self.predicate_holds_on_null_pad(predicates[i].as_ref().unwrap(), &tables[i])?;
                 let mut mask = vec![false; *n];
                 for &r in &surv {
                     mask[r as usize] = true;
