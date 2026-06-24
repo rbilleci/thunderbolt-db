@@ -153,7 +153,7 @@ is optional; each line is struck through only when it runs on the device.
     empty-`abs`) — fault-injection-proven non-vacuous. **After V1a the ONLY remaining join `host_rows` data
     read is `key_present`.**
   - [x] **V1b — NULL-key skip IN the kernels (HAZARD-class). DONE + audited SHIP.** PLUMB (all 8 kernels) +
-    **WIRE `5724bf55` + adopted audit tests `<pending>`.** `key_present` (`~2352`) read
+    **WIRE `5724bf55` + adopted audit tests `67c7db99`.** `key_present` (`~2352`) read
     `host_rows` for the NULL check → an optional validity-bitmap param on the 8 build/probe/emit kernels
     (`expr_proto.ptx`), NULL key skipped ON-DEVICE (sentinel `u64::MAX`=no-bitmap=byte-identical; mirrors the
     grouped-agg null-skip idiom `~7619-7630`). Host: gather per-key validity from the device, pack a dense
