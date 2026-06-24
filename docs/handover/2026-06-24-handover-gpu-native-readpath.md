@@ -71,7 +71,7 @@ Per slice, in order, every time:
   producing the bug in the first place, with the audit as backstop — not relying on the audit to catch
   carelessness.
 
-## 4. State (branch `phase0-m1-engine-facade`, HEAD `3295e955`, NOT merged to `main`)
+## 4. State (branch `phase0-m1-engine-facade`, HEAD `13d3783b` at handover, NOT merged to `main`)
 
 **DONE + each independently audited SHIP this session:**
 
