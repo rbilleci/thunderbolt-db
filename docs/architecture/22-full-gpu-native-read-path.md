@@ -223,9 +223,30 @@ is optional; each line is struck through only when it runs on the device.
   V1: source keys from the device payload, like `key_i64` already does).
 
 ### Resident-probe fallback branches
-- [ ] **S8 — `!gpu_ordered` host finalization in resident-probe.** Host sort/HAVING/LIMIT
-  branches at `engine_resident_probe.rs:3145-3187` and `3383-3425` → on-device (or route to the
-  GPU-ordered path so the branch is dead, then delete it).
+- [ ] **S8 — `!gpu_ordered` host finalization in resident-probe. APPROACH CHOSEN (user, 2026-06-24): ROUTE to
+  the general executor + RETIRE the legacy path (NOT reimplement-in-place — that path is slated for S9/S10
+  deletion, so in-place would be throwaway).** SCOPED 2026-06-24:
+  - **The branches.** Two legacy resident-probe grouped methods host-finalize sort/HAVING/LIMIT:
+    `execute_relational_grouped_aggregate_with_resident_device_memory_probe` (`engine_resident_probe.rs:2893`;
+    `!gpu_ordered` at `~3144`, reached when `use_gpu=false` = AVG ordering / non-i64 / non-translatable HAVING)
+    and `execute_relational_filtered_grouped_aggregate_..._probe` (`:3214`; `gpu_ordered=false` ALWAYS at
+    `~3348` → host sort/HAVING/LIMIT for EVERY filtered grouped query). These are `*_probe` canned-matcher
+    shape methods (the charter rule-2 anti-pattern). Routes are int4-group + int4-value ONLY
+    (`resident_route.rs:399`), a strict subset of what the general executor does on-device (S2/S3/S4).
+  - **The dispatch.** `execute_relational_select_text(text)` (`engine_select_exec.rs:80`) already routes
+    GPU-sortable projections on a resident table to the general executor `execute_resident_expr_select_sql(text)`
+    (`:98`, gated by `select_is_gpu_sortable_projection`); else `execute_relational_select` → the enumerated
+    route dispatch (`:439/:442`) → the two probe methods. **PLAN:** add a gate predicate (mirror the grouped
+    route classification) so `int4_grouped_aggregate` + `int4_filtered_grouped_aggregate` on a resident table
+    route to `execute_resident_expr_select_sql(text)` too; then DELETE the two probe methods + their route
+    classifiers + dispatch arms + the now-dead `gpu_order`/`gpu_having` machinery.
+  - **⚠️ THE RISK (do this FRESH, audit hard).** Behavior-EQUIVALENCE between the two executors: the enumerated
+    path emits `Int8` for COUNT, `Int4` for MIN/MAX, specific column names, a group-ASC tie-break, an AVG
+    Numeric representation, and specific HAVING/ORDER BY/LIMIT semantics. The general executor must match ALL of
+    these or it is a SILENT WRONG ANSWER (this is the exact compatibility-minefield class that produced the 4
+    HAVING regressions). **Before deleting anything: a DIFFERENTIAL test (enumerated route vs general route,
+    same queries, byte-identical rows+types+names) over COUNT/SUM/AVG/MIN/MAX × {plain, HAVING, ORDER BY agg,
+    ORDER BY group, LIMIT, filtered} — like the S6 62-shape probe.** Then the independent adversarial audit.
 
 ### Retire the host relational path entirely (the "incl. oracle" decision)
 - [ ] **S9 — replace CPU-oracle parity tests with GPU-native oracles** (serial-vs-parallel /
