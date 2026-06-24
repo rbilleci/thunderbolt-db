@@ -93,19 +93,17 @@ is optional; each line is struck through only when it runs on the device.
     FULLY on-device.**
 
 ### Result-stage operators on the general executor
-- [ ] **S3 — HAVING on-device.** First attempt (`488083ea`, transient relation + `lower_resident_predicate`)
-  was **REVERTED `4582c1d7`** — independent audit caught a **P0**: a `SUM(int2/int4)` result is *declared*
-  `Int4` in the catalog but its materialized value is `Int8` (the old host `retain` compared `SqlValue`s so
-  the skew was harmless; routing it into `build_transient_relation_residency`'s int4 payload section rejects
-  the Int8 value → `HAVING SUM(int4) > c` ERRORED). Plus a structural flaw: the WHERE predicate VM evaluates
-  a predicate at ONE type-width, but HAVING mixes widths (int4 key + int8 COUNT) → `HAVING g>=2 AND COUNT(*)>1`
-  clean-errored. **LESSON: the transient-relation + WHERE-VM reuse is the WRONG approach for HAVING.**
-  **CORRECT REDO (the direct approach):** build the result payload, evaluate EACH filter as its own device
-  compare→i32 mask at the column's ACTUAL value type (CompareScalar i32/i64/i128 / TextEqMask / BoolMask,
-  value encoded per column), then combine masks ON-DEVICE per DNF (`gpu_db_mask_binary` AND within a group,
-  OR across), then compact → survivors. Each filter is single-type (no mixed-width issue) and the column type
-  is taken from the materialized value (no declared-vs-value skew). NULL aggregate result → predicate UNKNOWN
-  → row dropped (3VL).
+- [x] **S3 — HAVING on-device.** First attempt (`488083ea`) was REVERTED (`4582c1d7`) after the audit caught
+  a P0. **REDO DONE `35f60719`** (suite 235/0; re-audit running). The host `rows.retain` is gone: the grouped
+  result is a TRANSIENT device relation, the HAVING DNF → a `ResidentExpr`, evaluated by the SAME device
+  predicate VM as WHERE (`lower_resident_predicate`) → survivor indices. **THE FIX (vs the reverted attempt):
+  build the HAVING transient with every INTEGER-FAMILY column + value PROMOTED to `Int8`** — this corrects
+  BOTH (1) the P0 (`SUM(int*)` is declared Int4 but valued Int8 → the catalog type mis-routed it into the int4
+  payload section) AND (2) the mixed-width wall (the predicate VM is single-width, but HAVING mixes int4-key +
+  int8-COUNT; promotion makes it a single i64 width). New test `gpu_grouped_having_sum_and_dnf_runs_on_gpu`
+  reproduces the audit's exact failing cases (`SUM(int4)`, int-key AND/OR int8-count). **NARROW OPEN GAP
+  (S3.1):** a timestamp/uuid HAVING CONSTANT clean-errors (predicate-IR literal gap; no test hits it).
+  **LESSON RECORDED: the audit gate caught the P0 before merge — rushing produced it, the rigor stopped it.**
 - [ ] **S4 — LIMIT/OFFSET on-device.** `engine_expr.rs:~4205` and `~4955` host `drain/truncate`. Note:
   the rows are sorted on-device (`gpu_sort_permutation` now returns the index vector), so LIMIT/OFFSET is
   best applied to the PERMUTATION before the final gather — materialize only the kept window. (Slicing an
