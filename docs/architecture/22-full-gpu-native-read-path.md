@@ -152,7 +152,8 @@ is optional; each line is struck through only when it runs on the device.
     (uuid byte-order exactness, numeric mantissa negatives/cross-32-bit, multi-way b128, N:N + NULL gate,
     empty-`abs`) — fault-injection-proven non-vacuous. **After V1a the ONLY remaining join `host_rows` data
     read is `key_present`.**
-  - [ ] **V1b — NULL-key skip IN the kernels (HAZARD-class, next).** `key_present` (`~2352`) reads
+  - [x] **V1b — NULL-key skip IN the kernels (HAZARD-class). DONE + audited SHIP.** PLUMB (all 8 kernels) +
+    **WIRE `5724bf55` + adopted audit tests `<pending>`.** `key_present` (`~2352`) read
     `host_rows` for the NULL check → an optional validity-bitmap param on the 8 build/probe/emit kernels
     (`expr_proto.ptx`), NULL key skipped ON-DEVICE (sentinel `u64::MAX`=no-bitmap=byte-identical; mirrors the
     grouped-agg null-skip idiom `~7619-7630`). Host: gather per-key validity from the device, pack a dense
@@ -173,13 +174,24 @@ is optional; each line is struck through only when it runs on the device.
     faults), 265/0; **combined 6-kernel audit SHIP** (byte-identical proven two ways incl. an 800×800 multi-block
     scale test vs parent; per-kernel register safety incl. the `%vsent`-vs-`%end` separation; launcher arg
     counts recounted; HAZARD clean on `atom.cas.b128`). **ALL 8 hash-join kernels are now PLUMBED + audited**
-    (validity param + dormant skip, sentinel passed; byte-identical). **NEXT = the single WIRE slice:** in `execute_resident_expr_inner_join`
-    gather per-key validity from the device payload (`project_bool` at the key column's null offset, ANDed
-    across composite members), pack dense LSB-first u32 bitmaps, pass real bitmaps to the kernels through the
-    `hash_join`/`text_hash_join` closures (swap with build/probe like the keys), map carried `JOIN_NULL_ROW`
-    → validity 0, DELETE the host `key_present` `host_rows` read + the `acc_keep`/`new_keep` filter, and
-    simplify the OUTER remapping (kernel-skipped NULL keys fall through as unmatched → padded). HAZARD + a
-    COMPREHENSIVE adversarial audit (this activates the skip + removes the last join `host_rows` data read).
+    (validity param + dormant skip, sentinel passed; byte-identical). **WIRE DONE `5724bf55`:** in
+    `execute_resident_expr_inner_join` the host `key_present` `host_rows` read + `acc_keep`/`new_keep` filter
+    are DELETED; the FULL carried index vectors are joined; per-key validity is gathered FROM THE DEVICE
+    (`resident_device_null_column_offset` → `project_bool_rows_from_payload`), ANDed across composite members,
+    a carried `JOIN_NULL_ROW` marked invalid; packed into dense LSB-first u32 bitmaps (all-valid → None → the
+    sentinel fast path = no-NULL join byte-identical) passed through the `hash_join`/`text_hash_join` closures
+    (SWAP with build/probe incl. the `DuplicateBuildKey` re-swap; N:N build_validity=acc). `key_i64`/
+    `key_texts`/`key_b128` map `JOIN_NULL_ROW`→placeholder 0 + guard a 0-row relation; the OUTER remap
+    simplifies (orig = p). NULL fixed-width cells store a 0 placeholder (NULL int8 = 0, not i64::MIN), so the
+    launcher's i64::MIN reject is not tripped. **THE LAST join `host_rows` DATA read is GONE** (only a
+    `host_rows.len()` control-plane count assert remains). Verify: full suite **274/0**; +4 V1b NULL-key tests
+    (scale/grid-stride placeholder-0-vs-real-key-0, int2/int8/uuid, int+text N:N, RIGHT/FULL OUTER padding) +
+    **5 adopted `audit_v1b_*` tests** (all-NULL build column, build-side swap, composite member-AND, anti-join
+    `LEFT JOIN..WHERE inner IS NULL` silent-data-loss, 32-bit bitmap word boundary); HAZARD 39 join 3×seq +
+    2×conc, zero 700/716/717 (incl. `atom.cas.b128`). **Independent adversarial audit: SHIP** (host-parent
+    `02ab08e7`) — non-vacuity fault-injection-proven (skip disabled ⇒ all 10 tests fail with the exact
+    spurious matches; polarity inversion confirmed load-bearing), PTX `%vsent`-vs-`%end` register-safe in both
+    N:N emit kernels, charter-clean. All 9 adopted tests re-verified non-vacuous locally (fail skip-disabled).
 - [ ] **S6 — join pad-WHERE 3VL on-device (V2).** `predicate_truth_on_null_pad` host Kleene
   (`engine_expr.rs:108-153`) → evaluate the all-NULL pad via the device WHERE-3VL mask VM.
 - [x] **S7 — join result materialization on-device (V3 + values).** DONE `70758557`, audited SHIP. The
@@ -212,8 +224,9 @@ is optional; each line is struck through only when it runs on the device.
 ## 5. Sequencing
 
 S1 ✅ → **S2 (keystone, the big one)** ✅ → S3 ✅ → S4 ✅ (result-stage operators; small, mechanical) →
-S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 (V1, NULL-key skip + key-value
-gather, the HAZARD-class kernel slice — NEXT)** → S6 (V2, pad-WHERE 3VL) → S8 (probe fallback) →
+S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 V1a ✅ + V1b PLUMB ✅ + V1b WIRE
+✅ `5724bf55` (audit running) — the HAZARD-class kernel slice; the last join `host_rows` data read is GONE**
+→ **S6 (V2, pad-WHERE 3VL) — NEXT** → S8 (probe fallback) →
 S9 (GPU-native oracles) → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
 no-kernel first, then the kernel work fresh.)_
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2

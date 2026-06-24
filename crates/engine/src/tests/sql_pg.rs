@@ -1001,6 +1001,202 @@ fn gpu_join_null_keys_right_and_full_outer_padded_v1b() {
     );
 }
 
+// ── V1b WIRE adversarial regression net (adopted from the independent audit of `5724bf55`) ───────────
+// Each was fault-injection-proven non-vacuous by the auditor: with the on-device skip disabled (bitmaps
+// forced to None), each FAILS with the exact spurious match noted. They isolate cases the author's 4 v1b
+// tests don't: build-side swap, an all-NULL build column, composite member-AND, the anti-join silent
+// data-loss, and the 32-bit bitmap word boundary.
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_v1b_all_null_build_column_empty_effective_build() {
+    // An ENTIRELY-NULL build key column: every build key is skipped on-device => the effective build is
+    // empty => nothing matches, EVEN against a real probe key 0. The build's placeholder index 0 is itself
+    // a NULL row. Skip-disabled: the two NULL build rows (placeholder key 0) collide => DuplicateBuildKey =>
+    // N:N => both spuriously match the probe's real key 0.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE ba (k INT, x TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE bb (k INT, y TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO ba (k,x) VALUES (NULL,'a0'),(NULL,'a1')").unwrap();
+    e.execute_text(4, "INSERT INTO bb (k,y) VALUES (0,'b0'),(5,'b5')").unwrap();
+    let bas = e.populate_relational_residency_snapshot("ba").unwrap();
+    let bbs = e.populate_relational_residency_snapshot("bb").unwrap();
+    if bas.device_memory_proof.is_none() || bbs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM ba JOIN bb ON ba.k = bb.k")
+        .expect("all-NULL build column join");
+    assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
+    assert!(
+        res.rows.is_empty(),
+        "an all-NULL build key column matches nothing -- not even the probe's real key 0; got {:?}",
+        res.rows
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_v1b_null_on_build_side_when_smaller_side_swaps() {
+    // The bitmaps must SWAP with the keys when the smaller side becomes the build. Here the NEW (right) side
+    // is smaller, so the hash join builds on it (build/probe swap); the right bitmap must follow to the build
+    // slot. NULLs on BOTH sides. Skip-disabled or a mis-swapped bitmap => a NULL row leaks into the result.
+    let mut e = Engine::new_local();
+    // acc (left) = 3 rows incl a NULL; new (right) = 2 rows incl a NULL => smaller_is_left = false => the
+    // build swaps to the right side.
+    e.execute_text(1, "CREATE TABLE sa (k INT, x TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE sb (k INT, y TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO sa (k,x) VALUES (1,'a1'),(2,'a2'),(NULL,'anull')").unwrap();
+    e.execute_text(4, "INSERT INTO sb (k,y) VALUES (1,'b1'),(NULL,'bnull')").unwrap();
+    let sas = e.populate_relational_residency_snapshot("sa").unwrap();
+    let sbs = e.populate_relational_residency_snapshot("sb").unwrap();
+    if sas.device_memory_proof.is_none() || sbs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM sa JOIN sb ON sa.k = sb.k")
+        .expect("build-side-swap NULL-key join");
+    let mut got: Vec<(String, String)> = res
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (SqlValue::Text(a), SqlValue::Text(b)) => (a.clone(), b.clone()),
+            o => panic!("expected (text,text), got {o:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![("a1".to_string(), "b1".to_string())],
+        "only key 1 matches; the NULL rows on both sides are skipped even though build/probe swapped"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_v1b_composite_one_member_null_other_equals_real_row() {
+    // A composite key where ONE member is NULL but the other equals a real row's member. Validity must be
+    // AND'd across BOTH members, so `(5,NULL)` is skipped. The NULL member's 0 placeholder makes `(5,NULL)`
+    // pack identically to a real `(5,0)` row on the other side -- if validity were checked on member0 only,
+    // `(5,NULL)` would spuriously match `(5,0)`.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE ca (k1 INT, k2 INT, x TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE cb (k1 INT, k2 INT, y TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO ca (k1,k2,x) VALUES (5,7,'match'),(5,NULL,'pnull')").unwrap();
+    e.execute_text(4, "INSERT INTO cb (k1,k2,y) VALUES (5,7,'cb7'),(5,0,'cb0')").unwrap();
+    let cas = e.populate_relational_residency_snapshot("ca").unwrap();
+    let cbs = e.populate_relational_residency_snapshot("cb").unwrap();
+    if cas.device_memory_proof.is_none() || cbs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT x, y FROM ca JOIN cb ON ca.k1 = cb.k1 AND ca.k2 = cb.k2",
+        )
+        .expect("composite NULL-member join");
+    let mut got: Vec<(String, String)> = res
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (SqlValue::Text(a), SqlValue::Text(b)) => (a.clone(), b.clone()),
+            o => panic!("expected (text,text), got {o:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![("match".to_string(), "cb7".to_string())],
+        "(5,NULL) is skipped (validity AND'd across members); no spurious ('pnull','cb0')"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_v1b_anti_join_left_where_inner_is_null_with_null_keys() {
+    // The anti-join `LEFT JOIN ... WHERE inner IS NULL` with NULL keys on BOTH sides. The left NULL-key row
+    // matches nothing => it is NULL-padded => WHERE inner IS NULL KEEPS it. If the two NULL rows spuriously
+    // matched, the left NULL-key row would be a MATCH (inner not NULL) and silently DROPPED -- data loss.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE la (id INT, name TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE lb (rid INT, label TEXT)").unwrap();
+    e.execute_text(3, "INSERT INTO la (id,name) VALUES (1,'a'),(NULL,'lnull')").unwrap();
+    e.execute_text(4, "INSERT INTO lb (rid,label) VALUES (1,'x'),(NULL,'rnull')").unwrap();
+    let las = e.populate_relational_residency_snapshot("la").unwrap();
+    let lbs = e.populate_relational_residency_snapshot("lb").unwrap();
+    if las.device_memory_proof.is_none() || lbs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql(
+            "SELECT name FROM la LEFT JOIN lb ON la.id = lb.rid WHERE lb.label IS NULL",
+        )
+        .expect("anti-join with NULL keys");
+    let mut got: Vec<String> = res
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            SqlValue::Text(s) => s.clone(),
+            o => panic!("expected text, got {o:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["lnull".to_string()],
+        "the unmatched NULL-key left row is padded + kept by WHERE inner IS NULL (not spuriously matched)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn audit_v1b_null_at_word_boundary_index_32() {
+    // The ONLY NULL key is at row index 32 -- bitmap word 1 (32>>5), bit 0 (32&31). Catches any off-by-one
+    // in the kernel's bitmap word/bit math: exactly row 32 must be skipped, every other row matches 1:1.
+    let mut e = Engine::new_local();
+    const N: i32 = 40;
+    let mut wa = String::new();
+    let mut wb = String::new();
+    for i in 0..N {
+        if i > 0 {
+            wa.push(',');
+            wb.push(',');
+        }
+        if i == 32 {
+            wa.push_str(&format!("(NULL,'a{i}')"));
+        } else {
+            wa.push_str(&format!("({i},'a{i}')"));
+        }
+        wb.push_str(&format!("({i},'b{i}')"));
+    }
+    e.execute_text(1, "CREATE TABLE wa (k INT, x TEXT)").unwrap();
+    e.execute_text(2, "CREATE TABLE wb (k INT, y TEXT)").unwrap();
+    e.execute_text(3, &format!("INSERT INTO wa (k,x) VALUES {wa}")).unwrap();
+    e.execute_text(4, &format!("INSERT INTO wb (k,y) VALUES {wb}")).unwrap();
+    let was = e.populate_relational_residency_snapshot("wa").unwrap();
+    let wbs = e.populate_relational_residency_snapshot("wb").unwrap();
+    if was.device_memory_proof.is_none() || wbs.device_memory_proof.is_none() {
+        return;
+    }
+    let res = e
+        .execute_resident_expr_select_sql("SELECT x, y FROM wa JOIN wb ON wa.k = wb.k")
+        .expect("word-boundary NULL-key join");
+    let mut got: Vec<(String, String)> = res
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (SqlValue::Text(a), SqlValue::Text(b)) => (a.clone(), b.clone()),
+            o => panic!("expected (text,text), got {o:?}"),
+        })
+        .collect();
+    got.sort();
+    let mut expected: Vec<(String, String)> = (0..N)
+        .filter(|&i| i != 32)
+        .map(|i| (format!("a{i}"), format!("b{i}")))
+        .collect();
+    expected.sort();
+    assert_eq!(got, expected, "exactly row 32 (word 1, bit 0) is skipped; all others match 1:1");
+}
+
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
