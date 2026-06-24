@@ -13,7 +13,7 @@ use gpu_db_execution::{
     CudaI32EqualAnyProjectSubmission, CudaI32GroupedStats, CudaI32Stats, CudaMvccRowBatch,
     CudaOwnedDeviceMemoryChunk,
     CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
-    ExprStep, FilterOperator, GroupedI64Order, GroupedI64SortColumn, LimitOperator,
+    ExprStep, FilterOperator, LimitOperator,
     ResidentElemType,
     MockGpuRuntime, Operator,
     PlannedOp, ProjectOperator, RouteDecision, ScanOperator, SortOperator,

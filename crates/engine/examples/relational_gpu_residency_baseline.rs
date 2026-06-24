@@ -1516,8 +1516,9 @@ fn timed_resident_device_grouped_aggregate_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result =
-        engine.execute_relational_grouped_aggregate_with_resident_device_memory_probe(query)?;
+    // S8: grouped aggregates run via the `&Select`->general BRIDGE, reached through the public route
+    // dispatch (`execute_relational_select`); the legacy resident-probe grouped methods were retired.
+    let result = engine.execute_relational_select(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
@@ -1558,8 +1559,9 @@ fn timed_resident_device_filtered_grouped_aggregate_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine
-        .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(query)?;
+    // S8: filtered grouped aggregates run via the `&Select`->general BRIDGE, reached through the public
+    // route dispatch (`execute_relational_select`); the legacy resident-probe grouped methods are gone.
+    let result = engine.execute_relational_select(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
