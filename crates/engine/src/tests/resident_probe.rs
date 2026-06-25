@@ -366,10 +366,11 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
     else {
         unreachable!()
     };
+    // S10a: the ordered projection now runs via the `&Select`->general bridge (the legacy
+    // resident-probe ordered method was retired); with no retained device memory it errors cleanly,
+    // like the grouped bridge above.
     let err = e
-        .execute_relational_ordered_projection_with_resident_device_memory_probe(
-            &ordered_projection_select,
-        )
+        .execute_resident_grouped_via_general(&ordered_projection_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -510,128 +511,6 @@ fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_tele
     assert_eq!(
         after_empty.kernel_exec_samples - before_empty.kernel_exec_samples,
         1
-    );
-}
-
-#[test]
-fn gpu_resident_device_memory_ordered_projection_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
-        .unwrap();
-    e.execute_text(
-            2,
-            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (3, 'gamma', 20), (4, 'delta', 40)",
-        )
-        .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
-    if snapshot.device_memory_proof.is_none() {
-        return;
-    }
-    let Command::Select(select) = parse_command(
-        "SELECT amount FROM events WHERE amount >= 20 ORDER BY amount DESC LIMIT 2 OFFSET 1",
-    )
-    .unwrap() else {
-        unreachable!()
-    };
-    let before = e.metrics().snapshot();
-    let resident = e
-        .execute_relational_ordered_projection_with_resident_device_memory_probe(&select)
-        .unwrap();
-    let after = e.metrics().snapshot();
-
-    // Closed-form oracle (S9): amount>=20 sorted DESC = [40,30,20]; LIMIT 2 OFFSET 1 -> [30,20].
-    assert_eq!(
-        resident.rows,
-        vec![vec![SqlValue::Int4(30)], vec![SqlValue::Int4(20)]]
-    );
-    assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(resident.fallback_reason, None);
-    assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
-    assert_eq!(
-        after.d2h_bytes_total - before.d2h_bytes_total,
-        2 * std::mem::size_of::<i32>() as u64 + std::mem::size_of::<u64>() as u64
-    );
-    assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
-
-    e.mark_gpu_memory_pressured(0);
-    assert!(e
-        .execute_relational_ordered_projection_with_resident_device_memory_probe(&select)
-        .unwrap_err()
-        .to_string()
-        .contains("resident snapshot is invalid"));
-}
-
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn gpu_s10a_ordered_projection_bridge_matches_probe_differential() {
-    // S10a PROOF (throwaway, pre-deletion): the `&Select`->general bridge
-    // (`execute_resident_grouped_via_general`, which builds EMPTY group keys for a non-grouped select)
-    // must be BYTE-IDENTICAL to the legacy `int4_ordered_projection` resident-probe over the ordered
-    // single-int4-column shape, so routing the dispatch arm to the bridge and DELETING the probe is
-    // behavior-preserving. The projected column IS the sort key, so tied values are IDENTICAL output
-    // rows -- no tie-break ambiguity (unlike the S8 grouped `ORDER BY <aggregate>` trap). Data has ties
-    // (5x3, 1x2, -3x2), negatives, zero, and needles that empty the result.
-    let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
-    e.execute_text(
-        2,
-        "INSERT INTO p (a) VALUES (5), (1), (5), (-3), (0), (5), (2), (-3), (10), (1)",
-    )
-    .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("p").unwrap();
-    if snapshot.device_memory_proof.is_none() {
-        return;
-    }
-
-    // The probe requires: single int4 projection == filter == order column, ONE non-equality range
-    // predicate, ORDER BY that column, LIMIT (OFFSET requires ORDER BY + LIMIT). Sweep the four range
-    // ops, ASC/DESC, LIMIT {0,1,3,100}, OFFSET {none,1,5(past end)}, and empty-result needles.
-    let mut shapes: Vec<String> = Vec::new();
-    for op in [">=", ">", "<", "<="] {
-        for needle in [-3, 0, 2, 5, 100] {
-            for dir in ["", " DESC"] {
-                for limit in [0usize, 1, 3, 100] {
-                    shapes.push(format!(
-                        "SELECT a FROM p WHERE a {op} {needle} ORDER BY a{dir} LIMIT {limit}"
-                    ));
-                    for offset in [1usize, 5] {
-                        shapes.push(format!(
-                            "SELECT a FROM p WHERE a {op} {needle} ORDER BY a{dir} LIMIT {limit} OFFSET {offset}"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut divergences = 0usize;
-    for sql in &shapes {
-        let Command::Select(select) =
-            parse_command(sql).unwrap_or_else(|_| panic!("parse failed: {sql}"))
-        else {
-            panic!("not a SELECT: {sql}");
-        };
-        let probe = e
-            .execute_relational_ordered_projection_with_resident_device_memory_probe(&select)
-            .unwrap_or_else(|err| panic!("probe failed for {sql}: {err:?}"));
-        let bridge = e
-            .execute_resident_grouped_via_general(&select)
-            .unwrap_or_else(|err| panic!("bridge failed for {sql}: {err:?}"));
-        if probe.columns != bridge.columns || probe.rows != bridge.rows {
-            divergences += 1;
-            eprintln!(
-                "DIVERGENCE for {sql}\n  probe.cols ={:?}\n  bridge.cols={:?}\n  probe.rows ={:?}\n  bridge.rows={:?}",
-                probe.columns, bridge.columns, probe.rows, bridge.rows
-            );
-        }
-        assert_eq!(probe.executed_target, DeviceTarget::Gpu(0), "probe off GPU: {sql}");
-        assert_eq!(bridge.executed_target, DeviceTarget::Gpu(0), "bridge off GPU: {sql}");
-    }
-    assert_eq!(
-        divergences, 0,
-        "{divergences} probe-vs-bridge divergences across {} ordered-projection shapes",
-        shapes.len()
     );
 }
 

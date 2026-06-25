@@ -372,14 +372,23 @@ is optional; each line is struck through only when it runs on the device.
 
   **Decomposed into per-gap slices (each GPU-native, differential-tested, INDEPENDENTLY audited; deletion
   is gated on coverage, so it goes LAST):**
-  - [ ] **S10a — non-grouped `&Select`->general bridge + route the on-device-capable shapes.** projection /
+  - [~] **S10a — non-grouped `&Select`->general bridge + route the on-device-capable shapes.** projection /
     equality / ordered / partitioned / between / membership / text_prefix_count / filter_group_count are
     already expressible on-device (the WHERE predicate VM + GPU sort + the per-type
-    `project_*_rows_from_payload` gather, S1–S4). Build the non-grouped bridge (mirror
-    `execute_resident_grouped_via_general`: bind, rebuild the predicate DNF from `bound` filters, clear the
-    bound filters, call `execute_resident_expr_select_with_binding` with empty group keys), route these
-    shapes, then DELETE those probe methods. Per-shape differential (probe-vs-general over tie / boundary /
-    empty data — recall the S8 tie-break + the S9 empty-result quirks), audit each.
+    `project_*_rows_from_payload` gather, S1–S4). **KEY FINDING (2026-06-25): the bridge already EXISTS** —
+    `execute_resident_grouped_via_general` builds an EMPTY group-key list when `group_by == None`, so it
+    already routes a non-grouped select through `execute_resident_expr_select_with_binding`'s plain-projection
+    path. No new bridge function needed; S10a is per-shape ROUTE + DELETE + differential + audit.
+    - [x] **`int4_ordered_projection` DONE** (route `36470be8`; probe delete + test/example migration this
+      commit). Single-int4-column ordered projection (`SELECT a FROM t WHERE a <range> ORDER BY a LIMIT n`)
+      now routes through the bridge; proven byte-identical to the deleted probe by a 480-shape probe-vs-bridge
+      differential (ties/negatives/zero/empty), non-vacuity sabotage-proven; keeper closed-form dispatch test
+      `gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch`. Suite 720/0. The projected column IS the
+      sort key, so ties are identical output rows (no S8 tie-break trap).
+    - [ ] **Remaining shapes:** projection / equality / partitioned ×8 / between / membership / text_prefix /
+      filter_group_count. NOTE the predicate builder `resident_predicate_from_bound_filters` currently emits
+      `numeric_mode=false` Int4 literals only (the grouped route's guarantee) — non-int4 filter constants
+      (text equality, etc.) need the literal builder extended. Per-shape differential + audit each.
   - [ ] **S10b — on-device DISTINCT (closes gap 1).** `SELECT DISTINCT a` ≡ `GROUP BY a` with no aggregate
     (one rep row per distinct key — S2 grouping + S2.1 ordering + S4 LIMIT/OFFSET are all already on-device),
     so route `int4_[filtered_]distinct_projection` through the grouped machinery (or add a dedicated

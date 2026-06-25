@@ -1808,11 +1808,15 @@ impl Engine {
         )
     }
 
-    /// `&Select`->general-executor BRIDGE for grouped int4 aggregates (S8). Runs a grouped aggregate
-    /// `Select` (the int4-group + int4-value shapes the route classifier accepts) through the SAME
-    /// on-device general executor as the SQL->Expr path, retiring the legacy resident-probe grouped
-    /// methods whose `!gpu_ordered` branches did a HOST sort / HAVING / LIMIT (a charter violation --
-    /// relational finalization on the host). The general executor does ORDER BY / HAVING / LIMIT
+    /// `&Select`->general-executor BRIDGE (S8 grouped int4 aggregates; S10a non-grouped projections).
+    /// Runs a `Select` through the SAME on-device general executor as the SQL->Expr path, retiring the
+    /// legacy resident-probe methods. For a GROUPED select it normalizes the legacy 1-aggregate
+    /// projection and runs the grouped path (the int4-group + int4-value shapes the route classifier
+    /// accepts); for a NON-grouped select (`group_by == None`) `grouped_projection_to_aggregates` is a
+    /// no-op and the group-key list is EMPTY, so the binding executor runs the plain-projection path
+    /// (WHERE VM + GPU sort + LIMIT/OFFSET window) -- this is how S10a routes the `int4_ordered_projection`
+    /// shape, replacing its probe. The grouped probes' `!gpu_ordered` branches did a HOST sort / HAVING /
+    /// LIMIT (a charter violation -- relational finalization on the host). The general executor does ORDER BY / HAVING / LIMIT
     /// ON-DEVICE (S2/S3/S4), so this is behavior-preserving (enumerated == general proven 0/24
     /// differential; bridge == general re-verified before the probe methods were deleted; the general
     /// grouped ORDER BY now appends a group-key tie-break, matching the legacy group-ASC tie order).
