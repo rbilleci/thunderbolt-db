@@ -618,6 +618,205 @@ fn gpu_s10a_ordered_projection_drops_nulls_pg_correct() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10b_distinct_bridge_matches_probe_differential() {
+    // S10b PROOF (throwaway, pre-deletion): the DISTINCT bridge `execute_resident_distinct_via_general`
+    // (`SELECT DISTINCT a` == `GROUP BY a` `COUNT(*)` with the count column dropped) must match the legacy
+    // int4_[filtered_]distinct probe on NON-NULL data. WITH ORDER BY both are sorted -> byte-identical
+    // (proven here). WITHOUT ORDER BY the probe returns FIRST-SEEN order while the bridge returns the
+    // deterministic default grouped order (key ASC) -> SAME SET, different sequence (PG leaves it
+    // unspecified; like the S8 tie-break this only makes an unspecified order deterministic) -- covered as
+    // a sorted-set check by `gpu_s10b_distinct_routes_through_bridge_on_dispatch`. Data has duplicates (the
+    // point of DISTINCT) and no NULLs (the divergent axis, covered by the PG-correctness test).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO p (a) VALUES (5), (1), (5), (3), (0), (5), (2), (3), (10), (1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("p").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // Every query carries ORDER BY (so both paths are sorted -> byte-identical). Plain (no WHERE) hits the
+    // plain probe; WHERE hits the filtered probe.
+    let mut plain: Vec<String> = Vec::new();
+    for dir in ["", " DESC"] {
+        plain.push(format!("SELECT DISTINCT a FROM p ORDER BY a{dir}"));
+        for limit in [0usize, 1, 3, 100] {
+            plain.push(format!("SELECT DISTINCT a FROM p ORDER BY a{dir} LIMIT {limit}"));
+            for offset in [1usize, 5] {
+                plain.push(format!(
+                    "SELECT DISTINCT a FROM p ORDER BY a{dir} LIMIT {limit} OFFSET {offset}"
+                ));
+            }
+        }
+    }
+    let mut filtered: Vec<String> = Vec::new();
+    for op in [">=", ">", "<", "<="] {
+        for k in [0, 2, 5, 100] {
+            for dir in ["", " DESC"] {
+                filtered.push(format!(
+                    "SELECT DISTINCT a FROM p WHERE a {op} {k} ORDER BY a{dir} LIMIT 100"
+                ));
+            }
+        }
+    }
+
+    let mut divergences = 0usize;
+    for (sql, is_filtered) in plain
+        .iter()
+        .map(|s| (s, false))
+        .chain(filtered.iter().map(|s| (s, true)))
+    {
+        let Command::Select(select) =
+            parse_command(sql).unwrap_or_else(|_| panic!("parse failed: {sql}"))
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let probe = if is_filtered {
+            e.execute_relational_filtered_distinct_projection_with_resident_device_memory_probe(
+                &select,
+            )
+        } else {
+            e.execute_relational_distinct_projection_with_resident_device_memory_probe(&select)
+        }
+        .unwrap_or_else(|err| panic!("probe failed for {sql}: {err:?}"));
+        let bridge = e
+            .execute_resident_distinct_via_general(&select)
+            .unwrap_or_else(|err| panic!("bridge failed for {sql}: {err:?}"));
+        if probe.columns != bridge.columns || probe.rows != bridge.rows {
+            divergences += 1;
+            eprintln!(
+                "DIVERGENCE for {sql}\n  probe.cols ={:?}\n  bridge.cols={:?}\n  probe.rows ={:?}\n  bridge.rows={:?}",
+                probe.columns, bridge.columns, probe.rows, bridge.rows
+            );
+        }
+        assert_eq!(bridge.executed_target, DeviceTarget::Gpu(0), "bridge off GPU: {sql}");
+    }
+    assert_eq!(
+        divergences, 0,
+        "{divergences} probe-vs-bridge DISTINCT divergences across {} ordered shapes",
+        plain.len() + filtered.len()
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10b_distinct_routes_through_bridge_on_dispatch() {
+    // S10b keeper: a single-int4-column SELECT DISTINCT reaches the int4_[filtered_]distinct route arms
+    // through the LIVE `&Select` dispatch and executes via the DISTINCT bridge ON THE GPU, closed-form.
+    // Survives the probes' deletion (calls the dispatch). The no-ORDER-BY case pins the deterministic
+    // default order (key ASC) the grouped path produces.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO p (a) VALUES (5), (1), (5), (3), (0), (5), (2), (3), (10), (1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("p").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i4 = |vs: &[i32]| vs.iter().map(|&v| vec![SqlValue::Int4(v)]).collect::<Vec<_>>();
+    let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
+        // distinct = {0,1,2,3,5,10}; no ORDER BY -> deterministic default order = key ASC.
+        ("SELECT DISTINCT a FROM p", i4(&[0, 1, 2, 3, 5, 10])),
+        ("SELECT DISTINCT a FROM p ORDER BY a DESC LIMIT 3", i4(&[10, 5, 3])),
+        ("SELECT DISTINCT a FROM p WHERE a >= 2 ORDER BY a", i4(&[2, 3, 5, 10])),
+        ("SELECT DISTINCT a FROM p WHERE a >= 100 ORDER BY a", vec![]),
+    ];
+    for (sql, expected) in cases {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(result.fallback_reason, None, "fell back: {sql}");
+        assert_eq!(&result.rows, expected, "rows mismatch: {sql}");
+    }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
+    // S10b NULL regression: the retired distinct probes were NULL-BLIND (host BTreeSet over the raw int4
+    // column -> a NULL placeholder-0 surfaced as a phantom Int4(0)). The DISTINCT bridge groups a NULL key
+    // into one group -> DISTINCT keeps exactly ONE SqlValue::Null row and NO phantom Int4(0) (PG-correct).
+    // The data has NO real 0, so any Int4(0) would be the bug. Filtered DISTINCT excludes NULL via 3VL.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE p2 (a INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO p2 (a) VALUES (5), (1), (NULL), (3), (5), (NULL), (2), (1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("p2").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // Unfiltered DISTINCT keeps the NULL group.
+    let sql = "SELECT DISTINCT a FROM p2 ORDER BY a";
+    let Command::Select(select) = parse_command(sql).unwrap() else {
+        unreachable!()
+    };
+    let dispatch = e.execute_relational_select(&select).unwrap();
+    assert_eq!(dispatch.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(dispatch.fallback_reason, None);
+    let nulls = dispatch.rows.iter().filter(|r| r[0] == SqlValue::Null).count();
+    let zeros = dispatch
+        .rows
+        .iter()
+        .filter(|r| r[0] == SqlValue::Int4(0))
+        .count();
+    assert_eq!(nulls, 1, "DISTINCT must keep exactly one NULL group: {sql}");
+    assert_eq!(zeros, 0, "phantom Int4(0) from a NULL (the retired probe's bug): {sql}");
+    let mut nonnull: Vec<i32> = dispatch
+        .rows
+        .iter()
+        .filter_map(|r| match r[0] {
+            SqlValue::Int4(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    nonnull.sort_unstable();
+    assert_eq!(nonnull, vec![1, 2, 3, 5], "non-null distinct set wrong: {sql}");
+    // Cross-check: the general SQL->Expr path has NO DISTINCT (it errors), but `SELECT DISTINCT a` is
+    // exactly `GROUP BY a` (count dropped) -- so the DISTINCT bridge must equal an explicit GROUP BY run
+    // through that general path on the SAME NULL data, proving the transform is faithful (incl. the NULL group).
+    assert!(e
+        .execute_resident_expr_select_sql(sql)
+        .unwrap_err()
+        .to_string()
+        .contains("DISTINCT is not on the general GPU executor"));
+    let mut grouped = e
+        .execute_resident_expr_select_sql("SELECT a, COUNT(*) FROM p2 GROUP BY a ORDER BY a")
+        .unwrap();
+    grouped.columns.truncate(1);
+    for row in &mut grouped.rows {
+        row.truncate(1);
+    }
+    assert_eq!(dispatch.rows, grouped.rows, "DISTINCT bridge != explicit GROUP BY (NULL): {sql}");
+    assert_eq!(dispatch.columns, grouped.columns, "bridge cols != GROUP BY cols: {sql}");
+
+    // Filtered DISTINCT: a NULL fails `a >= 2` (3VL) -> excluded; result has no NULL and no phantom 0.
+    let fsql = "SELECT DISTINCT a FROM p2 WHERE a >= 2 ORDER BY a";
+    let Command::Select(fselect) = parse_command(fsql).unwrap() else {
+        unreachable!()
+    };
+    let filtered = e.execute_relational_select(&fselect).unwrap();
+    assert_eq!(
+        filtered.rows,
+        vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(5)]],
+        "filtered DISTINCT (a>=2): {fsql}"
+    );
+}
+
+#[test]
 fn gpu_resident_device_memory_distinct_projection_probe_materializes_int4_results() {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, bucket INT)")

@@ -462,12 +462,14 @@ impl Engine {
             // byte-identical to the legacy `int4_ordered_projection` probe (the projected column IS the
             // sort key, so tied values are identical output rows). Covers text + CTAS + view uniformly.
             "int4_ordered_projection" => self.execute_resident_grouped_via_general(select),
-            "int4_distinct_projection" => self
-                .execute_relational_distinct_projection_with_resident_device_memory_probe(select),
-            "int4_filtered_distinct_projection" => self
-                .execute_relational_filtered_distinct_projection_with_resident_device_memory_probe(
-                    select,
-                ),
+            // S10b: a single-int4-column SELECT DISTINCT routes through the `&Select`->general DISTINCT
+            // bridge (`SELECT DISTINCT a` == `GROUP BY a` `COUNT(*)` with the count dropped) -- one row per
+            // distinct key ON THE DEVICE, retiring the probes that deduped on a HOST `BTreeSet` (a §1
+            // violation relabeled as GPU). Covers text + CTAS + view uniformly. NULL/no-ORDER-BY results
+            // become PG-correct (NULL group kept, not a phantom 0; default order key-ASC, deterministic).
+            "int4_distinct_projection" | "int4_filtered_distinct_projection" => {
+                self.execute_resident_distinct_via_general(select)
+            }
             shape => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident route accepted unsupported execution shape: {shape}"
             )))),

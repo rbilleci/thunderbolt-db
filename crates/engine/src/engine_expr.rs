@@ -1876,6 +1876,53 @@ impl Engine {
         )
     }
 
+    /// S10b: `&Select`->general BRIDGE for a single-column `SELECT DISTINCT` (the int4_[filtered_]distinct
+    /// route shapes). DISTINCT over column `a` is exactly `GROUP BY a` with no aggregate; the most-audited
+    /// on-device grouped path (S8) is built around >=1 aggregate, so synthesize a `COUNT(*)` grouped select,
+    /// run it through `execute_resident_grouped_via_general` (one row per distinct key, ON THE DEVICE -- the
+    /// retired probe deduped on a HOST `BTreeSet`), then DROP the trailing COUNT column. WHERE / ORDER BY a /
+    /// LIMIT / OFFSET ride the grouped select unchanged. **PG-correct on NULLs** (a behavior change vs the
+    /// retired probe, like the S10a ordered projection): GROUP BY groups a NULL key into one group (M3
+    /// NULL-key slot) -> DISTINCT yields ONE `SqlValue::Null` row, whereas the NULL-blind probe read the int4
+    /// column directly and surfaced a NULL as a phantom `Int4(0)`. For the FILTERED shape a NULL fails the
+    /// range predicate (3VL) so it is excluded either way. **No-ORDER-BY order:** the probe returned
+    /// first-seen order; the grouped path returns the deterministic default order (key ASC) -- same SET, a
+    /// PG-unspecified sequence made deterministic (like the S8 tie-break).
+    pub(crate) fn execute_resident_distinct_via_general(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let SelectProjection::Columns(columns) = &select.projection else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident DISTINCT bridge requires a column projection".to_string(),
+            )));
+        };
+        let [column] = columns.as_slice() else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident DISTINCT bridge currently supports a single projected column".to_string(),
+            )));
+        };
+        // SELECT DISTINCT a [WHERE ..] [ORDER BY a] [LIMIT ..] == SELECT a, COUNT(*) FROM t [WHERE ..]
+        // GROUP BY a [ORDER BY a] [LIMIT ..], with the COUNT column dropped from the result.
+        let mut grouped = select.clone();
+        grouped.distinct = false;
+        grouped.group_by = Some(column.clone());
+        grouped.projection = SelectProjection::GroupedAggregates {
+            group_column: column.clone(),
+            aggregates: vec![GroupedAggregate {
+                kind: GroupedAggKind::Count,
+                value_column: None,
+            }],
+        };
+        let mut result = self.execute_resident_grouped_via_general(&grouped)?;
+        // Drop the trailing COUNT(*) column -> the bare distinct keys (column 0 is the group key).
+        result.columns.truncate(1);
+        for row in &mut result.rows {
+            row.truncate(1);
+        }
+        Ok(result)
+    }
+
     /// Benchmark helper (tests only): run GROUP BY on a resident table with the SINGLE-LEVEL or
     /// TWO-LEVEL kernel selected explicitly, over a full-table scan. Returns the result rows so the
     /// caller can confirm both kernels agree; the caller times repeated calls. Not on the query path.
