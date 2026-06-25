@@ -759,6 +759,56 @@ fn gpu_s10a_projection_drops_nulls_pg_correct() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
+    // S10a keeper: an int4 multi-group COUNT(*) reaches the int4_filter_group_count route arm through the
+    // LIVE dispatch and executes via the bridge ON THE GPU, closed-form. NULL regression: a NULL in the
+    // filter column fails the predicate via 3VL (excluded), so the bridge does NOT phantom-count it as the
+    // retired probe did (NULL placeholder-0 -> matched `a = 0`).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE cnt (a INT, label TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO cnt (a, label) VALUES (1,'alpha'),(5,'beta'),(2,'alpaca'),(5,'gamma'),(8,'alps'),(1,'delta')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("cnt").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let count = |e: &Engine, sql: &str| -> SqlValue {
+        let Command::Select(s) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let r = e.execute_relational_select(&s).unwrap();
+        assert_eq!(r.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        r.rows[0][0].clone()
+    };
+    assert_eq!(count(&e, "SELECT COUNT(*) FROM cnt WHERE a = 1 OR a = 5"), SqlValue::Int8(4));
+    assert_eq!(count(&e, "SELECT COUNT(*) FROM cnt WHERE a >= 2 AND a <= 8"), SqlValue::Int8(4));
+
+    // NULL data: real 0s (x2) + a NULL (x2) + a 5; `a = 0 OR a = 5` counts the 3 real matches, NOT the NULLs.
+    let mut e2 = Engine::new_local();
+    e2.execute_text(1, "CREATE TABLE cntn (a INT)").unwrap();
+    e2.execute_text(2, "INSERT INTO cntn (a) VALUES (0), (NULL), (5), (NULL), (0), (1)")
+        .unwrap();
+    if e2
+        .populate_relational_residency_snapshot("cntn")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
+        return;
+    }
+    assert_eq!(
+        count(&e2, "SELECT COUNT(*) FROM cntn WHERE a = 0 OR a = 5"),
+        SqlValue::Int8(3),
+        "NULL phantom-counted as 0 (probe bug regressed)?"
+    );
+}
+
+#[test]
 fn relational_select_grouped_having_filters_engine_aggregate_rows() {
     let e = Engine::new_local();
     e.execute_text(
@@ -979,92 +1029,6 @@ fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
     };
     assert!(e
         .execute_relational_between_count_with_resident_device_memory_probe(&select)
-        .unwrap_err()
-        .to_string()
-        .contains("resident snapshot is invalid"));
-}
-
-#[test]
-fn gpu_resident_device_memory_filter_group_count_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
-        .unwrap();
-    e.execute_text(
-            2,
-            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (3, 'gamma', 20), (4, 'delta', 40), (5, 'epsilon', 5), (6, 'zeta', 60)",
-        )
-        .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
-    if snapshot.device_memory_proof.is_none() {
-        return;
-    }
-
-    // Closed-form oracles (S9): rows (id,amount) = (1,10),(2,30),(3,20),(4,40),(5,5),(6,60).
-    // id>=2 AND amount<=40 -> {2,3,4,5} = 4; (id=1&amt>=10)|(id=4&amt<=40) -> {1,4} = 2;
-    // id<=2 OR amount>=50 -> {1,2,6} = 3.
-    for (sql, expected) in [
-        ("SELECT COUNT(*) FROM events WHERE id >= 2 AND amount <= 40", SqlValue::Int8(4)),
-        (
-            "SELECT COUNT(*) FROM events WHERE (id = 1 AND amount >= 10) OR (id = 4 AND amount <= 40)",
-            SqlValue::Int8(2),
-        ),
-        ("SELECT COUNT(*) FROM events WHERE id <= 2 OR amount >= 50", SqlValue::Int8(3)),
-    ] {
-        let Command::Select(select) = parse_command(sql).unwrap() else {
-            unreachable!()
-        };
-        let before = e.metrics().snapshot();
-        let resident = e
-            .execute_relational_filter_group_count_with_resident_device_memory_probe(&select)
-            .unwrap();
-        let after = e.metrics().snapshot();
-
-        assert_eq!(resident.rows, vec![vec![expected]], "{sql}");
-        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
-        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
-        assert_eq!(resident.fallback_reason, None, "{sql}");
-        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0, "{sql}");
-        assert!(after.d2h_bytes_total > before.d2h_bytes_total, "{sql}");
-        assert!(
-            after.kernel_exec_samples > before.kernel_exec_samples,
-            "{sql}"
-        );
-    }
-
-    let Command::Select(unsupported_text_like) =
-        parse_command("SELECT COUNT(*) FROM events WHERE label LIKE 'a%'").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_relational_filter_group_count_with_resident_device_memory_probe(
-            &unsupported_text_like,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("supports only int4 literal predicates"));
-
-    let Command::Select(unsupported_ordered) =
-        parse_command("SELECT COUNT(*) FROM events WHERE id >= 2 ORDER BY count").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_relational_filter_group_count_with_resident_device_memory_probe(
-            &unsupported_ordered,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("SELECT COUNT(*) with int4 WHERE filter groups"));
-
-    e.mark_gpu_memory_pressured(0);
-    let Command::Select(select) =
-        parse_command("SELECT COUNT(*) FROM events WHERE id >= 2 AND amount <= 40").unwrap()
-    else {
-        unreachable!()
-    };
-    assert!(e
-        .execute_relational_filter_group_count_with_resident_device_memory_probe(&select)
         .unwrap_err()
         .to_string()
         .contains("resident snapshot is invalid"));
