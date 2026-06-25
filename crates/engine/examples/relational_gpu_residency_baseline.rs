@@ -1379,8 +1379,9 @@ fn timed_resident_device_distinct_projection_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result =
-        engine.execute_relational_distinct_projection_with_resident_device_memory_probe(query)?;
+    // S10b: SELECT DISTINCT runs via the `&Select`->general DISTINCT bridge, reached through the public
+    // route dispatch (`execute_relational_select`); the legacy resident-probe distinct method was retired.
+    let result = engine.execute_relational_select(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
@@ -1421,8 +1422,9 @@ fn timed_resident_device_filtered_distinct_projection_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine
-        .execute_relational_filtered_distinct_projection_with_resident_device_memory_probe(query)?;
+    // S10b: filtered SELECT DISTINCT runs via the `&Select`->general DISTINCT bridge through the public
+    // route dispatch (`execute_relational_select`); the legacy resident-probe method was retired.
+    let result = engine.execute_relational_select(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
