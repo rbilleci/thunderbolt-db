@@ -1926,6 +1926,11 @@ impl Engine {
     pub(crate) fn execute_resident_grouped_via_general(
         &self,
         select: &Select,
+        // `None` = look up the table's whole-table single resident store by name (the original
+        // text/CTAS/view callers). `Some(src)` INJECTS an already-built source (S10c slice 2b: the
+        // unified multi-partition buffer recompacted by `execute_resident_partitioned_via_general`), so
+        // the same on-device grouped/distinct/ordered path serves the partitioned shapes.
+        src: Option<&ResidentExecSource>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Normalize the legacy 1-aggregate grouped projection (GroupedCount / GroupedSum / GroupedAvg /
         // GroupedMin / GroupedMax produced by the hand-rolled parser) to the general GroupedAggregates
@@ -1958,7 +1963,7 @@ impl Engine {
         self.execute_resident_expr_select_with_binding(
             select,
             &table,
-            None,
+            src,
             bound,
             copin_s,
             predicate.as_ref(),
@@ -2175,6 +2180,23 @@ impl Engine {
             row_count: total_row_count as u64,
         };
 
+        // S10c slice 2b: DISTINCT / GROUP BY / ORDER-BY-projection are CORRECT over the unified buffer (it
+        // holds the WHOLE table), so route each to the grouped/distinct sub-bridge with the unified source
+        // injected. These sub-bridges re-bind + re-derive the WHERE predicate INTERNALLY from `select`, so
+        // they need only `select` + `Some(&unified_src)` (the outer filter-cleared `bound` is unused by
+        // them). Order matters: DISTINCT carries no `group_by` but synthesizes one internally, so it must be
+        // checked first; a grouped select may ALSO carry ORDER BY and must take the grouped path. The plain
+        // scalar/projection shapes fall through to the COUNT-precheck + single run below (unchanged).
+        if select.distinct {
+            return self.execute_resident_distinct_via_general(select, Some(&unified_src));
+        }
+        if select.group_by.is_some() {
+            return self.execute_resident_grouped_via_general(select, Some(&unified_src));
+        }
+        if !select.order_by.is_empty() {
+            return self.execute_resident_grouped_via_general(select, Some(&unified_src));
+        }
+
         // All-empty handling (pins byte-identicality with slice 1): the general SUM/MIN/MAX/AVG hard-error
         // on an empty filtered set, so first run a COUNT(*) over the unified buffer; if it is 0 AND the
         // projection is an aggregate, return the SAME placeholder slice 1 did.
@@ -2230,6 +2252,10 @@ impl Engine {
     pub(crate) fn execute_resident_distinct_via_general(
         &self,
         select: &Select,
+        // `None` = look up the table's whole-table single resident store by name (the original callers).
+        // `Some(src)` forwards an injected source to the grouped bridge it synthesizes (S10c slice 2b:
+        // the unified multi-partition buffer), so DISTINCT runs on-device over the whole table.
+        src: Option<&ResidentExecSource>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let SelectProjection::Columns(columns) = &select.projection else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -2253,7 +2279,7 @@ impl Engine {
                 value_column: None,
             }],
         };
-        let mut result = self.execute_resident_grouped_via_general(&grouped)?;
+        let mut result = self.execute_resident_grouped_via_general(&grouped, src)?;
         // Drop the trailing COUNT(*) column -> the bare distinct keys (column 0 is the group key).
         result.columns.truncate(1);
         for row in &mut result.rows {

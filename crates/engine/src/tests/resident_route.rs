@@ -3377,3 +3377,285 @@ fn p8_partitioned_resident_rejects_nonuniform_int4_layout() {
         "unexpected error: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------------
+// S10c slice 2b: partitioned DISTINCT / GROUP BY / ORDER-BY-projection.
+//
+// The partitioned bridge recompacts the whole table into ONE unified int4 buffer, so DISTINCT / GROUP BY /
+// ORDER BY are CORRECT over it (it sees every row). Each fixture below builds the SAME logical rows TWICE:
+// once as N device partitions (the SoA-bytes `build_partitions` pattern) and once as ONE single-store
+// snapshot (rows INSERTed via `execute_text`, then `populate_relational_residency_snapshot`). The
+// single-store engine is the ORACLE: it runs the SAME bridge over a whole-table store. We run the SAME SQL
+// through `execute_relational_select` on each engine and assert the columns AND rows are byte-identical, plus
+// the partitioned route's `accepted` / `query_shape` / `executed_target == Gpu(0)`.
+//
+// Logical rows for table `pt (k INT, v INT)` across THREE partitions (the cross-partition cases are the
+// whole point): k=42 appears in p0 (twice) AND p2 -> ONE grouped/distinct row; k=1 spans p0+p1; k=5 spans
+// p1+p2. `ORDER BY k DESC LIMIT 4` over all rows -> [42,42,42,9] drawn from p0 AND p2 (spans partitions).
+//
+//   p0: (42,10) (1,20) (42,30)
+//   p1: (3,5)   (1,15) (5,25)
+//   p2: (42,40) (5,50) (9,60)
+
+#[cfg(test)]
+fn s10c_2b_partition_values() -> [[Vec<i32>; 2]; 3] {
+    [
+        [vec![42, 1, 42], vec![10, 20, 30]],
+        [vec![3, 1, 5], vec![5, 15, 25]],
+        [vec![42, 5, 9], vec![40, 50, 60]],
+    ]
+}
+
+#[cfg(test)]
+fn s10c_2b_logical_rows() -> Vec<(i32, i32)> {
+    // The same rows in published partition order ((row_start, partition_id) — here partition order), so the
+    // single-store oracle holds the identical multiset.
+    let mut rows = Vec::new();
+    for [ks, vs] in s10c_2b_partition_values() {
+        for (k, v) in ks.into_iter().zip(vs) {
+            rows.push((k, v));
+        }
+    }
+    rows
+}
+
+/// Install the three partitions for `pt (k INT, v INT)` as SoA device bytes (8-byte row-count header, then
+/// k contiguous, then v contiguous). Returns `None` (caller should `return`) if there is no local GPU/driver.
+#[cfg(test)]
+fn s10c_2b_partitioned_engine() -> Option<Engine> {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE pt (k INT, v INT)").unwrap();
+    let partitions = s10c_2b_partition_values()
+        .iter()
+        .enumerate()
+        .map(|(partition_id, columns)| {
+            let row_count = columns[0].len();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
+            for column in columns {
+                for value in column {
+                    bytes.extend_from_slice(&(*value).to_le_bytes());
+                }
+            }
+            BenchmarkRelationalResidencyOwnedPartition {
+                partition_id: partition_id as u32,
+                row_start: partition_id * row_count + 1,
+                row_count,
+                resident_bytes: bytes.len() as u64,
+                allocated_bytes: bytes.len() as u64,
+                resident_device_int4_columns: vec!["k".to_string(), "v".to_string()],
+                resident_device_text_columns: Vec::new(),
+                chunks: vec![CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes,
+                }],
+            }
+        })
+        .collect::<Vec<_>>();
+    match e.install_benchmark_relational_residency_owned_partitions(
+        BenchmarkRelationalResidencyOwnedPartitionInstall {
+            table: "pt",
+            gpu_id: 0,
+            partitions,
+        },
+    ) {
+        Ok(()) => Some(e),
+        Err(err) => {
+            assert!(
+                err.to_string().contains("CUDA"),
+                "unexpected partition install error: {err}"
+            );
+            None
+        }
+    }
+}
+
+/// Install the same logical rows as ONE whole-table single-store snapshot (the ORACLE). Returns `None`
+/// (caller should `return`) if there is no local GPU/driver (no device-memory proof).
+#[cfg(test)]
+fn s10c_2b_single_store_engine() -> Option<Engine> {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE pt (k INT, v INT)").unwrap();
+    let values = s10c_2b_logical_rows()
+        .into_iter()
+        .map(|(k, v)| format!("({k}, {v})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    e.execute_text(2, &format!("INSERT INTO pt (k, v) VALUES {values}"))
+        .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("pt").unwrap();
+    snapshot.device_memory_proof.is_some().then_some(e)
+}
+
+/// Run `sql` on the partitioned engine and on the single-store oracle, assert the partitioned route is
+/// accepted with `expected_shape` and executed on GPU(0), and assert the partitioned result is byte-identical
+/// to the oracle's.
+#[cfg(test)]
+fn s10c_2b_assert_partitioned_matches_oracle(
+    partitioned: &Engine,
+    oracle: &Engine,
+    sql: &str,
+    expected_shape: &str,
+) {
+    let Command::Select(select) = parse_command(sql).unwrap() else {
+        unreachable!()
+    };
+    let route = partitioned.plan_relational_resident_route(&select);
+    assert!(route.accepted, "{sql}: route not accepted: {route:?}");
+    assert_eq!(route.query_shape, expected_shape, "{sql}");
+    assert_eq!(route.partition_count, 3, "{sql}");
+
+    let part = partitioned.execute_relational_select(&select).unwrap();
+    assert_eq!(part.executed_target, DeviceTarget::Gpu(0), "{sql}");
+    assert_eq!(part.fallback_reason, None, "{sql}");
+
+    let want = oracle.execute_relational_select(&select).unwrap();
+    assert_eq!(part.columns, want.columns, "{sql}: columns diverged");
+    assert_eq!(part.rows, want.rows, "{sql}: rows diverged from oracle");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn s10c_2b_partitioned_grouped_aggregate_matches_oracle() {
+    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+        return;
+    };
+    let Some(oracle) = s10c_2b_single_store_engine() else {
+        return;
+    };
+    // Cross-partition case (a): k=42 is present in p0 (twice) AND p2 -> ONE grouped row (COUNT 3, SUM 80).
+    // GROUP BY COUNT and GROUP BY SUM, with ORDER BY to pin order against the oracle.
+    s10c_2b_assert_partitioned_matches_oracle(
+        &partitioned,
+        &oracle,
+        "SELECT k, COUNT(*) FROM pt GROUP BY k ORDER BY k",
+        "partitioned_int4_grouped_aggregate",
+    );
+    s10c_2b_assert_partitioned_matches_oracle(
+        &partitioned,
+        &oracle,
+        "SELECT k, SUM(v) FROM pt GROUP BY k ORDER BY k",
+        "partitioned_int4_grouped_aggregate",
+    );
+    // Independently pin the k=42 collapse so the oracle equality can't pass on two matching-but-wrong sides.
+    let Command::Select(select) =
+        parse_command("SELECT k, COUNT(*) FROM pt GROUP BY k ORDER BY k").unwrap()
+    else {
+        unreachable!()
+    };
+    let rows = partitioned.execute_relational_select(&select).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Int4(1), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(3), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(5), SqlValue::Int8(2)],
+            vec![SqlValue::Int4(9), SqlValue::Int8(1)],
+            vec![SqlValue::Int4(42), SqlValue::Int8(3)],
+        ],
+        "k=42 (in p0 twice + p2) must collapse to ONE row with COUNT 3"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn s10c_2b_partitioned_filtered_grouped_aggregate_matches_oracle() {
+    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+        return;
+    };
+    let Some(oracle) = s10c_2b_single_store_engine() else {
+        return;
+    };
+    // Filtered grouped: WHERE v >= 25 keeps (1,? no) -> (42,30),(5,25),(42,40),(5,50),(9,60). k=42 still
+    // spans p0+p2 -> ONE row; k=5 still spans p1+p2 -> ONE row.
+    s10c_2b_assert_partitioned_matches_oracle(
+        &partitioned,
+        &oracle,
+        "SELECT k, COUNT(*) FROM pt WHERE v >= 25 GROUP BY k ORDER BY k",
+        "partitioned_int4_filtered_grouped_aggregate",
+    );
+    s10c_2b_assert_partitioned_matches_oracle(
+        &partitioned,
+        &oracle,
+        "SELECT k, SUM(v) FROM pt WHERE v >= 25 GROUP BY k ORDER BY k",
+        "partitioned_int4_filtered_grouped_aggregate",
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn s10c_2b_partitioned_distinct_projection_matches_oracle() {
+    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+        return;
+    };
+    let Some(oracle) = s10c_2b_single_store_engine() else {
+        return;
+    };
+    // Cross-partition case (c): DISTINCT k where k=42 (p0+p2), k=1 (p0+p1), k=5 (p1+p2) each yield ONE row.
+    s10c_2b_assert_partitioned_matches_oracle(
+        &partitioned,
+        &oracle,
+        "SELECT DISTINCT k FROM pt ORDER BY k",
+        "partitioned_int4_distinct_projection",
+    );
+    // Filtered DISTINCT: WHERE k >= 5 -> {5,9,42}; k=5 spans p1+p2, k=42 spans p0+p2 -> still one row each.
+    s10c_2b_assert_partitioned_matches_oracle(
+        &partitioned,
+        &oracle,
+        "SELECT DISTINCT k FROM pt WHERE k >= 5 ORDER BY k",
+        "partitioned_int4_filtered_distinct_projection",
+    );
+    // Independently pin the multi-partition DISTINCT key collapse.
+    let Command::Select(select) =
+        parse_command("SELECT DISTINCT k FROM pt ORDER BY k").unwrap()
+    else {
+        unreachable!()
+    };
+    let rows = partitioned.execute_relational_select(&select).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(5)],
+            vec![SqlValue::Int4(9)],
+            vec![SqlValue::Int4(42)],
+        ],
+        "DISTINCT keys present in multiple partitions must each yield ONE row"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn s10c_2b_partitioned_ordered_projection_matches_oracle() {
+    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+        return;
+    };
+    let Some(oracle) = s10c_2b_single_store_engine() else {
+        return;
+    };
+    // Cross-partition case (b): a global ORDER BY k DESC LIMIT 4 whose top-4 rows [42,42,42,9] are drawn
+    // from p0 (a 42) AND p2 (two 42s + the 9) — i.e. the top-N window spans MULTIPLE partitions.
+    s10c_2b_assert_partitioned_matches_oracle(
+        &partitioned,
+        &oracle,
+        "SELECT k FROM pt WHERE k >= 1 ORDER BY k DESC LIMIT 4",
+        "partitioned_int4_ordered_projection",
+    );
+    let Command::Select(select) =
+        parse_command("SELECT k FROM pt WHERE k >= 1 ORDER BY k DESC LIMIT 4").unwrap()
+    else {
+        unreachable!()
+    };
+    let rows = partitioned.execute_relational_select(&select).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqlValue::Int4(42)],
+            vec![SqlValue::Int4(42)],
+            vec![SqlValue::Int4(42)],
+            vec![SqlValue::Int4(9)],
+        ],
+        "the global top-4 (42,42,42,9) must span p0 and p2"
+    );
+}

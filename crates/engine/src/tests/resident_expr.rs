@@ -8505,7 +8505,7 @@ fn gpu_s8_bridge_matches_general_grouped_differential() {
             panic!("not a SELECT: {sql}");
         };
         let bridge = e
-            .execute_resident_grouped_via_general(&select)
+            .execute_resident_grouped_via_general(&select, None)
             .unwrap_or_else(|err| panic!("bridge failed for {sql}: {err:?}"));
         let general = e
             .execute_resident_expr_select_sql(sql)
@@ -8564,7 +8564,9 @@ fn audit_s8_filtered_grouped_having_order_limit() {
     );
     // The bridge produces the same result called directly as through the dispatch.
     assert_eq!(
-        e.execute_resident_grouped_via_general(&select).unwrap().rows,
+        e.execute_resident_grouped_via_general(&select, None)
+            .unwrap()
+            .rows,
         result.rows
     );
 }
@@ -8639,7 +8641,7 @@ fn audit_s8_where_and_or_dnf_matches_general() {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
-        let bridge = e.execute_resident_grouped_via_general(&select).unwrap();
+        let bridge = e.execute_resident_grouped_via_general(&select, None).unwrap();
         let general = e.execute_resident_expr_select_sql(sql).unwrap();
         assert_eq!(bridge.columns, general.columns, "{sql}");
         assert_eq!(bridge.rows, general.rows, "{sql}");

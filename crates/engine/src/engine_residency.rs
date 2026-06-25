@@ -1805,6 +1805,16 @@ impl Engine {
             && matches!(select.projection, SelectProjection::Max { .. })
         {
             "partitioned_int4_filtered_max".to_string()
+        } else if query_shape == "int4_distinct_projection" {
+            "partitioned_int4_distinct_projection".to_string()
+        } else if query_shape == "int4_filtered_distinct_projection" {
+            "partitioned_int4_filtered_distinct_projection".to_string()
+        } else if query_shape == "int4_grouped_aggregate" {
+            "partitioned_int4_grouped_aggregate".to_string()
+        } else if query_shape == "int4_filtered_grouped_aggregate" {
+            "partitioned_int4_filtered_grouped_aggregate".to_string()
+        } else if query_shape == "int4_ordered_projection" {
+            "partitioned_int4_ordered_projection".to_string()
         } else {
             query_shape
         };
@@ -1890,11 +1900,16 @@ impl Engine {
                 | "partitioned_int4_filtered_avg"
                 | "partitioned_int4_filtered_min"
                 | "partitioned_int4_filtered_max"
+                | "partitioned_int4_distinct_projection"
+                | "partitioned_int4_filtered_distinct_projection"
+                | "partitioned_int4_grouped_aggregate"
+                | "partitioned_int4_filtered_grouped_aggregate"
+                | "partitioned_int4_ordered_projection"
         ) {
             decision.cache_state = "Absent".to_string();
             decision.valid = false;
             decision.reason =
-                "partitioned resident routing currently supports only unfiltered COUNT(*), same-column int4 equality projection, int4 equality multi-column projection, int4 equality SUM, int4 BETWEEN AVG, int4 filtered AVG, int4 filtered MIN, and int4 filtered MAX"
+                "partitioned resident routing currently supports only unfiltered COUNT(*), same-column int4 equality projection, int4 equality multi-column projection, int4 equality SUM, int4 BETWEEN AVG, int4 filtered AVG, int4 filtered MIN, int4 filtered MAX, int4 [filtered] DISTINCT projection, int4 [filtered] grouped aggregate, and int4 ordered projection"
                     .to_string();
             return decision;
         }
@@ -1985,6 +2000,93 @@ impl Engine {
                 return decision;
             };
             required_int4_columns.insert(column.clone());
+            if let Some(filter) = &select.filter {
+                required_int4_columns.insert(filter.column.clone());
+            }
+            for filter in &select.filters {
+                required_int4_columns.insert(filter.column.clone());
+            }
+            for filter in select.filter_groups.iter().flatten() {
+                required_int4_columns.insert(filter.column.clone());
+            }
+        } else if matches!(
+            decision.query_shape.as_str(),
+            "partitioned_int4_grouped_aggregate" | "partitioned_int4_filtered_grouped_aggregate"
+        ) {
+            // Grouped int4 aggregate (S10c slice 2b): the per-partition layout check must cover both the
+            // GROUP BY key column AND the aggregated value column, plus every filter column. Mirror the
+            // route classifier's group/value extraction (resident_route.rs `resident_route_query_shape`):
+            // GroupedCount groups by `column` and counts it; the other grouped projections carry an
+            // explicit group/value column pair.
+            match &select.projection {
+                SelectProjection::GroupedCount { column } => {
+                    required_int4_columns.insert(column.clone());
+                }
+                SelectProjection::GroupedSum {
+                    group_column,
+                    sum_column,
+                } => {
+                    required_int4_columns.insert(group_column.clone());
+                    required_int4_columns.insert(sum_column.clone());
+                }
+                SelectProjection::GroupedAvg {
+                    group_column,
+                    avg_column,
+                } => {
+                    required_int4_columns.insert(group_column.clone());
+                    required_int4_columns.insert(avg_column.clone());
+                }
+                SelectProjection::GroupedMin {
+                    group_column,
+                    min_column,
+                } => {
+                    required_int4_columns.insert(group_column.clone());
+                    required_int4_columns.insert(min_column.clone());
+                }
+                SelectProjection::GroupedMax {
+                    group_column,
+                    max_column,
+                } => {
+                    required_int4_columns.insert(group_column.clone());
+                    required_int4_columns.insert(max_column.clone());
+                }
+                _ => {
+                    decision.cache_state = "Absent".to_string();
+                    decision.valid = false;
+                    decision.reason =
+                        "partitioned resident routing requires a grouped int4 aggregate projection"
+                            .to_string();
+                    return decision;
+                }
+            }
+            if let Some(filter) = &select.filter {
+                required_int4_columns.insert(filter.column.clone());
+            }
+            for filter in &select.filters {
+                required_int4_columns.insert(filter.column.clone());
+            }
+            for filter in select.filter_groups.iter().flatten() {
+                required_int4_columns.insert(filter.column.clone());
+            }
+        } else if matches!(
+            decision.query_shape.as_str(),
+            "partitioned_int4_distinct_projection"
+                | "partitioned_int4_filtered_distinct_projection"
+                | "partitioned_int4_ordered_projection"
+        ) {
+            // Single-column DISTINCT / ordered int4 projection (S10c slice 2b): the per-partition layout
+            // check must cover the single projected/distinct column plus every filter column. The route
+            // classifier accepts only a single projected column for these shapes.
+            let SelectProjection::Columns(columns) = &select.projection else {
+                decision.cache_state = "Absent".to_string();
+                decision.valid = false;
+                decision.reason =
+                    "partitioned resident routing requires a single projected int4 column".to_string();
+                return decision;
+            };
+            for column in columns {
+                required_int4_columns.insert(column.clone());
+            }
             if let Some(filter) = &select.filter {
                 required_int4_columns.insert(filter.column.clone());
             }
