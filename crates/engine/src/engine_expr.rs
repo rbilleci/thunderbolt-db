@@ -1855,6 +1855,18 @@ fn compile_bool_leaf(
     push_column_validity_and(col, table, snapshot, program)
 }
 
+/// The table payload `execute_resident_expr_select_with_binding` reads its rows from: the published
+/// device buffer + the matching catalog/GPU descriptor (whose `row_count` + `resident_device_*` section
+/// vectors define every column byte-offset) + the row count. Passing `None` makes the executor look these
+/// up by table name in the SINGLE resident store (the whole-table buffer), byte-identical to before;
+/// passing `Some(src)` INJECTS them so the SAME executor can serve one PARTITION slice (S10c) -- the
+/// injected descriptor's `row_count` + section vectors describe that slice. Whole-table callers pass `None`.
+pub(crate) struct ResidentExecSource {
+    pub(crate) descriptor: std::sync::Arc<RelationalResidencySnapshot>,
+    pub(crate) device_memory: std::sync::Arc<gpu_db_execution::CudaResidentDeviceMemory>,
+    pub(crate) row_count: u64,
+}
+
 impl Engine {
     /// General GPU executor entry (Charter rule 2): run `SELECT <int4 columns> FROM <table>` filtered
     /// by a general predicate [`ResidentExpr`], evaluating the predicate on the GPU via the device
@@ -1877,6 +1889,7 @@ impl Engine {
         self.execute_resident_expr_select_with_binding(
             select,
             &table,
+            None,
             bound,
             copin_s,
             Some(predicate),
@@ -1945,6 +1958,7 @@ impl Engine {
         self.execute_resident_expr_select_with_binding(
             select,
             &table,
+            None,
             bound,
             copin_s,
             predicate.as_ref(),
@@ -3085,6 +3099,10 @@ impl Engine {
         &self,
         select: &Select,
         table: &RelationalTable,
+        // `None` = look up the table payload (descriptor + device buffer + row count) by name in the
+        // SINGLE resident store (the whole-table buffer), as before. `Some(src)` INJECTS them so the
+        // same executor serves one partition slice (S10c). The identity/validity guards run for both.
+        src: Option<&ResidentExecSource>,
         bound: BoundRelationalSelect,
         copin_s: Index,
         // `None` = no WHERE clause: a full-table scan (every row survives).
@@ -3179,45 +3197,70 @@ impl Engine {
                 self.relational_select_mvcc_query_pinned(&ap_select, table, &bound, copin_s)?;
             access_path
         };
-        // Load the WHOLE residency entry (descriptor + host rows) from ONE atomic load() so a text
-        // GROUP BY key -- whose result string is read from host_rows[representative_row] -- sees host
-        // rows from the SAME generation as the descriptor / device memory the GPU grouped over.
-        let residency_entry = self
-            .relational_residency_entry(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no resident snapshot",
-                    table.name
-                )))
-            })?;
-        let snapshot = residency_entry.descriptor.clone();
-        if snapshot.schema != table.schema || snapshot.table != table.name {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot no longer matches catalog table identity".to_string(),
-            )));
-        }
-        if !snapshot.is_valid() {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" resident snapshot is invalid",
-                table.name
-            ))));
-        }
-        let device_memory = self
-            .read_state
-            .residency
-            .device_memory
-            .get(&table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    table.name
-                )))
-            })?;
-        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot row count exceeds retained device-memory proof range".to_string(),
-            ))
-        })?;
+        // The table payload the kernels read: the published device buffer + the catalog/GPU descriptor
+        // (its `row_count` + `resident_device_*` section vectors define every column byte-offset) + the
+        // row count. `None` looks these up by name in the SINGLE resident store -- byte-identical to the
+        // pre-S10c path: one atomic load of the descriptor, then the device-memory cell. `Some(src)`
+        // INJECTS them (S10c: one partition slice). The identity + validity guards run for BOTH, so a
+        // descriptor that drifted from the catalog or got invalidated is rejected either way. No
+        // `host_rows` read on this path: a text GROUP BY key result is materialized ON-DEVICE.
+        let (snapshot, device_memory, row_count) = match src {
+            Some(src) => {
+                let snapshot = src.descriptor.clone();
+                if snapshot.schema != table.schema || snapshot.table != table.name {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot no longer matches catalog table identity".to_string(),
+                    )));
+                }
+                if !snapshot.is_valid() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" resident snapshot is invalid",
+                        table.name
+                    ))));
+                }
+                (snapshot, src.device_memory.clone(), src.row_count)
+            }
+            None => {
+                let residency_entry = self
+                    .relational_residency_entry(&table.name)
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" has no resident snapshot",
+                            table.name
+                        )))
+                    })?;
+                let snapshot = residency_entry.descriptor.clone();
+                if snapshot.schema != table.schema || snapshot.table != table.name {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot no longer matches catalog table identity".to_string(),
+                    )));
+                }
+                if !snapshot.is_valid() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" resident snapshot is invalid",
+                        table.name
+                    ))));
+                }
+                let device_memory = self
+                    .read_state
+                    .residency
+                    .device_memory
+                    .get(&table.name)
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" has no retained resident device memory",
+                            table.name
+                        )))
+                    })?;
+                let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot row count exceeds retained device-memory proof range"
+                            .to_string(),
+                    ))
+                })?;
+                (snapshot, device_memory, row_count)
+            }
+        };
 
         // Evaluate the predicate on the GPU -> surviving row indices (ascending). With no WHERE clause
         // every row survives, so the indices are the full 0..row_count scan (the aggregate + projection

@@ -183,6 +183,7 @@ impl Engine {
         self.execute_resident_expr_select_with_binding(
             &select,
             &table,
+            None,
             bound,
             copin_s,
             predicate.as_ref(),
