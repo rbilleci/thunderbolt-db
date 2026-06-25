@@ -3182,3 +3182,198 @@ fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
     );
     status.validate().unwrap();
 }
+
+// S10c slice 2a: a partitioned int4 aggregate whose predicate matches ZERO rows across ALL
+// partitions. The recompacted unified buffer is run ONCE; the COUNT(*) precheck returns 0 and the
+// SUM projection yields the slice-1 / probe placeholder `SqlValue::Int8(0)` (rather than the general
+// SUM's empty-set hard error). This pins the all-empty path byte-identically with slice 1.
+#[test]
+fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+    )
+    .unwrap();
+
+    let partition_values: [[Vec<i32>; 4]; 4] = [
+        [
+            vec![1, 2, 3, 4],
+            vec![100, 101, 102, 103],
+            vec![5, 6, 7, 8],
+            vec![500, 501, 502, 503],
+        ],
+        [
+            vec![5, 6, 7, 8],
+            vec![200, 201, 202, 203],
+            vec![9, 10, 11, 12],
+            vec![600, 601, 602, 603],
+        ],
+        [
+            vec![9, 10, 11, 12],
+            vec![300, 301, 302, 303],
+            vec![13, 14, 15, 16],
+            vec![700, 701, 702, 703],
+        ],
+        [
+            vec![13, 14, 15, 16],
+            vec![400, 401, 402, 403],
+            vec![17, 18, 19, 20],
+            vec![800, 801, 802, 803],
+        ],
+    ];
+    let partitions = partition_values
+        .iter()
+        .enumerate()
+        .map(|(partition_id, columns)| {
+            let row_count = columns[0].len();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
+            for column in columns {
+                for value in column {
+                    bytes.extend_from_slice(&(*value).to_le_bytes());
+                }
+            }
+            BenchmarkRelationalResidencyOwnedPartition {
+                partition_id: partition_id as u32,
+                row_start: partition_id * row_count + 1,
+                row_count,
+                resident_bytes: bytes.len() as u64,
+                allocated_bytes: bytes.len() as u64,
+                resident_device_int4_columns: vec![
+                    "ol_o_id".to_string(),
+                    "ol_i_id".to_string(),
+                    "ol_quantity".to_string(),
+                    "ol_amount".to_string(),
+                ],
+                resident_device_text_columns: Vec::new(),
+                chunks: vec![CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes,
+                }],
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let installed = e.install_benchmark_relational_residency_owned_partitions(
+        BenchmarkRelationalResidencyOwnedPartitionInstall {
+            table: "order_line",
+            gpu_id: 0,
+            partitions,
+        },
+    );
+    if let Err(err) = installed {
+        assert!(
+            err.to_string().contains("CUDA"),
+            "unexpected partition install error: {err}"
+        );
+        return;
+    }
+
+    // ol_o_id is never 99999 in any partition, so the filtered set is empty across all partitions.
+    let Command::Select(select) =
+        parse_command("SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = 99999").unwrap()
+    else {
+        unreachable!()
+    };
+    let route = e.plan_relational_resident_route(&select);
+    assert!(route.accepted, "{route:?}");
+    assert_eq!(route.query_shape, "partitioned_int4_equality_sum");
+    assert_eq!(route.partition_count, 4);
+
+    let result = e.execute_relational_select(&select).unwrap();
+    // The all-empty placeholder is the slice-1 / probe value (Int8(0)), not a SUM hard error.
+    assert_eq!(result.rows, vec![vec![SqlValue::Int8(0)]]);
+    assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(result.fallback_reason, None);
+}
+
+// S10c slice 2a (audit F1): the recompaction indexes partition slices POSITIONALLY by int4 ordinal and
+// the unified descriptor labels the buffer with partition 0's int4 list, so a partition whose
+// `resident_device_int4_columns` disagrees with partition 0 (here the first two columns are swapped) must
+// be REJECTED with a clean error rather than silently recompacting a column's bytes into the wrong slot
+// (or reading past a too-short source). The partitioned benchmark install runs no layout validation, so
+// the bridge enforces uniformity itself; the route's referenced-column membership check does not catch it.
+#[test]
+fn p8_partitioned_resident_rejects_nonuniform_int4_layout() {
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+    )
+    .unwrap();
+
+    let layouts = [
+        vec![
+            "ol_o_id".to_string(),
+            "ol_i_id".to_string(),
+            "ol_quantity".to_string(),
+            "ol_amount".to_string(),
+        ],
+        vec![
+            // partition 1: ol_o_id / ol_i_id SWAPPED vs partition 0 (same set, different order).
+            "ol_i_id".to_string(),
+            "ol_o_id".to_string(),
+            "ol_quantity".to_string(),
+            "ol_amount".to_string(),
+        ],
+    ];
+    let partitions = layouts
+        .iter()
+        .enumerate()
+        .map(|(partition_id, int4_columns)| {
+            let row_count = 4_usize;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
+            for _ in 0..4 {
+                for value in 0..row_count as i32 {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            BenchmarkRelationalResidencyOwnedPartition {
+                partition_id: partition_id as u32,
+                row_start: partition_id * row_count + 1,
+                row_count,
+                resident_bytes: bytes.len() as u64,
+                allocated_bytes: bytes.len() as u64,
+                resident_device_int4_columns: int4_columns.clone(),
+                resident_device_text_columns: Vec::new(),
+                chunks: vec![CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes,
+                }],
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let installed = e.install_benchmark_relational_residency_owned_partitions(
+        BenchmarkRelationalResidencyOwnedPartitionInstall {
+            table: "order_line",
+            gpu_id: 0,
+            partitions,
+        },
+    );
+    if let Err(err) = installed {
+        assert!(
+            err.to_string().contains("CUDA"),
+            "unexpected partition install error: {err}"
+        );
+        return;
+    }
+
+    let Command::Select(select) =
+        parse_command("SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = 1").unwrap()
+    else {
+        unreachable!()
+    };
+    let route = e.plan_relational_resident_route(&select);
+    assert!(route.accepted, "{route:?}");
+
+    let err = e
+        .execute_relational_select(&select)
+        .expect_err("a non-uniform partition int4 layout must be rejected, not silently recompacted");
+    assert!(
+        err.to_string().contains("does not match partition 0 layout"),
+        "unexpected error: {err}"
+    );
+}

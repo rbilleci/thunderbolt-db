@@ -1969,22 +1969,26 @@ impl Engine {
         )
     }
 
-    /// S10c slice 1: `&Select`->general BRIDGE for the 8 MULTI-PARTITION resident shapes (single-GPU).
-    /// Iterates the table's resident partitions IN ORDER (already sorted by `(row_start, partition_id)`)
-    /// and runs the SAME on-device general resident-Expr executor over each partition's injected SoA
-    /// buffer (via `ResidentExecSource`), then COMBINES the per-partition results — retiring the 8
-    /// `execute_relational_partitioned_*_with_resident_device_memory_probe` methods. Each partition is a
-    /// self-contained SoA (`count_header_byte_offset == 0`, sized by `partition.row_count`), so a
-    /// per-partition descriptor with `row_count == partition.row_count` makes the executor's single-store
-    /// offset helpers address the partition buffer byte-identically. The WHERE predicate + the per-partition
-    /// identity/validity prechecks mirror the retired probes; only the combine differs by shape.
+    /// S10c slice 2a: `&Select`->general BRIDGE for the MULTI-PARTITION resident shapes (single-GPU,
+    /// int4-only). Supersedes the slice-1 per-partition host-combine: instead of running the executor once
+    /// per partition and folding the results on the HOST, it RECOMPACTS the table's partition buffers into
+    /// ONE unified int4-only `CudaResidentDeviceMemory` via device-to-device copies (the host stays fully
+    /// out — only the 8-byte row-count header crosses HtoD), then runs the SAME on-device general
+    /// resident-Expr executor ONCE over the unified buffer. The unified SoA is laid out exactly as a
+    /// whole-table single store (8-byte header, then each int4 column contiguous over `total_row_count`
+    /// rows in catalog order), so the single-store offset helpers address it byte-identically; a per-partition
+    /// segment copies column `c`'s slice from partition `p` (`8 + c*p.row_count*4`, len `p.row_count*4`)
+    /// to its unified slot (`8 + c*total_row_count*4 + rows_before_p*4`). The WHERE predicate + per-partition
+    /// identity/validity prechecks mirror the retired probes (each partition is still validated, to gather
+    /// its `device_ptr`).
     ///
-    /// Aggregate caveats the combine works around: the general SUM/MIN/MAX/AVG HARD-ERROR on an empty
-    /// filtered set (NULL is M3), and AVG returns only the quotient. So per partition we issue a COUNT(*)
-    /// precheck and skip the empty ones; SUM/AVG additionally accumulate the per-partition SUM (issued only
-    /// when count>0) + the count, finalizing AVG once via `average_sql_value(total_sum, matched_rows)` (the
-    /// helper the probe used) — so an all-empty AVG yields `average_sql_value(0, 0)` and an all-empty MIN/MAX
-    /// yields the probe's `SqlValue::Text(String::new())` placeholder, byte-identical to the retired probes.
+    /// All-empty handling pins byte-identicality with slice 1: the general SUM/MIN/MAX/AVG HARD-ERROR on an
+    /// empty filtered set (NULL is M3). So we first run a `COUNT(*)` over the unified buffer; if it is 0 AND
+    /// the projection is an aggregate, we return the SAME placeholder slice 1 did (MIN/MAX ->
+    /// `SqlValue::Text(String::new())`, AVG -> `average_sql_value(0, 0)`, SUM -> `SqlValue::Int8(0)`,
+    /// COUNT -> `Int8(0)`). Otherwise the executor runs ONCE over the unified buffer with the real
+    /// projection and its result is returned directly (it handles COUNT/SUM/MIN/MAX/AVG/projection
+    /// on-device). Text columns are DEFERRED in this slice (the unified buffer is int4-only).
     pub(crate) fn execute_resident_partitioned_via_general(
         &self,
         select: &Select,
@@ -2055,7 +2059,7 @@ impl Engine {
             })
         };
 
-        // Run one (already-bound) select against one partition's injected source via the general executor.
+        // Run one (already-bound) select against an injected source via the general executor.
         let run = |select_ref: &Select,
                    bound_for_select: BoundRelationalSelect,
                    src: &ResidentExecSource|
@@ -2091,148 +2095,124 @@ impl Engine {
             }
         };
 
-        // A derived COUNT(*) select bound at table level — its CountAll projection never errors on an empty
-        // partition, so it is the per-partition match precheck the empty-set-NULL aggregates need.
+        // The unified int4-only buffer lays the table's int4 columns out in catalog order, each contiguous
+        // over `total_row_count` rows after the 8-byte row-count header — exactly the whole-table single
+        // store the offset helpers expect. The recompaction indexes source slices POSITIONALLY by int4
+        // ordinal and the unified descriptor labels the buffer with this list, so every partition MUST
+        // carry the SAME `resident_device_int4_columns` (same names, same order) as partition 0 — otherwise
+        // a slice would land in the wrong column's slot (silent wrong data) or read past a too-short source
+        // (the DtoD primitive bounds-checks only the destination). The partitioned benchmark install runs no
+        // layout validation, so we enforce uniformity per partition in the gather loop below (audit F1).
+        let int4_columns = partitions[0].resident_device_int4_columns.clone();
+        let num_int4_cols = int4_columns.len();
+
+        // Gather each partition's (device_ptr, row_count) by running the SAME identity/validity precheck the
+        // probes did (via `source_for`), accumulate `total_row_count`, and build the device-to-device copy
+        // plan: for each int4 column ordinal `c` and each partition `p`, copy `p`'s slice of column `c`
+        // (`8 + c*p.row_count*4`, len `p.row_count*4`) into the unified slot
+        // (`8 + c*total_row_count*4 + rows_before_p*4`). Empty partitions contribute a zero-length segment
+        // (skipped by the primitive). The host never touches the column bytes.
+        let mut partition_ptrs: Vec<(u64, usize)> = Vec::with_capacity(partitions.len());
+        let mut total_row_count = 0_usize;
+        for partition in &partitions {
+            let src = source_for(partition)?;
+            // Uniformity guard (audit F1): the positional ordinal gather + the unified descriptor both
+            // assume every partition's int4 layout equals partition 0's. Reject a mismatch with a clean
+            // error rather than recompact a slice into the wrong column (or read past a short source).
+            if partition.resident_device_int4_columns != int4_columns {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident partition {} int4 column layout {:?} does not match partition 0 layout {:?}",
+                    partition.partition_id, partition.resident_device_int4_columns, int4_columns
+                ))));
+            }
+            partition_ptrs.push((src.device_memory.device_ptr(), partition.row_count));
+            total_row_count = total_row_count.saturating_add(partition.row_count);
+        }
+
+        let mut segments: Vec<gpu_db_execution::RecompactSegment> =
+            Vec::with_capacity(num_int4_cols * partitions.len());
+        for ordinal in 0..num_int4_cols {
+            let mut rows_before = 0_u64;
+            for (device_ptr, row_count) in &partition_ptrs {
+                let row_count = *row_count as u64;
+                let byte_len = row_count.saturating_mul(4);
+                segments.push(gpu_db_execution::RecompactSegment {
+                    src_device_ptr: *device_ptr,
+                    src_byte_offset: 8 + (ordinal as u64) * row_count * 4,
+                    dst_byte_offset: 8
+                        + (ordinal as u64) * (total_row_count as u64) * 4
+                        + rows_before * 4,
+                    byte_len,
+                });
+                rows_before = rows_before.saturating_add(row_count);
+            }
+        }
+        let allocated_bytes = 8 + (total_row_count as u64) * 4 * (num_int4_cols as u64);
+        let header = (total_row_count as u64).to_le_bytes();
+
+        // Recompact ON-DEVICE into one unified buffer, then build the whole-table descriptor + injected
+        // source the executor runs over ONCE.
+        let runtime = self.cuda_driver_probe_runtime();
+        let unified_mem = runtime
+            .retain_device_memory_recompacted(gpu_id, allocated_bytes, &header, &segments)
+            .map_err(|err| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "partitioned resident recompaction into a unified device buffer failed: {err}"
+                )))
+            })?;
+        let proof = unified_mem.metadata().clone();
+        let snapshot = self.resident_snapshot_for_unified(
+            &table,
+            total_row_count,
+            gpu_id,
+            allocated_bytes,
+            proof,
+            int4_columns,
+        );
+        let unified_src = ResidentExecSource {
+            descriptor: Arc::new(snapshot),
+            device_memory: Arc::new(unified_mem),
+            row_count: total_row_count as u64,
+        };
+
+        // All-empty handling (pins byte-identicality with slice 1): the general SUM/MIN/MAX/AVG hard-error
+        // on an empty filtered set, so first run a COUNT(*) over the unified buffer; if it is 0 AND the
+        // projection is an aggregate, return the SAME placeholder slice 1 did.
         let count_select = {
             let mut s = select.clone();
             s.projection = SelectProjection::CountAll;
             s
         };
         let count_bound = bind_relational_select(&table, &count_select)?;
-        let partition_count = |src: &ResidentExecSource| -> Result<i64, ExecuteError> {
-            let result = run(&count_select, count_bound.clone(), src)?;
+        let matched = {
+            let result = run(&count_select, count_bound, &unified_src)?;
             match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
-                Some(SqlValue::Int8(n)) => Ok(n),
-                other => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "partitioned resident COUNT(*) precheck returned an unexpected value: {other:?}"
-                )))),
+                Some(SqlValue::Int8(n)) => n,
+                other => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "partitioned resident COUNT(*) precheck returned an unexpected value: {other:?}"
+                    ))));
+                }
             }
         };
-
-        match &select.projection {
-            // COUNT(*): sum the per-partition counts into one Int8 row.
-            SelectProjection::CountAll => {
-                let mut total = 0_i128;
-                for partition in &partitions {
-                    let src = source_for(partition)?;
-                    total = total.saturating_add(i128::from(partition_count(&src)?));
+        if matched == 0 {
+            let placeholder = match &select.projection {
+                SelectProjection::Min { .. } | SelectProjection::Max { .. } => {
+                    Some(SqlValue::Text(String::new()))
                 }
-                let count = i64::try_from(total).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "partitioned resident row count {total} exceeds supported COUNT(*) result range"
-                    )))
-                })?;
-                Ok(finalize(vec![vec![SqlValue::Int8(count)]]))
+                SelectProjection::Avg { .. } => Some(average_sql_value(0, 0)),
+                SelectProjection::Sum { .. } => Some(SqlValue::Int8(0)),
+                SelectProjection::CountAll => Some(SqlValue::Int8(0)),
+                _ => None,
+            };
+            if let Some(cell) = placeholder {
+                return Ok(finalize(vec![vec![cell]]));
             }
-            // SUM(int4) -> Int8: the general SUM hard-errors on an empty partition, so issue SUM only when
-            // the per-partition COUNT(*) > 0; accumulate as i128, finalize one Int8 row.
-            SelectProjection::Sum { .. } => {
-                let mut total_sum = 0_i128;
-                for partition in &partitions {
-                    let src = source_for(partition)?;
-                    if partition_count(&src)? == 0 {
-                        continue;
-                    }
-                    let result = run(select, bound.clone(), &src)?;
-                    match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
-                        Some(SqlValue::Int8(n)) => {
-                            total_sum = total_sum.saturating_add(i128::from(n));
-                        }
-                        other => {
-                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                "partitioned resident SUM partition returned an unexpected value: {other:?}"
-                            ))));
-                        }
-                    }
-                }
-                let sum = i64::try_from(total_sum).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "partitioned resident SUM {total_sum} exceeds supported bigint result range"
-                    )))
-                })?;
-                Ok(finalize(vec![vec![SqlValue::Int8(sum)]]))
-            }
-            // MIN / MAX(int4): COUNT-precheck per partition; skip the empty ones; fold the i32 result.
-            // All-empty -> the probe's `SqlValue::Text(String::new())` placeholder (mirrored exactly).
-            SelectProjection::Min { .. } | SelectProjection::Max { .. } => {
-                let is_max = matches!(select.projection, SelectProjection::Max { .. });
-                let mut folded: Option<i32> = None;
-                for partition in &partitions {
-                    let src = source_for(partition)?;
-                    if partition_count(&src)? == 0 {
-                        continue;
-                    }
-                    let result = run(select, bound.clone(), &src)?;
-                    let value = match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
-                        Some(SqlValue::Int4(v)) => v,
-                        other => {
-                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                "partitioned resident MIN / MAX partition returned an unexpected value: {other:?}"
-                            ))));
-                        }
-                    };
-                    folded = Some(match folded {
-                        Some(current) if is_max => current.max(value),
-                        Some(current) => current.min(value),
-                        None => value,
-                    });
-                }
-                let cell = folded
-                    .map(SqlValue::Int4)
-                    .unwrap_or_else(|| SqlValue::Text(String::new()));
-                Ok(finalize(vec![vec![cell]]))
-            }
-            // AVG(int4): the bridge AVG returns only the quotient (insufficient to combine across
-            // partitions), so per non-empty partition issue SUM (guarded by COUNT>0) AND COUNT, accumulate
-            // a global (sum, matched_rows), and finalize ONCE via `average_sql_value` — the helper the probe
-            // used. All-empty -> `average_sql_value(0, 0)` (the canonical-zero numeric sentinel).
-            SelectProjection::Avg { column } => {
-                let sum_select = {
-                    let mut s = select.clone();
-                    s.projection = SelectProjection::Sum {
-                        column: column.clone(),
-                    };
-                    s
-                };
-                let sum_bound = bind_relational_select(&table, &sum_select)?;
-                let mut total_sum = 0_i128;
-                let mut matched_rows = 0_usize;
-                for partition in &partitions {
-                    let src = source_for(partition)?;
-                    let count = partition_count(&src)?;
-                    if count == 0 {
-                        continue;
-                    }
-                    let result = run(&sum_select, sum_bound.clone(), &src)?;
-                    match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
-                        Some(SqlValue::Int8(n)) => {
-                            total_sum = total_sum.saturating_add(i128::from(n));
-                        }
-                        other => {
-                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                "partitioned resident AVG SUM partition returned an unexpected value: {other:?}"
-                            ))));
-                        }
-                    }
-                    matched_rows = matched_rows.saturating_add(count.max(0) as usize);
-                }
-                Ok(finalize(vec![vec![average_sql_value(total_sum, matched_rows)]]))
-            }
-            // Projection (one or many columns): per-partition projected rows (ascending, no ORDER BY);
-            // concatenate in partition order. The result columns come from the table-level bound.
-            SelectProjection::Columns(_) => {
-                let mut rows = Vec::new();
-                for partition in &partitions {
-                    let src = source_for(partition)?;
-                    let mut result = run(select, bound.clone(), &src)?;
-                    rows.append(&mut result.rows);
-                }
-                Ok(finalize(rows))
-            }
-            other => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "partitioned resident bridge does not support projection {other:?}"
-            )))),
         }
+
+        // Run the executor ONCE over the unified buffer with the real projection — it handles
+        // COUNT / SUM / MIN / MAX / AVG / projection on-device — and return its result directly.
+        run(select, bound.clone(), &unified_src)
     }
 
     /// S10b: `&Select`->general BRIDGE for a single-column `SELECT DISTINCT` (the int4_[filtered_]distinct

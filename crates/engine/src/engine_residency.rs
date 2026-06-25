@@ -1075,6 +1075,54 @@ impl Engine {
         }
     }
 
+    /// S10c slice 2a: synthesize the single-store-shaped DESCRIPTOR for the ONE UNIFIED int4-only
+    /// buffer recompacted from all of a table's partitions. Like [`Self::resident_snapshot_for_partition`]
+    /// but sized by the WHOLE table (`row_count == total_row_count`) so the single-store offset helpers
+    /// address the unified SoA byte-identically. `int4_columns` is the partitions' OWN (uniform)
+    /// `resident_device_int4_columns` -- i.e. the list the unified buffer was physically recompacted from,
+    /// NOT a catalog re-derivation. Labelling the descriptor with the actual buffer layout keeps the
+    /// offset helper's per-read name-check load-bearing (a read of a column whose name does not sit at the
+    /// labelled int4 ordinal errors instead of silently returning another column's bytes) -- audit F1.
+    /// Text is deferred in this slice, so `resident_device_text_columns` is empty. The
+    /// `device_memory_proof` is the unified buffer's freshly-built proof.
+    pub(crate) fn resident_snapshot_for_unified(
+        &self,
+        table: &RelationalTable,
+        total_row_count: usize,
+        gpu_id: u16,
+        resident_bytes: u64,
+        proof: CudaDeviceMemoryProof,
+        int4_columns: Vec<String>,
+    ) -> RelationalResidencySnapshot {
+        let resident_device_int4_columns = int4_columns;
+        RelationalResidencySnapshot {
+            gpu_id,
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            generation: 0,
+            row_count: total_row_count,
+            column_count: table.columns.len(),
+            resident_bytes,
+            resident_device_int4_columns,
+            resident_device_int4_column_stats: Vec::new(),
+            resident_device_int8_columns: Vec::new(),
+            resident_device_numeric_columns: Vec::new(),
+            resident_device_bool_columns: Vec::new(),
+            resident_device_text_columns: Vec::new(),
+            resident_device_null_columns: Vec::new(),
+            valid_through_index: self.committed_seq(),
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: false,
+            memory_pressure_active: false,
+            last_refresh_cost: None,
+            admission_budget_bytes: None,
+            resident_bytes_after_admission: 0,
+            evicted_tables_on_admission: Vec::new(),
+            device_memory_proof: Some(proof),
+        }
+    }
+
     fn validate_benchmark_resident_chunk_columns(
         table: &RelationalTable,
         int4_columns: &[String],

@@ -789,6 +789,19 @@ pub struct CudaOwnedDeviceMemoryChunk {
     pub bytes: Vec<u8>,
 }
 
+/// One device-to-device copy in an on-device recompaction (S10c slice 2a): copy `byte_len` bytes
+/// from `src_device_ptr + src_byte_offset` (a SOURCE resident allocation, e.g. one partition's SoA
+/// buffer) to `dst_byte_offset` within the freshly-allocated unified buffer. `byte_len == 0` is a
+/// no-op (skipped). The host never touches the bytes — the copy is a `cuMemcpyDtoD` inside the
+/// shared primary context, so the unified buffer is built fully on-device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecompactSegment {
+    pub src_device_ptr: u64,
+    pub src_byte_offset: u64,
+    pub dst_byte_offset: u64,
+    pub byte_len: u64,
+}
+
 impl fmt::Debug for CudaResidentDeviceMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CudaResidentDeviceMemory")
@@ -3257,6 +3270,56 @@ impl CudaDriverRuntime {
             last_kernel_event_elapsed_us: Mutex::new(None),
         })
     }
+
+    /// S10c slice 2a: build ONE unified resident buffer fully ON-DEVICE by allocating
+    /// `allocated_bytes` in the GPU's shared primary context, HtoD-copying the 8-byte row-count
+    /// `header` to offset 0, then DEVICE-TO-DEVICE copying each [`RecompactSegment`] from its source
+    /// resident allocation into the unified buffer. The host never sees the column bytes (only the
+    /// tiny header crosses HtoD). Mirrors `retain_device_memory_owned_chunks`'s allocate/build/proof
+    /// shape; the resulting proof's `copied_bytes`/`allocated_bytes` are both `allocated_bytes`
+    /// (the unified buffer is fully populated) and `retained == true`.
+    pub fn retain_device_memory_recompacted(
+        &self,
+        gpu_id: u16,
+        allocated_bytes: u64,
+        header: &[u8],
+        segments: &[RecompactSegment],
+    ) -> Result<CudaResidentDeviceMemory, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+        if allocated_bytes == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let allocated_len = usize::try_from(allocated_bytes)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+        let device = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| device.id == gpu_id)
+            .cloned()
+            .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
+        let resident = launch_cuda_resident_device_memory_recompacted(
+            gpu_id,
+            allocated_len,
+            header,
+            segments,
+        )?;
+        Ok(CudaResidentDeviceMemory {
+            metadata: CudaDeviceMemoryProof {
+                gpu_id,
+                device_name: device.name,
+                allocated_bytes,
+                copied_bytes: allocated_bytes,
+                retained: true,
+            },
+            device_ptr: resident.device_ptr,
+            primary: resident.primary,
+            last_kernel_event_elapsed_us: Mutex::new(None),
+        })
+    }
 }
 
 struct RawCudaResidentDeviceMemory {
@@ -3440,6 +3503,114 @@ where
         device_ptr,
         primary,
         copied_bytes,
+    })
+}
+
+fn launch_cuda_resident_device_memory_recompacted(
+    gpu_id: u16,
+    allocated_len: usize,
+    header: &[u8],
+    segments: &[RecompactSegment],
+) -> Result<RawCudaResidentDeviceMemory, CudaRuntimeProbeError> {
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoD = unsafe extern "C" fn(u64, u64, usize) -> i32;
+
+    // §9.3: allocate into the shared primary context for this GPU (created + cached on
+    // first use), not a fresh per-allocation context. Make it current on this thread so
+    // the allocation, the header host→device copy, and the device→device copies land in it.
+    let primary = gpu_primary_context(gpu_id)?;
+    primary.set_current()?;
+
+    let cu_mem_alloc = unsafe {
+        *primary
+            .lib()
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        *primary
+            .lib()
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        *primary
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtod = unsafe {
+        *primary
+            .lib()
+            .get::<CuMemcpyDtoD>(b"cuMemcpyDtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyDtoD>(b"cuMemcpyDtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let allocated_bytes = allocated_len as u64;
+    let mut device_ptr = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_ptr, allocated_len) })?;
+    let allocation_guard = CudaDeviceAllocationGuard {
+        ptr: device_ptr,
+        free: cu_mem_free,
+    };
+
+    // The 8-byte row-count header is the only host bytes that cross HtoD; it lands at offset 0.
+    if !header.is_empty() {
+        let end = header.len() as u64;
+        if end > allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(end).unwrap_or(usize::MAX),
+            ));
+        }
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                allocation_guard.ptr,
+                header.as_ptr().cast::<c_void>(),
+                header.len(),
+            )
+        })?;
+    }
+
+    // Each segment is a device→device copy from a source resident allocation into the unified
+    // buffer; the host never touches the column bytes.
+    for segment in segments {
+        if segment.byte_len == 0 {
+            continue;
+        }
+        let end = segment
+            .dst_byte_offset
+            .checked_add(segment.byte_len)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if end > allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(end).unwrap_or(usize::MAX),
+            ));
+        }
+        let destination = allocation_guard
+            .ptr
+            .checked_add(segment.dst_byte_offset)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let source = segment
+            .src_device_ptr
+            .checked_add(segment.src_byte_offset)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let byte_len = usize::try_from(segment.byte_len)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        check_cuda(unsafe { cu_memcpy_dtod(destination, source, byte_len) })?;
+    }
+
+    std::mem::forget(allocation_guard);
+
+    Ok(RawCudaResidentDeviceMemory {
+        device_ptr,
+        primary,
+        copied_bytes: allocated_bytes,
     })
 }
 

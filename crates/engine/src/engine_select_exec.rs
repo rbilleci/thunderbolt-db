@@ -400,12 +400,14 @@ impl Engine {
             | "int4_filtered_scalar_aggregate" | "int4_between_scalar_aggregate" => {
                 self.execute_resident_plan(select)
             }
-            // S10c slice 1: the 8 MULTI-PARTITION resident shapes route to the SAME `&Select`->general
-            // bridge, per-partition (single-GPU). It iterates the table's resident partitions in order,
-            // runs the general resident-Expr executor over each partition's injected SoA buffer, and
-            // combines (COUNT/SUM/MIN/MAX/AVG reductions; projection concatenation) -- retiring the 8
-            // `execute_relational_partitioned_*_with_resident_device_memory_probe` methods. Byte-identical
-            // to the probes on non-NULL data; the empty-set aggregates take the same placeholders.
+            // S10c slice 2a: the 8 MULTI-PARTITION resident shapes route to the `&Select`->general bridge
+            // (single-GPU). It RECOMPACTS the table's partition buffers ON-DEVICE (device-to-device copies)
+            // into ONE unified int4 SoA buffer, then runs the general resident-Expr executor ONCE over it --
+            // so COUNT/SUM/MIN/MAX/AVG and projection are all computed on the device with the host FULLY out
+            // (no per-partition host combine; AVG is a single on-device quotient). Retired the 8
+            // `execute_relational_partitioned_*_with_resident_device_memory_probe` methods (slice 1) and then
+            // the per-partition combine (slice 2a). Byte-identical to the probes on non-NULL data; the
+            // empty-set aggregates take the same placeholders via a COUNT precheck.
             "partitioned_count_all"
             | "partitioned_int4_equality_projection"
             | "partitioned_int4_equality_multi_column_projection"
