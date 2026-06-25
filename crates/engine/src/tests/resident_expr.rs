@@ -2637,28 +2637,30 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    let keep_all = |_: usize| true;
-    let keep_lt2 = |i: usize| i < 2;
-    let min_of = |k: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| k(*i)).map(|(_, v)| *v).min().unwrap();
-    let max_of = |k: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| k(*i)).map(|(_, v)| *v).max().unwrap();
-    let sum_of = |k: &dyn Fn(usize) -> bool| vals.iter().enumerate().filter(|(i, _)| k(*i)).map(|(_, v)| i128::from(*v)).sum::<i128>();
+    // Closed-form oracles (S9): vals = [9e18, 8e18, 0, 5e9, -7e9, -9e18] (label = row index, the int4
+    // filter col). keep_all = all rows; keep_lt2 = rows 0,1 (label < 2) = {9e18, 8e18}. Explicit
+    // constants, not a host `vals.iter()...min()/max()/sum()` re-implementation of the aggregate.
+    let min_all: i64 = -9_000_000_000_000_000_000; // MIN over all rows
+    let max_lt2: i64 = 9_000_000_000_000_000_000; // MAX of {9e18, 8e18}
+    let sum_lt2: i128 = 17_000_000_000_000_000_000; // 9e18 + 8e18 (> i64::MAX -> i128 carry)
+    let sum_all: i128 = 7_999_999_998_000_000_000; // 9e18 + 8e18 + 0 + 5e9 - 7e9 - 9e18
 
     // MIN/MAX(int8) -> int8.
     let mn = e.execute_resident_expr_select_sql("SELECT MIN(b) FROM t WHERE label >= 0").expect("min");
-    assert_eq!(mn.rows, vec![vec![SqlValue::Int8(min_of(&keep_all))]], "MIN(b) all");
+    assert_eq!(mn.rows, vec![vec![SqlValue::Int8(min_all)]], "MIN(b) all");
     assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
     let mx = e.execute_resident_expr_select_sql("SELECT MAX(b) FROM t WHERE label < 2").expect("max subset");
-    assert_eq!(mx.rows, vec![vec![SqlValue::Int8(max_of(&keep_lt2))]], "MAX(b) subset => 9e18");
+    assert_eq!(mx.rows, vec![vec![SqlValue::Int8(max_lt2)]], "MAX(b) subset => 9e18");
 
     // SUM(int8) -> numeric (scale 0). The subset {9e18, 8e18} sums to 17e18 -- EXCEEDS i64::MAX, so
     // the i128 two-atomic carry must be correct.
     let s_sub = e.execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label < 2").expect("sum subset");
     assert_eq!(
         s_sub.rows,
-        vec![vec![SqlValue::Numeric(Decimal128::new(sum_of(&keep_lt2), 0))]],
+        vec![vec![SqlValue::Numeric(Decimal128::new(sum_lt2, 0))]],
         "SUM subset => 17e18 (> i64::MAX, i128 carry)"
     );
-    assert!(sum_of(&keep_lt2) > i128::from(i64::MAX), "test really exceeds i64");
+    assert!(sum_lt2 > i128::from(i64::MAX), "test really exceeds i64");
     // The result COLUMN descriptor must match the numeric value (the int8-agg audit caught SUM(int8)
     // declaring Int4/oid 23 -- a wire-decode mismatch). PG SUM(int8) -> numeric (oid 1700).
     assert!(
@@ -2670,7 +2672,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     let s_all = e.execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label >= 0").expect("sum all");
     assert_eq!(
         s_all.rows,
-        vec![vec![SqlValue::Numeric(Decimal128::new(sum_of(&keep_all), 0))]],
+        vec![vec![SqlValue::Numeric(Decimal128::new(sum_all, 0))]],
         "SUM all (incl. negatives)"
     );
 
@@ -2678,7 +2680,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     let av = e.execute_resident_expr_select_sql("SELECT AVG(b) FROM t WHERE label < 2").expect("avg subset");
     assert_eq!(
         av.rows,
-        vec![vec![average_sql_value(sum_of(&keep_lt2), 2)]],
+        vec![vec![average_sql_value(sum_lt2, 2)]],
         "AVG subset"
     );
     match &av.rows[0][0] {
@@ -6714,9 +6716,10 @@ fn gpu_nongrouped_order_by_text() {
             })
             .collect()
     };
-    // Host oracle: Rust's str Ord IS unsigned byte order (== the kernel's compare).
-    let mut oracle: Vec<String> = rows.iter().map(|(s, _)| s.to_string()).collect();
-    oracle.sort_unstable();
+    // Closed-form oracle (S9): the 8 rows in unsigned-byte (lexicographic) order -- empty string first,
+    // a < ab (a prefix sorts smaller), duplicates kept -- stated explicitly, not via a host Rust sort of
+    // the input (which would re-implement the ORDER BY comparator on the CPU).
+    let oracle: Vec<&str> = vec!["", "a", "ab", "ab", "apple", "apple", "banana", "cherry"];
 
     // (a) ORDER BY s ASC -- and confirm it took the general GPU path.
     let asc = e
