@@ -122,14 +122,21 @@ differential MUST include NULL data** (the 480-shape non-null differential misse
 caught it). The predicate builder `resident_predicate_from_bound_filters` is int4-literal-only today — extend it
 for text/non-int4 filter shapes.
 
-**CONTINUE S10a** with the next shape (projection / equality / partitioned ×8 / between / membership /
+**PROGRESS (session 5): S10b on-device DISTINCT DONE + AUDITED SHIP** — `96c2d59b` route + `0c56082e` delete the
+2 distinct probes (275 lines). **This CLOSED the latent §1 violation** (the probes deduped on a HOST `BTreeSet`
+relabeled as Gpu). `execute_resident_distinct_via_general` rewrites `SELECT DISTINCT a` as `SELECT a, COUNT(*) …
+GROUP BY a` (the S8 grouped bridge), then DROPS the trailing COUNT column; DISTINCT now runs entirely on-device.
+PG-correct vs the NULL-blind probe (one NULL group, not phantom 0) + deterministic no-ORDER-BY order (key ASC).
+Audit SHIP (105 query×dataset differential). **NOTE the general SQL→Expr path itself ERRORS on DISTINCT — the
+bridge (DISTINCT→GROUP BY COUNT(*), count dropped) is what makes it work; reuse that pattern, don't expect the
+general path to gain a `distinct` flag.**
+
+**CONTINUE with the remaining S10a shapes** (projection / equality / partitioned ×8 / between / membership /
 text_prefix / filter_group_count): pick one, route its dispatch arm to the bridge, prove byte-identical for
-NON-NULL data + assert the PG-correct NULL/empty behavior (differential bridge-vs-probe AND bridge-vs-general,
-WITH NULL data), sabotage non-vacuity, delete the probe + migrate callers, independent-audit, commit, update
-doc 22 + memory. Then **S10b** (on-device DISTINCT — the §1 violation closer; `SELECT DISTINCT a` ≡ `GROUP BY a`
-no-aggregate via the existing grouped machinery). **Do NOT route the distinct shapes until S10b** gives the
-general executor a real on-device DISTINCT — they CANNOT be deleted before then (the probe dedups on the host).
-Then **S10c** (partitioned). Do NOT take a host shortcut. Do NOT run `cargo fmt --all`. Only AFTER S10a–c make
-every shape route on-device, do **S10d**: delete the host finalize path + `mvcc_read_exec.rs` `cpu_fallback`. When
-that deletion lands, the campaign (doc 22 §4) is fully struck through — write the campaign-complete handover and
-propose merging `phase0-m1-engine-facade` to `main`.
+NON-NULL data + assert the PG-correct NULL/empty behavior (differential bridge-vs-probe, **WITH NULL data**),
+sabotage non-vacuity, delete the probe + migrate callers, independent-audit, commit, update doc 22 + memory.
+NOTE the predicate builder `resident_predicate_from_bound_filters` is int4-literal-only today — **extend it for
+text/non-int4 filter shapes** (equality on text, etc.). Then **S10c** (partitioned). Do NOT take a host shortcut.
+Do NOT run `cargo fmt --all`. Only AFTER S10a–c make every shape route on-device, do **S10d**: delete the host
+finalize path + `mvcc_read_exec.rs` `cpu_fallback`. When that deletion lands, the campaign (doc 22 §4) is fully
+struck through — write the campaign-complete handover and propose merging `phase0-m1-engine-facade` to `main`.

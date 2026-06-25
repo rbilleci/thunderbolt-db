@@ -396,11 +396,20 @@ is optional; each line is struck through only when it runs on the device.
       filter_group_count. NOTE the predicate builder `resident_predicate_from_bound_filters` currently emits
       `numeric_mode=false` Int4 literals only (the grouped route's guarantee) — non-int4 filter constants
       (text equality, etc.) need the literal builder extended. Per-shape differential + audit each.
-  - [ ] **S10b — on-device DISTINCT (closes gap 1).** `SELECT DISTINCT a` ≡ `GROUP BY a` with no aggregate
-    (one rep row per distinct key — S2 grouping + S2.1 ordering + S4 LIMIT/OFFSET are all already on-device),
-    so route `int4_[filtered_]distinct_projection` through the grouped machinery (or add a dedicated
-    on-device dedup). Confirm DISTINCT-treats-NULL-as-equal matches GROUP-BY NULL-grouping. DELETE the two
-    distinct probes (kills the host `BTreeSet`+`sort_by`). Sabotage-prove non-vacuity, audit.
+  - [x] **S10b — on-device DISTINCT DONE + AUDITED SHIP** (route `96c2d59b` + delete probes `0c56082e`).
+    **This CLOSED the latent §1 violation** (the int4_[filtered_]distinct probes deduped on a HOST `BTreeSet`
+    while reporting `executed_target:Gpu`). `execute_resident_distinct_via_general` rewrites `SELECT DISTINCT a`
+    as `SELECT a, COUNT(*) ... GROUP BY a` (the S8-audited grouped bridge — dedup is the GPU hash-group), then
+    DROPS the trailing COUNT column; both distinct dispatch arms route to it (text + CTAS + view). DISTINCT is
+    now computed entirely on the device. Proven byte-identical to the deleted probes on NON-NULL ORDER-BY data
+    (probe-vs-bridge differential, plain + filtered); non-vacuity sabotage-proven (skip the count-drop →
+    diverges). **Two PG-correctness changes vs the probe** (S9-anticipated quirk→PG shift), each pinned by a
+    keeper: (1) NULLs — the probe was NULL-blind (phantom `Int4(0)`), the bridge keeps ONE NULL group; (2)
+    no-ORDER-BY order — first-seen → deterministic key-ASC (same set, like the S8 tie-break). NOTE the general
+    SQL→Expr path itself still ERRORS on DISTINCT — the bridge (DISTINCT→GROUP BY) is what makes it work.
+    **Independent adversarial audit: SHIP** — 105 query×dataset parent-probe-vs-child-bridge differential combos
+    (all divergences confined to the 2 PG-correct axes), transform faithfulness + precondition parity + charter
+    §1 + 3 keeper-sabotages all verified; clippy clean; no findings to adopt.
   - [ ] **S10c — partitioned family** (the 8 `*_partitioned_*_with_resident_device_memory_probe` methods) —
     route via the grouped/general bridge or confirm general coverage shape-by-shape; differential + audit.
   - [ ] **S10d — delete the host finalization + CPU fallback (deletion slice, LAST).** Once S10a–c route
