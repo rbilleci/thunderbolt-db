@@ -392,10 +392,23 @@ is optional; each line is struck through only when it runs on the device.
       claim was overstated and no test covered the divergent NULL axis) — ADOPTED; the auditor confirmed the
       runtime is correct (bridge==general byte-for-byte, charter-clean, non-vacuous). Suite 721/0. The projected
       column IS the sort key, so ties are identical output rows (no S8 tie-break trap).
-    - [ ] **Remaining shapes:** projection / equality / partitioned ×8 / between / membership / text_prefix /
-      filter_group_count. NOTE the predicate builder `resident_predicate_from_bound_filters` currently emits
-      `numeric_mode=false` Int4 literals only (the grouped route's guarantee) — non-int4 filter constants
-      (text equality, etc.) need the literal builder extended. Per-shape differential + audit each.
+    - [x] **projection batch DONE + AUDITED SHIP** (route + delete 3 probes `5ffee92b`). int4_projection
+      (range filter) / int4_equality_projection / int4_equality_multi_column / composite-AND / mixed(text+int4)
+      route through the bridge; 3 probe methods deleted (616 lines), the separate `_batch_` probe (pgwire
+      benchmark) kept. NO predicate-builder change (every filter is int4; text only in the projection).
+      30-query parent-vs-child differential = 22 byte-identical + 8 PG-correct divergences (NULL phantom-0 →
+      excluded; +2 a latent PARENT BUG the bridge FIXES: a single-text-column mixed projection that the
+      ≥2-column probe hard-errored). Telemetry: `last_execution_d2h_bytes` now 0 for these (the bridge never
+      calls `observe_d2h_bytes` — uniform with ALL bridge-routed shapes; pure observability, no routing
+      consumer; the d2h ESTIMATE is unaffected). Tests: `gpu_s10a_projection_routes_through_bridge_on_dispatch`
+      + `gpu_s10a_projection_drops_nulls_pg_correct`. Suite 723/0; audit SHIP (no findings to adopt).
+    - [ ] **Remaining shapes:** scalar aggregates (int4_scalar / filtered / between — BETWEEN = `>= AND <=`,
+      all int4) + int4 counts (count_all / int4_equality_count / int4_range_count / int4_filter_group_count) →
+      route via the bridge (the binding executor's `is_aggregate` / CountAll path), NO predicate change; then
+      **`text_prefix_like_count`** — the ONE shape needing `resident_predicate_from_bound_filters` /
+      `having_value_to_resident_literal` extended for a Text literal + `LIKE` (and verify the general WHERE VM
+      does text `LIKE`); then **partitioned ×8** → the grouped bridge. Per-batch differential (WITH NULL data)
+      + audit each.
   - [x] **S10b — on-device DISTINCT DONE + AUDITED SHIP** (route `96c2d59b` + delete probes `0c56082e`).
     **This CLOSED the latent §1 violation** (the int4_[filtered_]distinct probes deduped on a HOST `BTreeSet`
     while reporting `executed_target:Gpu`). `execute_resident_distinct_via_general` rewrites `SELECT DISTINCT a`
