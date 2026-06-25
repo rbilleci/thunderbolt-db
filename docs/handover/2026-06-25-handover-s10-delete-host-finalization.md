@@ -110,13 +110,26 @@ each to the general path (or delete if the general path's own tests already cove
 values will change from the probe quirks (`Int8(0)` / empty-text) to PG-correct NULL — update the assertions.
 
 ## 5. First action for the next session
-Read this + doc 22 §S10 (the decomposed S10a–d) + the memory files in §intro. Start **S10a** FRESH: build the
-non-grouped `&Select`->general bridge (mirror `execute_resident_grouped_via_general`), route the FIRST
-on-device-capable probe shape through it, differential-test bridge-vs-probe over tie/boundary/empty data, prove
-non-vacuity by sabotage, independent-audit, commit, update doc 22 + memory. Then the remaining S10a shapes,
-then **S10b** (on-device DISTINCT — the verified gap), **S10c** (partitioned). Do NOT route the distinct shapes
-until S10b gives the general executor a real on-device DISTINCT — they CANNOT be deleted before then (the probe
-dedups on the host). Do NOT take a host shortcut. Do NOT run `cargo fmt --all`. Only AFTER S10a–c make every
-shape route on-device, do **S10d**: delete the host finalize path + `mvcc_read_exec.rs` `cpu_fallback`. When that
-deletion lands, the campaign (doc 22 §4) is fully struck through — write the campaign-complete handover and
+Read this + doc 22 §S10 (the decomposed S10a–d) + the memory files in §intro.
+
+**PROGRESS (session 5): S10a first shape `int4_ordered_projection` DONE + AUDITED SHIP** — `36470be8` route +
+`24ebe8cf` delete the 154-line probe + `0b9e0c1c` adopt the audit's P1. KEY FINDING: the bridge already serves
+non-grouped selects (`execute_resident_grouped_via_general` builds empty group keys when `group_by==None`), so
+S10a is per-shape **route + delete**, no new bridge fn. The audit caught that the deleted probe was NULL-BLIND
+(phantom `Int4(0)` rows); the bridge drops NULLs via the 3VL WHERE = PG-correct — so each routed shape is a
+PG-correctness fix, NOT byte-identical on NULL/empty/edge results (the S9-anticipated quirk→PG shift). **The
+differential MUST include NULL data** (the 480-shape non-null differential missed the NULL-blindness; the audit
+caught it). The predicate builder `resident_predicate_from_bound_filters` is int4-literal-only today — extend it
+for text/non-int4 filter shapes.
+
+**CONTINUE S10a** with the next shape (projection / equality / partitioned ×8 / between / membership /
+text_prefix / filter_group_count): pick one, route its dispatch arm to the bridge, prove byte-identical for
+NON-NULL data + assert the PG-correct NULL/empty behavior (differential bridge-vs-probe AND bridge-vs-general,
+WITH NULL data), sabotage non-vacuity, delete the probe + migrate callers, independent-audit, commit, update
+doc 22 + memory. Then **S10b** (on-device DISTINCT — the §1 violation closer; `SELECT DISTINCT a` ≡ `GROUP BY a`
+no-aggregate via the existing grouped machinery). **Do NOT route the distinct shapes until S10b** gives the
+general executor a real on-device DISTINCT — they CANNOT be deleted before then (the probe dedups on the host).
+Then **S10c** (partitioned). Do NOT take a host shortcut. Do NOT run `cargo fmt --all`. Only AFTER S10a–c make
+every shape route on-device, do **S10d**: delete the host finalize path + `mvcc_read_exec.rs` `cpu_fallback`. When
+that deletion lands, the campaign (doc 22 §4) is fully struck through — write the campaign-complete handover and
 propose merging `phase0-m1-engine-facade` to `main`.
