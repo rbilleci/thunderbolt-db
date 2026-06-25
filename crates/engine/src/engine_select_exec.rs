@@ -455,9 +455,13 @@ impl Engine {
                 .execute_relational_equality_multi_column_projection_with_resident_device_memory_probe(
                     select,
                 ),
-            "int4_ordered_projection" => {
-                self.execute_relational_ordered_projection_with_resident_device_memory_probe(select)
-            }
+            // S10a: a single-int4-column ordered projection (`SELECT a FROM t WHERE a <range> ORDER BY a
+            // LIMIT n`) routes to the SAME `&Select`->general bridge as the grouped shapes. For a
+            // non-grouped select the bridge builds EMPTY group keys, so the binding executor runs the
+            // plain-projection path (WHERE predicate VM + GPU sort + LIMIT/OFFSET window, S1/S2.1/S4) --
+            // byte-identical to the legacy `int4_ordered_projection` probe (the projected column IS the
+            // sort key, so tied values are identical output rows). Covers text + CTAS + view uniformly.
+            "int4_ordered_projection" => self.execute_resident_grouped_via_general(select),
             "int4_distinct_projection" => self
                 .execute_relational_distinct_projection_with_resident_device_memory_probe(select),
             "int4_filtered_distinct_projection" => self

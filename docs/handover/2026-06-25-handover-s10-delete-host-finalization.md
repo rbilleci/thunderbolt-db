@@ -66,32 +66,57 @@ S9 (replace CPU-oracle parity tests with GPU-native oracles) is **DONE + AUDITED
   MIN/MAX construction oracle (`resident_expr.rs:~3622`) builds extremes via `bytes.sort()` over its own parsed
   input — acceptable construction (uuid bytes are memcmp-ordered; g=1/g=2 also pinned to explicit literals).
 
-## 4. ▶ THE NEXT ACTION — S10 (the final campaign slice)
+## 4. ▶ THE NEXT ACTION — S10, now DECOMPOSED (2026-06-25 coverage re-check)
 **S10 — delete the host SQL finalization path** (doc 22 §S10). The host MUST NOT scan/filter/sort/group/
-aggregate/HAVING/DISTINCT/LIMIT or materialize result VALUES; the general GPU executor already does all of
-this (S1–S8). Delete:
-- `engine_select_bind.rs` `finalize_relational_select` host sort/agg/DISTINCT/HAVING/LIMIT (was
-  `engine_select_bind.rs:683/729/755` — re-confirm the exact lines, the file has moved since the sweep).
-- `mvcc_read_exec.rs` `cpu_fallback` (`:776/784`) + the host `sort_by`/`mvcc_row_cmp` (`:210/1582`).
-- The S9-deferred CPU-backend test scaffolding (above): the `FirstCudaSliceParityBackend` harness + its ~18
-  parity tests, the `sql_catalog` cuda-probe cache test, and `execute_relational_select_cpu_pinned` + its
-  `concurrency.rs` seam test. Rewrite any still-valuable coverage as GPU-native (general-executor) tests.
+aggregate/HAVING/DISTINCT/LIMIT or materialize result VALUES; the general GPU executor does MOST of this
+(S1–S8) — but a coverage re-check found **two shapes it does NOT yet serve on-device, so S10 is NOT pure
+route+delete.** Both gaps must be closed GPU-native FIRST; the deletion is the LAST slice, gated on coverage.
 
-**THE LEVER (from S8):** `execute_resident_grouped_via_general` proved the `&Select`->general bridge. S10
-routes the REMAINING enumerated `*_probe` shapes (projection / equality / ordered / distinct / partitioned —
-the methods `resident_probe.rs` tests today) to the general executor the SAME way, so the host finalization
-becomes dead, then delete it. **This is the BIGGER slice — DECOMPOSE it** (per-shape or per-stage), differential-
-test each shape (bridge-vs-general, over tie-prone + boundary + empty data — recall the S8 0/24 missed a
-tie-break because its data had no ties, and the S9 empty-result quirks), and **independently audit each**.
+**⚠️ THE TWO GAPS (verified 2026-06-25 — see doc 22 §S10 COVERAGE RE-CHECK):**
+1. **No on-device DISTINCT anywhere.** `engine_expr.rs` never reads `select.distinct`. The two distinct
+   probes (`execute_relational_[filtered_]distinct_projection_with_resident_device_memory_probe`,
+   `engine_resident_probe.rs:4056/4185`) dedup with a HOST `BTreeSet` + host `sort_by` (`:4156-4167`) while
+   reporting `executed_target: Gpu` — a LATENT §1 charter violation relabeled as GPU. You cannot "route" these
+   to the general executor; it has no DISTINCT.
+2. **Only a GROUPED `&Select`->general bridge exists** (`execute_resident_grouped_via_general`). The
+   text-entry general route (`select_is_gpu_sortable_projection`) requires a non-empty ORDER BY + plain
+   projection, so the non-grouped / non-ordered probe shapes (projection / equality / ordered / partitioned ×8 /
+   membership / between / text_prefix / filter_group_count) reached via the text else-branch AND every CTAS/view
+   `&Select` entry still hit the probes. Deleting them needs a NON-grouped `&Select`->general bridge.
+
+**THE LEVER (from S8):** `execute_resident_grouped_via_general` proved the `&Select`->general bridge pattern.
+S10a mirrors it for the non-grouped shapes; S10b reuses the GROUPED machinery for DISTINCT (`SELECT DISTINCT a`
+≡ `GROUP BY a`, no aggregate). **DO THESE AS SEPARATE, FRESH, INDEPENDENTLY-AUDITED SLICES — start each hard
+slice FRESH (§2 step 8):**
+- **S10a — non-grouped `&Select`->general bridge + route projection/equality/ordered/partitioned/between/
+  membership/text_prefix/filter_group_count.** These are already on-device-expressible (WHERE predicate VM +
+  GPU sort + `project_*_rows_from_payload` gather). Build the bridge (mirror the grouped one), route, delete
+  those probes. Per-shape differential bridge-vs-probe over tie/boundary/empty data.
+- **S10b — on-device DISTINCT (closes gap 1).** Route `int4_[filtered_]distinct_projection` through the grouped
+  path (group-by-the-column, no aggregate → S2 ordering + S4 LIMIT/OFFSET already on-device) or a dedicated
+  on-device dedup. Confirm DISTINCT-NULL-as-equal ≡ GROUP-BY NULL-grouping. Delete the 2 distinct probes (kills
+  the host `BTreeSet`+`sort_by`). Sabotage-prove non-vacuity.
+- **S10c — partitioned family** (8 `*_partitioned_*_probe` methods) — route via the bridge or confirm coverage
+  shape-by-shape; differential + audit.
+- **S10d — the DELETION slice (LAST, gated on S10a–c).** Delete `engine_select_bind.rs` `finalize_relational_
+  select` (now at `:486`; host sort/agg/DISTINCT at `:710`/HAVING/LIMIT) + `mvcc_read_exec.rs` `cpu_fallback`
+  (`:776/784`) + host `sort_by`/`mvcc_row_cmp` (`:210/1582`). Pull in the S9-deferred CPU-backend test
+  scaffolding: the `FirstCudaSliceParityBackend` harness + its ~18 parity tests, the `sql_catalog` cuda-probe
+  cache test, and `execute_relational_select_cpu_pinned` + its `concurrency.rs` seam test. Rewrite any
+  still-valuable coverage as GPU-native (general-executor) tests.
 
 ⚠️ When the probe methods are deleted, the `resident_probe.rs` tests that call them won't compile — migrate
 each to the general path (or delete if the general path's own tests already cover the shape). The empty-result
 values will change from the probe quirks (`Int8(0)` / empty-text) to PG-correct NULL — update the assertions.
 
 ## 5. First action for the next session
-Read this + doc 22 §S10 + the memory files in §intro. Then S10: pick the FIRST probe shape to route through a
-bridge (mirror S8), differential-test bridge-vs-general over tie/boundary/empty data, prove non-vacuity by
-sabotage, independent-audit, commit, update doc 22 + memory. Decompose the rest per-shape. Do NOT take a host
-shortcut. Do NOT run `cargo fmt --all`. After the host path is fully dead + deleted and `mvcc_read_exec.rs`
-`cpu_fallback` is gone, the campaign (doc 22 §4) is fully struck through — write the campaign-complete handover
-and propose merging `phase0-m1-engine-facade` to `main`.
+Read this + doc 22 §S10 (the decomposed S10a–d) + the memory files in §intro. Start **S10a** FRESH: build the
+non-grouped `&Select`->general bridge (mirror `execute_resident_grouped_via_general`), route the FIRST
+on-device-capable probe shape through it, differential-test bridge-vs-probe over tie/boundary/empty data, prove
+non-vacuity by sabotage, independent-audit, commit, update doc 22 + memory. Then the remaining S10a shapes,
+then **S10b** (on-device DISTINCT — the verified gap), **S10c** (partitioned). Do NOT route the distinct shapes
+until S10b gives the general executor a real on-device DISTINCT — they CANNOT be deleted before then (the probe
+dedups on the host). Do NOT take a host shortcut. Do NOT run `cargo fmt --all`. Only AFTER S10a–c make every
+shape route on-device, do **S10d**: delete the host finalize path + `mvcc_read_exec.rs` `cpu_fallback`. When that
+deletion lands, the campaign (doc 22 §4) is fully struck through — write the campaign-complete handover and
+propose merging `phase0-m1-engine-facade` to `main`.

@@ -563,6 +563,127 @@ fn gpu_resident_device_memory_ordered_projection_probe_materializes_int4_results
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10a_ordered_projection_bridge_matches_probe_differential() {
+    // S10a PROOF (throwaway, pre-deletion): the `&Select`->general bridge
+    // (`execute_resident_grouped_via_general`, which builds EMPTY group keys for a non-grouped select)
+    // must be BYTE-IDENTICAL to the legacy `int4_ordered_projection` resident-probe over the ordered
+    // single-int4-column shape, so routing the dispatch arm to the bridge and DELETING the probe is
+    // behavior-preserving. The projected column IS the sort key, so tied values are IDENTICAL output
+    // rows -- no tie-break ambiguity (unlike the S8 grouped `ORDER BY <aggregate>` trap). Data has ties
+    // (5x3, 1x2, -3x2), negatives, zero, and needles that empty the result.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO p (a) VALUES (5), (1), (5), (-3), (0), (5), (2), (-3), (10), (1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("p").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    // The probe requires: single int4 projection == filter == order column, ONE non-equality range
+    // predicate, ORDER BY that column, LIMIT (OFFSET requires ORDER BY + LIMIT). Sweep the four range
+    // ops, ASC/DESC, LIMIT {0,1,3,100}, OFFSET {none,1,5(past end)}, and empty-result needles.
+    let mut shapes: Vec<String> = Vec::new();
+    for op in [">=", ">", "<", "<="] {
+        for needle in [-3, 0, 2, 5, 100] {
+            for dir in ["", " DESC"] {
+                for limit in [0usize, 1, 3, 100] {
+                    shapes.push(format!(
+                        "SELECT a FROM p WHERE a {op} {needle} ORDER BY a{dir} LIMIT {limit}"
+                    ));
+                    for offset in [1usize, 5] {
+                        shapes.push(format!(
+                            "SELECT a FROM p WHERE a {op} {needle} ORDER BY a{dir} LIMIT {limit} OFFSET {offset}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut divergences = 0usize;
+    for sql in &shapes {
+        let Command::Select(select) =
+            parse_command(sql).unwrap_or_else(|_| panic!("parse failed: {sql}"))
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let probe = e
+            .execute_relational_ordered_projection_with_resident_device_memory_probe(&select)
+            .unwrap_or_else(|err| panic!("probe failed for {sql}: {err:?}"));
+        let bridge = e
+            .execute_resident_grouped_via_general(&select)
+            .unwrap_or_else(|err| panic!("bridge failed for {sql}: {err:?}"));
+        if probe.columns != bridge.columns || probe.rows != bridge.rows {
+            divergences += 1;
+            eprintln!(
+                "DIVERGENCE for {sql}\n  probe.cols ={:?}\n  bridge.cols={:?}\n  probe.rows ={:?}\n  bridge.rows={:?}",
+                probe.columns, bridge.columns, probe.rows, bridge.rows
+            );
+        }
+        assert_eq!(probe.executed_target, DeviceTarget::Gpu(0), "probe off GPU: {sql}");
+        assert_eq!(bridge.executed_target, DeviceTarget::Gpu(0), "bridge off GPU: {sql}");
+    }
+    assert_eq!(
+        divergences, 0,
+        "{divergences} probe-vs-bridge divergences across {} ordered-projection shapes",
+        shapes.len()
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch() {
+    // S10a keeper: a single-int4-column ordered projection reaches the `int4_ordered_projection` route
+    // arm through the LIVE `&Select` dispatch and now executes via the general bridge ON THE GPU, with
+    // closed-form rows. Survives the probe's deletion (calls the dispatch, not the probe). Non-vacuous:
+    // the literals pin the filtered + sorted + windowed result.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE p (a INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO p (a) VALUES (5), (1), (5), (-3), (0), (5), (2), (-3), (10), (1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("p").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
+        // a>=0 -> [5,1,5,0,5,2,1] sorted asc [0,1,1,2,5,5,5]; LIMIT 3 -> [0,1,1].
+        (
+            "SELECT a FROM p WHERE a >= 0 ORDER BY a LIMIT 3",
+            vec![vec![SqlValue::Int4(0)], vec![SqlValue::Int4(1)], vec![SqlValue::Int4(1)]],
+        ),
+        // a>0 -> [5,1,5,5,2,10,1] sorted desc [10,5,5,5,2,1,1]; LIMIT 4 -> [10,5,5,5].
+        (
+            "SELECT a FROM p WHERE a > 0 ORDER BY a DESC LIMIT 4",
+            vec![
+                vec![SqlValue::Int4(10)],
+                vec![SqlValue::Int4(5)],
+                vec![SqlValue::Int4(5)],
+                vec![SqlValue::Int4(5)],
+            ],
+        ),
+        // a>=100 -> empty.
+        ("SELECT a FROM p WHERE a >= 100 ORDER BY a LIMIT 5", vec![]),
+    ];
+    for (sql, expected) in cases {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(result.fallback_reason, None, "fell back: {sql}");
+        assert_eq!(&result.rows, expected, "rows mismatch: {sql}");
+    }
+}
+
+#[test]
 fn gpu_resident_device_memory_distinct_projection_probe_materializes_int4_results() {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, bucket INT)")
