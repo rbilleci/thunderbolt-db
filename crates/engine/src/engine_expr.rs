@@ -249,6 +249,26 @@ fn grouped_projection_to_aggregates(projection: &SelectProjection) -> Option<Sel
     })
 }
 
+/// Reconstruct a faithful SQL `LIKE` pattern from the BARE literal prefix a `LikePrefix` bound filter
+/// carries. The parser produces `LikePrefix` only for `LIKE '<prefix>%'` where `<prefix>` has no `%`/`_`
+/// (sql/lib.rs `parse_select_like_prefix_filter`), and strips the trailing `%`, so the bound value is the
+/// literal prefix bytes (a `\` is literal, not a LIKE escape, since `parse_sql_value` does not resolve LIKE
+/// escapes). To match the legacy probe's literal-byte prefix match EXACTLY, escape every LIKE-special byte
+/// in the prefix (`%`, `_`, `\`) and append a `%`: the resulting `LIKE '<escaped>%'` means "starts with the
+/// literal prefix" — `compile_like_pattern` then yields the same byte-prefix semantics the probe had.
+fn like_pattern_for_literal_prefix(prefix: &str) -> String {
+    let mut pattern = Vec::with_capacity(prefix.len() + 1);
+    for &byte in prefix.as_bytes() {
+        if matches!(byte, b'%' | b'_' | b'\\') {
+            pattern.push(b'\\');
+        }
+        pattern.push(byte);
+    }
+    pattern.push(b'%');
+    // The prefix is valid UTF-8 and only ASCII escape bytes are inserted, so the result stays valid UTF-8.
+    String::from_utf8(pattern).expect("ascii-escaped utf8 stays valid utf8")
+}
+
 /// Build the WHERE-predicate [`ResidentExpr`] DNF for the `&Select`->general grouped BRIDGE (S8) from a
 /// bound select's resolved filters. Normalizes to the canonical DNF (OR of AND-groups) exactly as the
 /// route classifiers do -- `filter_groups`, else `filters` as one AND-group, else the single `filter`,
@@ -259,7 +279,8 @@ fn grouped_projection_to_aggregates(projection: &SelectProjection) -> Option<Sel
 /// `Column <cmp> Int4Literal`), so routing a grouped probe shape through it is behavior-preserving.
 /// `None` = no WHERE (a full-table scan). The grouped routes only ever carry an int4 `Column <cmp>
 /// Int4Literal` leaf (`resident_route_grouped_aggregate_shape`), but the general DNF here is robust to
-/// any int4 OR-of-AND filter the bound may carry.
+/// any int4 OR-of-AND filter the bound may carry. A `LikePrefix` leaf becomes an on-device `LIKE` (see
+/// [`like_pattern_for_literal_prefix`]).
 fn resident_predicate_from_bound_filters(
     bound: &BoundRelationalSelect,
 ) -> Result<Option<ResidentExpr>, ExecuteError> {
@@ -277,12 +298,28 @@ fn resident_predicate_from_bound_filters(
     for group in &groups {
         let mut conj: Option<ResidentExpr> = None;
         for (idx, op, value) in group {
-            let leaf = ResidentExpr::Binary {
-                op: having_op_to_resident(*op),
-                lhs: Box::new(ResidentExpr::Column(*idx)),
-                // numeric_mode = false: a grouped-route filter constant is an int4 literal (the
-                // classifier guarantees `SqlValue::Int4`), matching `map_predicate_node`'s Int4Literal.
-                rhs: Box::new(having_value_to_resident_literal(value, false)?),
+            // A `LikePrefix` filter carries the BARE literal prefix; reconstruct the faithful `LIKE
+            // '<prefix>%'` pattern (escaped) so the bridge runs the SAME text-prefix match the retired probe
+            // did — on-device via the general LIKE mask. Other ops build a `Column <cmp> literal` leaf.
+            let leaf = if matches!(op, crate::SelectFilterOp::LikePrefix) {
+                let SqlValue::Text(prefix) = value else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "a LIKE-prefix filter requires a text prefix value".to_string(),
+                    )));
+                };
+                ResidentExpr::Binary {
+                    op: ResidentBinaryOp::Like,
+                    lhs: Box::new(ResidentExpr::Column(*idx)),
+                    rhs: Box::new(ResidentExpr::TextLiteral(like_pattern_for_literal_prefix(prefix))),
+                }
+            } else {
+                ResidentExpr::Binary {
+                    op: having_op_to_resident(*op),
+                    lhs: Box::new(ResidentExpr::Column(*idx)),
+                    // numeric_mode = false: a grouped-route filter constant is an int4 literal (the
+                    // classifier guarantees `SqlValue::Int4`), matching `map_predicate_node`'s Int4Literal.
+                    rhs: Box::new(having_value_to_resident_literal(value, false)?),
+                }
             };
             conj = Some(match conj {
                 None => leaf,
@@ -1627,9 +1664,13 @@ fn compile_predicate_program(
         program.push(ExprStep::MaskBinary { op: bool_op });
         return Ok(());
     }
-    // TEXT comparison leaf (`textcol =/<> 'literal'`) -> a TextEqMask step the VM combines with AND/OR
-    // (so text IN / multi-text WHERE run on the GPU). int4 leaves fall through to the arith VM below.
+    // TEXT comparison leaf -> a mask step the VM combines with AND/OR (so text IN / multi-text WHERE / a
+    // nullable-text or compound LIKE run on the GPU). LIKE -> TextLikeMask; `=`/`<>` -> TextEqMask. int4
+    // leaves fall through to the arith VM below.
     if expr_mentions_text(lhs, table) || expr_mentions_text(rhs, table) {
+        if matches!(op, ResidentBinaryOp::Like) {
+            return compile_text_like_leaf(lhs, rhs, table, snapshot, program, needles);
+        }
         return compile_text_eq_leaf(*op, lhs, rhs, table, snapshot, program, needles);
     }
     // BOOL comparison leaf (`boolcol =/<> true|false`, either order) -> a BoolMask step. `NOT flag` is
@@ -1730,6 +1771,44 @@ fn compile_text_eq_leaf(
     });
     // 3VL: a NULL text operand makes `=`/`<>` UNKNOWN ⇒ the row is not selected (its placeholder is an
     // empty span, which would otherwise mis-match `= ''` / mis-pass `<> 'x'`).
+    push_column_validity_and(col, table, snapshot, program)
+}
+
+/// Compile a TEXT `LIKE` leaf (`textcol LIKE 'pattern'`) into a `TextLikeMask` VM step + record the
+/// COMPILED pattern tokens (LE-serialized) in `needles` (indexed by `pattern_idx`). The mask-VM sibling of
+/// the standalone `try_lower_text_predicate` LIKE path: the standalone path serves a non-null single LIKE
+/// (it returns indices directly), but a NULLABLE-text or compound LIKE routes through the mask VM, which
+/// had no LIKE step (only `Eq`/`Ne`). `LIKE` is NOT symmetric — the column is the lhs, the pattern literal
+/// the rhs (PG: `x ~~ y`). The tokens are the host-compiled u32 array (`compile_like_pattern`, escapes
+/// resolved), serialized to bytes for the generic `text_needles` channel; the kernel reads `ntok = len/4`.
+fn compile_text_like_leaf(
+    lhs: &ResidentExpr,
+    rhs: &ResidentExpr,
+    table: &RelationalTable,
+    snapshot: &RelationalResidencySnapshot,
+    program: &mut Vec<ExprStep>,
+    needles: &mut Vec<Vec<u8>>,
+) -> Result<(), ExecuteError> {
+    let (col, pattern) = match (text_column_index(lhs, table), text_literal_value(rhs)) {
+        (Some(col), Some(pattern)) => (col, pattern),
+        _ => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "LIKE must be a text column LIKE a literal pattern".to_string(),
+            )));
+        }
+    };
+    let tokens = compile_like_pattern(pattern)?;
+    let layout = resident_device_text_column_layout(snapshot, table, col)?;
+    let pattern_idx = needles.len() as u32;
+    needles.push(tokens.iter().flat_map(|t| t.to_le_bytes()).collect());
+    program.push(ExprStep::TextLikeMask {
+        offsets_byte_offset: layout.offsets_byte_offset,
+        bytes_byte_offset: layout.bytes_byte_offset,
+        pattern_idx,
+    });
+    // 3VL: a NULL text operand makes `LIKE` UNKNOWN ⇒ the row is excluded. A NULL's placeholder is an
+    // empty span (start==end), which already fails any non-empty pattern; but `LIKE '%'` matches the empty
+    // span, so the validity AND is load-bearing (PG: `NULL LIKE '%'` is UNKNOWN, not TRUE).
     push_column_validity_and(col, table, snapshot, program)
 }
 

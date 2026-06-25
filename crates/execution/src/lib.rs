@@ -13616,6 +13616,19 @@ pub enum ExprStep {
         needle_idx: u32,
         negate: bool,
     },
+    /// Push the mask `(textcol[i] LIKE pattern) ? 1 : 0` for the resident TEXT column at
+    /// (`offsets_byte_offset`, `bytes_byte_offset`). The pattern is the COMPILED u32 token array (escapes
+    /// resolved on the host: each token `(op<<8)|byte`, op 0=literal/1=`_`/2=`%`), stored LE-serialized in
+    /// `text_needles[pattern_idx]` (the SAME out-of-band channel as `TextEqMask` — `ntok = len/4`), so
+    /// this step stays `Copy`. Lets the mask VM combine LIKE with AND/OR and (via a following validity
+    /// MaskBinary) with NULL 3VL — the path a NULLABLE-text `LIKE` predicate takes (a non-null text LIKE
+    /// keeps the standalone `expr_text_like_scalar_filter` fast path). Launches the SAME on-device matcher
+    /// kernel as that fast path (`gpu_db_resident_text_like_scalar_to_mask`).
+    TextLikeMask {
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        pattern_idx: u32,
+    },
     /// Push the mask `bitmap[i] ^ negate ? 1 : 0` for the resident BOOL column whose 1-bit-per-row
     /// bitmap is at `bitmap_byte_offset` (`negate` selects the clear bits, i.e. `flag = false` / `NOT
     /// flag`). Lets the mask VM combine a bool column with AND/OR (and int4/text) -- e.g. `flag AND x>0`.
@@ -14025,6 +14038,17 @@ fn run_resident_arith_program<'r>(
     } else {
         None
     };
+    // Text LIKE -> i32 mask (the SAME matcher kernel the standalone `expr_text_like_scalar_filter` uses),
+    // so the VM can combine LIKE with AND/OR and the NULL 3VL validity AND. The pattern tokens are the
+    // varlen bytes `text_needles[pattern_idx]` (LE u32). Loaded lazily (only if a TextLikeMask step is used).
+    let text_like_mask_fn = if program
+        .iter()
+        .any(|s| matches!(s, ExprStep::TextLikeMask { .. }))
+    {
+        Some(primary.cached_function(c"gpu_db_resident_text_like_scalar_to_mask", &ptx)?)
+    } else {
+        None
+    };
     // Bool column bitmap -> i32 mask, so the VM can combine a bool column with AND/OR. Lazy (only if used).
     let bool_mask_fn = if program
         .iter()
@@ -14419,6 +14443,54 @@ fn run_resident_arith_program<'r>(
                     (&mut a5 as *mut u32).cast::<c_void>(),
                     (&mut a6 as *mut u64).cast::<c_void>(),
                     (&mut a7 as *mut u64).cast::<c_void>(),
+                ];
+                launch(function, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::TextLikeMask {
+                offsets_byte_offset,
+                bytes_byte_offset,
+                pattern_idx,
+            } => {
+                // (textcol[i] LIKE pattern) -> i32 mask pushed on the stack; the VM combines it with AND/OR
+                // (and a following validity MaskBinary for NULL 3VL) like any other mask. The pattern is the
+                // LE-serialized u32 token array `text_needles[pattern_idx]` (`ntok = len/4`), uploaded H2D
+                // into a fresh lease (>=1 byte so the pointer is valid for the empty pattern, never read).
+                let pattern = text_needles
+                    .get(pattern_idx as usize)
+                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(pattern_idx as usize))?;
+                if pattern.len() % std::mem::size_of::<u32>() != 0 {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(pattern.len()));
+                }
+                let ntok = (pattern.len() / std::mem::size_of::<u32>()) as u64;
+                let function =
+                    text_like_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let pattern_lease = primary.lease_device_buffer(pattern.len().max(1))?;
+                if !pattern.is_empty() {
+                    check_cuda(unsafe {
+                        cu_memcpy_htod(
+                            pattern_lease.ptr,
+                            pattern.as_ptr().cast::<c_void>(),
+                            pattern.len(),
+                        )
+                    })?;
+                }
+                let out = primary.lease_device_buffer(byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = offsets_byte_offset;
+                let mut a2 = bytes_byte_offset;
+                let mut a3 = pattern_lease.ptr;
+                let mut a4 = ntok;
+                let mut a5 = n;
+                let mut a6 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                    (&mut a4 as *mut u64).cast::<c_void>(),
+                    (&mut a5 as *mut u64).cast::<c_void>(),
+                    (&mut a6 as *mut u64).cast::<c_void>(),
                 ];
                 launch(function, &mut args)?;
                 stack.push(out);

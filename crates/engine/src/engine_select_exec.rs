@@ -430,16 +430,19 @@ impl Engine {
                 .execute_relational_partitioned_filtered_max_with_resident_device_memory_probe(
                     select,
                 ),
-            "text_prefix_like_count" => {
-                self.execute_relational_text_prefix_count_with_resident_device_memory_probe(select)
-            }
+            // S10a: a text-prefix `COUNT(*)` (`SELECT COUNT(*) ... WHERE col LIKE 'al%'`) routes to the
+            // `&Select`->general bridge as a CountAll + a reconstructed `LIKE` predicate. The bridge rebuilds
+            // the faithful `LIKE '<prefix>%'` pattern from the bare `LikePrefix` bound filter (the parser
+            // strips the trailing `%`); the general WHERE runs it ON-DEVICE -- a nullable-text LIKE via the
+            // new `TextLikeMask` mask-VM step, a non-null LIKE via the standalone `expr_text_like_scalar_filter`
+            // fast path. Byte-identical to the retired probe on non-NULL data; PG-correct on NULLs (a NULL is
+            // UNKNOWN under LIKE 3VL so it is excluded, whereas the NULL-blind probe's empty placeholder span
+            // matched `LIKE '%'`). Covers text + CTAS + view uniformly.
+            "text_prefix_like_count" => self.execute_resident_grouped_via_general(select),
             // S10a: an int4 COUNT(*) with multiple filter groups (OR of AND-groups, all int4) routes to the
             // `&Select`->general bridge as a CountAll + the rebuilt int4 DNF predicate -- byte-identical to the
             // retired probe on non-NULL data; PG-correct on NULLs (a NULL fails the predicate via 3VL instead
-            // of the probe's phantom Int4(0)). (text_prefix_like_count stays a probe for now: routing a text
-            // LIKE through the bridge returned COUNT=0 in testing -- the general WHERE has a LIKE path
-            // (`expr_text_like_scalar_filter`), but the bridge's RECONSTRUCTED `Like` predicate did not match,
-            // a LIKE pattern-format mismatch to reconcile in a separate slice.)
+            // of the probe's phantom Int4(0)).
             "int4_filter_group_count" => self.execute_resident_grouped_via_general(select),
             // S8: grouped int4 aggregates route to the general on-device executor via the
             // `&Select`->general BRIDGE (it does ORDER BY / HAVING / LIMIT ON-DEVICE), retiring the

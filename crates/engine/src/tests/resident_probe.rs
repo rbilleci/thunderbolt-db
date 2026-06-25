@@ -273,16 +273,8 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
 
-    let Command::Select(text_prefix_select) =
-        parse_command("SELECT COUNT(*) FROM events WHERE label LIKE 'a%'").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_relational_text_prefix_count_with_resident_device_memory_probe(&text_prefix_select)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no retained resident device memory"));
+    // (text_prefix_like_count is no longer a probe -- S10a routed it to the `&Select`->general bridge;
+    // its device-memory guard is the bridge's, covered by the bridge-routed shapes' tests.)
 
     let Command::Select(membership_select) =
         parse_command("SELECT COUNT(*) FROM events WHERE id IN (1, 2)").unwrap()
@@ -1034,14 +1026,18 @@ fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
         .contains("resident snapshot is invalid"));
 }
 
+// S10a: a text-prefix `COUNT(*)` (`WHERE col LIKE 'al%'`) over a NON-NULL text column routes through the
+// `&Select`->general bridge (replacing the retired `text_prefix_like_count` probe). A non-null text column
+// has no validity bitmap, so the bridge's reconstructed `LIKE '<prefix>%'` predicate takes the standalone
+// on-device LIKE filter (`expr_text_like_scalar_filter`). Closed-form GPU-native oracle, no probe reference.
 #[test]
-fn gpu_resident_device_memory_text_prefix_count_probe_materializes_text_results() {
+fn gpu_s10a_text_prefix_like_count_routes_through_bridge_on_device() {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
     e.execute_text(
             2,
-            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'alpine', 30), (3, 'beta', 20), (4, 'alphabet', 40), (5, 'gamma', 5)",
+            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'alpine', 30), (3, 'beta', 20), (4, 'alphabet', 40), (5, 'gamma', 5), (7, 'al', 1)",
         )
         .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
@@ -1056,58 +1052,61 @@ fn gpu_resident_device_memory_text_prefix_count_probe_materializes_text_results(
     if snapshot.device_memory_proof.is_none() {
         return;
     }
+    // labels {alpha,alpine,beta,alphabet,gamma,al}: LIKE 'alp%' = 3; 'al%' = 4 (+al); 'beta%' = 1; 'z%' = 0;
+    // '%' = all 6 (no NULLs to exclude). The COUNT runs entirely on the device via the bridge.
+    for (pattern, expected) in [("alp%", 3i64), ("al%", 4), ("beta%", 1), ("z%", 0), ("%", 6)] {
+        let sql = format!("SELECT COUNT(*) FROM events WHERE label LIKE '{pattern}'");
+        let Command::Select(select) = parse_command(&sql).unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int8(expected)]],
+            "LIKE '{pattern}'"
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+    }
+}
 
-    let Command::Select(select) =
-        parse_command("SELECT COUNT(*) FROM events WHERE label LIKE 'alp%'").unwrap()
-    else {
-        unreachable!()
-    };
-    let before = e.metrics().snapshot();
-    let resident = e
-        .execute_relational_text_prefix_count_with_resident_device_memory_probe(&select)
+// S10a: the SAME text-prefix `COUNT(*)` over a NULLABLE text column (the NULL gives `label` a validity
+// bitmap) routes the bridge's `LIKE` through the general mask VM's new `TextLikeMask` step + the NULL 3VL
+// validity AND. The result is PG-correct: a NULL is UNKNOWN under LIKE so it is excluded -- whereas the
+// retired NULL-blind probe counted the NULL's empty placeholder span for the empty-prefix `LIKE '%'`
+// (returning 7, not 6). Non-empty prefixes are unchanged (a NULL fails them either way). Closed-form oracle;
+// the BE-token sabotage proved the mask-VM path is load-bearing (LIKE 'alp%' -> 0 instead of 3).
+#[test]
+fn gpu_s10a_text_prefix_like_count_nullable_text_pg_correct_on_device() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
         .unwrap();
-    let after = e.metrics().snapshot();
-
-    // Closed-form oracle (S9): labels {alpha,alpine,beta,alphabet,gamma} LIKE 'alp%' = 3.
-    assert_eq!(resident.rows, vec![vec![SqlValue::Int8(3)]]);
-    assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(resident.fallback_reason, None);
-    assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
-    assert!(after.d2h_bytes_total > before.d2h_bytes_total);
-    assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 0);
-
-    let Command::Select(unsupported_int4) =
-        parse_command("SELECT COUNT(*) FROM events WHERE id LIKE '1%'").unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_relational_text_prefix_count_with_resident_device_memory_probe(&unsupported_int4)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("supports only text predicates"));
-
-    let Command::Select(unsupported_ordered) =
-        parse_command("SELECT COUNT(*) FROM events WHERE label LIKE 'alp%' ORDER BY count")
-            .unwrap()
-    else {
-        unreachable!()
-    };
-    let err = e
-        .execute_relational_text_prefix_count_with_resident_device_memory_probe(
-            &unsupported_ordered,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("one text prefix LIKE predicate"));
-
-    e.mark_gpu_memory_pressured(0);
-    assert!(e
-        .execute_relational_text_prefix_count_with_resident_device_memory_probe(&select)
-        .unwrap_err()
-        .to_string()
-        .contains("resident snapshot is invalid"));
+    e.execute_text(
+        2,
+        "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'alpine', 30), (3, 'beta', 20), (4, 'alphabet', 40), (5, 'gamma', 5), (6, NULL, 7), (7, 'al', 1)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // 7 rows, one NULL label. LIKE 'alp%' = 3 (NULL excluded), 'al%' = 4, 'beta%' = 1, 'z%' = 0; the
+    // empty-prefix '%' = 6 = the non-NULL rows (PG-correct -- the probe returned 7, counting the NULL).
+    for (pattern, expected) in [("alp%", 3i64), ("al%", 4), ("beta%", 1), ("z%", 0), ("%", 6)] {
+        let sql = format!("SELECT COUNT(*) FROM events WHERE label LIKE '{pattern}'");
+        let Command::Select(select) = parse_command(&sql).unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int8(expected)]],
+            "LIKE '{pattern}'"
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+    }
 }
 
 #[test]

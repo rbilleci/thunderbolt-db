@@ -1005,8 +1005,9 @@ fn timed_resident_device_text_prefix_count_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result =
-        engine.execute_relational_text_prefix_count_with_resident_device_memory_probe(query)?;
+    // S10a: a text-prefix COUNT(*) runs via the `&Select`->general bridge through the public route dispatch
+    // (`execute_relational_select`); the legacy resident-probe text-prefix-count method was retired.
+    let result = engine.execute_relational_select(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
