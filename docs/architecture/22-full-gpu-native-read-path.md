@@ -305,9 +305,9 @@ is optional; each line is struck through only when it runs on the device.
     already proven (0/24); the new risk is ONLY the predicate-DNF reconstruction in the bridge.
 
 ### Retire the host relational path entirely (the "incl. oracle" decision)
-- [~] **S9 — replace CPU-oracle parity tests with GPU-native oracles** (serial-vs-parallel /
+- [x] **S9 — replace CPU-oracle parity tests with GPU-native oracles** (serial-vs-parallel /
   construction / closed-form) wherever tests currently assert vs a CPU re-implementation.
-  **STEP 1 `f43418b7` AUDITED SHIP + STEP 2 follow-up `06576048` (step-2 audit RUNNING).** The 2026-06-25
+  **DONE + AUDITED SHIP 2026-06-25 — STEP 1 `f43418b7` + STEP 2 `06576048`, both independently audited SHIP.** The 2026-06-25
   re-sweep of `crates/engine/src/tests/` + `crates/execution/src/` found the surviving CPU/host-path result
   oracles in resident-path clusters; all converted to closed-form construction oracles (behavior-preserving,
   full `--include-ignored` suite **720/0** on RTX PRO 6000; GPU-output binding sabotage-proven —
@@ -336,6 +336,12 @@ is optional; each line is struck through only when it runs on the device.
     charter's canonical form), the uuid byte-wise min/max CONSTRUCTION oracle (~3611, built from the test's
     own parsed input, no host relational path), and the single-vs-two-level GPU group-by kernel cross-check
     (~7826, GPU-vs-GPU / serial-vs-parallel). None depend on the host SQL finalization path; none block S10.
+    **STEP-2 AUDIT = SHIP** (2 fault-injections; full re-sweep confirmed no operator-re-implementation oracle
+    remains; the 3 permitted classifications validated). One LOW/cosmetic non-blocking nit (auditor-reviewed,
+    NOT a violation): the uuid grouped MIN/MAX construction oracle (~3622) builds per-group extremes via
+    `bytes.sort()` over the test's own parsed input — acceptable construction (uuid bytes are definitionally
+    memcmp-ordered; the discriminating g=1/g=2 rows are ALSO pinned to explicit uuid literals at ~3640-3660),
+    redundant belt-and-suspenders; optional future tidy, not required.
   - **NOT S9 — deferred to S10** (the "incl. oracle" §2 decision, retired WITH the host path): the
     `FirstCudaSliceParityBackend` harness tests (`mvcc_provenance.rs` ×8, `mvcc_query.rs` ×9,
     `sql_dml.rs:2078`) — that backend executes via `CpuMvccExecutionBackend` and RELABELS the target as
@@ -356,7 +362,7 @@ S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 V1a 
 ✅ `5724bf55` (audit running) — the HAZARD-class kernel slice; the last join `host_rows` data read is GONE**
 → S6 ✅ (V2, pad-WHERE 3VL on-device `76315706`, audited SHIP) → **S8 ✅ AUDITED SHIP (probe fallback retired
 via the `&Select`->general bridge `47c874f3`+`a2bfa319`, 2 audit tests `004bc3d7`)** → **S9 (GPU-native
-oracles) — STEP 1 `f43418b7` AUDITED SHIP + STEP 2 `06576048` (audit running), suite 720/0** → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
+oracles) ✅ AUDITED SHIP — STEP 1 `f43418b7` + STEP 2 `06576048`, both audited, suite 720/0** → **S10 (delete host path) — NEXT**. _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
 no-kernel first, then the kernel work fresh.)_
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2
 is the keystone and unblocks the most queries.
