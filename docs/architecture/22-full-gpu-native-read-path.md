@@ -411,18 +411,29 @@ is optional; each line is struck through only when it runs on the device.
         `COUNT(*)` (OR of AND-groups) → bridge as `CountAll` + the rebuilt int4 DNF predicate. 15-query
         differential = byte-identical non-NULL + the PG-correct NULL fix (a NULL fails the predicate via 3VL,
         not the probe's phantom `Int4(0)` match for `a = 0`). Audit SHIP.
-      - [ ] **`text_prefix_like_count`** — BLOCKED on a mask-VM LIKE gap (deeper than first thought; a fresh
-        slice). Two findings from a 2026-06-25 attempt (reverted, tree clean): (1) **the bound filter carries the
-        BARE prefix** (`LIKE 'al%'` → `Text("al")`, `%` stripped, op `LikePrefix`) and the probe does a literal
-        byte prefix-match; a fix in `resident_predicate_from_bound_filters` that reconstructs a real LIKE pattern
-        (escape `%`/`_`/`\`, append `%`) made a DIRECT `execute_resident_grouped_via_general` bridge call
-        byte-identical to the probe (differential passed). BUT (2) **via the LIVE dispatch the same CountAll+LIKE
-        errors** `text inequalities need collation sort keys` — the COUNT path lowers the predicate through the
-        **composable mask VM `compile_text_eq_leaf` (engine_expr.rs:1717)** which handles only `Eq`/`Ne`, NOT
-        `Like` (only the STANDALONE `try_lower_text_predicate` :6533 / `expr_text_like_scalar_filter` does). So
-        routing needs a `TextLikeMask` step in the mask VM (+ kernel) OR routing a single-Like predicate to the
-        standalone path. ALSO unexplained: the direct bridge call succeeded while the live dispatch failed on the
-        SAME method + SAME predicate (`[[(0, LikePrefix, Text("al"))]]` in both) — debug that first.
+      - [x] **`text_prefix_like_count` DONE + AUDITED SHIP** (route + delete `32a3995b`). Closed the mask-VM
+        LIKE gap GENERALLY: added `ExprStep::TextLikeMask` + a dispatch arm in `run_resident_arith_program` that
+        launches the EXISTING `gpu_db_resident_text_like_scalar_to_mask` kernel (the SAME matcher the standalone
+        `expr_text_like_scalar_filter` uses — **no new kernel, no PTX change**); pattern tokens ride the generic
+        `text_needles` channel LE-serialized (`ntok = len/4`). `compile_text_like_leaf` (engine) lowers a text
+        `Like` leaf to it + the NULL 3VL validity AND; `compile_predicate_program` dispatches `Like` there.
+        `like_pattern_for_literal_prefix` reconstructs the faithful `LIKE '<prefix>%'` (escape `%`/`_`/`\`, append
+        `%`) from the bare `LikePrefix` bound filter; `resident_predicate_from_bound_filters` uses it. Routed the
+        dispatch arm to `execute_resident_grouped_via_general`; deleted the 103-line probe; migrated the benchmark
+        + tests. **The "direct succeeds / dispatch fails" mystery was the NULLABLE-vs-not split:** a non-null text
+        LIKE reaches the standalone path (already worked); a NULLABLE text column routes WHERE through the mask VM
+        (`compile_predicate_program` → `compile_text_eq_leaf`, which rejected `Like`) — now `TextLikeMask` serves
+        it. LIKE now also composes inside AND/OR over nullable text. Differential (local, probe-vs-bridge, WITH
+        NULL data): byte-identical for every non-empty prefix; PG-correct divergence ONLY at the empty-prefix
+        `LIKE '%'` (NULL-blind probe counts a NULL's empty placeholder = 7; the 3VL bridge excludes it = 6 = PG
+        `NULL LIKE '%'` is UNKNOWN). Non-vacuity sabotage-proven (BE-token serialization → `LIKE 'alp%'` returns 0
+        not 3). Two closed-form keepers (non-null standalone path + nullable mask-VM path). Suite 723/0 serial.
+        **Independent adversarial audit: SHIP** (no findings) — all 7 claims VERIFIED (route, no-new-kernel,
+        LE-token byte-identity, NULL 3VL validity-AND load-bearing, `%`/`_`/`\` escaping, empty-`LIKE '%'` as
+        the sole PG-correct divergence over every adversarial prefix incl. UTF-8/over-length/escape-char, both
+        keepers non-vacuous). Charter §1 IMPROVED: the retired probe `launch_cuda_resident_text_prefix_count`
+        D2H-copied offsets + the whole bytes payload and matched/counted on the HOST; the bridge runs LIKE+COUNT
+        entirely on-device. 723/0 serial, clippy clean (2 pre-existing).
       - [ ] **partitioned ×8** — BLOCKED on multi-partition (a fresh slice, likely a design call). The
         `partitioned_*` shapes are emitted by `engine_residency.rs:1568-1595` when a table has >1 resident
         partition; the probes iterate `read_state.residency.partition_device_memory` across ALL partitions
