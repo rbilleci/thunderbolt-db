@@ -563,6 +563,61 @@ fn gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch() {
 }
 
 #[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10a_ordered_projection_drops_nulls_pg_correct() {
+    // S10a NULL regression (audit-adopted): the deleted `int4_ordered_projection` probe was NULL-BLIND --
+    // it read the int4 column directly, so a NULL (stored as placeholder 0 + a cleared validity bit)
+    // surfaced as a PHANTOM `Int4(0)` result row. The general bridge drops NULL rows via the 3VL WHERE
+    // (a NULL fails `a >= k` -> UNKNOWN -> excluded), matching PostgreSQL and the engine's own SQL->Expr
+    // path. So routing this shape is a PG-CORRECTNESS FIX, NOT byte-identical -- this test pins the
+    // corrected behavior (the divergent axis the 480-shape non-null differential did not cover) and
+    // cross-checks the bridge against the SQL->Expr reference on NULL data.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE p2 (a INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO p2 (a) VALUES (5), (1), (NULL), (5), (-3), (0), (NULL), (5), (2), (-3), (10), (1), (NULL)",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("p2").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    // a>=0 keeps the NON-NULL non-negative values 5,1,5,0,5,2,10,1 -> sorted asc [0,1,1,2,5,5,5,10].
+    // Exactly ONE 0 (the real row); the 3 NULLs are NOT phantom 0s (that was the probe bug).
+    let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
+        (
+            "SELECT a FROM p2 WHERE a >= 0 ORDER BY a LIMIT 100",
+            [0, 1, 1, 2, 5, 5, 5, 10]
+                .iter()
+                .map(|&v| vec![SqlValue::Int4(v)])
+                .collect(),
+        ),
+        // Windowed (same order): OFFSET 2 LIMIT 3 -> [1,2,5].
+        (
+            "SELECT a FROM p2 WHERE a >= 0 ORDER BY a LIMIT 3 OFFSET 2",
+            [1, 2, 5].iter().map(|&v| vec![SqlValue::Int4(v)]).collect(),
+        ),
+    ];
+    for (sql, expected) in cases {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let dispatch = e.execute_relational_select(&select).unwrap();
+        assert_eq!(dispatch.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(dispatch.fallback_reason, None, "fell back: {sql}");
+        assert_eq!(
+            &dispatch.rows, expected,
+            "NULL not dropped (probe phantom-0 bug regressed?): {sql}"
+        );
+        // The bridge (live dispatch) must match the engine's SQL->Expr general path byte-for-byte.
+        let general = e.execute_resident_expr_select_sql(sql).unwrap();
+        assert_eq!(dispatch.rows, general.rows, "bridge != general on NULL data: {sql}");
+        assert_eq!(dispatch.columns, general.columns, "bridge cols != general: {sql}");
+    }
+}
+
+#[test]
 fn gpu_resident_device_memory_distinct_projection_probe_materializes_int4_results() {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, bucket INT)")

@@ -379,12 +379,19 @@ is optional; each line is struck through only when it runs on the device.
     `execute_resident_grouped_via_general` builds an EMPTY group-key list when `group_by == None`, so it
     already routes a non-grouped select through `execute_resident_expr_select_with_binding`'s plain-projection
     path. No new bridge function needed; S10a is per-shape ROUTE + DELETE + differential + audit.
-    - [x] **`int4_ordered_projection` DONE** (route `36470be8`; probe delete + test/example migration this
-      commit). Single-int4-column ordered projection (`SELECT a FROM t WHERE a <range> ORDER BY a LIMIT n`)
-      now routes through the bridge; proven byte-identical to the deleted probe by a 480-shape probe-vs-bridge
-      differential (ties/negatives/zero/empty), non-vacuity sabotage-proven; keeper closed-form dispatch test
-      `gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch`. Suite 720/0. The projected column IS the
-      sort key, so ties are identical output rows (no S8 tie-break trap).
+    - [x] **`int4_ordered_projection` DONE + AUDITED SHIP** (route `36470be8`; probe delete `24ebe8cf`; audit
+      adoption — NULL test + claim correction — follow-up commit). Single-int4-column ordered projection
+      (`SELECT a FROM t WHERE a <range> ORDER BY a LIMIT n`) routes through the bridge. Byte-identical to the
+      deleted probe for NON-NULL data (480-shape probe-vs-bridge differential over ties/negatives/zero/empty;
+      non-vacuity sabotage-proven). **NOT byte-identical on NULLs — it is a PG-CORRECTNESS FIX:** the deleted
+      probe was NULL-BLIND (read the int4 column directly → a NULL surfaced as a phantom `Int4(0)` row); the
+      bridge drops NULL rows via the 3VL WHERE (NULL fails the range predicate → UNKNOWN → excluded), matching
+      the SQL->Expr/PG reference — exactly the probe-quirk→PG-correct shift the S9 lesson anticipated. Tests:
+      keeper closed-form dispatch test + `gpu_s10a_ordered_projection_drops_nulls_pg_correct` (NULL-dropped
+      result pinned + bridge==general cross-check). **Independent adversarial audit: P1** (the "byte-identical"
+      claim was overstated and no test covered the divergent NULL axis) — ADOPTED; the auditor confirmed the
+      runtime is correct (bridge==general byte-for-byte, charter-clean, non-vacuous). Suite 721/0. The projected
+      column IS the sort key, so ties are identical output rows (no S8 tie-break trap).
     - [ ] **Remaining shapes:** projection / equality / partitioned ×8 / between / membership / text_prefix /
       filter_group_count. NOTE the predicate builder `resident_predicate_from_bound_filters` currently emits
       `numeric_mode=false` Int4 literals only (the grouped route's guarantee) — non-int4 filter constants
