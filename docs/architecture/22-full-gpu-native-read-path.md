@@ -455,8 +455,39 @@ is optional; each line is struck through only when it runs on the device.
     **Independent adversarial audit: SHIP** — 105 query×dataset parent-probe-vs-child-bridge differential combos
     (all divergences confined to the 2 PG-correct axes), transform faithfulness + precondition parity + charter
     §1 + 3 keeper-sabotages all verified; clippy clean; no findings to adopt.
-  - [ ] **S10c — partitioned family** (the 8 `*_partitioned_*_with_resident_device_memory_probe` methods) —
-    route via the grouped/general bridge or confirm general coverage shape-by-shape; differential + audit.
+  - [~] **S10c — partitioned family** (the 8 `*_partitioned_*_with_resident_device_memory_probe` methods).
+    **Decision (user, 2026-06-25):** "partition" = horizontal row-range shard of one table = the over-VRAM /
+    multi-GPU scale-out residency model (roadmap `prototype-to-production-plan.md:784,910`), TEST-ONLY today
+    (no production producer yet). Retire the probes by routing through the general bridge, SINGLE-GPU first
+    (cross-GPU combine deferred to NCCL/peer-copy), sequenced B-then-A.
+    - [x] **Slice 0 — inject the residency source DONE + AUDITED SHIP** (`96acf025`). `execute_resident_expr_select_with_binding`
+      takes `Option<&ResidentExecSource>`; `None` = single-store (byte-identical), `Some` = inject a partition
+      buffer. Behavior-preserving (723/0); audit SHIP, no findings.
+    - [x] **Slice 1 (B) — per-partition bridge route + retire the 8 probes DONE + AUDITED SHIP** (`8da01cb6`).
+      A synthesized per-partition descriptor (`row_count = partition.row_count`) lets the single-store offset
+      helpers address each partition's self-contained SoA buffer; `execute_resident_partitioned_via_general`
+      binds + builds the predicate once, loops partitions injecting `Some(src)`, and host-combines O(#partitions)
+      DEVICE-produced partials (COUNT/SUM/MIN/MAX fold, AVG as per-partition SUM+COUNT→`average_sql_value`,
+      projection concat). Deleted the 8 probes (-1547) + the probe-only `resident_partition_int4_column_offset`.
+      Charter: per-row work on GPU; host = scalar-fold + row concat (the accepted single-GPU coordinator pattern),
+      no host_rows. Behavior-preserving on the dense/NULL-free fixtures (all result-row asserts kept; only
+      probe-only telemetry asserts re-derived). **Independent adversarial audit: SHIP** — all 9 claims verified
+      (offset addressing; the COUNT-precheck "double-filter" worry REFUTED — the executor reads only the injected
+      predicate, never `bound.filters`; AVG = true global sum/count; all-empty placeholders probe-faithful;
+      projection order; charter §1 clean; NULL gap acceptable — partitions have no NULL-ingest path). One P3 nit
+      (saturating- vs checked-add overflow message, unreachable), no fix required. **This retires every S10c
+      probe and unblocks S10d.**
+    - [ ] **Slice 2a (A) — on-device recompaction (host fully out, existing shapes).** Add a `cuMemcpyDtoD`
+      primitive + `retain_device_memory_recompacted` (crates/execution — NO new PTX kernel, pure DtoD orchestration
+      + HAZARD device-write tier) to build ONE int4-only unified buffer (`[u64 total_rows][col0 p0..pN][col1 ...]`)
+      from the partition buffers, then run the executor ONCE over it via `Some(&unified_src)` — SUPERSEDES the
+      Slice 1 per-partition combine. Differential: byte-identical to Slice 1 on the existing fixtures (pin the
+      all-empty aggregate). Guard against text reads (defer text recompaction).
+    - [ ] **Slice 2b — admit the hard shapes.** Extend `partitioned_resident_route_query_shape`
+      (resident_route.rs:237 — currently rejects distinct/group_by/having/order_by/limit/offset) + the dispatch to
+      route partitioned DISTINCT/GROUP BY/ORDER BY/top-N onto the unified buffer (rides 2a + the existing on-device
+      grouped/distinct/ordered executors); author new fixtures (oracle = same rows as one single-store snapshot).
+    - [ ] **Text recompaction** — separate slice (per-row offset rebasing + blob concat).
   - [ ] **S10d — delete the host finalization + CPU fallback (deletion slice, LAST).** Once S10a–c route
     every shape on-device: delete `engine_select_bind.rs` `finalize_relational_select` (now at `:486`; host
     sort/agg/DISTINCT at `:710`/HAVING/LIMIT) + **`mvcc_read_exec.rs` `cpu_fallback`** (`:776/784`) + the host
