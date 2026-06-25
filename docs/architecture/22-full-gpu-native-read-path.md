@@ -490,11 +490,26 @@ is optional; each line is struck through only when it runs on the device.
       wrong data / source OOB DtoD); the auditor's catalog-equality suggestion was corrected (it would break
       the empty-int4 count_all shape), pinned by `p8_partitioned_resident_rejects_nonuniform_int4_layout`; F2
       (P3) — stale comments refreshed.
-    - [ ] **Slice 2b — admit the hard shapes.** Extend `partitioned_resident_route_query_shape`
-      (resident_route.rs:237 — currently rejects distinct/group_by/having/order_by/limit/offset) + the dispatch to
-      route partitioned DISTINCT/GROUP BY/ORDER BY/top-N onto the unified buffer (rides 2a + the existing on-device
-      grouped/distinct/ordered executors); author new fixtures (oracle = same rows as one single-store snapshot).
-    - [ ] **Text recompaction** — separate slice (per-row offset rebasing + blob concat).
+    - [x] **Slice 2b — partitioned DISTINCT / GROUP BY / ORDER-BY projection DONE + AUDITED SHIP** (`99ef51f7`).
+      The hard shapes over the unified buffer (correct ACROSS partitions: a group key spanning partitions
+      collapses to one row; a global top-N sorts over all partitions). The gap was a MISROUTE, not a missing
+      route — the single-store classifier already emits `int4_[filtered_]distinct_projection` /
+      `int4_[filtered_]grouped_aggregate` / `int4_ordered_projection`, but `plan_relational_partitioned_resident_route`
+      rejected them; now it maps them to 5 `partitioned_*` strings + accepts + builds `required_int4_columns`.
+      `execute_resident_grouped_via_general` / `_distinct_via_general` gained `Option<&ResidentExecSource>`
+      (slice-0 pattern, behavior-preserving — S8 differential still passes); the partitioned bridge branches
+      DISTINCT→GROUP BY→ORDER BY to them with `Some(&unified_src)`. NO new device code (rides 2a + the audited
+      S8/S10b/S10a executors). Oracle fixtures: same rows as 3 partitions vs one single-store snapshot,
+      byte-identical + independent cross-partition row-pins. Suite 729/0; HAZARD 3×concurrent clean. **Audit:
+      SHIP, no findings** (threading behavior-preserving, branch order, oracle non-vacuous, admission not
+      over-broad, charter §1 clean). int4-only / non-null.
+    - [ ] **Text recompaction** — the one remaining S10c sub-item: extend the recompaction to text columns
+      (per-row offset rebasing + bytes-blob concat, likely a tiny rebase kernel) so partitioned shapes over
+      text columns route too. Separate slice; the int4-only classifier guards reject text shapes until then
+      (clean rejection, no silent wrong data).
+  - **S10c STATUS: single-GPU partitioned read path COMPLETE for int4 shapes** — all 8 probes retired
+    (S10d unblocked), host fully out, and DISTINCT/GROUP BY/ORDER BY admitted; only text-column recompaction
+    and the true multi-GPU cross-shard combine (NCCL/peer-copy) remain, both deliberately deferred.
   - [ ] **S10d — delete the host finalization + CPU fallback (deletion slice, LAST).** Once S10a–c route
     every shape on-device: delete `engine_select_bind.rs` `finalize_relational_select` (now at `:486`; host
     sort/agg/DISTINCT at `:710`/HAVING/LIMIT) + **`mvcc_read_exec.rs` `cpu_fallback`** (`:776/784`) + the host
