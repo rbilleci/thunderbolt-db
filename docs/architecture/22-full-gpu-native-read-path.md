@@ -406,11 +406,17 @@ is optional; each line is struck through only when it runs on the device.
       (count_all / int4_equality_count / int4_range_count / int4_scalar / filtered / between) are NOT `*_probe`
       methods — they route to `execute_resident_plan` (a structured GPU-native ResidentOp path: run_resident_count
       / run_resident_scalar_aggregate), so they're out of the "retire the canned-matcher probes" scope (a later
-      consolidation decision, not a violation). The actual remaining `*_probe` targets are: **(a) the 2 count
-      probes** `text_prefix_like_count` + `int4_filter_group_count` → route via the bridge as `COUNT(*)` + the
-      rebuilt predicate. **CORRECTION: no predicate-builder extension is needed — `having_value_to_resident_literal`
-      ALREADY emits `TextLiteral`/`Like` and the general WHERE VM does text `LIKE` (`expr_text_like_scalar_filter`).**
-      **(b) partitioned ×8** → the grouped bridge. Per-batch differential (WITH NULL data) + audit each.
+      consolidation decision, not a violation). The actual remaining `*_probe` targets are:
+      - [x] **`int4_filter_group_count` DONE + AUDITED SHIP** (route + delete `986a2b69`). int4 multi-group
+        `COUNT(*)` (OR of AND-groups) → bridge as `CountAll` + the rebuilt int4 DNF predicate. 15-query
+        differential = byte-identical non-NULL + the PG-correct NULL fix (a NULL fails the predicate via 3VL,
+        not the probe's phantom `Int4(0)` match for `a = 0`). Audit SHIP.
+      - [ ] **`text_prefix_like_count`** — BLOCKED, needs a reconciliation slice. `having_value_to_resident_literal`
+        emits `TextLiteral`/`Like` and the general WHERE *does* have a LIKE path (`expr_text_like_scalar_filter`,
+        engine_expr.rs:6538), BUT a bridged LIKE predicate returned **COUNT=0** in testing — the bridge's
+        RECONSTRUCTED `Like` predicate did not match (a LIKE pattern-format mismatch: the bound filter's pattern
+        value vs what the WHERE LIKE path expects, e.g. the `%`). Investigate + reconcile, then route + delete.
+      - [ ] **partitioned ×8** → the grouped bridge. Per-batch differential (WITH NULL data) + audit each.
   - [x] **S10b — on-device DISTINCT DONE + AUDITED SHIP** (route `96c2d59b` + delete probes `0c56082e`).
     **This CLOSED the latent §1 violation** (the int4_[filtered_]distinct probes deduped on a HOST `BTreeSet`
     while reporting `executed_target:Gpu`). `execute_resident_distinct_via_general` rewrites `SELECT DISTINCT a`
