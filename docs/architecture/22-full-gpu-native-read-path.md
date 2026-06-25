@@ -307,11 +307,14 @@ is optional; each line is struck through only when it runs on the device.
 ### Retire the host relational path entirely (the "incl. oracle" decision)
 - [~] **S9 — replace CPU-oracle parity tests with GPU-native oracles** (serial-vs-parallel /
   construction / closed-form) wherever tests currently assert vs a CPU re-implementation.
-  **CONVERSION DONE + suite-green `f43418b7` (independent audit RUNNING).** The 2026-06-25 re-sweep of
-  `crates/engine/src/tests/` + `crates/execution/src/` found the surviving CPU/host-path result oracles
-  in THREE resident-path clusters; all converted to closed-form construction oracles (behavior-preserving,
+  **STEP 1 `f43418b7` AUDITED SHIP + STEP 2 follow-up `06576048` (step-2 audit RUNNING).** The 2026-06-25
+  re-sweep of `crates/engine/src/tests/` + `crates/execution/src/` found the surviving CPU/host-path result
+  oracles in resident-path clusters; all converted to closed-form construction oracles (behavior-preserving,
   full `--include-ignored` suite **720/0** on RTX PRO 6000; GPU-output binding sabotage-proven —
-  `p8` fails `left [[Int8(3)]] right [[Int8(4)]]` on a wrong literal):
+  `p8` fails `left [[Int8(3)]] right [[Int8(4)]]` on a wrong literal). **Step-1 independent audit = SHIP**
+  (8 fault-injections confirmed each oracle binds to real GPU output; behavior-preserving; tests-only;
+  scoping + the two empty-result quirks validated) with ONE P2: the re-sweep had MISSED two more
+  `resident_expr.rs` oracles — fixed in step 2 (not deferred):
   - **`resident_probe.rs` (14 device-memory-probe tests)** — dropped `let cpu = execute_relational_select(..)`
     + `assert_eq!(resident.rows, cpu.rows)`; assert closed-form rows (many already present, redundant with
     the CPU compare). Column-metadata compare dropped to the in-file M3 precedent (closed-form rows carry
@@ -324,8 +327,15 @@ is optional; each line is struck through only when it runs on the device.
     explicit closed-form rows instead of `execute_relational_select_with_cuda_driver_probe`; column
     coverage is now a GPU-vs-GPU consistency check (`resident.columns == default.columns`). AVG uses the
     engine's own `average_sql_value` finalizer (closed-form sum/count).
-  - **`resident_expr.rs` (2 tests)** — `a.iter()...` SUM/MIN/MAX + grouped `g{1,2}.iter()...` MIN/MAX host
-    re-implementations replaced by explicit literals.
+  - **`resident_expr.rs`** — STEP 1: `a.iter()...` SUM/MIN/MAX + grouped `g{1,2}.iter()...` MIN/MAX host
+    re-implementations → explicit literals. STEP 2 (`06576048`, the audit's P2): `runs_int8_aggregates`'
+    `vals.iter()...min()/max()/sum()` → i64/i128 constants (incl. an `i128`-carry SUM 17e18 > i64::MAX), and
+    `gpu_nongrouped_order_by_text`' Rust-`sort_unstable()` ORDER BY oracle → an explicit unsigned-byte-ordered
+    string literal. **RE-SWEEP NOW COMPLETE/ACCURATE** — the remaining resident_expr host-computed expecteds
+    are PERMITTED, not targets: the `(0..N).filter(..)` index-range construction oracles (~2470-2501, the
+    charter's canonical form), the uuid byte-wise min/max CONSTRUCTION oracle (~3611, built from the test's
+    own parsed input, no host relational path), and the single-vs-two-level GPU group-by kernel cross-check
+    (~7826, GPU-vs-GPU / serial-vs-parallel). None depend on the host SQL finalization path; none block S10.
   - **NOT S9 — deferred to S10** (the "incl. oracle" §2 decision, retired WITH the host path): the
     `FirstCudaSliceParityBackend` harness tests (`mvcc_provenance.rs` ×8, `mvcc_query.rs` ×9,
     `sql_dml.rs:2078`) — that backend executes via `CpuMvccExecutionBackend` and RELABELS the target as
@@ -346,7 +356,7 @@ S7 ✅ (join result materialization + LIMIT window, V3, no kernel) → **S5 V1a 
 ✅ `5724bf55` (audit running) — the HAZARD-class kernel slice; the last join `host_rows` data read is GONE**
 → S6 ✅ (V2, pad-WHERE 3VL on-device `76315706`, audited SHIP) → **S8 ✅ AUDITED SHIP (probe fallback retired
 via the `&Select`->general bridge `47c874f3`+`a2bfa319`, 2 audit tests `004bc3d7`)** → **S9 (GPU-native
-oracles) — CONVERSION DONE `f43418b7`, suite 720/0, audit RUNNING** → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
+oracles) — STEP 1 `f43418b7` AUDITED SHIP + STEP 2 `06576048` (audit running), suite 720/0** → S10 (delete host path). _(Join implemented V3→V1→V2 per the handover: V3 lowest-risk
 no-kernel first, then the kernel work fresh.)_
 S9 underpins S10 and is done alongside each slice's tests. Order within S3–S8 is flexible; S2
 is the keystone and unblocks the most queries.
