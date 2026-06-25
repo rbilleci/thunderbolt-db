@@ -350,13 +350,15 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
 
+    // S10a: the int4 projection shapes now run via the `&Select`->general bridge (the legacy
+    // resident-probe projection methods were retired); with no retained device memory it errors cleanly.
     let Command::Select(projection_select) =
         parse_command("SELECT id FROM events WHERE id >= 1").unwrap()
     else {
         unreachable!()
     };
     let err = e
-        .execute_relational_projection_with_resident_device_memory_probe(&projection_select)
+        .execute_resident_grouped_via_general(&projection_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -388,58 +390,6 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
-}
-
-#[test]
-fn gpu_resident_device_memory_projection_probe_materializes_int4_results() {
-    let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
-        .unwrap();
-    e.execute_text(
-            2,
-            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 30)",
-        )
-        .unwrap();
-    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
-    if snapshot.device_memory_proof.is_none() {
-        return;
-    }
-    let Command::Select(select) =
-        parse_command("SELECT amount FROM events WHERE amount >= 20").unwrap()
-    else {
-        unreachable!()
-    };
-    let before = e.metrics().snapshot();
-    let resident = e
-        .execute_relational_projection_with_resident_device_memory_probe(&select)
-        .unwrap();
-    let after = e.metrics().snapshot();
-
-    // Closed-form oracle (S9): `SELECT amount WHERE amount >= 20` over amount=[10,20,30] (row order).
-    assert_eq!(
-        resident.rows,
-        vec![vec![SqlValue::Int4(20)], vec![SqlValue::Int4(30)]]
-    );
-    assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
-    assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(resident.fallback_reason, None);
-    assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
-    assert_eq!(
-        after.d2h_bytes_total - before.d2h_bytes_total,
-        2 * std::mem::size_of::<i32>() as u64 + std::mem::size_of::<u64>() as u64
-    );
-    assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
-
-    e.execute_text(
-        3,
-        "INSERT INTO events (id, label, amount) VALUES (4, 'delta', 40)",
-    )
-    .unwrap();
-    assert!(e
-        .execute_relational_projection_with_resident_device_memory_probe(&select)
-        .unwrap_err()
-        .to_string()
-        .contains("resident snapshot is invalid"));
 }
 
 #[test]
@@ -729,6 +679,83 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
         vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(5)]],
         "filtered DISTINCT (a>=2): {fsql}"
     );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10a_projection_routes_through_bridge_on_dispatch() {
+    // S10a keeper: the int4 projection shapes reach their route arms through the LIVE `&Select` dispatch
+    // and execute via the general bridge ON THE GPU, closed-form (incl. multi-column + a mixed text+int4
+    // projection). Survives the probes' deletion (calls the dispatch).
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE proj (a INT, b INT, label TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO proj (a, b, label) VALUES (5,3,'x'),(1,7,'y'),(5,9,'z'),(2,3,'w'),(5,3,'q'),(8,1,'r')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("proj").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let t = |s: &str| SqlValue::Text(s.to_string());
+    let i = SqlValue::Int4;
+    let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
+        // index order preserved (no ORDER BY): a>=5 -> rows 0,2,4,5 = [5,5,5,8].
+        ("SELECT a FROM proj WHERE a >= 5", vec![vec![i(5)], vec![i(5)], vec![i(5)], vec![i(8)]]),
+        ("SELECT a FROM proj WHERE a = 5", vec![vec![i(5)], vec![i(5)], vec![i(5)]]),
+        ("SELECT a, b FROM proj WHERE a = 5 AND b = 3", vec![vec![i(5), i(3)], vec![i(5), i(3)]]),
+        ("SELECT label, a FROM proj WHERE a = 5", vec![vec![t("x"), i(5)], vec![t("z"), i(5)], vec![t("q"), i(5)]]),
+    ];
+    for (sql, expected) in cases {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(result.fallback_reason, None, "fell back: {sql}");
+        assert_eq!(&result.rows, expected, "rows mismatch: {sql}");
+    }
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_s10a_projection_drops_nulls_pg_correct() {
+    // S10a NULL regression: the retired int4 projection probes read the int4 column directly, so a NULL
+    // (placeholder 0) that passed the filter surfaced as a phantom Int4(0). The bridge filters via the 3VL
+    // WHERE VM, so a NULL fails `a >= 0` / `a = 0` (UNKNOWN) and is excluded -- PG-correct. Data has real 0s
+    // AND NULLs; the result must contain ONLY the real 0s.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE projn (a INT, label TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO projn (a, label) VALUES (0,'a'), (NULL,'b'), (5,'c'), (NULL,'d'), (0,'e')",
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("projn").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let i = SqlValue::Int4;
+    // a>=0 keeps the non-NULL 0,5,0 (rows 0,2,4) in index order; NULLs excluded (no phantom 0).
+    let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
+        ("SELECT a FROM projn WHERE a >= 0", vec![vec![i(0)], vec![i(5)], vec![i(0)]]),
+        // a = 0 keeps ONLY the two real 0s (rows 0,4); the 2 NULLs are NOT phantom 0s.
+        ("SELECT a FROM projn WHERE a = 0", vec![vec![i(0)], vec![i(0)]]),
+    ];
+    for (sql, expected) in cases {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(
+            &result.rows, expected,
+            "NULL not excluded (probe phantom-0 bug regressed?): {sql}"
+        );
+    }
 }
 
 #[test]

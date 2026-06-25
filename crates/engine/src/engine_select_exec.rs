@@ -444,17 +444,20 @@ impl Engine {
             "int4_grouped_aggregate" | "int4_filtered_grouped_aggregate" => {
                 self.execute_resident_grouped_via_general(select)
             }
-            "int4_projection" => {
-                self.execute_relational_projection_with_resident_device_memory_probe(select)
-            }
-            "int4_equality_projection" => self
-                .execute_relational_equality_projection_with_resident_device_memory_probe(select),
-            "int4_equality_multi_column_projection"
+            // S10a (projection batch): the non-grouped int4 projection shapes (a single-column range-filtered
+            // projection; equality; multi-column / composite-AND equality; and a mixed text+int4 projection)
+            // route to the SAME `&Select`->general bridge. The binding executor runs the plain-projection path
+            // (WHERE predicate VM + on-device column/text gather, S1) -- byte-identical to the retired probes on
+            // non-NULL data; NULL/empty results become PG-correct (a NULL fails the filter via 3VL instead of
+            // the probe's phantom Int4(0)). Every FILTER is int4 (text only in the projection), so the int4-only
+            // predicate builder suffices. Covers text + CTAS + view uniformly.
+            "int4_projection"
+            | "int4_equality_projection"
+            | "int4_equality_multi_column_projection"
             | "int4_composite_equality_multi_column_projection"
-            | "int4_equality_mixed_column_projection" => self
-                .execute_relational_equality_multi_column_projection_with_resident_device_memory_probe(
-                    select,
-                ),
+            | "int4_equality_mixed_column_projection" => {
+                self.execute_resident_grouped_via_general(select)
+            }
             // S10a: a single-int4-column ordered projection (`SELECT a FROM t WHERE a <range> ORDER BY a
             // LIMIT n`) routes to the SAME `&Select`->general bridge as the grouped shapes. For a
             // non-grouped select the bridge builds EMPTY group keys, so the binding executor runs the
