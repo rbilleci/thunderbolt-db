@@ -411,12 +411,25 @@ is optional; each line is struck through only when it runs on the device.
         `COUNT(*)` (OR of AND-groups) → bridge as `CountAll` + the rebuilt int4 DNF predicate. 15-query
         differential = byte-identical non-NULL + the PG-correct NULL fix (a NULL fails the predicate via 3VL,
         not the probe's phantom `Int4(0)` match for `a = 0`). Audit SHIP.
-      - [ ] **`text_prefix_like_count`** — BLOCKED, needs a reconciliation slice. `having_value_to_resident_literal`
-        emits `TextLiteral`/`Like` and the general WHERE *does* have a LIKE path (`expr_text_like_scalar_filter`,
-        engine_expr.rs:6538), BUT a bridged LIKE predicate returned **COUNT=0** in testing — the bridge's
-        RECONSTRUCTED `Like` predicate did not match (a LIKE pattern-format mismatch: the bound filter's pattern
-        value vs what the WHERE LIKE path expects, e.g. the `%`). Investigate + reconcile, then route + delete.
-      - [ ] **partitioned ×8** → the grouped bridge. Per-batch differential (WITH NULL data) + audit each.
+      - [ ] **`text_prefix_like_count`** — BLOCKED on a mask-VM LIKE gap (deeper than first thought; a fresh
+        slice). Two findings from a 2026-06-25 attempt (reverted, tree clean): (1) **the bound filter carries the
+        BARE prefix** (`LIKE 'al%'` → `Text("al")`, `%` stripped, op `LikePrefix`) and the probe does a literal
+        byte prefix-match; a fix in `resident_predicate_from_bound_filters` that reconstructs a real LIKE pattern
+        (escape `%`/`_`/`\`, append `%`) made a DIRECT `execute_resident_grouped_via_general` bridge call
+        byte-identical to the probe (differential passed). BUT (2) **via the LIVE dispatch the same CountAll+LIKE
+        errors** `text inequalities need collation sort keys` — the COUNT path lowers the predicate through the
+        **composable mask VM `compile_text_eq_leaf` (engine_expr.rs:1717)** which handles only `Eq`/`Ne`, NOT
+        `Like` (only the STANDALONE `try_lower_text_predicate` :6533 / `expr_text_like_scalar_filter` does). So
+        routing needs a `TextLikeMask` step in the mask VM (+ kernel) OR routing a single-Like predicate to the
+        standalone path. ALSO unexplained: the direct bridge call succeeded while the live dispatch failed on the
+        SAME method + SAME predicate (`[[(0, LikePrefix, Text("al"))]]` in both) — debug that first.
+      - [ ] **partitioned ×8** — BLOCKED on multi-partition (a fresh slice, likely a design call). The
+        `partitioned_*` shapes are emitted by `engine_residency.rs:1568-1595` when a table has >1 resident
+        partition; the probes iterate `read_state.residency.partition_device_memory` across ALL partitions
+        (`engine_resident_probe.rs:848-895`). The bridge uses the SINGLE `device_memory` / `relational_residency_entry`
+        store — it does NOT iterate partitions, so it would miss data. These probes are GPU-native (not §1
+        violations) — retiring them requires the general executor to handle multi-partition resident tables (a
+        large extension to the most-audited path) OR a decision to keep them as a legitimate GPU-native path.
   - [x] **S10b — on-device DISTINCT DONE + AUDITED SHIP** (route `96c2d59b` + delete probes `0c56082e`).
     **This CLOSED the latent §1 violation** (the int4_[filtered_]distinct probes deduped on a HOST `BTreeSet`
     while reporting `executed_target:Gpu`). `execute_resident_distinct_via_general` rewrites `SELECT DISTINCT a`
