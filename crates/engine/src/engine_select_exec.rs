@@ -400,36 +400,22 @@ impl Engine {
             | "int4_filtered_scalar_aggregate" | "int4_between_scalar_aggregate" => {
                 self.execute_resident_plan(select)
             }
-            "partitioned_count_all" => self
-                .execute_relational_partitioned_count_with_resident_device_memory_probe(select),
-            "partitioned_int4_equality_projection" => self
-                .execute_relational_partitioned_equality_projection_with_resident_device_memory_probe(
-                    select,
-                ),
-            "partitioned_int4_equality_multi_column_projection" => self
-                .execute_relational_partitioned_equality_multi_column_projection_with_resident_device_memory_probe(
-                    select,
-                ),
-            "partitioned_int4_equality_sum" => self
-                .execute_relational_partitioned_equality_sum_with_resident_device_memory_probe(
-                    select,
-                ),
-            "partitioned_int4_between_avg" => self
-                .execute_relational_partitioned_between_avg_with_resident_device_memory_probe(
-                    select,
-                ),
-            "partitioned_int4_filtered_min" => self
-                .execute_relational_partitioned_filtered_min_with_resident_device_memory_probe(
-                    select,
-                ),
-            "partitioned_int4_filtered_avg" => self
-                .execute_relational_partitioned_filtered_avg_with_resident_device_memory_probe(
-                    select,
-                ),
-            "partitioned_int4_filtered_max" => self
-                .execute_relational_partitioned_filtered_max_with_resident_device_memory_probe(
-                    select,
-                ),
+            // S10c slice 1: the 8 MULTI-PARTITION resident shapes route to the SAME `&Select`->general
+            // bridge, per-partition (single-GPU). It iterates the table's resident partitions in order,
+            // runs the general resident-Expr executor over each partition's injected SoA buffer, and
+            // combines (COUNT/SUM/MIN/MAX/AVG reductions; projection concatenation) -- retiring the 8
+            // `execute_relational_partitioned_*_with_resident_device_memory_probe` methods. Byte-identical
+            // to the probes on non-NULL data; the empty-set aggregates take the same placeholders.
+            "partitioned_count_all"
+            | "partitioned_int4_equality_projection"
+            | "partitioned_int4_equality_multi_column_projection"
+            | "partitioned_int4_equality_sum"
+            | "partitioned_int4_between_avg"
+            | "partitioned_int4_filtered_min"
+            | "partitioned_int4_filtered_avg"
+            | "partitioned_int4_filtered_max" => {
+                self.execute_resident_partitioned_via_general(select)
+            }
             // S10a: a text-prefix `COUNT(*)` (`SELECT COUNT(*) ... WHERE col LIKE 'al%'`) routes to the
             // `&Select`->general bridge as a CountAll + a reconstructed `LIKE` predicate. The bridge rebuilds
             // the faithful `LIKE '<prefix>%'` pattern from the bare `LikePrefix` bound filter (the parser

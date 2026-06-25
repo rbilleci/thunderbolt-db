@@ -1111,7 +1111,11 @@ fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidate
                 .saturating_sub(before.kernel_exec_samples)
         )
     );
-    assert_eq!(decision.last_execution_matched_rows, Some(4));
+    // S10c: this shape now executes via the per-partition `&Select`->general bridge, which records the
+    // generic execution observation (rows/h2d/d2h/kernel_samples) but NOT the probe-only per-partition
+    // `record_route_device_lookup_micros`. So `last_execution_matched_rows` (set only by that recorder)
+    // is no longer populated; assert the generic `last_execution_rows == Some(1)` (one COUNT(*) row).
+    assert_eq!(decision.last_execution_rows, Some(1));
 
     e.execute_text(
             2,
@@ -1225,7 +1229,10 @@ fn p8_partitioned_resident_key_lookup_merges_matches_and_rejects_invalidated() {
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    assert_eq!(decision.last_execution_matched_rows, Some(4));
+    // S10c: executes via the per-partition `&Select`->general bridge. The probe-only
+    // `record_route_device_lookup_micros` (which set `last_execution_matched_rows`) is no longer called,
+    // so assert the generic `last_execution_rows == Some(4)` (the 4 concatenated projected rows) instead.
+    assert_eq!(decision.last_execution_rows, Some(4));
 
     e.execute_text(
             2,
@@ -1393,9 +1400,12 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    assert_eq!(decision.last_execution_matched_rows, Some(4));
-    assert!(decision.last_execution_match_index_micros.is_some());
-    assert!(decision.last_execution_selected_projection_micros.is_some());
+    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // observation but NOT the probe-only `record_route_{device_lookup,selected_projection}_micros`. So
+    // `last_execution_matched_rows` / `last_execution_match_index_micros` /
+    // `last_execution_selected_projection_micros` are no longer populated; assert the generic
+    // `last_execution_rows == Some(4)` (the 4 concatenated projected rows) instead.
+    assert_eq!(decision.last_execution_rows, Some(4));
 
     e.execute_text(
             2,
@@ -1964,13 +1974,12 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
+    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // observation (`last_execution_rows == Some(1)`, one SUM row) but NOT the probe-only
+    // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
+    // `last_execution_match_index_micros` / `last_execution_selected_projection_micros` /
+    // `last_execution_result_materialization_micros` are no longer populated; the generic rows check covers it.
     assert_eq!(decision.last_execution_rows, Some(1));
-    assert_eq!(decision.last_execution_matched_rows, Some(4));
-    assert!(decision.last_execution_match_index_micros.is_some());
-    assert!(decision.last_execution_selected_projection_micros.is_some());
-    assert!(decision
-        .last_execution_result_materialization_micros
-        .is_some());
 
     e.execute_text(
             2,
@@ -2145,13 +2154,12 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
+    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // observation (`last_execution_rows == Some(1)`, one AVG row) but NOT the probe-only
+    // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
+    // `last_execution_match_index_micros` / `last_execution_selected_projection_micros` /
+    // `last_execution_result_materialization_micros` are no longer populated; the generic rows check covers it.
     assert_eq!(decision.last_execution_rows, Some(1));
-    assert_eq!(decision.last_execution_matched_rows, Some(8));
-    assert!(decision.last_execution_match_index_micros.is_some());
-    assert!(decision.last_execution_selected_projection_micros.is_some());
-    assert!(decision
-        .last_execution_result_materialization_micros
-        .is_some());
 
     let Command::Select(no_match_select) =
         parse_command("SELECT AVG(ol_amount) FROM order_line WHERE ol_o_id BETWEEN 90 AND 99")
@@ -2333,12 +2341,12 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
+    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // observation (`last_execution_rows == Some(1)`, one MAX row) but NOT the probe-only
+    // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
+    // `last_execution_match_index_micros` / `last_execution_result_materialization_micros` are no longer
+    // populated; the generic rows check covers it.
     assert_eq!(decision.last_execution_rows, Some(1));
-    assert_eq!(decision.last_execution_matched_rows, Some(5));
-    assert!(decision.last_execution_match_index_micros.is_some());
-    assert!(decision
-        .last_execution_result_materialization_micros
-        .is_some());
 
     let Command::Select(no_match_select) =
         parse_command("SELECT MAX(ol_amount) FROM order_line WHERE ol_amount >= 100").unwrap()
@@ -2515,12 +2523,12 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
+    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // observation (`last_execution_rows == Some(1)`, one MIN row) but NOT the probe-only
+    // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
+    // `last_execution_match_index_micros` / `last_execution_result_materialization_micros` are no longer
+    // populated; the generic rows check covers it.
     assert_eq!(decision.last_execution_rows, Some(1));
-    assert_eq!(decision.last_execution_matched_rows, Some(6));
-    assert!(decision.last_execution_match_index_micros.is_some());
-    assert!(decision
-        .last_execution_result_materialization_micros
-        .is_some());
 
     let Command::Select(no_match_select) =
         parse_command("SELECT MIN(ol_amount) FROM order_line WHERE ol_amount <= 0").unwrap()
@@ -2702,12 +2710,12 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
+    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // observation (`last_execution_rows == Some(1)`, one AVG row) but NOT the probe-only
+    // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
+    // `last_execution_match_index_micros` / `last_execution_result_materialization_micros` are no longer
+    // populated; the generic rows check covers it.
     assert_eq!(decision.last_execution_rows, Some(1));
-    assert_eq!(decision.last_execution_matched_rows, Some(8));
-    assert!(decision.last_execution_match_index_micros.is_some());
-    assert!(decision
-        .last_execution_result_materialization_micros
-        .is_some());
 
     let Command::Select(no_match_select) =
         parse_command("SELECT AVG(ol_amount) FROM order_line WHERE ol_amount <= 0").unwrap()

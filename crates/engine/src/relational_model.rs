@@ -959,62 +959,6 @@ pub(crate) fn resident_device_text_column_layout<'a>(
         })
 }
 
-pub(crate) fn resident_partition_int4_column_offset(
-    partition: &RelationalResidentPartition,
-    table: &RelationalTable,
-    column_idx: usize,
-) -> Result<u64, ExecuteError> {
-    let column = table.columns.get(column_idx).ok_or_else(|| {
-        ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident partition predicate column is outside the catalog table".to_string(),
-        ))
-    })?;
-    if column.ty != SqlType::Int4 {
-        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident partition predicate column is not int4".to_string(),
-        )));
-    }
-    let int4_ordinal = table
-        .columns
-        .iter()
-        .take(column_idx)
-        .filter(|candidate| candidate.ty == SqlType::Int4)
-        .count();
-    if partition
-        .resident_device_int4_columns
-        .get(int4_ordinal)
-        .is_none_or(|name| name != &column.name)
-    {
-        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-            "resident partition {} device payload has no int4 column \"{}\"",
-            partition.partition_id, column.name
-        ))));
-    }
-    let row_count = u64::try_from(partition.row_count).map_err(|_| {
-        ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident partition row count exceeds retained device-memory proof range".to_string(),
-        ))
-    })?;
-    let int4_width = std::mem::size_of::<i32>() as u64;
-    row_count
-        .checked_mul(int4_width)
-        .and_then(|column_bytes| {
-            (int4_ordinal as u64)
-                .checked_mul(column_bytes)
-                .and_then(|prefix_bytes| {
-                    partition
-                        .count_header_byte_offset
-                        .checked_add(std::mem::size_of::<u64>() as u64)
-                        .and_then(|header_end| header_end.checked_add(prefix_bytes))
-                })
-        })
-        .ok_or_else(|| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident partition int4 payload offset overflowed".to_string(),
-            ))
-        })
-}
-
 pub(crate) fn resident_device_i32_comparison(op: SelectFilterOp) -> Option<CudaI32Comparison> {
     match op {
         SelectFilterOp::Lt => Some(CudaI32Comparison::Lt),

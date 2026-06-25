@@ -1030,6 +1030,51 @@ impl Engine {
         Ok(())
     }
 
+    /// Synthesize a single-store-shaped [`RelationalResidencySnapshot`] DESCRIPTOR for ONE partition
+    /// (S10c slice 1). A partition's SoA payload is self-contained (`count_header_byte_offset == 0`,
+    /// sized by `partition.row_count`), so a descriptor whose `row_count == partition.row_count` plus the
+    /// partition's `resident_device_{int4,text}_columns` makes the SINGLE-store offset helpers address the
+    /// partition buffer BYTE-IDENTICALLY — letting the general resident-Expr executor serve one partition
+    /// slice when handed it via `ResidentExecSource`. Mirrors the benchmark snapshot constructor (the
+    /// per-table install path) field-for-field; the fields the offset helpers DON'T read (generation,
+    /// stats, int8/numeric/bool/null columns, refresh cost, admission accounting) take inert defaults.
+    /// The identity guard (`schema`/`table` == catalog) and `is_valid()` are satisfied for a valid
+    /// partition, so the executor's per-source identity/validity prechecks pass.
+    pub(crate) fn resident_snapshot_for_partition(
+        &self,
+        partition: &RelationalResidentPartition,
+        table: &RelationalTable,
+    ) -> RelationalResidencySnapshot {
+        RelationalResidencySnapshot {
+            gpu_id: partition.gpu_id,
+            schema: partition.schema.clone(),
+            table: partition.table.clone(),
+            generation: 0,
+            // CRITICAL: the partition's own row count sizes the SoA the single-store offset helpers
+            // read, so they address THIS partition's buffer (not the whole table).
+            row_count: partition.row_count,
+            column_count: table.columns.len(),
+            resident_bytes: partition.resident_bytes,
+            resident_device_int4_columns: partition.resident_device_int4_columns.clone(),
+            resident_device_int4_column_stats: Vec::new(),
+            resident_device_int8_columns: Vec::new(),
+            resident_device_numeric_columns: Vec::new(),
+            resident_device_bool_columns: Vec::new(),
+            resident_device_text_columns: partition.resident_device_text_columns.clone(),
+            resident_device_null_columns: Vec::new(),
+            valid_through_index: self.committed_seq(),
+            invalidated_by_txn_id: partition.invalidated_by_txn_id,
+            invalidated_at_index: partition.invalidated_at_index,
+            invalidated_by_memory_pressure: partition.invalidated_by_memory_pressure,
+            memory_pressure_active: partition.memory_pressure_active,
+            last_refresh_cost: None,
+            admission_budget_bytes: None,
+            resident_bytes_after_admission: 0,
+            evicted_tables_on_admission: Vec::new(),
+            device_memory_proof: partition.device_memory_proof.clone(),
+        }
+    }
+
     fn validate_benchmark_resident_chunk_columns(
         table: &RelationalTable,
         int4_columns: &[String],

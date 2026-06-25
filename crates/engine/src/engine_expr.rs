@@ -1969,6 +1969,272 @@ impl Engine {
         )
     }
 
+    /// S10c slice 1: `&Select`->general BRIDGE for the 8 MULTI-PARTITION resident shapes (single-GPU).
+    /// Iterates the table's resident partitions IN ORDER (already sorted by `(row_start, partition_id)`)
+    /// and runs the SAME on-device general resident-Expr executor over each partition's injected SoA
+    /// buffer (via `ResidentExecSource`), then COMBINES the per-partition results — retiring the 8
+    /// `execute_relational_partitioned_*_with_resident_device_memory_probe` methods. Each partition is a
+    /// self-contained SoA (`count_header_byte_offset == 0`, sized by `partition.row_count`), so a
+    /// per-partition descriptor with `row_count == partition.row_count` makes the executor's single-store
+    /// offset helpers address the partition buffer byte-identically. The WHERE predicate + the per-partition
+    /// identity/validity prechecks mirror the retired probes; only the combine differs by shape.
+    ///
+    /// Aggregate caveats the combine works around: the general SUM/MIN/MAX/AVG HARD-ERROR on an empty
+    /// filtered set (NULL is M3), and AVG returns only the quotient. So per partition we issue a COUNT(*)
+    /// precheck and skip the empty ones; SUM/AVG additionally accumulate the per-partition SUM (issued only
+    /// when count>0) + the count, finalizing AVG once via `average_sql_value(total_sum, matched_rows)` (the
+    /// helper the probe used) — so an all-empty AVG yields `average_sql_value(0, 0)` and an all-empty MIN/MAX
+    /// yields the probe's `SqlValue::Text(String::new())` placeholder, byte-identical to the retired probes.
+    pub(crate) fn execute_resident_partitioned_via_general(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, mut bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        // Rebuild the WHERE predicate from the bound filters, then clear them so the executor filters
+        // SOLELY via the predicate (the SQL->Expr contract), exactly as the grouped bridge does.
+        let predicate = resident_predicate_from_bound_filters(&bound)?;
+        bound.filter = None;
+        bound.filters.clear();
+        bound.filter_groups.clear();
+        // Load the table's resident partitions in published order (sorted by (row_start, partition_id)).
+        // Error text mirrors the retired probes.
+        let partitions = self
+            .read_state
+            .residency
+            .partitions
+            .load()
+            .get(&table.name)
+            .cloned()
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident partitions",
+                    table.name
+                )))
+            })?;
+        if partitions.is_empty() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" has no resident partitions",
+                table.name
+            ))));
+        }
+        let gpu_id = partitions[0].gpu_id;
+        let runtime_snapshot = self.router.runtime().snapshot();
+
+        // Build a `ResidentExecSource` for one partition (the per-partition identity + validity prechecks
+        // mirror the probe's at engine_resident_probe.rs ~873), or return the same error a probe did.
+        let source_for = |partition: &RelationalResidentPartition| -> Result<ResidentExecSource, ExecuteError> {
+            if partition.schema != table.schema || partition.table != table.name {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident partition no longer matches catalog table identity".to_string(),
+                )));
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&partition.gpu_id);
+            if !partition.is_valid(memory_pressure_active) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident partition {} is invalid",
+                    partition.partition_id
+                ))));
+            }
+            let device_memory = self
+                .read_state
+                .residency
+                .partition_device_memory
+                .get(&(table.name.clone(), partition.partition_id))
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident partition {} has no retained device memory",
+                        partition.partition_id
+                    )))
+                })?;
+            Ok(ResidentExecSource {
+                descriptor: Arc::new(self.resident_snapshot_for_partition(partition, &table)),
+                device_memory,
+                row_count: partition.row_count as u64,
+            })
+        };
+
+        // Run one (already-bound) select against one partition's injected source via the general executor.
+        let run = |select_ref: &Select,
+                   bound_for_select: BoundRelationalSelect,
+                   src: &ResidentExecSource|
+         -> Result<RelationalSelectResult, ExecuteError> {
+            self.execute_resident_expr_select_with_binding(
+                select_ref,
+                &table,
+                Some(src),
+                bound_for_select,
+                copin_s,
+                predicate.as_ref(),
+                &[],
+                &[],
+                None,
+                &[],
+            )
+        };
+
+        // The access path is shape/table-level metadata (it does not depend on the partition data), so
+        // compute it once from the (filter-cleared) bound exactly as a probe did (engine_resident_probe.rs
+        // ~846). bound was filter-cleared above; the partitioned shapes carry no ORDER BY / LIMIT.
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
+
+        let finalize = |rows: Vec<Vec<SqlValue>>| -> RelationalSelectResult {
+            RelationalSelectResult {
+                columns: bound.selected_columns.clone(),
+                rows,
+                planned_target: DeviceTarget::Gpu(gpu_id),
+                executed_target: DeviceTarget::Gpu(gpu_id),
+                fallback_reason: None,
+                access_path: access_path.clone(),
+            }
+        };
+
+        // A derived COUNT(*) select bound at table level — its CountAll projection never errors on an empty
+        // partition, so it is the per-partition match precheck the empty-set-NULL aggregates need.
+        let count_select = {
+            let mut s = select.clone();
+            s.projection = SelectProjection::CountAll;
+            s
+        };
+        let count_bound = bind_relational_select(&table, &count_select)?;
+        let partition_count = |src: &ResidentExecSource| -> Result<i64, ExecuteError> {
+            let result = run(&count_select, count_bound.clone(), src)?;
+            match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
+                Some(SqlValue::Int8(n)) => Ok(n),
+                other => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "partitioned resident COUNT(*) precheck returned an unexpected value: {other:?}"
+                )))),
+            }
+        };
+
+        match &select.projection {
+            // COUNT(*): sum the per-partition counts into one Int8 row.
+            SelectProjection::CountAll => {
+                let mut total = 0_i128;
+                for partition in &partitions {
+                    let src = source_for(partition)?;
+                    total = total.saturating_add(i128::from(partition_count(&src)?));
+                }
+                let count = i64::try_from(total).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "partitioned resident row count {total} exceeds supported COUNT(*) result range"
+                    )))
+                })?;
+                Ok(finalize(vec![vec![SqlValue::Int8(count)]]))
+            }
+            // SUM(int4) -> Int8: the general SUM hard-errors on an empty partition, so issue SUM only when
+            // the per-partition COUNT(*) > 0; accumulate as i128, finalize one Int8 row.
+            SelectProjection::Sum { .. } => {
+                let mut total_sum = 0_i128;
+                for partition in &partitions {
+                    let src = source_for(partition)?;
+                    if partition_count(&src)? == 0 {
+                        continue;
+                    }
+                    let result = run(select, bound.clone(), &src)?;
+                    match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
+                        Some(SqlValue::Int8(n)) => {
+                            total_sum = total_sum.saturating_add(i128::from(n));
+                        }
+                        other => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "partitioned resident SUM partition returned an unexpected value: {other:?}"
+                            ))));
+                        }
+                    }
+                }
+                let sum = i64::try_from(total_sum).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "partitioned resident SUM {total_sum} exceeds supported bigint result range"
+                    )))
+                })?;
+                Ok(finalize(vec![vec![SqlValue::Int8(sum)]]))
+            }
+            // MIN / MAX(int4): COUNT-precheck per partition; skip the empty ones; fold the i32 result.
+            // All-empty -> the probe's `SqlValue::Text(String::new())` placeholder (mirrored exactly).
+            SelectProjection::Min { .. } | SelectProjection::Max { .. } => {
+                let is_max = matches!(select.projection, SelectProjection::Max { .. });
+                let mut folded: Option<i32> = None;
+                for partition in &partitions {
+                    let src = source_for(partition)?;
+                    if partition_count(&src)? == 0 {
+                        continue;
+                    }
+                    let result = run(select, bound.clone(), &src)?;
+                    let value = match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
+                        Some(SqlValue::Int4(v)) => v,
+                        other => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "partitioned resident MIN / MAX partition returned an unexpected value: {other:?}"
+                            ))));
+                        }
+                    };
+                    folded = Some(match folded {
+                        Some(current) if is_max => current.max(value),
+                        Some(current) => current.min(value),
+                        None => value,
+                    });
+                }
+                let cell = folded
+                    .map(SqlValue::Int4)
+                    .unwrap_or_else(|| SqlValue::Text(String::new()));
+                Ok(finalize(vec![vec![cell]]))
+            }
+            // AVG(int4): the bridge AVG returns only the quotient (insufficient to combine across
+            // partitions), so per non-empty partition issue SUM (guarded by COUNT>0) AND COUNT, accumulate
+            // a global (sum, matched_rows), and finalize ONCE via `average_sql_value` — the helper the probe
+            // used. All-empty -> `average_sql_value(0, 0)` (the canonical-zero numeric sentinel).
+            SelectProjection::Avg { column } => {
+                let sum_select = {
+                    let mut s = select.clone();
+                    s.projection = SelectProjection::Sum {
+                        column: column.clone(),
+                    };
+                    s
+                };
+                let sum_bound = bind_relational_select(&table, &sum_select)?;
+                let mut total_sum = 0_i128;
+                let mut matched_rows = 0_usize;
+                for partition in &partitions {
+                    let src = source_for(partition)?;
+                    let count = partition_count(&src)?;
+                    if count == 0 {
+                        continue;
+                    }
+                    let result = run(&sum_select, sum_bound.clone(), &src)?;
+                    match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
+                        Some(SqlValue::Int8(n)) => {
+                            total_sum = total_sum.saturating_add(i128::from(n));
+                        }
+                        other => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "partitioned resident AVG SUM partition returned an unexpected value: {other:?}"
+                            ))));
+                        }
+                    }
+                    matched_rows = matched_rows.saturating_add(count.max(0) as usize);
+                }
+                Ok(finalize(vec![vec![average_sql_value(total_sum, matched_rows)]]))
+            }
+            // Projection (one or many columns): per-partition projected rows (ascending, no ORDER BY);
+            // concatenate in partition order. The result columns come from the table-level bound.
+            SelectProjection::Columns(_) => {
+                let mut rows = Vec::new();
+                for partition in &partitions {
+                    let src = source_for(partition)?;
+                    let mut result = run(select, bound.clone(), &src)?;
+                    rows.append(&mut result.rows);
+                }
+                Ok(finalize(rows))
+            }
+            other => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "partitioned resident bridge does not support projection {other:?}"
+            )))),
+        }
+    }
+
     /// S10b: `&Select`->general BRIDGE for a single-column `SELECT DISTINCT` (the int4_[filtered_]distinct
     /// route shapes). DISTINCT over column `a` is exactly `GROUP BY a` with no aggregate; the most-audited
     /// on-device grouped path (S8) is built around >=1 aggregate, so synthesize a `COUNT(*)` grouped select,
