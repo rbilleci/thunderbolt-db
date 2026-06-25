@@ -477,12 +477,19 @@ is optional; each line is struck through only when it runs on the device.
       projection order; charter §1 clean; NULL gap acceptable — partitions have no NULL-ingest path). One P3 nit
       (saturating- vs checked-add overflow message, unreachable), no fix required. **This retires every S10c
       probe and unblocks S10d.**
-    - [ ] **Slice 2a (A) — on-device recompaction (host fully out, existing shapes).** Add a `cuMemcpyDtoD`
-      primitive + `retain_device_memory_recompacted` (crates/execution — NO new PTX kernel, pure DtoD orchestration
-      + HAZARD device-write tier) to build ONE int4-only unified buffer (`[u64 total_rows][col0 p0..pN][col1 ...]`)
-      from the partition buffers, then run the executor ONCE over it via `Some(&unified_src)` — SUPERSEDES the
-      Slice 1 per-partition combine. Differential: byte-identical to Slice 1 on the existing fixtures (pin the
-      all-empty aggregate). Guard against text reads (defer text recompaction).
+    - [x] **Slice 2a (A) — on-device recompaction DONE + AUDITED SHIP** (`f786a9f1`). New `cuMemcpyDtoD`
+      primitive + `retain_device_memory_recompacted` (crates/execution — NO new PTX kernel, pure DtoD
+      orchestration) build ONE int4-only unified buffer (`[u64 total_rows][col0 p0..pN][col1 ...]`) from the
+      partition buffers; `execute_resident_partitioned_via_general` recompacts + runs the executor ONCE over
+      `Some(&unified_src)` — SUPERSEDES the Slice 1 per-partition combine. **Host is now FULLY out** (AVG is a
+      single on-device quotient, not a host division). All-empty aggregates keep the Slice 1 placeholders via
+      a unified-buffer COUNT precheck. int4-only (text deferred). Suite 725/0; HAZARD 3×serial+3×concurrent,
+      zero 700/716/717. **Independent adversarial audit: SHIP-WITH-NITS → both adopted:** F1 (P2) — descriptor
+      now labels the buffer with the partitions' OWN int4 list (restores the offset-helper name-check) + the
+      bridge asserts per-partition layout uniformity (rejects a malformed install cleanly instead of silent
+      wrong data / source OOB DtoD); the auditor's catalog-equality suggestion was corrected (it would break
+      the empty-int4 count_all shape), pinned by `p8_partitioned_resident_rejects_nonuniform_int4_layout`; F2
+      (P3) — stale comments refreshed.
     - [ ] **Slice 2b — admit the hard shapes.** Extend `partitioned_resident_route_query_shape`
       (resident_route.rs:237 — currently rejects distinct/group_by/having/order_by/limit/offset) + the dispatch to
       route partitioned DISTINCT/GROUP BY/ORDER BY/top-N onto the unified buffer (rides 2a + the existing on-device
