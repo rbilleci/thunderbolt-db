@@ -131,12 +131,31 @@ Audit SHIP (105 query×dataset differential). **NOTE the general SQL→Expr path
 bridge (DISTINCT→GROUP BY COUNT(*), count dropped) is what makes it work; reuse that pattern, don't expect the
 general path to gain a `distinct` flag.**
 
-**CONTINUE with the remaining S10a shapes** (projection / equality / partitioned ×8 / between / membership /
-text_prefix / filter_group_count): pick one, route its dispatch arm to the bridge, prove byte-identical for
-NON-NULL data + assert the PG-correct NULL/empty behavior (differential bridge-vs-probe, **WITH NULL data**),
-sabotage non-vacuity, delete the probe + migrate callers, independent-audit, commit, update doc 22 + memory.
-NOTE the predicate builder `resident_predicate_from_bound_filters` is int4-literal-only today — **extend it for
-text/non-int4 filter shapes** (equality on text, etc.). Then **S10c** (partitioned). Do NOT take a host shortcut.
+**PROGRESS (session 5 cont.): S10a probe-routing batches DONE + AUDITED SHIP** — the **projection batch** (5
+shapes / 3 probes, `5ffee92b`; the audit even found a latent PARENT BUG the bridge fixes) and **int4_filter_group_count**
+(`986a2b69`+`16886b59`). Each: byte-identical non-NULL differential + PG-correct NULL fix, probe deleted, callers/
+benchmark migrated, audit SHIP. **RE-SCOPE (corrects the earlier §intro note):** (i) the predicate builder is NOT
+int4-only — `having_value_to_resident_literal` already emits Text/Bool/Numeric/Int8. (ii) the scalar-aggregate +
+simple-count shapes (count_all / int4_equality_count / int4_range_count / int4_scalar / filtered / between) are
+NOT `*_probe` — they use `execute_resident_plan` (a structured GPU-native path), so they're OUT of the
+probe-retirement scope (a later consolidation decision, not a violation).
+
+**REMAINING S10a — two slices, both START FRESH:**
+- **`text_prefix_like_count`** — BLOCKED. A bridged text `LIKE` predicate returned `COUNT=0`. The general WHERE
+  HAS a LIKE path (`expr_text_like_scalar_filter`, engine_expr.rs:6538), but the bridge's RECONSTRUCTED `Like`
+  predicate did not match — a LIKE pattern-format mismatch (the bound filter's pattern value, e.g. the trailing
+  `%`, vs what the WHERE LIKE path expects). Reconcile that, then route + delete (differential WITH text + NULL).
+- **partitioned ×8** — MORE COMPLEX than the other batches: own classifier + routing/planning machinery in
+  `engine_residency.rs:1573-1809` (the 5 aggregate shapes — SUM/MIN/MAX/AVG-with-int4-filter — via
+  `partitioned_resident_route_query_shape`; the count/projection ones are special-cased at :1689-1809). Likely
+  routes via the bridge's scalar-aggregate / projection / count path, but VERIFY against that machinery first.
+  Differential (WITH NULL data) + audit.
+
+Pattern for each: route the dispatch arm to the bridge, prove byte-identical for NON-NULL + assert the PG-correct
+NULL behavior (differential bridge-vs-probe, **WITH NULL data**), sabotage non-vacuity, delete the probe + migrate
+callers (incl. the `relational_gpu_residency_baseline` benchmark helper + any `resident_route.rs` probe-specific
+d2h-byte assertions — the bridge records 0 execution-d2h), independent-audit, commit, update doc 22 + memory.
+Then **S10c** (= the partitioned work above). Do NOT take a host shortcut.
 Do NOT run `cargo fmt --all`. Only AFTER S10a–c make every shape route on-device, do **S10d**: delete the host
 finalize path + `mvcc_read_exec.rs` `cpu_fallback`. When that deletion lands, the campaign (doc 22 §4) is fully
 struck through — write the campaign-complete handover and propose merging `phase0-m1-engine-facade` to `main`.
