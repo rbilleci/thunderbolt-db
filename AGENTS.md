@@ -50,12 +50,11 @@ When choosing between implementation approaches:
 
 Before major runtime, storage, or scheduler changes, read:
 
-- `docs/architecture/00-gpu-native-principles.md`
-- `docs/roadmap/gpu-native-oltp-roadmap.md`
-- `docs/GPU_GUARDRAILS.md`
-- `docs/architecture/04-execution-model-cpu-gpu.md`
-- `docs/architecture/11-high-throughput-query-runtime.md`
-- `docs/architecture/12-acid-isolation-and-gpu-memory.md`
+- `docs/CHARTER.md` — mandate, invariants, the OLTP bet, execution discipline + gotchas
+- `docs/ARCHITECTURE.md` — the full system design (execution model, residency/STRATA, OLTP wave engine, MVCC,
+  durability, multi-GPU)
+- `docs/DECISIONS.md` — the decision ledger (ADRs)
+- `docs/PLAN.md` (ordered work) · `docs/STATUS.md` (current state) · `docs/HANDOVER.md` (resume baton)
 
 When a change intentionally favors CPU-first behavior, document why it is a
 fallback, bootstrap step, or product-scope exception.

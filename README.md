@@ -31,9 +31,7 @@ invalidated, or evicted without weakening WAL-before-visibility.
   retained-route benchmarking through real `psql`/libpq traffic. It is not a
   broad replacement for the full compatibility server.
 
-See [docs/compatibility/matrix.md](docs/compatibility/matrix.md) and
-[docs/compatibility/scorecard.latest.md](docs/compatibility/scorecard.latest.md)
-for the detailed compatibility source of truth.
+See [docs/STATUS.md](docs/STATUS.md) for the current compatibility surface and the broad compat-suite total.
 
 ## Quick Validation
 
@@ -107,27 +105,8 @@ Current blockers and non-claims:
   generation, production cache-daemon, durable GPU page, or external
   orchestration claim
 
-Details live in [docs/testing/benchmarks/README.md](docs/testing/benchmarks/README.md).
-The latest reports are
-[docs/testing/reports/series/p8-pgwire-endpoint/runs/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md](docs/testing/reports/series/p8-pgwire-endpoint/runs/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md)
-and
-[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md).
-The 10% pivot/blocker report is
-[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md).
-The latest narrowed bulk-admission report is
-[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md).
-The latest value-index admission report is
-[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md).
-The latest COPY phase-profile report is
-[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md).
-The latest 10% execution blocker report is
-[docs/testing/reports/series/p8-25pct-full-run/runs/2026-06-01-p8-10pct-identical-single-load-curves-v1.md](docs/testing/reports/series/p8-25pct-full-run/runs/2026-06-01-p8-10pct-identical-single-load-curves-v1.md).
-The latest retained query profile report is
-[docs/testing/reports/series/p8-retained-route-primitives/runs/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md](docs/testing/reports/series/p8-retained-route-primitives/runs/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md).
-The latest COPY admission recheck report is
-[docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md).
-The latest COPY WAL/current-apply architecture report is
-[docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md).
+Benchmark methodology and the dated run reports are archived under
+[docs/archive/testing/](docs/archive/testing/) (`benchmarks/` + `reports/series/...`).
 
 ## Security And Operations
 
@@ -145,22 +124,14 @@ prepared-statement/portal/cursor parity beyond the current supported subset.
 
 ## Docs Map
 
-- [docs/roadmap/v0-v1.md](docs/roadmap/v0-v1.md): phase roadmap and P8 design
-  track.
-- [docs/compatibility/matrix.md](docs/compatibility/matrix.md): detailed
-  compatibility claims, partials, and non-goals.
-- [docs/compatibility/scorecard.latest.md](docs/compatibility/scorecard.latest.md):
-  latest checked compatibility scorecard.
-- [docs/GPU_GUARDRAILS.md](docs/GPU_GUARDRAILS.md): GPU-first engineering
-  guardrails.
-- [docs/architecture/10-p8-gpu-optimized-storage-engine.md](docs/architecture/10-p8-gpu-optimized-storage-engine.md):
-  P8 storage/cache architecture.
-- [docs/architecture/12-acid-isolation-and-gpu-memory.md](docs/architecture/12-acid-isolation-and-gpu-memory.md):
-  code-sourced ACID, isolation-level, and GPU memory-management design.
-- [docs/testing/benchmarks/README.md](docs/testing/benchmarks/README.md): P8
-  benchmark methodology, commands, artifacts, accepted evidence, and blockers.
-- [docs/testing/reports/](docs/testing/reports/): durable report artifacts for
-  compatibility, resilience, security, GPU residency, and P8 benchmark slices.
+- [docs/README.md](docs/README.md): index of the six canonical docs.
+- [docs/CHARTER.md](docs/CHARTER.md): mandate, invariants, the OLTP bet, gotchas.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the full system design.
+- [docs/DECISIONS.md](docs/DECISIONS.md): decision ledger (ADRs).
+- [docs/PLAN.md](docs/PLAN.md): ordered forward work.
+- [docs/STATUS.md](docs/STATUS.md): current state (built / audited / gaps).
+- [docs/HANDOVER.md](docs/HANDOVER.md): rolling resume baton.
+- [docs/archive/](docs/archive/): reference corpus, dated benchmark evidence, ops runbooks, and superseded plans.
 
 ## Safety Invariant
 
