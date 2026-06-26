@@ -2,6 +2,10 @@
 
 This project uses a layered documentation model so implementation can proceed quickly without losing architectural rigor.
 
+> **Start here for current work:** [`docs/PLAN.md`](PLAN.md) — the single charter-based, STRATA-first **forward
+> plan** (what to build next, in order). The reading order below is the architectural baseline; `PLAN.md` owns
+> sequencing and supersedes the old session handovers (removed) and the roadmap docs' ordering.
+
 ## Recommended Reading Order
 
 1. **Design baseline**
@@ -46,14 +50,12 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/interfaces/transaction-interfaces.md`
    - `docs/interfaces/error-interfaces.md`
 
-13. **Research journal and candidate techniques**
-   - `docs/research/gpu-db-literature-review-loop.md`
+13. **Research journal and candidate techniques** (concluded architecture search — reference only)
    - `docs/research/gpu-db-paper-candidates.md`
    - `docs/research/gpu-db-literature-journal.md`
    - `docs/research/architecture-compatibility.md`
    - `docs/research/architecture-compatibility/paper-mechanism-coverage.md`
    - `docs/research/architecture-compatibility/benchmark-backlog.md`
-   - `docs/research/end-to-end-architecture-search-plan.md`
    - `docs/research/end-to-end-architecture-design-space.md`
    - `docs/research/end-to-end-architecture-candidates.md`
    - `docs/research/end-to-end-architecture-final-dossier.md`
@@ -69,10 +71,12 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/adr/ADR-005-snapshot-install-snapshot-strategy.md`
 
 15. **Delivery scope and sequencing**
-   - `docs/roadmap/v0-v1.md`
-   - `docs/roadmap/gpu-native-oltp-roadmap.md`
-   - `docs/roadmap/no-nvidia-bootstrap-plan.md`
-   - `docs/roadmap/no-gpu-bootstrap-closeout-review.md`
+   - `docs/PLAN.md` — the unified forward plan (authoritative for order)
+   - `docs/roadmap/prototype-to-production-plan.md` — P0–P8 milestone detail (sequencing superseded by PLAN)
+   - `docs/roadmap/gpu-native-oltp-roadmap.md` — OLTP route classes (sequencing superseded by PLAN)
+   - `docs/roadmap/v0-v1.md` — early v0→v1 baseline (superseded; requirements reference)
+   - `docs/roadmap/implementation-log.md` — history
+   - `docs/archive/` — archived dead-premise plans (no-nvidia-bootstrap, no-gpu-bootstrap-closeout-review)
 
 16. **Compatibility and validation gates**
    - `docs/compatibility/matrix.md`

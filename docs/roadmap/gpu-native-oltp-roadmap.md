@@ -1,5 +1,9 @@
 # GPU-Native OLTP Roadmap
 
+> **⚠ Forward sequencing is superseded by [`../PLAN.md`](../PLAN.md)** (charter-based, STRATA-first, 2026-06-26).
+> Retained for the **6 route-class taxonomy + per-route benchmark policy + M5–M7 detail**; M1–M4 are done. The
+> live route-class items are carried in PLAN §5.
+
 This roadmap narrows the GPU-native target to OLTP workloads: high-concurrency
 entity reads, tenant/security-filtered page reads, bounded joins, and computed
 detail routes for banking and e-commerce style systems.

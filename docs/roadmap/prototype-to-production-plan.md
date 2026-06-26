@@ -1,5 +1,9 @@
 # Prototype → Production Architecture Review and Plan
 
+> **⚠ Forward sequencing is superseded by [`../PLAN.md`](../PLAN.md)** (the charter-based, STRATA-first unified
+> plan, consolidated 2026-06-26). This document is retained for **P0–P8 milestone detail + the §9 deferred-work
+> register**; treat its ordering and the §8 session handoff as historical. Pending items are sequenced in PLAN §5.
+
 Status: REVIEW
 Date: 2026-06-13
 Authors: Chief Software Architect + Principal Engineering review (engine, GPU/CUDA,

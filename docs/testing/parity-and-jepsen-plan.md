@@ -1,5 +1,9 @@
 # Parity and Jepsen Validation Plan
 
+> **⚠ Indexed by [`../PLAN.md`](../PLAN.md) §4** (charter-based unified plan, 2026-06-26). Retained for the
+> durability / replication / Jepsen **methodology detail**. NOTE: Stream 1 ("CPU reference mode" parity) is the
+> anti-pattern the charter forbids — parity tests must use a **GPU-native oracle**, not a CPU re-implementation.
+
 This plan defines how we prove correctness while moving from local deterministic execution to replicated, GPU-native operation.
 
 ## Objectives

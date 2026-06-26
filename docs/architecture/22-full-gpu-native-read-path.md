@@ -1,5 +1,10 @@
 # Full GPU-Native Read Path — Host Out of the Data Path (Campaign)
 
+> **Forward work has moved to [`../PLAN.md`](../PLAN.md)** (the unified plan) and the STRATA design
+> ([`23-strata-resident-shard-data-plane.md`](23-strata-resident-shard-data-plane.md)). This doc is the **S1–S10c
+> completion record + the S10d re-scope**; new sequencing lives in PLAN. Key correction: S10d is **not** a simple
+> deletion — the host read path is live until automatic residency admission on commit (STRATA) exists.
+
 **Status:** in progress. **Priority:** high. **Mandate (user, 2026-06-23):** go full
 GPU-native, **zero charter violations, zero deferrals.** The host is control plane ONLY.
 Stop the cross-session pattern of deferring the hard GPU kernel and shipping a host-side
@@ -517,6 +522,29 @@ is optional; each line is struck through only when it runs on the device.
     `FirstCudaSliceParityBackend` harness + its ~18 parity tests, the `sql_catalog` cuda-probe cache test,
     and `execute_relational_select_cpu_pinned` + its `concurrency.rs` seam test — all bound to the host/CPU
     backend being removed. No CPU relational execution remains.
+    - **⚠ RE-SCOPE (2026-06-26 verification, corrects "S10c unblocked S10d"):** S10c retired the partitioned
+      *probe methods* only. S10d as a deletion is **NOT executable** and its safe-to-delete-now subset is
+      **EMPTY**. Two verified reasons:
+      1. **Residency is operator-triggered, never auto-installed on commit.** Proof: `engine_commit.rs` only
+         *invalidates* residency; every `warm_`/`populate_`/`admit_` caller is in `examples/` (impl-log:1529
+         — "bounded operator-triggered workflow", autonomous scheduling OUT OF SCOPE); facade wire entry
+         `facade/src/lib.rs:271,390` → `execute_relational_select` with no warm. So a non-resident table
+         (the **production default**) reads host-side via `cpu_pinned` → `finalize_relational_select`. Tests
+         confirm: `execute_relational_select_cpu_pinned_matches_the_public_select` +
+         `select_text_non_resident_*_falls_through_to_existing_path` (×3) pass without a GPU. Deleting the
+         host path **regresses every non-resident read**.
+      2. **The "pull-in" tests guard code that STAYS.** `FirstCudaSliceParityBackend` executes via
+         `CpuMvccExecutionBackend` and relabels the target GPU (both sides CPU); its ~26 tests cover the LIVE
+         MVCC dispatch + CPU-fallback accounting (`engine_mvcc_dispatch.rs:137`). Per S9's own note they
+         retire **WITH** the host path, not before — deleting them now is a coverage regression.
+    - **Real gates for "no CPU relational execution remains" (4, not 1; S10c cleared only the probes):**
+      (a) **automatic residency admission on commit** so every committed single-GPU-fitting table is resident
+      and the resident route always accepts (the missing keystone — makes the GPU path the default instead of
+      opt-in); (b) **over-budget / spill** admission for tables too big for one GPU (the multi-partition
+      admission producer, roadmap v2); (c) **pg_catalog/information_schema synthesis** routed on-device or an
+      explicit §6 host carve-out (tension with "no CPU relational execution remains"); (d) the **MVCC-layer**
+      `cpu_fallback` retired, gated on the provenance/multi-source shapes going GPU-native. Until (a), S10d
+      cannot start. Recommended next step toward the mandate: build (a).
 
 ## 5. Sequencing
 
