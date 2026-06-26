@@ -1,6 +1,6 @@
 # 15. Batched / async GPU submission (Thread 3) — design
 
-**Status:** design approved, staged implementation in progress (2026-06-15).
+**Status:** **IMPLEMENTED** — the `PointLookupBatcher` is live and default-on (`crates/server`, `crates/facade`). NOTE: the `RwLock<Engine>` read-lock framing below is **superseded** — the engine is now interior-mutable `Arc<Engine>` + `SnapshotCell` (doc 16); the mechanism (generation guard + Arc reclamation) is unchanged.
 **Branch:** `phase0-m1-engine-facade`. **Supersedes the lost M0 owner-thread batching.**
 
 ## Problem

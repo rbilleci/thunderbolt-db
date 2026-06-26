@@ -1,6 +1,13 @@
 # Execution Model (CPU + GPU)
 
-GPU is a first-class execution target; CPU is the reference semantics implementation.
+> **⚠ Partially superseded by the charter (`../PLAN.md` §1, doc 22, doc 23 STRATA).** GPU is the execution
+> substrate for all relational work; **CPU relational execution is interim parity-oracle / WIP debt to be DELETED**
+> (PLAN §3 S-F / doc 22 S10d), not a co-equal backend. The snapshot/batching mechanics below remain valid; the
+> dual-backend operator contract and the "reduce on CPU" tier do **not** — cross-shard combine runs **on-device**
+> (doc 23 §6).
+
+GPU is **the** execution substrate for all relational work. CPU relational execution exists only as the interim
+parity oracle / GPU-parity debt being deleted (charter; PLAN §3 S-F / doc 22 S10d) — not a co-equal reference backend.
 
 This document defines the execution contract. The runtime topology that serves
 many client sessions, owns mutable state, routes work through bounded queues,
@@ -10,9 +17,9 @@ and publishes read snapshots is specified in
 ## Operator contract
 
 Each physical operator must declare:
-- CPU implementation
-- GPU implementation or explicit fallback rule
-- Semantics parity notes
+- GPU implementation (the operator runs on the device — charter rule 2)
+- Semantics parity notes (verified against a GPU-native oracle, not a CPU re-implementation)
+- (interim only) the GPU-parity-debt tracking issue if a shape still falls back to the host path being deleted
 
 ## Batching model
 
@@ -63,7 +70,7 @@ resident device handles they use. They may execute:
 
 - one retained read at a time when latency is the priority
 - a drained micro-batch of same-shape retained lookups
-- partition-local aggregate batches that later reduce on CPU or a coordinator
+- shard-local aggregate batches whose partials are combined **on-device** (cross-shard combine, doc 23 §6 — never reduced on the host)
 - COPY or refresh staging work where the input already has deterministic order
 
 Kernel launches should be amortized across compatible work when queue depth

@@ -66,9 +66,10 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/adr/README.md`
    - `docs/adr/ADR-001-log-boundary-is-wal.md`
    - `docs/adr/ADR-002-deterministic-batch-ordering.md`
-   - `docs/adr/ADR-003-cpu-fallback-policy.md`
+   - `docs/adr/ADR-003-cpu-fallback-policy.md` (SUPERSEDED by ADR-006)
    - `docs/adr/ADR-004-replicator-interface.md`
    - `docs/adr/ADR-005-snapshot-install-snapshot-strategy.md`
+   - `docs/adr/ADR-006-gpu-required-no-cpu-steady-state.md`
 
 15. **Delivery scope and sequencing**
    - `docs/PLAN.md` — the unified forward plan (authoritative for order)

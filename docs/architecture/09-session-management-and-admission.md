@@ -1,5 +1,9 @@
 # 09 — Session Management and Admission Control (Bootstrap)
 
+> **Disambiguation:** "admission" here = **session / connection + mutation-queue** admission (request
+> backpressure) — a *different control loop* from STRATA's **GPU-residency on-commit admission** (doc 23 §5 /
+> PLAN §3). Several "Runtime Admission State" snapshot fields below are forward (v1), not yet built.
+
 ## Purpose
 
 Define deterministic session and admission-control behavior so connection pressure cannot violate core safety invariants:

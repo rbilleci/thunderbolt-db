@@ -41,12 +41,11 @@ parser must keep strictly rejecting arithmetic, so routing never silently mis-an
 
 ## Coverage today / not yet
 
-Runs on the GPU: a single int4 table, int4 column projection, int4 `WHERE` over arithmetic
-(`+ - *`), comparisons (`= <> < <= > >=`), column-vs-column, and `AND`/`OR`. NOT yet (each
-a hard error or stays on the existing path): other types (int8 / numeric / text / bool),
-`NOT`, `IN` / `LIKE` / `BETWEEN`, division / modulo, aggregates / GROUP BY / HAVING /
-ORDER BY / DISTINCT / LIMIT on the Expr path, joins (M5), and arithmetic over a
-non-resident table (errors — the hand-rolled CPU path cannot express it).
+> **⚠ STALE — do not rely on this snapshot.** This handoff is dated 2026-06-18 and its coverage list is far behind
+> the shipped engine (the int4-only claim is obsolete). For the **live** per-type / per-operator status see
+> [`19-type-matrix.md`](19-type-matrix.md) (int2/4/8 + numeric / text / date / timestamp / uuid / bool, all five
+> aggregates, GROUP BY, ORDER BY / DISTINCT / LIMIT) and the doc 22 campaign record. This document is retained for
+> its routing-design rationale, not its coverage numbers.
 
 Read `17-general-gpu-executor.md` (the design + Charter rule 2) for the executor itself.
 

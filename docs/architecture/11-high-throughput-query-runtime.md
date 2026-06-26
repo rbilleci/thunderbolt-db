@@ -1,5 +1,10 @@
 # 11 — High-Throughput Query Runtime
 
+> **Status: FORWARD / ASPIRATIONAL — not implemented.** Current serving is thread-per-connection (sync) or
+> task-per-connection (async tokio + `spawn_blocking`); the IO-worker-pool / bounded-ring / owner-domain topology
+> below is the *target*, not the current runtime (PLAN §5 scale traces here). Vocabulary: "partition owners" =
+> STRATA L2 **shards** (doc 23 §1).
+
 ## Purpose
 
 Define the production serving architecture for high-throughput SQL over the GPU

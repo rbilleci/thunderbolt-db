@@ -1,5 +1,11 @@
 # 12 - ACID, Isolation, And GPU Memory Management
 
+> **Note (2026-06-26):** the ACID / WAL-before-visibility / GPU-as-cache trust model below is current and
+> authoritative. Two reframes: (1) bare **"partition"** here = the L2 residency **shard** (doc 23 §1), not SQL
+> `PARTITION BY`; (2) the CPU/MVCC read **fallback** is **interim WIP being deleted** (PLAN §3 S-F / doc 22 S10d),
+> not a permanent execution tier. The "Read Snapshot Publication Plan" is STRATA's shard-publication precursor —
+> see doc 23.
+
 ## Purpose
 
 This document explains how the current GPU database engine supports ACID-style

@@ -1,6 +1,6 @@
 # Engine Snapshot Integration Design (P1-M3 blueprint)
 
-Status: DESIGN (blueprint for the next milestone)
+Status: **IMPLEMENTED** — the `SnapshotCell<Arc>` publish-don't-mutate residency spine landed (B2 shared-primary-context via `Arc<GpuPrimaryContext>`). Retained as the design-of-record for the snapshot spine STRATA (doc 23 §4/§5) builds on. Original blueprint below.
 Date: 2026-06-13
 Plan: `docs/roadmap/prototype-to-production-plan.md` Phase 1
 Depends on: P1-M2 spike (`crates/snapshot`, `gpu_db_snapshot`)

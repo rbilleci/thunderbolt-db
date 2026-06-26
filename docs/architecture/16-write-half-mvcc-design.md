@@ -1,5 +1,10 @@
 # 16. The write-half — concurrent writes via publish-on-commit + MVCC (Thread 4) — design
 
+> **Status (2026-06-26): Stages 0–4 IMPLEMENTED** — the `commit_seq` unification (version stamp == read boundary),
+> off-lock prepare + short `commit_mutex`, removal of the engine write lock, and per-table
+> `SnapshotCell<Arc<TableVersionData>>` all landed. **Stage 5 open** (SSI / RR / RC, value-index fast-path) —
+> PLAN §5 "real MVCC SI→SSI". This is the commit seam STRATA's admission producer hooks into (doc 23 §5).
+
 **Status:** scope CONFIRMED 2026-06-15 — **SI for autocommit** (RR/RC/SSI deferred to Stage 5+) and
 **DDL via a catalog latch** (no online DDL this milestone); see §7. Stage 0 in progress.
 **Branch:** `phase0-m1-engine-facade`.

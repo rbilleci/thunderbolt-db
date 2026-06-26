@@ -205,8 +205,9 @@ seam. Convergence path:
    `cuModuleLoad` substrate, to fuse hot trees into bespoke kernels and beat the
    interpreter on hot paths. The loader exists; only the emitter is new.
 
-CPU relational execution remains *only* the parity oracle and GPU-absent
-bootstrap (Charter rule 1) and shrinks as interpreter coverage grows.
+CPU relational execution remains *only* the parity oracle (Charter rule 1) — interim
+debt that shrinks as interpreter coverage grows and is deleted at doc 22 S10d / PLAN §3
+S-F. (There is no GPU-absent bootstrap: the engine requires a GPU.)
 
 ---
 

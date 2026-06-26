@@ -1,5 +1,12 @@
 # P8 GPU-Optimized Storage Engine Design
 
+> **⚠ Partially superseded — read with [`../PLAN.md`](../PLAN.md) + doc 23 (STRATA).** The residency
+> cache-manager mechanics here (admission / budget / eviction / invalidation) are STRATA's substrate and remain
+> valid. But: (1) the planner cost model's CPU execution paths are **interim debt to be deleted** (PLAN §3 S-F /
+> doc 22 S10d), not permanent costed peers; (2) the "spill / cold state" tier's execution model is **STRATA §6
+> cross-shard combine** (not generic CPU fallback); (3) the residency unit called "snapshot / segment" here is the
+> L2 **shard** (doc 23 §1, `RelationalResidentPartition → ResidentShard`).
+
 This document establishes P8 as the design track for turning the current
 bootstrap MVCC tuple store into a high-performance storage system optimized for
 the GPU engine.
