@@ -114,6 +114,11 @@ and `roadmap/gpu-native-oltp-roadmap.md` (route classes) — both marked "sequen
 - **Charter debt (p2p §9.4/§9.5):** GPU-ify the 3 remaining CPU-execution resident routes (between/range→row
   indices; text-prefix-count; text-project filter). Sort operator S4/S5 (adaptive dispatch + HAVING/LIMIT operator)
   then wire it to replace any residual host `.sort_by`/HAVING/LIMIT.
+- **Expression-overflow PG-divergence (charter correctness):** `ORDER BY`/`GROUP BY <expr>` evaluates the
+  expression over **all** rows *before* WHERE drops survivors, so a query whose only overflowing rows are
+  filtered out **errors where PG (survivors-only) succeeds**. Fix = gather-then-evaluate
+  (`engine_expr.rs:~5757` `arith_value_column_at_indices`, shared with the WHERE-arith VM). Distinct from the
+  Phase 8 SUM/AVG accumulator-overflow review.
 - **Durability / HA (p2p Phase 4):** live streaming replication (network AppendEntries/RequestVote, heartbeats,
   election timers, leases/fencing, auto-failover); synchronous commit on fsync'd quorum; **group commit + WAL-fsync**
   (incl. the S1 prerequisite: fix the 4 DDL apply helpers reading published-vs-working catalog before multi-entry
@@ -141,6 +146,9 @@ and `roadmap/gpu-native-oltp-roadmap.md` (route classes) — both marked "sequen
   `NULLS FIRST/LAST`; OUTER+WHERE per-side pushdown. *May have landed in the doc-22 campaign — verify.*
 - **Perf residual** — async the fused `mixed_int_text` route's ~11 sync round-trips → ~2–3. Gated on the
   (not-yet-built) Phase-5 perf harness; parked.
+- **Routing-gate case-sensitivity** — ORDER BY/GROUP BY column matching is case-**in**sensitive in the route
+  gate (`resident_route.rs:388`, `engine_select_exec.rs:39`) but case-sensitive in the executor, so a
+  case-mismatch clean-errors instead of resolving. Align eventually (low priority; never wrong rows).
 
 ---
 
