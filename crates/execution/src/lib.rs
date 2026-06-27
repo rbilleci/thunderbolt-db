@@ -864,7 +864,7 @@ impl CudaResidentDeviceMemoryReadView {
     /// are unchanged). `index_table_mask` = table_size-1, `index_hash_shift` = 32 - log2(table_size).
     pub fn submit_match_project_i32_index_probe_from_payload(
         &self,
-        index_ptr: u64,
+        index: &Arc<CudaResidentDeviceMemory>,
         index_table_mask: u32,
         index_hash_shift: u32,
         needles: &[i32],
@@ -873,7 +873,7 @@ impl CudaResidentDeviceMemoryReadView {
     ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
         submit_cuda_resident_i32_index_probe(
             self,
-            index_ptr,
+            index,
             index_table_mask,
             index_hash_shift,
             needles,
@@ -2058,7 +2058,7 @@ impl CudaResidentDeviceMemory {
     /// are unchanged). `index_table_mask` = table_size-1, `index_hash_shift` = 32 - log2(table_size).
     pub fn submit_match_project_i32_index_probe_from_payload(
         &self,
-        index_ptr: u64,
+        index: &Arc<CudaResidentDeviceMemory>,
         index_table_mask: u32,
         index_hash_shift: u32,
         needles: &[i32],
@@ -2067,7 +2067,7 @@ impl CudaResidentDeviceMemory {
     ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
         submit_cuda_resident_i32_index_probe(
             self,
-            index_ptr,
+            index,
             index_table_mask,
             index_hash_shift,
             needles,
@@ -2555,6 +2555,12 @@ pub struct CudaI32EqualAnyProjectSubmission {
     stream: Option<PooledStreamOwned>,
     // Whether the pooled stream's start/stop events were available (best-effort timing).
     timed: bool,
+    // R1b: for the GPU index-probe route ONLY (`None` for the scan route), a refcount on the device
+    // index buffer the kernel reads. Unlike the resident allocation (owned by the residency map and
+    // kept alive by the caller per the contract above), the index lives in an engine-side reuse cache
+    // that a concurrent re-admission may evict mid-flight; pinning the `Arc` here makes the index
+    // buffer outlive THIS kernel's submit->complete regardless of cache eviction. Released on Drop.
+    _wave_index_guard: Option<Arc<CudaResidentDeviceMemory>>,
 }
 
 // Pending read submissions own their temporary CUDA allocations/events/module.
@@ -9407,6 +9413,7 @@ DONE:
         _needles_guard: needles_guard,
         stream: Some(stream_owned),
         timed,
+        _wave_index_guard: None,
     })
 }
 
@@ -9422,13 +9429,14 @@ DONE:
 #[allow(clippy::too_many_arguments)]
 fn submit_cuda_resident_i32_index_probe<R: CudaResidentReadSource>(
     resident: &R,
-    index_ptr: u64,
+    index: &Arc<CudaResidentDeviceMemory>,
     index_table_mask: u32,
     index_hash_shift: u32,
     needles: &[i32],
     projection_offsets: &[u64],
     row_count: u64,
 ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
+    let index_ptr = index.device_ptr();
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
@@ -9781,6 +9789,7 @@ DONE:
         _needles_guard: needles_guard,
         stream: Some(stream_owned),
         timed,
+        _wave_index_guard: Some(Arc::clone(index)),
     })
 }
 
@@ -23277,10 +23286,11 @@ mod tests {
             index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
         }
         let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
-        let index_resident = runtime
-            .retain_device_memory_copy(0, &index_bytes)
-            .expect("index device memory");
-        let index_ptr = index_resident.device_ptr();
+        let index_resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &index_bytes)
+                .expect("index device memory"),
+        );
 
         // Present needles (rows 5, 100, 999, 0) + one absent value.
         let needles = vec![keys[5], keys[100], keys[999], -12345, keys[0]];
@@ -23292,7 +23302,7 @@ mod tests {
 
         let probe = resident
             .submit_match_project_i32_index_probe_from_payload(
-                index_ptr, table_mask, hash_shift, &needles, &projections, rows,
+                &index_resident, table_mask, hash_shift, &needles, &projections, rows,
             )
             .expect("index submit");
         let mut probe_rows = probe.complete(&resident).expect("index complete");

@@ -522,20 +522,166 @@ impl Engine {
         device_memory.clear_last_kernel_event_elapsed_us();
         let before_metrics = self.metrics.snapshot();
         let batch_started = Instant::now();
-        let cuda_submission = device_memory
-            .submit_match_project_i32_equal_any_from_payload(
-                filter_offset,
-                needles,
-                &projection_offsets,
-                row_count,
-            )
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        // ADR-009 R1: with the wave engine on, prefer a GPU hash-index probe (O(1) per needle) over the
+        // full-scan kernel for this resident int4 unique-key column. `wave_resident_int4_index` returns
+        // `None` (→ scan) when the flag is off, the column is non-unique / un-buildable, or a generation
+        // race is detected — so the index route NEVER changes results, it only changes how they're found.
+        // Both arms produce the SAME `CudaI32EqualAnyProjectSubmission`, so completion is byte-identical.
+        // CONTRACT: `needles` are distinct (the batcher's `dedup_needles` collapses identical lookups). The
+        // thread-per-needle index emits one match per found needle vs the scan's one per matched row; for a
+        // UNIQUE key + distinct needles these coincide (a bijection, match_count ≤ row_count). Were a caller
+        // to pass duplicates, `complete`'s `match_count > row_count` guard fail-safes to an error, never wrong rows.
+        let cuda_submission = match self
+            .wave_engine_enabled()
+            .then(|| self.wave_resident_int4_index(&table.name, &snapshot, filter_idx))
+            .flatten()
+        {
+            Some((index, table_mask, hash_shift)) => device_memory
+                .submit_match_project_i32_index_probe_from_payload(
+                    &index,
+                    table_mask,
+                    hash_shift,
+                    needles,
+                    &projection_offsets,
+                    row_count,
+                )
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+            None => device_memory
+                .submit_match_project_i32_equal_any_from_payload(
+                    filter_offset,
+                    needles,
+                    &projection_offsets,
+                    row_count,
+                )
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+        };
         Ok(Some((
             snapshot_gpu_id,
             before_metrics,
             batch_started,
             cuda_submission,
         )))
+    }
+
+    /// ADR-009 R1: fetch (building + caching on demand) the GPU hash index over resident int4 key column
+    /// `filter_idx` for `table_name` at `snapshot.generation`. `Some((index, table_mask, hash_shift))`
+    /// drives the index-probe route; `None` means "use the scan" — the column is non-unique, not an int4
+    /// key, un-buildable, or a re-admission moved the generation out from under us. The cache is keyed by
+    /// table and validated by `(generation, column_idx)`, so a stale entry is detected by mismatch and
+    /// rebuilt — the index can never serve a wrong generation, and never needs lock-step invalidation.
+    fn wave_resident_int4_index(
+        &self,
+        table_name: &str,
+        snapshot: &RelationalResidencySnapshot,
+        filter_idx: usize,
+    ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32)> {
+        let generation = snapshot.generation;
+        {
+            let cache = self
+                .read_state
+                .residency
+                .wave_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing) = cache.get(table_name) {
+                if existing.generation == generation && existing.column_idx == filter_idx {
+                    return existing
+                        .index_memory
+                        .as_ref()
+                        .map(|memory| (Arc::clone(memory), existing.table_mask, existing.hash_shift));
+                }
+            }
+        }
+        // Miss / stale / different column: build OUTSIDE the lock (a host hash pass + one HtoD upload),
+        // then publish. A concurrent builder for the same (table, generation) merely rebuilds + overwrites
+        // — rare (once per generation) and harmless: each index is self-contained and its in-flight kernels
+        // pin their own `Arc`, so a replaced entry's buffer is freed only once no submission still holds it.
+        let built = self.build_wave_resident_int4_index(snapshot, filter_idx);
+        let (index_memory, table_mask, hash_shift) = match &built {
+            Some((memory, mask, shift)) => (Some(Arc::clone(memory)), *mask, *shift),
+            None => (None, 0, 0),
+        };
+        let mut cache = self
+            .read_state
+            .residency
+            .wave_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            table_name.to_string(),
+            WaveResidentIndex {
+                generation,
+                column_idx: filter_idx,
+                index_memory,
+                table_mask,
+                hash_shift,
+            },
+        );
+        built
+    }
+
+    /// ADR-009 R1: host-build the open-addressing GPU hash index (`(key<<32)|(row+1)`, 0 = empty;
+    /// Fibonacci `(key*0x9E3779B1)>>hash_shift` + linear probe) over int4 column `filter_idx`, then upload
+    /// it once (HtoD) into a resident device buffer. `None` (→ caller scans) when: a re-admission moved the
+    /// generation; host rows don't match the device row count; the table is empty / too large to pack a
+    /// row index into 32 bits; a non-int4 / missing key value appears; or — critically for correctness —
+    /// the column has DUPLICATE keys (a hash index holds one row per key but the scan returns every match).
+    /// NULL keys are skipped (SQL 3VL: `col = needle` is never true for NULL, exactly as the scan behaves),
+    /// which is what keeps results byte-identical to the scan on NULL data.
+    fn build_wave_resident_int4_index(
+        &self,
+        snapshot: &RelationalResidencySnapshot,
+        filter_idx: usize,
+    ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32)> {
+        let entry = self.relational_residency_entry(&snapshot.table)?;
+        if entry.descriptor.generation != snapshot.generation {
+            return None;
+        }
+        let host_rows = entry.host_rows.as_ref();
+        let row_count = snapshot.row_count;
+        if host_rows.len() != row_count {
+            return None;
+        }
+        // `row + 1` is packed into the low 32 bits, so the row index must fit in u32; also bound the table
+        // so a pathological row count can't allocate an absurd host vector (fall back to the scan instead).
+        if row_count == 0 || row_count >= (u32::MAX as usize) {
+            return None;
+        }
+        let table_size = (row_count as u64)
+            .checked_mul(2)
+            .and_then(|doubled| doubled.checked_next_power_of_two())?;
+        if table_size > (1_u64 << 30) {
+            return None;
+        }
+        let table_mask = (table_size - 1) as u32;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (row, values) in host_rows.iter().enumerate() {
+            let key = match values.get(filter_idx) {
+                Some(SqlValue::Int4(value)) => *value,
+                Some(SqlValue::Null) => continue,
+                _ => return None,
+            };
+            let key_bits = key as u32;
+            let mut slot = (key_bits.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            loop {
+                let occupant = index[slot as usize];
+                if occupant == 0 {
+                    index[slot as usize] = ((key_bits as u64) << 32) | (row as u64 + 1);
+                    break;
+                }
+                if (occupant >> 32) as u32 == key_bits {
+                    return None;
+                }
+                slot = (slot + 1) & table_mask;
+            }
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
+        let runtime = self.cuda_driver_probe_runtime();
+        let memory = runtime
+            .retain_device_memory_copy(snapshot.gpu_id, &index_bytes)
+            .ok()?;
+        Some((Arc::new(memory), table_mask, hash_shift))
     }
 
     fn complete_relational_retained_int4_projection_submission(

@@ -3774,3 +3774,150 @@ fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
     };
     assert_eq!(e.execute_relational_select(&proj).unwrap().rows, expected);
 }
+
+/// ADR-009 R1: the GPU index-probe point-lookup route (`wave_engine_enabled` ON) must return
+/// BYTE-IDENTICAL results to the full-scan route (OFF) — including NULL projections, absent needles,
+/// repeated needles, the duplicate-key fallback (a non-unique column makes the index abandon so the
+/// scan runs), and across a generation change (an INSERT re-admits, so the per-generation index cache
+/// rebuilds). The differential IS the gate: same engine, same needles, only the flag flips. Skips
+/// gracefully when there is no GPU residency route (CI without a GPU).
+#[test]
+fn r1_wave_index_probe_matches_scan_differential() {
+    let mut e = Engine::new_local();
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
+    )
+    .unwrap();
+    // `id` is a UNIQUE key (the index route fires); `bucket` is NON-unique (duplicate -> scan fallback).
+    // NULL `balance` (id=20) + NULL `note` exercise NULL handling on projected + unprojected columns.
+    // NULL `balance` (id=20) exercises a NULL in a PROJECTED column (handled identically by both routes,
+    // so the differential covers it). The NULL-`id` row exercises R1b's NULL-KEY skip: a NULL key never
+    // satisfies `id = needle` (SQL 3VL), so the index build drops it AND the scan never matches it.
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, bucket, balance, note) VALUES \
+         (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("accounts").unwrap();
+
+    let select_cmd = |sql: &str| -> Select {
+        match parse_command(sql).unwrap() {
+            Command::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    };
+    let select_unique = select_cmd("SELECT id, balance FROM accounts WHERE id = 1");
+    // One probe is enough — every query below shares this resident table.
+    if !e.plan_relational_resident_route(&select_unique).accepted {
+        return;
+    }
+    let select_dup = select_cmd("SELECT id, bucket FROM accounts WHERE bucket = 1");
+
+    // Per-needle rows via the retained-template path (the route the index/scan swap lives on).
+    let run = |e: &Engine, select: &Select, needles: &[i32]| -> Vec<Vec<Vec<SqlValue>>> {
+        let template = e.prepare_relational_retained_read_template(select).unwrap();
+        let submission = e
+            .submit_relational_retained_template_point_lookups(&template, needles)
+            .unwrap();
+        e.complete_relational_retained_read_submission(submission)
+            .unwrap()
+            .iter()
+            .map(|result| result.rows.clone())
+            .collect()
+    };
+    let cached_index = |e: &Engine| -> (usize, bool) {
+        let cache = e
+            .read_state
+            .residency
+            .wave_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache.get("accounts").expect("wave index cached after a flag-on run");
+        (entry.column_idx, entry.index_memory.is_some())
+    };
+
+    // (a) Unique-key differential WITH NULL: DISTINCT present needles (incl the NULL-balance row 20) +
+    // one absent needle (25). Needles are distinct by contract — the batcher's `dedup_needles` collapses
+    // identical point lookups before submission — so the thread-per-needle index and the thread-per-row
+    // scan are a bijection (each needle hits a unique row; match_count <= row_count).
+    let unique_needles = vec![10, 20, 30, 40, 25];
+    e.set_wave_engine_enabled(false);
+    let scan_unique = run(&e, &select_unique, &unique_needles);
+    e.set_wave_engine_enabled(true);
+    let index_unique = run(&e, &select_unique, &unique_needles);
+    assert_eq!(
+        index_unique, scan_unique,
+        "index-probe rows must equal scan rows for a unique key (incl NULL projection)"
+    );
+    // Non-vacuous: the flag-on run BUILT + USED a real index over the `id` filter column (col 0).
+    assert_eq!(
+        cached_index(&e),
+        (0, true),
+        "unique key -> a real index over col 0, not a scan-fallback marker"
+    );
+    assert_eq!(
+        index_unique[0],
+        vec![vec![SqlValue::Int4(10), SqlValue::Int4(100)]],
+        "needle 10 -> its row (gather of a non-NULL balance)"
+    );
+    assert_eq!(
+        index_unique[2],
+        vec![vec![SqlValue::Int4(30), SqlValue::Int4(300)]],
+        "needle 30 -> its row"
+    );
+    assert_eq!(
+        index_unique[4],
+        Vec::<Vec<SqlValue>>::new(),
+        "needle 25 absent -> no rows"
+    );
+    // id=20 (NULL balance) is covered by the `index_unique == scan_unique` differential above — this fast
+    // path returns the raw stored int4 for a NULL projection (no bitmap mask), identically on both routes.
+
+    // (b) Duplicate-key fallback: `bucket` is non-unique, so the index build abandons (None) and the
+    // scan runs -- flag on must STILL match flag off (and return BOTH rows for bucket = 1).
+    let dup_needles = vec![1, 2, 9];
+    e.set_wave_engine_enabled(false);
+    let scan_dup = run(&e, &select_dup, &dup_needles);
+    e.set_wave_engine_enabled(true);
+    let index_dup = run(&e, &select_dup, &dup_needles);
+    assert_eq!(
+        index_dup, scan_dup,
+        "a non-unique key must fall back to the scan and stay identical"
+    );
+    assert_eq!(index_dup[0].len(), 2, "bucket = 1 matches two rows (id 10 and 20)");
+    assert_eq!(
+        cached_index(&e),
+        (1, false),
+        "duplicate key over col 1 -> a scan-fallback marker (no index)"
+    );
+
+    // (c) Generation change: an INSERT re-admits the table (new generation). The per-generation index
+    // cache must rebuild against the new rows -- flag on still matches flag off over the larger table.
+    e.execute_text(
+        3,
+        "INSERT INTO accounts (id, bucket, balance, note) VALUES (50, 3, 500, 'e')",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("accounts").unwrap();
+    let gen_needles = vec![10, 50, 40, 999];
+    e.set_wave_engine_enabled(false);
+    let scan_gen = run(&e, &select_unique, &gen_needles);
+    e.set_wave_engine_enabled(true);
+    let index_gen = run(&e, &select_unique, &gen_needles);
+    assert_eq!(
+        index_gen, scan_gen,
+        "after a generation change the rebuilt index must still match the scan"
+    );
+    assert_eq!(
+        index_gen[1],
+        vec![vec![SqlValue::Int4(50), SqlValue::Int4(500)]],
+        "the newly-inserted row 50 is found by the rebuilt index"
+    );
+    assert_eq!(
+        cached_index(&e),
+        (0, true),
+        "the index rebuilt over col 0 for the new generation"
+    );
+}

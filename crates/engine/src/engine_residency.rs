@@ -555,6 +555,20 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// ADR-009 R1: enable/disable the GPU index-probe point-lookup route (default OFF). When on, a
+    /// resident int4 unique-key equality batch probes a cached GPU hash index instead of full-scanning;
+    /// non-unique columns / un-buildable indexes transparently fall back to the scan. `&self` (an
+    /// interior-mutable flag the read path reads).
+    pub fn set_wave_engine_enabled(&self, on: bool) {
+        self.wave_engine_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn wave_engine_enabled(&self) -> bool {
+        self.wave_engine_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit
     /// mutated. Runs AFTER `publish_committed_seq` (so it snapshots the new generation) while the
     /// commit_mutex is held; it can NEVER fail the commit — over-budget / memory-pressure / GPU-absent /

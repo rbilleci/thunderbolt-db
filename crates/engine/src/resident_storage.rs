@@ -8,6 +8,24 @@
 
 use super::*;
 
+/// ADR-009 R1: a cached GPU hash index over one resident int4 key column, for the index-probe
+/// point-lookup route. Built lazily from the resident snapshot's host rows and cached per table;
+/// `generation` + `column_idx` tag WHICH (snapshot generation, key column) it indexes, so a stale
+/// entry — after a re-admission bumps the generation, or a different column is queried — is detected
+/// by mismatch and rebuilt: the index can never silently serve a wrong generation. `index_memory`
+/// is `None` when this (generation, column) is NOT indexable (duplicate keys, since the scan returns
+/// EVERY match but a hash index holds one row per key; or the index could not be built), so the route
+/// transparently falls back to the scan. The `Arc<CudaResidentDeviceMemory>` is what a submission pins
+/// (R1b) so the device index buffer outlives an in-flight kernel even if this cache entry is evicted.
+#[derive(Debug)]
+pub(crate) struct WaveResidentIndex {
+    pub(crate) generation: u64,
+    pub(crate) column_idx: usize,
+    pub(crate) index_memory: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(crate) table_mask: u32,
+    pub(crate) hash_shift: u32,
+}
+
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
 /// generation. A reader `get`s an owned `Arc` (a refcount bump, no borrow of the map)
 /// so it pins the owner for its whole read; the serialized writer publishes a new

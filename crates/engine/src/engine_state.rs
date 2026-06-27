@@ -502,6 +502,11 @@ pub(crate) struct CatalogSnapshot {
 pub(crate) struct ResidencyReadState {
     pub(crate) device_memory: ResidentDeviceMemoryMap,
     pub(crate) shard_device_memory: ShardResidentDeviceMemoryMap,
+    /// ADR-009 R1: per-table GPU hash-index reuse cache for the index-probe point-lookup route (built
+    /// lazily, behind the default-OFF `wave_engine_enabled` flag). A plain `Mutex` (not the lock-free
+    /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the
+    /// fast cache-hit path; staleness is handled by the per-entry `generation` tag, not by eviction.
+    pub(crate) wave_index: Mutex<BTreeMap<String, WaveResidentIndex>>,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
