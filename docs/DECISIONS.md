@@ -111,6 +111,23 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   are host-I/O + coordination problems CPU OLTP engines face too, so the GPU isn't disadvantaged. Caveats: low contention
   (sequential keys + Fibonacci spread); raw insert only (no commit/durability/MVCC/CC); synthetic keys. Next write
   probes: contended inserts; the commit/durability floor; deterministic CC.
+- **R1 end-to-end measurement (2026-06-27, RTX PRO 6000; `engine/examples/r1_wave_index_ab`) — the index win, through
+  the engine.** R1 wired the GPU hash-index probe into the resident int4 unique-key point-lookup route behind default-OFF
+  `wave_engine_enabled` (`submit_resident_int4_equal_any_payload`); this measures the SAME swap on the production
+  retained-read **template** path (results materialized to `Vec<SqlValue>`), flag OFF (full-scan `equal_any`, O(rows)/batch)
+  vs ON (index probe, O(1)/needle) — identical distinct needles, **ON==OFF byte-identical asserted** each size. Batched
+  lookups/s (batch=256, single coalescer): **1M 1.69M→2.34M (1.39×), 4M 733k→1.90M (2.59×), 16M 242k→1.69M (6.99×)**.
+  Table grew 16× → **scan fell 7.0× (≈O(rows)), index fell only 1.38× (≈flat ⇒ O(1))**; per-batch scan latency
+  150→346→**1057µs** vs index flat **107–149µs**. **Crossover ≈1M rows:** below it the fixed ~110µs host+launch floor
+  dominates and the index is a wash (~1.0× at 64k–256k). So the per-batch O(rows)→O(1) win is REAL end-to-end and GROWS
+  with table size — but is table-size-dependent, so the batcher stays the production default and any flip should be
+  size-aware (or land with R2). The index's own ~1.7M/s end-to-end ≪ the 1c data-plane ~10.5M: the residual gap is the
+  same per-batch host+launch floor R2 (persistent kernel + ring) removes — consistent with the bet.
+  **Verified (independent re-run, 2026-06-27):** ON==OFF byte-identity held at every size; the scan curve reproduced
+  exactly (1M→4M→16M scan = 1.68M→731k→247k lookups/s, the load-bearing O(rows) falloff). The index is FLAT at ~2.3M
+  across all sizes — the recorded 16M index 1.69M was a slow sample (re-run 2.31M ⇒ 16M speedup 9.34×, index falloff
+  ≈1.0× not 1.38×), so the O(1) claim holds even more cleanly than first measured. Conclusion (real, size-dependent win;
+  batcher stays default; flip is size-aware or lands with R2) unchanged.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

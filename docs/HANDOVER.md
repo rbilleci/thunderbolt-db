@@ -55,11 +55,14 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
 - **Gate:** `r1_wave_index_probe_matches_scan_differential` (flag OFF vs ON) — NULL projection + NULL-as-0 key (needle 0) +
   absent + dup-fallback + generation rebuild, non-vacuous. Suites green: engine 437 + 295 GPU, execution 84, facade 34.
   Independent adversarial audit done (2 P1 + 2 P2 all adopted via `ffeccfc4`); **re-audit of the fix in flight.**
-- **NEXT:** (1) Measure the per-batch O(rows)→O(1) win end-to-end (flag ON vs OFF on a large resident table; the batcher
-  stays default until the wave path wins). (2) **R2** — persistent kernel + ring (breaks the host-serial coalescer cap →
-  proven 10–30M), **gated by an SM-coexistence measurement** (wave kernel + concurrent engine kernels on one shared context
-  = the recon's #1 unknown); FFI `cuMemHostGetDevicePointer` + the `all_done` ordering audit land here. (3) **R3** — writes
-  (concurrent index maintenance proven fast) + deterministic CC.
+- **NEXT:** (1) ✅ DONE — end-to-end O(rows)→O(1) win MEASURED (`engine/examples/r1_wave_index_ab`, DECISIONS ADR-008 "R1
+  end-to-end measurement"): flag ON vs OFF on the production template path, ON==OFF byte-identical, **16M rows = 6.99×**
+  (242k→1.69M lookups/s); table grew 16× → scan fell 7.0× (≈O(rows)), index flat 1.38× (≈O(1)). **Crossover ≈1M rows**;
+  below it the fixed ~110µs host+launch floor dominates (~1.0× at ≤256k) → batcher stays default; any flip is size-aware
+  or lands with R2. (2) **R2** — persistent kernel + ring (breaks the host-serial coalescer cap = the ~110µs floor this
+  measurement is now bound by → proven 10–30M), **gated by an SM-coexistence measurement** (wave kernel + concurrent
+  engine kernels on one shared context = the recon's #1 unknown); FFI `cuMemHostGetDevicePointer` + the `all_done`
+  ordering audit land here. (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
   only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The
