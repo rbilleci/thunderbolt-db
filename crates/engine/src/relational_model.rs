@@ -285,6 +285,39 @@ pub struct RelationalRetainedReadJob {
     pub(crate) select: Select,
 }
 
+/// The **needle-invariant** plan for a batchable int4-equality point lookup, prepared ONCE per shape
+/// (`prepare_relational_retained_read_template`) and reused across every needle in a batch by
+/// `submit_relational_retained_template_point_lookups`. It is the route descriptor the point-lookup
+/// batcher (and, later, the persistent-kernel wave engine) enqueues: everything *except* the
+/// per-request `i32` needle. Splitting it out removes the per-request host re-plan/re-bind that
+/// bottlenecked the single coalescer thread at ~15µs/item (DECISIONS ADR-008 "First measurement").
+/// `result_columns` + `access_path` are the fields the completion stamps onto every per-needle
+/// result — verified needle-invariant (the same for all needles of one shape).
+#[derive(Debug, Clone)]
+pub struct RelationalRetainedReadTemplate {
+    pub route_id: String,
+    pub schema: String,
+    pub table: RelationalTable,
+    pub snapshot_generation: u64,
+    pub(crate) selected_indexes: Vec<usize>,
+    pub(crate) result_columns: Vec<RelationalColumn>,
+    pub(crate) filter_idx: usize,
+    pub(crate) access_path: RelationalAccessPath,
+}
+
+impl RelationalRetainedReadTemplate {
+    /// True iff every projected column is int4 — the only projection the fast resident `equal_any`
+    /// kernel can materialize (route shapes `int4_equality_projection` / `_multi_column_`). A mixed
+    /// int4+text projection (`int4_equality_mixed_column_projection`) returns false: the int4 kernel
+    /// cannot project text, so the batcher must route those to the text-capable general batch path
+    /// (mirrors the jobs path's int4-only gate in `try_submit_relational_retained_int4_projection_jobs`).
+    pub fn is_int4_only_projection(&self) -> bool {
+        self.result_columns
+            .iter()
+            .all(|column| column.ty == SqlType::Int4)
+    }
+}
+
 pub struct RelationalRetainedReadSubmission {
     pub route_id: String,
     pub table: String,
@@ -326,7 +359,7 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
     pub(crate) table: RelationalTable,
     pub(crate) snapshot_gpu_id: u16,
     pub(crate) selected_indexes: Vec<usize>,
-    pub(crate) members: Vec<(BoundRelationalSelect, RelationalAccessPath, i32)>,
+    pub(crate) members: Vec<(Vec<RelationalColumn>, RelationalAccessPath, i32)>,
     pub(crate) before_metrics: RuntimeMetricsSnapshot,
     pub(crate) batch_started: Instant,
     pub(crate) submission: CudaI32EqualAnyProjectSubmission,

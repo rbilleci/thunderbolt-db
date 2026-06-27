@@ -543,34 +543,30 @@ pub enum BatchedDispatch {
 /// Decide whether `sql` is a batchable single-predicate int4 equality point-lookup against
 /// a resident, valid-generation table, and if so return the parsed `Select` + its int4
 /// needle. Conservative: it returns `Some` only when the engine's own resident-route
-/// planner accepts the statement AND reports one of the batchable projection shapes —
-/// `int4_equality_projection` (single column), `int4_equality_multi_column_projection`
-/// (multiple int4 columns), or `int4_equality_mixed_column_projection` (int4 + text)
-/// (Stage 4 widened this from the single-column shape only). The needle is extracted from
-/// the equality filter with the SAME `filter_groups`/`filters`/`filter` precedence the
-/// engine uses to bind the job, so the batcher's needle-dedup key matches the engine's
-/// bound needle exactly.
+/// planner accepts the statement AND reports one of the batchable **all-int4** projection
+/// shapes — `int4_equality_projection` (single column) or `int4_equality_multi_column_projection`
+/// (multiple int4 columns). The mixed int4+text shape (`int4_equality_mixed_column_projection`)
+/// is deliberately NOT batched: the resident `equal_any` kernel materializes int4 columns only,
+/// and the general (text-capable) batch executor is not CUDA-context-safe on the batcher's
+/// coalescer thread (a pre-existing latent constraint), so mixed point lookups take the unchanged
+/// per-query path. The needle is extracted from the equality filter with the SAME
+/// `filter_groups`/`filters`/`filter` precedence the engine uses to bind the job.
 fn classify_batchable_point_lookup(shared: &SharedEngine, sql: &str) -> Option<(Select, i32)> {
     let Ok(Command::Select(select)) = parse_command(sql) else {
         return None;
     };
     // A read lock just for the planning probe; released before the batcher takes its own
     // (single) read lock for the batch. The planner is `&self`. An accepted single-predicate
-    // int4-equality projection — single-column, multi-column (all-int4), or mixed int4/text —
-    // is batchable (Thread-3 Stage 4 widened this from single-column only); anything else
-    // returns `None` and the caller takes the unchanged per-query path. The multi-predicate
-    // mixed shape also reports `int4_equality_mixed_column_projection`, but the engine batch
-    // API accepts only ONE predicate, so the single-needle guard below
-    // (`select_int4_equality_needle`) rejects it and it falls through to the per-query path.
+    // all-int4-equality projection — single-column or multi-column — is batchable; anything else
+    // (including the mixed int4/text projection — see the doc comment) returns `None` and the
+    // caller takes the unchanged per-query path.
     {
         let engine = shared.read_engine().ok()?;
         let decision = engine.plan_relational_resident_route(&select);
         if !decision.accepted
             || !matches!(
                 decision.query_shape.as_str(),
-                "int4_equality_projection"
-                    | "int4_equality_multi_column_projection"
-                    | "int4_equality_mixed_column_projection"
+                "int4_equality_projection" | "int4_equality_multi_column_projection"
             )
         {
             return None;

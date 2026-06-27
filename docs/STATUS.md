@@ -73,6 +73,20 @@ MVCC CPU-fallback dispatch and retire *with* the host path, not before.
   pg_dump/restore + pg_dumpall round-trip. Broad driver/binary/extended-protocol parity beyond this is later.
 
 ## Recent
+**Batcher Tier-1: per-shape template (2026-06-27).** Removed the redundant per-request host plan/bind
+from the point-lookup batcher's single coalescer: a needle-invariant `RelationalRetainedReadTemplate`
+is prepared ONCE per shape (`prepare_relational_retained_read_template`) and reused across all needles
+(`submit_relational_retained_template_point_lookups`); the batcher groups by a cheap shape key instead
+of preparing a job per request. **Result: batched point-read throughput 68k → 156k ops/s (2.3× at 1024
+threads) and it now *scales* with concurrency (was flat); gap to the CPU baseline 11× → ~4.5×.**
+Behavior-preserving (suite 731/0), HAZARD clean (67 retained/resident tests 3×; 3× 512k-concurrent
+stress, zero CUDA faults). The residual ~6µs/item is now result materialization + oneshot distribution
+(the next target: Tier 2 parallelize the coalescer, or the wave engine). This is the reusable ingress
+the wave engine (ADR-009) will also consume. The adversarial audit caught a **pre-existing** latent bug
+(mixed int4+text point lookups errored CUDA 201 on the coalescer thread); fix: `classify` routes mixed
+shapes to the per-query path (the batcher is now all-int4-only) — batched mixed is a follow-up. See
+DECISIONS ADR-008.
+
 **OLTP benchmark v1 + S-F decision (2026-06-27):** built the first OLTP micro-benchmarks to gate STRATA **S-F**
 (flip `auto_admit_on_commit` ON). Result: **S-F stays OFF** — resident GPU point reads lose to host today (single read
 ~72µs vs ~3µs; even batched is 11× under the CPU at ~68k vs ~770k ops/s). The gap is **host-side serial coalescer

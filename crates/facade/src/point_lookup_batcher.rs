@@ -2,12 +2,16 @@
 //!
 //! Amortizes the per-call host-side CUDA driver-submit floor by coalescing many
 //! concurrent equality point-lookups into ONE GPU submission. It owns a single
-//! coalescer OS thread (Model 1: synchronous `complete` on that thread). It batches
-//! every single-predicate int4-equality projection route class — `int4_equality_projection`
-//! (single column), `int4_equality_multi_column_projection` (multiple int4 columns), and
-//! `int4_equality_mixed_column_projection` (int4 + text) (Stage 4 widened this from the
-//! single-column class only); distinct shapes/tables form distinct `route_id` groups and so
-//! distinct engine submits. The async ingress, instead of a
+//! coalescer OS thread (Model 1: synchronous `complete` on that thread). It batches the **all-int4**
+//! single-predicate int4-equality projection route classes — `int4_equality_projection` (single
+//! column) and `int4_equality_multi_column_projection` (multiple int4 columns). The mixed int4+text
+//! shape (`int4_equality_mixed_column_projection`) is NOT batched: the resident `equal_any` kernel
+//! materializes int4 only, and the text-capable general executor is not CUDA-context-safe on the
+//! coalescer thread, so `classify_batchable_point_lookup` routes mixed point lookups to the unchanged
+//! per-query path. Distinct shapes/tables form distinct shape-key groups (one prepared resident-read
+//! TEMPLATE each, reused across all needles), and so distinct engine submits. The template is the
+//! needle-invariant plan, so the expensive plan/bind runs once per shape, not per request (Tier 1,
+//! DECISIONS ADR-008). The async ingress, instead of a
 //! `spawn_blocking(execute_on_shared_engine)` per query, hands a batchable
 //! `SELECT` to [`PointLookupBatcher::enqueue`] and `await`s the returned
 //! `oneshot` while holding no semaphore permit (it is parked, not running).
@@ -20,8 +24,9 @@
 //!   snapshot even as concurrent writers commit (lock-free read path, write-half MVCC).
 //! - **Error fanout is total.** Any error from prepare/submit/complete is sent to
 //!   *every* waiter whose request was in that submit group — never a hung
-//!   connection. A drained batch is split into per-`route_id` groups; a failing
-//!   group fails only its own waiters, the other groups still complete.
+//!   connection. A drained batch is split into per-shape-key groups; a failing
+//!   group (including a template-prepare failure) fails only its own waiters, the
+//!   other groups still complete.
 //! - **Stale generation is a clean per-waiter error.** The engine's per-job
 //!   generation guard rejects a stale item with an `Err`; that `Err` is fanned
 //!   out to the group's waiters (it does not wedge the coalescer).
@@ -32,7 +37,7 @@
 //!   request channel closes. `mpsc` delivers every already-buffered request before
 //!   `recv` reports the close, so the coalescer runs each still-queued request for
 //!   real (answering its `oneshot`) and only then exits — no waiter is left parked.
-//! - **Request↔job order + needle dedup.** Within a `route_id` group, identical
+//! - **Request↔result order + needle dedup.** Within a shape-key group, identical
 //!   needles are submitted to the kernel once (the `equal_any` kernel scans every
 //!   row against all N needles, so duplicates would be wasted work); each request
 //!   is mapped back to its needle's sliced result, preserving per-request order.
@@ -415,98 +420,139 @@ fn run_batch(engine: &SharedEngine, batch: Batch<PointLookupRequest>) {
         return;
     }
 
-    // Prepare a job per request. `prepare_relational_retained_read_job` is `&self`
-    // (Stage 0) and computes `route_id`, which encodes shape:schema:table:proj:filter
-    // — so equal route_ids share table/columns/filter and differ only by needle.
-    // A request whose job fails to prepare (e.g. the snapshot went non-resident
-    // between classify and now) is answered immediately with that error and dropped
-    // from the batch — it never poisons the rest.
-    let mut prepared: Vec<PreparedRequest> = Vec::with_capacity(requests.len());
-    for request in requests {
-        match engine_ref.prepare_relational_retained_read_job(&request.select) {
-            Ok(job) => prepared.push(PreparedRequest {
-                respond: request.respond,
-                route_id: job.route_id.clone(),
-                needle: request.needle,
-                job,
-            }),
-            Err(err) => {
-                let _ = request.respond.send(Err(map_execute_error_local(err)));
-            }
-        }
-    }
-
-    // Group prepared requests by route_id, preserving first-seen group order and
-    // per-request order within a group. Each group is one engine submit.
+    // Group requests by a CHEAP shape key (the parsed `Select` with the needle VALUE normalized out —
+    // see `point_lookup_shape_key`), preserving first-seen group order and per-request order within a
+    // group. The expensive plan/bind (`prepare_relational_retained_read_template`) then runs ONCE per
+    // shape in `run_group`, not once per request — removing the ~15µs/item serial host cost that capped
+    // the single coalescer (DECISIONS ADR-008 "First measurement"). Each group is one engine submit.
     let mut group_order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<PreparedRequest>> = HashMap::new();
-    for pr in prepared {
-        let route_id = pr.route_id.clone();
-        if !groups.contains_key(&route_id) {
-            group_order.push(route_id.clone());
+    let mut groups: HashMap<String, Vec<PointLookupRequest>> = HashMap::new();
+    for request in requests {
+        let key = point_lookup_shape_key(&request.select);
+        if !groups.contains_key(&key) {
+            group_order.push(key.clone());
         }
-        groups.entry(route_id).or_default().push(pr);
+        groups.entry(key).or_default().push(request);
     }
 
-    for route_id in group_order {
-        let group = groups.remove(&route_id).expect("group present");
+    for key in group_order {
+        let group = groups.remove(&key).expect("group present");
         run_group(engine_ref, group);
     }
     // The batch is complete; every group ran over the shared `&Engine` (no lock to release).
 }
 
-/// A request whose retained-read job has been prepared under the read lock.
-struct PreparedRequest {
-    respond: oneshot::Sender<Result<QueryOutcome, DbError>>,
-    route_id: String,
-    needle: i32,
-    job: gpu_db_engine::RelationalRetainedReadJob,
+/// A CHEAP shape key for a batchable int4 point lookup. Requests sharing a key share one resident-read
+/// template, so the expensive plan/bind runs once per shape. A classify-accepted batchable point lookup
+/// (route shapes `int4_equality_projection` / `_multi_column_` / `_mixed_column_`) provably has NO
+/// `order_by` / `group_by` / `having` / `distinct` / `limit` / `offset` (those route to other shapes —
+/// `resident_route.rs`) and exactly ONE equality predicate, so the template is fully determined by
+/// `(table, projection, filter column)` with the needle VALUE excluded. We also fold in the remaining
+/// scalar shape flags (cheap, all default here) as belt-and-suspenders against any future shape
+/// widening. This is sub-µs — no full-`Select` clone or Debug (which dominated the coalescer when first
+/// tried). Mirrors the engine's `filter_groups → filters → filter` predicate precedence.
+fn point_lookup_shape_key(select: &Select) -> String {
+    let filter_column =
+        if let Some(filter) = select.filter_groups.first().and_then(|group| group.first()) {
+            filter.column.as_str()
+        } else if let Some(filter) = select.filters.first() {
+            filter.column.as_str()
+        } else if let Some(filter) = select.filter.as_ref() {
+            filter.column.as_str()
+        } else {
+            ""
+        };
+    format!(
+        "{}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{}",
+        select.table,
+        select.projection,
+        filter_column,
+        select.distinct,
+        select.group_by,
+        select.limit,
+        select.offset,
+        select.order_by.len(),
+        select.having_groups.len(),
+    )
 }
 
-/// Submit+complete one same-`route_id` group (identical table/columns/filter; only
-/// needles vary). Identical needles are deduplicated into a single job so the
-/// `equal_any` kernel does not scan the same needle twice; each request is then
-/// answered from its needle's sliced result. Any submit/complete error is fanned
-/// out to every waiter in the group.
-fn run_group(engine: &Engine, group: Vec<PreparedRequest>) {
-    // Deduplicate needles: one job per distinct needle, remembering which job index
-    // each request maps to. Job order == first-seen needle order (stable).
-    let mut jobs: Vec<gpu_db_engine::RelationalRetainedReadJob> = Vec::new();
-    let mut needle_to_job: HashMap<i32, usize> = HashMap::new();
-    let mut request_job_index: Vec<usize> = Vec::with_capacity(group.len());
-    for pr in &group {
-        let idx = match needle_to_job.get(&pr.needle) {
-            Some(&idx) => idx,
-            None => {
-                let idx = jobs.len();
-                needle_to_job.insert(pr.needle, idx);
-                jobs.push(pr.job.clone());
-                idx
-            }
-        };
-        request_job_index.push(idx);
-    }
-
-    // Submit + complete under the caller's already-held read lock. On ANY error,
-    // fan it out to every waiter in the group (no hung connection).
-    let results = match submit_and_complete(engine, &jobs) {
-        Ok(results) => results,
+/// Submit+complete one same-shape group (identical table/columns/filter; only needles vary). The batcher
+/// admits ONLY all-int4 projections (`classify_batchable_point_lookup` routes mixed int4+text to the
+/// per-query path — see its doc), so this prepares the needle-invariant template ONCE, deduplicates
+/// needles into a single `equal_any` submission, and answers each request from its needle's sliced
+/// result. Any prepare/submit/complete error is fanned out to every waiter (no hung connection).
+fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
+    // Prepare the shared template once for the whole group (group is non-empty by construction). A
+    // prepare error (e.g. the snapshot went non-resident since classify) fails the group uniformly —
+    // every request in it shares the table, so they would all fail anyway.
+    let template = match engine.prepare_relational_retained_read_template(&group[0].select) {
+        Ok(template) => template,
         Err(err) => {
-            let mapped = map_execute_error_local(err);
-            for pr in group {
-                let _ = pr.respond.send(Err(mapped.clone()));
-            }
+            fail_group(group, err);
             return;
         }
     };
+    // Defensive: classify admits only all-int4 projections to the batcher, so a mixed int4+text
+    // projection must never reach here — the `equal_any` kernel cannot materialize text (and the
+    // text-capable general executor is not CUDA-context-safe on this coalescer thread). Guard with a
+    // clean per-waiter error rather than feed a text column to the int4 kernel.
+    if !template.is_int4_only_projection() {
+        let mapped = DbError {
+            category: ErrorCategory::Internal,
+            message: "batched point lookup received a non-int4 projection (mixed int4+text shapes \
+                      must take the per-query path)"
+                .to_string(),
+        };
+        for request in group {
+            let _ = request.respond.send(Err(mapped.clone()));
+        }
+        return;
+    }
+    // Deduplicate needles into one submission, then map each request back to its needle's result.
+    let (distinct_needles, request_result_index) = dedup_needles(&group);
+    let results = match submit_and_complete_template(engine, &template, &distinct_needles) {
+        Ok(results) => results,
+        Err(err) => {
+            fail_group(group, err);
+            return;
+        }
+    };
+    debug_assert_eq!(results.len(), distinct_needles.len());
+    distribute_results(group, request_result_index, results);
+}
 
-    // The engine returns one `RelationalSelectResult` per job, in job order. Map
-    // each request to its job's result and answer its oneshot. A dropped receiver
-    // (client disconnected while parked) makes `send` fail harmlessly.
-    debug_assert_eq!(results.len(), jobs.len());
-    for (pr, job_idx) in group.into_iter().zip(request_job_index) {
+/// Deduplicate a group's needles, returning the distinct needles (first-seen order) and, per request,
+/// the index of its needle in that distinct list. Identical needles submit to the kernel once.
+fn dedup_needles(group: &[PointLookupRequest]) -> (Vec<i32>, Vec<usize>) {
+    let mut distinct_needles: Vec<i32> = Vec::new();
+    let mut needle_to_index: HashMap<i32, usize> = HashMap::new();
+    let mut request_result_index: Vec<usize> = Vec::with_capacity(group.len());
+    for request in group {
+        let idx = match needle_to_index.get(&request.needle) {
+            Some(&idx) => idx,
+            None => {
+                let idx = distinct_needles.len();
+                needle_to_index.insert(request.needle, idx);
+                distinct_needles.push(request.needle);
+                idx
+            }
+        };
+        request_result_index.push(idx);
+    }
+    (distinct_needles, request_result_index)
+}
+
+/// One `RelationalSelectResult` per distinct needle, in needle order: map each request to its needle's
+/// result and answer its oneshot. A dropped receiver (client disconnected while parked) makes `send`
+/// fail harmlessly.
+fn distribute_results(
+    group: Vec<PointLookupRequest>,
+    request_result_index: Vec<usize>,
+    results: Vec<RelationalSelectResult>,
+) {
+    for (request, result_idx) in group.into_iter().zip(request_result_index) {
         let outcome = results
-            .get(job_idx)
+            .get(result_idx)
             .map(map_select_result_to_outcome)
             .unwrap_or_else(|| {
                 Err(DbError {
@@ -514,18 +560,26 @@ fn run_group(engine: &Engine, group: Vec<PreparedRequest>) {
                     message: "batched point-lookup result slice missing for request".to_string(),
                 })
             });
-        let _ = pr.respond.send(outcome);
+        let _ = request.respond.send(outcome);
     }
 }
 
-/// Submit then complete a job group. Kept as one call so the read lock spans the
-/// whole submit→complete window (the engine API itself takes `&self`).
-fn submit_and_complete(
+/// Fan one error out to every waiter in a group (no hung connection).
+fn fail_group(group: Vec<PointLookupRequest>, err: ExecuteError) {
+    let mapped = map_execute_error_local(err);
+    for request in group {
+        let _ = request.respond.send(Err(mapped.clone()));
+    }
+}
+
+/// Submit then complete a template+needles batch. Kept as one call so the read view spans the whole
+/// submit→complete window (the engine API takes `&self`).
+fn submit_and_complete_template(
     engine: &Engine,
-    jobs: &[gpu_db_engine::RelationalRetainedReadJob],
+    template: &gpu_db_engine::RelationalRetainedReadTemplate,
+    needles: &[i32],
 ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
-    let submission =
-        engine.submit_relational_retained_read_jobs_with_resident_device_memory_probe(jobs)?;
+    let submission = engine.submit_relational_retained_template_point_lookups(template, needles)?;
     engine.complete_relational_retained_read_submission(submission)
 }
 
@@ -556,7 +610,7 @@ fn map_execute_error_local(err: ExecuteError) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execute_on_shared_engine;
+    use crate::{execute_on_shared_engine, execute_on_shared_engine_batched, BatchedDispatch};
     use gpu_db_sql::{parse_command, Command};
     use std::sync::mpsc::TryRecvError;
 
@@ -726,6 +780,64 @@ mod tests {
         assert_eq!(got_2a, ref_2, "batched needle=2 must match per-query");
         assert_eq!(got_2b, ref_2, "duplicate needle=2 must get the same result");
         assert_eq!(got_1, ref_1, "batched needle=1 must match per-query");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU (resident route)"]
+    fn mixed_int4_text_point_lookup_routes_to_per_query_not_batcher() {
+        use gpu_db_engine::Engine;
+
+        // Regression (adversarial audit, Tier 1): a mixed int4+text projection
+        // (`int4_equality_mixed_column_projection`) must NOT be batched — the resident `equal_any` kernel
+        // cannot materialize text, and the text-capable general executor errored CUDA 201 (invalid
+        // context) on the coalescer thread (a pre-existing latent constraint). `classify` routes it to
+        // the per-query path instead. Build + warm a table with a text column AND a NULL row; confirm the
+        // dispatch is Immediate (per-query) and byte-identical to the direct per-query path.
+        let mut engine = Engine::new_local();
+        engine
+            .execute_text(1, "CREATE TABLE m (id INT, label TEXT)")
+            .unwrap();
+        engine
+            .execute_text(
+                2,
+                "INSERT INTO m (id, label) VALUES (1, 'one'), (2, 'two'), (3, NULL)",
+            )
+            .unwrap();
+        engine.populate_relational_residency_snapshot("m").unwrap();
+        // Skip if the box has no GPU device memory or the mixed shape is not admitted to the route.
+        let probe = parse_command("SELECT id, label FROM m WHERE id = 2").unwrap();
+        let Command::Select(probe_select) = probe else {
+            unreachable!()
+        };
+        if !engine
+            .plan_relational_resident_route(&probe_select)
+            .accepted
+        {
+            return;
+        }
+
+        let shared = Arc::new(SharedEngine::from_engine(engine));
+        let batcher =
+            PointLookupBatcher::with_triggers(Arc::clone(&shared), 8, Duration::from_millis(5));
+
+        // A mixed int4+text point lookup (including the NULL-label row) must take the Immediate
+        // (per-query) dispatch, NOT the batcher, and return rows byte-identical to the per-query path.
+        for sql in [
+            "SELECT id, label FROM m WHERE id = 2",
+            "SELECT id, label FROM m WHERE id = 3",
+        ] {
+            let outcome = match execute_on_shared_engine_batched(&shared, &batcher, sql) {
+                BatchedDispatch::Immediate(result) => result.unwrap(),
+                BatchedDispatch::Batched(_) => {
+                    panic!("mixed int4+text point lookup must route to per-query, not the batcher: {sql}")
+                }
+            };
+            let reference = execute_on_shared_engine(&shared, sql).unwrap();
+            assert_eq!(
+                outcome, reference,
+                "mixed int4+text must match per-query: {sql}"
+            );
+        }
     }
 
     // --- Adaptive-wait unit tests (no GPU; pure controller + timing/coalescing) ---

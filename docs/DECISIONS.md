@@ -68,6 +68,20 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   The gap is host-serial → in scope to fix, consistent with the bet. Path to ballpark: remove the per-item host cost →
   the persistent-kernel wave engine (ADR-009) with on-GPU result slots. **S-F (flip auto-admit default) stays OFF** —
   resident GPU point reads lose to host today (DECISIONS ADR-010 / PLAN §2).
+- **Tier-1 result (2026-06-27):** removed the per-request plan/bind — a needle-invariant resident-read **template**
+  prepared once per shape, reused across all needles (`prepare_relational_retained_read_template` /
+  `submit_relational_retained_template_point_lookups`; batcher groups by a cheap shape key). **Batched point-read
+  throughput 68k → 156k ops/s (2.3× @ 1024 threads), now scales with concurrency (was flat); CPU gap 11× → ~4.5×.**
+  Behavior-preserving (731/0), HAZARD clean. Confirms the diagnosis (the wall WAS host-serial per-item work). Residual
+  ~6µs/item = result materialization + oneshot distribution (still single-coalescer). Next: Tier 2 (parallelize the
+  coalescer) and/or the wave engine (ADR-009) — the template is the ingress the wave engine reuses.
+  - **Audit finding adopted:** the independent adversarial audit caught that the batcher admitted the **mixed int4+text**
+    shape (`int4_equality_mixed_column_projection`) but the int4 `equal_any` kernel cannot project text — and the
+    text-capable general executor errors **CUDA 201 (invalid context)** on the coalescer thread (a *pre-existing latent*
+    bug — that path was never exercised; the prior engine-level mixed test runs on the main thread). Fix: `classify`
+    now routes mixed point lookups to the **per-query path** (correct; 18 engine mixed tests + a new facade regression
+    test with NULL data lock it in). Batched mixed-column lookups are a follow-up (need the coalescer-thread context
+    fix, or the wave engine). The batcher is now all-int4-only by construction.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

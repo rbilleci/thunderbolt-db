@@ -51,8 +51,14 @@ Spec: ARCHITECTURE §7 + §13.
 (`crates/server/tests/pgwire_roundtrip.rs` pattern), assert exact rows + that the GPU sharded route served them
 (non-vacuous), differential vs 1/N shards/host, **with NULL data**, GPU-guarded.
 
-## 3. OLTP execution engine (ARCHITECTURE §9 — gated on the benchmark telling us it's needed)
-- Persistent-kernel wave engine + lock-free submission ring (replace launch-per-batch).
+## 3. OLTP execution engine (ARCHITECTURE §9 — the benchmark says this is the critical path for the bet)
+- **Point-read coalescer (the measured bottleneck, DECISIONS ADR-008):**
+  - **Tier 1 ✅ DONE (2026-06-27):** per-shape resident-read template (prepare once, reuse across needles) — removed the
+    per-request plan/bind. 68k → 156k ops/s (2.3×), now scales; CPU gap 11× → ~4.5×. The template is the ingress the
+    wave engine reuses. (Tier 2 = parallelize the single coalescer thread is **dropped** — the wave engine replaces it.)
+  - **Residual:** ~6µs/item = result materialization + oneshot distribution, still single-coalescer.
+- Persistent-kernel wave engine + lock-free submission ring (replace launch-per-batch); on-GPU result slots remove the
+  remaining host per-item orchestration — the real path to the CPU ballpark.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
