@@ -26,9 +26,12 @@ Spec: ARCHITECTURE §7 + §13.
   `residency.partitions → shards`, `partition_device_memory → shard_device_memory`, `partition_id/count → shard_*`,
   route shapes `partitioned_* → sharded_*` (engine + observability; MVCC tuple-store "partition" left intact).
   Behavior-preserving, suite 729/0.
-- **S-B — admission producer v1 (N=1 unified) behind `auto_admit_on_commit` (default OFF).** Commit-triggered,
-  post-`publish_committed_seq`, best-effort, via the `&self`+held-catalog-guard seam. Makes the GPU path reachable
-  end-to-end via the wire for fits-one-GPU tables (int4 + text). Golden wire tests (below) go green.
+- **S-B — admission producer v1 (N=1 unified) behind `auto_admit_on_commit` ✅ DONE (2026-06-27).**
+  Commit-triggered (all 3 commit paths), post-`publish_committed_seq`, best-effort (never fails the durable
+  commit), via the `&self`+held-catalog-guard seam (`populate_relational_residency_snapshot_inner` /
+  `admit_..._inner`). Default OFF → behavior-preserving (suite 730/0). Acceptance test proves a CREATE+INSERT(with
+  NULL) table is GPU-resident with **no explicit warm**, reads on the GPU route, results match the host path;
+  HAZARD clean. Remaining: the full pgwire-socket golden test; flipping the default is **S-F**.
 - **S-C — same-GPU N>1 shards + partial-combine (int4);** incremental shard append.
 - **S-D — text shard recompaction/combine** (per-shard offset rebasing + 8-alignment); removes the int4-only guard.
 - **S-E — cross-shard combine (peer-copy / NCCL) → true spill / multi-GPU;** the missing scale mechanism + the

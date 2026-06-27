@@ -241,8 +241,9 @@ impl Engine {
         self.populate_relational_residency_snapshot_on_gpu(table, gpu_id)
     }
 
-    fn populate_relational_residency_snapshot_on_gpu(
-        &mut self,
+    fn populate_relational_residency_snapshot_inner(
+        &self,
+        cat: &mut DdlCatalogState,
         table: &str,
         gpu_id: u16,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
@@ -253,8 +254,7 @@ impl Engine {
             .load()
             .get(table)
             .map(|entry| entry.descriptor.clone());
-        let catalog_table = self
-            .ddl_catalog_mut()
+        let catalog_table = cat
             .relational_catalog
             .get(table)
             .ok_or_else(|| {
@@ -344,9 +344,9 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&gpu_id);
-        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+        let admission_budget_bytes = cat.relational_resident_cache.budget_bytes_by_gpu.get(&gpu_id).copied();
         let (evicted_tables_on_admission, resident_bytes_after_admission) =
-            self.admit_relational_residency_snapshot(table, gpu_id, resident_bytes)?;
+            self.admit_relational_residency_snapshot_inner(cat, table, gpu_id, resident_bytes)?;
         let device_memory = self.relational_residency_device_memory(gpu_id, &device_payload);
         let device_memory_proof = device_memory
             .as_ref()
@@ -392,7 +392,7 @@ impl Engine {
             device_memory_proof,
         };
         let read_state = Arc::clone(&self.read_state);
-        self.ddl_catalog_mut()
+        cat
             .relational_resident_cache
             .install_snapshot(
                 catalog_table.name,
@@ -404,17 +404,18 @@ impl Engine {
         Ok(snapshot)
     }
 
-    fn admit_relational_residency_snapshot(
-        &mut self,
+    fn admit_relational_residency_snapshot_inner(
+        &self,
+        cat: &mut DdlCatalogState,
         table: &str,
         gpu_id: u16,
         resident_bytes: u64,
     ) -> Result<(Vec<String>, u64), ExecuteError> {
-        let Some(budget_bytes) = self.relational_residency_budget_bytes(gpu_id) else {
+        let Some(budget_bytes) = cat.relational_resident_cache.budget_bytes_by_gpu.get(&gpu_id).copied() else {
             let resident_bytes_after_admission = self
                 .relational_resident_bytes_for_gpu_excluding(gpu_id, table)
                 .saturating_add(resident_bytes);
-            self.ddl_catalog_mut()
+            cat
                 .relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
@@ -432,7 +433,7 @@ impl Engine {
         };
         if resident_bytes > budget_bytes {
             let current_bytes = self.relational_resident_bytes_for_gpu(gpu_id);
-            self.ddl_catalog_mut()
+            cat
                 .relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
@@ -454,7 +455,7 @@ impl Engine {
         let current_bytes_before = current_bytes;
         let mut evicted_tables = Vec::new();
         if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
-            self.ddl_catalog_mut()
+            cat
                 .relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
@@ -492,14 +493,14 @@ impl Engine {
                 break;
             }
             let read_state = Arc::clone(&self.read_state);
-            self.ddl_catalog_mut()
+            cat
                 .relational_resident_cache
                 .remove_table(&map_key, &read_state.residency, &read_state.route_telemetry);
             current_bytes = current_bytes.saturating_sub(bytes);
             evicted_tables.push(map_key);
         }
 
-        self.ddl_catalog_mut()
+        cat
             .relational_resident_cache
             .record_decision(RelationalResidentCacheDecision {
                 table: table.to_string(),
@@ -519,8 +520,60 @@ impl Engine {
         Ok((evicted_tables, current_bytes + resident_bytes))
     }
 
-    fn relational_residency_device_memory(
+    /// `&mut self` entry for the operator warm path: acquire the catalog latch, then run the
+    /// `&self`+held-guard producer (the STRATA S-B seam — also reachable from the `&self` commit path).
+    fn populate_relational_residency_snapshot_on_gpu(
         &mut self,
+        table: &str,
+        gpu_id: u16,
+    ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        let mut guard = self.ddl_catalog();
+        self.populate_relational_residency_snapshot_inner(&mut guard, table, gpu_id)
+    }
+
+    /// `&mut self` entry for the benchmark residency installers.
+    fn admit_relational_residency_snapshot(
+        &mut self,
+        table: &str,
+        gpu_id: u16,
+        resident_bytes: u64,
+    ) -> Result<(Vec<String>, u64), ExecuteError> {
+        let mut guard = self.ddl_catalog();
+        self.admit_relational_residency_snapshot_inner(&mut guard, table, gpu_id, resident_bytes)
+    }
+
+    /// STRATA S-B: enable/disable automatic GPU-residency admission on commit. Default OFF — turning it
+    /// on makes a committed table GPU-resident so subsequent reads take the GPU-native route instead of
+    /// the host path. `&self` (an interior-mutable flag the commit path reads).
+    pub fn set_auto_admit_on_commit(&self, on: bool) {
+        self.auto_admit_on_commit
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn auto_admit_on_commit_enabled(&self) -> bool {
+        self.auto_admit_on_commit
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit
+    /// mutated. Runs AFTER `publish_committed_seq` (so it snapshots the new generation) while the
+    /// commit_mutex is held; it can NEVER fail the commit — over-budget / memory-pressure / GPU-absent /
+    /// dropped-table simply leaves the table non-resident (reads fall back to the host path). N=1
+    /// unified buffer per table (single-GPU); shard/spill is S-C/S-E.
+    pub(crate) fn auto_admit_resident_tables(&self, tables: &std::collections::BTreeSet<String>) {
+        if tables.is_empty() {
+            return;
+        }
+        let gpu_id = self.planner.default_gpu_id();
+        let mut guard = self.ddl_catalog();
+        let cat = &mut *guard;
+        for table in tables {
+            let _ = self.populate_relational_residency_snapshot_inner(cat, table, gpu_id);
+        }
+    }
+
+    fn relational_residency_device_memory(
+        &self,
         gpu_id: u16,
         payload: &[u8],
     ) -> Option<CudaResidentDeviceMemory> {

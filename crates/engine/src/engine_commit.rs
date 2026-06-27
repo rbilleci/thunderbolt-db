@@ -122,6 +122,13 @@ impl Engine {
             self.publish_catalog_snapshot(cat, token.index, prune_below);
         }
         self.publish_committed_seq(token.index);
+        // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
+        // after the publish so it snapshots the new generation; never fails the already-durable commit).
+        if self.auto_admit_on_commit_enabled() {
+            if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
+                self.auto_admit_resident_tables(&tables);
+            }
+        }
         self.metrics.inc_commit();
         drop(commit);
 
@@ -213,6 +220,13 @@ impl Engine {
             self.publish_catalog_snapshot(cat, token.index, prune_below);
         }
         self.publish_committed_seq(token.index);
+        // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
+        // after the publish so it snapshots the new generation; never fails the already-durable commit).
+        if self.auto_admit_on_commit_enabled() {
+            if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
+                self.auto_admit_resident_tables(&tables);
+            }
+        }
         self.metrics.inc_commit();
 
         Ok((token, residency_invalidation_micros))

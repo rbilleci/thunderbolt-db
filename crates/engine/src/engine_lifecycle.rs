@@ -164,6 +164,7 @@ impl Engine {
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
             cached_cuda_probe_runtime: OnceLock::new(),
+            auto_admit_on_commit: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

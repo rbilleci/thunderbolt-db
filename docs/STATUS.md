@@ -40,12 +40,13 @@ real pgwire round-trip tests (`tokio_postgres`). `PointLookupBatcher` (microbatc
   domains) — current serving is thread-per-connection (sync) or task-per-connection (async tokio + `spawn_blocking`).
   The OLTP deterministic wave engine (ARCHITECTURE §OLTP) is **design, not built**.
 
-## The blocking gap
-**No production producer of GPU residency exists.** `residency.shards` is written only by a test
-helper; the operator warm path makes only a unified single buffer and is operator-triggered. So a committed user
-table is **non-resident by default and reads run host-side** (`execute_relational_select_cpu_pinned` →
-`finalize_relational_select`). The host read path is therefore **live**, and **S10d (delete the host path) is gated on
-STRATA auto-admission** (PLAN S-B / DECISIONS ADR-010). The `FirstCudaSliceParityBackend` tests guard the **live**
+## The blocking gap (S-B partially closed it)
+A production producer of GPU residency now **exists** — `auto_admit_on_commit` (S-B) admits a committed table on
+commit (verified: a CREATE+INSERT table is GPU-resident with no explicit warm) — but it is **default-OFF**, so the
+production default is still **non-resident → host-side** reads (`execute_relational_select_cpu_pinned` →
+`finalize_relational_select`) until **S-F** flips the default (gated on perf + S-C/S-D/S-E for the multi-shard /
+text / spill cases). The host read path is therefore still **live**, and **S10d (delete it) is gated on S-F**
+(PLAN §2 / DECISIONS ADR-010). The `FirstCudaSliceParityBackend` tests guard the **live**
 MVCC CPU-fallback dispatch and retire *with* the host path, not before.
 
 ## Known gaps / debt
@@ -67,7 +68,10 @@ MVCC CPU-fallback dispatch and retire *with* the host path, not before.
   pg_dump/restore + pg_dumpall round-trip. Broad driver/binary/extended-protocol parity beyond this is later.
 
 ## Recent
-**STRATA S-A landed (2026-06-27):** L2 vocabulary rename `partition → shard` (`RelationalResidentShard`,
+**STRATA S-B landed (2026-06-27):** auto-admission producer v1 (N=1 unified, behind default-off
+`auto_admit_on_commit`) — a committed table becomes GPU-resident on commit with **no explicit warm** (verified
+non-vacuously on the RTX PRO 6000; HAZARD clean; suite 730/0). **STRATA S-A landed (2026-06-27):** L2 vocabulary
+rename `partition → shard` (`RelationalResidentShard`,
 `residency.shards`, `shard_device_memory`, `sharded_*` route shapes; engine + observability; the MVCC tuple-store
 "partition" namespace was deliberately left intact); behavior-preserving, 729/0. Earlier: docs consolidated to 6
 canonical files; STRATA + OLTP-execution designs written; the OLTP bet decided; architecture docs reconciled with

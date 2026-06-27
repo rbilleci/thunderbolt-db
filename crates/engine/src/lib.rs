@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -306,6 +306,9 @@ pub struct Engine {
     // Lazily-probed CUDA runtime, behind a OnceLock so the probe getter is `&self`
     // (the read path lazily initializes it — P1-M3 step 3c).
     cached_cuda_probe_runtime: OnceLock<CudaDriverRuntime>,
+    /// STRATA S-B: when true, a committing mutation auto-admits its tables to GPU residency after the
+    /// commit publishes (best-effort, never fails the commit). Default off. Interior-mutable (`&self`).
+    auto_admit_on_commit: AtomicBool,
 }
 
 /// The DDL-only catalog working state, serialized behind the engine's **catalog latch**

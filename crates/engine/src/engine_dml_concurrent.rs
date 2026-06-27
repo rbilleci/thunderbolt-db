@@ -315,6 +315,10 @@ impl Engine {
         // and the data/value-index publish, so an acquire-load by a reader observes a fully durable,
         // fully published commit.
         self.publish_committed_seq(commit_seq);
+        // STRATA S-B: best-effort GPU-residency admission for the mutated tables (flag-gated).
+        if self.auto_admit_on_commit_enabled() {
+            self.auto_admit_resident_tables(&residency_tables);
+        }
         self.metrics.inc_commit();
         drop(commit);
         // === leave the commit critical section ===

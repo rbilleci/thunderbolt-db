@@ -3659,3 +3659,118 @@ fn s10c_2b_sharded_ordered_projection_matches_oracle() {
         "the global top-4 (42,42,42,9) must span p0 and p2"
     );
 }
+
+/// STRATA S-B acceptance: with `auto_admit_on_commit` ON, a freshly CREATE+INSERTed table becomes
+/// GPU-resident WITHOUT any explicit warm/populate call, so reads take the GPU-native resident route
+/// and return correct results — including a NULL-bearing int4 column. A flag-OFF engine over identical
+/// data stays non-resident (host path) and returns byte-identical rows. Self-guards on a non-GPU box
+/// (the resident route is not accepted when the device-memory upload cannot run).
+#[test]
+fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
+    let expected = vec![
+        vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+        vec![SqlValue::Int4(2), SqlValue::Null],
+        vec![SqlValue::Int4(3), SqlValue::Int4(30)],
+    ];
+    let parse = |s: &str| {
+        let Command::Select(sel) = parse_command(s).unwrap() else {
+            unreachable!()
+        };
+        sel
+    };
+
+    // Auto-admit ON, and NO explicit populate/warm call — residency must come purely from the commit.
+    let e = Engine::new_local();
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)")
+        .unwrap();
+
+    // Probe with a definitely-accepted shape; self-guard on a box without a usable GPU (the
+    // device-memory upload returns None there, so the route is not accepted — the auto-admit code
+    // path still ran).
+    let probe = parse("SELECT id FROM t WHERE id = 2");
+    let route = e.plan_relational_resident_route(&probe);
+    if !route.accepted {
+        assert_eq!(
+            route.reason,
+            "resident snapshot has no retained device memory"
+        );
+        return;
+    }
+    let probe_res = e.execute_relational_select(&probe).unwrap();
+    assert_eq!(
+        probe_res.executed_target,
+        DeviceTarget::Gpu(0),
+        "auto-admitted table must read on the GPU resident route"
+    );
+    assert_eq!(probe_res.rows, vec![vec![SqlValue::Int4(2)]]);
+
+    // NULL-bearing projection: rows must be correct (NULL at id=2) whichever route serves it.
+    let proj = parse("SELECT id, v FROM t ORDER BY id");
+    let gpu = e.execute_relational_select(&proj).unwrap();
+    assert_eq!(
+        gpu.rows, expected,
+        "auto-admitted GPU read must be correct, incl. NULL"
+    );
+
+    // Flag OFF (default): identical data is NOT auto-admitted -> host path -> byte-identical rows.
+    let host = Engine::new_local();
+    host.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    host.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)")
+        .unwrap();
+    assert!(
+        !host.plan_relational_resident_route(&proj).accepted,
+        "flag-off table must NOT be auto-admitted"
+    );
+    let host_res = host.execute_relational_select(&proj).unwrap();
+    assert_eq!(host_res.executed_target, DeviceTarget::Cpu);
+    assert_eq!(host_res.rows, expected, "host rows must equal the GPU rows");
+}
+
+/// STRATA S-B (production commit path): in production a plain INSERT is routed through the CONCURRENT
+/// DML path (`execute_dml_concurrent`), which hits a DIFFERENT commit hook than `execute_text`. Confirm
+/// auto-admit-on-commit fires there too — the table is GPU-resident after a concurrent-path INSERT,
+/// with NULL data, no explicit warm. Self-guards on a non-GPU box.
+#[test]
+fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
+    let expected = vec![
+        vec![SqlValue::Int4(1), SqlValue::Int4(10)],
+        vec![SqlValue::Int4(2), SqlValue::Null],
+        vec![SqlValue::Int4(3), SqlValue::Int4(30)],
+    ];
+    let e = Engine::new_local();
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    // Drive the INSERT through the concurrent path that production uses for a no-sequence-default
+    // INSERT (NOT `execute_text`), so the `commit_dml_concurrent` hook is the one under test.
+    e.execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)")
+        .unwrap();
+
+    // Probe residency with a definitely-accepted shape (proving the concurrent hook admitted the
+    // table); self-guard on a non-GPU box.
+    let Command::Select(probe) = parse_command("SELECT id FROM t WHERE id = 2").unwrap() else {
+        unreachable!()
+    };
+    let route = e.plan_relational_resident_route(&probe);
+    if !route.accepted {
+        assert_eq!(
+            route.reason,
+            "resident snapshot has no retained device memory"
+        );
+        return;
+    }
+    let probe_res = e.execute_relational_select(&probe).unwrap();
+    assert_eq!(
+        probe_res.executed_target,
+        DeviceTarget::Gpu(0),
+        "auto-admit must fire on the concurrent DML commit path (the production INSERT route)"
+    );
+    assert_eq!(probe_res.rows, vec![vec![SqlValue::Int4(2)]]);
+
+    // NULL-bearing projection: rows must be correct (NULL at id=2) whichever route serves it.
+    let Command::Select(proj) = parse_command("SELECT id, v FROM t ORDER BY id").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(e.execute_relational_select(&proj).unwrap().rows, expected);
+}
