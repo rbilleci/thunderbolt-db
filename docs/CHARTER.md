@@ -14,6 +14,12 @@ GPU advances driven by AI demand — coherent CPU–GPU memory (NVLink-C2C), HBM
 **outpace CPU engines**. Architectural or benchmark obstacles to OLTP-on-GPU are **in scope to fix**, not a reason
 to retreat to analytics. The bet is **unproven until measured** against a tuned CPU baseline (PLAN benchmark mandate).
 
+**Success bar (clarified 2026-06-27): same ballpark on *today's* hardware, not beat-the-CPU-today.** This is a
+*trajectory* bet. We win when (a) GPU OLTP is within the **same order of magnitude** as a tuned CPU engine on current
+hardware, AND (b) the residual gap is **GPU-architectural** (launch amortization, parallelism, memory bandwidth/
+coherence) so it **closes as GPU hardware advances** while the CPU path sits near its ceiling. A measured gap that is
+**host-side serial overhead** (not GPU-bound) is in scope to fix — it is not evidence against the bet.
+
 ## Success criteria (SLO targets, mid-size core-banking deployment)
 | Metric | Target |
 |---|---|

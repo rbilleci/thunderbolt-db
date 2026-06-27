@@ -54,6 +54,20 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   Obstacles are in scope to fix. Optimized target = predeclarable transaction waves (ADR-009); interactive
   multi-statement is a supported slow class.
 - **Consequences:** Benchmark mandate (open-loop p99 vs tuned Postgres) becomes the gate that proves/kills the bet.
+- **Refinement (2026-06-27):** Success = **same ballpark on today's hardware**, NOT beating the CPU today. Win
+  condition: (a) within an order of magnitude of a tuned CPU engine now, and (b) the residual gap is GPU-architectural
+  (amortizable launch / parallelism / bandwidth) so it narrows as hardware advances. Host-side serial overhead does
+  not count against the bet — it is a fix (see CHARTER "Success bar").
+- **First measurement (2026-06-27, RTX PRO 6000; `engine/examples/oltp_auto_admit_ab` +
+  `facade/examples/oltp_batched_read_scaling`), point-lookup `WHERE id=?`:** (1) one GPU read is a **fixed ~72µs**
+  (launch + context-set + stream-sync + host round-trip — flat across a 100× table-size sweep, so overhead not compute)
+  vs ~3µs host. (2) Batching (`PointLookupBatcher`) amortizes that **13.7×** but **plateaus at ~68k ops/s, 11× under
+  the CPU's ~770k**, and does NOT scale with concurrency (flat throughput, p50 grows linearly). Root cause (queueing
+  signature + Little's law + code at `point_lookup_batcher.rs:395`): **~15µs/item of serial host-side work in the single
+  coalescer thread** (per-item `route_id` String build + `HashMap` grouping + per-item oneshot) — **not GPU compute.**
+  The gap is host-serial → in scope to fix, consistent with the bet. Path to ballpark: remove the per-item host cost →
+  the persistent-kernel wave engine (ADR-009) with on-GPU result slots. **S-F (flip auto-admit default) stays OFF** —
+  resident GPU point reads lose to host today (DECISIONS ADR-010 / PLAN §2).
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

@@ -53,8 +53,13 @@ MVCC CPU-fallback dispatch and retire *with* the host path, not before.
 - **Sharded read path is int4-only** — text shards reject (offset rebasing unbuilt); cross-shard combine /
   multi-GPU absent (single-GPU recompaction requires all shards on one GPU → doesn't relieve memory pressure yet).
 - **GPUDirect Storage / cuFile:** absent (greenfield).
-- **No open-loop perf harness** — all current numbers are closed-loop (self-throttling); can't validate the OLTP
-  latency bet (PLAN benchmark mandate).
+- **Perf harness — partial.** First OLTP micro-benchmarks landed (`engine/examples/oltp_auto_admit_ab`,
+  `facade/examples/oltp_batched_read_scaling`): closed-loop per-op A/B + a concurrent batched-vs-host scaling probe.
+  Key findings (2026-06-27, RTX PRO 6000, point lookups): a single GPU read is a fixed **~72µs** (launch/sync overhead,
+  flat across 100× rows) vs ~3µs host; batching amortizes 13.7× but **plateaus at ~68k ops/s, 11× under the CPU's
+  ~770k**, bottlenecked on **~15µs/item serial host work in the single coalescer thread** (not GPU compute) — see
+  DECISIONS ADR-008 "First measurement". Still missing: the true **open-loop offered-rate** harness + a **tuned
+  Postgres baseline** on a standard workload (TPC-C/sysbench/YCSB), split by txn class (PLAN §1).
 - **Two charter-debt correctness items** (recovered from old handovers, verified live):
   - Expression-overflow PG-divergence: `ORDER BY`/`GROUP BY <expr>` evaluates over all rows before WHERE drops
     survivors → a filtered-out overflow row errors where PG succeeds (`engine_expr.rs:~5757`; fix = gather-then-evaluate).
@@ -68,6 +73,14 @@ MVCC CPU-fallback dispatch and retire *with* the host path, not before.
   pg_dump/restore + pg_dumpall round-trip. Broad driver/binary/extended-protocol parity beyond this is later.
 
 ## Recent
+**OLTP benchmark v1 + S-F decision (2026-06-27):** built the first OLTP micro-benchmarks to gate STRATA **S-F**
+(flip `auto_admit_on_commit` ON). Result: **S-F stays OFF** — resident GPU point reads lose to host today (single read
+~72µs vs ~3µs; even batched is 11× under the CPU at ~68k vs ~770k ops/s). The gap is **host-side serial coalescer
+overhead (~15µs/item), not GPU compute**, so it is in scope to fix and consistent with the bet (CHARTER "Success bar"
+= same ballpark today + GPU-architectural gap that closes with hardware). Next: attack the coalescer's per-item cost,
+then the persistent-kernel wave engine (ADR-009). Empirically, flipping S-F also breaks 19/731 tests (contract
+migration deferred with the flip). Details: DECISIONS ADR-008 "First measurement".
+
 **STRATA S-B landed (2026-06-27):** auto-admission producer v1 (N=1 unified, behind default-off
 `auto_admit_on_commit`) — a committed table becomes GPU-resident on commit with **no explicit warm** (verified
 non-vacuously on the RTX PRO 6000; HAZARD clean; suite 730/0). **STRATA S-A landed (2026-06-27):** L2 vocabulary

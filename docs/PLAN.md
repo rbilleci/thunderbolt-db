@@ -11,6 +11,10 @@ The OLTP bet (DECISIONS ADR-008) is **unproven until measured**. Two near-term t
 - **Unblock production** — STRATA auto-admission (§2), without which the entire GPU read path is dormant.
 
 ## 1. Benchmark mandate (prove or kill the OLTP bet)
+**v1 landed (2026-06-27):** `engine/examples/oltp_auto_admit_ab` (per-op A/B) + `facade/examples/oltp_batched_read_scaling`
+(concurrent batched-vs-host). First findings in DECISIONS ADR-008 — they already redirected priority: the point-read
+gap is **host-side serial coalescer cost (~15µs/item)**, so §3's wave engine / coalescer fix is the measured critical
+path, ahead of more resident-route breadth (S-C/S-D/S-E). Still owed below:
 Before deep OLTP-engine investment:
 - **Open-loop / offered-rate** harness measuring **p99 / p99.9 / p99.99 at a target TPS** (today's numbers are
   closed-loop / self-throttling — they cannot validate a latency bet).
@@ -38,6 +42,10 @@ Spec: ARCHITECTURE §7 + §13.
   production shard producer for over-VRAM tables.
 - **S-F — flip `auto_admit_on_commit` ON** + migrate the non-resident test contracts. This is the real precondition
   for **S10d** (delete the host read path; the `FirstCudaSliceParityBackend` tests retire *with* it).
+  **HELD OFF (2026-06-27), evidence-gated:** the OLTP benchmark (DECISIONS ADR-008 "First measurement") shows resident
+  GPU point reads lose to host (even batched, 11×) and per-commit re-admit costs O(rows) — flipping is net-negative
+  today. Flip only once the read path is in the CPU ballpark (kill the coalescer per-item cost → wave engine, §3).
+  Empirically flipping breaks 19/731 tests; that contract migration rides with the flip.
 
 **Golden wire tests** (acceptance spec): drive SQL over the real pgwire socket
 (`crates/server/tests/pgwire_roundtrip.rs` pattern), assert exact rows + that the GPU sharded route served them
