@@ -40,22 +40,30 @@
   bottleneck**; the remaining write constraints (durability/WAL fsync, deterministic CC) are host-I/O + coordination
   problems CPU engines face too. (`wave_index_insert_probe.rs`; caveats: low contention, raw insert only.)
 
-## The one next action — **engine integration R1** (design done; recon cited below)
-Wire the GPU index into the engine the LOW-RISK way (defers the persistent-kernel SM-coexistence risk to R2):
-- **R1 — index in the engine, behind a default-OFF `wave_engine_enabled` flag, NO persistent kernel:**
-  1. Add the flag (copy `auto_admit_on_commit`: `engine/src/lib.rs:311`).
-  2. Extend `RelationalResidencySnapshot` (`relational_model.rs:197`) with `wave_gpu_index_ptr: Option<u64>` + `wave_hash_shift`.
-  3. Build the GPU hash index on admission (host-build + HtoD in `populate_relational_residency_snapshot`, reuse the probe).
-  4. **Crux:** an index-probe kernel that emits the EXISTING `CudaI32EqualAnyProjectSubmission` format (result path unchanged).
-  5. Guard the swap in `submit_resident_int4_equal_any_payload` (`engine_residency.rs:479`): flag-on + index present → probe; else scan.
-  - Gates: differential vs scan (byte-identical, **WITH NULL**), HAZARD, **independent audit**. Win: per-batch GPU cost O(rows)→O(1).
-- **R2 — persistent kernel + ring** (breaks the host-serial coalescer cap → proven 10–30M), **gated by an SM-coexistence
-  measurement** (wave kernel + concurrent engine kernels on one shared context = the recon's #1 unknown). FFI
-  `cuMemHostGetDevicePointer` + the `all_done` ordering audit land here.
-- **R3 — writes** (concurrent index maintenance proven fast) + deterministic CC.
-Integration recon cites: facade dispatch `facade/src/lib.rs:522`; snapshot `relational_model.rs:197`; scan-vs-index
-`engine_residency.rs:479`; retained-read `engine_retained_read.rs:16`; GpuPrimaryContext+FFI `execution/src/lib.rs:182,545`;
-threading `server/src/lib.rs:66`. The batcher stays the default until the integrated wave path wins end-to-end.
+## R1 ✅ DONE + MERGED (index in the engine read path, default-OFF flag) — SHIP; next = measure, then R2
+**R1a (`53b5fc97`) + R1b (`3f7e5b08`) + audit-adoption (`ffeccfc4`) + re-audit fix (`5b84bb9e`)** are merged to main.
+Two independent adversarial audit cycles; **re-audit verdict = SHIP the flag-on path** (both P1 divergences + all P2s
+closed at the root). The GPU hash-index probe serves resident int4 unique-key point lookups when `wave_engine_enabled`
+is on, returning **byte-identical** results to the scan; default OFF leaves the scan path untouched.
+- **Key design (audit-driven):** the index is built from the **same device bytes the scan reads** — `CudaResidentDeviceMemory::
+  read_resident_i32_column` DtoH-reads the key column, `build_wave_resident_int4_index` hashes it (NO host_rows). This makes
+  NULL-as-0 keys match the scan AND makes the index inherently consistent with the buffer it gathers from (cache keyed by
+  `(column_idx, resident_device_ptr)`, buffer pinned so the ptr can't be reused). Index buffer pinned in the submission.
+- **Swap:** `submit_resident_int4_equal_any_payload` (`engine_retained_read.rs`), flag-gated index-vs-scan, same submission
+  type → byte-identical completion. Falls back to scan on: non-unique keys (dup detect), >256-probe, un-buildable. Distinct
+  needles required (batcher `dedup_needles`, debug-asserted).
+- **Gate:** `r1_wave_index_probe_matches_scan_differential` (flag OFF vs ON) — NULL projection + NULL-as-0 key (needle 0) +
+  absent + dup-fallback + generation rebuild, non-vacuous. Suites green: engine 437 + 295 GPU, execution 84, facade 34.
+  Independent adversarial audit done (2 P1 + 2 P2 all adopted via `ffeccfc4`); **re-audit of the fix in flight.**
+- **NEXT:** (1) Measure the per-batch O(rows)→O(1) win end-to-end (flag ON vs OFF on a large resident table; the batcher
+  stays default until the wave path wins). (2) **R2** — persistent kernel + ring (breaks the host-serial coalescer cap →
+  proven 10–30M), **gated by an SM-coexistence measurement** (wave kernel + concurrent engine kernels on one shared context
+  = the recon's #1 unknown); FFI `cuMemHostGetDevicePointer` + the `all_done` ordering audit land here. (3) **R3** — writes
+  (concurrent index maintenance proven fast) + deterministic CC.
+- **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
+  (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
+  only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The
+  facade-template path is unaffected (`dedup_needles`). Fix = dedup in the jobs-batch path (or map results by value).
 *Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real end-to-end OLTP-fitness
 instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+text; STRATA S-C/S-D/S-E.
 
