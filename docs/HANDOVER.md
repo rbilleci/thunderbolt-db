@@ -66,8 +66,12 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   cleanly (188 SMs), BUT the cost is steeply non-linear: 1 reserved SM ~2%, **8 SMs ~60%, 32 SMs ~87%** of concurrent
   scan throughput (≈ same busy-spin vs gentle ⇒ SM co-residency, not poll traffic). **Design rule: the wave kernel must
   be ~1-SM minimal as a sidecar, or REPLACE the per-batch path (ADR-009 intent) — never a fat always-resident
-  co-resident.** `cuMemHostGetDevicePointer` already in the FFI (probes); the `all_done` ordering audit still owed before
-  any engine lift. (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
+  co-resident.** **`all_done` ordering audit ✅ DONE** (two independent auditors, DECISIONS ADR-008 "R2 `all_done`
+  ordering audit"): they split (cumulativity GAP vs SOUND) but CONVERGED — `all_done` alone is NOT a robust gate; the
+  sound completion gate is the host **acquiring the `completed` counter** (DtoH `==requests` before reading slots = the
+  proven 1b pattern; `all_done` is only a wake hint). **Engine-lift rule: gate on the counter-acquire, never on
+  `all_done`-only** (ideally `.release.sys`/`.acquire.sys` under sm_70). `cuMemHostGetDevicePointer` already in the FFI
+  (probes). (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
   only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The

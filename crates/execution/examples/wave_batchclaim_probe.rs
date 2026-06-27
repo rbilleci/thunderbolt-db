@@ -421,6 +421,9 @@ fn main() {
     fence(Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        // `all_done` is only a WAKE HINT (R2 all_done ordering audit, DECISIONS ADR-008): the last
+        // completer's flag carries no happens-before for the other workers' slot stores. The sound gate
+        // is the DtoH `completed==requests` below (host acquires the counter workers release into).
         let done = unsafe { ptr::read_volatile(ctrl.add(2)) };
         if done != 0 {
             break;
@@ -433,6 +436,8 @@ fn main() {
     }
     let drain_elapsed = started.elapsed();
 
+    // AUTHORITATIVE completion gate (the sound acquire): DtoH the device counter, require == requests
+    // BEFORE reading any slot. `all_done` above is only the wake hint (audit verdict).
     let mut dev_counters = [0u32; 2];
     check(
         unsafe { cu_memcpy_dtoh(dev_counters.as_mut_ptr() as *mut c_void, d_counters, 8) },

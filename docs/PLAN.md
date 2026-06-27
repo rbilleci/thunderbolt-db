@@ -114,9 +114,13 @@ Spec: ARCHITECTURE §7 + §13.
   deadlock/starvation/zombie, 188 SMs), but the SM-reservation cost is steeply non-linear (1 SM ~2%, 8 SMs ~60%, 32 SMs
   ~87% of concurrent scan throughput; busy-spin ≈ gentle ⇒ co-residency cost, not poll traffic). **⇒ the wave kernel is a
   ~1-SM sidecar OR replaces the per-batch path; never a fat co-resident** (DECISIONS ADR-008 "R2 SM-coexistence gate").
+- **`all_done` ordering audit ✅ DONE (2026-06-27):** two independent adversarial auditors (split cumulativity GAP vs
+  SOUND, converged) → **the sound completion gate is the host ACQUIRING the `completed` counter (DtoH `==requests` before
+  reading slots = the proven 1b pattern); `all_done` is only a wake hint, never the correctness gate** (DECISIONS
+  ADR-008 "R2 `all_done` ordering audit"). Carry this rule into (iv).
 - (iv) **Integrate the proven read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
-  template; audit the `all_done` ordering first), differential vs the batcher WITH NULL, HAZARD + independent audit.
-  The batcher stays the default until the integrated wave path beats it end-to-end.
+  template; gate completion on the counter-acquire per the audit, NOT `all_done`), differential vs the batcher WITH NULL,
+  HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).

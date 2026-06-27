@@ -406,7 +406,11 @@ fn main() {
     fence(Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let done = unsafe { ptr::read_volatile(ctrl.add(2)) }; // all_done flag
+        // `all_done` is only a WAKE HINT (avoid busy-polling): per the R2 all_done ordering audit
+        // (DECISIONS ADR-008) the flag set by the last completer carries NO happens-before for the OTHER
+        // workers' result-slot stores. The load-bearing acquire is the DtoH `completed==requests` below
+        // (the proven 1b pattern: host acquires the counter each worker released into via membar.sys).
+        let done = unsafe { ptr::read_volatile(ctrl.add(2)) }; // all_done flag (wake hint, not the gate)
         if done != 0 {
             break;
         }
@@ -418,7 +422,8 @@ fn main() {
     }
     let drain_elapsed = started.elapsed();
 
-    // Confirm the completion count via the DEVICE counter (== requests).
+    // AUTHORITATIVE completion gate (the sound acquire): DtoH the DEVICE counter and require == requests
+    // BEFORE reading any slot. This is what makes the subsequent slot reads ordered-safe (audit verdict).
     let mut dev_counters = [0u32; 2];
     check(
         unsafe { cu_memcpy_dtoh(dev_counters.as_mut_ptr() as *mut c_void, d_counters, 8) },

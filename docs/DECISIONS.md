@@ -144,6 +144,26 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   with heavy engine kernels. (Caveat: the scan storm is latency-bound serial launches, faithful to today's launch-per-
   batch engine; `cuMemHostGetDevicePointer` already in the probe FFI; the `all_done` ordering audit is still owed before
   any engine lift.)
+- **R2 `all_done` ordering audit (2026-06-27) — owed gate, now done; DONT lift the `all_done`-only pattern.** Two
+  independent adversarial GPU-memory-model auditors examined the 1d-i/1d-ii completion mechanism (worker: `st.volatile`
+  result slot → `membar.sys` → `atom.add(completed)` on DEVICE mem; the LAST completer — the one whose RMW makes
+  `completed==head` — does `membar.sys` → set host-mapped `all_done`; host polls `all_done`). **They SPLIT:** (A) **GAP /
+  sound-only-by-luck** — the last completer learns "done" from its OWN RMW return value and never acquires the other
+  workers' stores; single-location coherence on `completed` carries the COUNT, not a happens-before for other threads'
+  result stores, so `all_done` alone has no synchronizes-with edge to those slots. (B) **SOUND (~90%)** — `membar.sys`
+  is CUMULATIVE, so each worker's fenced slot store propagates with its counter bump through coherence and the last
+  completer's 2nd `membar.sys` re-flushes before `all_done`; the HOST (not the last completer) reads the slots so no
+  acquire-by-L is needed — BUT B's confidence explicitly hinges on cumulativity surviving a **bare device-scope RMW**
+  ("the one assumption worth pinning empirically"). **CONVERGENCE (decision):** both agree (1) `all_done` ALONE is not a
+  robust correctness gate, and (2) the host's synchronous **`cuMemcpyDtoH(completed)==requests`, performed BEFORE reading
+  any slot, IS the sound acquire — the proven-sound 1b pattern** (host acquires the counter each worker released into via
+  `membar.sys`+bump). The 1d probes read slots only after that DtoH ⇒ sound *for the DtoH reason, not the `all_done`
+  reason* (`all_done` is only a wake hint). **DESIGN RULE for the engine lift:** completion MUST be the host acquiring
+  the `completed` counter (read-and-check `==expected`, host-mapped read like 1b OR via DtoH), with each worker's slot
+  store released ahead of its bump (`membar.sys`, ideally explicit `.release.sys`/`.acquire.sys` under an sm_70 target to
+  drop the cumulativity assumption) — **never lift an `all_done`-only gate, never drop the counter-acquire**. If the
+  cumulativity question ever needs settling empirically: remove the DtoH + the per-thread `membar.sys`, stress at max
+  threads / small claim-K, poison slots with a sentinel, and watch for `done==0` stale-slot reads after `all_done`.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
