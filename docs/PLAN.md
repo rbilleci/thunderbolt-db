@@ -57,8 +57,17 @@ Spec: ARCHITECTURE §7 + §13.
     per-request plan/bind. 68k → 156k ops/s (2.3×), now scales; CPU gap 11× → ~4.5×. The template is the ingress the
     wave engine reuses. (Tier 2 = parallelize the single coalescer thread is **dropped** — the wave engine replaces it.)
   - **Residual:** ~6µs/item = result materialization + oneshot distribution, still single-coalescer.
-- Persistent-kernel wave engine + lock-free submission ring (replace launch-per-batch); on-GPU result slots remove the
-  remaining host per-item orchestration — the real path to the CPU ballpark.
+- **Persistent-kernel wave engine + lock-free submission ring** (replace launch-per-batch); on-GPU result slots remove
+  the remaining host per-item orchestration — the real path to the CPU ballpark (moves the bottleneck host→GPU, where
+  it scales with hardware). **Started (2026-06-27): design + infra recon done.** Reuses Tier-1's template as the request
+  descriptor + the existing CUDA FFI / context / module-cache / stream-pool / pinned-host pool / int4 `equal_any` kernel.
+  Greenfield = (1) host-pinned **device-mapped** ring (`cuMemHostAlloc`+`DEVICEMAP`, add `cuMemHostGetDevicePointer`),
+  (2) persistent kernel loop, (3) **clean-exit doorbell**, (4) result-slot layout. **Biggest risk = the exit** on this
+  `--gpu-reset`-denied shared box (a hung kernel zombies the context). Mitigation: doorbell **plus a hard iteration-cap
+  backstop** so the kernel ALWAYS self-terminates; single block (1 SM); lock-free atomics only. **Increment staging:**
+  **1a** = bare lifecycle (poll doorbell + heartbeat, exit on doorbell AND cap; prove launch→exit→context-reusable 3×,
+  NO data plane) → **1b** = int4 point-lookup data plane (slots + scan), differential vs per-query, measure vs the 156k
+  single-coalescer cap. Flag default-OFF; batcher stays default. NEXT: build + GPU-test 1a (the bare lifecycle).
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
