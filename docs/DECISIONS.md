@@ -180,6 +180,24 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   the wave kernel REPLACES the launch-per-batch path so they never interleave — the ADR-008 SM-coexistence "replace"
   option). NEXT R2 step = a focused freeze-mechanism probe (blocking vs non-blocking vs NULL-stream-sync interleave),
   NOT blind wiring. Multi-projection correctness itself is settled.
+- **R2.2 freeze ROOT CAUSE PINNED (2026-06-27, `execution/examples/wave_freeze_probe`) — it is `cuMemAlloc`/`cuMemFree`,
+  NOT the stream type.** The probe runs each candidate interleave op against a fresh non-blocking persistent kernel
+  (heartbeat liveness) and times it. Result (persistent grid 4x256, 5s backstop): **ALIVE** for non-blocking launch,
+  flag-0/blocking launch, NULL-stream HtoD, NULL-stream DtoH, the blocking+HtoD+sync combo, AND CUDA events — every op
+  in microseconds. **FROZEN only for `cuMemAlloc + cuMemFree`, and the op itself blocked 4.96s ~= the backstop** (vs us
+  for all others) before the kernel died. So **`cuMemAlloc`/`cuMemFree` are device-synchronizing: they block until ALL
+  GPU work drains, including the never-ending persistent kernel — which only ends when its `%globaltimer` backstop fires,
+  killing it.** This explains the original symptom end-to-end: the failing data-plane test ran ~50s = ~30s (the first R1
+  oracle's COLD `lease_device_buffer` -> `cuMemAlloc` blocking to the 30s backstop, killing the wave kernel) + 20s
+  (wave 2 then finding a dead kernel and timing out). The stream type / NULL-stream sync were red herrings. **R2.2 design
+  consequence:** a co-resident wave kernel dies the instant the engine does a synchronizing `cuMemAlloc`/`cuMemFree` on
+  the shared context. The engine's device-buffer **pool amortizes** this — steady-state leases REUSE pooled buffers (no
+  `cuMemAlloc`); it only syncs on COLD pool growth (new bucket / empty pool) or pool-overflow `cuMemFree`. So the
+  pragmatic R2.2 path: **pre-warm the device-buffer pool + suppress pool shrink (`cuMemFree`) while a wave kernel is
+  resident** (the wave path is itself alloc-free — pre-allocated device-mapped ring), so no synchronizing alloc occurs
+  during wave operation. The robust long-term fix is migrating the engine's device allocation to **`cuMemAllocAsync`/
+  `cuMemFreeAsync`** (stream-ordered, non-synchronizing). NOTE: "replace the per-batch path" ALONE is insufficient —
+  other concurrent engine activity (residency admission, other routes) still `cuMemAlloc`s on the shared context.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

@@ -128,11 +128,14 @@ Spec: ARCHITECTURE §7 + §13.
 - **R2.2a wave multi-projection ✅ DONE (2026-06-27):** `WaveReadEngine::submit` now gathers up to 4 int4 columns
   (R1's unrolled gather) over the ring and returns `CudaI32BatchProjectionRow`s byte-identical to the R1 index probe
   (GPU oracle test green); `atom.cas` bounded claim makes cumulative multi-wave work.
-- **R2.2 BLOCKER — interleaved-launch freeze (DECISIONS ADR-008):** an interleaved GPU kernel launch (the index-probe
-  oracle on a flag-0/blocking pooled stream) FREEZES the idle persistent wave kernel. The engine launches on flag-0
-  pooled streams, so this must be resolved before wiring. **NEXT = a focused freeze-mechanism probe** (blocking vs
-  non-blocking vs NULL-stream-sync) → decides whether R2.2 fixes coexistence (non-blocking) or has the wave kernel
-  REPLACE the per-batch path (so launches never interleave).
+- **R2.2 freeze ROOT CAUSE PINNED ✅ (2026-06-27, `execution/examples/wave_freeze_probe`, DECISIONS ADR-008):** the
+  freezer is **`cuMemAlloc`/`cuMemFree` (device-synchronizing), NOT the stream type.** The probe shows every interleave
+  op keeps the persistent kernel ALIVE in µs except `cuMemAlloc+cuMemFree`, which blocks ~the backstop and kills it
+  (it device-syncs, waiting for the never-ending kernel). Consequence: a co-resident wave kernel dies the instant the
+  engine does a synchronizing alloc. The device-buffer **pool amortizes** alloc (steady-state reuses; syncs only on cold
+  growth / overflow free), and the wave path is alloc-free → **R2.2 path: pre-warm the pool + suppress pool shrink while
+  a wave kernel is resident** (pragmatic), or move engine device alloc to `cuMemAllocAsync` (robust). "Replace per-batch"
+  alone is insufficient (other engine activity still allocs).
 - (iv) **R2.2b — integrate the wave read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
   template; gate completion on the counter-acquire per the audit, NOT `all_done`), differential vs the batcher WITH NULL,
   HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.

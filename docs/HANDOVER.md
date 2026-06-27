@@ -85,10 +85,17 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   BETWEEN waves FREEZES the idle persistent kernel (claim frozen, no error/fault/backstop); reordering so all submits
   precede any launch passes. The SM-coexistence probe only tested NON-blocking concurrent launches (fine); the
   index-probe uses a flag-0 (blocking) pooled stream + NULL-stream memcpy — the legacy-default-stream path is the prime
-  suspect. Since the engine's launches use flag-0 pooled streams, a co-resident wave kernel would freeze under normal
-  traffic. **NEXT = a focused freeze-mechanism probe** (blocking vs non-blocking vs NULL-stream-sync interleave), which
-  decides R2.2's shape: fix coexistence (non-blocking) OR have the wave kernel REPLACE the per-batch path (so they never
-  interleave). THEN R2.2b wiring → R2.3 (audit + measure vs batcher). (3) **R3** — writes + deterministic CC.
+  suspect. **ROOT CAUSE PINNED (`execution/examples/wave_freeze_probe`, DECISIONS ADR-008 "R2.2 freeze ROOT CAUSE"): it
+  is `cuMemAlloc`/`cuMemFree`, NOT the stream type.** The probe shows every interleave op (non-blocking/blocking launch,
+  NULL-stream HtoD/DtoH, events, the combo) keeps the kernel ALIVE in µs; only `cuMemAlloc+cuMemFree` FREEZES it, and
+  that op blocks ~the backstop (4.96s of a 5s backstop) — i.e. `cuMemAlloc/Free` **device-synchronize**, blocking until
+  the never-ending wave kernel hits its backstop and dies. (Explains the original 50s test: ~30s cold `cuMemAlloc` to
+  the 30s backstop + 20s wave-2 timeout.) **R2.2 path:** the engine's device-buffer pool amortizes `cuMemAlloc` (steady
+  state reuses pooled buffers; syncs only on cold growth / overflow free), and the wave path is itself alloc-free
+  (pre-allocated device-mapped ring) — so **pre-warm the pool + suppress pool shrink while a wave kernel is resident**
+  (pragmatic), or migrate engine device alloc to `cuMemAllocAsync` (robust). "Replace per-batch" ALONE is insufficient
+  (other engine activity still `cuMemAlloc`s). **NEXT = R2.2b** wiring under that constraint → R2.3 (audit + measure vs
+  batcher). (3) **R3** — writes + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
   only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The
