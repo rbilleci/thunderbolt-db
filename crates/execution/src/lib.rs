@@ -858,6 +858,30 @@ impl CudaResidentDeviceMemoryReadView {
         )
     }
 
+    /// R1a — GPU-index point-lookup variant of [`Self::submit_match_project_i32_equal_any_from_payload`]:
+    /// hash-probes the device-resident `index_ptr` (built over the key column on admission) instead of
+    /// scanning, producing the SAME `CudaI32EqualAnyProjectSubmission` (so `complete`/`complete_detached`
+    /// are unchanged). `index_table_mask` = table_size-1, `index_hash_shift` = 32 - log2(table_size).
+    pub fn submit_match_project_i32_index_probe_from_payload(
+        &self,
+        index_ptr: u64,
+        index_table_mask: u32,
+        index_hash_shift: u32,
+        needles: &[i32],
+        projection_offsets: &[u64],
+        row_count: u64,
+    ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_index_probe(
+            self,
+            index_ptr,
+            index_table_mask,
+            index_hash_shift,
+            needles,
+            projection_offsets,
+            row_count,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn match_project_i32_equal_any_text_from_payload(
         &self,
@@ -2022,6 +2046,30 @@ impl CudaResidentDeviceMemory {
         submit_cuda_resident_i32_equal_any_project(
             self,
             filter_offset,
+            needles,
+            projection_offsets,
+            row_count,
+        )
+    }
+
+    /// R1a — GPU-index point-lookup variant of [`Self::submit_match_project_i32_equal_any_from_payload`]:
+    /// hash-probes the device-resident `index_ptr` (built over the key column on admission) instead of
+    /// scanning, producing the SAME `CudaI32EqualAnyProjectSubmission` (so `complete`/`complete_detached`
+    /// are unchanged). `index_table_mask` = table_size-1, `index_hash_shift` = 32 - log2(table_size).
+    pub fn submit_match_project_i32_index_probe_from_payload(
+        &self,
+        index_ptr: u64,
+        index_table_mask: u32,
+        index_hash_shift: u32,
+        needles: &[i32],
+        projection_offsets: &[u64],
+        row_count: u64,
+    ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_index_probe(
+            self,
+            index_ptr,
+            index_table_mask,
+            index_hash_shift,
             needles,
             projection_offsets,
             row_count,
@@ -9346,6 +9394,380 @@ DONE:
     }
     // NB: deliberately NOT synced here — `complete` does the single covering sync, so the kernel
     // overlaps the caller's host work between `submit` and `complete`.
+
+    Ok(CudaI32EqualAnyProjectSubmission {
+        projection_count: projection_offsets.len(),
+        needles_len: needles.len(),
+        row_count,
+        primary,
+        values_guard,
+        indices_guard,
+        row_indices_guard,
+        count_guard,
+        _needles_guard: needles_guard,
+        stream: Some(stream_owned),
+        timed,
+    })
+}
+
+/// R1a — the GPU-INDEX point-lookup analogue of `submit_cuda_resident_i32_equal_any_project`. Instead of
+/// scanning every row for the needles (thread-per-row), it launches ONE thread per needle, hash-probes a
+/// device-resident open-addressing index (`(key<<32)|(row+1)`, 0 = empty; Fibonacci
+/// `(needle*0x9E3779B1)>>hash_shift` + linear probe, hard-capped) for the matching row, then appends
+/// `(needle_index, row_index, projected values)` via the IDENTICAL atomic-`out_count` protocol the scan
+/// uses — so the submission + `complete_detached` path is reused byte-for-byte. Output buffers are sized
+/// for `needle_count` (a unique-key point lookup matches at most one row per needle), not the scan's
+/// worst-case `row_count`. The index is a SEPARATE device buffer (built on admission over the key column),
+/// passed by pointer; projections are still gathered from `resident` at the probed row.
+#[allow(clippy::too_many_arguments)]
+fn submit_cuda_resident_i32_index_probe<R: CudaResidentReadSource>(
+    resident: &R,
+    index_ptr: u64,
+    index_table_mask: u32,
+    index_hash_shift: u32,
+    needles: &[i32],
+    projection_offsets: &[u64],
+    row_count: u64,
+) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const MAX_PROJECTIONS: usize = 4;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_index_probe(
+    .param .u64 resident_ptr,
+    .param .u64 index_ptr,
+    .param .u32 table_mask,
+    .param .u32 hash_shift,
+    .param .u32 needle_count,
+    .param .u32 projection_count,
+    .param .u64 projection_offset0,
+    .param .u64 projection_offset1,
+    .param .u64 projection_offset2,
+    .param .u64 projection_offset3,
+    .param .u64 needles_ptr,
+    .param .u64 out_values_ptr,
+    .param .u64 out_needle_indices_ptr,
+    .param .u64 out_row_indices_ptr,
+    .param .u64 out_count_ptr
+)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<28>;
+
+    ld.param.u64 %rd1, [resident_ptr];
+    ld.param.u64 %rd2, [index_ptr];
+    ld.param.u32 %r1, [table_mask];
+    ld.param.u32 %r2, [hash_shift];
+    ld.param.u32 %r3, [needle_count];
+    ld.param.u32 %r4, [projection_count];
+    ld.param.u64 %rd3, [projection_offset0];
+    ld.param.u64 %rd4, [projection_offset1];
+    ld.param.u64 %rd5, [projection_offset2];
+    ld.param.u64 %rd6, [projection_offset3];
+    ld.param.u64 %rd7, [needles_ptr];
+    ld.param.u64 %rd8, [out_values_ptr];
+    ld.param.u64 %rd9, [out_needle_indices_ptr];
+    ld.param.u64 %rd10, [out_row_indices_ptr];
+    ld.param.u64 %rd11, [out_count_ptr];
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;
+    setp.ge.u32 %p1, %r8, %r3;
+    @%p1 bra DONE;
+    setp.eq.u32 %p1, %r4, 0;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd12, %r8, 4;
+    add.u64 %rd13, %rd7, %rd12;
+    ld.global.s32 %r9, [%rd13];
+    mul.lo.u32 %r10, %r9, 2654435761;
+    shr.u32 %r11, %r10, %r2;
+    mov.u32 %r12, 0;
+
+PROBE:
+    and.b32 %r11, %r11, %r1;
+    mul.wide.u32 %rd14, %r11, 8;
+    add.u64 %rd15, %rd2, %rd14;
+    ld.global.u64 %rd16, [%rd15];
+    setp.eq.u64 %p2, %rd16, 0;
+    @%p2 bra DONE;
+    shr.u64 %rd17, %rd16, 32;
+    cvt.u32.u64 %r13, %rd17;
+    setp.eq.s32 %p2, %r13, %r9;
+    @%p2 bra FOUND;
+    add.u32 %r11, %r11, 1;
+    add.u32 %r12, %r12, 1;
+    setp.ge.u32 %p3, %r12, 256;
+    @%p3 bra DONE;
+    bra PROBE;
+
+FOUND:
+    cvt.u32.u64 %r14, %rd16;
+    sub.u32 %r14, %r14, 1;
+    cvt.u64.u32 %rd18, %r14;
+
+    mov.u32 %r15, 1;
+    atom.global.add.u32 %r16, [%rd11], %r15;
+    cvt.u64.u32 %rd19, %r16;
+
+    mul.lo.u64 %rd20, %rd19, 4;
+    add.u64 %rd21, %rd9, %rd20;
+    st.global.u32 [%rd21], %r8;
+
+    mul.lo.u64 %rd20, %rd19, 8;
+    add.u64 %rd21, %rd10, %rd20;
+    st.global.u64 [%rd21], %rd18;
+
+    cvt.u64.u32 %rd22, %r4;
+    mul.lo.u64 %rd23, %rd19, %rd22;
+    mul.lo.u64 %rd23, %rd23, 4;
+    mul.lo.u64 %rd24, %rd18, 4;
+
+    add.u64 %rd25, %rd1, %rd3;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    st.global.s32 [%rd26], %r17;
+
+    setp.le.u32 %p4, %r4, 1;
+    @%p4 bra DONE;
+    add.u64 %rd25, %rd1, %rd4;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    add.u64 %rd26, %rd26, 4;
+    st.global.s32 [%rd26], %r17;
+
+    setp.le.u32 %p4, %r4, 2;
+    @%p4 bra DONE;
+    add.u64 %rd25, %rd1, %rd5;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    add.u64 %rd26, %rd26, 8;
+    st.global.s32 [%rd26], %r17;
+
+    setp.le.u32 %p4, %r4, 3;
+    @%p4 bra DONE;
+    add.u64 %rd25, %rd1, %rd6;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    add.u64 %rd26, %rd26, 12;
+    st.global.s32 [%rd26], %r17;
+
+DONE:
+    ret;
+}
+"#;
+
+    if needles.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    if projection_offsets.is_empty() || projection_offsets.len() > MAX_PROJECTIONS {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            projection_offsets.len(),
+        ));
+    }
+    if row_count == 0 || index_ptr == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    for byte_offset in projection_offsets {
+        let bytes = row_count
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .and_then(|bytes| byte_offset.checked_add(bytes))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if bytes > resident.metadata().allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+        }
+    }
+    let needle_count_u32 = u32::try_from(needles.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
+    let output_cells = (needles.len() as u64)
+        .checked_mul(projection_offsets.len() as u64)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_bytes = usize::try_from(
+        output_cells
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_indices_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_row_indices_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let needle_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_memset_d8 = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let primary = resident.primary_arc();
+    primary.set_current()?;
+
+    let needles_guard = primary.lease_device_buffer_owned(needle_bytes)?;
+    let values_guard = primary.lease_device_buffer_owned(output_bytes)?;
+    let indices_guard = primary.lease_device_buffer_owned(output_indices_bytes)?;
+    let row_indices_guard = primary.lease_device_buffer_owned(output_row_indices_bytes)?;
+    let count_guard = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_resident_i32_index_probe", &ptx)?;
+
+    let mut resident_arg = resident.device_ptr();
+    let mut index_arg = index_ptr;
+    let mut table_mask_arg = index_table_mask;
+    let mut hash_shift_arg = index_hash_shift;
+    let mut needle_count_arg = needle_count_u32;
+    let mut projection_count_arg = u32::try_from(projection_offsets.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(projection_offsets.len()))?;
+    let mut projected_offsets = [0_u64; MAX_PROJECTIONS];
+    for (idx, offset) in projection_offsets.iter().enumerate() {
+        projected_offsets[idx] = *offset;
+    }
+    let mut needles_arg = needles_guard.ptr;
+    let mut output_arg = values_guard.ptr;
+    let mut indices_arg = indices_guard.ptr;
+    let mut row_indices_arg = row_indices_guard.ptr;
+    let mut count_arg = count_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut index_arg as *mut u64).cast::<c_void>(),
+        (&mut table_mask_arg as *mut u32).cast::<c_void>(),
+        (&mut hash_shift_arg as *mut u32).cast::<c_void>(),
+        (&mut needle_count_arg as *mut u32).cast::<c_void>(),
+        (&mut projection_count_arg as *mut u32).cast::<c_void>(),
+        (&mut projected_offsets[0] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[1] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[2] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[3] as *mut u64).cast::<c_void>(),
+        (&mut needles_arg as *mut u64).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut indices_arg as *mut u64).cast::<c_void>(),
+        (&mut row_indices_arg as *mut u64).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+    ];
+    let threads_per_block = 128;
+    let blocks = needle_count_u32.div_ceil(threads_per_block);
+
+    let stream_owned = PooledStreamOwned {
+        primary: Arc::clone(&primary),
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let pooled = stream_owned
+        .pooled
+        .as_ref()
+        .expect("pooled stream just leased");
+    let stream = pooled.stream;
+    let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    let async_ops = match (primary.cu_memcpy_htod_async, primary.cu_memset_d8_async) {
+        (Some(htod), Some(memset)) => Some((htod, memset)),
+        _ => None,
+    };
+    if let Some((htod_async, memset_async)) = async_ops {
+        check_cuda(unsafe {
+            htod_async(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+                stream,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { memset_async(count_guard.ptr, 0, std::mem::size_of::<u32>(), stream) })
+            .map_err(drain_err)?;
+    } else {
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })
+            .map_err(drain_err)?;
+    }
+
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })
+            .map_err(drain_err)?;
+    }
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            blocks,
+            1,
+            1,
+            threads_per_block,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })
+            .map_err(drain_err)?;
+    }
 
     Ok(CudaI32EqualAnyProjectSubmission {
         projection_count: projection_offsets.len(),
@@ -22816,6 +23238,77 @@ mod tests {
         let runtime = CudaDriverRuntime::probe().unwrap();
 
         assert_eq!(runtime.launch_smoke_add_one(41).unwrap(), 42);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_index_probe_matches_equal_any_scan() {
+        // R1a: the GPU index-probe point lookup must return EXACTLY the equal_any scan's rows.
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let rows: u64 = 1000;
+        // Distinct key values (so the index is a real map) + distinct payload (so the gather is load-bearing).
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r * 3 + 1).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r * 1000 + 7).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_copy(0, &buf)
+            .expect("resident device memory");
+        let key_offset = 0_u64;
+        let payload_offset = rows * 4;
+        let projections = [key_offset, payload_offset];
+
+        // Open-addressing index over the key column (same format/hash as the wave probes).
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = runtime
+            .retain_device_memory_copy(0, &index_bytes)
+            .expect("index device memory");
+        let index_ptr = index_resident.device_ptr();
+
+        // Present needles (rows 5, 100, 999, 0) + one absent value.
+        let needles = vec![keys[5], keys[100], keys[999], -12345, keys[0]];
+
+        let scan = resident
+            .submit_match_project_i32_equal_any_from_payload(key_offset, &needles, &projections, rows)
+            .expect("scan submit");
+        let mut scan_rows = scan.complete(&resident).expect("scan complete");
+
+        let probe = resident
+            .submit_match_project_i32_index_probe_from_payload(
+                index_ptr, table_mask, hash_shift, &needles, &projections, rows,
+            )
+            .expect("index submit");
+        let mut probe_rows = probe.complete(&resident).expect("index complete");
+
+        // Match modulo append order (both append via the atomic counter in schedule order).
+        scan_rows.sort_by_key(|r| (r.needle_index, r.row_index));
+        probe_rows.sort_by_key(|r| (r.needle_index, r.row_index));
+        assert_eq!(
+            probe_rows, scan_rows,
+            "index probe must return exactly the equal_any scan's rows"
+        );
+        assert_eq!(probe_rows.len(), 4, "4 present needles, 1 absent");
+        let first = &probe_rows[0];
+        assert_eq!(first.needle_index, 0, "first sorted row is needle 0 (keys[5])");
+        assert_eq!(first.row_index, 5);
+        assert_eq!(first.values, vec![keys[5], payload[5]], "gather: (key, payload) at row 5");
     }
 
     #[test]
