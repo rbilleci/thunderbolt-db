@@ -35,13 +35,19 @@
   slot→wire mapping quantified MINOR (~200M–1.1B rows/s, ≪ GPU drain). **Read half of the bet is SETTLED** — further
   read gains are diminishing/tuning-sensitive. (`wave_devatomic_probe.rs`, `wave_batchclaim_probe.rs`.)
 
-## The one next action — **the write path** (PLAN §3)
-The read path is proven; the **write/transaction path is the unmeasured frontier** of the OLTP bet. Probe it like the
-reads: GPU commit throughput + **concurrent lock-free index maintenance on inserts** (CAS, ADR-009 — the static
-host-built index is the current gap) + deterministic-CC wave execution. *Then* **integrate the proven read path into
-the engine** behind a default-OFF flag (request descriptor = Tier-1's `RelationalRetainedReadTemplate`; first audit the
-`all_done` cross-thread ordering). Gates: differential vs the batcher **WITH NULL**, HAZARD, **independent adversarial
-audit**. The batcher stays the default until the integrated wave path wins end-to-end.
+- **Write probe 1** (concurrent lock-free index INSERT) ✅ DONE: many threads `atom.cas.b64`-insert into a shared
+  open-addressing table at **~tens of BILLIONS of inserts/s** (all verified) → **GPU index maintenance is NOT a
+  bottleneck**; the remaining write constraints (durability/WAL fsync, deterministic CC) are host-I/O + coordination
+  problems CPU engines face too. (`wave_index_insert_probe.rs`; caveats: low contention, raw insert only.)
+
+## The one next action (pick one)
+1. **Continue the write path** — the **commit/durability** floor (group-commit throughput vs fsync — the likely real
+   write bottleneck, and the engine already has crash-durable WAL + group commit to measure), then contended inserts +
+   deterministic CC. The remaining unknowns for the write half of the bet.
+2. **Integrate the proven read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
+   `RelationalRetainedReadTemplate`; first audit the `all_done` ordering) → serve real SQL + enable an end-to-end
+   Postgres comparison. Gates: differential vs the batcher **WITH NULL**, HAZARD, **independent adversarial audit**.
+The batcher stays the default until the integrated wave path wins end-to-end.
 *Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real end-to-end OLTP-fitness
 instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+text; STRATA S-C/S-D/S-E.
 

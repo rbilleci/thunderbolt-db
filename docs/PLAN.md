@@ -97,12 +97,21 @@ Spec: ARCHITECTURE §7 + §13.
   **K=8 → ~45–53M req/s** (~1.5–1.75× over 1d-i's 30M, **~5× the original 10.5M, ~60–69× the CPU**), 3× stable. K is a
   balance (K≥32 collapses: fewer batches than threads → under-parallel + serial host-mapped writes). **Read ceiling is
   now firmly tens-of-millions; further gains need a structural lever (sharded per-block counters / cheaper result
-  writes) — diminishing, tuning-sensitive. The read half of the bet is SETTLED.** → **NEXT (1d remaining):**
-  (iii) **concurrent index maintenance on writes** (lock-free CAS inserts, ADR-009 — the static host-built index is the
-  real OLTP write-path gap, and **the write path is still unmeasured** = the frontier); (iv) **integrate into the
-  engine** behind a default-OFF flag (request descriptor = Tier-1's template; audit the `all_done` ordering first),
-  differential vs the batcher WITH NULL, HAZARD + independent audit. The batcher stays the default until the integrated
-  wave path beats it end-to-end.
+  writes) — diminishing, tuning-sensitive. The read half of the bet is SETTLED.**
+
+### Write path (the frontier) — probing
+- **Write probe 1 ✅ DONE (2026-06-27)** = `crates/execution/examples/wave_index_insert_probe.rs` — **concurrent
+  lock-free index INSERT** (the novel, historically-hard piece: many threads `atom.cas.b64`-install (key,row) into a
+  shared open-addressing table, no locks). All keys verified inserted exactly once (no lost/dup/torn). **~tens of
+  BILLIONS of inserts/s** (1M: ~29G/s wall-clock, ~77G/s after removing the ~21µs launch floor; 16M/256MB L2-spill:
+  4.2G/s). **Conclusion: GPU concurrent index maintenance is NOT a bottleneck.** The remaining write constraints
+  (durability/WAL fsync, deterministic CC) are host-I/O + coordination problems CPU OLTP engines face too — the GPU
+  isn't disadvantaged there. *Caveats:* low contention (sequential keys + Fibonacci spread); raw insert only (no
+  commit/durability/MVCC/CC); synthetic keys. → **NEXT write probes:** contended inserts; the **commit/durability**
+  path (group commit — the likely real write floor); deterministic CC for conflicts.
+- (iv) **Integrate the proven read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
+  template; audit the `all_done` ordering first), differential vs the batcher WITH NULL, HAZARD + independent audit.
+  The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).

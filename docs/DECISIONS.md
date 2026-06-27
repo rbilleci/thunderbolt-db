@@ -101,6 +101,16 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   write-path gap); **synthetic keys are BEST-CASE** (sequential + Fibonacci hash → equidistribution caps clusters at
   length 2, avg ~1.18 probes; arbitrary OLTP key/insertion orders → longer chains, still O(1) but no depth-2 ceiling);
   the ~10M ceiling is the **host-mapped PCIe atomic** (256 threads already saturate it → device memory next); single-GPU.
+  Read ceiling later pushed to ~30M (device-mem atomics, 1d-i) then ~45–53M (batched claiming, 1d-ii); slot→wire mapping
+  measured CHEAP (~200M–1.1B rows/s, parallel). **The read half of the bet is settled (~tens of M/s, O(1), ≫ CPU).**
+- **Write-path probe (2026-06-27) — index maintenance is not the obstacle.** The novel, historically-hard piece of GPU
+  writes is concurrent **lock-free index maintenance**. Measured (`wave_index_insert_probe.rs`, all inserts verified):
+  many threads `atom.cas.b64`-insert (key,row) into a shared open-addressing table at **~tens of BILLIONS of inserts/s**
+  (1M ~29G/s wall-clock / ~77G/s minus launch floor; 16M L2-spill 4.2G/s). **So GPU concurrent index maintenance is NOT
+  a bottleneck.** The remaining write constraints — **durability (WAL fsync, group commit)** and **deterministic CC** —
+  are host-I/O + coordination problems CPU OLTP engines face too, so the GPU isn't disadvantaged. Caveats: low contention
+  (sequential keys + Fibonacci spread); raw insert only (no commit/durability/MVCC/CC); synthetic keys. Next write
+  probes: contended inserts; the commit/durability floor; deterministic CC.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
