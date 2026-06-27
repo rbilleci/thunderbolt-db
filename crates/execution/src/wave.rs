@@ -8,10 +8,13 @@
 //! index space (no claim counter, no block barriers — a barrier deadlock would evade the backstop and zombie
 //! the shared context), hash-probes the index, **gathers up to `MAX_PROJECTIONS` int4 columns** at the
 //! matched row (exactly like the R1 `gpu_db_resident_i32_index_probe` kernel), and writes a per-needle
-//! result record (status + row_index + values). `submit_async` enqueues a wave and returns a `WaveTicket`
-//! immediately; `harvest` turns a ticket into `CudaI32BatchProjectionRow`s once it drains — byte-identical
-//! to the R1 index probe, one row per found needle. Pipelining many tickets (depth K) amortizes the
-//! host<->device round-trip; the blocking `submit` is `submit_async` + spin-`harvest`.
+//! result record (status + row_index + values) into a **DEVICE result ring** (full device-memory bandwidth
+//! — per-needle host-mapped record writes capped the drain ~7.5M). `submit_async` enqueues a wave and
+//! returns a `WaveTicket` immediately; `harvest`, once the completion mirror says the wave drained,
+//! bulk-`DtoH`s its records (on a separate stream) and returns `CudaI32BatchProjectionRow`s — byte-identical
+//! to the R1 index probe, one row per found needle. This device-result path lifts the large-batch drain to
+//! ~31.8M (1.35x the launch-per-batch index probe) while every smaller batch also beats it ~1.7-1.85x; the
+//! blocking `submit` is `submit_async` + spin-`harvest`.
 //!
 //! ## Completion gate (DECISIONS ADR-008 "R2 all_done ordering audit") — load-bearing
 //! `completed` is a **monotonic / cumulative** device-memory atomic, never reset; the ring is **circular**
@@ -99,6 +102,9 @@ type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
 type CuMemFree = unsafe extern "C" fn(u64) -> i32;
 type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+// Async DtoH on a SEPARATE stream so it never blocks on (or device-syncs against) the persistent kernel's
+// stream. Used to bulk-copy a drained wave's records from a DEVICE result buffer to host.
+type CuMemcpyDtoHAsync = unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> i32;
 type CuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> i32;
 type CuMemHostGetDevicePointer = unsafe extern "C" fn(*mut u64, *mut c_void, u32) -> i32;
 type CuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -340,8 +346,15 @@ pub(crate) struct WaveReadEngine {
     ctrl_host: *mut c_void,
     /// Device-mapped pinned needle ring (host view): i32[ring_capacity].
     req_host: *mut c_void,
-    /// Device-mapped pinned result ring (host view): RES_SLOT_BYTES * ring_capacity bytes.
+    /// PINNED host staging buffer for the DtoH of a drained wave's records (RES_SLOT_BYTES * ring_capacity).
+    /// No longer kernel-written (the kernel writes the DEVICE `res_dev` buffer); this is the DtoH target.
     res_host: *mut c_void,
+    /// DEVICE result ring (the kernel writes records here at full device-memory bandwidth, vs per-needle
+    /// host-mapped PCIe writes which capped the drain ~7.5M). `harvest` bulk-DtoHs the drained region.
+    res_dev: u64,
+    /// Separate stream for the result DtoH so it never queues behind the never-ending persistent kernel.
+    copy_stream: *mut c_void,
+    cu_memcpy_dtoh_async: CuMemcpyDtoHAsync,
     /// Device counters [claim@0, completed@4] (monotonic; never reset).
     counters: u64,
     ring_capacity: usize,
@@ -394,6 +407,8 @@ impl WaveReadEngine {
         let cu_mem_free: CuMemFree = unsafe { sym(lib, &[b"cuMemFree_v2\0", b"cuMemFree\0"]) }?;
         let cu_memcpy_htod: CuMemcpyHtoD =
             unsafe { sym(lib, &[b"cuMemcpyHtoD_v2\0", b"cuMemcpyHtoD\0"]) }?;
+        let cu_memcpy_dtoh_async: CuMemcpyDtoHAsync =
+            unsafe { sym(lib, &[b"cuMemcpyDtoHAsync_v2\0", b"cuMemcpyDtoHAsync\0"]) }?;
         let cu_mem_host_alloc: CuMemHostAlloc = unsafe { sym(lib, &[b"cuMemHostAlloc\0"]) }?;
         let cu_mem_host_get_device_pointer: CuMemHostGetDevicePointer = unsafe {
             sym(
@@ -426,7 +441,9 @@ impl WaveReadEngine {
         let mut ctrl_host: *mut c_void = ptr::null_mut();
         let mut req_host: *mut c_void = ptr::null_mut();
         let mut res_host: *mut c_void = ptr::null_mut();
+        let mut res_dev: u64 = 0;
         let mut stream: *mut c_void = ptr::null_mut();
+        let mut copy_stream: *mut c_void = ptr::null_mut();
         let setup = (|| -> Result<(), CudaRuntimeProbeError> {
             // [claim@0, completed@4, dev_head@8, dev_doorbell@12] — claim is unused by the grid-stride
             // kernel; dev_head/dev_doorbell are DEVICE-memory mirrors of the host-mapped ctrl that thread 0
@@ -457,21 +474,22 @@ impl WaveReadEngine {
             unsafe {
                 ptr::write_bytes(res_host as *mut u8, 0, ring_capacity * RES_SLOT_BYTES);
             }
+            // DEVICE result ring the kernel writes (full device bandwidth). harvest DtoHs the drained region.
+            check_cuda(unsafe { cu_mem_alloc(&mut res_dev, ring_capacity * RES_SLOT_BYTES) })?;
             fence(Ordering::SeqCst);
 
             let mut ctrl_dptr: u64 = 0;
             let mut req_dptr: u64 = 0;
-            let mut res_dptr: u64 = 0;
             check_cuda(unsafe { cu_mem_host_get_device_pointer(&mut ctrl_dptr, ctrl_host, 0) })?;
             check_cuda(unsafe { cu_mem_host_get_device_pointer(&mut req_dptr, req_host, 0) })?;
-            check_cuda(unsafe { cu_mem_host_get_device_pointer(&mut res_dptr, res_host, 0) })?;
 
             check_cuda(unsafe { cu_stream_create(&mut stream, CU_STREAM_NON_BLOCKING) })?;
+            check_cuda(unsafe { cu_stream_create(&mut copy_stream, CU_STREAM_NON_BLOCKING) })?;
 
             let mut a_ctrl = ctrl_dptr;
             let mut a_counters = counters;
             let mut a_req = req_dptr;
-            let mut a_res = res_dptr;
+            let mut a_res = res_dev;
             let mut a_resident = resident_ptr;
             let mut a_index = index_ptr;
             let mut a_shift = hash_shift;
@@ -525,8 +543,14 @@ impl WaveReadEngine {
 
         if let Err(err) = setup {
             unsafe {
+                if !copy_stream.is_null() {
+                    cu_stream_destroy(copy_stream);
+                }
                 if !stream.is_null() {
                     cu_stream_destroy(stream);
+                }
+                if res_dev != 0 {
+                    cu_mem_free(res_dev);
                 }
                 if !res_host.is_null() {
                     cu_mem_free_host(res_host);
@@ -552,6 +576,9 @@ impl WaveReadEngine {
             ctrl_host,
             req_host,
             res_host,
+            res_dev,
+            copy_stream,
+            cu_memcpy_dtoh_async,
             counters,
             ring_capacity,
             ring_mask,
@@ -584,14 +611,22 @@ impl WaveReadEngine {
             return Err(CudaRuntimeProbeError::InvalidInputLength(needles.len()));
         }
         let base = self.head;
+        // Bulk-copy needles into the (contiguous modulo ring wraparound) slots in one/two memcpys instead of
+        // a per-item volatile loop -- the per-item host I/O, NOT the GPU, was the large-batch drain cap.
+        // The per-slot status clear is dropped: the harvest gate (completed >= base+len) guarantees the
+        // kernel freshly wrote every record of THIS wave before read_records runs, so a stale-slot read is
+        // impossible (the clear only masked the now-fixed gate underflow).
         let req = self.req_host as *mut i32;
-        let res = self.res_host as *mut u8;
-        for (i, &needle) in needles.iter().enumerate() {
-            let slot = (base as usize + i) & (self.ring_mask as usize);
-            unsafe {
-                ptr::write_volatile(req.add(slot), needle);
-                // Clear the status word so a stale (reused-slot) record can't read as complete.
-                ptr::write_volatile(res.add(slot * RES_SLOT_BYTES).cast::<u32>(), 0);
+        let cap = self.ring_capacity;
+        let start = (base as usize) & (self.ring_mask as usize);
+        let n = needles.len();
+        unsafe {
+            if start + n <= cap {
+                ptr::copy_nonoverlapping(needles.as_ptr(), req.add(start), n);
+            } else {
+                let first = cap - start;
+                ptr::copy_nonoverlapping(needles.as_ptr(), req.add(start), first);
+                ptr::copy_nonoverlapping(needles.as_ptr().add(first), req, n - first);
             }
         }
         fence(Ordering::SeqCst);
@@ -638,19 +673,52 @@ impl WaveReadEngine {
     /// Read the per-needle records for a fully-drained wave `[base, base+len)` into rows (found needles
     /// only). Caller MUST have confirmed completion (the `harvest` gate) before calling.
     fn read_records(&self, base: u32, len: u32) -> Vec<CudaI32BatchProjectionRow> {
-        let res = self.res_host as *mut u8;
+        let cap = self.ring_capacity;
+        let start = (base as usize) & (self.ring_mask as usize);
+        let n = len as usize;
+        let dst = self.res_host as *mut u8;
+        let bytes = RES_SLOT_BYTES;
+        // Bulk-DtoH the drained wave's records from the DEVICE result ring into the pinned host staging, on
+        // the copy stream (so it never queues behind the never-ending persistent kernel). Two copies if the
+        // wave wraps the ring; the staging lands the records contiguously at [0, n*32). The kernel's
+        // `membar.sys` (ahead of the `completed` bump this wave's gate already confirmed) makes the records
+        // visible to the copy engine; `cu_stream_synchronize` then orders the copy before the host parse.
+        unsafe {
+            if start + n <= cap {
+                (self.cu_memcpy_dtoh_async)(
+                    dst.cast::<c_void>(),
+                    self.res_dev + (start * bytes) as u64,
+                    n * bytes,
+                    self.copy_stream,
+                );
+            } else {
+                let first = (cap - start) * bytes;
+                (self.cu_memcpy_dtoh_async)(
+                    dst.cast::<c_void>(),
+                    self.res_dev + (start * bytes) as u64,
+                    first,
+                    self.copy_stream,
+                );
+                (self.cu_memcpy_dtoh_async)(
+                    dst.add(first).cast::<c_void>(),
+                    self.res_dev,
+                    n * bytes - first,
+                    self.copy_stream,
+                );
+            }
+            (self.cu_stream_synchronize)(self.copy_stream);
+        }
         let mut rows = Vec::new();
-        for i in 0..len as usize {
-            let slot = (base as usize + i) & (self.ring_mask as usize);
-            let rec = unsafe { res.add(slot * RES_SLOT_BYTES) };
-            let status = unsafe { ptr::read_volatile(rec.cast::<u32>()) };
+        for i in 0..n {
+            let rec = unsafe { (dst as *const u8).add(i * RES_SLOT_BYTES) };
+            let status = unsafe { ptr::read_unaligned(rec.cast::<u32>()) };
             if status != 1 {
                 continue; // 2 = not found (no row, like the R1 index probe); 0 would be a bug
             }
-            let row_index = unsafe { ptr::read_volatile(rec.add(8).cast::<u64>()) };
+            let row_index = unsafe { ptr::read_unaligned(rec.add(8).cast::<u64>()) };
             let mut values = Vec::with_capacity(self.proj_count as usize);
             for j in 0..self.proj_count as usize {
-                values.push(unsafe { ptr::read_volatile(rec.add(16 + j * 4).cast::<i32>()) });
+                values.push(unsafe { ptr::read_unaligned(rec.add(16 + j * 4).cast::<i32>()) });
             }
             rows.push(CudaI32BatchProjectionRow {
                 needle_index: i,
@@ -689,8 +757,11 @@ impl WaveReadEngine {
         unsafe { ptr::write_volatile(self.ctrl_host as *mut u32, 1) }; // doorbell
         fence(Ordering::SeqCst);
         unsafe {
-            (self.cu_stream_synchronize)(self.stream);
+            (self.cu_stream_synchronize)(self.stream); // kernel drained (doorbell) before any free
+            (self.cu_stream_synchronize)(self.copy_stream);
+            (self.cu_stream_destroy)(self.copy_stream);
             (self.cu_stream_destroy)(self.stream);
+            (self.cu_mem_free)(self.res_dev);
             (self.cu_mem_free_host)(self.res_host);
             (self.cu_mem_free_host)(self.req_host);
             (self.cu_mem_free_host)(self.ctrl_host);
@@ -837,13 +908,13 @@ mod tests {
     /// NOT its intended pipelined/concurrent regime. Each timed wave is verified to return `batch` rows
     /// (in-loop adversarial check — a no-op/early harvest trips it instead of inflating throughput, the bug
     /// an independent audit found in the old gate). Verified picture (grid-stride drain, thread-0
-    /// coordinator): the wave WINS small batches (~3x lpb at 1/8, ~2.2x at 32, the OLTP regime), crosses over
-    /// near batch 256, and LOSES large batches (~7.6M vs lpb ~23M). The large-batch loss is HOST-bound, not
-    /// GPU-bound: `submit_async`/`read_records` move needles+records one-at-a-time over the host-mapped ring,
-    /// vs lpb's bulk `cuMemcpy` DMA; the GPU drain itself does not cap here (more threads do not change the
-    /// number). Bulk host I/O + pipelining are the levers to close the large-batch gap.
-    /// Wave is measured FIRST then shut down, THEN the index probe — so the index probe's `cuMemAlloc`
-    /// (which device-syncs) never runs while the wave kernel is live (the freeze root cause).
+    /// coordinator, DEVICE result ring + bulk DtoH harvest): the wave EXCEEDS lpb at EVERY batch size —
+    /// ~1.7x at 1/8/256, ~1.85x at 32, and ~1.35x (~31.8M vs ~23.5M) at 65536, peaking around 8-16k threads.
+    /// The earlier ~7.6M large-batch cap was the per-needle host-mapped record WRITE (not the host loops,
+    /// not atom.add, not claim — K/thread/bulk-host-I/O sweeps were all flat); moving records to device
+    /// memory + one DtoH lifted it 4.2x. Small batches pay ~6us of DtoH latency vs the old host-mapped read
+    /// but still beat lpb. Wave is measured FIRST then shut down, THEN the index probe — so the index probe's
+    /// `cuMemAlloc` (which device-syncs) never runs while the wave kernel is live (the freeze root cause).
     ///
     /// Run: `GPU_DB_WAVE_BENCH_ROWS=1000000 cargo test -p gpu_db_execution \
     ///   wave::tests::wave_vs_launch_per_batch_throughput -- --ignored --nocapture`
