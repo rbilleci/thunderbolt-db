@@ -65,9 +65,13 @@ Spec: ARCHITECTURE §7 + §13.
   (2) persistent kernel loop, (3) **clean-exit doorbell**, (4) result-slot layout. **Biggest risk = the exit** on this
   `--gpu-reset`-denied shared box (a hung kernel zombies the context). Mitigation: doorbell **plus a hard iteration-cap
   backstop** so the kernel ALWAYS self-terminates; single block (1 SM); lock-free atomics only. **Increment staging:**
-  **1a** = bare lifecycle (poll doorbell + heartbeat, exit on doorbell AND cap; prove launch→exit→context-reusable 3×,
-  NO data plane) → **1b** = int4 point-lookup data plane (slots + scan), differential vs per-query, measure vs the 156k
-  single-coalescer cap. Flag default-OFF; batcher stays default. NEXT: build + GPU-test 1a (the bare lifecycle).
+  **1a ✅ DONE (2026-06-27)** = bare lifecycle proven: `crates/execution/examples/wave_lifecycle_probe.rs` — a persistent
+  kernel polls a device-mapped doorbell, advances a heartbeat, and EXITS on the doorbell in **~3.5µs** (with a
+  `%globaltimer` 30s wall-clock backstop as the zombie-prevention net). **9/9 clean lifecycles across 3 processes, no
+  zombie context.** The biggest risk (clean exit on the `--gpu-reset`-denied box) is de-risked. Add
+  `cuMemHostGetDevicePointer` to the engine FFI for 1b. → **1b (NEXT)** = int4 point-lookup data plane (request/result
+  slots + the scan in-kernel), differential vs per-query WITH NULL data, measure vs the 156k single-coalescer cap.
+  Flag default-OFF; batcher stays default.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
