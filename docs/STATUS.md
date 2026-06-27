@@ -73,6 +73,17 @@ MVCC CPU-fallback dispatch and retire *with* the host path, not before.
   pg_dump/restore + pg_dumpall round-trip. Broad driver/binary/extended-protocol parity beyond this is later.
 
 ## Recent
+**Wave engine (ADR-009) — 1a + 1b proven (2026-06-27).** The bet-critical move after Tier-1 (which left the read
+bottleneck host-serial at a ~167k single-coalescer cap that does NOT scale with GPU hardware). Built as isolated
+standalone probes (`crates/execution/examples/wave_{lifecycle,dataplane}_probe.rs`; own libcuda + context, can't touch
+the engine). **1a:** a persistent kernel polls a device-mapped doorbell and exits cleanly in **~3.5µs** (with a
+`%globaltimer` 30s wall-clock backstop = zombie-prevention); 9/9 clean lifecycles across 3 processes — the biggest risk
+(clean exit on the `--gpu-reset`-denied box) is de-risked. **1b:** persistent-kernel threads lock-free-claim requests,
+scan a resident column, gather a payload, write packed `(value<<32)|done` atomically; host reads slots. **~9.8M point
+lookups/s, all gathers verified — ~60× the 156k cap, ~13× the CPU's 770k. The host-serial bottleneck moved host→GPU
+(scales with hardware = validates the bet).** Caveats + next (1c = device-mem atomics + slot→wire mapping, then engine
+integration): PLAN §3 / DECISIONS ADR-008. NOT yet integrated into the engine; the batcher stays the production default.
+
 **Batcher Tier-1: per-shape template (2026-06-27).** Removed the redundant per-request host plan/bind
 from the point-lookup batcher's single coalescer: a needle-invariant `RelationalRetainedReadTemplate`
 is prepared ONCE per shape (`prepare_relational_retained_read_template`) and reused across all needles

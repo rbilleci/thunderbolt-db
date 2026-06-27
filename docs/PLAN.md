@@ -69,9 +69,18 @@ Spec: ARCHITECTURE §7 + §13.
   kernel polls a device-mapped doorbell, advances a heartbeat, and EXITS on the doorbell in **~3.5µs** (with a
   `%globaltimer` 30s wall-clock backstop as the zombie-prevention net). **9/9 clean lifecycles across 3 processes, no
   zombie context.** The biggest risk (clean exit on the `--gpu-reset`-denied box) is de-risked. Add
-  `cuMemHostGetDevicePointer` to the engine FFI for 1b. → **1b (NEXT)** = int4 point-lookup data plane (request/result
-  slots + the scan in-kernel), differential vs per-query WITH NULL data, measure vs the 156k single-coalescer cap.
-  Flag default-OFF; batcher stays default.
+  `cuMemHostGetDevicePointer` to the engine FFI for 1b. **1b ✅ DONE (2026-06-27)** =
+  `crates/execution/examples/wave_dataplane_probe.rs` — persistent-kernel threads lock-free-claim requests
+  (`atom.add`, no barriers), scan a resident key column, gather a payload, and write `(value<<32)|done` as one atomic
+  8-byte store; host enqueues needles + reads packed slots (no per-request host materialization). **~9.8M point
+  lookups/s (20k-row column, 8192 threads), all gathers + not-found verified — ~60× the 156k single-coalescer cap,
+  ~13× the CPU's 770k. The host-serial bottleneck is GONE** (bottleneck moved host→GPU = scales with hardware = the
+  bet). *Caveats:* bare data plane (slot→wire neutral mapping not yet built — but it's parallelizable, not serial);
+  full-scan-with-break per lookup (a GPU index pushes further); throughput is bound by the claim/`completed` atomics
+  being in host-mapped memory (move to device memory = next opt; explains the sublinear thread scaling + flat 4k-vs-20k
+  rows). → **NEXT (1c):** move the hot atomics to device memory + the slot→neutral-result mapping; then integrate into
+  the engine behind a default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher WITH NULL,
+  HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
