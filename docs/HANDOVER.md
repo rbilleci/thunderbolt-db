@@ -19,19 +19,26 @@
 - **Batcher Tier-1 landed** (per-shape resident-read template): batched point reads **68k → 156k ops/s (2.3×)**, CPU
   gap **11× → ~4.5×**. Residual bottleneck = the **single-coalescer host-serial cap (~167k)**, which does NOT scale
   with GPU hardware. (Audit caught + fixed a pre-existing mixed-int4+text CUDA-201 bug → mixed routes to per-query.)
-- **Wave engine (ADR-009) 1a + 1b PROVEN** (isolated standalone probes `crates/execution/examples/wave_*_probe.rs`):
-  **1a** = persistent kernel clean **~3.5µs doorbell exit** + `%globaltimer` backstop (the `--gpu-reset`-box risk is
-  de-risked). **1b** = parallel data plane (lock-free claim, on-GPU scan+gather, packed atomic result) = **~9.8M point
-  lookups/s, ~60× the cap, all gathers verified — the host-serial bottleneck moved host→GPU (= the bet).** NOT yet
-  integrated into the engine; the batcher remains the production default.
+- **Wave engine (ADR-009) 1a + 1b + 1c PROVEN** (isolated standalone probes `crates/execution/examples/wave_*_probe.rs`;
+  each independently audited):
+  - **1a** = persistent kernel clean **~3.5µs doorbell exit** + `%globaltimer` backstop (the `--gpu-reset`-box risk is
+    de-risked).
+  - **1b** = parallel data plane (lock-free claim, on-GPU scan+gather, packed atomic result) = host-serial cap broken;
+    full-scan O(rows) → 1M-row table = 485k req/s.
+  - **1c** = a GPU hash index removes the scan → **~10.5M point lookups/s FLAT across 1M/4M/16M-row tables (O(1)),
+    ~13.6× the CPU's 770k, table-size-independent. THE OLTP POINT-READ BET VALIDATED at the data-plane level** — the GPU
+    does millions of lookups/s at realistic scale; the residual bottleneck (host-mapped atomics) is GPU-architectural
+    (scales with hardware). NOT integrated into the engine; the batcher remains the production default.
 
-## The one next action — **wave 1c** (PLAN §3)
-Move the hot claim/`completed` atomics to **device memory** (host-mapped PCIe atomics are the current bound) + build the
-**slot → neutral-result mapping** (parallelizable), then **integrate the wave path into the engine behind a default-OFF
-flag** — request descriptor = Tier-1's `RelationalRetainedReadTemplate`. Gates: differential vs the batcher **WITH NULL**,
-HAZARD, **independent adversarial audit**. The batcher stays the default until the integrated wave path wins end-to-end.
-*Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real OLTP-fitness instrument);
-batched-mixed int4+text (needs coalescer-thread CUDA-context fix or the wave engine); STRATA S-C/S-D/S-E.
+## The one next action — **wave 1d** (PLAN §3)
+Turn the proven data plane toward production, in this order: (i) move claim/`completed` atomics to **device memory**
+(raise the ~10M ceiling); (ii) build + quantify the **slot → neutral-result mapping** (parallelizable, not serial);
+(iii) **concurrent index maintenance on writes** (lock-free CAS inserts, ADR-009 — the static host-built index is the
+real OLTP write-path gap); (iv) **integrate into the engine** behind a default-OFF flag — request descriptor =
+Tier-1's `RelationalRetainedReadTemplate`. Gates: differential vs the batcher **WITH NULL**, HAZARD, **independent
+adversarial audit**. The batcher stays the default until the integrated wave path wins end-to-end.
+*Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real end-to-end OLTP-fitness
+instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+text; STRATA S-C/S-D/S-E.
 
 ## Top open decisions (unresolved)
 - **Data-size envelope:** OLTP working set vs aggregate VRAM, and the over-VRAM spill/tiering model (cross-shard

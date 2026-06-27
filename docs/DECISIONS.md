@@ -82,6 +82,21 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
     now routes mixed point lookups to the **per-query path** (correct; 18 engine mixed tests + a new facade regression
     test with NULL data lock it in). Batched mixed-column lookups are a follow-up (need the coalescer-thread context
     fix, or the wave engine). The batcher is now all-int4-only by construction.
+- **Wave-engine data-plane proof (2026-06-27) — the bet validated for point reads.** Tier-1 left the read bottleneck
+  HOST-serial (single coalescer ~167k cap, does NOT scale with HW). The wave engine (ADR-009) moves it host→GPU. Built
+  + measured as isolated standalone probes (`crates/execution/examples/wave_{lifecycle,dataplane,index}_probe.rs`;
+  own libcuda + ctx, can't touch the engine; persistent kernel always terminates via doorbell + `%globaltimer`
+  backstop). **1a:** clean ~3.5µs persistent-kernel doorbell exit (the `--gpu-reset`-box risk de-risked; 9/9 across 3
+  processes). **1b:** parallel data plane — lock-free claim + on-GPU scan+gather + packed atomic result; host reads
+  slots (no per-request host materialization) → **the host-serial cap is GONE.** Independently audited (REAL across
+  20 runs; correctness SOUND; `membar.sys` ordering fixed). Full-scan is O(rows): 4k:10M → 1M-row table:485k. **1c:**
+  a GPU hash index removes the scan → **~10.5M point lookups/s, FLAT across 1M/4M/16M-row tables (O(1)) — ~13.6× the
+  CPU's 770k, ~67× the batcher, independent of table size.** Now atomic-ceiling-bound (host-mapped claim/`completed`
+  atomics → device memory raises it). **Conclusion: the GPU does millions of point lookups/s at realistic scale; the
+  residual bottleneck is GPU-architectural (scales with hardware) — the bet holds, and not just "ballpark", >10× the
+  CPU at the data-plane level.** *Not yet integrated into the engine; the batcher remains the production default.*
+  Honest caveats: bare data plane (no slot→wire mapping / facade); static host-built index (real OLTP needs concurrent
+  index maintenance on writes — ADR-009 lock-free CAS inserts at epoch boundaries); synthetic keys; single-GPU.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

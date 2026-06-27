@@ -83,9 +83,11 @@ scan a resident column, gather a payload, write packed `(value<<32)|done` atomic
 lookups/s, all gathers verified — ~60× the 156k cap, ~13× the CPU's 770k. The host-serial bottleneck moved host→GPU
 (scales with hardware = validates the bet).** Independently audited: number REAL (20-run reproduce), correctness SOUND;
 fixed a `membar.sys` ordering gap (held the number). **Honest scan-knee:** small tables atomic-ceiling-bound (~10M),
-but full-scan is O(rows) → a 1M-row table does ~485k req/s (~3× cap, ~CPU-ballpark, scan-bound). **Next (1c, audit-
-reordered): the GPU index** (removes the scan → atomic ceiling governs at any scale), then device-mem atomics +
-slot→wire mapping, then engine integration. PLAN §3. NOT integrated; the batcher stays the production default.
+but full-scan is O(rows) → a 1M-row table does ~485k req/s (scan-bound). **1c (GPU index) DONE:** a hash index removes
+the scan → **~10.5M point lookups/s FLAT across 1M/4M/16M-row tables (O(1)), ~13.6× the CPU's 770k, table-size
+independent** = **the OLTP point-read bet validated at the data-plane level** (residual bottleneck is the host-mapped
+atomics = GPU-architectural, scales with HW). **Next (1d):** device-mem atomics + slot→wire mapping + concurrent index
+maintenance on writes + engine integration (PLAN §3). NOT integrated; the batcher stays the production default.
 
 **Batcher Tier-1: per-shape template (2026-06-27).** Removed the redundant per-request host plan/bind
 from the point-lookup batcher's single coalescer: a needle-invariant `RelationalRetainedReadTemplate`

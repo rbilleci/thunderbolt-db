@@ -79,11 +79,17 @@ Spec: ARCHITECTURE §7 + §13.
   threads):** small tables are atomic-ceiling-bound (4k:10.0M, 20k:8.3M req/s), but the full-scan is O(rows) so
   100k:2.7M, 500k:755k, **1M-row table: 485k req/s** (~3× the 156k cap, ~CPU-ballpark, scan-bound). *Caveats:* bare
   data plane (no slot→wire mapping yet — parallelizable, not serial); vs the 156k batcher is apples-to-oranges
-  (omits the full facade + neutral mapping). → **NEXT (1c), reordered by the audit:** the **GPU index** (ADR-009 hash/
-  sorted) is the priority — it removes the O(rows) scan so the atomic ceiling (~10M) governs at ANY table size; THEN
-  device-mem atomics (raise that ceiling) + slot→neutral-result mapping; THEN integrate into the engine behind a
-  default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher WITH NULL, HAZARD + audit.
-  The batcher stays the default until the integrated wave path beats it end-to-end.
+  (omits the full facade + neutral mapping).
+- **1c ✅ DONE (2026-06-27)** = `crates/execution/examples/wave_index_probe.rs` — a GPU hash index (host-built
+  open-addressing, Fibonacci hash, in-kernel probe + gather, bounded probe count) **removes the O(rows) scan →
+  ~10.5M point lookups/s FLAT across 1M/4M/16M-row tables (O(1)), ~13.6× the CPU's 770k, independent of table size.**
+  Atomic-ceiling-bound now. **This validates the OLTP point-read bet at the data-plane level: the GPU does millions
+  of lookups/s at realistic scale, residual bottleneck is GPU-architectural (scales with HW).** → **NEXT (1d):**
+  (i) move claim/`completed` atomics to **device memory** (raise the ~10M ceiling); (ii) the **slot→neutral-result
+  mapping** (quantify it — parallelizable); (iii) **concurrent index maintenance on writes** (lock-free CAS inserts,
+  ADR-009 — the static host-built index is the current gap for a real OLTP write path); (iv) **integrate into the
+  engine** behind a default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher WITH NULL,
+  HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
