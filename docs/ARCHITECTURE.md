@@ -148,6 +148,40 @@ concurrent index maintenance on writes (lock-free CAS inserts below), and the de
   under the p50 budget), type-binning, pad to a warp multiple; CUDA Graphs to collapse the kernel pipeline.
 - **Coherent memory** (GH200/GB200) is a fast-path transport target, **not a requirement**; PCIe is the baseline;
   STRATA placement (not hardware paging) owns the tail.
+- **Kernel placement (forward, R2+) — one megakernel, evidence-scoped.** EVIDENCE: the R2 SM-coexistence gate (ADR-009)
+  measured SM reservation as steeply non-linear (8 reserved SMs ≈ 40% of baseline throughput). With non-preemptive block
+  scheduling, a *fleet* of never-exiting per-shape kernels would statically partition the SMs (→ deadlock/starve or
+  load-balance badly) AND is unaffordable at that reservation cost ⇒ the wave engine is **ONE persistent megakernel with
+  internal per-wave dispatch** (route/opcode; any block grabs any wave). PRINCIPLE (not yet thresholded by measurement): a
+  megakernel's register allocation is the MAX over its branches, so only cheap, register-light, bounded-duration,
+  latency-critical ops belong inline; heavy/long/divergent ops (UDFs, regex, window fns, large aggregates) get their own
+  **batched** kernels — high call frequency is amortized by batching calls into a wave, NOT by inlining. Decide per-op by
+  measuring register footprint + per-wave runtime vs the ~70µs launch it would save; default lean.
+- **Scalar functions & functional indexes (e.g. `lower()`) — DESIGN SPACE, NOT DECIDED; the ONLY evidence is int4.** R1
+  measured 4-byte-key point lookups (O(1) probe, cheap build, ~110µs floor). **That result MUST NOT be assumed to
+  generalize to text or wide values — MEASURE before implementing any approach below; cost scales with W (value width)
+  AND N (rows), and SQL users write pathological queries.** Three approaches, with per-row fusion as the always-correct
+  floor: **(a) per-row fused** — inline the fn into the consuming kernel (predicate/key: compare/hash inline, no
+  materialization; projection: write a result arena); always correct, cost O(N·W)/query. **(b) functional index, auto
+  on-demand** — build `hash(fn(col))` lazily like R1's plain index; build O(N·W), index memory O(N·key); NB the probe is
+  **NOT O(1) for text** (a hash hit needs a full-string compare O(W), and variable-length keys need a key-arena
+  (offset+len), unlike the 8-byte int4 entry). **(c) functional index, explicit** — `CREATE INDEX ON t(lower(col))`
+  (pgwire-standard; deterministic/IMMUTABLE only); same costs as (b), DBA-scoped.
+  - **Failure modes a correct algorithm MUST survive (do NOT design for the int4 happy path):** *wide text (100–1000
+    chars) × large table (≥100M rows)* — an auto-built functional index can be tens of GB of keys + a long first-query
+    stall, while the fused fallback is ~N·W (hundreds of GB) of char work per query; neither is obviously right, the
+    choice depends on frequency × N × W, unknown until measured. *No-filter projection `SELECT lower(bigtext) FROM big`*
+    — output is O(N·W), can exceed VRAM ⇒ must stream/chunk, never assume one result arena fits. *Cardinality* —
+    high-cardinality wide keys never amortize a build; low-cardinality trips R1's duplicate-key fallback (→ scan) AFTER
+    paying the build.
+  - **DON'T-ASSUME (so a future agent doesn't ship a bad algorithm):** no O(1) text probe (O(W) on collision); no cheap
+    build (O(N·W)); do NOT auto-build a functional index for every `lower()` predicate (unbounded memory — any auto path
+    MUST gate on width + hotness + determinism + the residency budget, and be width-aware: `lower()` is cheap on a 4-char
+    code, expensive on a 1000-char blob); do NOT assume projection output fits VRAM; do NOT reuse R1's ~110µs/O(1) numbers
+    for text. **OPEN — measure first:** build cost + index memory vs (N, W); probe cost vs W; the (frequency, N, W)
+    crossover where a functional index beats a fused scan; the VRAM/chunking ceiling for wide projections; whether
+    auto-indexing is gated to narrow keys only (explicit required for wide). Until measured, only the per-row fused floor
+    is safe to rely on.
 
 ## 10. MVCC, isolation & concurrency control
 - **MVCC** (PostgreSQL-style xmin/xmax; append-on-update; readers never block writers). **`commit_seq`** unifies the
