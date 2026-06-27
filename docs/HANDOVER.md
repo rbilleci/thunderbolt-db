@@ -78,9 +78,17 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   Kernel = the audited probe kernel with ONE change: `atom.cas` claim (bounded, no overshoot) instead of `atom.add`, so
   cumulative `head` works across waves (the result/completion ordering path is unchanged → audit still holds). GPU test
   `wave_engine_point_lookups_match_oracle_on_shared_context` (#[ignore]) passes: 2 waves, results == CPU oracle, clean
-  exit; ASCII-PTX guard + exec suite 24/0/62-ignored green. **NEXT = R2.2** (wire into the engine read path behind the
-  default-OFF flag; differential vs the batcher WITH NULL; HAZARD; the SM-coexistence integration shape) → R2.3 (audit +
-  measure vs batcher). (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
+  exit; ASCII-PTX guard + exec suite 24/0/62-ignored green. **R2.2a ✅ DONE** — multi-column projection (R1's 4-way
+  gather) over the ring, `submit` returns `CudaI32BatchProjectionRow`s **byte-identical to the R1 index probe** (GPU
+  oracle test green); `atom.cas` bounded claim makes cumulative multi-wave work. **BUT a CRITICAL BLOCKER for R2.2
+  wiring surfaced (DECISIONS ADR-008 "R2.2a ... INTERLEAVED-LAUNCH FREEZE"):** launching the GPU index-probe oracle
+  BETWEEN waves FREEZES the idle persistent kernel (claim frozen, no error/fault/backstop); reordering so all submits
+  precede any launch passes. The SM-coexistence probe only tested NON-blocking concurrent launches (fine); the
+  index-probe uses a flag-0 (blocking) pooled stream + NULL-stream memcpy — the legacy-default-stream path is the prime
+  suspect. Since the engine's launches use flag-0 pooled streams, a co-resident wave kernel would freeze under normal
+  traffic. **NEXT = a focused freeze-mechanism probe** (blocking vs non-blocking vs NULL-stream-sync interleave), which
+  decides R2.2's shape: fix coexistence (non-blocking) OR have the wave kernel REPLACE the per-batch path (so they never
+  interleave). THEN R2.2b wiring → R2.3 (audit + measure vs batcher). (3) **R3** — writes + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
   only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The

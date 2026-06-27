@@ -4,19 +4,28 @@
 //!
 //! A single persistent kernel is launched once over a resident int4 table's GPU hash index (the SAME R1
 //! index format `(key<<32)|(row+1)`, Fibonacci hash, 256-probe cap). Its worker threads drain a host-
-//! pinned **device-mapped ring** of needle requests: each thread lock-free-claims the next index via a
-//! DEVICE-memory `atom.add` (no block barriers — a barrier deadlock would evade the backstop and zombie
-//! the shared context), hash-probes the index, gathers the payload, and writes a packed `(value<<32)|done`
-//! result slot. `submit` enqueues a wave of needles and reads the slots back — no per-request host
-//! orchestration (the wave model). This is the same kernel the R2 `all_done` ordering audit covered.
+//! pinned **device-mapped ring** of needle requests: each thread bounded-claims the next index via a
+//! DEVICE-memory `atom.cas` (no block barriers — a barrier deadlock would evade the backstop and zombie
+//! the shared context), hash-probes the index, **gathers up to `MAX_PROJECTIONS` int4 columns** at the
+//! matched row (exactly like the R1 `gpu_db_resident_i32_index_probe` kernel), and writes a per-needle
+//! result record (status + row_index + values). `submit` enqueues a wave of needles and reads the records
+//! back as `CudaI32BatchProjectionRow`s — byte-identical to the R1 index probe, one row per found needle.
 //!
 //! ## Completion gate (DECISIONS ADR-008 "R2 all_done ordering audit") — load-bearing
 //! Counters (`claim`, `completed`) are **monotonic / cumulative** device-memory atomics, never reset; the
 //! ring is **circular** (`idx & ring_mask`). Each `submit` advances a cumulative `head` and waits until
 //! `completed == head` read back via **`cuMemcpyDtoH` (the host ACQUIRING the device counter — the proven
-//! 1b pattern)** before reading any result slot. The host-mapped `all_done` flag is ONLY a wake hint to
-//! avoid busy-polling DtoH; it carries no happens-before for the workers' slot stores, so it is NEVER the
-//! gate. Each worker releases its slot store ahead of its `completed` bump via `membar.sys`.
+//! 1b pattern)** before reading any result record. Each worker releases all its record writes ahead of its
+//! `completed` bump via `membar.sys`, so the counter-acquire makes every record visible. The host-mapped
+//! `all_done` flag is ONLY a wake hint; it carries no happens-before for the records, so it is NEVER the
+//! gate.
+//!
+//! ## Bounded claim (vs the probe's speculative `atom.add`)
+//! The claim uses `atom.cas` (increments `claim` by 1 only while `claim < head`), so `claim` never
+//! overshoots `head` — it ends exactly at `head` each wave and a cumulative `head` admits the next wave.
+//! (The probe's `atom.add` overshoots ~thread-count, harmless in its single wave but it would stall the
+//! next.) This is orthogonal to the audited path: result writes -> `membar.sys` -> `completed` bump ->
+//! `all_done` is unchanged, so the ordering audit still holds.
 //!
 //! ## Safety net (the `--gpu-reset`-denied-box rule, proven in probe 1a)
 //! The kernel ALWAYS self-terminates: host doorbell OR a `%globaltimer` wall-clock backstop (`backstop_ns`).
@@ -24,10 +33,10 @@
 //! (DECISIONS ADR-008): keep the persistent footprint small; `threads` is an explicit, modest knob.
 //! ASCII-only PTX (the driver JIT rejects non-ASCII even where the local ptxas tolerates it).
 //!
-//! Sub-step 2 = the data plane, verified in ISOLATION (a GPU test vs a CPU oracle); NOT wired into any
-//! engine query path yet (that is R2.2).
+//! R2.2a = the data plane with multi-column projection, verified in ISOLATION vs the R1 index-probe
+//! oracle; NOT wired into any engine query path yet (that is R2.2b).
 
-// TODO(R2.2): drop this once the engine wiring consumes `WaveReadEngine`. Until then the type is used
+// TODO(R2.2b): drop this once the engine wiring consumes `WaveReadEngine`. Until then the type is used
 // only by its `#[cfg(test)]` GPU test, so a non-test build sees it as dead.
 #![allow(dead_code)]
 
@@ -40,21 +49,25 @@ use std::time::{Duration, Instant};
 use libloading::Library;
 
 use crate::{
-    check_cuda, CudaResidentDeviceMemory, CudaResidentReadSource, CudaRuntimeProbeError,
-    GpuPrimaryContext,
+    check_cuda, CudaI32BatchProjectionRow, CudaResidentDeviceMemory, CudaResidentReadSource,
+    CudaRuntimeProbeError, GpuPrimaryContext,
 };
 
 const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 const CU_STREAM_NON_BLOCKING: u32 = 0x01;
 /// Control block bytes (device-mapped pinned): [doorbell@0, head@4, all_done@8]; rest reserved.
 const CTRL_BYTES: usize = 64;
+/// Max projected int4 columns per needle (matches the R1 index probe's `MAX_PROJECTIONS`).
+const MAX_PROJECTIONS: usize = 4;
+/// Per-needle result record (device-mapped): [status@0 u32, pad@4, row@8 u64, v0@16, v1@20, v2@24, v3@28].
+/// status: 0 = incomplete (bug), 1 = found, 2 = not found.
+const RES_SLOT_BYTES: usize = 32;
 /// Host-side timeout waiting for a wave to drain (the kernel's own backstop is the device-side net).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
-// FFI signatures resolved ad-hoc from the primary context's `Library` (the crate idiom — see how
-// `cuLaunchKernel`/`cuMemcpyHtoD` are resolved in `submit_cuda_resident_i32_index_probe`).
-// `cuMemHostGetDevicePointer` is not bound as a `GpuPrimaryContext` field; the device-mapped ring/result/
-// ctrl buffers need it to hand the kernel a device pointer.
+// FFI signatures resolved ad-hoc from the primary context's `Library` (the crate idiom).
+// `cuMemHostGetDevicePointer` is not bound as a `GpuPrimaryContext` field; the device-mapped buffers need
+// it to hand the kernel a device pointer.
 type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
 type CuMemFree = unsafe extern "C" fn(u64) -> i32;
 type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
@@ -80,21 +93,11 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> i32;
 
-/// The persistent data-plane kernel — from `wave_devatomic_probe.rs` (probe 1d-i, the kernel the R2
-/// `all_done` ordering audit covered), with ONE change for multi-wave persistence: the claim uses
-/// `atom.cas` (bounded) instead of `atom.add` (speculative). The probe's `atom.add` lets many threads
-/// overshoot `claim` past `head` (harmless in its single wave, but it leaves `claim` ~thread-count high,
-/// which would stall the next wave under a cumulative `head`). `atom.cas` increments `claim` by exactly 1
-/// only while `claim < head`, so `claim` ends exactly at `head` each wave and never overshoots. This is
-/// orthogonal to the audited path: the result-store -> `membar.sys` -> `completed` bump -> `all_done`
-/// ordering is UNCHANGED, so the `all_done` ordering audit (gate on the counter-acquire, not `all_done`)
-/// still holds.
-///
-/// Control block = [doorbell@0, head@4, all_done@8]; counters (device) = [claim@0, completed@4]. Each
-/// thread: exit on doorbell/backstop; read `claim` < head; `atom.cas` to claim that index; hash-probe
-/// `table` + gather `col_payload`; atomically store packed `(value<<32)|done`; `membar.sys`; `atom.add`
-/// `completed`; the completer that reaches `head` sets `all_done` (wake hint). Lock-free, no barriers,
-/// pure ASCII.
+/// The persistent multi-projection data-plane kernel. From the audited `wave_devatomic_probe` kernel,
+/// with (1) `atom.cas` bounded claim instead of `atom.add` (no overshoot, for multi-wave persistence),
+/// and (2) the R1 index-probe's 4-way-unrolled multi-column gather + a per-needle result record (status,
+/// row, values) instead of a single packed value. The result-writes -> `membar.sys` -> `completed` bump
+/// -> `all_done` ordering is UNCHANGED, so the `all_done` ordering audit still applies. Pure ASCII.
 const WAVE_DATAPLANE_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -105,97 +108,125 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     .param .u64 counters,
     .param .u64 req,
     .param .u64 res,
-    .param .u64 table,
-    .param .u64 col_payload,
+    .param .u64 resident,
+    .param .u64 index,
     .param .u32 hash_shift,
     .param .u32 table_mask,
     .param .u32 ring_mask,
+    .param .u32 proj_count,
+    .param .u64 proj_off0,
+    .param .u64 proj_off1,
+    .param .u64 proj_off2,
+    .param .u64 proj_off3,
     .param .u64 max_ns
 )
 {
-    .reg .pred %p<5>;
-    .reg .b32 %r<24>;
-    .reg .b64 %rd<32>;
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<48>;
 
     ld.param.u64 %rd1, [ctrl];
     ld.param.u64 %rd2, [counters];
     ld.param.u64 %rd3, [req];
     ld.param.u64 %rd4, [res];
-    ld.param.u64 %rd5, [table];
-    ld.param.u64 %rd6, [col_payload];
+    ld.param.u64 %rd5, [resident];
+    ld.param.u64 %rd6, [index];
     ld.param.u32 %r1, [hash_shift];
     ld.param.u32 %r2, [table_mask];
     ld.param.u32 %r3, [ring_mask];
-    ld.param.u64 %rd7, [max_ns];
-    mov.u64 %rd8, %globaltimer;
+    ld.param.u32 %r4, [proj_count];
+    ld.param.u64 %rd7, [proj_off0];
+    ld.param.u64 %rd30, [proj_off1];
+    ld.param.u64 %rd31, [proj_off2];
+    ld.param.u64 %rd32, [proj_off3];
+    ld.param.u64 %rd8, [max_ns];
+    mov.u64 %rd9, %globaltimer;
 
 $L_loop:
-    ld.volatile.global.u32 %r4, [%rd1];
-    setp.ne.s32 %p1, %r4, 0;
+    ld.volatile.global.u32 %r5, [%rd1];
+    setp.ne.s32 %p1, %r5, 0;
     @%p1 bra $L_done;
-    mov.u64 %rd9, %globaltimer;
-    sub.u64 %rd10, %rd9, %rd8;
-    setp.ge.u64 %p1, %rd10, %rd7;
+    mov.u64 %rd10, %globaltimer;
+    sub.u64 %rd11, %rd10, %rd9;
+    setp.ge.u64 %p1, %rd11, %rd8;
     @%p1 bra $L_done;
-    ld.volatile.global.u32 %r5, [%rd1+4];
-    ld.volatile.global.u32 %r6, [%rd2];
-    setp.ge.u32 %p1, %r6, %r5;
+    ld.volatile.global.u32 %r6, [%rd1+4];
+    ld.volatile.global.u32 %r7, [%rd2];
+    setp.ge.u32 %p1, %r7, %r6;
     @%p1 bra $L_loop;
-    add.u32 %r20, %r6, 1;
-    atom.global.cas.b32 %r7, [%rd2], %r6, %r20;
-    setp.ne.u32 %p1, %r7, %r6;
+    add.u32 %r8, %r7, 1;
+    atom.global.cas.b32 %r9, [%rd2], %r7, %r8;
+    setp.ne.u32 %p1, %r9, %r7;
     @%p1 bra $L_loop;
-    and.b32 %r8, %r7, %r3;
-    mul.wide.u32 %rd11, %r8, 4;
-    add.u64 %rd12, %rd3, %rd11;
-    ld.volatile.global.u32 %r9, [%rd12];
-    mul.lo.u32 %r10, %r9, 2654435761;
-    shr.u32 %r11, %r10, %r1;
-    mov.u32 %r12, 2;
-    mov.u32 %r13, 0;
-    mov.u32 %r17, 0;
+    and.b32 %r10, %r7, %r3;
+    mul.wide.u32 %rd12, %r10, 4;
+    add.u64 %rd13, %rd3, %rd12;
+    ld.volatile.global.u32 %r11, [%rd13];
+    mul.wide.u32 %rd14, %r10, 32;
+    add.u64 %rd15, %rd4, %rd14;
+    mul.lo.u32 %r12, %r11, 2654435761;
+    shr.u32 %r13, %r12, %r1;
+    mov.u32 %r14, 0;
+    mov.u32 %r15, 2;
 
 $L_probe:
-    and.b32 %r11, %r11, %r2;
-    mul.wide.u32 %rd13, %r11, 8;
-    add.u64 %rd14, %rd5, %rd13;
-    ld.global.u64 %rd15, [%rd14];
-    setp.eq.u64 %p2, %rd15, 0;
+    and.b32 %r13, %r13, %r2;
+    mul.wide.u32 %rd16, %r13, 8;
+    add.u64 %rd17, %rd6, %rd16;
+    ld.global.u64 %rd18, [%rd17];
+    setp.eq.u64 %p2, %rd18, 0;
     @%p2 bra $L_write;
-    shr.u64 %rd16, %rd15, 32;
-    cvt.u32.u64 %r14, %rd16;
-    setp.ne.s32 %p2, %r14, %r9;
+    shr.u64 %rd19, %rd18, 32;
+    cvt.u32.u64 %r16, %rd19;
+    setp.ne.s32 %p2, %r16, %r11;
     @%p2 bra $L_probe_next;
-    cvt.u32.u64 %r15, %rd15;
-    sub.u32 %r15, %r15, 1;
-    mul.wide.u32 %rd17, %r15, 4;
-    add.u64 %rd18, %rd6, %rd17;
-    ld.global.u32 %r13, [%rd18];
-    mov.u32 %r12, 1;
-    bra $L_write;
-$L_probe_next:
-    add.u32 %r11, %r11, 1;
-    add.u32 %r17, %r17, 1;
-    setp.ge.u32 %p3, %r17, 256;
+    cvt.u32.u64 %r17, %rd18;
+    sub.u32 %r17, %r17, 1;
+    cvt.u64.u32 %rd20, %r17;
+    mov.u32 %r15, 1;
+    st.global.u64 [%rd15+8], %rd20;
+    mul.lo.u64 %rd21, %rd20, 4;
+    add.u64 %rd22, %rd5, %rd7;
+    add.u64 %rd22, %rd22, %rd21;
+    ld.global.s32 %r18, [%rd22];
+    st.global.s32 [%rd15+16], %r18;
+    setp.le.u32 %p3, %r4, 1;
     @%p3 bra $L_write;
+    add.u64 %rd22, %rd5, %rd30;
+    add.u64 %rd22, %rd22, %rd21;
+    ld.global.s32 %r18, [%rd22];
+    st.global.s32 [%rd15+20], %r18;
+    setp.le.u32 %p3, %r4, 2;
+    @%p3 bra $L_write;
+    add.u64 %rd22, %rd5, %rd31;
+    add.u64 %rd22, %rd22, %rd21;
+    ld.global.s32 %r18, [%rd22];
+    st.global.s32 [%rd15+24], %r18;
+    setp.le.u32 %p3, %r4, 3;
+    @%p3 bra $L_write;
+    add.u64 %rd22, %rd5, %rd32;
+    add.u64 %rd22, %rd22, %rd21;
+    ld.global.s32 %r18, [%rd22];
+    st.global.s32 [%rd15+28], %r18;
+    bra $L_write;
+
+$L_probe_next:
+    add.u32 %r13, %r13, 1;
+    add.u32 %r14, %r14, 1;
+    setp.ge.u32 %p4, %r14, 256;
+    @%p4 bra $L_write;
     bra $L_probe;
 
 $L_write:
-    cvt.u64.u32 %rd19, %r13;
-    shl.b64 %rd20, %rd19, 32;
-    cvt.u64.u32 %rd21, %r12;
-    or.b64 %rd22, %rd20, %rd21;
-    mul.wide.u32 %rd23, %r8, 8;
-    add.u64 %rd24, %rd4, %rd23;
-    st.volatile.global.u64 [%rd24], %rd22;
+    st.global.u32 [%rd15], %r15;
     membar.sys;
-    atom.global.add.u32 %r18, [%rd2+4], 1;
-    add.u32 %r18, %r18, 1;
-    setp.ne.u32 %p4, %r18, %r5;
-    @%p4 bra $L_loop;
+    atom.global.add.u32 %r19, [%rd2+4], 1;
+    add.u32 %r19, %r19, 1;
+    setp.ne.u32 %p5, %r19, %r6;
+    @%p5 bra $L_loop;
     membar.sys;
-    mov.u32 %r19, 1;
-    st.volatile.global.u32 [%rd1+8], %r19;
+    mov.u32 %r20, 1;
+    st.volatile.global.u32 [%rd1+8], %r20;
     bra $L_loop;
 
 $L_done:
@@ -219,25 +250,25 @@ unsafe fn sym<T: Copy>(lib: &Library, names: &[&[u8]]) -> Result<T, CudaRuntimeP
 }
 
 /// A persistent GPU "wave" read kernel resident on the engine's shared primary context, draining a
-/// circular needle ring against one resident int4 table's hash index. Owns a dedicated (non-pooled)
-/// stream the kernel occupies for its whole life, device-mapped ctrl/req/res buffers, and a device
-/// counters buffer. `submit` runs one wave at a time (serialized) and reads its results back.
+/// circular needle ring against one resident int4 table's hash index, projecting up to `MAX_PROJECTIONS`
+/// columns. `submit` runs one wave at a time (serialized) and reads its rows back.
 pub(crate) struct WaveReadEngine {
-    /// Keep the shared context + the index/payload device buffers alive for the engine's lifetime.
+    /// Keep the shared context + the index/table device buffers alive for the engine's lifetime.
     _primary: Arc<GpuPrimaryContext>,
     _index: Arc<CudaResidentDeviceMemory>,
-    _payload: Arc<CudaResidentDeviceMemory>,
+    _resident: Arc<CudaResidentDeviceMemory>,
     stream: *mut c_void,
     /// Device-mapped pinned control block (host view): [doorbell@0, head@4, all_done@8].
     ctrl_host: *mut c_void,
     /// Device-mapped pinned needle ring (host view): i32[ring_capacity].
     req_host: *mut c_void,
-    /// Device-mapped pinned result ring (host view): u64[ring_capacity], packed (value<<32)|done.
+    /// Device-mapped pinned result ring (host view): RES_SLOT_BYTES * ring_capacity bytes.
     res_host: *mut c_void,
     /// Device counters [claim@0, completed@4] (monotonic; never reset).
     counters: u64,
     ring_capacity: usize,
     ring_mask: u32,
+    proj_count: u32,
     /// Cumulative count of needles ever published (host-tracked; mirrors ctrl.head). Monotonic.
     head: u32,
     cu_memcpy_dtoh: CuMemcpyDtoH,
@@ -249,22 +280,31 @@ pub(crate) struct WaveReadEngine {
 }
 
 impl WaveReadEngine {
-    /// Launch the persistent data-plane kernel over `index` (built with `table_mask`/`hash_shift`) and
-    /// `payload` (the resident column gathered at `payload_offset + row*4`), on the SAME shared context
-    /// the `index` lives in. `ring_capacity` is rounded up to a power of two and bounds a single wave's
-    /// size. `threads` is the persistent grid (kept modest per the SM-coexistence rule). The kernel runs
-    /// until `shutdown`/`Drop`, or `backstop_ns` elapses (the wall-clock safety net).
+    /// Launch the persistent kernel over `index` (built with `table_mask`/`hash_shift`) and `resident`
+    /// (the table whose columns are gathered at `projection_offsets[j] + row*4`), on the SAME shared
+    /// context the `index` lives in. `projection_offsets` must be 1..=MAX_PROJECTIONS. `ring_capacity` is
+    /// rounded up to a power of two and bounds a single wave. `threads` is the persistent grid (kept
+    /// modest per the SM-coexistence rule). Runs until `shutdown`/`Drop`, or `backstop_ns` elapses.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         index: Arc<CudaResidentDeviceMemory>,
-        payload: Arc<CudaResidentDeviceMemory>,
-        payload_offset: u64,
+        resident: Arc<CudaResidentDeviceMemory>,
+        projection_offsets: &[u64],
         table_mask: u32,
         hash_shift: u32,
         ring_capacity: usize,
         threads: u32,
         backstop_ns: u64,
     ) -> Result<Self, CudaRuntimeProbeError> {
+        if projection_offsets.is_empty() || projection_offsets.len() > MAX_PROJECTIONS {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                projection_offsets.len(),
+            ));
+        }
+        let proj_count = projection_offsets.len() as u32;
+        let mut proj = [0u64; MAX_PROJECTIONS];
+        proj[..projection_offsets.len()].copy_from_slice(projection_offsets);
+
         let ring_capacity = ring_capacity.next_power_of_two().max(8);
         let ring_mask = (ring_capacity - 1) as u32;
         let threads = threads.max(1);
@@ -302,24 +342,21 @@ impl WaveReadEngine {
         ptx.push(0);
         let function = primary.cached_function(c"gpu_db_wave_read_dataplane", &ptx)?;
 
-        let table_ptr = index.device_ptr();
-        let payload_ptr = payload.device_ptr() + payload_offset;
+        let resident_ptr = resident.device_ptr();
+        let index_ptr = index.device_ptr();
         let blocks = threads.div_ceil(256);
         let threads_per_block = threads.min(256);
 
-        // Allocate every resource through a try-block; free whatever was created on any error.
         let mut counters: u64 = 0;
         let mut ctrl_host: *mut c_void = ptr::null_mut();
         let mut req_host: *mut c_void = ptr::null_mut();
         let mut res_host: *mut c_void = ptr::null_mut();
         let mut stream: *mut c_void = ptr::null_mut();
         let setup = (|| -> Result<(), CudaRuntimeProbeError> {
-            // Device counters [claim, completed], zeroed.
             check_cuda(unsafe { cu_mem_alloc(&mut counters, 8) })?;
             let zero = [0u32; 2];
             check_cuda(unsafe { cu_memcpy_htod(counters, zero.as_ptr().cast::<c_void>(), 8) })?;
 
-            // Device-mapped ctrl / req / res; ctrl + res zeroed (req is overwritten per wave).
             check_cuda(unsafe {
                 cu_mem_host_alloc(&mut ctrl_host, CTRL_BYTES, CU_MEMHOSTALLOC_DEVICEMAP)
             })?;
@@ -332,12 +369,14 @@ impl WaveReadEngine {
                 cu_mem_host_alloc(&mut req_host, ring_capacity * 4, CU_MEMHOSTALLOC_DEVICEMAP)
             })?;
             check_cuda(unsafe {
-                cu_mem_host_alloc(&mut res_host, ring_capacity * 8, CU_MEMHOSTALLOC_DEVICEMAP)
+                cu_mem_host_alloc(
+                    &mut res_host,
+                    ring_capacity * RES_SLOT_BYTES,
+                    CU_MEMHOSTALLOC_DEVICEMAP,
+                )
             })?;
             unsafe {
-                for i in 0..ring_capacity {
-                    ptr::write_volatile((res_host as *mut u64).add(i), 0);
-                }
+                ptr::write_bytes(res_host as *mut u8, 0, ring_capacity * RES_SLOT_BYTES);
             }
             fence(Ordering::SeqCst);
 
@@ -350,27 +389,36 @@ impl WaveReadEngine {
 
             check_cuda(unsafe { cu_stream_create(&mut stream, CU_STREAM_NON_BLOCKING) })?;
 
-            // Launch the persistent kernel ASYNC; it idles (head=0) until the first `submit`.
             let mut a_ctrl = ctrl_dptr;
             let mut a_counters = counters;
             let mut a_req = req_dptr;
             let mut a_res = res_dptr;
-            let mut a_table = table_ptr;
-            let mut a_pay = payload_ptr;
+            let mut a_resident = resident_ptr;
+            let mut a_index = index_ptr;
             let mut a_shift = hash_shift;
             let mut a_tmask = table_mask;
             let mut a_rmask = ring_mask;
+            let mut a_pcount = proj_count;
+            let mut a_off0 = proj[0];
+            let mut a_off1 = proj[1];
+            let mut a_off2 = proj[2];
+            let mut a_off3 = proj[3];
             let mut a_max = backstop_ns;
             let mut params = [
                 (&mut a_ctrl as *mut u64).cast::<c_void>(),
                 (&mut a_counters as *mut u64).cast::<c_void>(),
                 (&mut a_req as *mut u64).cast::<c_void>(),
                 (&mut a_res as *mut u64).cast::<c_void>(),
-                (&mut a_table as *mut u64).cast::<c_void>(),
-                (&mut a_pay as *mut u64).cast::<c_void>(),
+                (&mut a_resident as *mut u64).cast::<c_void>(),
+                (&mut a_index as *mut u64).cast::<c_void>(),
                 (&mut a_shift as *mut u32).cast::<c_void>(),
                 (&mut a_tmask as *mut u32).cast::<c_void>(),
                 (&mut a_rmask as *mut u32).cast::<c_void>(),
+                (&mut a_pcount as *mut u32).cast::<c_void>(),
+                (&mut a_off0 as *mut u64).cast::<c_void>(),
+                (&mut a_off1 as *mut u64).cast::<c_void>(),
+                (&mut a_off2 as *mut u64).cast::<c_void>(),
+                (&mut a_off3 as *mut u64).cast::<c_void>(),
                 (&mut a_max as *mut u64).cast::<c_void>(),
             ];
             check_cuda(unsafe {
@@ -415,7 +463,7 @@ impl WaveReadEngine {
         Ok(Self {
             _primary: primary,
             _index: index,
-            _payload: payload,
+            _resident: resident,
             stream,
             ctrl_host,
             req_host,
@@ -423,6 +471,7 @@ impl WaveReadEngine {
             counters,
             ring_capacity,
             ring_mask,
+            proj_count,
             head: 0,
             cu_memcpy_dtoh,
             cu_stream_synchronize,
@@ -433,12 +482,14 @@ impl WaveReadEngine {
         })
     }
 
-    /// Run one wave of point lookups: enqueue `needles` (each a key value), wait for the wave to drain,
-    /// and return one result per needle (`Some(payload)` if the key was found, else `None`). Serialized:
-    /// each call publishes its needles, waits for `completed == head`, then reads its slots — so the
-    /// circular ring never overwrites an un-read wave (one wave in flight at a time). `needles.len()` must
-    /// not exceed `ring_capacity`.
-    pub(crate) fn submit(&mut self, needles: &[i32]) -> Result<Vec<Option<i32>>, CudaRuntimeProbeError> {
+    /// Run one wave: enqueue `needles` (each a key value), wait for the wave to drain (the DtoH
+    /// counter-acquire gate), and return one `CudaI32BatchProjectionRow` per FOUND needle (byte-identical
+    /// to the R1 index probe; `needle_index` is the position in `needles`). Serialized — one wave in
+    /// flight, so the circular ring never overwrites an un-read wave. `needles.len() <= ring_capacity`.
+    pub(crate) fn submit(
+        &mut self,
+        needles: &[i32],
+    ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
         if needles.is_empty() {
             return Ok(Vec::new());
         }
@@ -447,37 +498,35 @@ impl WaveReadEngine {
         }
         let base = self.head;
         let req = self.req_host as *mut i32;
-        let res = self.res_host as *mut u64;
+        let res = self.res_host as *mut u8;
         for (i, &needle) in needles.iter().enumerate() {
             let slot = (base as usize + i) & (self.ring_mask as usize);
             unsafe {
                 ptr::write_volatile(req.add(slot), needle);
-                ptr::write_volatile(res.add(slot), 0); // clear stale (this slot was read last wave)
+                // Clear the status word so a stale (reused-slot) record can't read as complete.
+                ptr::write_volatile(res.add(slot * RES_SLOT_BYTES).cast::<u32>(), 0);
             }
         }
-        // Reset the all_done WAKE HINT (not the gate) and publish the new cumulative head.
-        unsafe { ptr::write_volatile((self.ctrl_host as *mut u32).add(2), 0) };
+        unsafe { ptr::write_volatile((self.ctrl_host as *mut u32).add(2), 0) }; // all_done wake hint
         fence(Ordering::SeqCst);
         let new_head = base + needles.len() as u32;
         self.head = new_head;
-        unsafe { ptr::write_volatile((self.ctrl_host as *mut u32).add(1), new_head) };
+        unsafe { ptr::write_volatile((self.ctrl_host as *mut u32).add(1), new_head) }; // publish head
         fence(Ordering::SeqCst);
 
-        // Wake hint: cheap host-mapped poll of all_done so we don't hammer DtoH.
         let deadline = Instant::now() + DRAIN_TIMEOUT;
+        // Wake hint: cheap host-mapped poll of all_done so we don't hammer DtoH.
         loop {
             if unsafe { ptr::read_volatile((self.ctrl_host as *const u32).add(2)) } != 0 {
                 break;
             }
             if Instant::now() >= deadline {
-                break; // fall through to the authoritative gate (which also has the deadline)
+                break;
             }
             std::hint::spin_loop();
         }
-        // AUTHORITATIVE GATE (ADR-008 "R2 all_done ordering audit"): the host ACQUIRES the device
-        // `completed` counter (== cumulative head) via DtoH BEFORE reading any slot. This is the sound
-        // 1b release/acquire (each worker released its slot store ahead of its bump via membar.sys);
-        // all_done above is only the wake hint and carries no happens-before for the slot stores.
+        // AUTHORITATIVE GATE (ADR-008 "R2 all_done ordering audit"): host ACQUIRES the device `completed`
+        // counter (== cumulative head) via DtoH BEFORE reading any record (the sound 1b release/acquire).
         let mut counters = [0u32; 2];
         loop {
             check_cuda(unsafe {
@@ -492,15 +541,26 @@ impl WaveReadEngine {
             std::hint::spin_loop();
         }
 
-        let mut out = Vec::with_capacity(needles.len());
-        for i in 0..needles.len() {
+        let mut rows = Vec::new();
+        for (i, _needle) in needles.iter().enumerate() {
             let slot = (base as usize + i) & (self.ring_mask as usize);
-            let packed = unsafe { ptr::read_volatile(res.add(slot)) };
-            let done = (packed & 0xffff_ffff) as u32; // 1 = found, 2 = not found
-            let value = (packed >> 32) as i32;
-            out.push(if done == 1 { Some(value) } else { None });
+            let rec = unsafe { res.add(slot * RES_SLOT_BYTES) };
+            let status = unsafe { ptr::read_volatile(rec.cast::<u32>()) };
+            if status != 1 {
+                continue; // 2 = not found (no row, like the R1 index probe); 0 would be a bug
+            }
+            let row_index = unsafe { ptr::read_volatile(rec.add(8).cast::<u64>()) };
+            let mut values = Vec::with_capacity(self.proj_count as usize);
+            for j in 0..self.proj_count as usize {
+                values.push(unsafe { ptr::read_volatile(rec.add(16 + j * 4).cast::<i32>()) });
+            }
+            rows.push(CudaI32BatchProjectionRow {
+                needle_index: i,
+                row_index,
+                values,
+            });
         }
-        Ok(out)
+        Ok(rows)
     }
 
     /// Ring the doorbell, wait for the kernel to exit, then free the stream + buffers. Idempotent.
@@ -512,7 +572,6 @@ impl WaveReadEngine {
         unsafe { ptr::write_volatile(self.ctrl_host as *mut u32, 1) }; // doorbell
         fence(Ordering::SeqCst);
         unsafe {
-            // The kernel exits on the doorbell (~us); the %globaltimer backstop is the ultimate net.
             (self.cu_stream_synchronize)(self.stream);
             (self.cu_stream_destroy)(self.stream);
             (self.cu_mem_free_host)(self.res_host);
@@ -550,15 +609,15 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn wave_engine_point_lookups_match_oracle_on_shared_context() {
-        // Build a tiny resident int4 table + its R1-format hash index on the SHARED primary context,
-        // run the persistent wave engine over it, and assert every needle's result matches a CPU oracle
-        // (present key -> its payload; absent value -> None). Two waves exercise the cumulative ring.
+    fn wave_engine_point_lookups_match_index_probe_oracle() {
+        // Build a tiny resident int4 table + its R1-format hash index on the SHARED primary context, run
+        // the persistent wave engine over it with a 2-column projection, and assert every wave's rows are
+        // BYTE-IDENTICAL to the R1 index probe (`submit_match_project_i32_index_probe_from_payload`). Two
+        // waves exercise the cumulative ring.
         let Ok(runtime) = CudaDriverRuntime::probe() else {
             return; // no GPU -> skip (also #[ignore]d by default)
         };
         let rows: u64 = 1000;
-        // Distinct keys (a real map) + distinct payload (a load-bearing gather).
         let keys: Vec<i32> = (0..rows as i32).map(|r| r * 3 + 1).collect();
         let payload: Vec<i32> = (0..rows as i32).map(|r| r * 1000 + 7).collect();
         let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
@@ -573,9 +632,10 @@ mod tests {
                 .retain_device_memory_copy(0, &buf)
                 .expect("resident device memory"),
         );
+        let key_offset = 0_u64;
         let payload_offset = rows * 4;
+        let projections = [key_offset, payload_offset];
 
-        // Open-addressing index over the key column (same format/hash as R1 + the probes).
         let table_size = ((rows * 2) as u32).next_power_of_two();
         let table_mask = table_size - 1;
         let hash_shift = 32 - table_size.trailing_zeros();
@@ -595,10 +655,27 @@ mod tests {
                 .expect("index device memory"),
         );
 
+        // The R1 index probe is the oracle.
+        let oracle = |needles: &[i32]| -> Vec<CudaI32BatchProjectionRow> {
+            let submission = resident
+                .submit_match_project_i32_index_probe_from_payload(
+                    &index_resident,
+                    table_mask,
+                    hash_shift,
+                    needles,
+                    &projections,
+                    rows,
+                )
+                .expect("index submit");
+            let mut r = submission.complete(&resident).expect("index complete");
+            r.sort_by_key(|row| (row.needle_index, row.row_index));
+            r
+        };
+
         let mut engine = WaveReadEngine::new(
-            index_resident,
-            resident,
-            payload_offset,
+            Arc::clone(&index_resident),
+            Arc::clone(&resident),
+            &projections,
             table_mask,
             hash_shift,
             1024,
@@ -607,25 +684,34 @@ mod tests {
         )
         .expect("wave engine launches on the shared context");
 
-        // CPU oracle: a needle is a KEY value; found -> its row's payload, else None.
-        let oracle = |needle: i32| -> Option<i32> {
-            keys.iter().position(|&k| k == needle).map(|r| payload[r])
-        };
+        let waves = [
+            vec![keys[5], keys[100], keys[999], -12345, keys[0]],
+            vec![keys[10], keys[20], 2, keys[30]],
+        ];
+        // Run all waves on the persistent kernel FIRST (no interleaved GPU launches), then validate vs
+        // the R1 oracle — isolates multi-wave persistence from any concurrent-launch interaction.
+        let mut results = Vec::new();
+        for needles in &waves {
+            let mut got = engine.submit(needles).expect("wave submit");
+            got.sort_by_key(|row| (row.needle_index, row.row_index));
+            results.push(got);
+        }
+        // Non-vacuous spot-check gather (also a 3rd wave) — collected BEFORE any GPU oracle launch.
+        let spot = engine.submit(&[keys[5]]).expect("spot submit");
+        engine.shutdown();
 
-        // Wave 1: present keys (rows 5, 100, 999, 0) + one absent value (2 is not 1 mod 3).
-        let w1: Vec<i32> = vec![keys[5], keys[100], keys[999], keys[0], 2];
-        let got1 = engine.submit(&w1).expect("wave 1");
-        let want1: Vec<Option<i32>> = w1.iter().map(|&n| oracle(n)).collect();
-        assert_eq!(got1, want1, "wave 1 results must match the CPU oracle");
-        assert_eq!(got1[0], Some(payload[5]), "needle keys[5] -> payload[5]");
-        assert_eq!(got1[4], None, "absent needle 2 -> None");
-
-        // Wave 2 (cumulative ring): a different set, proving multi-wave correctness.
-        let w2: Vec<i32> = vec![keys[10], keys[20], keys[30], 5];
-        let got2 = engine.submit(&w2).expect("wave 2");
-        let want2: Vec<Option<i32>> = w2.iter().map(|&n| oracle(n)).collect();
-        assert_eq!(got2, want2, "wave 2 results must match the CPU oracle");
-
-        engine.shutdown(); // clean doorbell exit on the shared context
+        for (got, needles) in results.iter().zip(waves.iter()) {
+            let want = oracle(needles);
+            assert_eq!(
+                *got, want,
+                "wave rows must be byte-identical to the R1 index probe for {needles:?}"
+            );
+        }
+        assert_eq!(spot.len(), 1, "present key -> exactly one row");
+        assert_eq!(
+            spot[0].values,
+            vec![keys[5], payload[5]],
+            "2-column gather (key, payload) at row 5"
+        );
     }
 }

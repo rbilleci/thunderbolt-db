@@ -164,6 +164,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   drop the cumulativity assumption) — **never lift an `all_done`-only gate, never drop the counter-acquire**. If the
   cumulativity question ever needs settling empirically: remove the DtoH + the per-thread `membar.sys`, stress at max
   threads / small claim-K, poison slots with a sentinel, and watch for `done==0` stale-slot reads after `all_done`.
+- **R2.2a wave data plane in-crate + the INTERLEAVED-LAUNCH FREEZE (2026-06-27, `crates/execution/src/wave.rs`).**
+  `WaveReadEngine` now does multi-column projection (the R1 index probe's 4-way gather) over a circular lock-free ring,
+  returning `CudaI32BatchProjectionRow`s **byte-identical to the R1 index probe** (GPU oracle test, 2 waves + spot,
+  green). Claim uses `atom.cas` (bounded, no overshoot) so cumulative `head` works across waves. **BUT a critical
+  coexistence discovery gates R2.2 wiring:** when the GPU index-probe oracle is launched BETWEEN two waves, the idle
+  persistent kernel FREEZES — wave 2's `claim` stays frozen (no CUDA error, no fault, no backstop; just stops claiming)
+  and the wave times out. Reordering so all `submit`s precede any oracle launch makes it pass. So **an interleaved
+  kernel launch stalls the idle persistent wave kernel.** This SHARPENS the SM-coexistence verdict: that probe showed a
+  persistent kernel coexists with concurrent scans launched on a **non-blocking** stream (heartbeat advanced), but the
+  index-probe oracle launches on a **flag-0 (blocking) pooled stream + synchronous NULL-stream memcpy + stream sync** —
+  the legacy-default-stream path is the leading suspect. **Implication:** the engine's existing launches use flag-0
+  pooled streams, so a co-resident wave kernel would freeze under normal engine traffic → R2.2 must FIRST resolve this
+  (candidate fixes: engine launches / wave stream interaction via non-blocking streams or avoiding NULL-stream sync; OR
+  the wave kernel REPLACES the launch-per-batch path so they never interleave — the ADR-008 SM-coexistence "replace"
+  option). NEXT R2 step = a focused freeze-mechanism probe (blocking vs non-blocking vs NULL-stream-sync interleave),
+  NOT blind wiring. Multi-projection correctness itself is settled.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

@@ -125,7 +125,15 @@ Spec: ARCHITECTURE §7 + §13.
   one change — `atom.cas` claim (bounded, no overshoot) vs `atom.add` — so cumulative `head` works across waves (the
   audited result/completion ordering path is unchanged). GPU test vs a CPU oracle (2 waves, clean exit) + ASCII guard
   pass; NOT yet wired into any query path.
-- (iv) **R2.2 — integrate the wave read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
+- **R2.2a wave multi-projection ✅ DONE (2026-06-27):** `WaveReadEngine::submit` now gathers up to 4 int4 columns
+  (R1's unrolled gather) over the ring and returns `CudaI32BatchProjectionRow`s byte-identical to the R1 index probe
+  (GPU oracle test green); `atom.cas` bounded claim makes cumulative multi-wave work.
+- **R2.2 BLOCKER — interleaved-launch freeze (DECISIONS ADR-008):** an interleaved GPU kernel launch (the index-probe
+  oracle on a flag-0/blocking pooled stream) FREEZES the idle persistent wave kernel. The engine launches on flag-0
+  pooled streams, so this must be resolved before wiring. **NEXT = a focused freeze-mechanism probe** (blocking vs
+  non-blocking vs NULL-stream-sync) → decides whether R2.2 fixes coexistence (non-blocking) or has the wave kernel
+  REPLACE the per-batch path (so launches never interleave).
+- (iv) **R2.2b — integrate the wave read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
   template; gate completion on the counter-acquire per the audit, NOT `all_done`), differential vs the batcher WITH NULL,
   HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
