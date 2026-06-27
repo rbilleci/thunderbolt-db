@@ -62,6 +62,9 @@ const MAX_PROJECTIONS: usize = 4;
 /// Per-needle result record (device-mapped): [status@0 u32, pad@4, row@8 u64, v0@16, v1@20, v2@24, v3@28].
 /// status: 0 = incomplete (bug), 1 = found, 2 = not found.
 const RES_SLOT_BYTES: usize = 32;
+/// Indices a thread claims per `atom.cas` (clamped to `head`). Amortizes the CAS + `membar.sys` +
+/// completion atomic over up to K indices (the probe's 1d-ii sweet spot was K=8); no overshoot.
+const CLAIM_BATCH: u32 = 8;
 /// Host-side timeout waiting for a wave to drain (the kernel's own backstop is the device-side net).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -118,12 +121,13 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     .param .u64 proj_off1,
     .param .u64 proj_off2,
     .param .u64 proj_off3,
+    .param .u32 claim_batch,
     .param .u64 max_ns
 )
 {
-    .reg .pred %p<8>;
-    .reg .b32 %r<32>;
-    .reg .b64 %rd<48>;
+    .reg .pred %p<10>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<64>;
 
     ld.param.u64 %rd1, [ctrl];
     ld.param.u64 %rd2, [counters];
@@ -139,94 +143,106 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     ld.param.u64 %rd30, [proj_off1];
     ld.param.u64 %rd31, [proj_off2];
     ld.param.u64 %rd32, [proj_off3];
+    ld.param.u32 %r5, [claim_batch];
     ld.param.u64 %rd8, [max_ns];
     mov.u64 %rd9, %globaltimer;
 
 $L_loop:
-    ld.volatile.global.u32 %r5, [%rd1];
-    setp.ne.s32 %p1, %r5, 0;
+    ld.volatile.global.u32 %r6, [%rd1];
+    setp.ne.s32 %p1, %r6, 0;
     @%p1 bra $L_done;
     mov.u64 %rd10, %globaltimer;
     sub.u64 %rd11, %rd10, %rd9;
     setp.ge.u64 %p1, %rd11, %rd8;
     @%p1 bra $L_done;
-    ld.volatile.global.u32 %r6, [%rd1+4];
-    ld.volatile.global.u32 %r7, [%rd2];
-    setp.ge.u32 %p1, %r7, %r6;
+    ld.volatile.global.u32 %r7, [%rd1+4];
+    ld.volatile.global.u32 %r8, [%rd2];
+    setp.ge.u32 %p1, %r8, %r7;
     @%p1 bra $L_loop;
-    add.u32 %r8, %r7, 1;
-    atom.global.cas.b32 %r9, [%rd2], %r7, %r8;
-    setp.ne.u32 %p1, %r9, %r7;
+    add.u32 %r9, %r8, %r5;
+    min.u32 %r9, %r9, %r7;
+    atom.global.cas.b32 %r10, [%rd2], %r8, %r9;
+    setp.ne.u32 %p1, %r10, %r8;
     @%p1 bra $L_loop;
-    and.b32 %r10, %r7, %r3;
-    mul.wide.u32 %rd12, %r10, 4;
+    sub.u32 %r11, %r9, %r8;
+    mov.u32 %r12, %r8;
+
+$L_proc:
+    setp.ge.u32 %p2, %r12, %r9;
+    @%p2 bra $L_after;
+    and.b32 %r13, %r12, %r3;
+    mul.wide.u32 %rd12, %r13, 4;
     add.u64 %rd13, %rd3, %rd12;
-    ld.volatile.global.u32 %r11, [%rd13];
-    mul.wide.u32 %rd14, %r10, 32;
+    ld.volatile.global.u32 %r14, [%rd13];
+    mul.wide.u32 %rd14, %r13, 32;
     add.u64 %rd15, %rd4, %rd14;
-    mul.lo.u32 %r12, %r11, 2654435761;
-    shr.u32 %r13, %r12, %r1;
-    mov.u32 %r14, 0;
-    mov.u32 %r15, 2;
+    mul.lo.u32 %r15, %r14, 2654435761;
+    shr.u32 %r15, %r15, %r1;
+    mov.u32 %r16, 0;
+    mov.u32 %r17, 2;
 
 $L_probe:
-    and.b32 %r13, %r13, %r2;
-    mul.wide.u32 %rd16, %r13, 8;
+    and.b32 %r15, %r15, %r2;
+    mul.wide.u32 %rd16, %r15, 8;
     add.u64 %rd17, %rd6, %rd16;
     ld.global.u64 %rd18, [%rd17];
-    setp.eq.u64 %p2, %rd18, 0;
-    @%p2 bra $L_write;
+    setp.eq.u64 %p3, %rd18, 0;
+    @%p3 bra $L_write;
     shr.u64 %rd19, %rd18, 32;
-    cvt.u32.u64 %r16, %rd19;
-    setp.ne.s32 %p2, %r16, %r11;
-    @%p2 bra $L_probe_next;
-    cvt.u32.u64 %r17, %rd18;
-    sub.u32 %r17, %r17, 1;
-    cvt.u64.u32 %rd20, %r17;
-    mov.u32 %r15, 1;
+    cvt.u32.u64 %r18, %rd19;
+    setp.ne.s32 %p3, %r18, %r14;
+    @%p3 bra $L_probe_next;
+    cvt.u32.u64 %r19, %rd18;
+    sub.u32 %r19, %r19, 1;
+    cvt.u64.u32 %rd20, %r19;
+    mov.u32 %r17, 1;
     st.global.u64 [%rd15+8], %rd20;
     mul.lo.u64 %rd21, %rd20, 4;
     add.u64 %rd22, %rd5, %rd7;
     add.u64 %rd22, %rd22, %rd21;
-    ld.global.s32 %r18, [%rd22];
-    st.global.s32 [%rd15+16], %r18;
-    setp.le.u32 %p3, %r4, 1;
-    @%p3 bra $L_write;
+    ld.global.s32 %r20, [%rd22];
+    st.global.s32 [%rd15+16], %r20;
+    setp.le.u32 %p4, %r4, 1;
+    @%p4 bra $L_write;
     add.u64 %rd22, %rd5, %rd30;
     add.u64 %rd22, %rd22, %rd21;
-    ld.global.s32 %r18, [%rd22];
-    st.global.s32 [%rd15+20], %r18;
-    setp.le.u32 %p3, %r4, 2;
-    @%p3 bra $L_write;
+    ld.global.s32 %r20, [%rd22];
+    st.global.s32 [%rd15+20], %r20;
+    setp.le.u32 %p4, %r4, 2;
+    @%p4 bra $L_write;
     add.u64 %rd22, %rd5, %rd31;
     add.u64 %rd22, %rd22, %rd21;
-    ld.global.s32 %r18, [%rd22];
-    st.global.s32 [%rd15+24], %r18;
-    setp.le.u32 %p3, %r4, 3;
-    @%p3 bra $L_write;
+    ld.global.s32 %r20, [%rd22];
+    st.global.s32 [%rd15+24], %r20;
+    setp.le.u32 %p4, %r4, 3;
+    @%p4 bra $L_write;
     add.u64 %rd22, %rd5, %rd32;
     add.u64 %rd22, %rd22, %rd21;
-    ld.global.s32 %r18, [%rd22];
-    st.global.s32 [%rd15+28], %r18;
+    ld.global.s32 %r20, [%rd22];
+    st.global.s32 [%rd15+28], %r20;
     bra $L_write;
 
 $L_probe_next:
-    add.u32 %r13, %r13, 1;
-    add.u32 %r14, %r14, 1;
-    setp.ge.u32 %p4, %r14, 256;
+    add.u32 %r15, %r15, 1;
+    add.u32 %r16, %r16, 1;
+    setp.ge.u32 %p4, %r16, 256;
     @%p4 bra $L_write;
     bra $L_probe;
 
 $L_write:
-    st.global.u32 [%rd15], %r15;
+    st.global.u32 [%rd15], %r17;
+    add.u32 %r12, %r12, 1;
+    bra $L_proc;
+
+$L_after:
     membar.sys;
-    atom.global.add.u32 %r19, [%rd2+4], 1;
-    add.u32 %r19, %r19, 1;
-    setp.ne.u32 %p5, %r19, %r6;
+    atom.global.add.u32 %r21, [%rd2+4], %r11;
+    add.u32 %r21, %r21, %r11;
+    setp.ne.u32 %p5, %r21, %r7;
     @%p5 bra $L_loop;
     membar.sys;
-    mov.u32 %r20, 1;
-    st.volatile.global.u32 [%rd1+8], %r20;
+    mov.u32 %r22, 1;
+    st.volatile.global.u32 [%rd1+8], %r22;
     bra $L_loop;
 
 $L_done:
@@ -403,6 +419,7 @@ impl WaveReadEngine {
             let mut a_off1 = proj[1];
             let mut a_off2 = proj[2];
             let mut a_off3 = proj[3];
+            let mut a_claim_batch = CLAIM_BATCH;
             let mut a_max = backstop_ns;
             let mut params = [
                 (&mut a_ctrl as *mut u64).cast::<c_void>(),
@@ -419,6 +436,7 @@ impl WaveReadEngine {
                 (&mut a_off1 as *mut u64).cast::<c_void>(),
                 (&mut a_off2 as *mut u64).cast::<c_void>(),
                 (&mut a_off3 as *mut u64).cast::<c_void>(),
+                (&mut a_claim_batch as *mut u32).cast::<c_void>(),
                 (&mut a_max as *mut u64).cast::<c_void>(),
             ];
             check_cuda(unsafe {
@@ -717,12 +735,13 @@ mod tests {
 
     /// R2.2 diagnostic — persistent wave vs launch-per-batch R1 index probe, swept over (large) batch.
     /// CAVEAT (DECISIONS ADR-008 "R2.2 evidence gate CORRECTION"): this is SINGLE-THREADED serialized
-    /// submit-and-wait, which is NOT the wave engine's intended regime, and the baseline (raw 1-thread
-    /// index probe) is NOT what the wave is meant to beat (that is the 156k single-coalescer batcher cap
-    /// under concurrency). It is a DIAGNOSTIC: it shows this NAIVE wave port plateaus at ~520k/s FLAT
-    /// across batch size (a per-needle drain ceiling, congestion-bound, ~85x below the proven probe's
-    /// 45M/s — it lacks the 1d batched-claiming/device-atomic optimizations). A FAIR wave evaluation
-    /// needs an optimized drain + a concurrent lock-free enqueue model measured vs the 156k batcher.
+    /// submit-and-wait (still blocking) — NOT the wave's intended pipelined/concurrent regime; the depth-K
+    /// pipelined benchmark (proper-port step 3) is the real evidence gate. The right baseline is the 156k
+    /// single-coalescer BATCHER cap (the production concurrent path), not the raw 1-thread index probe
+    /// (7-24M, a microbenchmark ceiling). With the OPTIMIZED drain (clamped-batched CAS claim + amortized
+    /// membar) the wave drain is now ~2.45M/s (was ~520k), already ~16x the batcher's 156k. Scaling peaks
+    /// near 128 threads — CAS contention on the single `claim` counter is the remaining limiter (sharded
+    /// counters would lift it toward the probe's 45M); more threads make it worse.
     /// Wave is measured FIRST then shut down, THEN the index probe — so the index probe's `cuMemAlloc`
     /// (which device-syncs) never runs while the wave kernel is live (the freeze root cause).
     ///
