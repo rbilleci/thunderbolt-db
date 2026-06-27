@@ -72,15 +72,18 @@ Spec: ARCHITECTURE §7 + §13.
   `cuMemHostGetDevicePointer` to the engine FFI for 1b. **1b ✅ DONE (2026-06-27)** =
   `crates/execution/examples/wave_dataplane_probe.rs` — persistent-kernel threads lock-free-claim requests
   (`atom.add`, no barriers), scan a resident key column, gather a payload, and write `(value<<32)|done` as one atomic
-  8-byte store; host enqueues needles + reads packed slots (no per-request host materialization). **~9.8M point
-  lookups/s (20k-row column, 8192 threads), all gathers + not-found verified — ~60× the 156k single-coalescer cap,
-  ~13× the CPU's 770k. The host-serial bottleneck is GONE** (bottleneck moved host→GPU = scales with hardware = the
-  bet). *Caveats:* bare data plane (slot→wire neutral mapping not yet built — but it's parallelizable, not serial);
-  full-scan-with-break per lookup (a GPU index pushes further); throughput is bound by the claim/`completed` atomics
-  being in host-mapped memory (move to device memory = next opt; explains the sublinear thread scaling + flat 4k-vs-20k
-  rows). → **NEXT (1c):** move the hot atomics to device memory + the slot→neutral-result mapping; then integrate into
-  the engine behind a default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher WITH NULL,
-  HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
+  8-byte store; host enqueues needles + reads packed slots (no per-request host materialization). **The host-serial
+  bottleneck is GONE — the bottleneck moved host→GPU (scales with hardware = the bet).** Independently audited: the
+  number is REAL (reproduced ~9.5–10.1M across 20 runs), correctness SOUND (proven non-vacuous via sabotage variants);
+  fixed a `membar.sys` ordering gap (held the number) + broadened not-found sampling. **Honest scan-knee curve (8192
+  threads):** small tables are atomic-ceiling-bound (4k:10.0M, 20k:8.3M req/s), but the full-scan is O(rows) so
+  100k:2.7M, 500k:755k, **1M-row table: 485k req/s** (~3× the 156k cap, ~CPU-ballpark, scan-bound). *Caveats:* bare
+  data plane (no slot→wire mapping yet — parallelizable, not serial); vs the 156k batcher is apples-to-oranges
+  (omits the full facade + neutral mapping). → **NEXT (1c), reordered by the audit:** the **GPU index** (ADR-009 hash/
+  sorted) is the priority — it removes the O(rows) scan so the atomic ceiling (~10M) governs at ANY table size; THEN
+  device-mem atomics (raise that ceiling) + slot→neutral-result mapping; THEN integrate into the engine behind a
+  default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher WITH NULL, HAZARD + audit.
+  The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).

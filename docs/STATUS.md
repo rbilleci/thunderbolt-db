@@ -81,8 +81,11 @@ the engine). **1a:** a persistent kernel polls a device-mapped doorbell and exit
 (clean exit on the `--gpu-reset`-denied box) is de-risked. **1b:** persistent-kernel threads lock-free-claim requests,
 scan a resident column, gather a payload, write packed `(value<<32)|done` atomically; host reads slots. **~9.8M point
 lookups/s, all gathers verified — ~60× the 156k cap, ~13× the CPU's 770k. The host-serial bottleneck moved host→GPU
-(scales with hardware = validates the bet).** Caveats + next (1c = device-mem atomics + slot→wire mapping, then engine
-integration): PLAN §3 / DECISIONS ADR-008. NOT yet integrated into the engine; the batcher stays the production default.
+(scales with hardware = validates the bet).** Independently audited: number REAL (20-run reproduce), correctness SOUND;
+fixed a `membar.sys` ordering gap (held the number). **Honest scan-knee:** small tables atomic-ceiling-bound (~10M),
+but full-scan is O(rows) → a 1M-row table does ~485k req/s (~3× cap, ~CPU-ballpark, scan-bound). **Next (1c, audit-
+reordered): the GPU index** (removes the scan → atomic ceiling governs at any scale), then device-mem atomics +
+slot→wire mapping, then engine integration. PLAN §3. NOT integrated; the batcher stays the production default.
 
 **Batcher Tier-1: per-shape template (2026-06-27).** Removed the redundant per-request host plan/bind
 from the point-lookup batcher's single coalescer: a needle-invariant `RelationalRetainedReadTemplate`
