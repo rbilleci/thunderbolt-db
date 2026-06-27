@@ -95,8 +95,12 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   atomics → device memory raises it). **Conclusion: the GPU does millions of point lookups/s at realistic scale; the
   residual bottleneck is GPU-architectural (scales with hardware) — the bet holds, and not just "ballpark", >10× the
   CPU at the data-plane level.** *Not yet integrated into the engine; the batcher remains the production default.*
-  Honest caveats: bare data plane (no slot→wire mapping / facade); static host-built index (real OLTP needs concurrent
-  index maintenance on writes — ADR-009 lock-free CAS inserts at epoch boundaries); synthetic keys; single-GPU.
+  Honest caveats (1c independently audited — no P0, number REAL + index NON-VACUOUS by sabotage tests): bare data
+  plane (no slot→wire mapping / facade — the ~13.6× is data-plane-only, not end-to-end); static host-built index (real
+  OLTP needs **concurrent index maintenance on writes** — ADR-009 lock-free CAS inserts at epoch boundaries — the key
+  write-path gap); **synthetic keys are BEST-CASE** (sequential + Fibonacci hash → equidistribution caps clusters at
+  length 2, avg ~1.18 probes; arbitrary OLTP key/insertion orders → longer chains, still O(1) but no depth-2 ceiling);
+  the ~10M ceiling is the **host-mapped PCIe atomic** (256 threads already saturate it → device memory next); single-GPU.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

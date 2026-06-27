@@ -4,10 +4,16 @@
 //! ADR-009 specifies a GPU index. This swaps the in-kernel serial scan for a hash-table probe: a
 //! host-built open-addressing table (`(key<<32)|(row+1)`, 0 = empty, load factor 0.5) is uploaded once;
 //! the persistent kernel hashes the needle (Fibonacci: `(needle * 0x9E3779B1) >> shift` — high bits, so
-//! sequential keys still distribute, not a perfect-hash artifact), linear-probes to the match, and
-//! gathers the payload at that row. O(1) average — so the wave engine should be atomic-ceiling-bound
-//! again at ANY table size, not scan-bound. Probe count is hard-capped (defensive: a probe loop inside
-//! a request would evade the `%globaltimer` backstop and zombie the context).
+//! sequential keys still COLLIDE: ~18% at 1M rows, avg ~1.18 probes — NOT a perfect hash), linear-probes
+//! to the match, and gathers the payload at that row. O(1) average — so the wave engine should be
+//! atomic-ceiling-bound again at ANY table size, not scan-bound. Probe count is hard-capped (defensive:
+//! a probe loop inside a request would evade the `%globaltimer` backstop and zombie the context).
+//!
+//! **Audit caveat (best-case ordering):** sequential keys inserted in order under a Fibonacci hash are
+//! the *friendliest* input for open addressing — equidistribution caps clusters at length 2 (avg ~1.18
+//! probes) regardless of size. A real OLTP index with arbitrary key/insertion order at load factor 0.5
+//! sees longer chains (still O(1), but no depth-2 ceiling). So the O(1) + flat-vs-size claim is sound;
+//! the *exact* ~1.18-probe number is workload-specific best-case, not a universal hash-table constant.
 //!
 //! Verifies present needles (gather correct) + absent (not-found), then measures vs the 1b scan curve
 //! (1M rows: ~485k req/s). Standalone (own libcuda + context).
