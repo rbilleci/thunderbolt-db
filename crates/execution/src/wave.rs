@@ -4,8 +4,8 @@
 //!
 //! A single persistent kernel is launched once over a resident int4 table's GPU hash index (the SAME R1
 //! index format `(key<<32)|(row+1)`, Fibonacci hash, 256-probe cap). Its worker threads drain a host-
-//! pinned **device-mapped ring** of needle requests: each thread bounded-claims the next index via a
-//! DEVICE-memory `atom.cas` (no block barriers — a barrier deadlock would evade the backstop and zombie
+//! pinned **device-mapped ring** of needle requests: each thread statically owns a GRID-STRIDE slice of the
+//! index space (no claim counter, no block barriers — a barrier deadlock would evade the backstop and zombie
 //! the shared context), hash-probes the index, **gathers up to `MAX_PROJECTIONS` int4 columns** at the
 //! matched row (exactly like the R1 `gpu_db_resident_i32_index_probe` kernel), and writes a per-needle
 //! result record (status + row_index + values). `submit_async` enqueues a wave and returns a `WaveTicket`
@@ -14,21 +14,28 @@
 //! host<->device round-trip; the blocking `submit` is `submit_async` + spin-`harvest`.
 //!
 //! ## Completion gate (DECISIONS ADR-008 "R2 all_done ordering audit") — load-bearing
-//! Counters (`claim`, `completed`) are **monotonic / cumulative** device-memory atomics, never reset; the
-//! ring is **circular** (`idx & ring_mask`). `submit_async` advances a cumulative `head`; a wave is
-//! complete once `completed >= base+len`. The kernel writes `completed` into a **host-mapped MIRROR** after
-//! its `membar.sys` + device-`completed` bump, and `harvest` reads that mirror DIRECTLY (a local
-//! system-RAM read, no DtoH — a DtoH spin congests with the kernel's PCIe polling). Because each worker
-//! releases its record writes ahead of its `completed` bump (`membar.sys`), `mirror >= base+len` means
-//! those records are host-visible (the audit's counter-acquire, host-mapped variant). The `all_done` flag
-//! is unused now; the mirror is the gate.
+//! `completed` is a **monotonic / cumulative** device-memory atomic, never reset; the ring is **circular**
+//! (`idx & ring_mask`). `submit_async` advances a cumulative `head`; a wave is complete once
+//! `completed >= base+len`. Each worker releases its record writes ahead of its `completed` bump
+//! (`membar.sys`), so `completed >= base+len` means this wave's records are host-visible (the audit's
+//! counter-acquire). **Thread 0** publishes the device `completed` into a **host-mapped MIRROR**, and
+//! `harvest` reads that mirror DIRECTLY (a local system-RAM read, no DtoH — a DtoH spin congests with the
+//! kernel's PCIe polling). The harvest gate is `completed >= base+len` AND `completed >= base` — the second
+//! guard is mandatory: when the kernel lags the host (`completed < base`) the wrapping subtraction would
+//! underflow and FALSE-fire, returning unwritten slots (an independent audit caught this — it had inflated
+//! the throughput benchmark into a no-op false-pass).
 //!
-//! ## Bounded, clamped-batched claim (vs the probe's speculative `atom.add`)
-//! Each thread CAS-claims a CLAMPED BATCH `[c, min(c+K, head))` in one `atom.cas` (K=`CLAIM_BATCH`), then
-//! does ONE `membar.sys` + ONE `atom.add(completed, cnt)` for the whole batch. This amortizes the CAS +
-//! system fence + completion atomic over up to K indices AND never overshoots `head` (correct for
-//! incremental/continuous fill — no lost requests), unlike the probe's `atom.add(claim, K)` which
-//! overshoots. The audited ordering (record writes -> `membar.sys` -> `completed` bump) is unchanged.
+//! ## Grid-stride claim (no claim counter, no CAS) + thread-0 coordinator
+//! Each thread STATICALLY owns indices `tid, tid+T, tid+2T, ...` (T = total launched threads); index `i` is
+//! processed by exactly thread `i mod T`, exactly once. There is **no claim counter and no CAS**, so claim
+//! contention is eliminated and the drain no longer collapses past ~512 threads (the prior clamped-`atom.cas`
+//! variant capped ~3.2M at 128 threads and DEGRADED/timed out beyond that). A thread accumulates up to
+//! `CLAIM_BATCH` processed indices, then does ONE `membar.sys` + ONE `atom.add(completed, cnt)` (the audited
+//! record-writes -> `membar.sys` -> `completed`-bump ordering). **Only thread 0 touches the host-mapped ctrl
+//! block**: it mirrors host `doorbell`+`head` into DEVICE memory (which every other worker polls — device
+//! reads, no PCIe) and publishes `completed` to the host mirror. Reason: thousands of workers polling the
+//! host-mapped ctrl over PCIe congest the bus and starve the host's `head` write -> waves never start ->
+//! timeouts. The `all_done` flag and the `claim` counter are unused.
 //!
 //! ## Safety net (the `--gpu-reset`-denied-box rule, proven in probe 1a)
 //! The kernel ALWAYS self-terminates: host doorbell OR a `%globaltimer` wall-clock backstop (`backstop_ns`).
@@ -70,8 +77,9 @@ const MAX_PROJECTIONS: usize = 4;
 /// Per-needle result record (device-mapped): [status@0 u32, pad@4, row@8 u64, v0@16, v1@20, v2@24, v3@28].
 /// status: 0 = incomplete (bug), 1 = found, 2 = not found.
 const RES_SLOT_BYTES: usize = 32;
-/// Indices a thread claims per `atom.cas` (clamped to `head`). Amortizes the CAS + `membar.sys` +
-/// completion atomic over up to K indices (the probe's 1d-ii sweet spot was K=8); no overshoot.
+/// Grid-stride indices a thread processes between completion flushes. Amortizes the `membar.sys` + the
+/// `atom.add(completed)` over up to K indices (the probe's sweet spot was K=8). Overridable for tuning via
+/// `GPU_DB_WAVE_CLAIM_BATCH`.
 const CLAIM_BATCH: u32 = 8;
 
 /// Handle to an in-flight `submit_async` wave: its cumulative ring range `[base, base+len)`. `harvest`
@@ -112,12 +120,13 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> i32;
 
-/// The persistent multi-projection data-plane kernel (proper port). Each thread CAS-claims a CLAMPED
-/// BATCH `[c, min(c+K, head))` in one `atom.cas` (no overshoot — correct for incremental fill), processes
-/// that range (R1's 4-way-unrolled multi-column gather, per-needle record [status,row,v0..v3]), then does
-/// ONE `membar.sys` + ONE `atom.add(completed, cnt)` per batch and writes `completed` to a host-mapped
-/// MIRROR (`ctrl+64`, own cacheline) for the host to read without a DtoH. record-writes -> `membar.sys` -> `completed`
-/// bump (-> mirror) ordering preserves the `all_done` ordering audit's counter-acquire. Pure ASCII.
+/// The persistent multi-projection data-plane kernel. Each thread processes a GRID-STRIDE slice of the index
+/// space (`idx = tid, tid+T, ...`; no claim counter, no CAS), per index doing R1's 4-way-unrolled
+/// multi-column gather + a per-needle record [status,row,v0..v3]; after every K processed indices it does
+/// ONE `membar.sys` + ONE `atom.add(completed, cnt)`. Thread 0 is the coordinator: it mirrors host
+/// doorbell+head into device memory for the other workers (so they never poll the host-mapped ctrl over
+/// PCIe) and publishes `completed` to the host-mapped MIRROR (`ctrl+64`). record-writes -> `membar.sys` ->
+/// `completed`-bump ordering preserves the ordering audit's counter-acquire. Pure ASCII.
 const WAVE_DATAPLANE_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -164,29 +173,64 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     ld.param.u64 %rd8, [max_ns];
     mov.u64 %rd9, %globaltimer;
 
+    // Grid-stride claim (ONCE): each thread statically owns indices tid, tid+T, tid+2T, ... where T is the
+    // TOTAL launched threads. There is NO claim counter and NO CAS -> zero claim contention -> throughput
+    // scales with threads. (The clamped-CAS variant capped ~3.2M at 128 threads and DEGRADED past that on
+    // CAS contention; 2048 threads timed out.) Indices are global/cumulative so sequential waves are
+    // covered seamlessly: index i is processed by exactly thread (i mod T), exactly once.
+    mov.u32 %r26, %ntid.x;
+    mov.u32 %r23, %ctaid.x;
+    mov.u32 %r27, %tid.x;                        // special regs must be moved before use in mad/mul
+    mad.lo.u32 %r23, %r23, %r26, %r27;           // r23 = global tid = ctaid*ntid + tid
+    mov.u32 %r24, %nctaid.x;
+    mul.lo.u32 %r24, %r24, %r26;                // r24 = T = nctaid * ntid (actual total threads)
+    mov.u32 %r12, %r23;                          // r12 = idx (this thread's current index)
+    mov.u32 %r25, 0;                             // r25 = cnt_in_batch (processed since last completion flush)
+
 $L_loop:
-    ld.volatile.global.u32 %r6, [%rd1];
+    // Thread 0 is the SOLE accessor of the host-mapped ctrl block. It (a) mirrors host doorbell+head into
+    // DEVICE memory (counters+12, counters+8) for the other workers to poll, and (b) publishes the device
+    // `completed` counter into the host-mapped mirror (single writer -> monotonic plain store). Every other
+    // thread polls ONLY device memory. Reason: 1000s of threads polling the host-mapped ctrl over PCIe
+    // congest the bus and starve the host's head write -> 65536-waves never start -> timeouts (the failure
+    // the audit traced, and the limiter that capped earlier variants at ~512 threads).
+    setp.ne.u32 %p1, %r23, 0;
+    @%p1 bra $L_poll;
+    ld.volatile.global.u32 %r28, [%rd1];        // host doorbell
+    st.volatile.global.u32 [%rd2+12], %r28;     // -> device doorbell mirror
+    ld.volatile.global.u32 %r28, [%rd1+4];      // host head
+    st.volatile.global.u32 [%rd2+8], %r28;      // -> device head mirror
+    ld.volatile.global.u32 %r28, [%rd2+4];      // device completed
+    st.volatile.global.u32 [%rd1+64], %r28;     // -> host-mapped completed MIRROR (harvest reads it, no DtoH)
+$L_poll:
+    ld.volatile.global.u32 %r6, [%rd2+12];      // device doorbell mirror (all threads -> device read, no PCIe)
     setp.ne.s32 %p1, %r6, 0;
-    @%p1 bra $L_done;
+    @%p1 bra $L_flush_exit;
     mov.u64 %rd10, %globaltimer;
     sub.u64 %rd11, %rd10, %rd9;
     setp.ge.u64 %p1, %rd11, %rd8;
-    @%p1 bra $L_done;
-    ld.volatile.global.u32 %r7, [%rd1+4];
-    ld.volatile.global.u32 %r8, [%rd2];
-    setp.ge.u32 %p1, %r8, %r7;
-    @%p1 bra $L_loop;
-    add.u32 %r9, %r8, %r5;
-    min.u32 %r9, %r9, %r7;
-    atom.global.cas.b32 %r10, [%rd2], %r8, %r9;
-    setp.ne.u32 %p1, %r10, %r8;
-    @%p1 bra $L_loop;
-    sub.u32 %r11, %r9, %r8;
-    mov.u32 %r12, %r8;
+    @%p1 bra $L_flush_exit;                      // wall-clock backstop -> flush pending + exit
+    ld.volatile.global.u32 %r7, [%rd2+8];       // device head mirror (all threads -> device read, no PCIe)
+    setp.lt.u32 %p1, %r12, %r7;
+    @%p1 bra $L_have;                            // idx < head -> needle ready
+    // No needle for idx yet: publish any pending completion so the host sees progress, then back off on the
+    // wall clock (NOT a tight head re-poll: many idle threads polling head over PCIe starve the host's head
+    // write -- the failure mode the audit traced).
+    setp.eq.u32 %p1, %r25, 0;
+    @%p1 bra $L_backoff;
+    membar.sys;
+    atom.global.add.u32 %r21, [%rd2+4], %r25;   // publish pending to device counter; thread 0 mirrors it to the host
+    mov.u32 %r25, 0;
+$L_backoff:
+    mov.u64 %rd33, %globaltimer;
+$L_backoff_spin:
+    mov.u64 %rd34, %globaltimer;
+    sub.u64 %rd35, %rd34, %rd33;
+    setp.lt.u64 %p1, %rd35, 1024;
+    @%p1 bra $L_backoff_spin;
+    bra $L_loop;
 
-$L_proc:
-    setp.ge.u32 %p2, %r12, %r9;
-    @%p2 bra $L_after;
+$L_have:
     and.b32 %r13, %r12, %r3;
     mul.wide.u32 %rd12, %r13, 4;
     add.u64 %rd13, %rd3, %rd12;
@@ -247,21 +291,21 @@ $L_probe_next:
     bra $L_probe;
 
 $L_write:
-    st.global.u32 [%rd15], %r17;
-    add.u32 %r12, %r12, 1;
-    bra $L_proc;
-
-$L_after:
-    membar.sys;
-    atom.global.add.u32 %r21, [%rd2+4], %r11;
-    add.u32 %r21, %r21, %r11;
-    st.volatile.global.u32 [%rd1+64], %r21;     // host-mapped completed MIRROR on its OWN cacheline (harvest reads it, no DtoH)
-    setp.ne.u32 %p5, %r21, %r7;
-    @%p5 bra $L_loop;
-    membar.sys;
-    mov.u32 %r22, 1;
-    st.volatile.global.u32 [%rd1+8], %r22;
+    st.global.u32 [%rd15], %r17;                // status written LAST (record body already stored above)
+    add.u32 %r25, %r25, 1;                       // cnt_in_batch++
+    add.u32 %r12, %r12, %r24;                    // grid-stride advance: idx += T
+    setp.lt.u32 %p2, %r25, %r5;                  // keep accumulating until K processed (amortize membar+atom)
+    @%p2 bra $L_loop;
+    membar.sys;                                  // release this batch's record writes BEFORE the completion bump
+    atom.global.add.u32 %r21, [%rd2+4], %r25;    // completed += cnt_in_batch (cumulative device counter; thread 0 mirrors it)
+    mov.u32 %r25, 0;
     bra $L_loop;
+
+$L_flush_exit:
+    setp.eq.u32 %p1, %r25, 0;                    // on exit, publish any unflushed records (else completed lags head -> host hangs)
+    @%p1 bra $L_done;
+    membar.sys;
+    atom.global.add.u32 %r21, [%rd2+4], %r25;    // finalize device counter on exit (host has already harvested; mirror not needed post-shutdown)
 
 $L_done:
     ret;
@@ -384,9 +428,13 @@ impl WaveReadEngine {
         let mut res_host: *mut c_void = ptr::null_mut();
         let mut stream: *mut c_void = ptr::null_mut();
         let setup = (|| -> Result<(), CudaRuntimeProbeError> {
-            check_cuda(unsafe { cu_mem_alloc(&mut counters, 8) })?;
-            let zero = [0u32; 2];
-            check_cuda(unsafe { cu_memcpy_htod(counters, zero.as_ptr().cast::<c_void>(), 8) })?;
+            // [claim@0, completed@4, dev_head@8, dev_doorbell@12] — claim is unused by the grid-stride
+            // kernel; dev_head/dev_doorbell are DEVICE-memory mirrors of the host-mapped ctrl that thread 0
+            // republishes each iter, so the other (1000s of) worker threads poll DEVICE memory instead of
+            // hammering the host-mapped ctrl over PCIe (which starves the host's head write -> timeouts).
+            check_cuda(unsafe { cu_mem_alloc(&mut counters, 16) })?;
+            let zero = [0u32; 4];
+            check_cuda(unsafe { cu_memcpy_htod(counters, zero.as_ptr().cast::<c_void>(), 16) })?;
 
             check_cuda(unsafe {
                 cu_mem_host_alloc(&mut ctrl_host, CTRL_BYTES, CU_MEMHOSTALLOC_DEVICEMAP)
@@ -434,7 +482,10 @@ impl WaveReadEngine {
             let mut a_off1 = proj[1];
             let mut a_off2 = proj[2];
             let mut a_off3 = proj[3];
-            let mut a_claim_batch = CLAIM_BATCH;
+            let mut a_claim_batch = std::env::var("GPU_DB_WAVE_CLAIM_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(CLAIM_BATCH);
             let mut a_max = backstop_ns;
             let mut params = [
                 (&mut a_ctrl as *mut u64).cast::<c_void>(),
@@ -572,7 +623,13 @@ impl WaveReadEngine {
         let completed = unsafe {
             ptr::read_volatile((self.ctrl_host as *const u8).add(COMPLETED_MIRROR_OFFSET).cast::<u32>())
         };
-        if completed.wrapping_sub(ticket.base) < ticket.len {
+        // Ready iff `completed` has reached `base + len`. The kernel can fall BEHIND the host (it hasn't
+        // drained up to this wave's start yet), i.e. `completed < base`; that case MUST gate to None.
+        // Without the `completed < base` guard, `wrapping_sub` underflows to ~u32::MAX, the gate
+        // false-fires, and `read_records` returns UNWRITTEN slots (audit finding — a no-op false-pass that
+        // also inflated the benchmark). NOTE: `base`/`completed`/`len` are cumulative u32 — sound for a
+        // session under ~4B lookups; widen to u64 for long-running durability (TODO).
+        if completed < ticket.base || completed.wrapping_sub(ticket.base) < ticket.len {
             return Ok(None);
         }
         Ok(Some(self.read_records(ticket.base, ticket.len)))
@@ -775,15 +832,16 @@ mod tests {
         );
     }
 
-    /// R2.2 diagnostic — persistent wave vs launch-per-batch R1 index probe, swept over (large) batch.
-    /// CAVEAT (DECISIONS ADR-008 "R2.2 evidence gate CORRECTION"): this is SINGLE-THREADED serialized
-    /// submit-and-wait (still blocking) — NOT the wave's intended pipelined/concurrent regime; the depth-K
-    /// pipelined benchmark (proper-port step 3) is the real evidence gate. The right baseline is the 156k
-    /// single-coalescer BATCHER cap (the production concurrent path), not the raw 1-thread index probe
-    /// (7-24M, a microbenchmark ceiling). With the OPTIMIZED drain (clamped-batched CAS claim + amortized
-    /// membar) the wave drain is now ~2.45M/s (was ~520k), already ~16x the batcher's 156k. Scaling peaks
-    /// near 128 threads — CAS contention on the single `claim` counter is the remaining limiter (sharded
-    /// counters would lift it toward the probe's 45M); more threads make it worse.
+    /// R2.2 diagnostic — persistent wave vs launch-per-batch R1 index probe, swept over batch size.
+    /// CAVEAT (DECISIONS ADR-008): this is SINGLE-FLIGHT submit-and-wait (blocking) — the wave's WORST case,
+    /// NOT its intended pipelined/concurrent regime. Each timed wave is verified to return `batch` rows
+    /// (in-loop adversarial check — a no-op/early harvest trips it instead of inflating throughput, the bug
+    /// an independent audit found in the old gate). Verified picture (grid-stride drain, thread-0
+    /// coordinator): the wave WINS small batches (~3x lpb at 1/8, ~2.2x at 32, the OLTP regime), crosses over
+    /// near batch 256, and LOSES large batches (~7.6M vs lpb ~23M). The large-batch loss is HOST-bound, not
+    /// GPU-bound: `submit_async`/`read_records` move needles+records one-at-a-time over the host-mapped ring,
+    /// vs lpb's bulk `cuMemcpy` DMA; the GPU drain itself does not cap here (more threads do not change the
+    /// number). Bulk host I/O + pipelining are the levers to close the large-batch gap.
     /// Wave is measured FIRST then shut down, THEN the index probe — so the index probe's `cuMemAlloc`
     /// (which device-syncs) never runs while the wave kernel is live (the freeze root cause).
     ///
@@ -865,6 +923,38 @@ mod tests {
                 30_000_000_000,
             )
             .expect("wave engine");
+
+            // CORRECTNESS GATE (charter: adversarial verification): a sampled wave's rows MUST match a
+            // CPU oracle. needles_for(b, it) = keys[(it*b+i) % rows], all present, so row = (it*b+i)%rows
+            // and the projection ([payload_offset]) yields payload[row]. Guards against a fast-but-wrong
+            // drain (e.g. early/incomplete harvest reporting completion before all needles are processed).
+            // Uses a CPU oracle, NOT the R1 probe (whose cuMemAlloc would device-sync-kill the live kernel).
+            for &cb in &[64usize, 1000, 65536] {
+                let cb = cb.min(ring_capacity);
+                let sample = needles_for(cb, 3);
+                let mut got = engine.submit(&sample).expect("correctness submit");
+                got.sort_by_key(|r| (r.needle_index, r.row_index));
+                let mut want: Vec<CudaI32BatchProjectionRow> = (0..cb)
+                    .map(|i| {
+                        let row = (3usize.wrapping_mul(cb).wrapping_add(i)) % rows as usize;
+                        CudaI32BatchProjectionRow {
+                            needle_index: i,
+                            row_index: row as u64,
+                            values: vec![payload[row]],
+                        }
+                    })
+                    .collect();
+                want.sort_by_key(|r| (r.needle_index, r.row_index));
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "wave drain returned {} rows, expected {} (batch={cb}, threads={wave_threads}) — FAST-BUT-WRONG",
+                    got.len(),
+                    want.len()
+                );
+                assert_eq!(got, want, "wave drain WRONG rows at batch={cb} threads={wave_threads}");
+            }
+
             for (bi, &batch) in batch_sizes.iter().enumerate() {
                 let iters = iters_for(batch);
                 // A timeout (Err) records 0 for this config rather than crashing (high thread counts can
@@ -876,9 +966,26 @@ mod tests {
                 let t = Instant::now();
                 let mut ok = true;
                 for it in 0..iters {
-                    if engine.submit(&needles_for(batch, it)).is_err() {
-                        ok = false;
-                        break;
+                    match engine.submit(&needles_for(batch, it)) {
+                        // EVERY timed wave MUST return `batch` rows (needles are all present keys). This
+                        // bakes the charter's adversarial verification INTO the measurement: a no-op/early
+                        // harvest (the gate-underflow bug the audit found) returns empty/short and trips
+                        // here instead of silently inflating throughput. `black_box` stops the compiler
+                        // eliding the `read_records` work.
+                        Ok(rows) => {
+                            assert_eq!(
+                                rows.len(),
+                                batch,
+                                "TIMED wave returned {} rows, expected {batch} (no-op/early harvest) \
+                                 threads={wave_threads}",
+                                rows.len()
+                            );
+                            std::hint::black_box(&rows);
+                        }
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
                 let secs = t.elapsed().as_secs_f64();
