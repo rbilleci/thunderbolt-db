@@ -8,24 +8,27 @@
 //! DEVICE-memory `atom.cas` (no block barriers — a barrier deadlock would evade the backstop and zombie
 //! the shared context), hash-probes the index, **gathers up to `MAX_PROJECTIONS` int4 columns** at the
 //! matched row (exactly like the R1 `gpu_db_resident_i32_index_probe` kernel), and writes a per-needle
-//! result record (status + row_index + values). `submit` enqueues a wave of needles and reads the records
-//! back as `CudaI32BatchProjectionRow`s — byte-identical to the R1 index probe, one row per found needle.
+//! result record (status + row_index + values). `submit_async` enqueues a wave and returns a `WaveTicket`
+//! immediately; `harvest` turns a ticket into `CudaI32BatchProjectionRow`s once it drains — byte-identical
+//! to the R1 index probe, one row per found needle. Pipelining many tickets (depth K) amortizes the
+//! host<->device round-trip; the blocking `submit` is `submit_async` + spin-`harvest`.
 //!
 //! ## Completion gate (DECISIONS ADR-008 "R2 all_done ordering audit") — load-bearing
 //! Counters (`claim`, `completed`) are **monotonic / cumulative** device-memory atomics, never reset; the
-//! ring is **circular** (`idx & ring_mask`). Each `submit` advances a cumulative `head` and waits until
-//! `completed == head` read back via **`cuMemcpyDtoH` (the host ACQUIRING the device counter — the proven
-//! 1b pattern)** before reading any result record. Each worker releases all its record writes ahead of its
-//! `completed` bump via `membar.sys`, so the counter-acquire makes every record visible. The host-mapped
-//! `all_done` flag is ONLY a wake hint; it carries no happens-before for the records, so it is NEVER the
-//! gate.
+//! ring is **circular** (`idx & ring_mask`). `submit_async` advances a cumulative `head`; a wave is
+//! complete once `completed >= base+len`. The kernel writes `completed` into a **host-mapped MIRROR** after
+//! its `membar.sys` + device-`completed` bump, and `harvest` reads that mirror DIRECTLY (a local
+//! system-RAM read, no DtoH — a DtoH spin congests with the kernel's PCIe polling). Because each worker
+//! releases its record writes ahead of its `completed` bump (`membar.sys`), `mirror >= base+len` means
+//! those records are host-visible (the audit's counter-acquire, host-mapped variant). The `all_done` flag
+//! is unused now; the mirror is the gate.
 //!
-//! ## Bounded claim (vs the probe's speculative `atom.add`)
-//! The claim uses `atom.cas` (increments `claim` by 1 only while `claim < head`), so `claim` never
-//! overshoots `head` — it ends exactly at `head` each wave and a cumulative `head` admits the next wave.
-//! (The probe's `atom.add` overshoots ~thread-count, harmless in its single wave but it would stall the
-//! next.) This is orthogonal to the audited path: result writes -> `membar.sys` -> `completed` bump ->
-//! `all_done` is unchanged, so the ordering audit still holds.
+//! ## Bounded, clamped-batched claim (vs the probe's speculative `atom.add`)
+//! Each thread CAS-claims a CLAMPED BATCH `[c, min(c+K, head))` in one `atom.cas` (K=`CLAIM_BATCH`), then
+//! does ONE `membar.sys` + ONE `atom.add(completed, cnt)` for the whole batch. This amortizes the CAS +
+//! system fence + completion atomic over up to K indices AND never overshoots `head` (correct for
+//! incremental/continuous fill — no lost requests), unlike the probe's `atom.add(claim, K)` which
+//! overshoots. The audited ordering (record writes -> `membar.sys` -> `completed` bump) is unchanged.
 //!
 //! ## Safety net (the `--gpu-reset`-denied-box rule, proven in probe 1a)
 //! The kernel ALWAYS self-terminates: host doorbell OR a `%globaltimer` wall-clock backstop (`backstop_ns`).
@@ -55,8 +58,13 @@ use crate::{
 
 const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 const CU_STREAM_NON_BLOCKING: u32 = 0x01;
-/// Control block bytes (device-mapped pinned): [doorbell@0, head@4, all_done@8]; rest reserved.
-const CTRL_BYTES: usize = 64;
+/// Control block bytes (device-mapped pinned), TWO cachelines to avoid false sharing: cacheline 0 =
+/// [doorbell@0, head@4, all_done@8] (GPU polls these every iteration); cacheline 1 = [completed_mirror@64]
+/// (the host tight-spins reading this in `harvest`). Keeping the host-spun mirror off the GPU-polled
+/// cacheline stops the host spin from starving the kernel's head/doorbell PCIe reads.
+const CTRL_BYTES: usize = 128;
+/// Byte offset of the host-mapped `completed` mirror (its own cacheline).
+const COMPLETED_MIRROR_OFFSET: usize = 64;
 /// Max projected int4 columns per needle (matches the R1 index probe's `MAX_PROJECTIONS`).
 const MAX_PROJECTIONS: usize = 4;
 /// Per-needle result record (device-mapped): [status@0 u32, pad@4, row@8 u64, v0@16, v1@20, v2@24, v3@28].
@@ -65,6 +73,14 @@ const RES_SLOT_BYTES: usize = 32;
 /// Indices a thread claims per `atom.cas` (clamped to `head`). Amortizes the CAS + `membar.sys` +
 /// completion atomic over up to K indices (the probe's 1d-ii sweet spot was K=8); no overshoot.
 const CLAIM_BATCH: u32 = 8;
+
+/// Handle to an in-flight `submit_async` wave: its cumulative ring range `[base, base+len)`. `harvest`
+/// turns it into rows once `completed >= base + len`. `Copy` so the host can queue many in flight.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WaveTicket {
+    base: u32,
+    len: u32,
+}
 /// Host-side timeout waiting for a wave to drain (the kernel's own backstop is the device-side net).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -96,11 +112,12 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> i32;
 
-/// The persistent multi-projection data-plane kernel. From the audited `wave_devatomic_probe` kernel,
-/// with (1) `atom.cas` bounded claim instead of `atom.add` (no overshoot, for multi-wave persistence),
-/// and (2) the R1 index-probe's 4-way-unrolled multi-column gather + a per-needle result record (status,
-/// row, values) instead of a single packed value. The result-writes -> `membar.sys` -> `completed` bump
-/// -> `all_done` ordering is UNCHANGED, so the `all_done` ordering audit still applies. Pure ASCII.
+/// The persistent multi-projection data-plane kernel (proper port). Each thread CAS-claims a CLAMPED
+/// BATCH `[c, min(c+K, head))` in one `atom.cas` (no overshoot — correct for incremental fill), processes
+/// that range (R1's 4-way-unrolled multi-column gather, per-needle record [status,row,v0..v3]), then does
+/// ONE `membar.sys` + ONE `atom.add(completed, cnt)` per batch and writes `completed` to a host-mapped
+/// MIRROR (`ctrl+64`, own cacheline) for the host to read without a DtoH. record-writes -> `membar.sys` -> `completed`
+/// bump (-> mirror) ordering preserves the `all_done` ordering audit's counter-acquire. Pure ASCII.
 const WAVE_DATAPLANE_PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -238,6 +255,7 @@ $L_after:
     membar.sys;
     atom.global.add.u32 %r21, [%rd2+4], %r11;
     add.u32 %r21, %r21, %r11;
+    st.volatile.global.u32 [%rd1+64], %r21;     // host-mapped completed MIRROR on its OWN cacheline (harvest reads it, no DtoH)
     setp.ne.u32 %p5, %r21, %r7;
     @%p5 bra $L_loop;
     membar.sys;
@@ -287,7 +305,6 @@ pub(crate) struct WaveReadEngine {
     proj_count: u32,
     /// Cumulative count of needles ever published (host-tracked; mirrors ctrl.head). Monotonic.
     head: u32,
-    cu_memcpy_dtoh: CuMemcpyDtoH,
     cu_stream_synchronize: CuStreamSynchronize,
     cu_stream_destroy: CuStreamDestroy,
     cu_mem_free: CuMemFree,
@@ -333,8 +350,6 @@ impl WaveReadEngine {
         let cu_mem_free: CuMemFree = unsafe { sym(lib, &[b"cuMemFree_v2\0", b"cuMemFree\0"]) }?;
         let cu_memcpy_htod: CuMemcpyHtoD =
             unsafe { sym(lib, &[b"cuMemcpyHtoD_v2\0", b"cuMemcpyHtoD\0"]) }?;
-        let cu_memcpy_dtoh: CuMemcpyDtoH =
-            unsafe { sym(lib, &[b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0"]) }?;
         let cu_mem_host_alloc: CuMemHostAlloc = unsafe { sym(lib, &[b"cuMemHostAlloc\0"]) }?;
         let cu_mem_host_get_device_pointer: CuMemHostGetDevicePointer = unsafe {
             sym(
@@ -491,7 +506,6 @@ impl WaveReadEngine {
             ring_mask,
             proj_count,
             head: 0,
-            cu_memcpy_dtoh,
             cu_stream_synchronize,
             cu_stream_destroy,
             cu_mem_free,
@@ -500,16 +514,20 @@ impl WaveReadEngine {
         })
     }
 
-    /// Run one wave: enqueue `needles` (each a key value), wait for the wave to drain (the DtoH
-    /// counter-acquire gate), and return one `CudaI32BatchProjectionRow` per FOUND needle (byte-identical
-    /// to the R1 index probe; `needle_index` is the position in `needles`). Serialized — one wave in
-    /// flight, so the circular ring never overwrites an un-read wave. `needles.len() <= ring_capacity`.
-    pub(crate) fn submit(
+    /// Enqueue a wave of `needles` (each a key value) and return IMMEDIATELY (non-blocking) with a
+    /// `WaveTicket`. The host can keep MANY tickets in flight and `harvest` them as they drain — the only
+    /// way the persistent kernel amortizes its host<->device round-trip (review directive B). The caller
+    /// must bound total un-harvested needles to `ring_capacity` so the circular ring never overwrites an
+    /// un-read wave. `needle_index` in the harvested rows is the position within THIS `needles` slice.
+    pub(crate) fn submit_async(
         &mut self,
         needles: &[i32],
-    ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+    ) -> Result<WaveTicket, CudaRuntimeProbeError> {
         if needles.is_empty() {
-            return Ok(Vec::new());
+            return Ok(WaveTicket {
+                base: self.head,
+                len: 0,
+            });
         }
         if needles.len() > self.ring_capacity {
             return Err(CudaRuntimeProbeError::InvalidInputLength(needles.len()));
@@ -525,42 +543,47 @@ impl WaveReadEngine {
                 ptr::write_volatile(res.add(slot * RES_SLOT_BYTES).cast::<u32>(), 0);
             }
         }
-        unsafe { ptr::write_volatile((self.ctrl_host as *mut u32).add(2), 0) }; // all_done wake hint
         fence(Ordering::SeqCst);
         let new_head = base + needles.len() as u32;
         self.head = new_head;
         unsafe { ptr::write_volatile((self.ctrl_host as *mut u32).add(1), new_head) }; // publish head
         fence(Ordering::SeqCst);
+        Ok(WaveTicket {
+            base,
+            len: needles.len() as u32,
+        })
+    }
 
-        let deadline = Instant::now() + DRAIN_TIMEOUT;
-        // Wake hint: cheap host-mapped poll of all_done so we don't hammer DtoH.
-        loop {
-            if unsafe { ptr::read_volatile((self.ctrl_host as *const u32).add(2)) } != 0 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::hint::spin_loop();
+    /// Non-blocking completion check + read for a `submit_async` ticket. Reads the HOST-MAPPED `completed`
+    /// mirror directly — a local system-RAM read (~ns), NOT a DtoH (a PCIe round-trip that also congests
+    /// with the kernel's polling; the review flagged the DtoH spin). The kernel writes the mirror AFTER
+    /// its `membar.sys` + device `completed` bump, so `mirror >= base+len` means this wave's records are
+    /// host-visible (the audit's counter-acquire, host-mapped variant). If ready, read + return the rows
+    /// (found needles only, byte-identical to the R1 index probe); else `None`. The mirror is last-writer-
+    /// wins (`st.volatile`, untorn 4-byte) and can briefly under-read under contention — safe (an
+    /// under-read only delays, never reads records early); the caller just retries.
+    pub(crate) fn harvest(
+        &self,
+        ticket: WaveTicket,
+    ) -> Result<Option<Vec<CudaI32BatchProjectionRow>>, CudaRuntimeProbeError> {
+        if ticket.len == 0 {
+            return Ok(Some(Vec::new()));
         }
-        // AUTHORITATIVE GATE (ADR-008 "R2 all_done ordering audit"): host ACQUIRES the device `completed`
-        // counter (== cumulative head) via DtoH BEFORE reading any record (the sound 1b release/acquire).
-        let mut counters = [0u32; 2];
-        loop {
-            check_cuda(unsafe {
-                (self.cu_memcpy_dtoh)(counters.as_mut_ptr().cast::<c_void>(), self.counters, 8)
-            })?;
-            if counters[1] >= new_head {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(CudaRuntimeProbeError::KernelLaunchFailed(-1));
-            }
-            std::hint::spin_loop();
+        let completed = unsafe {
+            ptr::read_volatile((self.ctrl_host as *const u8).add(COMPLETED_MIRROR_OFFSET).cast::<u32>())
+        };
+        if completed.wrapping_sub(ticket.base) < ticket.len {
+            return Ok(None);
         }
+        Ok(Some(self.read_records(ticket.base, ticket.len)))
+    }
 
+    /// Read the per-needle records for a fully-drained wave `[base, base+len)` into rows (found needles
+    /// only). Caller MUST have confirmed completion (the `harvest` gate) before calling.
+    fn read_records(&self, base: u32, len: u32) -> Vec<CudaI32BatchProjectionRow> {
+        let res = self.res_host as *mut u8;
         let mut rows = Vec::new();
-        for (i, _needle) in needles.iter().enumerate() {
+        for i in 0..len as usize {
             let slot = (base as usize + i) & (self.ring_mask as usize);
             let rec = unsafe { res.add(slot * RES_SLOT_BYTES) };
             let status = unsafe { ptr::read_volatile(rec.cast::<u32>()) };
@@ -578,7 +601,26 @@ impl WaveReadEngine {
                 values,
             });
         }
-        Ok(rows)
+        rows
+    }
+
+    /// Blocking single-wave submit (`submit_async` + spin-`harvest`). Kept for correctness tests and
+    /// request-response callers; for THROUGHPUT use `submit_async`/`harvest` pipelined (depth K).
+    pub(crate) fn submit(
+        &mut self,
+        needles: &[i32],
+    ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+        let ticket = self.submit_async(needles)?;
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        loop {
+            if let Some(rows) = self.harvest(ticket)? {
+                return Ok(rows);
+            }
+            if Instant::now() >= deadline {
+                return Err(CudaRuntimeProbeError::KernelLaunchFailed(-1));
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Ring the doorbell, wait for the kernel to exit, then free the stream + buffers. Idempotent.
@@ -768,7 +810,7 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(128);
         // Adaptive iters so total work per batch size is ~constant (large single waves = continuous fill).
-        let target_lookups: usize = 4_000_000;
+        let target_lookups: usize = 2_000_000;
         let keys: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(3).wrapping_add(1)).collect();
         let payload: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(1000).wrapping_add(7)).collect();
         let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
@@ -797,11 +839,12 @@ mod tests {
         let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
         let index_resident = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).expect("index"));
 
-        // Large batches = continuous-fill in ONE wave (amortizes the per-wave round-trip), the regime a
-        // persistent kernel is FOR. Separates "fixed per-wave round-trip" from "per-needle drain".
-        let batch_sizes = [256usize, 4096, 65536];
+        // SMALL realistic point-lookup batches (where lpb is launch-overhead-bound). The wave is drain-
+        // bound (persistent kernel, no per-batch launch), so it sustains throughput as the batch shrinks
+        // while lpb falls off; plus 65536 for the wave drain ceiling.
+        let batch_sizes = [1usize, 8, 32, 256, 65536];
         let ring_capacity = 131_072usize;
-        let iters_for = |batch: usize| (target_lookups / batch).max(20);
+        let iters_for = |batch: usize| (target_lookups / batch).clamp(20, 50_000);
         let needles_for = |batch: usize, iter: usize| -> Vec<i32> {
             (0..batch)
                 .map(|i| keys[(iter.wrapping_mul(batch).wrapping_add(i)) % rows as usize])
@@ -809,7 +852,7 @@ mod tests {
         };
 
         // --- Persistent wave engine (alloc-free submits) ---
-        let mut wave_lps = [0f64; 3];
+        let mut wave_lps = [0f64; 5];
         {
             let mut engine = WaveReadEngine::new(
                 Arc::clone(&index_resident),
@@ -845,7 +888,7 @@ mod tests {
         }
 
         // --- Launch-per-batch R1 index probe (cuMemAlloc safe now: no wave kernel alive) ---
-        let mut lpb_lps = [0f64; 3];
+        let mut lpb_lps = [0f64; 5];
         for (bi, &batch) in batch_sizes.iter().enumerate() {
             let iters = iters_for(batch);
             for w in 0..4 {
