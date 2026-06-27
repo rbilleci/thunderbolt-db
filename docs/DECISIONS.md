@@ -260,6 +260,30 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   host-serial coalescer, the regime that would show the biggest win) — its harness had a bug (the engine itself is fine,
   ~8-26us/submit); rebuilding it is the remaining R2.2 step before any engine wiring (R2.2b).
 
+- **R2.2 DEVICE-RESULT REWRITE — the wave now EXCEEDS lpb at EVERY batch size (2026-06-27, commits `7dd041e2`,
+  `e1b2072f`, `aeaee74d`; `wave_vs_launch_per_batch_throughput`).** An independent adversarial audit of the proper port
+  caught a **harvest-gate underflow** (a REAL correctness bug): `completed.wrapping_sub(base) < len` wraps to ~u32::MAX
+  when the kernel lags the host (`completed < base`) -> gate FALSE-fires -> `read_records` returns UNWRITTEN slots
+  (empty). It had inflated the benchmark to a fake **348M/s** (30/30 waves actually empty). Fixed with the
+  `completed < base` behind-guard, and the timed loop now verifies every wave (row count + `black_box`) so a no-op
+  can't inflate it again. Then three levers, each measured: (1) **grid-stride claim** (each thread statically owns
+  `idx = tid, tid+T, ...`; no claim counter, no CAS) replaced clamped-CAS, which was claim-contention-capped ~3.2M at
+  128 threads and DEGRADED past it; (2) a **thread-0 coordinator** mirrors host doorbell+head into DEVICE memory so the
+  other 1000s of workers don't poll host-mapped ctrl over PCIe (that congestion starved the host's head write ->
+  timeouts past ~512 threads); (3) the decisive one — **records to a DEVICE result ring + bulk DtoH harvest** on a
+  separate stream. Sweeps proved the ~7.5M plateau was the per-needle **host-mapped record WRITE** (flat across K=8..2048,
+  flat across 128..32768 threads, unchanged by bulk host I/O); moving records to device lifted it **4.2x**. **VERIFIED
+  (T=8192, 1M rows, wave vs lpb, byte-identical in a reused-slot stress gate at K=1/max-threads):** batch1 68k/40k =
+  **1.72x**; batch8 530k/313k = **1.69x**; batch32 2.17M/1.20M = **1.81x**; batch256 12.1M/7.06M = **1.72x**; batch65536
+  **31.6M/23.4M = 1.35x** (peak ~31.8M @ 16k threads). The wave now MATCHES/EXCEEDS the launch-per-batch index probe
+  across the whole sweep and reaches the bare probe's ballpark (~31.8M vs 45M / 1d-i's 30M). Two audits confirmed the
+  number is REAL (not a no-op) and that the cross-stream DtoH ordering (membar.sys system-scope cumulativity reaching the
+  copy engine) is sound — empirically validated by the stress gate. Small batches pay ~6us DtoH latency vs the prior
+  host-mapped read but still beat lpb ~1.7x. **Caveats:** the cumulative-counter completion gate is **in-order /
+  single-flight ONLY** (out-of-order depth-K pipelining needs a per-slot status gate); thread 0's block must stay
+  co-resident (modest grids; backstop catches eviction). needles-to-device (toward the 45M bare ceiling) is a further
+  lever. **The read-ceiling bet is now demonstrated IN-CRATE on the shared context, not just in standalone probes.**
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.

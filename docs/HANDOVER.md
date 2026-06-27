@@ -103,10 +103,20 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   batch8 448k/309k=1.45x, batch32 1.21M/1.19M=1.02x, batch256 0.30x, batch65536 0.10x.** The persistent kernel WINS at
   small batches (no per-batch launch: 8us/submit vs lpb's ~25us) — exactly the OLTP point-lookup regime; lpb wins only at
   large batches (GPU-bound 23M vs the wave's ~2.27M drain ceiling = CAS contention on the single `claim` counter, sharded
-  counters the lever). At batch 8-32 the wave is already 3-8x the 156k batcher. **STILL DEFERRED:** the CONCURRENT/
-  pipelined depth-K test (many producers -> the wave's full advantage over the host-serial coalescer, biggest expected
-  win) — its harness had a bug (engine fine, ~8-26us/submit); rebuild it before any R2.2b wiring. **NEXT options: (A)
-  rebuild the concurrent harness + decide on wiring; (B) R3 writes (independent). Point-read bet already settled by R1.**
+  counters the lever). At batch 8-32 the wave is already 3-8x the 156k batcher.
+  **R2.2 DEVICE-RESULT REWRITE — the wave now EXCEEDS lpb at EVERY batch size (`7dd041e2`, `e1b2072f`, `aeaee74d`;
+  DECISIONS ADR-008 "R2.2 DEVICE-RESULT REWRITE").** An independent audit caught a REAL harvest-gate underflow
+  (`completed.wrapping_sub(base)` wraps when the kernel lags -> returned UNWRITTEN slots; had FAKED a 348M no-op);
+  fixed + timed loop now verifies every wave. Then: grid-stride claim (no claim CAS) + thread-0 device-mirror
+  coordinator (workers stop polling host-mapped ctrl over PCIe) + **records to a DEVICE ring + bulk DtoH** (the ~7.5M
+  plateau was the per-needle host-mapped record WRITE; device lifted it 4.2x). **VERIFIED byte-identical (T=8192, stress
+  gate K=1/max-threads, reused slots): batch1 1.72x, batch8 1.69x, batch32 1.81x, batch256 1.72x, batch65536
+  31.6M/23.4M = 1.35x (peak ~31.8M).** Two audits: number REAL (not a no-op); cross-stream DtoH ordering sound
+  (empirically validated). Caveats: completion gate is single-flight/in-order ONLY (depth-K pipelining needs per-slot
+  status); thread-0 co-residency assumed (backstop catches eviction). **The read-ceiling bet is now in-crate on the
+  shared context, not just standalone probes — lpb is matched/beaten everywhere.** **NEXT options: (A) needles-to-device
+  (toward the 45M bare ceiling) + per-slot status gate to unlock depth-K pipelining + then R2.2b engine wiring;
+  (B) R3 writes (independent). Point-read bet settled by R1 + this.**
   (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
