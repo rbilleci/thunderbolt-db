@@ -528,18 +528,12 @@ impl Engine {
         // index does not mirror THIS resident buffer — so the index route NEVER changes results, it only
         // changes how they're found. Both arms produce the SAME `CudaI32EqualAnyProjectSubmission`, so
         // completion is byte-identical.
-        // CONTRACT: `needles` MUST be distinct — the facade batcher's `dedup_needles` guarantees this. The
-        // thread-per-needle index emits one match per found needle vs the scan's one per matched row; for a
-        // unique key + distinct needles these coincide (a bijection). Duplicate needles would make the index
-        // over-count relative to the scan, so the index path is only correct under the distinct-needle
-        // contract (debug-asserted below); callers bypassing the batcher must uphold it.
-        debug_assert!(
-            {
-                let mut seen = std::collections::HashSet::with_capacity(needles.len());
-                needles.iter().all(|needle| seen.insert(*needle))
-            },
-            "wave index route requires distinct needles (batcher dedup_needles contract)"
-        );
+        // CONTRACT: the index route requires `needles` to be DISTINCT — the facade batcher's `dedup_needles`
+        // guarantees this. The thread-per-needle index emits one match per found needle vs the scan's one per
+        // matched row; for a unique key + distinct needles these coincide (a bijection). Duplicate needles
+        // would make the index over-count relative to the scan, so the distinct-needle invariant is debug-
+        // asserted INSIDE the index arm only — the scan arm is reachable with duplicate needles from the
+        // jobs-batch caller (`submit_relational_retained_int4_projection_batch`) and must NOT be guarded.
         let cuda_submission = match self
             .wave_engine_enabled()
             .then(|| {
@@ -553,16 +547,25 @@ impl Engine {
             })
             .flatten()
         {
-            Some((index, table_mask, hash_shift)) => device_memory
-                .submit_match_project_i32_index_probe_from_payload(
-                    &index,
-                    table_mask,
-                    hash_shift,
-                    needles,
-                    &projection_offsets,
-                    row_count,
-                )
-                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+            Some((index, table_mask, hash_shift)) => {
+                debug_assert!(
+                    {
+                        let mut seen = std::collections::HashSet::with_capacity(needles.len());
+                        needles.iter().all(|needle| seen.insert(*needle))
+                    },
+                    "wave index route requires distinct needles (batcher dedup_needles contract)"
+                );
+                device_memory
+                    .submit_match_project_i32_index_probe_from_payload(
+                        &index,
+                        table_mask,
+                        hash_shift,
+                        needles,
+                        &projection_offsets,
+                        row_count,
+                    )
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
+            }
             None => device_memory
                 .submit_match_project_i32_equal_any_from_payload(
                     filter_offset,
