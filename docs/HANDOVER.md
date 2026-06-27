@@ -40,14 +40,22 @@
   bottleneck**; the remaining write constraints (durability/WAL fsync, deterministic CC) are host-I/O + coordination
   problems CPU engines face too. (`wave_index_insert_probe.rs`; caveats: low contention, raw insert only.)
 
-## The one next action (pick one)
-1. **Continue the write path** — the **commit/durability** floor (group-commit throughput vs fsync — the likely real
-   write bottleneck, and the engine already has crash-durable WAL + group commit to measure), then contended inserts +
-   deterministic CC. The remaining unknowns for the write half of the bet.
-2. **Integrate the proven read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
-   `RelationalRetainedReadTemplate`; first audit the `all_done` ordering) → serve real SQL + enable an end-to-end
-   Postgres comparison. Gates: differential vs the batcher **WITH NULL**, HAZARD, **independent adversarial audit**.
-The batcher stays the default until the integrated wave path wins end-to-end.
+## The one next action — **engine integration R1** (design done; recon cited below)
+Wire the GPU index into the engine the LOW-RISK way (defers the persistent-kernel SM-coexistence risk to R2):
+- **R1 — index in the engine, behind a default-OFF `wave_engine_enabled` flag, NO persistent kernel:**
+  1. Add the flag (copy `auto_admit_on_commit`: `engine/src/lib.rs:311`).
+  2. Extend `RelationalResidencySnapshot` (`relational_model.rs:197`) with `wave_gpu_index_ptr: Option<u64>` + `wave_hash_shift`.
+  3. Build the GPU hash index on admission (host-build + HtoD in `populate_relational_residency_snapshot`, reuse the probe).
+  4. **Crux:** an index-probe kernel that emits the EXISTING `CudaI32EqualAnyProjectSubmission` format (result path unchanged).
+  5. Guard the swap in `submit_resident_int4_equal_any_payload` (`engine_residency.rs:479`): flag-on + index present → probe; else scan.
+  - Gates: differential vs scan (byte-identical, **WITH NULL**), HAZARD, **independent audit**. Win: per-batch GPU cost O(rows)→O(1).
+- **R2 — persistent kernel + ring** (breaks the host-serial coalescer cap → proven 10–30M), **gated by an SM-coexistence
+  measurement** (wave kernel + concurrent engine kernels on one shared context = the recon's #1 unknown). FFI
+  `cuMemHostGetDevicePointer` + the `all_done` ordering audit land here.
+- **R3 — writes** (concurrent index maintenance proven fast) + deterministic CC.
+Integration recon cites: facade dispatch `facade/src/lib.rs:522`; snapshot `relational_model.rs:197`; scan-vs-index
+`engine_residency.rs:479`; retained-read `engine_retained_read.rs:16`; GpuPrimaryContext+FFI `execution/src/lib.rs:182,545`;
+threading `server/src/lib.rs:66`. The batcher stays the default until the integrated wave path wins end-to-end.
 *Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real end-to-end OLTP-fitness
 instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+text; STRATA S-C/S-D/S-E.
 
