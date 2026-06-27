@@ -30,17 +30,18 @@
     does millions of lookups/s at realistic scale; the residual bottleneck (host-mapped atomics) is GPU-architectural
     (scales with hardware). NOT integrated into the engine; the batcher remains the production default.
 
-- **Wave 1d-i** (push the read ceiling) ✅ DONE: claim/`completed` atomics → **device memory** = read ceiling
-  **10.5M → ~30M req/s (~2.9×)**, 3× stable; slot→wire mapping quantified MINOR (~200M–1.1B rows/s, ≪ GPU drain). New
-  limiter = device-atomic contention on the single counter. (`wave_devatomic_probe.rs`.)
+- **Wave 1d-i + 1d-ii** (push the read ceiling) ✅ DONE: claim/`completed` atomics → **device memory** (1d-i, ~30M),
+  then **batched claiming** K=8 (1d-ii) = read ceiling **10.5M → ~45–53M req/s (~5×, ~60–69× the CPU)**, 3× stable.
+  slot→wire mapping quantified MINOR (~200M–1.1B rows/s, ≪ GPU drain). **Read half of the bet is SETTLED** — further
+  read gains are diminishing/tuning-sensitive. (`wave_devatomic_probe.rs`, `wave_batchclaim_probe.rs`.)
 
-## The one next action — **wave 1d (remaining)** (PLAN §3)
-Continue toward production: (ii) **batched/striped claiming** (each thread grabs K requests per `atom.add` → push past
-the single-atomic ceiling); (iii) **concurrent index maintenance on writes** (lock-free CAS inserts, ADR-009 — the
-static host-built index is the real OLTP write-path gap, and the **write path is still unmeasured**); (iv) **integrate
-into the engine** behind a default-OFF flag — request descriptor = Tier-1's `RelationalRetainedReadTemplate`; first
-audit the `all_done` cross-thread ordering from 1d-i. Gates: differential vs the batcher **WITH NULL**, HAZARD,
-**independent adversarial audit**. The batcher stays the default until the integrated wave path wins end-to-end.
+## The one next action — **the write path** (PLAN §3)
+The read path is proven; the **write/transaction path is the unmeasured frontier** of the OLTP bet. Probe it like the
+reads: GPU commit throughput + **concurrent lock-free index maintenance on inserts** (CAS, ADR-009 — the static
+host-built index is the current gap) + deterministic-CC wave execution. *Then* **integrate the proven read path into
+the engine** behind a default-OFF flag (request descriptor = Tier-1's `RelationalRetainedReadTemplate`; first audit the
+`all_done` cross-thread ordering). Gates: differential vs the batcher **WITH NULL**, HAZARD, **independent adversarial
+audit**. The batcher stays the default until the integrated wave path wins end-to-end.
 *Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real end-to-end OLTP-fitness
 instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+text; STRATA S-C/S-D/S-E.
 

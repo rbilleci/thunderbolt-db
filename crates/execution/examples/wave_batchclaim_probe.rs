@@ -8,7 +8,7 @@
 //!
 //! Run: `cargo run --release -p gpu_db_execution --example wave_batchclaim_probe`
 //! Env: GPU_DB_WAVE_THREADS (8192), GPU_DB_WAVE_REQUESTS (200000), GPU_DB_WAVE_ROWS (1000000),
-//!      GPU_DB_WAVE_CLAIM_BATCH (K, default 32).
+//!      GPU_DB_WAVE_CLAIM_BATCH (K, default 8 — the swept sweet spot; K>=32 collapses).
 
 use std::ffi::{c_void, CString};
 use std::ptr;

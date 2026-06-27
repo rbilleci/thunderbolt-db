@@ -91,11 +91,18 @@ Spec: ARCHITECTURE §7 + §13.
   single counter (peaks at LOW thread count, 512–1024; → batched/striped claiming next). Also quantified the
   **slot→wire mapping**: 200k packed slots → neutral rows in ~180µs–1ms single-threaded (~200M–1.1B rows/s), far below
   the ~7ms GPU drain + embarrassingly parallel → the bare-data-plane caveat is MINOR. (NB the `all_done` cross-thread
-  ordering wants an independent audit before it's lifted into the engine.) → **NEXT (1d remaining):** (ii) batched/
-  striped claiming (push past the single-atomic ceiling); (iii) **concurrent index maintenance on writes** (lock-free
-  CAS inserts, ADR-009 — the static host-built index is the current gap for a real OLTP write path); (iv) **integrate
-  into the engine** behind a default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher
-  WITH NULL, HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
+  ordering wants an independent audit before it's lifted into the engine.)
+- **1d-ii ✅ DONE (2026-06-27)** = `crates/execution/examples/wave_batchclaim_probe.rs` — **batched claiming**: each
+  thread reserves K requests per `atom.add(claim, K)` + bumps `completed` once/batch under one `membar.sys`. Sweet spot
+  **K=8 → ~45–53M req/s** (~1.5–1.75× over 1d-i's 30M, **~5× the original 10.5M, ~60–69× the CPU**), 3× stable. K is a
+  balance (K≥32 collapses: fewer batches than threads → under-parallel + serial host-mapped writes). **Read ceiling is
+  now firmly tens-of-millions; further gains need a structural lever (sharded per-block counters / cheaper result
+  writes) — diminishing, tuning-sensitive. The read half of the bet is SETTLED.** → **NEXT (1d remaining):**
+  (iii) **concurrent index maintenance on writes** (lock-free CAS inserts, ADR-009 — the static host-built index is the
+  real OLTP write-path gap, and **the write path is still unmeasured** = the frontier); (iv) **integrate into the
+  engine** behind a default-OFF flag (request descriptor = Tier-1's template; audit the `all_done` ordering first),
+  differential vs the batcher WITH NULL, HAZARD + independent audit. The batcher stays the default until the integrated
+  wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
