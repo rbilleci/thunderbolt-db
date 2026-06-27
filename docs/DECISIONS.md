@@ -128,6 +128,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   across all sizes — the recorded 16M index 1.69M was a slow sample (re-run 2.31M ⇒ 16M speedup 9.34×, index falloff
   ≈1.0× not 1.38×), so the O(1) claim holds even more cleanly than first measured. Conclusion (real, size-dependent win;
   batcher stays default; flip is size-aware or lands with R2) unchanged.
+- **R2 SM-coexistence gate (2026-06-27, RTX PRO 6000 = 188 SMs; `execution/examples/wave_coexist_probe`) — the recon's #1
+  unknown, resolved.** R2 wants ONE always-resident persistent wave kernel on the SAME context as the engine's
+  launch-per-batch kernels. The probe runs the proven 1a persistent kernel (reserving `pblocks` SMs) concurrently with a
+  storm of full-grid int4 scan launches on a second non-blocking stream, sweeping `pblocks ∈ {1,8,32}` in two poll modes
+  (busy-spin vs ~1µs `%globaltimer` backoff). **VIABLE: zero deadlock/starvation — the persistent heartbeat keeps
+  advancing through every scan storm and the kernel exits cleanly on the doorbell (no backstop), at all footprints**, so
+  a wave kernel CAN share the engine's context. **But the SM-reservation cost is steeply non-linear (reproduced 2×):
+  1 SM = ~2% (97–99% of baseline), 8 SMs (4.3% of chip) = ~60% LOST (≈40% of baseline), 32 SMs (17%) = ~87% lost (~13%).**
+  Busy-spin ≈ gentle (the persistent kernel's host-mapped doorbell poll is itself ~µs-throttled over PCIe, so neither is
+  truly high-frequency) ⇒ the cost is **SM co-residency/scheduling, not the kernel's polling memory traffic** (exact
+  mechanism — scheduler vs L2 pollution — not isolated; the design rule holds either way). Baseline scan ≈1.04 Trows/s
+  (128MB column, L2-resident). **Design rule for ADR-009 integration:** the wave kernel must be a **~1-SM-minimal sidecar
+  OR fully REPLACE the per-batch launch path** (its actual intent) — NOT a wide always-resident data-plane co-resident
+  with heavy engine kernels. (Caveat: the scan storm is latency-bound serial launches, faithful to today's launch-per-
+  batch engine; `cuMemHostGetDevicePointer` already in the probe FFI; the `all_done` ordering audit is still owed before
+  any engine lift.)
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

@@ -59,10 +59,15 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   ADR-008 "R1 end-to-end measurement"): flag ON vs OFF on the production template path, ON==OFF byte-identical each size.
   Verified re-run: scan falls ≈O(rows) (1M→4M→16M = 1.68M→731k→247k lookups/s), index is **FLAT ~2.3M across all sizes
   (true O(1))** → **16M rows = 9.34×**. **Crossover ≈1M rows**; below it the fixed ~110µs host+launch floor dominates
-  (~1.0× at ≤256k) → batcher stays default; any flip is size-aware or lands with R2. (2) **R2** — persistent kernel + ring (breaks the host-serial coalescer cap = the ~110µs floor this
-  measurement is now bound by → proven 10–30M), **gated by an SM-coexistence measurement** (wave kernel + concurrent
-  engine kernels on one shared context = the recon's #1 unknown); FFI `cuMemHostGetDevicePointer` + the `all_done`
-  ordering audit land here. (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
+  (~1.0× at ≤256k) → batcher stays default; any flip is size-aware or lands with R2. (2) **R2** — persistent kernel + ring
+  (breaks the host-serial coalescer cap = the ~110µs floor this measurement is now bound by → proven 10–30M).
+  **SM-coexistence gate ✅ MEASURED (`execution/examples/wave_coexist_probe`, DECISIONS ADR-008 "R2 SM-coexistence
+  gate"): VIABLE** — a persistent kernel + concurrent engine scans on ONE shared context never deadlock/starve and exit
+  cleanly (188 SMs), BUT the cost is steeply non-linear: 1 reserved SM ~2%, **8 SMs ~60%, 32 SMs ~87%** of concurrent
+  scan throughput (≈ same busy-spin vs gentle ⇒ SM co-residency, not poll traffic). **Design rule: the wave kernel must
+  be ~1-SM minimal as a sidecar, or REPLACE the per-batch path (ADR-009 intent) — never a fat always-resident
+  co-resident.** `cuMemHostGetDevicePointer` already in the FFI (probes); the `all_done` ordering audit still owed before
+  any engine lift. (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
   only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The
@@ -75,9 +80,10 @@ instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+
   combine doesn't exist; STRATA placement, not hardware paging, owns the tail).
 - **Coherent-memory dependency:** the strongest latency wins assume GH200/GB200 (untestable on the dev box) — the
   PCIe baseline must be competitive or the bet is confined to premium hardware.
-- **Wave-engine integration shape (1c+):** how the persistent kernel coexists with the current launch-per-batch
-  engine (one always-resident wave kernel? SM reservation on the shared box?); the slow-class (dependent-read,
-  data-dependent-predicate) path; and the deterministic spine + MV-dependency-graph CC the writes will need (ADR-009).
+- **Wave-engine integration shape (1c+):** coexistence is now MEASURED (above) — viable but a fat co-resident wave
+  kernel is too costly, so the shape is **either ~1-SM sidecar or full replacement of the per-batch path**, not a wide
+  always-resident data-plane beside launch-per-batch. Still open: the slow-class (dependent-read, data-dependent-
+  predicate) path; and the deterministic spine + MV-dependency-graph CC the writes will need (ADR-009).
 - **S-B v1 tradeoffs (now lower priority — S-F is OFF):** admission holds the catalog latch during the upload + re-admits
   the whole table per commit. Only matters if auto-admit is ever turned on for an analytical/read-heavy resident case.
 

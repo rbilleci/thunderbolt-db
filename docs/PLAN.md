@@ -109,6 +109,11 @@ Spec: ARCHITECTURE §7 + §13.
   isn't disadvantaged there. *Caveats:* low contention (sequential keys + Fibonacci spread); raw insert only (no
   commit/durability/MVCC/CC); synthetic keys. → **NEXT write probes:** contended inserts; the **commit/durability**
   path (group commit — the likely real write floor); deterministic CC for conflicts.
+- **SM-coexistence gate ✅ DONE (2026-06-27)** = `crates/execution/examples/wave_coexist_probe.rs` — the R2 prerequisite
+  (the recon's #1 unknown). A persistent kernel + concurrent engine scans on one shared context COEXIST cleanly (no
+  deadlock/starvation/zombie, 188 SMs), but the SM-reservation cost is steeply non-linear (1 SM ~2%, 8 SMs ~60%, 32 SMs
+  ~87% of concurrent scan throughput; busy-spin ≈ gentle ⇒ co-residency cost, not poll traffic). **⇒ the wave kernel is a
+  ~1-SM sidecar OR replaces the per-batch path; never a fat co-resident** (DECISIONS ADR-008 "R2 SM-coexistence gate").
 - (iv) **Integrate the proven read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
   template; audit the `all_done` ordering first), differential vs the batcher WITH NULL, HAZARD + independent audit.
   The batcher stays the default until the integrated wave path beats it end-to-end.
