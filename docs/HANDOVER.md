@@ -71,7 +71,16 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   sound completion gate is the host **acquiring the `completed` counter** (DtoH `==requests` before reading slots = the
   proven 1b pattern; `all_done` is only a wake hint). **Engine-lift rule: gate on the counter-acquire, never on
   `all_done`-only** (ideally `.release.sys`/`.acquire.sys` under sm_70). `cuMemHostGetDevicePointer` already in the FFI
-  (probes). (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
+  (probes). **R2.1 BUILD ✅ DONE** (`crates/execution/src/wave.rs`, new child module): `WaveReadEngine` lifts the proven
+  1d data-plane into the crate, running the persistent kernel on the engine's **shared primary context** (not a throwaway
+  one). Multi-wave `submit(needles)->Vec<Option<i32>>` over a circular lock-free ring; completion GATED ON the DtoH
+  `completed` counter-acquire (audit rule), `all_done` = wake hint; doorbell + `%globaltimer` backstop + clean Drop.
+  Kernel = the audited probe kernel with ONE change: `atom.cas` claim (bounded, no overshoot) instead of `atom.add`, so
+  cumulative `head` works across waves (the result/completion ordering path is unchanged → audit still holds). GPU test
+  `wave_engine_point_lookups_match_oracle_on_shared_context` (#[ignore]) passes: 2 waves, results == CPU oracle, clean
+  exit; ASCII-PTX guard + exec suite 24/0/62-ignored green. **NEXT = R2.2** (wire into the engine read path behind the
+  default-OFF flag; differential vs the batcher WITH NULL; HAZARD; the SM-coexistence integration shape) → R2.3 (audit +
+  measure vs batcher). (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
   only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The

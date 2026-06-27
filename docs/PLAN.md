@@ -118,7 +118,14 @@ Spec: ARCHITECTURE §7 + §13.
   SOUND, converged) → **the sound completion gate is the host ACQUIRING the `completed` counter (DtoH `==requests` before
   reading slots = the proven 1b pattern); `all_done` is only a wake hint, never the correctness gate** (DECISIONS
   ADR-008 "R2 `all_done` ordering audit"). Carry this rule into (iv).
-- (iv) **Integrate the proven read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
+- **R2.1 wave read engine ✅ DONE (2026-06-27)** = `crates/execution/src/wave.rs` (new child module) — the proven 1d
+  data-plane lifted in-crate as `WaveReadEngine`, running the persistent kernel on the engine's SHARED primary context.
+  Multi-wave `submit` over a circular lock-free ring; completion GATED on the DtoH `completed` counter-acquire (audit
+  rule), `all_done` = wake hint; doorbell + `%globaltimer` backstop + clean Drop. Kernel = the audited probe kernel with
+  one change — `atom.cas` claim (bounded, no overshoot) vs `atom.add` — so cumulative `head` works across waves (the
+  audited result/completion ordering path is unchanged). GPU test vs a CPU oracle (2 waves, clean exit) + ASCII guard
+  pass; NOT yet wired into any query path.
+- (iv) **R2.2 — integrate the wave read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
   template; gate completion on the counter-acquire per the audit, NOT `all_done`), differential vs the batcher WITH NULL,
   HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
