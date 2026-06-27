@@ -55,11 +55,11 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
 - **Gate:** `r1_wave_index_probe_matches_scan_differential` (flag OFF vs ON) — NULL projection + NULL-as-0 key (needle 0) +
   absent + dup-fallback + generation rebuild, non-vacuous. Suites green: engine 437 + 295 GPU, execution 84, facade 34.
   Independent adversarial audit done (2 P1 + 2 P2 all adopted via `ffeccfc4`); **re-audit of the fix in flight.**
-- **NEXT:** (1) ✅ DONE — end-to-end O(rows)→O(1) win MEASURED (`engine/examples/r1_wave_index_ab`, DECISIONS ADR-008 "R1
-  end-to-end measurement"): flag ON vs OFF on the production template path, ON==OFF byte-identical, **16M rows = 6.99×**
-  (242k→1.69M lookups/s); table grew 16× → scan fell 7.0× (≈O(rows)), index flat 1.38× (≈O(1)). **Crossover ≈1M rows**;
-  below it the fixed ~110µs host+launch floor dominates (~1.0× at ≤256k) → batcher stays default; any flip is size-aware
-  or lands with R2. (2) **R2** — persistent kernel + ring (breaks the host-serial coalescer cap = the ~110µs floor this
+- **NEXT:** (1) ✅ DONE + VERIFIED — end-to-end O(rows)→O(1) win MEASURED (`engine/examples/r1_wave_index_ab`, DECISIONS
+  ADR-008 "R1 end-to-end measurement"): flag ON vs OFF on the production template path, ON==OFF byte-identical each size.
+  Verified re-run: scan falls ≈O(rows) (1M→4M→16M = 1.68M→731k→247k lookups/s), index is **FLAT ~2.3M across all sizes
+  (true O(1))** → **16M rows = 9.34×**. **Crossover ≈1M rows**; below it the fixed ~110µs host+launch floor dominates
+  (~1.0× at ≤256k) → batcher stays default; any flip is size-aware or lands with R2. (2) **R2** — persistent kernel + ring (breaks the host-serial coalescer cap = the ~110µs floor this
   measurement is now bound by → proven 10–30M), **gated by an SM-coexistence measurement** (wave kernel + concurrent
   engine kernels on one shared context = the recon's #1 unknown); FFI `cuMemHostGetDevicePointer` + the `all_done`
   ordering audit land here. (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
