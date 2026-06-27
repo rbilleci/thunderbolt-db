@@ -593,10 +593,16 @@ impl WaveReadEngine {
     }
 
     /// Enqueue a wave of `needles` (each a key value) and return IMMEDIATELY (non-blocking) with a
-    /// `WaveTicket`. The host can keep MANY tickets in flight and `harvest` them as they drain — the only
-    /// way the persistent kernel amortizes its host<->device round-trip (review directive B). The caller
-    /// must bound total un-harvested needles to `ring_capacity` so the circular ring never overwrites an
-    /// un-read wave. `needle_index` in the harvested rows is the position within THIS `needles` slice.
+    /// `WaveTicket`. The caller must bound total un-harvested needles to `ring_capacity` so the circular ring
+    /// never overwrites an un-read wave. `needle_index` in the harvested rows is the position within THIS
+    /// `needles` slice.
+    ///
+    /// IN-ORDER ONLY (audit): `harvest`'s completion gate compares the single cumulative `completed` counter
+    /// to `base+len`. That is sound only when no EARLIER wave's indices can still be in flight — i.e. submit
+    /// and harvest strictly in order (the engine's current single-flight use). True out-of-order depth-K
+    /// pipelining (harvesting an earlier ticket while a later one is mid-drain) would need a PER-SLOT status
+    /// gate instead, because the global counter can pass `base+len` via a later wave's indices while this
+    /// wave's own slots are still unwritten. Do NOT harvest tickets out of submission order with this gate.
     pub(crate) fn submit_async(
         &mut self,
         needles: &[i32],
@@ -640,14 +646,18 @@ impl WaveReadEngine {
         })
     }
 
-    /// Non-blocking completion check + read for a `submit_async` ticket. Reads the HOST-MAPPED `completed`
-    /// mirror directly — a local system-RAM read (~ns), NOT a DtoH (a PCIe round-trip that also congests
-    /// with the kernel's polling; the review flagged the DtoH spin). The kernel writes the mirror AFTER
-    /// its `membar.sys` + device `completed` bump, so `mirror >= base+len` means this wave's records are
-    /// host-visible (the audit's counter-acquire, host-mapped variant). If ready, read + return the rows
-    /// (found needles only, byte-identical to the R1 index probe); else `None`. The mirror is last-writer-
-    /// wins (`st.volatile`, untorn 4-byte) and can briefly under-read under contention — safe (an
-    /// under-read only delays, never reads records early); the caller just retries.
+    /// Non-blocking completion check + read for a `submit_async` ticket. The COMPLETION SIGNAL is the
+    /// HOST-MAPPED `completed` mirror — a local system-RAM read (~ns), no DtoH, published by thread 0 (the
+    /// sole writer; monotonic). A worker releases its record writes via `membar.sys` ahead of its device
+    /// `completed` bump, so once the host observes `completed >= base+len`, this wave's records are committed
+    /// to global memory; `read_records` then bulk-DtoHs them. The cross-engine ordering (worker SM writes ->
+    /// `membar.sys` -> bump -> host observes -> DtoH copy engine reads) relies on `membar.sys` system-scope
+    /// cumulativity reaching the copy engine; this is EMPIRICALLY VALIDATED by the benchmark's byte-identical
+    /// stress gate (thousands of reused-slot waves at K=1, max threads, where a stale/torn copy would carry a
+    /// prior wave's bytes). If ready, returns the rows (found needles only, byte-identical to the R1 index
+    /// probe); else `None`. The mirror can briefly under-read (delays, never early); the caller retries.
+    /// LIVENESS: thread 0's block must stay co-resident (true for the modest grids the SM-coexistence rule
+    /// allows); if it were evicted, head/doorbell mirroring + completion would stall (caught by the backstop).
     pub(crate) fn harvest(
         &self,
         ticket: WaveTicket,
@@ -995,35 +1005,47 @@ mod tests {
             )
             .expect("wave engine");
 
-            // CORRECTNESS GATE (charter: adversarial verification): a sampled wave's rows MUST match a
-            // CPU oracle. needles_for(b, it) = keys[(it*b+i) % rows], all present, so row = (it*b+i)%rows
-            // and the projection ([payload_offset]) yields payload[row]. Guards against a fast-but-wrong
-            // drain (e.g. early/incomplete harvest reporting completion before all needles are processed).
-            // Uses a CPU oracle, NOT the R1 probe (whose cuMemAlloc would device-sync-kill the live kernel).
-            for &cb in &[64usize, 1000, 65536] {
-                let cb = cb.min(ring_capacity);
-                let sample = needles_for(cb, 3);
-                let mut got = engine.submit(&sample).expect("correctness submit");
-                got.sort_by_key(|r| (r.needle_index, r.row_index));
-                let mut want: Vec<CudaI32BatchProjectionRow> = (0..cb)
-                    .map(|i| {
-                        let row = (3usize.wrapping_mul(cb).wrapping_add(i)) % rows as usize;
-                        CudaI32BatchProjectionRow {
-                            needle_index: i,
-                            row_index: row as u64,
-                            values: vec![payload[row]],
-                        }
-                    })
-                    .collect();
-                want.sort_by_key(|r| (r.needle_index, r.row_index));
+            // CORRECTNESS + STALE-DtoH STRESS GATE (charter: adversarial verification, audit-driven).
+            // The device-result ring is DtoH'd on a separate stream with no event edge to the worker kernel,
+            // so a stale/torn copy would yield the right ROW COUNT but WRONG bytes (a prior wave's slot
+            // contents). Two independent audits flagged that a count-only check can't catch this. So here we
+            // run MANY waves at the FULL thread count with byte-identical CPU-oracle checks, REUSING ring
+            // slots (needles rotate per `it`, so a stale read of a reused slot from an earlier wave carries
+            // DIFFERENT values and mismatches). needles_for(b,it)=keys[(it*b+i)%rows], all present, so
+            // row=(it*b+i)%rows and the projection ([payload_offset]) yields payload[row]. This is also the
+            // discriminating experiment the auditors prescribed. CPU oracle (no cuMemAlloc -> no freeze).
+            let verify = |it: usize, cb: usize, got: &[CudaI32BatchProjectionRow]| {
                 assert_eq!(
                     got.len(),
-                    want.len(),
-                    "wave drain returned {} rows, expected {} (batch={cb}, threads={wave_threads}) — FAST-BUT-WRONG",
-                    got.len(),
-                    want.len()
+                    cb,
+                    "wave returned {} rows, expected {cb} (it={it} threads={wave_threads}) -- no-op/short harvest",
+                    got.len()
                 );
-                assert_eq!(got, want, "wave drain WRONG rows at batch={cb} threads={wave_threads}");
+                for (k, row) in got.iter().enumerate() {
+                    let want_row = (it.wrapping_mul(cb).wrapping_add(k)) % rows as usize;
+                    assert!(
+                        row.needle_index == k
+                            && row.row_index == want_row as u64
+                            && row.values.len() == 1
+                            && row.values[0] == payload[want_row],
+                        "STALE/WRONG DtoH record it={it} k={k} cb={cb} threads={wave_threads}: \
+                         got (ni={}, row={}, vals={:?}), want (ni={k}, row={want_row}, val={})",
+                        row.needle_index,
+                        row.row_index,
+                        row.values,
+                        payload[want_row],
+                    );
+                }
+            };
+            // Heavy slot reuse (small batch, many waves) + the fast-drain race window (large batch).
+            for it in 0..2000 {
+                let got = engine.submit(&needles_for(256, it)).expect("verify submit 256");
+                verify(it, 256, &got);
+            }
+            let big = 65536usize.min(ring_capacity);
+            for it in 0..40 {
+                let got = engine.submit(&needles_for(big, it)).expect("verify submit big");
+                verify(it, big, &got);
             }
 
             for (bi, &batch) in batch_sizes.iter().enumerate() {
