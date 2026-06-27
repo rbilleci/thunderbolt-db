@@ -714,4 +714,131 @@ mod tests {
             "2-column gather (key, payload) at row 5"
         );
     }
+
+    /// R2.2 evidence gate: does the PERSISTENT wave engine beat the LAUNCH-PER-BATCH R1 index probe?
+    /// Same resident table / index / needles / projection, single-threaded serialized batches, swept
+    /// over batch size. The wave engine's whole thesis is removing the per-batch kernel launch (~72us
+    /// fixed) — this measures whether that materializes end-to-end (results materialized to rows both
+    /// ways). Wave is measured FIRST then shut down, THEN the index probe — so the index probe's
+    /// `cuMemAlloc` (which device-syncs) never runs while the wave kernel is live (the freeze root cause).
+    ///
+    /// Run: `GPU_DB_WAVE_BENCH_ROWS=1000000 cargo test -p gpu_db_execution \
+    ///   wave::tests::wave_vs_launch_per_batch_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_vs_launch_per_batch_throughput() {
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        let rows: u64 = std::env::var("GPU_DB_WAVE_BENCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let iters: usize = std::env::var("GPU_DB_WAVE_BENCH_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(3).wrapping_add(1)).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(1000).wrapping_add(7)).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = Arc::new(runtime.retain_device_memory_copy(0, &buf).expect("resident"));
+        let payload_offset = rows * 4;
+        let projections = [payload_offset]; // "SELECT payload WHERE key = ?"
+
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).expect("index"));
+
+        let batch_sizes = [1usize, 8, 64, 256];
+        let needles_for = |batch: usize, iter: usize| -> Vec<i32> {
+            (0..batch)
+                .map(|i| keys[(iter * batch + i) % rows as usize])
+                .collect()
+        };
+
+        // --- Measure the PERSISTENT wave engine (alloc-free submits) ---
+        let mut wave_lps = [0f64; 4]; // lookups/s per batch size
+        {
+            let mut engine = WaveReadEngine::new(
+                Arc::clone(&index_resident),
+                Arc::clone(&resident),
+                &projections,
+                table_mask,
+                hash_shift,
+                512,
+                1024,
+                30_000_000_000,
+            )
+            .expect("wave engine");
+            for (bi, &batch) in batch_sizes.iter().enumerate() {
+                for w in 0..8 {
+                    let _ = engine.submit(&needles_for(batch, w)).expect("warmup");
+                }
+                let t = Instant::now();
+                for it in 0..iters {
+                    let _ = engine.submit(&needles_for(batch, it)).expect("wave submit");
+                }
+                let secs = t.elapsed().as_secs_f64();
+                wave_lps[bi] = (iters * batch) as f64 / secs;
+            }
+            engine.shutdown(); // MUST shut down before the index probe's cuMemAlloc (freeze root cause)
+        }
+
+        // --- Measure the LAUNCH-PER-BATCH R1 index probe (cuMemAlloc safe now: no wave kernel alive) ---
+        let mut lpb_lps = [0f64; 4];
+        for (bi, &batch) in batch_sizes.iter().enumerate() {
+            for w in 0..8 {
+                let s = resident
+                    .submit_match_project_i32_index_probe_from_payload(
+                        &index_resident, table_mask, hash_shift, &needles_for(batch, w), &projections, rows,
+                    )
+                    .expect("warmup submit");
+                let _ = s.complete(&resident).expect("warmup complete");
+            }
+            let t = Instant::now();
+            for it in 0..iters {
+                let s = resident
+                    .submit_match_project_i32_index_probe_from_payload(
+                        &index_resident, table_mask, hash_shift, &needles_for(batch, it), &projections, rows,
+                    )
+                    .expect("lpb submit");
+                let _ = s.complete(&resident).expect("lpb complete");
+            }
+            let secs = t.elapsed().as_secs_f64();
+            lpb_lps[bi] = (iters * batch) as f64 / secs;
+        }
+
+        println!("\n# R2.2 gate: persistent WAVE vs LAUNCH-PER-BATCH index probe  rows={rows} iters={iters}");
+        println!(
+            "  {:>6}  {:>16}  {:>16}  {:>9}  {:>12}  {:>12}",
+            "batch", "wave lookups/s", "lpb lookups/s", "speedup", "wave us/sub", "lpb us/call"
+        );
+        for (bi, &batch) in batch_sizes.iter().enumerate() {
+            let speedup = if lpb_lps[bi] > 0.0 { wave_lps[bi] / lpb_lps[bi] } else { 0.0 };
+            let wave_us = 1.0e6 / (wave_lps[bi] / batch as f64);
+            let lpb_us = 1.0e6 / (lpb_lps[bi] / batch as f64);
+            println!(
+                "  {batch:>6}  {:>16.0}  {:>16.0}  {speedup:>8.2}x  {wave_us:>11.2}  {lpb_us:>11.2}",
+                wave_lps[bi], lpb_lps[bi]
+            );
+        }
+        println!("# context: batcher ~156k ops/s (host-serial cap); R1 index end-to-end ~2.3M (engine template path).");
+    }
 }

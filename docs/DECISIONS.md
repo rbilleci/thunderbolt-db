@@ -198,6 +198,27 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   during wave operation. The robust long-term fix is migrating the engine's device allocation to **`cuMemAllocAsync`/
   `cuMemFreeAsync`** (stream-ordered, non-synchronizing). NOTE: "replace the per-batch path" ALONE is insufficient —
   other concurrent engine activity (residency admission, other routes) still `cuMemAlloc`s on the shared context.
+- **R2.2 EVIDENCE GATE (2026-06-27, `wave::tests::wave_vs_launch_per_batch_throughput`, release, 1M rows) — the
+  persistent wave engine LOSES to launch-per-batch in request-response; wave-in-engine is PARKED, async-alloc fix NOT
+  built.** Before investing in the async-alloc refactor or wiring, measured the persistent `WaveReadEngine` vs the
+  launch-per-batch R1 index probe directly (same table/index/needles/projection, single-thread serialized batches).
+  **Result (lookups/s, wave vs lpb): batch1 8.6k vs 39k (0.22x); batch8 35k vs 309k (0.11x); batch64 55k vs 2.29M
+  (0.02x); batch256 60k vs 7.08M (0.01x).** The wave per-submit latency is ~116us (batch1) growing to ~4.3ms (batch256);
+  the launch-per-batch call is ~25-36us. So the wave engine is **4.5x-118x SLOWER**, and plateaus at ~60k (below even
+  the 156k batcher). **Mechanism:** in a request-response (submit a batch, wait for it) pattern, each wave pays a host<->
+  device round-trip (publish `head` -> kernel notices/drains -> host DtoH the `completed` counter) of ~116us, which is
+  WORSE than a kernel launch+stream-sync (~25us); the 1024 persistent threads also continuously poll host-mapped memory
+  over PCIe, congesting the bus and inflating every wave. A kernel launch that runs-to-completion has a clean, fast
+  stream-sync completion and no idle polling. **The probes' ~45M req/s was ONE GIANT continuous-fill wave** (round-trip
+  amortized over 200k requests); request-response does not amortize it. **Decision:** do NOT wire the wave engine into
+  the read path and do NOT do the async-alloc fix — the launch-per-batch GPU index probe (R1, already shipped: 2.3M
+  end-to-end via the template path, ~7M at the execution layer, O(1)) is the point-read winner. R2's premise ("the
+  persistent kernel breaks the host+launch floor") does NOT hold for the engine's request-response point-read path: the
+  launch path is already GPU-bound, and the persistent kernel's signaling round-trip is a worse floor. The wave engine
+  would only win under sustained **continuous-fill high concurrency with async result delivery** (many producers keeping
+  the ring full, host reading slots without per-batch waits) — a much larger architectural change, unproven to be
+  needed, so PARKED. "Measure first" saved the async-alloc refactor + the wiring. (R2.1/R2.2a code retained as proven,
+  audited building blocks; R3 writes + deterministic CC are independent of this.)
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

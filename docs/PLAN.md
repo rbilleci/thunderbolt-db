@@ -136,9 +136,15 @@ Spec: ARCHITECTURE §7 + §13.
   growth / overflow free), and the wave path is alloc-free → **R2.2 path: pre-warm the pool + suppress pool shrink while
   a wave kernel is resident** (pragmatic), or move engine device alloc to `cuMemAllocAsync` (robust). "Replace per-batch"
   alone is insufficient (other engine activity still allocs).
-- (iv) **R2.2b — integrate the wave read path into the engine** behind a default-OFF flag (request descriptor = Tier-1's
-  template; gate completion on the counter-acquire per the audit, NOT `all_done`), differential vs the batcher WITH NULL,
-  HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
+- **R2.2 EVIDENCE GATE ❌ — wave LOSES to launch-per-batch; wave-in-engine PARKED (2026-06-27, DECISIONS ADR-008 "R2.2
+  EVIDENCE GATE", `wave::tests::wave_vs_launch_per_batch_throughput`):** persistent `WaveReadEngine` vs the launch-per-
+  batch R1 index probe (1M rows, release) = batch256 **60k vs 7.08M lookups/s (wave 118x SLOWER)**; in request-response
+  each wave's host↔device round-trip (~116µs) is worse than a launch+stream-sync (~25µs) + the persistent threads' PCIe
+  polling congests the bus. **Do NOT wire the wave engine, do NOT do the async-alloc fix — R1's launch-per-batch GPU
+  index probe (shipped, O(1), 2.3M end-to-end) is the point-read winner.** The wave engine would only win under sustained
+  continuous-fill high concurrency with async result delivery (large architectural change, unproven need) → PARKED.
+  R2.1/R2.2a code retained as proven/audited building blocks. **NEXT = §"Write path" (R3) / the parked benchmark items
+  — independent of the wave read path.**
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
