@@ -30,13 +30,17 @@
     does millions of lookups/s at realistic scale; the residual bottleneck (host-mapped atomics) is GPU-architectural
     (scales with hardware). NOT integrated into the engine; the batcher remains the production default.
 
-## The one next action — **wave 1d** (PLAN §3)
-Turn the proven data plane toward production, in this order: (i) move claim/`completed` atomics to **device memory**
-(raise the ~10M ceiling); (ii) build + quantify the **slot → neutral-result mapping** (parallelizable, not serial);
-(iii) **concurrent index maintenance on writes** (lock-free CAS inserts, ADR-009 — the static host-built index is the
-real OLTP write-path gap); (iv) **integrate into the engine** behind a default-OFF flag — request descriptor =
-Tier-1's `RelationalRetainedReadTemplate`. Gates: differential vs the batcher **WITH NULL**, HAZARD, **independent
-adversarial audit**. The batcher stays the default until the integrated wave path wins end-to-end.
+- **Wave 1d-i** (push the read ceiling) ✅ DONE: claim/`completed` atomics → **device memory** = read ceiling
+  **10.5M → ~30M req/s (~2.9×)**, 3× stable; slot→wire mapping quantified MINOR (~200M–1.1B rows/s, ≪ GPU drain). New
+  limiter = device-atomic contention on the single counter. (`wave_devatomic_probe.rs`.)
+
+## The one next action — **wave 1d (remaining)** (PLAN §3)
+Continue toward production: (ii) **batched/striped claiming** (each thread grabs K requests per `atom.add` → push past
+the single-atomic ceiling); (iii) **concurrent index maintenance on writes** (lock-free CAS inserts, ADR-009 — the
+static host-built index is the real OLTP write-path gap, and the **write path is still unmeasured**); (iv) **integrate
+into the engine** behind a default-OFF flag — request descriptor = Tier-1's `RelationalRetainedReadTemplate`; first
+audit the `all_done` cross-thread ordering from 1d-i. Gates: differential vs the batcher **WITH NULL**, HAZARD,
+**independent adversarial audit**. The batcher stays the default until the integrated wave path wins end-to-end.
 *Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real end-to-end OLTP-fitness
 instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+text; STRATA S-C/S-D/S-E.
 

@@ -84,12 +84,18 @@ Spec: ARCHITECTURE §7 + §13.
   open-addressing, Fibonacci hash, in-kernel probe + gather, bounded probe count) **removes the O(rows) scan →
   ~10.5M point lookups/s FLAT across 1M/4M/16M-row tables (O(1)), ~13.6× the CPU's 770k, independent of table size.**
   Atomic-ceiling-bound now. **This validates the OLTP point-read bet at the data-plane level: the GPU does millions
-  of lookups/s at realistic scale, residual bottleneck is GPU-architectural (scales with HW).** → **NEXT (1d):**
-  (i) move claim/`completed` atomics to **device memory** (raise the ~10M ceiling); (ii) the **slot→neutral-result
-  mapping** (quantify it — parallelizable); (iii) **concurrent index maintenance on writes** (lock-free CAS inserts,
-  ADR-009 — the static host-built index is the current gap for a real OLTP write path); (iv) **integrate into the
-  engine** behind a default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher WITH NULL,
-  HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
+  of lookups/s at realistic scale, residual bottleneck is GPU-architectural (scales with HW).**
+- **1d-i ✅ DONE (2026-06-27)** = `crates/execution/examples/wave_devatomic_probe.rs` — moved the claim/`completed`
+  atomics to **device memory** (last completer sets a host-mapped `all_done` flag; device counter DtoH-verified):
+  **read ceiling 10.5M → ~30M req/s (~2.9×), 3× stable, all correct.** New limiter = device-atomic contention on the
+  single counter (peaks at LOW thread count, 512–1024; → batched/striped claiming next). Also quantified the
+  **slot→wire mapping**: 200k packed slots → neutral rows in ~180µs–1ms single-threaded (~200M–1.1B rows/s), far below
+  the ~7ms GPU drain + embarrassingly parallel → the bare-data-plane caveat is MINOR. (NB the `all_done` cross-thread
+  ordering wants an independent audit before it's lifted into the engine.) → **NEXT (1d remaining):** (ii) batched/
+  striped claiming (push past the single-atomic ceiling); (iii) **concurrent index maintenance on writes** (lock-free
+  CAS inserts, ADR-009 — the static host-built index is the current gap for a real OLTP write path); (iv) **integrate
+  into the engine** behind a default-OFF flag (request descriptor = Tier-1's template), differential vs the batcher
+  WITH NULL, HAZARD + independent audit. The batcher stays the default until the integrated wave path beats it end-to-end.
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
