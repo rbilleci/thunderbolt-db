@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 
+// R2 wave read engine (ADR-009): persistent-kernel point-lookup read path. A child module so it can use
+// the root module's private CUDA infra (`gpu_primary_context`, `GpuPrimaryContext` methods, `check_cuda`)
+// while keeping the (unsafe FFI) wave code isolated from this file.
+mod wave;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceTarget {
     Cpu,
