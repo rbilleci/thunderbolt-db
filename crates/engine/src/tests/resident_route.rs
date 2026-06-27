@@ -3791,9 +3791,11 @@ fn r1_wave_index_probe_matches_scan_differential() {
     .unwrap();
     // `id` is a UNIQUE key (the index route fires); `bucket` is NON-unique (duplicate -> scan fallback).
     // NULL `balance` (id=20) + NULL `note` exercise NULL handling on projected + unprojected columns.
-    // NULL `balance` (id=20) exercises a NULL in a PROJECTED column (handled identically by both routes,
-    // so the differential covers it). The NULL-`id` row exercises R1b's NULL-KEY skip: a NULL key never
-    // satisfies `id = needle` (SQL 3VL), so the index build drops it AND the scan never matches it.
+    // NULL `balance` (id=20) exercises a NULL in a PROJECTED column (handled identically by both routes).
+    // The NULL-`id` row exercises NULL-as-0 KEY handling: a NULL int4 is materialized as 0, so BOTH the
+    // scan (raw int4 compare, no validity-bitmap consult) and the index (built from the SAME device bytes)
+    // match it at `id = 0`. The index does NOT skip it — that byte-identity at needle 0 is the audit's
+    // P1 #1, closed by building the index from the resident device buffer rather than from host rows.
     e.execute_text(
         2,
         "INSERT INTO accounts (id, bucket, balance, note) VALUES \
@@ -3838,11 +3840,11 @@ fn r1_wave_index_probe_matches_scan_differential() {
         (entry.column_idx, entry.index_memory.is_some())
     };
 
-    // (a) Unique-key differential WITH NULL: DISTINCT present needles (incl the NULL-balance row 20) +
-    // one absent needle (25). Needles are distinct by contract — the batcher's `dedup_needles` collapses
-    // identical point lookups before submission — so the thread-per-needle index and the thread-per-row
-    // scan are a bijection (each needle hits a unique row; match_count <= row_count).
-    let unique_needles = vec![10, 20, 30, 40, 25];
+    // (a) Unique-key differential WITH NULL: DISTINCT present needles (incl the NULL-balance row 20), one
+    // absent needle (25), and needle 0 which hits the NULL-`id` row (NULL materialized as 0 — both routes
+    // must agree). Needles are distinct by contract — the batcher's `dedup_needles` collapses identical
+    // point lookups — so the thread-per-needle index and the thread-per-row scan are a bijection.
+    let unique_needles = vec![10, 20, 30, 40, 25, 0];
     e.set_wave_engine_enabled(false);
     let scan_unique = run(&e, &select_unique, &unique_needles);
     e.set_wave_engine_enabled(true);
@@ -3872,8 +3874,12 @@ fn r1_wave_index_probe_matches_scan_differential() {
         Vec::<Vec<SqlValue>>::new(),
         "needle 25 absent -> no rows"
     );
-    // id=20 (NULL balance) is covered by the `index_unique == scan_unique` differential above — this fast
-    // path returns the raw stored int4 for a NULL projection (no bitmap mask), identically on both routes.
+    // needle 0 hits the NULL-`id` row (NULL int4 == 0): the index returns it exactly as the scan does
+    // (audit P1 #1). The differential `index_unique == scan_unique` already pins byte-identity; assert the
+    // row is non-empty so the case is not vacuous (both routes genuinely match a NULL-as-0 key).
+    assert_eq!(index_unique[5].len(), 1, "needle 0 -> the NULL-id row, on both routes");
+    // id=20 (NULL balance) is covered by the differential above — this fast path returns the raw stored
+    // int4 for a NULL projection (no bitmap mask), identically on both routes.
 
     // (b) Duplicate-key fallback: `bucket` is non-unique, so the index build abandons (None) and the
     // scan runs -- flag on must STILL match flag off (and return BOTH rows for bucket = 1).

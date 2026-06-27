@@ -9,18 +9,23 @@
 use super::*;
 
 /// ADR-009 R1: a cached GPU hash index over one resident int4 key column, for the index-probe
-/// point-lookup route. Built lazily from the resident snapshot's host rows and cached per table;
-/// `generation` + `column_idx` tag WHICH (snapshot generation, key column) it indexes, so a stale
-/// entry — after a re-admission bumps the generation, or a different column is queried — is detected
-/// by mismatch and rebuilt: the index can never silently serve a wrong generation. `index_memory`
-/// is `None` when this (generation, column) is NOT indexable (duplicate keys, since the scan returns
-/// EVERY match but a hash index holds one row per key; or the index could not be built), so the route
-/// transparently falls back to the scan. The `Arc<CudaResidentDeviceMemory>` is what a submission pins
-/// (R1b) so the device index buffer outlives an in-flight kernel even if this cache entry is evicted.
+/// point-lookup route. Built lazily by DtoH-reading the key column from the resident device buffer
+/// (NOT host rows) so the index's row→value mapping is inherently consistent with the SAME bytes the
+/// scan reads — the audit's host_rows↔device_memory cross-generation hazard cannot arise. Validity:
+/// `column_idx` + `resident_device_ptr` tag WHICH resident buffer (a unique allocation per residency
+/// generation) this index mirrors. `_resident_guard` pins that buffer so its address can never be
+/// freed-then-reused while cached — making `resident_device_ptr` an unambiguous identity check: a
+/// re-admission allocates a NEW buffer (new ptr) → cache miss → rebuild against the live bytes.
+/// `index_memory` is `None` when the buffer is NOT cleanly indexable for this column (duplicate keys
+/// — incl. multiple NULLs materialized as 0 — since the scan returns EVERY match but a hash index
+/// holds one row per key; or a key would exceed the kernel's probe cap; or the build failed), so the
+/// route transparently falls back to the scan. The index `Arc<CudaResidentDeviceMemory>` is what a
+/// submission pins (R1b) so the device index buffer outlives an in-flight kernel even if evicted.
 #[derive(Debug)]
 pub(crate) struct WaveResidentIndex {
-    pub(crate) generation: u64,
     pub(crate) column_idx: usize,
+    pub(crate) resident_device_ptr: u64,
+    pub(crate) _resident_guard: Arc<CudaResidentDeviceMemory>,
     pub(crate) index_memory: Option<Arc<CudaResidentDeviceMemory>>,
     pub(crate) table_mask: u32,
     pub(crate) hash_shift: u32,
