@@ -388,7 +388,7 @@ impl Engine {
         for device_memory in self
             .read_state
             .residency
-            .partition_device_memory
+            .shard_device_memory
             .published_owners_for_table(&decision.table)
         {
             let _ = device_memory.set_current_context();
@@ -401,31 +401,31 @@ impl Engine {
                 self.execute_resident_plan(select)
             }
             // S10c slice 2a: the 8 MULTI-PARTITION resident shapes route to the `&Select`->general bridge
-            // (single-GPU). It RECOMPACTS the table's partition buffers ON-DEVICE (device-to-device copies)
+            // (single-GPU). It RECOMPACTS the table's shard buffers ON-DEVICE (device-to-device copies)
             // into ONE unified int4 SoA buffer, then runs the general resident-Expr executor ONCE over it --
             // so COUNT/SUM/MIN/MAX/AVG and projection are all computed on the device with the host FULLY out
-            // (no per-partition host combine; AVG is a single on-device quotient). Retired the 8
-            // `execute_relational_partitioned_*_with_resident_device_memory_probe` methods (slice 1) and then
-            // the per-partition combine (slice 2a). Byte-identical to the probes on non-NULL data; the
+            // (no per-shard host combine; AVG is a single on-device quotient). Retired the 8
+            // `execute_relational_sharded_*_with_resident_device_memory_probe` methods (slice 1) and then
+            // the per-shard combine (slice 2a). Byte-identical to the probes on non-NULL data; the
             // empty-set aggregates take the same placeholders via a COUNT precheck.
-            "partitioned_count_all"
-            | "partitioned_int4_equality_projection"
-            | "partitioned_int4_equality_multi_column_projection"
-            | "partitioned_int4_equality_sum"
-            | "partitioned_int4_between_avg"
-            | "partitioned_int4_filtered_min"
-            | "partitioned_int4_filtered_avg"
-            | "partitioned_int4_filtered_max"
-            // S10c slice 2b: partitioned DISTINCT / GROUP BY / ORDER-BY projection. The unified
+            "sharded_count_all"
+            | "sharded_int4_equality_projection"
+            | "sharded_int4_equality_multi_column_projection"
+            | "sharded_int4_equality_sum"
+            | "sharded_int4_between_avg"
+            | "sharded_int4_filtered_min"
+            | "sharded_int4_filtered_avg"
+            | "sharded_int4_filtered_max"
+            // S10c slice 2b: sharded DISTINCT / GROUP BY / ORDER-BY projection. The unified
             // recompacted buffer holds the WHOLE table, so these dedup/group/sort/window shapes are
-            // CORRECT over it; the partitioned bridge dispatches each to the grouped/distinct sub-bridge
+            // CORRECT over it; the sharded bridge dispatches each to the grouped/distinct sub-bridge
             // with the unified source injected (no new device/kernel code).
-            | "partitioned_int4_distinct_projection"
-            | "partitioned_int4_filtered_distinct_projection"
-            | "partitioned_int4_grouped_aggregate"
-            | "partitioned_int4_filtered_grouped_aggregate"
-            | "partitioned_int4_ordered_projection" => {
-                self.execute_resident_partitioned_via_general(select)
+            | "sharded_int4_distinct_projection"
+            | "sharded_int4_filtered_distinct_projection"
+            | "sharded_int4_grouped_aggregate"
+            | "sharded_int4_filtered_grouped_aggregate"
+            | "sharded_int4_ordered_projection" => {
+                self.execute_resident_sharded_via_general(select)
             }
             // S10a: a text-prefix `COUNT(*)` (`SELECT COUNT(*) ... WHERE col LIKE 'al%'`) routes to the
             // `&Select`->general bridge as a CountAll + a reconstructed `LIKE` predicate. The bridge rebuilds

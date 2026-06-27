@@ -230,7 +230,7 @@ impl Engine {
             .load()
             .keys()
             .cloned()
-            .chain(self.read_state.residency.partitions.load().keys().cloned())
+            .chain(self.read_state.residency.shards.load().keys().cloned())
             .collect();
         for table in &tables {
             self.invalidate_relational_residency_table(table, txn_id, index);
@@ -238,14 +238,14 @@ impl Engine {
     }
 
     /// Invalidate the residency of a **single** table (its snapshot, device memory,
-    /// and partitions). This is the per-table unit the commit path uses so a write to
+    /// and shards). This is the per-table unit the commit path uses so a write to
     /// one table no longer evicts every other table's residency — the former
     /// stop-the-world behavior. Summing this over all resident tables reproduces the
-    /// previous global invalidation; the device-memory/partition removals here are
+    /// previous global invalidation; the device-memory/shard removals here are
     /// unconditional, so in degenerate cache states it may clear a stray cross-map
     /// entry the old two-loop form left — strictly-safe extra cleanup, never stale.
     fn invalidate_relational_residency_table(&self, table: &str, txn_id: TxnId, index: Index) {
-        // Stage 3 — blocker #2: the snapshot/partition flag maps are now published behind `ArcSwap`,
+        // Stage 3 — blocker #2: the snapshot/shard flag maps are now published behind `ArcSwap`,
         // so flag the invalidation copy-on-write under the serialized catalog latch (this never runs
         // on the concurrent commit path — that uses `invalidate_relational_residency_tables_concurrent`
         // which only tombstones the device-memory cells via `&self`).
@@ -263,14 +263,14 @@ impl Engine {
             }
         });
         self.read_state.residency.device_memory.invalidate(table);
-        self.read_state.residency.with_partitions_mut(|partitions| {
-            if let Some(partitions) = partitions.get_mut(table) {
-                for partition in partitions.iter_mut() {
-                    if partition.invalidated_by_txn_id.is_none() {
-                        partition.invalidated_by_txn_id = Some(txn_id);
-                        partition.invalidated_at_index = Some(index);
+        self.read_state.residency.with_shards_mut(|shards| {
+            if let Some(shards) = shards.get_mut(table) {
+                for shard in shards.iter_mut() {
+                    if shard.invalidated_by_txn_id.is_none() {
+                        shard.invalidated_by_txn_id = Some(txn_id);
+                        shard.invalidated_at_index = Some(index);
                     }
-                    if let Some(proof) = partition.device_memory_proof.as_mut() {
+                    if let Some(proof) = shard.device_memory_proof.as_mut() {
                         proof.retained = false;
                     }
                 }
@@ -278,7 +278,7 @@ impl Engine {
         });
         self.read_state
             .residency
-            .partition_device_memory
+            .shard_device_memory
             .invalidate_table(table);
     }
 
@@ -290,7 +290,7 @@ impl Engine {
     /// Called INSIDE the commit critical section, before `committed_seq` is bumped, so a reader that
     /// observes the new `committed_seq` also observes the residency tombstone.
     ///
-    /// It deliberately does NOT mutate the `snapshots`/`partitions` flag maps (those are not
+    /// It deliberately does NOT mutate the `snapshots`/`shards` flag maps (those are not
     /// interior-mutable and are read lock-free by `&self` readers): the cell tombstone alone forces
     /// the CPU route. The flag-based telemetry / the explicit resident-snapshot-probe API are kept
     /// current only on the serialized invalidation path (`invalidate_relational_residency_table`),
@@ -305,7 +305,7 @@ impl Engine {
             self.read_state.residency.device_memory.invalidate(table);
             self.read_state
                 .residency
-                .partition_device_memory
+                .shard_device_memory
                 .invalidate_table(table);
         }
     }
@@ -367,7 +367,7 @@ impl Engine {
     }
 
     pub(crate) fn invalidate_relational_residency_for_memory_pressure(&self, gpu_id: u16) {
-        // Stage 3 — blocker #2: COW the snapshot/partition flag maps under the catalog latch, then
+        // Stage 3 — blocker #2: COW the snapshot/shard flag maps under the catalog latch, then
         // tombstone the device-memory cells of every table that was pressured (the cell `invalidate`
         // is `&self`, done outside the COW closure on the collected tables).
         let pressured_snapshot_tables = self.read_state.residency.with_snapshots_mut(|snapshots| {
@@ -389,17 +389,17 @@ impl Engine {
         for table in &pressured_snapshot_tables {
             self.read_state.residency.device_memory.invalidate(table);
         }
-        let pressured_partition_tables =
-            self.read_state.residency.with_partitions_mut(|partitions| {
+        let pressured_shard_tables =
+            self.read_state.residency.with_shards_mut(|shards| {
                 let mut tables = Vec::new();
-                for (table, table_partitions) in partitions.iter_mut() {
+                for (table, table_shards) in shards.iter_mut() {
                     let mut table_pressured = false;
-                    for partition in table_partitions {
-                        if partition.gpu_id == gpu_id {
-                            partition.invalidated_by_memory_pressure = true;
-                            partition.memory_pressure_active = true;
+                    for shard in table_shards {
+                        if shard.gpu_id == gpu_id {
+                            shard.invalidated_by_memory_pressure = true;
+                            shard.memory_pressure_active = true;
                             table_pressured = true;
-                            if let Some(proof) = partition.device_memory_proof.as_mut() {
+                            if let Some(proof) = shard.device_memory_proof.as_mut() {
                                 proof.retained = false;
                             }
                         }
@@ -410,10 +410,10 @@ impl Engine {
                 }
                 tables
             });
-        for table in &pressured_partition_tables {
+        for table in &pressured_shard_tables {
             self.read_state
                 .residency
-                .partition_device_memory
+                .shard_device_memory
                 .invalidate_table(table);
         }
     }
@@ -450,7 +450,7 @@ impl Engine {
 
         match cmd {
             Command::SetKv { key, value } => {
-                // KV lives in its own partition. Read the current version under the loaded
+                // KV lives in its own shard. Read the current version under the loaded
                 // generation, then publish a new KV generation with the update/insert applied.
                 let existing = self
                     .read_state

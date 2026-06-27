@@ -41,7 +41,7 @@ real pgwire round-trip tests (`tokio_postgres`). `PointLookupBatcher` (microbatc
   The OLTP deterministic wave engine (ARCHITECTURE §OLTP) is **design, not built**.
 
 ## The blocking gap
-**No production producer of GPU residency exists.** `residency.shards`/`partitions` is written only by a test
+**No production producer of GPU residency exists.** `residency.shards` is written only by a test
 helper; the operator warm path makes only a unified single buffer and is operator-triggered. So a committed user
 table is **non-resident by default and reads run host-side** (`execute_relational_select_cpu_pinned` →
 `finalize_relational_select`). The host read path is therefore **live**, and **S10d (delete the host path) is gated on
@@ -66,6 +66,9 @@ MVCC CPU-fallback dispatch and retire *with* the host path, not before.
   protocol (Parse/Bind/Describe/Execute), cursors/FETCH, bounded COPY in/out, SCRAM+TLS production profile,
   pg_dump/restore + pg_dumpall round-trip. Broad driver/binary/extended-protocol parity beyond this is later.
 
-## Recent (this session, on `main`)
-Docs consolidated to 6 canonical files; STRATA (residency) + OLTP-execution designs written; the OLTP bet decided;
-architecture docs reconciled with the charter; ADR-003 superseded by ADR-006.
+## Recent
+**STRATA S-A landed (2026-06-27):** L2 vocabulary rename `partition → shard` (`RelationalResidentShard`,
+`residency.shards`, `shard_device_memory`, `sharded_*` route shapes; engine + observability; the MVCC tuple-store
+"partition" namespace was deliberately left intact); behavior-preserving, 729/0. Earlier: docs consolidated to 6
+canonical files; STRATA + OLTP-execution designs written; the OLTP bet decided; architecture docs reconciled with
+the charter; ADR-003 superseded by ADR-006.

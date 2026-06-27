@@ -1024,7 +1024,7 @@ fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
 }
 
 #[test]
-fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidated() {
+fn p8_sharded_resident_count_reduces_valid_shards_and_rejects_invalidated() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -1032,14 +1032,14 @@ fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidate
         )
         .unwrap();
 
-    let partitions = (0..4_u32)
-        .map(|partition_id| {
+    let shards = (0..4_u32)
+        .map(|shard_id| {
             let row_count = 256_usize;
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id,
-                row_start: partition_id as usize * row_count + 1,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id,
+                row_start: shard_id as usize * row_count + 1,
                 row_count,
                 resident_bytes: bytes.len() as u64,
                 allocated_bytes: bytes.len() as u64,
@@ -1053,17 +1053,17 @@ fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidate
         })
         .collect::<Vec<_>>();
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions,
+            shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -1073,8 +1073,8 @@ fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidate
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_count_all");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_count_all");
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 1024);
     assert_eq!(route.resident_bytes, 32);
     assert_eq!(route.h2d_bytes_if_resident, 0);
@@ -1096,8 +1096,8 @@ fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidate
         .latest_route_decision("order_line")
         .unwrap()
         .clone();
-    assert_eq!(decision.query_shape, "partitioned_count_all");
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.query_shape, "sharded_count_all");
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
@@ -1111,8 +1111,8 @@ fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidate
                 .saturating_sub(before.kernel_exec_samples)
         )
     );
-    // S10c: this shape now executes via the per-partition `&Select`->general bridge, which records the
-    // generic execution observation (rows/h2d/d2h/kernel_samples) but NOT the probe-only per-partition
+    // S10c: this shape now executes via the per-shard `&Select`->general bridge, which records the
+    // generic execution observation (rows/h2d/d2h/kernel_samples) but NOT the probe-only per-shard
     // `record_route_device_lookup_micros`. So `last_execution_matched_rows` (set only by that recorder)
     // is no longer populated; assert the generic `last_execution_rows == Some(1)` (one COUNT(*) row).
     assert_eq!(decision.last_execution_rows, Some(1));
@@ -1124,14 +1124,14 @@ fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidate
         .unwrap();
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
-    assert_eq!(invalidated.query_shape, "partitioned_count_all");
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.query_shape, "sharded_count_all");
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 }
 
 #[test]
-fn p8_partitioned_resident_key_lookup_merges_matches_and_rejects_invalidated() {
+fn p8_sharded_resident_key_lookup_merges_matches_and_rejects_invalidated() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -1139,25 +1139,25 @@ fn p8_partitioned_resident_key_lookup_merges_matches_and_rejects_invalidated() {
         )
         .unwrap();
 
-    let partition_values: [Vec<i32>; 4] = [
+    let shard_values: [Vec<i32>; 4] = [
         vec![42, 1, 42, 2],
         vec![3, 4, 5, 6],
         vec![42, 7, 8, 42],
         vec![9, 10, 11, 12],
     ];
-    let partitions = partition_values
+    let shards = shard_values
         .iter()
         .enumerate()
-        .map(|(partition_id, values)| {
+        .map(|(shard_id, values)| {
             let row_count = values.len();
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
             for value in values {
                 bytes.extend_from_slice(&(*value).to_le_bytes());
             }
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id: partition_id as u32,
-                row_start: partition_id * row_count + 1,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id: shard_id as u32,
+                row_start: shard_id * row_count + 1,
                 row_count,
                 resident_bytes: bytes.len() as u64,
                 allocated_bytes: bytes.len() as u64,
@@ -1171,17 +1171,17 @@ fn p8_partitioned_resident_key_lookup_merges_matches_and_rejects_invalidated() {
         })
         .collect::<Vec<_>>();
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions,
+            shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -1193,8 +1193,8 @@ fn p8_partitioned_resident_key_lookup_merges_matches_and_rejects_invalidated() {
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_int4_equality_projection");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_int4_equality_projection");
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 16);
     assert_eq!(route.h2d_bytes_if_resident, 0);
     assert_eq!(
@@ -1222,14 +1222,14 @@ fn p8_partitioned_resident_key_lookup_merges_matches_and_rejects_invalidated() {
         .latest_route_decision("order_line")
         .unwrap()
         .clone();
-    assert_eq!(decision.query_shape, "partitioned_int4_equality_projection");
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.query_shape, "sharded_int4_equality_projection");
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    // S10c: executes via the per-partition `&Select`->general bridge. The probe-only
+    // S10c: executes via the per-shard `&Select`->general bridge. The probe-only
     // `record_route_device_lookup_micros` (which set `last_execution_matched_rows`) is no longer called,
     // so assert the generic `last_execution_rows == Some(4)` (the 4 concatenated projected rows) instead.
     assert_eq!(decision.last_execution_rows, Some(4));
@@ -1243,15 +1243,15 @@ fn p8_partitioned_resident_key_lookup_merges_matches_and_rejects_invalidated() {
     assert!(!invalidated.accepted);
     assert_eq!(
         invalidated.query_shape,
-        "partitioned_int4_equality_projection"
+        "sharded_int4_equality_projection"
     );
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 }
 
 #[test]
-fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects_missing_layout() {
+fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_missing_layout() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -1259,7 +1259,7 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
         )
         .unwrap();
 
-    let partition_values: [[Vec<i32>; 4]; 4] = [
+    let shard_values: [[Vec<i32>; 4]; 4] = [
         [
             vec![42, 1, 42, 2],
             vec![100, 101, 102, 103],
@@ -1285,10 +1285,10 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
             vec![800, 801, 802, 803],
         ],
     ];
-    let partitions = partition_values
+    let shards = shard_values
         .iter()
         .enumerate()
-        .map(|(partition_id, columns)| {
+        .map(|(shard_id, columns)| {
             let row_count = columns[0].len();
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -1297,9 +1297,9 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
                     bytes.extend_from_slice(&(*value).to_le_bytes());
                 }
             }
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id: partition_id as u32,
-                row_start: partition_id * row_count + 1,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id: shard_id as u32,
+                row_start: shard_id * row_count + 1,
                 row_count,
                 resident_bytes: bytes.len() as u64,
                 allocated_bytes: bytes.len() as u64,
@@ -1318,17 +1318,17 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
         })
         .collect::<Vec<_>>();
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions,
+            shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -1343,9 +1343,9 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
     assert!(route.accepted, "{route:?}");
     assert_eq!(
         route.query_shape,
-        "partitioned_int4_equality_multi_column_projection"
+        "sharded_int4_equality_multi_column_projection"
     );
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 16);
     assert_eq!(route.h2d_bytes_if_resident, 0);
     assert!(route.d2h_bytes_estimate > 0);
@@ -1392,15 +1392,15 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
         .clone();
     assert_eq!(
         decision.query_shape,
-        "partitioned_int4_equality_multi_column_projection"
+        "sharded_int4_equality_multi_column_projection"
     );
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // S10c: executes via the per-shard `&Select`->general bridge, which records the generic execution
     // observation but NOT the probe-only `record_route_{device_lookup,selected_projection}_micros`. So
     // `last_execution_matched_rows` / `last_execution_match_index_micros` /
     // `last_execution_selected_projection_micros` are no longer populated; assert the generic
@@ -1416,11 +1416,11 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
     assert!(!invalidated.accepted);
     assert_eq!(
         invalidated.query_shape,
-        "partitioned_int4_equality_multi_column_projection"
+        "sharded_int4_equality_multi_column_projection"
     );
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
     let mut missing_layout_engine = Engine::new_local();
     missing_layout_engine
@@ -1429,10 +1429,10 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
                 "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
             )
             .unwrap();
-    let mut missing_layout_partitions = partition_values
+    let mut missing_layout_shards = shard_values
         .iter()
         .enumerate()
-        .map(|(partition_id, columns)| {
+        .map(|(shard_id, columns)| {
             let row_count = columns[0].len();
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -1441,9 +1441,9 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
                     bytes.extend_from_slice(&(*value).to_le_bytes());
                 }
             }
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id: partition_id as u32,
-                row_start: partition_id * row_count + 1,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id: shard_id as u32,
+                row_start: shard_id * row_count + 1,
                 row_count,
                 resident_bytes: bytes.len() as u64,
                 allocated_bytes: bytes.len() as u64,
@@ -1461,20 +1461,20 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
             }
         })
         .collect::<Vec<_>>();
-    missing_layout_partitions[2]
+    missing_layout_shards[2]
         .resident_device_int4_columns
         .pop();
-    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: missing_layout_partitions,
+            shards: missing_layout_shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -1482,34 +1482,34 @@ fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects
     assert!(!missing_layout.accepted);
     assert_eq!(
         missing_layout.query_shape,
-        "partitioned_int4_equality_multi_column_projection"
+        "sharded_int4_equality_multi_column_projection"
     );
     assert_eq!(
         missing_layout.reason,
-        "resident partition 2 lacks required int4 projection layout"
+        "resident shard 2 lacks required int4 projection layout"
     );
 }
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_per_partition()
+fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_per_shard()
 {
     // Coverage-gap closer (engine side) for the resident row-index host-sort fix. The
-    // partitioned multi-column route iterates partitions in order and, within each partition,
+    // sharded multi-column route iterates shards in order and, within each shard,
     // materializes one output row per entry of `match_i32_equal_row_indices_from_payload(..)` in
     // that vector's order via a strictly positional gather. The CPU/non-resident reference emits
-    // a partition's matching rows in ASCENDING row order. The resident kernel, however, appends
+    // a shard's matching rows in ASCENDING row order. The resident kernel, however, appends
     // matches in `atom.global.add` SCHEDULE order, which is ascending only while all matches in
-    // a partition fit in ONE warp (<= 32). Every existing partitioned parity test stays under
-    // that boundary (<= 2 matches per partition), so this is the first test that puts MORE THAN
-    // ONE WARP of matches in a SINGLE partition.
+    // a shard fit in ONE warp (<= 32). Every existing sharded parity test stays under
+    // that boundary (<= 2 matches per shard), so this is the first test that puts MORE THAN
+    // ONE WARP of matches in a SINGLE shard.
     //
     // Why this is non-vacuous (would fail/flake WITHOUT the host sort in
     // `launch_cuda_resident_i32_equal_row_indices`): with > 32 interleaved matches in a
-    // partition, the kernel's cross-warp append order is non-deterministic and is essentially
-    // never ascending, so the positional gather would emit that partition's rows in a
+    // shard, the kernel's cross-warp append order is non-deterministic and is essentially
+    // never ascending, so the positional gather would emit that shard's rows in a
     // non-deterministic, non-ascending order — diverging from the ascending reference asserted
-    // below and breaking the partitioned ascending-merge. It passes only because the route now
+    // below and breaking the sharded ascending-merge. It passes only because the route now
     // sorts the [0, count) indices host-side. The loop re-runs the query so a sort-less route
     // surfaces a wrong ordering on at least one iteration.
     let mut e = Engine::new_local();
@@ -1520,11 +1520,11 @@ fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matc
         .unwrap();
 
     const NEEDLE: i32 = 42;
-    // Two partitions. Partition 0 carries a MULTI-WARP block of matches: 200 rows where the
+    // Two shards. Shard 0 carries a MULTI-WARP block of matches: 200 rows where the
     // even rows match the needle (100 matches >> 32, interleaved across many warps and several
     // 128-thread blocks); the projected columns are distinct per row so the asserted order is
-    // load-bearing. Partition 1 is a small non-matching tail (exercises the cross-partition
-    // merge after the multi-warp partition).
+    // load-bearing. Shard 1 is a small non-matching tail (exercises the cross-shard
+    // merge after the multi-warp shard).
     let p0_rows: usize = 200;
     let p0_ol_o_id: Vec<i32> = (0..p0_rows as i32)
         .map(|row| if row % 2 == 0 { NEEDLE } else { row + 1000 })
@@ -1540,14 +1540,14 @@ fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matc
     let p1_ol_quantity = vec![17, 18, 19, 20];
     let p1_ol_amount = vec![801, 802, 803, 804];
 
-    let partition_columns: Vec<[Vec<i32>; 4]> = vec![
+    let shard_columns: Vec<[Vec<i32>; 4]> = vec![
         [p0_ol_o_id, p0_ol_i_id, p0_ol_quantity, p0_ol_amount],
         [p1_ol_o_id, p1_ol_i_id, p1_ol_quantity, p1_ol_amount],
     ];
 
-    // CPU reference: rows from each partition in ASCENDING row order, partitions in order.
+    // CPU reference: rows from each shard in ASCENDING row order, shards in order.
     let mut expected_rows: Vec<Vec<SqlValue>> = Vec::new();
-    for columns in &partition_columns {
+    for columns in &shard_columns {
         for (row, key) in columns[0].iter().enumerate() {
             if *key == NEEDLE {
                 expected_rows.push(vec![
@@ -1561,14 +1561,14 @@ fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matc
     }
     assert!(
         expected_rows.len() > 32,
-        "test must match more than one warp of rows in a single partition"
+        "test must match more than one warp of rows in a single shard"
     );
 
     let mut row_cursor = 1usize;
-    let partitions = partition_columns
+    let shards = shard_columns
         .iter()
         .enumerate()
-        .map(|(partition_id, columns)| {
+        .map(|(shard_id, columns)| {
             let row_count = columns[0].len();
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -1579,8 +1579,8 @@ fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matc
             }
             let row_start = row_cursor;
             row_cursor += row_count;
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id: partition_id as u32,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id: shard_id as u32,
                 row_start,
                 row_count,
                 resident_bytes: bytes.len() as u64,
@@ -1600,17 +1600,17 @@ fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matc
         })
         .collect::<Vec<_>>();
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions,
+            shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -1625,9 +1625,9 @@ fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matc
     assert!(route.accepted, "{route:?}");
     assert_eq!(
         route.query_shape,
-        "partitioned_int4_equality_multi_column_projection"
+        "sharded_int4_equality_multi_column_projection"
     );
-    assert_eq!(route.partition_count, 2);
+    assert_eq!(route.shard_count, 2);
 
     // Re-run so a non-deterministic (sort-less) cross-warp order is caught on some iteration.
     for iter in 0..25 {
@@ -1636,7 +1636,7 @@ fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matc
         assert_eq!(result.fallback_reason, None);
         assert_eq!(
             result.rows, expected_rows,
-            "partitioned multi-warp resident rows were not in ascending reference order on \
+            "sharded multi-warp resident rows were not in ascending reference order on \
                  iteration {iter} — the resident route's host sort over [0, count) is missing?"
         );
     }
@@ -1854,7 +1854,7 @@ fn p8_batched_mixed_column_projection_matches_per_query_for_more_than_one_warp_o
 }
 
 #[test]
-fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
+fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -1862,7 +1862,7 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
         )
         .unwrap();
 
-    let partition_values: [[Vec<i32>; 4]; 4] = [
+    let shard_values: [[Vec<i32>; 4]; 4] = [
         [
             vec![42, 1, 42, 2],
             vec![100, 101, 102, 103],
@@ -1888,11 +1888,11 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
             vec![800, 801, 802, 803],
         ],
     ];
-    let build_partitions = || {
-        partition_values
+    let build_shards = || {
+        shard_values
             .iter()
             .enumerate()
-            .map(|(partition_id, columns)| {
+            .map(|(shard_id, columns)| {
                 let row_count = columns[0].len();
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -1901,9 +1901,9 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
                         bytes.extend_from_slice(&(*value).to_le_bytes());
                     }
                 }
-                BenchmarkRelationalResidencyOwnedPartition {
-                    partition_id: partition_id as u32,
-                    row_start: partition_id * row_count + 1,
+                BenchmarkRelationalResidencyOwnedShard {
+                    shard_id: shard_id as u32,
+                    row_start: shard_id * row_count + 1,
                     row_count,
                     resident_bytes: bytes.len() as u64,
                     allocated_bytes: bytes.len() as u64,
@@ -1923,17 +1923,17 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
             .collect::<Vec<_>>()
     };
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: build_partitions(),
+            shards: build_shards(),
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -1945,8 +1945,8 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_int4_equality_sum");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_int4_equality_sum");
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 16);
     assert_eq!(route.h2d_bytes_if_resident, 0);
     assert_eq!(route.d2h_rows_estimate, 1);
@@ -1967,14 +1967,14 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
         .latest_route_decision("order_line")
         .unwrap()
         .clone();
-    assert_eq!(decision.query_shape, "partitioned_int4_equality_sum");
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.query_shape, "sharded_int4_equality_sum");
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // S10c: executes via the per-shard `&Select`->general bridge, which records the generic execution
     // observation (`last_execution_rows == Some(1)`, one SUM row) but NOT the probe-only
     // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
     // `last_execution_match_index_micros` / `last_execution_selected_projection_micros` /
@@ -1988,10 +1988,10 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
         .unwrap();
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
-    assert_eq!(invalidated.query_shape, "partitioned_int4_equality_sum");
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.query_shape, "sharded_int4_equality_sum");
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
     let mut missing_layout_engine = Engine::new_local();
     missing_layout_engine
@@ -2000,35 +2000,35 @@ fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
                 "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
             )
             .unwrap();
-    let mut missing_layout_partitions = build_partitions();
-    missing_layout_partitions[2]
+    let mut missing_layout_shards = build_shards();
+    missing_layout_shards[2]
         .resident_device_int4_columns
         .pop();
-    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: missing_layout_partitions,
+            shards: missing_layout_shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
     let missing_layout = missing_layout_engine.plan_relational_resident_route(&select);
     assert!(!missing_layout.accepted);
-    assert_eq!(missing_layout.query_shape, "partitioned_int4_equality_sum");
+    assert_eq!(missing_layout.query_shape, "sharded_int4_equality_sum");
     assert_eq!(
         missing_layout.reason,
-        "resident partition 2 lacks required int4 projection layout"
+        "resident shard 2 lacks required int4 projection layout"
     );
 }
 
 #[test]
-fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layout() {
+fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -2036,7 +2036,7 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
         )
         .unwrap();
 
-    let partition_values: [[Vec<i32>; 4]; 4] = [
+    let shard_values: [[Vec<i32>; 4]; 4] = [
         [
             vec![10, 20, 30, 40],
             vec![100, 101, 102, 103],
@@ -2062,11 +2062,11 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
             vec![20, 21, 22, 23],
         ],
     ];
-    let build_partitions = || {
-        partition_values
+    let build_shards = || {
+        shard_values
             .iter()
             .enumerate()
-            .map(|(partition_id, columns)| {
+            .map(|(shard_id, columns)| {
                 let row_count = columns[0].len();
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -2075,9 +2075,9 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
                         bytes.extend_from_slice(&(*value).to_le_bytes());
                     }
                 }
-                BenchmarkRelationalResidencyOwnedPartition {
-                    partition_id: partition_id as u32,
-                    row_start: partition_id * row_count + 1,
+                BenchmarkRelationalResidencyOwnedShard {
+                    shard_id: shard_id as u32,
+                    row_start: shard_id * row_count + 1,
                     row_count,
                     resident_bytes: bytes.len() as u64,
                     allocated_bytes: bytes.len() as u64,
@@ -2097,17 +2097,17 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
             .collect::<Vec<_>>()
     };
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: build_partitions(),
+            shards: build_shards(),
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -2120,8 +2120,8 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_int4_between_avg");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_int4_between_avg");
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 16);
     assert_eq!(route.h2d_bytes_if_resident, 0);
     assert_eq!(route.d2h_rows_estimate, 1);
@@ -2147,14 +2147,14 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
         .latest_route_decision("order_line")
         .unwrap()
         .clone();
-    assert_eq!(decision.query_shape, "partitioned_int4_between_avg");
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.query_shape, "sharded_int4_between_avg");
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // S10c: executes via the per-shard `&Select`->general bridge, which records the generic execution
     // observation (`last_execution_rows == Some(1)`, one AVG row) but NOT the probe-only
     // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
     // `last_execution_match_index_micros` / `last_execution_selected_projection_micros` /
@@ -2181,10 +2181,10 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
         .unwrap();
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
-    assert_eq!(invalidated.query_shape, "partitioned_int4_between_avg");
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.query_shape, "sharded_int4_between_avg");
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
     let mut missing_layout_engine = Engine::new_local();
     missing_layout_engine
@@ -2193,35 +2193,35 @@ fn p8_partitioned_resident_between_avg_reduces_matches_and_rejects_missing_layou
                 "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
             )
             .unwrap();
-    let mut missing_layout_partitions = build_partitions();
-    missing_layout_partitions[2]
+    let mut missing_layout_shards = build_shards();
+    missing_layout_shards[2]
         .resident_device_int4_columns
         .pop();
-    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: missing_layout_partitions,
+            shards: missing_layout_shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
     let missing_layout = missing_layout_engine.plan_relational_resident_route(&select);
     assert!(!missing_layout.accepted);
-    assert_eq!(missing_layout.query_shape, "partitioned_int4_between_avg");
+    assert_eq!(missing_layout.query_shape, "sharded_int4_between_avg");
     assert_eq!(
         missing_layout.reason,
-        "resident partition 2 lacks required int4 projection layout"
+        "resident shard 2 lacks required int4 projection layout"
     );
 }
 
 #[test]
-fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layout() {
+fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -2229,7 +2229,7 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
         )
         .unwrap();
 
-    let partition_values: [[Vec<i32>; 4]; 4] = [
+    let shard_values: [[Vec<i32>; 4]; 4] = [
         [
             vec![10, 20, 30, 40],
             vec![100, 101, 102, 103],
@@ -2255,11 +2255,11 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
             vec![1, 2, 3, 4],
         ],
     ];
-    let build_partitions = || {
-        partition_values
+    let build_shards = || {
+        shard_values
             .iter()
             .enumerate()
-            .map(|(partition_id, columns)| {
+            .map(|(shard_id, columns)| {
                 let row_count = columns[0].len();
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -2268,9 +2268,9 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
                         bytes.extend_from_slice(&(*value).to_le_bytes());
                     }
                 }
-                BenchmarkRelationalResidencyOwnedPartition {
-                    partition_id: partition_id as u32,
-                    row_start: partition_id * row_count + 1,
+                BenchmarkRelationalResidencyOwnedShard {
+                    shard_id: shard_id as u32,
+                    row_start: shard_id * row_count + 1,
                     row_count,
                     resident_bytes: bytes.len() as u64,
                     allocated_bytes: bytes.len() as u64,
@@ -2290,17 +2290,17 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
             .collect::<Vec<_>>()
     };
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: build_partitions(),
+            shards: build_shards(),
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -2312,8 +2312,8 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_int4_filtered_max");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_int4_filtered_max");
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 16);
     assert_eq!(route.h2d_bytes_if_resident, 0);
     assert_eq!(route.d2h_rows_estimate, 1);
@@ -2334,14 +2334,14 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
         .latest_route_decision("order_line")
         .unwrap()
         .clone();
-    assert_eq!(decision.query_shape, "partitioned_int4_filtered_max");
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.query_shape, "sharded_int4_filtered_max");
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // S10c: executes via the per-shard `&Select`->general bridge, which records the generic execution
     // observation (`last_execution_rows == Some(1)`, one MAX row) but NOT the probe-only
     // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
     // `last_execution_match_index_micros` / `last_execution_result_materialization_micros` are no longer
@@ -2363,10 +2363,10 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
         .unwrap();
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
-    assert_eq!(invalidated.query_shape, "partitioned_int4_filtered_max");
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.query_shape, "sharded_int4_filtered_max");
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
     let mut missing_layout_engine = Engine::new_local();
     missing_layout_engine
@@ -2375,35 +2375,35 @@ fn p8_partitioned_resident_filtered_max_reduces_matches_and_rejects_missing_layo
                 "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
             )
             .unwrap();
-    let mut missing_layout_partitions = build_partitions();
-    missing_layout_partitions[2]
+    let mut missing_layout_shards = build_shards();
+    missing_layout_shards[2]
         .resident_device_int4_columns
         .pop();
-    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: missing_layout_partitions,
+            shards: missing_layout_shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
     let missing_layout = missing_layout_engine.plan_relational_resident_route(&select);
     assert!(!missing_layout.accepted);
-    assert_eq!(missing_layout.query_shape, "partitioned_int4_filtered_max");
+    assert_eq!(missing_layout.query_shape, "sharded_int4_filtered_max");
     assert_eq!(
         missing_layout.reason,
-        "resident partition 2 lacks required int4 projection layout"
+        "resident shard 2 lacks required int4 projection layout"
     );
 }
 
 #[test]
-fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layout() {
+fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -2411,7 +2411,7 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
         )
         .unwrap();
 
-    let partition_values: [[Vec<i32>; 4]; 4] = [
+    let shard_values: [[Vec<i32>; 4]; 4] = [
         [
             vec![10, 20, 30, 40],
             vec![100, 101, 102, 103],
@@ -2437,11 +2437,11 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
             vec![91, 92, 93, 94],
         ],
     ];
-    let build_partitions = || {
-        partition_values
+    let build_shards = || {
+        shard_values
             .iter()
             .enumerate()
-            .map(|(partition_id, columns)| {
+            .map(|(shard_id, columns)| {
                 let row_count = columns[0].len();
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -2450,9 +2450,9 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
                         bytes.extend_from_slice(&(*value).to_le_bytes());
                     }
                 }
-                BenchmarkRelationalResidencyOwnedPartition {
-                    partition_id: partition_id as u32,
-                    row_start: partition_id * row_count + 1,
+                BenchmarkRelationalResidencyOwnedShard {
+                    shard_id: shard_id as u32,
+                    row_start: shard_id * row_count + 1,
                     row_count,
                     resident_bytes: bytes.len() as u64,
                     allocated_bytes: bytes.len() as u64,
@@ -2472,17 +2472,17 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
             .collect::<Vec<_>>()
     };
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: build_partitions(),
+            shards: build_shards(),
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -2494,8 +2494,8 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_int4_filtered_min");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_int4_filtered_min");
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 16);
     assert_eq!(route.h2d_bytes_if_resident, 0);
     assert_eq!(route.d2h_rows_estimate, 1);
@@ -2516,14 +2516,14 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
         .latest_route_decision("order_line")
         .unwrap()
         .clone();
-    assert_eq!(decision.query_shape, "partitioned_int4_filtered_min");
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.query_shape, "sharded_int4_filtered_min");
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // S10c: executes via the per-shard `&Select`->general bridge, which records the generic execution
     // observation (`last_execution_rows == Some(1)`, one MIN row) but NOT the probe-only
     // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
     // `last_execution_match_index_micros` / `last_execution_result_materialization_micros` are no longer
@@ -2545,10 +2545,10 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
         .unwrap();
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
-    assert_eq!(invalidated.query_shape, "partitioned_int4_filtered_min");
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.query_shape, "sharded_int4_filtered_min");
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
     let mut missing_layout_engine = Engine::new_local();
     missing_layout_engine
@@ -2557,35 +2557,35 @@ fn p8_partitioned_resident_filtered_min_reduces_matches_and_rejects_missing_layo
                 "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
             )
             .unwrap();
-    let mut missing_layout_partitions = build_partitions();
-    missing_layout_partitions[2]
+    let mut missing_layout_shards = build_shards();
+    missing_layout_shards[2]
         .resident_device_int4_columns
         .pop();
-    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: missing_layout_partitions,
+            shards: missing_layout_shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
     let missing_layout = missing_layout_engine.plan_relational_resident_route(&select);
     assert!(!missing_layout.accepted);
-    assert_eq!(missing_layout.query_shape, "partitioned_int4_filtered_min");
+    assert_eq!(missing_layout.query_shape, "sharded_int4_filtered_min");
     assert_eq!(
         missing_layout.reason,
-        "resident partition 2 lacks required int4 projection layout"
+        "resident shard 2 lacks required int4 projection layout"
     );
 }
 
 #[test]
-fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layout() {
+fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout() {
     let mut e = Engine::new_local();
     e.execute_text(
             1,
@@ -2593,7 +2593,7 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
         )
         .unwrap();
 
-    let partition_values: [[Vec<i32>; 4]; 4] = [
+    let shard_values: [[Vec<i32>; 4]; 4] = [
         [
             vec![10, 20, 30, 40],
             vec![100, 101, 102, 103],
@@ -2619,11 +2619,11 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
             vec![91, 92, 93, 94],
         ],
     ];
-    let build_partitions = || {
-        partition_values
+    let build_shards = || {
+        shard_values
             .iter()
             .enumerate()
-            .map(|(partition_id, columns)| {
+            .map(|(shard_id, columns)| {
                 let row_count = columns[0].len();
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -2632,9 +2632,9 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
                         bytes.extend_from_slice(&(*value).to_le_bytes());
                     }
                 }
-                BenchmarkRelationalResidencyOwnedPartition {
-                    partition_id: partition_id as u32,
-                    row_start: partition_id * row_count + 1,
+                BenchmarkRelationalResidencyOwnedShard {
+                    shard_id: shard_id as u32,
+                    row_start: shard_id * row_count + 1,
                     row_count,
                     resident_bytes: bytes.len() as u64,
                     allocated_bytes: bytes.len() as u64,
@@ -2654,17 +2654,17 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
             .collect::<Vec<_>>()
     };
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: build_partitions(),
+            shards: build_shards(),
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -2676,8 +2676,8 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_int4_filtered_avg");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_int4_filtered_avg");
+    assert_eq!(route.shard_count, 4);
     assert_eq!(route.estimated_rows, 16);
     assert_eq!(route.h2d_bytes_if_resident, 0);
     assert_eq!(route.d2h_rows_estimate, 1);
@@ -2703,14 +2703,14 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
         .latest_route_decision("order_line")
         .unwrap()
         .clone();
-    assert_eq!(decision.query_shape, "partitioned_int4_filtered_avg");
-    assert_eq!(decision.partition_count, 4);
+    assert_eq!(decision.query_shape, "sharded_int4_filtered_avg");
+    assert_eq!(decision.shard_count, 4);
     assert_eq!(decision.last_execution_h2d_bytes, Some(0));
     assert_eq!(
         decision.last_execution_d2h_bytes,
         Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
     );
-    // S10c: executes via the per-partition `&Select`->general bridge, which records the generic execution
+    // S10c: executes via the per-shard `&Select`->general bridge, which records the generic execution
     // observation (`last_execution_rows == Some(1)`, one AVG row) but NOT the probe-only
     // `record_route_selected_projection_micros`. So `last_execution_matched_rows` /
     // `last_execution_match_index_micros` / `last_execution_result_materialization_micros` are no longer
@@ -2736,10 +2736,10 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
         .unwrap();
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
-    assert_eq!(invalidated.query_shape, "partitioned_int4_filtered_avg");
-    assert_eq!(invalidated.partition_count, 4);
+    assert_eq!(invalidated.query_shape, "sharded_int4_filtered_avg");
+    assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
-    assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    assert_eq!(invalidated.reason, "resident shard set is Invalidated");
 
     let mut missing_layout_engine = Engine::new_local();
     missing_layout_engine
@@ -2748,30 +2748,30 @@ fn p8_partitioned_resident_filtered_avg_reduces_matches_and_rejects_missing_layo
                 "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
             )
             .unwrap();
-    let mut missing_layout_partitions = build_partitions();
-    missing_layout_partitions[2]
+    let mut missing_layout_shards = build_shards();
+    missing_layout_shards[2]
         .resident_device_int4_columns
         .pop();
-    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions: missing_layout_partitions,
+            shards: missing_layout_shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
     let missing_layout = missing_layout_engine.plan_relational_resident_route(&select);
     assert!(!missing_layout.accepted);
-    assert_eq!(missing_layout.query_shape, "partitioned_int4_filtered_avg");
+    assert_eq!(missing_layout.query_shape, "sharded_int4_filtered_avg");
     assert_eq!(
         missing_layout.reason,
-        "resident partition 2 lacks required int4 projection layout"
+        "resident shard 2 lacks required int4 projection layout"
     );
 }
 
@@ -3183,12 +3183,12 @@ fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
     status.validate().unwrap();
 }
 
-// S10c slice 2a: a partitioned int4 aggregate whose predicate matches ZERO rows across ALL
-// partitions. The recompacted unified buffer is run ONCE; the COUNT(*) precheck returns 0 and the
+// S10c slice 2a: a sharded int4 aggregate whose predicate matches ZERO rows across ALL
+// shards. The recompacted unified buffer is run ONCE; the COUNT(*) precheck returns 0 and the
 // SUM projection yields the slice-1 / probe placeholder `SqlValue::Int8(0)` (rather than the general
 // SUM's empty-set hard error). This pins the all-empty path byte-identically with slice 1.
 #[test]
-fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
+fn p8_sharded_resident_sum_all_empty_returns_zero_placeholder() {
     let mut e = Engine::new_local();
     e.execute_text(
         1,
@@ -3196,7 +3196,7 @@ fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
     )
     .unwrap();
 
-    let partition_values: [[Vec<i32>; 4]; 4] = [
+    let shard_values: [[Vec<i32>; 4]; 4] = [
         [
             vec![1, 2, 3, 4],
             vec![100, 101, 102, 103],
@@ -3222,10 +3222,10 @@ fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
             vec![800, 801, 802, 803],
         ],
     ];
-    let partitions = partition_values
+    let shards = shard_values
         .iter()
         .enumerate()
-        .map(|(partition_id, columns)| {
+        .map(|(shard_id, columns)| {
             let row_count = columns[0].len();
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -3234,9 +3234,9 @@ fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
                     bytes.extend_from_slice(&(*value).to_le_bytes());
                 }
             }
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id: partition_id as u32,
-                row_start: partition_id * row_count + 1,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id: shard_id as u32,
+                row_start: shard_id * row_count + 1,
                 row_count,
                 resident_bytes: bytes.len() as u64,
                 allocated_bytes: bytes.len() as u64,
@@ -3255,22 +3255,22 @@ fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
         })
         .collect::<Vec<_>>();
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions,
+            shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
 
-    // ol_o_id is never 99999 in any partition, so the filtered set is empty across all partitions.
+    // ol_o_id is never 99999 in any shard, so the filtered set is empty across all shards.
     let Command::Select(select) =
         parse_command("SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = 99999").unwrap()
     else {
@@ -3278,8 +3278,8 @@ fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
     };
     let route = e.plan_relational_resident_route(&select);
     assert!(route.accepted, "{route:?}");
-    assert_eq!(route.query_shape, "partitioned_int4_equality_sum");
-    assert_eq!(route.partition_count, 4);
+    assert_eq!(route.query_shape, "sharded_int4_equality_sum");
+    assert_eq!(route.shard_count, 4);
 
     let result = e.execute_relational_select(&select).unwrap();
     // The all-empty placeholder is the slice-1 / probe value (Int8(0)), not a SUM hard error.
@@ -3288,14 +3288,14 @@ fn p8_partitioned_resident_sum_all_empty_returns_zero_placeholder() {
     assert_eq!(result.fallback_reason, None);
 }
 
-// S10c slice 2a (audit F1): the recompaction indexes partition slices POSITIONALLY by int4 ordinal and
-// the unified descriptor labels the buffer with partition 0's int4 list, so a partition whose
-// `resident_device_int4_columns` disagrees with partition 0 (here the first two columns are swapped) must
+// S10c slice 2a (audit F1): the recompaction indexes shard slices POSITIONALLY by int4 ordinal and
+// the unified descriptor labels the buffer with shard 0's int4 list, so a shard whose
+// `resident_device_int4_columns` disagrees with shard 0 (here the first two columns are swapped) must
 // be REJECTED with a clean error rather than silently recompacting a column's bytes into the wrong slot
-// (or reading past a too-short source). The partitioned benchmark install runs no layout validation, so
+// (or reading past a too-short source). The sharded benchmark install runs no layout validation, so
 // the bridge enforces uniformity itself; the route's referenced-column membership check does not catch it.
 #[test]
-fn p8_partitioned_resident_rejects_nonuniform_int4_layout() {
+fn p8_sharded_resident_rejects_nonuniform_int4_layout() {
     let mut e = Engine::new_local();
     e.execute_text(
         1,
@@ -3311,17 +3311,17 @@ fn p8_partitioned_resident_rejects_nonuniform_int4_layout() {
             "ol_amount".to_string(),
         ],
         vec![
-            // partition 1: ol_o_id / ol_i_id SWAPPED vs partition 0 (same set, different order).
+            // shard 1: ol_o_id / ol_i_id SWAPPED vs shard 0 (same set, different order).
             "ol_i_id".to_string(),
             "ol_o_id".to_string(),
             "ol_quantity".to_string(),
             "ol_amount".to_string(),
         ],
     ];
-    let partitions = layouts
+    let shards = layouts
         .iter()
         .enumerate()
-        .map(|(partition_id, int4_columns)| {
+        .map(|(shard_id, int4_columns)| {
             let row_count = 4_usize;
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -3330,9 +3330,9 @@ fn p8_partitioned_resident_rejects_nonuniform_int4_layout() {
                     bytes.extend_from_slice(&value.to_le_bytes());
                 }
             }
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id: partition_id as u32,
-                row_start: partition_id * row_count + 1,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id: shard_id as u32,
+                row_start: shard_id * row_count + 1,
                 row_count,
                 resident_bytes: bytes.len() as u64,
                 allocated_bytes: bytes.len() as u64,
@@ -3346,17 +3346,17 @@ fn p8_partitioned_resident_rejects_nonuniform_int4_layout() {
         })
         .collect::<Vec<_>>();
 
-    let installed = e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    let installed = e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
             gpu_id: 0,
-            partitions,
+            shards,
         },
     );
     if let Err(err) = installed {
         assert!(
             err.to_string().contains("CUDA"),
-            "unexpected partition install error: {err}"
+            "unexpected shard install error: {err}"
         );
         return;
     }
@@ -3371,34 +3371,34 @@ fn p8_partitioned_resident_rejects_nonuniform_int4_layout() {
 
     let err = e
         .execute_relational_select(&select)
-        .expect_err("a non-uniform partition int4 layout must be rejected, not silently recompacted");
+        .expect_err("a non-uniform shard int4 layout must be rejected, not silently recompacted");
     assert!(
-        err.to_string().contains("does not match partition 0 layout"),
+        err.to_string().contains("does not match shard 0 layout"),
         "unexpected error: {err}"
     );
 }
 
 // ---------------------------------------------------------------------------------------------------
-// S10c slice 2b: partitioned DISTINCT / GROUP BY / ORDER-BY-projection.
+// S10c slice 2b: sharded DISTINCT / GROUP BY / ORDER-BY-projection.
 //
-// The partitioned bridge recompacts the whole table into ONE unified int4 buffer, so DISTINCT / GROUP BY /
+// The sharded bridge recompacts the whole table into ONE unified int4 buffer, so DISTINCT / GROUP BY /
 // ORDER BY are CORRECT over it (it sees every row). Each fixture below builds the SAME logical rows TWICE:
-// once as N device partitions (the SoA-bytes `build_partitions` pattern) and once as ONE single-store
+// once as N device shards (the SoA-bytes `build_shards` pattern) and once as ONE single-store
 // snapshot (rows INSERTed via `execute_text`, then `populate_relational_residency_snapshot`). The
 // single-store engine is the ORACLE: it runs the SAME bridge over a whole-table store. We run the SAME SQL
 // through `execute_relational_select` on each engine and assert the columns AND rows are byte-identical, plus
-// the partitioned route's `accepted` / `query_shape` / `executed_target == Gpu(0)`.
+// the sharded route's `accepted` / `query_shape` / `executed_target == Gpu(0)`.
 //
-// Logical rows for table `pt (k INT, v INT)` across THREE partitions (the cross-partition cases are the
+// Logical rows for table `pt (k INT, v INT)` across THREE shards (the cross-shard cases are the
 // whole point): k=42 appears in p0 (twice) AND p2 -> ONE grouped/distinct row; k=1 spans p0+p1; k=5 spans
-// p1+p2. `ORDER BY k DESC LIMIT 4` over all rows -> [42,42,42,9] drawn from p0 AND p2 (spans partitions).
+// p1+p2. `ORDER BY k DESC LIMIT 4` over all rows -> [42,42,42,9] drawn from p0 AND p2 (spans shards).
 //
 //   p0: (42,10) (1,20) (42,30)
 //   p1: (3,5)   (1,15) (5,25)
 //   p2: (42,40) (5,50) (9,60)
 
 #[cfg(test)]
-fn s10c_2b_partition_values() -> [[Vec<i32>; 2]; 3] {
+fn s10c_2b_shard_values() -> [[Vec<i32>; 2]; 3] {
     [
         [vec![42, 1, 42], vec![10, 20, 30]],
         [vec![3, 1, 5], vec![5, 15, 25]],
@@ -3408,10 +3408,10 @@ fn s10c_2b_partition_values() -> [[Vec<i32>; 2]; 3] {
 
 #[cfg(test)]
 fn s10c_2b_logical_rows() -> Vec<(i32, i32)> {
-    // The same rows in published partition order ((row_start, partition_id) — here partition order), so the
+    // The same rows in published shard order ((row_start, shard_id) — here shard order), so the
     // single-store oracle holds the identical multiset.
     let mut rows = Vec::new();
-    for [ks, vs] in s10c_2b_partition_values() {
+    for [ks, vs] in s10c_2b_shard_values() {
         for (k, v) in ks.into_iter().zip(vs) {
             rows.push((k, v));
         }
@@ -3419,16 +3419,16 @@ fn s10c_2b_logical_rows() -> Vec<(i32, i32)> {
     rows
 }
 
-/// Install the three partitions for `pt (k INT, v INT)` as SoA device bytes (8-byte row-count header, then
+/// Install the three shards for `pt (k INT, v INT)` as SoA device bytes (8-byte row-count header, then
 /// k contiguous, then v contiguous). Returns `None` (caller should `return`) if there is no local GPU/driver.
 #[cfg(test)]
-fn s10c_2b_partitioned_engine() -> Option<Engine> {
+fn s10c_2b_sharded_engine() -> Option<Engine> {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE pt (k INT, v INT)").unwrap();
-    let partitions = s10c_2b_partition_values()
+    let shards = s10c_2b_shard_values()
         .iter()
         .enumerate()
-        .map(|(partition_id, columns)| {
+        .map(|(shard_id, columns)| {
             let row_count = columns[0].len();
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
@@ -3437,9 +3437,9 @@ fn s10c_2b_partitioned_engine() -> Option<Engine> {
                     bytes.extend_from_slice(&(*value).to_le_bytes());
                 }
             }
-            BenchmarkRelationalResidencyOwnedPartition {
-                partition_id: partition_id as u32,
-                row_start: partition_id * row_count + 1,
+            BenchmarkRelationalResidencyOwnedShard {
+                shard_id: shard_id as u32,
+                row_start: shard_id * row_count + 1,
                 row_count,
                 resident_bytes: bytes.len() as u64,
                 allocated_bytes: bytes.len() as u64,
@@ -3452,18 +3452,18 @@ fn s10c_2b_partitioned_engine() -> Option<Engine> {
             }
         })
         .collect::<Vec<_>>();
-    match e.install_benchmark_relational_residency_owned_partitions(
-        BenchmarkRelationalResidencyOwnedPartitionInstall {
+    match e.install_benchmark_relational_residency_owned_shards(
+        BenchmarkRelationalResidencyOwnedShardInstall {
             table: "pt",
             gpu_id: 0,
-            partitions,
+            shards,
         },
     ) {
         Ok(()) => Some(e),
         Err(err) => {
             assert!(
                 err.to_string().contains("CUDA"),
-                "unexpected partition install error: {err}"
+                "unexpected shard install error: {err}"
             );
             None
         }
@@ -3487,12 +3487,12 @@ fn s10c_2b_single_store_engine() -> Option<Engine> {
     snapshot.device_memory_proof.is_some().then_some(e)
 }
 
-/// Run `sql` on the partitioned engine and on the single-store oracle, assert the partitioned route is
-/// accepted with `expected_shape` and executed on GPU(0), and assert the partitioned result is byte-identical
+/// Run `sql` on the sharded engine and on the single-store oracle, assert the sharded route is
+/// accepted with `expected_shape` and executed on GPU(0), and assert the sharded result is byte-identical
 /// to the oracle's.
 #[cfg(test)]
-fn s10c_2b_assert_partitioned_matches_oracle(
-    partitioned: &Engine,
+fn s10c_2b_assert_sharded_matches_oracle(
+    sharded: &Engine,
     oracle: &Engine,
     sql: &str,
     expected_shape: &str,
@@ -3500,12 +3500,12 @@ fn s10c_2b_assert_partitioned_matches_oracle(
     let Command::Select(select) = parse_command(sql).unwrap() else {
         unreachable!()
     };
-    let route = partitioned.plan_relational_resident_route(&select);
+    let route = sharded.plan_relational_resident_route(&select);
     assert!(route.accepted, "{sql}: route not accepted: {route:?}");
     assert_eq!(route.query_shape, expected_shape, "{sql}");
-    assert_eq!(route.partition_count, 3, "{sql}");
+    assert_eq!(route.shard_count, 3, "{sql}");
 
-    let part = partitioned.execute_relational_select(&select).unwrap();
+    let part = sharded.execute_relational_select(&select).unwrap();
     assert_eq!(part.executed_target, DeviceTarget::Gpu(0), "{sql}");
     assert_eq!(part.fallback_reason, None, "{sql}");
 
@@ -3516,26 +3516,26 @@ fn s10c_2b_assert_partitioned_matches_oracle(
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn s10c_2b_partitioned_grouped_aggregate_matches_oracle() {
-    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+fn s10c_2b_sharded_grouped_aggregate_matches_oracle() {
+    let Some(sharded) = s10c_2b_sharded_engine() else {
         return;
     };
     let Some(oracle) = s10c_2b_single_store_engine() else {
         return;
     };
-    // Cross-partition case (a): k=42 is present in p0 (twice) AND p2 -> ONE grouped row (COUNT 3, SUM 80).
+    // Cross-shard case (a): k=42 is present in p0 (twice) AND p2 -> ONE grouped row (COUNT 3, SUM 80).
     // GROUP BY COUNT and GROUP BY SUM, with ORDER BY to pin order against the oracle.
-    s10c_2b_assert_partitioned_matches_oracle(
-        &partitioned,
+    s10c_2b_assert_sharded_matches_oracle(
+        &sharded,
         &oracle,
         "SELECT k, COUNT(*) FROM pt GROUP BY k ORDER BY k",
-        "partitioned_int4_grouped_aggregate",
+        "sharded_int4_grouped_aggregate",
     );
-    s10c_2b_assert_partitioned_matches_oracle(
-        &partitioned,
+    s10c_2b_assert_sharded_matches_oracle(
+        &sharded,
         &oracle,
         "SELECT k, SUM(v) FROM pt GROUP BY k ORDER BY k",
-        "partitioned_int4_grouped_aggregate",
+        "sharded_int4_grouped_aggregate",
     );
     // Independently pin the k=42 collapse so the oracle equality can't pass on two matching-but-wrong sides.
     let Command::Select(select) =
@@ -3543,7 +3543,7 @@ fn s10c_2b_partitioned_grouped_aggregate_matches_oracle() {
     else {
         unreachable!()
     };
-    let rows = partitioned.execute_relational_select(&select).unwrap().rows;
+    let rows = sharded.execute_relational_select(&select).unwrap().rows;
     assert_eq!(
         rows,
         vec![
@@ -3559,8 +3559,8 @@ fn s10c_2b_partitioned_grouped_aggregate_matches_oracle() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn s10c_2b_partitioned_filtered_grouped_aggregate_matches_oracle() {
-    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+fn s10c_2b_sharded_filtered_grouped_aggregate_matches_oracle() {
+    let Some(sharded) = s10c_2b_sharded_engine() else {
         return;
     };
     let Some(oracle) = s10c_2b_single_store_engine() else {
@@ -3568,50 +3568,50 @@ fn s10c_2b_partitioned_filtered_grouped_aggregate_matches_oracle() {
     };
     // Filtered grouped: WHERE v >= 25 keeps (1,? no) -> (42,30),(5,25),(42,40),(5,50),(9,60). k=42 still
     // spans p0+p2 -> ONE row; k=5 still spans p1+p2 -> ONE row.
-    s10c_2b_assert_partitioned_matches_oracle(
-        &partitioned,
+    s10c_2b_assert_sharded_matches_oracle(
+        &sharded,
         &oracle,
         "SELECT k, COUNT(*) FROM pt WHERE v >= 25 GROUP BY k ORDER BY k",
-        "partitioned_int4_filtered_grouped_aggregate",
+        "sharded_int4_filtered_grouped_aggregate",
     );
-    s10c_2b_assert_partitioned_matches_oracle(
-        &partitioned,
+    s10c_2b_assert_sharded_matches_oracle(
+        &sharded,
         &oracle,
         "SELECT k, SUM(v) FROM pt WHERE v >= 25 GROUP BY k ORDER BY k",
-        "partitioned_int4_filtered_grouped_aggregate",
+        "sharded_int4_filtered_grouped_aggregate",
     );
 }
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn s10c_2b_partitioned_distinct_projection_matches_oracle() {
-    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+fn s10c_2b_sharded_distinct_projection_matches_oracle() {
+    let Some(sharded) = s10c_2b_sharded_engine() else {
         return;
     };
     let Some(oracle) = s10c_2b_single_store_engine() else {
         return;
     };
-    // Cross-partition case (c): DISTINCT k where k=42 (p0+p2), k=1 (p0+p1), k=5 (p1+p2) each yield ONE row.
-    s10c_2b_assert_partitioned_matches_oracle(
-        &partitioned,
+    // Cross-shard case (c): DISTINCT k where k=42 (p0+p2), k=1 (p0+p1), k=5 (p1+p2) each yield ONE row.
+    s10c_2b_assert_sharded_matches_oracle(
+        &sharded,
         &oracle,
         "SELECT DISTINCT k FROM pt ORDER BY k",
-        "partitioned_int4_distinct_projection",
+        "sharded_int4_distinct_projection",
     );
     // Filtered DISTINCT: WHERE k >= 5 -> {5,9,42}; k=5 spans p1+p2, k=42 spans p0+p2 -> still one row each.
-    s10c_2b_assert_partitioned_matches_oracle(
-        &partitioned,
+    s10c_2b_assert_sharded_matches_oracle(
+        &sharded,
         &oracle,
         "SELECT DISTINCT k FROM pt WHERE k >= 5 ORDER BY k",
-        "partitioned_int4_filtered_distinct_projection",
+        "sharded_int4_filtered_distinct_projection",
     );
-    // Independently pin the multi-partition DISTINCT key collapse.
+    // Independently pin the multi-shard DISTINCT key collapse.
     let Command::Select(select) =
         parse_command("SELECT DISTINCT k FROM pt ORDER BY k").unwrap()
     else {
         unreachable!()
     };
-    let rows = partitioned.execute_relational_select(&select).unwrap().rows;
+    let rows = sharded.execute_relational_select(&select).unwrap().rows;
     assert_eq!(
         rows,
         vec![
@@ -3621,33 +3621,33 @@ fn s10c_2b_partitioned_distinct_projection_matches_oracle() {
             vec![SqlValue::Int4(9)],
             vec![SqlValue::Int4(42)],
         ],
-        "DISTINCT keys present in multiple partitions must each yield ONE row"
+        "DISTINCT keys present in multiple shards must each yield ONE row"
     );
 }
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn s10c_2b_partitioned_ordered_projection_matches_oracle() {
-    let Some(partitioned) = s10c_2b_partitioned_engine() else {
+fn s10c_2b_sharded_ordered_projection_matches_oracle() {
+    let Some(sharded) = s10c_2b_sharded_engine() else {
         return;
     };
     let Some(oracle) = s10c_2b_single_store_engine() else {
         return;
     };
-    // Cross-partition case (b): a global ORDER BY k DESC LIMIT 4 whose top-4 rows [42,42,42,9] are drawn
-    // from p0 (a 42) AND p2 (two 42s + the 9) — i.e. the top-N window spans MULTIPLE partitions.
-    s10c_2b_assert_partitioned_matches_oracle(
-        &partitioned,
+    // Cross-shard case (b): a global ORDER BY k DESC LIMIT 4 whose top-4 rows [42,42,42,9] are drawn
+    // from p0 (a 42) AND p2 (two 42s + the 9) — i.e. the top-N window spans MULTIPLE shards.
+    s10c_2b_assert_sharded_matches_oracle(
+        &sharded,
         &oracle,
         "SELECT k FROM pt WHERE k >= 1 ORDER BY k DESC LIMIT 4",
-        "partitioned_int4_ordered_projection",
+        "sharded_int4_ordered_projection",
     );
     let Command::Select(select) =
         parse_command("SELECT k FROM pt WHERE k >= 1 ORDER BY k DESC LIMIT 4").unwrap()
     else {
         unreachable!()
     };
-    let rows = partitioned.execute_relational_select(&select).unwrap().rows;
+    let rows = sharded.execute_relational_select(&select).unwrap().rows;
     assert_eq!(
         rows,
         vec![

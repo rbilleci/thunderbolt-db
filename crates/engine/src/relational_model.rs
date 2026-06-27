@@ -210,14 +210,14 @@ pub struct RelationalResidencySnapshot {
     pub resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     /// int8 columns retained in the device payload (fixed 8-byte row-major, after the int4 section,
     /// before the text section), in catalog order — the general GPU executor reads int8 predicates /
-    /// projections from here (the type matrix, doc 19). Empty for partitioned / benchmark installs
+    /// projections from here (the type matrix, doc 19). Empty for sharded / benchmark installs
     /// that have not adopted int8 retention yet.
     pub resident_device_int8_columns: Vec<String>,
     /// numeric columns retained in the device payload (fixed 16-byte i128 mantissa, row-major, after
     /// the int8 section, before the text section), in catalog order — the general GPU executor reads
     /// numeric predicates / projections from here (the type matrix, doc 19). The decimal SCALE is a
     /// per-column catalog constant (values are rescaled on insert), so only the mantissa is stored.
-    /// Empty for partitioned / benchmark installs that have not adopted numeric retention yet.
+    /// Empty for sharded / benchmark installs that have not adopted numeric retention yet.
     pub resident_device_numeric_columns: Vec<String>,
     /// bool columns retained as 1-bit-per-row bitmaps (the type matrix, doc 19), in catalog order.
     /// Self-describing: each carries its bitmap's byte offset. Empty for installs not retaining bool.
@@ -412,8 +412,8 @@ where
     pub chunks: I,
 }
 
-pub struct BenchmarkRelationalResidencyOwnedPartition {
-    pub partition_id: u32,
+pub struct BenchmarkRelationalResidencyOwnedShard {
+    pub shard_id: u32,
     pub row_start: usize,
     pub row_count: usize,
     pub resident_bytes: u64,
@@ -423,10 +423,10 @@ pub struct BenchmarkRelationalResidencyOwnedPartition {
     pub chunks: Vec<CudaOwnedDeviceMemoryChunk>,
 }
 
-pub struct BenchmarkRelationalResidencyOwnedPartitionInstall<'a> {
+pub struct BenchmarkRelationalResidencyOwnedShardInstall<'a> {
     pub table: &'a str,
     pub gpu_id: u16,
-    pub partitions: Vec<BenchmarkRelationalResidencyOwnedPartition>,
+    pub shards: Vec<BenchmarkRelationalResidencyOwnedShard>,
 }
 
 impl RelationalResidencySnapshot {

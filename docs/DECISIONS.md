@@ -27,7 +27,8 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   future SQL `PARTITION BY`, L1; and from a shard's columnar **sections**, L3). A **commit-triggered admission
   producer** (post-durability, best-effort, via the `&self`+held-catalog-guard seam) makes committed tables
   resident. Reads = push-down to shards + cross-shard combine. Explicit residency/admission owns placement.
-- **Consequences:** Renames `RelationalResidentPartition → ResidentShard`. Unblocks host-read-path deletion once
+- **Consequences:** Renames `RelationalResidentPartition → RelationalResidentShard` (**landed: S-A, 2026-06-27,
+  suite 729/0**). Unblocks host-read-path deletion once
   admission is the default. Over-VRAM tables spill across shards (needs cross-shard combine — not yet built).
 
 ## ADR-009 — Deterministic batched OLTP execution model

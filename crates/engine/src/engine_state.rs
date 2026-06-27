@@ -315,7 +315,7 @@ pub(crate) fn percent_decode_lossy(input: &str) -> String {
 /// `committed_seq`-last release-store discipline (see `publish_committed_seq`).
 ///
 /// Stage 1 holds the already-lock-free fields (`mvcc`, `committed_seq`, the resident device-memory
-/// maps, route telemetry). The catalog (Stage 2) and the resident snapshot/partition metadata
+/// maps, route telemetry). The catalog (Stage 2) and the resident snapshot/shard metadata
 /// (Stage 3) move in behind `ArcSwap` later.
 ///
 /// Public as an **opaque** type (all fields private): the concurrent-dispatch façade holds an
@@ -337,7 +337,7 @@ pub struct ReadState {
     // so the concurrent commit critical section can bump it via `&self` (release-store, LAST — the
     // publish point) while lock-free readers acquire-load it once per statement (write-half Stage 4).
     pub(crate) committed_seq: AtomicU64,
-    // GPU-resident read-route metadata (device memory + — from Stage 3 — snapshot/partition maps).
+    // GPU-resident read-route metadata (device memory + — from Stage 3 — snapshot/shard maps).
     pub(crate) residency: ResidencyReadState,
     // Per-execution route telemetry the read path records through `&self` (Mutex + a test counter).
     pub(crate) route_telemetry: RouteTelemetry,
@@ -494,20 +494,20 @@ pub(crate) struct CatalogSnapshot {
 
 /// The GPU-resident read-route metadata reached by the lock-free read path. The device-memory maps
 /// are the authoritative residency tombstone gate the concurrent commit path flips via `&self`; the
-/// snapshot/partition metadata (Stage 3 — blocker #2) is published behind `ArcSwap` so the resident
+/// snapshot/shard metadata (Stage 3 — blocker #2) is published behind `ArcSwap` so the resident
 /// route can `load()` a guard whose pinned `Arc` outlives the across-kernel-launch read, and the
 /// serialized catalog-latch path (warm-up / DDL drop / invalidate / memory-pressure — NEVER the
 /// concurrent commit path) mutates it copy-on-write.
 #[derive(Debug, Default)]
 pub(crate) struct ResidencyReadState {
     pub(crate) device_memory: ResidentDeviceMemoryMap,
-    pub(crate) partition_device_memory: PartitionResidentDeviceMemoryMap,
-    // The per-table resident snapshot metadata + partition metadata, each an immutable published map
+    pub(crate) shard_device_memory: ShardResidentDeviceMemoryMap,
+    // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
     // memory-pressure.
     pub(crate) snapshots: ArcSwap<BTreeMap<String, RelationalResidencyEntry>>,
-    pub(crate) partitions: ArcSwap<BTreeMap<String, Vec<RelationalResidentPartition>>>,
+    pub(crate) shards: ArcSwap<BTreeMap<String, Vec<RelationalResidentShard>>>,
 }
 
 impl ResidencyReadState {
@@ -524,15 +524,15 @@ impl ResidencyReadState {
         result
     }
 
-    /// COW-mutate the resident partition map under the serialized catalog latch (see
+    /// COW-mutate the resident shard map under the serialized catalog latch (see
     /// [`ResidencyReadState::with_snapshots_mut`]).
-    pub(crate) fn with_partitions_mut<R>(
+    pub(crate) fn with_shards_mut<R>(
         &self,
-        mutate: impl FnOnce(&mut BTreeMap<String, Vec<RelationalResidentPartition>>) -> R,
+        mutate: impl FnOnce(&mut BTreeMap<String, Vec<RelationalResidentShard>>) -> R,
     ) -> R {
-        let mut next = (**self.partitions.load()).clone();
+        let mut next = (**self.shards.load()).clone();
         let result = mutate(&mut next);
-        self.partitions.store(Arc::new(next));
+        self.shards.store(Arc::new(next));
         result
     }
 }

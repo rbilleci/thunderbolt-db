@@ -1,9 +1,9 @@
 //! Resident device-memory + MVCC version storage internals (P0 §9.6
 //! decomposition, behavior-preserving): the per-table resident device-memory
-//! cell map (ResidentDeviceMemoryMap, PartitionResidentDeviceMemoryMap), the
+//! cell map (ResidentDeviceMemoryMap, ShardResidentDeviceMemoryMap), the
 //! MVCC version store (ColumnValueKey, TableVersionData, MvccData), the rows
 //! view, and the resident cache + read-pin (TableRowsView, RelationalReadPin,
-//! RelationalResidentCache + decision/observation/partition). Storage the
+//! RelationalResidentCache + decision/observation/shard). Storage the
 //! Engine owns and drives; not the commit-critical lock state.
 
 use super::*;
@@ -100,25 +100,25 @@ impl ResidentDeviceMemoryMap {
     }
 }
 
-/// Per-partition resident device memory, keyed by `(table, partition_id)`, under the same
+/// Per-shard resident device memory, keyed by `(table, shard_id)`, under the same
 /// publish-don't-mutate discipline as `ResidentDeviceMemoryMap` (P1-M3 slice B; doc 14).
-/// Before this, partitions were a plain `BTreeMap<(String,u32), CudaResidentDeviceMemory>`
+/// Before this, shards were a plain `BTreeMap<(String,u32), CudaResidentDeviceMemory>`
 /// freed *in place* on invalidate/replace/drop while a reader borrowed `&owner` across a
 /// kernel launch — a use-after-free the moment a writer overlaps a reader. Now each
-/// partition is a `SnapshotCell<Option<Arc<…>>>`: readers `get()` an owned `Arc` (no map
+/// shard is a `SnapshotCell<Option<Arc<…>>>`: readers `get()` an owned `Arc` (no map
 /// borrow held across the launch), and the writer publishes a new generation / `None`
 /// tombstone, so an in-flight reader's generation is freed only after it drains.
 /// The cell map is an [`arc_swap::ArcSwap`] (same rationale as [`ResidentDeviceMemoryMap`]):
-/// structural mutation (`install_table_partitions`, `remove_table`) is wait-free copy-on-write
+/// structural mutation (`install_table_shards`, `remove_table`) is wait-free copy-on-write
 /// through `&self`, so it works from inside the shared `Arc<ReadState>`, while `get`/`invalidate`
 /// stay wait-free.
 #[derive(Debug, Default)]
-pub(crate) struct PartitionResidentDeviceMemoryMap {
+pub(crate) struct ShardResidentDeviceMemoryMap {
     pub(crate) cells: ArcSwap<BTreeMap<(String, u32), ResidentDeviceMemoryCell>>,
 }
 
-impl PartitionResidentDeviceMemoryMap {
-    /// Load the published owner for one partition, if any (owned `Arc` — the borrow of the
+impl ShardResidentDeviceMemoryMap {
+    /// Load the published owner for one shard, if any (owned `Arc` — the borrow of the
     /// map ends here, so it is never held across a kernel launch).
     pub(crate) fn get(&self, key: &(String, u32)) -> Option<Arc<CudaResidentDeviceMemory>> {
         self.cells
@@ -127,7 +127,7 @@ impl PartitionResidentDeviceMemoryMap {
             .and_then(|cell| cell.load().get().clone())
     }
 
-    /// Whether this partition currently has a published owner (tombstones excluded).
+    /// Whether this shard currently has a published owner (tombstones excluded).
     pub(crate) fn contains_key(&self, key: &(String, u32)) -> bool {
         self.cells
             .load()
@@ -135,7 +135,7 @@ impl PartitionResidentDeviceMemoryMap {
             .is_some_and(|cell| cell.load().get().is_some())
     }
 
-    /// Published owners for every partition of `table` (tombstones excluded), owned `Arc`s.
+    /// Published owners for every shard of `table` (tombstones excluded), owned `Arc`s.
     pub(crate) fn published_owners_for_table(
         &self,
         table: &str,
@@ -148,12 +148,12 @@ impl PartitionResidentDeviceMemoryMap {
             .collect()
     }
 
-    /// Replace a table's partitions: publish each new partition as a new generation
+    /// Replace a table's shards: publish each new shard as a new generation
     /// (creating the cell on first residency) and publish a `None` tombstone for any prior
-    /// partition of this table not in the new set. In-flight readers keep the generation
+    /// shard of this table not in the new set. In-flight readers keep the generation
     /// they already loaded. `&self`: existing cells are republished in place; only newly-keyed
-    /// partitions COW-install a cell, so the map is stored at most once per call.
-    pub(crate) fn install_table_partitions(
+    /// shards COW-install a cell, so the map is stored at most once per call.
+    pub(crate) fn install_table_shards(
         &self,
         table: &str,
         device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
@@ -162,19 +162,19 @@ impl PartitionResidentDeviceMemoryMap {
         let prior_ids: Vec<u32> = snapshot
             .keys()
             .filter(|(cell_table, _)| cell_table == table)
-            .map(|(_, partition_id)| *partition_id)
+            .map(|(_, shard_id)| *shard_id)
             .collect();
-        for partition_id in prior_ids {
-            if !device_memory.contains_key(&partition_id) {
-                if let Some(cell) = snapshot.get(&(table.to_string(), partition_id)) {
+        for shard_id in prior_ids {
+            if !device_memory.contains_key(&shard_id) {
+                if let Some(cell) = snapshot.get(&(table.to_string(), shard_id)) {
                     cell.publish(None);
                 }
             }
         }
         let mut new_cells: BTreeMap<(String, u32), ResidentDeviceMemoryCell> = BTreeMap::new();
-        for (partition_id, memory) in device_memory {
+        for (shard_id, memory) in device_memory {
             let owner = Some(Arc::new(memory));
-            let key = (table.to_string(), partition_id);
+            let key = (table.to_string(), shard_id);
             if let Some(cell) = snapshot.get(&key) {
                 cell.publish(owner);
             } else {
@@ -188,7 +188,7 @@ impl PartitionResidentDeviceMemoryMap {
         }
     }
 
-    /// Publish a `None` tombstone for every partition of `table` (invalidation): cells are
+    /// Publish a `None` tombstone for every shard of `table` (invalidation): cells are
     /// retained so in-flight readers keep their generation; new loads see "not resident". `&self`
     /// (cells publish via `&self`) for the concurrent commit path (write-half Stage 4).
     pub(crate) fn invalidate_table(&self, table: &str) {
@@ -199,7 +199,7 @@ impl PartitionResidentDeviceMemoryMap {
         }
     }
 
-    /// Remove every partition cell of `table` (DROP TABLE) via a COW store. In-flight readers
+    /// Remove every shard cell of `table` (DROP TABLE) via a COW store. In-flight readers
     /// retain their own loaded generation via its `Arc`, so this never frees memory under a reader.
     pub(crate) fn remove_table(&self, table: &str) {
         if !self
@@ -579,7 +579,7 @@ impl RelationalReadPin {
 
 /// The serialized-path resident-route metadata kept on [`Engine`] (mutated only by the catalog-latch
 /// path). The lock-free read path's parts all moved to `Engine::read_state`: the device-memory maps
-/// (the tombstone gate) and the snapshot/partition metadata to [`ResidencyReadState`] (Stage 3 —
+/// (the tombstone gate) and the snapshot/shard metadata to [`ResidencyReadState`] (Stage 3 —
 /// blocker #2), the route telemetry to [`RouteTelemetry`]. What remains here is purely the
 /// admission-time accounting the read path never consults: per-GPU residency budgets and the last
 /// admission decision per table.
@@ -613,8 +613,8 @@ pub(crate) struct RelationalResidentRouteExecutionObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RelationalResidentPartition {
-    pub(crate) partition_id: u32,
+pub(crate) struct RelationalResidentShard {
+    pub(crate) shard_id: u32,
     pub(crate) row_start: usize,
     pub(crate) row_count: usize,
     pub(crate) resident_bytes: u64,
@@ -632,7 +632,7 @@ pub(crate) struct RelationalResidentPartition {
     pub(crate) memory_pressure_active: bool,
 }
 
-impl RelationalResidentPartition {
+impl RelationalResidentShard {
     pub(crate) fn is_valid(&self, memory_pressure_active: bool) -> bool {
         self.invalidated_by_txn_id.is_none()
             && self.invalidated_at_index.is_none()
@@ -653,7 +653,7 @@ impl RelationalResidentCache {
     /// Drop a table's serialized-path metadata, plus its device memory (now in `residency`) and its
     /// route telemetry (now in `telemetry`). The device-memory/route-telemetry stores live in the
     /// shared `Arc<ReadState>`; the catalog-latch caller passes `&self`-views of them in.
-    /// Drop a table's resident metadata. The snapshot/partition maps + device memory now live in the
+    /// Drop a table's resident metadata. The snapshot/shard maps + device memory now live in the
     /// shared `residency` (Stage 3); the route telemetry in `telemetry`. `&self` (nothing on the
     /// `RelationalResidentCache` itself is removed — its budget/last-decision accounting is keyed
     /// independently and pruned elsewhere); the catalog-latch caller passes `&self`-views in.
@@ -665,8 +665,8 @@ impl RelationalResidentCache {
     ) {
         residency.with_snapshots_mut(|snapshots| snapshots.remove(table));
         residency.device_memory.remove(table);
-        residency.with_partitions_mut(|partitions| partitions.remove(table));
-        residency.partition_device_memory.remove_table(table);
+        residency.with_shards_mut(|shards| shards.remove(table));
+        residency.shard_device_memory.remove_table(table);
         telemetry.remove_table(table);
     }
 
@@ -694,16 +694,16 @@ impl RelationalResidentCache {
         residency.with_snapshots_mut(|snapshots| snapshots.insert(table, entry));
     }
 
-    pub(crate) fn install_partitions(
+    pub(crate) fn install_shards(
         &self,
         table: String,
-        partitions: Vec<RelationalResidentPartition>,
+        shards: Vec<RelationalResidentShard>,
         device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
         residency: &ResidencyReadState,
     ) {
         residency
-            .partition_device_memory
-            .install_table_partitions(&table, device_memory);
-        residency.with_partitions_mut(|map| map.insert(table, partitions));
+            .shard_device_memory
+            .install_table_shards(&table, device_memory);
+        residency.with_shards_mut(|map| map.insert(table, shards));
     }
 }

@@ -1,30 +1,32 @@
 # HANDOVER — Resume Baton
 
-> **This is a SINGLE ROLLING file. Overwrite it each session — never date it, never accrete.** (11 dated
-> handovers became sprawl; that is what this discipline prevents.) Keep it short: where we are, the one next
-> action, and the open decisions. Everything else lives in the other five docs.
+> **This is a SINGLE ROLLING file. Overwrite it each session — never date it, never accrete.** Keep it short:
+> where we are, the one next action, and the open decisions. Everything else lives in the other five docs.
 
-**Updated:** 2026-06-26.
+**Updated:** 2026-06-27.
 
 ## Where we are
-- Docs consolidated to **6 canonical files**: [CHARTER](CHARTER.md), [ARCHITECTURE](ARCHITECTURE.md),
-  [DECISIONS](DECISIONS.md), [PLAN](PLAN.md), [STATUS](STATUS.md), this.
-- **Workload decided: high-throughput OLTP** (DECISIONS ADR-008); execution model = deterministic batched waves
-  (ADR-009); residency = STRATA shards + auto-admission on commit (ADR-010).
+- Docs are **6 canonical files**: [CHARTER](CHARTER.md), [ARCHITECTURE](ARCHITECTURE.md), [DECISIONS](DECISIONS.md),
+  [PLAN](PLAN.md), [STATUS](STATUS.md), this.
+- **Workload = high-throughput OLTP** (DECISIONS ADR-008); execution = deterministic batched waves (ADR-009);
+  residency = STRATA shards + auto-admission on commit (ADR-010).
 - The GPU-native **resident read path is complete for int4** (S1–S10c, audited). Suite **729/0**.
-- **The blocker:** nothing auto-admits tables to GPU residency, so production reads still run host-side — the
-  entire GPU read path is dormant in production until STRATA auto-admission lands (STATUS "blocking gap").
+- **STRATA S-A landed (2026-06-27):** the L2 vocabulary rename `partition → shard`
+  (`RelationalResidentShard`, `residency.shards`, `shard_device_memory`, `sharded_*` route shapes; engine +
+  observability; the MVCC tuple-store "partition" namespace was deliberately left intact). Behavior-preserving,
+  729/0. PLAN §2.
+- **The blocker still stands:** nothing auto-admits tables to GPU residency, so production reads run host-side —
+  the GPU read path is dormant in production until **S-B** (auto-admission) lands (STATUS "blocking gap").
 
 ## The one next action (pick with the user)
-The two highest-leverage moves, both pointing at the OLTP bet:
-1. **Build the benchmark first** — an open-loop / offered-rate p99 harness vs **tuned Postgres** on the same box,
-   on a real OLTP workload (TPC-C / sysbench-oltp). This is the instrument that proves or kills the bet; nothing
-   today can validate it. *(Recommended first — it tells you which architecture work actually matters.)*
-2. **STRATA S-A → S-B** — the vocabulary rename, then the auto-admission producer (N=1, behind a default-off flag),
-   which makes the GPU path reachable end-to-end and unblocks S10d. PLAN §3.
+1. **STRATA S-B** — the auto-admission producer v1 (N=1 unified, behind a default-off `auto_admit_on_commit` flag),
+   commit-triggered, post-`publish_committed_seq`, via the `&self`+held-catalog-guard seam. Makes the GPU path
+   reachable end-to-end via the wire and unblocks S10d. PLAN §2. *(The natural continuation of S-A.)*
+2. **Build the benchmark first** — open-loop p99 vs tuned Postgres on a real OLTP workload, to prove/kill the
+   bet before deeper OLTP-engine investment. PLAN §1.
 
-## Top open decisions (big-picture, unresolved)
-- **Data-size envelope:** OLTP working set vs aggregate VRAM — and the over-VRAM spill/tiering model (cross-shard
+## Top open decisions (unresolved)
+- **Data-size envelope:** OLTP working set vs aggregate VRAM, and the over-VRAM spill/tiering model (cross-shard
   combine doesn't exist; STRATA placement, not hardware paging, must own it).
 - **Coherent-memory dependency:** the strongest latency wins assume GH200/GB200 (untestable on the dev box) — the
   PCIe baseline must be competitive or the bet is confined to premium hardware.

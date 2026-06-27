@@ -1,9 +1,9 @@
 //! GPU residency management + resident-route planning (P0 §9.6 decomposition,
 //! behavior-preserving): a focused `impl Engine` block for populating/admitting
-//! resident snapshots (incl. on-GPU), the benchmark chunk/partition installs,
+//! resident snapshots (incl. on-GPU), the benchmark chunk/shard installs,
 //! resident device-memory + bytes accounting, retained-read snapshot handles,
 //! warmup/maintenance policy execution, and the resident-route planners
-//! (plan_relational_resident_route + partitioned variant) + residency status.
+//! (plan_relational_resident_route + sharded variant) + residency status.
 
 use super::*;
 
@@ -892,14 +892,14 @@ impl Engine {
         Ok(snapshot)
     }
 
-    pub fn install_benchmark_relational_residency_owned_partitions(
+    pub fn install_benchmark_relational_residency_owned_shards(
         &mut self,
-        install: BenchmarkRelationalResidencyOwnedPartitionInstall<'_>,
+        install: BenchmarkRelationalResidencyOwnedShardInstall<'_>,
     ) -> Result<(), ExecuteError> {
         let table = install.table;
-        if install.partitions.is_empty() {
+        if install.shards.is_empty() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "benchmark resident partition admission requires at least one partition"
+                "benchmark resident shard admission requires at least one shard"
                     .to_string(),
             )));
         }
@@ -916,30 +916,30 @@ impl Engine {
         let visible_rows = self.visible_relational_row_count(table)?;
         if visible_rows != 0 {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "benchmark resident partition admission requires relation \"{table}\" to have no SQL-visible rows; found {visible_rows}"
+                "benchmark resident shard admission requires relation \"{table}\" to have no SQL-visible rows; found {visible_rows}"
             ))));
         }
 
         let total_resident_bytes =
             install
-                .partitions
+                .shards
                 .iter()
-                .try_fold(0_u64, |total, partition| {
-                    if partition.row_count == 0 {
+                .try_fold(0_u64, |total, shard| {
+                    if shard.row_count == 0 {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "benchmark resident partition {} has no rows",
-                            partition.partition_id
+                            "benchmark resident shard {} has no rows",
+                            shard.shard_id
                         ))));
                     }
-                    if partition.chunks.is_empty() {
+                    if shard.chunks.is_empty() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "benchmark resident partition {} has no retained chunks",
-                            partition.partition_id
+                            "benchmark resident shard {} has no retained chunks",
+                            shard.shard_id
                         ))));
                     }
-                    total.checked_add(partition.resident_bytes).ok_or_else(|| {
+                    total.checked_add(shard.resident_bytes).ok_or_else(|| {
                         ExecuteError::Engine(EngineError::ApplyFailed(
-                            "benchmark resident partition byte count overflowed".to_string(),
+                            "benchmark resident shard byte count overflowed".to_string(),
                         ))
                     })
                 })?;
@@ -953,59 +953,59 @@ impl Engine {
             .memory_pressured_gpu_ids
             .contains(&install.gpu_id);
         let runtime = self.cuda_driver_probe_runtime();
-        let mut partitions = Vec::new();
+        let mut shards = Vec::new();
         let mut device_memory = BTreeMap::new();
-        for partition in install.partitions {
-            let copied_bytes = partition.chunks.iter().try_fold(0_u64, |total, chunk| {
+        for shard in install.shards {
+            let copied_bytes = shard.chunks.iter().try_fold(0_u64, |total, chunk| {
                 let len = u64::try_from(chunk.bytes.len()).map_err(|_| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
-                        "benchmark resident partition chunk length exceeds u64".to_string(),
+                        "benchmark resident shard chunk length exceeds u64".to_string(),
                     ))
                 })?;
                 let end = chunk.byte_offset.checked_add(len).ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
-                        "benchmark resident partition chunk offset overflowed".to_string(),
+                        "benchmark resident shard chunk offset overflowed".to_string(),
                     ))
                 })?;
-                if end > partition.allocated_bytes {
+                if end > shard.allocated_bytes {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "benchmark resident partition {} chunk ending at byte {end} exceeds allocation {}",
-                        partition.partition_id, partition.allocated_bytes
+                        "benchmark resident shard {} chunk ending at byte {end} exceeds allocation {}",
+                        shard.shard_id, shard.allocated_bytes
                     ))));
                 }
                 total.checked_add(len).ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(
-                        "benchmark resident partition copied byte count overflowed".to_string(),
+                        "benchmark resident shard copied byte count overflowed".to_string(),
                     ))
                 })
             })?;
             if copied_bytes == 0 {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "benchmark resident partition {} copied no bytes",
-                    partition.partition_id
+                    "benchmark resident shard {} copied no bytes",
+                    shard.shard_id
                 ))));
             }
             let retained = runtime
                 .retain_device_memory_owned_chunks(
                     install.gpu_id,
-                    partition.allocated_bytes,
-                    partition.chunks,
+                    shard.allocated_bytes,
+                    shard.chunks,
                 )
                 .map_err(|err| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "benchmark resident partition admission failed CUDA retained upload: {err}"
+                        "benchmark resident shard admission failed CUDA retained upload: {err}"
                     )))
                 })?;
             let device_memory_proof = Some(retained.metadata().clone());
-            partitions.push(RelationalResidentPartition {
-                partition_id: partition.partition_id,
-                row_start: partition.row_start,
-                row_count: partition.row_count,
-                resident_bytes: partition.resident_bytes,
-                allocated_bytes: partition.allocated_bytes,
+            shards.push(RelationalResidentShard {
+                shard_id: shard.shard_id,
+                row_start: shard.row_start,
+                row_count: shard.row_count,
+                resident_bytes: shard.resident_bytes,
+                allocated_bytes: shard.allocated_bytes,
                 count_header_byte_offset: 0,
-                resident_device_int4_columns: partition.resident_device_int4_columns,
-                resident_device_text_columns: partition.resident_device_text_columns,
+                resident_device_int4_columns: shard.resident_device_int4_columns,
+                resident_device_text_columns: shard.resident_device_text_columns,
                 gpu_id: install.gpu_id,
                 schema: catalog_table.schema.clone(),
                 table: catalog_table.name.clone(),
@@ -1015,70 +1015,70 @@ impl Engine {
                 invalidated_by_memory_pressure: memory_pressure_active,
                 memory_pressure_active,
             });
-            device_memory.insert(partition.partition_id, retained);
+            device_memory.insert(shard.shard_id, retained);
         }
-        partitions.sort_by_key(|partition| (partition.row_start, partition.partition_id));
+        shards.sort_by_key(|shard| (shard.row_start, shard.shard_id));
         let read_state = Arc::clone(&self.read_state);
         self.ddl_catalog_mut()
             .relational_resident_cache
-            .install_partitions(
+            .install_shards(
                 catalog_table.name,
-                partitions,
+                shards,
                 device_memory,
                 &read_state.residency,
             );
         Ok(())
     }
 
-    /// Synthesize a single-store-shaped [`RelationalResidencySnapshot`] DESCRIPTOR for ONE partition
-    /// (S10c slice 1). A partition's SoA payload is self-contained (`count_header_byte_offset == 0`,
-    /// sized by `partition.row_count`), so a descriptor whose `row_count == partition.row_count` plus the
-    /// partition's `resident_device_{int4,text}_columns` makes the SINGLE-store offset helpers address the
-    /// partition buffer BYTE-IDENTICALLY — letting the general resident-Expr executor serve one partition
+    /// Synthesize a single-store-shaped [`RelationalResidencySnapshot`] DESCRIPTOR for ONE shard
+    /// (S10c slice 1). A shard's SoA payload is self-contained (`count_header_byte_offset == 0`,
+    /// sized by `shard.row_count`), so a descriptor whose `row_count == shard.row_count` plus the
+    /// shard's `resident_device_{int4,text}_columns` makes the SINGLE-store offset helpers address the
+    /// shard buffer BYTE-IDENTICALLY — letting the general resident-Expr executor serve one shard
     /// slice when handed it via `ResidentExecSource`. Mirrors the benchmark snapshot constructor (the
     /// per-table install path) field-for-field; the fields the offset helpers DON'T read (generation,
     /// stats, int8/numeric/bool/null columns, refresh cost, admission accounting) take inert defaults.
     /// The identity guard (`schema`/`table` == catalog) and `is_valid()` are satisfied for a valid
-    /// partition, so the executor's per-source identity/validity prechecks pass.
-    pub(crate) fn resident_snapshot_for_partition(
+    /// shard, so the executor's per-source identity/validity prechecks pass.
+    pub(crate) fn resident_snapshot_for_shard(
         &self,
-        partition: &RelationalResidentPartition,
+        shard: &RelationalResidentShard,
         table: &RelationalTable,
     ) -> RelationalResidencySnapshot {
         RelationalResidencySnapshot {
-            gpu_id: partition.gpu_id,
-            schema: partition.schema.clone(),
-            table: partition.table.clone(),
+            gpu_id: shard.gpu_id,
+            schema: shard.schema.clone(),
+            table: shard.table.clone(),
             generation: 0,
-            // CRITICAL: the partition's own row count sizes the SoA the single-store offset helpers
-            // read, so they address THIS partition's buffer (not the whole table).
-            row_count: partition.row_count,
+            // CRITICAL: the shard's own row count sizes the SoA the single-store offset helpers
+            // read, so they address THIS shard's buffer (not the whole table).
+            row_count: shard.row_count,
             column_count: table.columns.len(),
-            resident_bytes: partition.resident_bytes,
-            resident_device_int4_columns: partition.resident_device_int4_columns.clone(),
+            resident_bytes: shard.resident_bytes,
+            resident_device_int4_columns: shard.resident_device_int4_columns.clone(),
             resident_device_int4_column_stats: Vec::new(),
             resident_device_int8_columns: Vec::new(),
             resident_device_numeric_columns: Vec::new(),
             resident_device_bool_columns: Vec::new(),
-            resident_device_text_columns: partition.resident_device_text_columns.clone(),
+            resident_device_text_columns: shard.resident_device_text_columns.clone(),
             resident_device_null_columns: Vec::new(),
             valid_through_index: self.committed_seq(),
-            invalidated_by_txn_id: partition.invalidated_by_txn_id,
-            invalidated_at_index: partition.invalidated_at_index,
-            invalidated_by_memory_pressure: partition.invalidated_by_memory_pressure,
-            memory_pressure_active: partition.memory_pressure_active,
+            invalidated_by_txn_id: shard.invalidated_by_txn_id,
+            invalidated_at_index: shard.invalidated_at_index,
+            invalidated_by_memory_pressure: shard.invalidated_by_memory_pressure,
+            memory_pressure_active: shard.memory_pressure_active,
             last_refresh_cost: None,
             admission_budget_bytes: None,
             resident_bytes_after_admission: 0,
             evicted_tables_on_admission: Vec::new(),
-            device_memory_proof: partition.device_memory_proof.clone(),
+            device_memory_proof: shard.device_memory_proof.clone(),
         }
     }
 
     /// S10c slice 2a: synthesize the single-store-shaped DESCRIPTOR for the ONE UNIFIED int4-only
-    /// buffer recompacted from all of a table's partitions. Like [`Self::resident_snapshot_for_partition`]
+    /// buffer recompacted from all of a table's shards. Like [`Self::resident_snapshot_for_shard`]
     /// but sized by the WHOLE table (`row_count == total_row_count`) so the single-store offset helpers
-    /// address the unified SoA byte-identically. `int4_columns` is the partitions' OWN (uniform)
+    /// address the unified SoA byte-identically. `int4_columns` is the shards' OWN (uniform)
     /// `resident_device_int4_columns` -- i.e. the list the unified buffer was physically recompacted from,
     /// NOT a catalog re-derivation. Labelling the descriptor with the actual buffer layout keeps the
     /// offset helper's per-read name-check load-bearing (a read of a column whose name does not sit at the
@@ -1206,18 +1206,18 @@ impl Engine {
             .filter(|(name, entry)| name.as_str() != table && entry.descriptor.gpu_id == gpu_id)
             .map(|(_name, entry)| entry.descriptor.resident_bytes)
             .sum();
-        let partition_bytes: u64 = self
+        let shard_bytes: u64 = self
             .read_state
             .residency
-            .partitions
+            .shards
             .load()
             .iter()
-            .filter(|(name, _partitions)| name.as_str() != table)
-            .flat_map(|(_name, partitions)| partitions)
-            .filter(|partition| partition.gpu_id == gpu_id)
-            .map(|partition| partition.resident_bytes)
+            .filter(|(name, _shards)| name.as_str() != table)
+            .flat_map(|(_name, shards)| shards)
+            .filter(|shard| shard.gpu_id == gpu_id)
+            .map(|shard| shard.resident_bytes)
             .sum();
-        snapshot_bytes.saturating_add(partition_bytes)
+        snapshot_bytes.saturating_add(shard_bytes)
     }
 
     pub fn relational_residency_snapshot(
@@ -1580,7 +1580,7 @@ impl Engine {
             table: table.to_string(),
             gpu_id: None,
             snapshot_generation: None,
-            partition_count: 0,
+            shard_count: 0,
             accepted: false,
             reason: reason.into(),
             query_shape: query_shape.into(),
@@ -1651,22 +1651,22 @@ impl Engine {
             }
         };
 
-        // Stage 3 — blocker #2: pin the published resident partition + snapshot maps for the rest of
-        // the planning decision (the partition slice is passed by reference into the partitioned-route
+        // Stage 3 — blocker #2: pin the published resident shard + snapshot maps for the rest of
+        // the planning decision (the shard slice is passed by reference into the sharded-route
         // planner, and the snapshot is read field-by-field below — both must outlive those uses, so the
         // guards are bound here and held to the end of the function).
-        let partitions_guard = self.read_state.residency.partitions.load();
+        let shards_guard = self.read_state.residency.shards.load();
         let snapshots_guard = self.read_state.residency.snapshots.load();
 
         let query_shape = match resident_route_query_shape(select, &table, &bound) {
             Some(shape) => shape,
             None => {
-                if let Some(partitions) = partitions_guard.get(&table.name) {
+                if let Some(shards) = shards_guard.get(&table.name) {
                     if let Some(shape) =
-                        partitioned_resident_route_query_shape(select, &table, &bound)
+                        sharded_resident_route_query_shape(select, &table, &bound)
                     {
-                        return self.plan_relational_partitioned_resident_route(
-                            select, &table, shape, partitions,
+                        return self.plan_relational_sharded_resident_route(
+                            select, &table, shape, shards,
                         );
                     }
                 }
@@ -1678,12 +1678,12 @@ impl Engine {
             }
         };
 
-        if let Some(partitions) = partitions_guard.get(&table.name) {
-            return self.plan_relational_partitioned_resident_route(
+        if let Some(shards) = shards_guard.get(&table.name) {
+            return self.plan_relational_sharded_resident_route(
                 select,
                 &table,
                 query_shape,
-                partitions,
+                shards,
             );
         }
 
@@ -1716,7 +1716,7 @@ impl Engine {
             table: table.name.clone(),
             gpu_id: Some(snapshot.gpu_id),
             snapshot_generation: Some(snapshot.generation),
-            partition_count: 1,
+            shard_count: 1,
             accepted: false,
             reason: String::new(),
             query_shape,
@@ -1762,83 +1762,83 @@ impl Engine {
         decision
     }
 
-    fn plan_relational_partitioned_resident_route(
+    fn plan_relational_sharded_resident_route(
         &self,
         select: &Select,
         table: &RelationalTable,
         query_shape: String,
-        partitions: &[RelationalResidentPartition],
+        shards: &[RelationalResidentShard],
     ) -> RelationalResidentRouteDecisionStatus {
-        let total_rows = partitions
+        let total_rows = shards
             .iter()
-            .map(|partition| partition.row_count)
+            .map(|shard| shard.row_count)
             .sum::<usize>();
-        let total_resident_bytes = partitions
+        let total_resident_bytes = shards
             .iter()
-            .map(|partition| partition.resident_bytes)
+            .map(|shard| shard.resident_bytes)
             .sum::<u64>();
-        let gpu_id = partitions.first().map(|partition| partition.gpu_id);
-        let partitioned_query_shape = if query_shape == "count_all" {
-            "partitioned_count_all".to_string()
+        let gpu_id = shards.first().map(|shard| shard.gpu_id);
+        let sharded_query_shape = if query_shape == "count_all" {
+            "sharded_count_all".to_string()
         } else if query_shape == "int4_equality_projection" {
-            "partitioned_int4_equality_projection".to_string()
+            "sharded_int4_equality_projection".to_string()
         } else if query_shape == "int4_equality_multi_column_projection" {
-            "partitioned_int4_equality_multi_column_projection".to_string()
+            "sharded_int4_equality_multi_column_projection".to_string()
         } else if matches!(
             query_shape.as_str(),
-            "partitioned_int4_equality_sum"
-                | "partitioned_int4_between_avg"
-                | "partitioned_int4_filtered_avg"
-                | "partitioned_int4_filtered_min"
-                | "partitioned_int4_filtered_max"
+            "sharded_int4_equality_sum"
+                | "sharded_int4_between_avg"
+                | "sharded_int4_filtered_avg"
+                | "sharded_int4_filtered_min"
+                | "sharded_int4_filtered_max"
         ) {
             query_shape
         } else if query_shape == "int4_filtered_scalar_aggregate"
             && matches!(select.projection, SelectProjection::Avg { .. })
         {
-            "partitioned_int4_filtered_avg".to_string()
+            "sharded_int4_filtered_avg".to_string()
         } else if query_shape == "int4_filtered_scalar_aggregate"
             && matches!(select.projection, SelectProjection::Min { .. })
         {
-            "partitioned_int4_filtered_min".to_string()
+            "sharded_int4_filtered_min".to_string()
         } else if query_shape == "int4_filtered_scalar_aggregate"
             && matches!(select.projection, SelectProjection::Max { .. })
         {
-            "partitioned_int4_filtered_max".to_string()
+            "sharded_int4_filtered_max".to_string()
         } else if query_shape == "int4_distinct_projection" {
-            "partitioned_int4_distinct_projection".to_string()
+            "sharded_int4_distinct_projection".to_string()
         } else if query_shape == "int4_filtered_distinct_projection" {
-            "partitioned_int4_filtered_distinct_projection".to_string()
+            "sharded_int4_filtered_distinct_projection".to_string()
         } else if query_shape == "int4_grouped_aggregate" {
-            "partitioned_int4_grouped_aggregate".to_string()
+            "sharded_int4_grouped_aggregate".to_string()
         } else if query_shape == "int4_filtered_grouped_aggregate" {
-            "partitioned_int4_filtered_grouped_aggregate".to_string()
+            "sharded_int4_filtered_grouped_aggregate".to_string()
         } else if query_shape == "int4_ordered_projection" {
-            "partitioned_int4_ordered_projection".to_string()
+            "sharded_int4_ordered_projection".to_string()
         } else {
             query_shape
         };
         let d2h_bytes_estimate = if matches!(
-            partitioned_query_shape.as_str(),
-            "partitioned_count_all"
-                | "partitioned_int4_equality_projection"
-                | "partitioned_int4_equality_sum"
-                | "partitioned_int4_between_avg"
-                | "partitioned_int4_filtered_avg"
-                | "partitioned_int4_filtered_min"
-                | "partitioned_int4_filtered_max"
+            sharded_query_shape.as_str(),
+            "sharded_count_all"
+                | "sharded_int4_equality_projection"
+                | "sharded_int4_equality_sum"
+                | "sharded_int4_between_avg"
+                | "sharded_int4_filtered_avg"
+                | "sharded_int4_filtered_min"
+                | "sharded_int4_filtered_max"
         ) {
-            partitions
+            shards
                 .len()
                 .checked_mul(std::mem::size_of::<u64>())
                 .and_then(|bytes| u64::try_from(bytes).ok())
                 .unwrap_or(u64::MAX)
-        } else if partitioned_query_shape == "partitioned_int4_equality_multi_column_projection" {
+        } else if sharded_query_shape == "sharded_int4_equality_multi_column_projection" {
             let SelectProjection::Columns(columns) = &select.projection else {
                 return Self::resident_route_reject(
                     &table.name,
-                    "partitioned resident routing has no retained-kernel proof for this SELECT shape",
-                    partitioned_query_shape,
+                    "sharded resident routing has no retained-kernel proof for this SELECT shape",
+                    sharded_query_shape,
                 );
             };
             u64::try_from(total_rows)
@@ -1850,7 +1850,7 @@ impl Engine {
                         .saturating_add(std::mem::size_of::<u64>() as u64),
                 )
                 .saturating_add(
-                    u64::try_from(partitions.len())
+                    u64::try_from(shards.len())
                         .unwrap_or(u64::MAX)
                         .saturating_mul(std::mem::size_of::<u64>() as u64),
                 )
@@ -1861,10 +1861,10 @@ impl Engine {
             table: table.name.clone(),
             gpu_id,
             snapshot_generation: None,
-            partition_count: partitions.len(),
+            shard_count: shards.len(),
             accepted: false,
             reason: String::new(),
-            query_shape: partitioned_query_shape,
+            query_shape: sharded_query_shape,
             cache_state: "Valid".to_string(),
             valid: true,
             has_retained_device_memory: false,
@@ -1892,34 +1892,34 @@ impl Engine {
 
         if !matches!(
             decision.query_shape.as_str(),
-            "partitioned_count_all"
-                | "partitioned_int4_equality_projection"
-                | "partitioned_int4_equality_multi_column_projection"
-                | "partitioned_int4_equality_sum"
-                | "partitioned_int4_between_avg"
-                | "partitioned_int4_filtered_avg"
-                | "partitioned_int4_filtered_min"
-                | "partitioned_int4_filtered_max"
-                | "partitioned_int4_distinct_projection"
-                | "partitioned_int4_filtered_distinct_projection"
-                | "partitioned_int4_grouped_aggregate"
-                | "partitioned_int4_filtered_grouped_aggregate"
-                | "partitioned_int4_ordered_projection"
+            "sharded_count_all"
+                | "sharded_int4_equality_projection"
+                | "sharded_int4_equality_multi_column_projection"
+                | "sharded_int4_equality_sum"
+                | "sharded_int4_between_avg"
+                | "sharded_int4_filtered_avg"
+                | "sharded_int4_filtered_min"
+                | "sharded_int4_filtered_max"
+                | "sharded_int4_distinct_projection"
+                | "sharded_int4_filtered_distinct_projection"
+                | "sharded_int4_grouped_aggregate"
+                | "sharded_int4_filtered_grouped_aggregate"
+                | "sharded_int4_ordered_projection"
         ) {
             decision.cache_state = "Absent".to_string();
             decision.valid = false;
             decision.reason =
-                "partitioned resident routing currently supports only unfiltered COUNT(*), same-column int4 equality projection, int4 equality multi-column projection, int4 equality SUM, int4 BETWEEN AVG, int4 filtered AVG, int4 filtered MIN, int4 filtered MAX, int4 [filtered] DISTINCT projection, int4 [filtered] grouped aggregate, and int4 ordered projection"
+                "sharded resident routing currently supports only unfiltered COUNT(*), same-column int4 equality projection, int4 equality multi-column projection, int4 equality SUM, int4 BETWEEN AVG, int4 filtered AVG, int4 filtered MIN, int4 filtered MAX, int4 [filtered] DISTINCT projection, int4 [filtered] grouped aggregate, and int4 ordered projection"
                     .to_string();
             return decision;
         }
         let mut required_int4_columns = BTreeSet::new();
-        if decision.query_shape == "partitioned_int4_equality_multi_column_projection" {
+        if decision.query_shape == "sharded_int4_equality_multi_column_projection" {
             let SelectProjection::Columns(columns) = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
                 decision.reason =
-                    "partitioned resident routing requires projected columns".to_string();
+                    "sharded resident routing requires projected columns".to_string();
                 return decision;
             };
             for column in columns {
@@ -1934,12 +1934,12 @@ impl Engine {
             for filter in select.filter_groups.iter().flatten() {
                 required_int4_columns.insert(filter.column.clone());
             }
-        } else if decision.query_shape == "partitioned_int4_equality_sum" {
+        } else if decision.query_shape == "sharded_int4_equality_sum" {
             let SelectProjection::Sum { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
                 decision.reason =
-                    "partitioned resident routing requires SUM(int4_column)".to_string();
+                    "sharded resident routing requires SUM(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -1954,13 +1954,13 @@ impl Engine {
             }
         } else if matches!(
             decision.query_shape.as_str(),
-            "partitioned_int4_between_avg" | "partitioned_int4_filtered_avg"
+            "sharded_int4_between_avg" | "sharded_int4_filtered_avg"
         ) {
             let SelectProjection::Avg { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
                 decision.reason =
-                    "partitioned resident routing requires AVG(int4_column)".to_string();
+                    "sharded resident routing requires AVG(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -1973,12 +1973,12 @@ impl Engine {
             for filter in select.filter_groups.iter().flatten() {
                 required_int4_columns.insert(filter.column.clone());
             }
-        } else if decision.query_shape == "partitioned_int4_filtered_min" {
+        } else if decision.query_shape == "sharded_int4_filtered_min" {
             let SelectProjection::Min { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
                 decision.reason =
-                    "partitioned resident routing requires MIN(int4_column)".to_string();
+                    "sharded resident routing requires MIN(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -1991,12 +1991,12 @@ impl Engine {
             for filter in select.filter_groups.iter().flatten() {
                 required_int4_columns.insert(filter.column.clone());
             }
-        } else if decision.query_shape == "partitioned_int4_filtered_max" {
+        } else if decision.query_shape == "sharded_int4_filtered_max" {
             let SelectProjection::Max { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
                 decision.reason =
-                    "partitioned resident routing requires MAX(int4_column)".to_string();
+                    "sharded resident routing requires MAX(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -2011,9 +2011,9 @@ impl Engine {
             }
         } else if matches!(
             decision.query_shape.as_str(),
-            "partitioned_int4_grouped_aggregate" | "partitioned_int4_filtered_grouped_aggregate"
+            "sharded_int4_grouped_aggregate" | "sharded_int4_filtered_grouped_aggregate"
         ) {
-            // Grouped int4 aggregate (S10c slice 2b): the per-partition layout check must cover both the
+            // Grouped int4 aggregate (S10c slice 2b): the per-shard layout check must cover both the
             // GROUP BY key column AND the aggregated value column, plus every filter column. Mirror the
             // route classifier's group/value extraction (resident_route.rs `resident_route_query_shape`):
             // GroupedCount groups by `column` and counts it; the other grouped projections carry an
@@ -2054,7 +2054,7 @@ impl Engine {
                     decision.cache_state = "Absent".to_string();
                     decision.valid = false;
                     decision.reason =
-                        "partitioned resident routing requires a grouped int4 aggregate projection"
+                        "sharded resident routing requires a grouped int4 aggregate projection"
                             .to_string();
                     return decision;
                 }
@@ -2070,18 +2070,18 @@ impl Engine {
             }
         } else if matches!(
             decision.query_shape.as_str(),
-            "partitioned_int4_distinct_projection"
-                | "partitioned_int4_filtered_distinct_projection"
-                | "partitioned_int4_ordered_projection"
+            "sharded_int4_distinct_projection"
+                | "sharded_int4_filtered_distinct_projection"
+                | "sharded_int4_ordered_projection"
         ) {
-            // Single-column DISTINCT / ordered int4 projection (S10c slice 2b): the per-partition layout
+            // Single-column DISTINCT / ordered int4 projection (S10c slice 2b): the per-shard layout
             // check must cover the single projected/distinct column plus every filter column. The route
             // classifier accepts only a single projected column for these shapes.
             let SelectProjection::Columns(columns) = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
                 decision.reason =
-                    "partitioned resident routing requires a single projected int4 column".to_string();
+                    "sharded resident routing requires a single projected int4 column".to_string();
                 return decision;
             };
             for column in columns {
@@ -2097,66 +2097,66 @@ impl Engine {
                 required_int4_columns.insert(filter.column.clone());
             }
         }
-        if partitions.is_empty() {
+        if shards.is_empty() {
             decision.cache_state = "Absent".to_string();
             decision.valid = false;
-            decision.reason = "relation has no resident partitions".to_string();
+            decision.reason = "relation has no resident shards".to_string();
             return decision;
         }
 
         let mut has_all_device_memory = true;
-        for partition in partitions {
+        for shard in shards {
             let memory_pressure_active = self
                 .router
                 .runtime()
                 .snapshot()
                 .memory_pressured_gpu_ids
-                .contains(&partition.gpu_id);
-            let valid = partition.is_valid(memory_pressure_active);
+                .contains(&shard.gpu_id);
+            let valid = shard.is_valid(memory_pressure_active);
             decision.valid &= valid;
-            if memory_pressure_active || partition.invalidated_by_memory_pressure {
+            if memory_pressure_active || shard.invalidated_by_memory_pressure {
                 decision.cache_state = "InvalidatedByMemoryPressure".to_string();
-            } else if partition.invalidated_by_txn_id.is_some()
-                || partition.invalidated_at_index.is_some()
+            } else if shard.invalidated_by_txn_id.is_some()
+                || shard.invalidated_at_index.is_some()
             {
                 decision.cache_state = "Invalidated".to_string();
             }
-            if partition.schema != table.schema || partition.table != table.name {
+            if shard.schema != table.schema || shard.table != table.name {
                 decision.reason =
-                    "resident partition no longer matches catalog table identity".to_string();
+                    "resident shard no longer matches catalog table identity".to_string();
                 return decision;
             }
             if !self
                 .read_state
                 .residency
-                .partition_device_memory
-                .contains_key(&(table.name.clone(), partition.partition_id))
+                .shard_device_memory
+                .contains_key(&(table.name.clone(), shard.shard_id))
             {
                 has_all_device_memory = false;
             }
             if !required_int4_columns.is_empty()
                 && required_int4_columns
                     .iter()
-                    .any(|column| !partition.resident_device_int4_columns.contains(column))
+                    .any(|column| !shard.resident_device_int4_columns.contains(column))
             {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
                 decision.reason = format!(
-                    "resident partition {} lacks required int4 projection layout",
-                    partition.partition_id
+                    "resident shard {} lacks required int4 projection layout",
+                    shard.shard_id
                 );
                 return decision;
             }
         }
         decision.has_retained_device_memory = has_all_device_memory;
         if !decision.valid {
-            decision.reason = format!("resident partition set is {}", decision.cache_state);
+            decision.reason = format!("resident shard set is {}", decision.cache_state);
         } else if !has_all_device_memory {
             decision.reason =
-                "resident partition set has missing retained device memory".to_string();
+                "resident shard set has missing retained device memory".to_string();
         } else {
             decision.accepted = true;
-            decision.reason = "partitioned resident route accepted".to_string();
+            decision.reason = "sharded resident route accepted".to_string();
         }
         decision
     }

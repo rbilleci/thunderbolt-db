@@ -85,7 +85,7 @@ Protocol layer → Management/observability. Cross-cutting (logging, config, err
   shards; `CREATE INDEX CONCURRENTLY` two-pass; plan-cache invalidation.
 
 ## 7. GPU residency — STRATA (DECISIONS ADR-010)
-- A relation is laid down as **1..N shards** (`ResidentShard`: `shard_id`, `row_start`, `row_count`, per-shard L3
+- A relation is laid down as **1..N shards** (`RelationalResidentShard`: `shard_id`, `row_start`, `row_count`, per-shard L3
   layout, `gpu_id`, `device_memory_proof`, invalidation flags). Stored in `residency.shards` (ArcSwap COW) +
   `shard_device_memory` keyed `(table, shard_id)`; ordered by `(row_start, shard_id)`. Each shard lives on exactly
   one GPU.

@@ -1928,8 +1928,8 @@ impl Engine {
         select: &Select,
         // `None` = look up the table's whole-table single resident store by name (the original
         // text/CTAS/view callers). `Some(src)` INJECTS an already-built source (S10c slice 2b: the
-        // unified multi-partition buffer recompacted by `execute_resident_partitioned_via_general`), so
-        // the same on-device grouped/distinct/ordered path serves the partitioned shapes.
+        // unified multi-shard buffer recompacted by `execute_resident_sharded_via_general`), so
+        // the same on-device grouped/distinct/ordered path serves the sharded shapes.
         src: Option<&ResidentExecSource>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         // Normalize the legacy 1-aggregate grouped projection (GroupedCount / GroupedSum / GroupedAvg /
@@ -1975,16 +1975,16 @@ impl Engine {
     }
 
     /// S10c slice 2a: `&Select`->general BRIDGE for the MULTI-PARTITION resident shapes (single-GPU,
-    /// int4-only). Supersedes the slice-1 per-partition host-combine: instead of running the executor once
-    /// per partition and folding the results on the HOST, it RECOMPACTS the table's partition buffers into
+    /// int4-only). Supersedes the slice-1 per-shard host-combine: instead of running the executor once
+    /// per shard and folding the results on the HOST, it RECOMPACTS the table's shard buffers into
     /// ONE unified int4-only `CudaResidentDeviceMemory` via device-to-device copies (the host stays fully
     /// out — only the 8-byte row-count header crosses HtoD), then runs the SAME on-device general
     /// resident-Expr executor ONCE over the unified buffer. The unified SoA is laid out exactly as a
     /// whole-table single store (8-byte header, then each int4 column contiguous over `total_row_count`
-    /// rows in catalog order), so the single-store offset helpers address it byte-identically; a per-partition
-    /// segment copies column `c`'s slice from partition `p` (`8 + c*p.row_count*4`, len `p.row_count*4`)
-    /// to its unified slot (`8 + c*total_row_count*4 + rows_before_p*4`). The WHERE predicate + per-partition
-    /// identity/validity prechecks mirror the retired probes (each partition is still validated, to gather
+    /// rows in catalog order), so the single-store offset helpers address it byte-identically; a per-shard
+    /// segment copies column `c`'s slice from shard `p` (`8 + c*p.row_count*4`, len `p.row_count*4`)
+    /// to its unified slot (`8 + c*total_row_count*4 + rows_before_p*4`). The WHERE predicate + per-shard
+    /// identity/validity prechecks mirror the retired probes (each shard is still validated, to gather
     /// its `device_ptr`).
     ///
     /// All-empty handling pins byte-identicality with slice 1: the general SUM/MIN/MAX/AVG HARD-ERROR on an
@@ -1994,7 +1994,7 @@ impl Engine {
     /// COUNT -> `Int8(0)`). Otherwise the executor runs ONCE over the unified buffer with the real
     /// projection and its result is returned directly (it handles COUNT/SUM/MIN/MAX/AVG/projection
     /// on-device). Text columns are DEFERRED in this slice (the unified buffer is int4-only).
-    pub(crate) fn execute_resident_partitioned_via_general(
+    pub(crate) fn execute_resident_sharded_via_general(
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
@@ -2005,62 +2005,62 @@ impl Engine {
         bound.filter = None;
         bound.filters.clear();
         bound.filter_groups.clear();
-        // Load the table's resident partitions in published order (sorted by (row_start, partition_id)).
+        // Load the table's resident shards in published order (sorted by (row_start, shard_id)).
         // Error text mirrors the retired probes.
-        let partitions = self
+        let shards = self
             .read_state
             .residency
-            .partitions
+            .shards
             .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no resident partitions",
+                    "relation \"{}\" has no resident shards",
                     table.name
                 )))
             })?;
-        if partitions.is_empty() {
+        if shards.is_empty() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "relation \"{}\" has no resident partitions",
+                "relation \"{}\" has no resident shards",
                 table.name
             ))));
         }
-        let gpu_id = partitions[0].gpu_id;
+        let gpu_id = shards[0].gpu_id;
         let runtime_snapshot = self.router.runtime().snapshot();
 
-        // Build a `ResidentExecSource` for one partition (the per-partition identity + validity prechecks
+        // Build a `ResidentExecSource` for one shard (the per-shard identity + validity prechecks
         // mirror the probe's at engine_resident_probe.rs ~873), or return the same error a probe did.
-        let source_for = |partition: &RelationalResidentPartition| -> Result<ResidentExecSource, ExecuteError> {
-            if partition.schema != table.schema || partition.table != table.name {
+        let source_for = |shard: &RelationalResidentShard| -> Result<ResidentExecSource, ExecuteError> {
+            if shard.schema != table.schema || shard.table != table.name {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident partition no longer matches catalog table identity".to_string(),
+                    "resident shard no longer matches catalog table identity".to_string(),
                 )));
             }
             let memory_pressure_active = runtime_snapshot
                 .memory_pressured_gpu_ids
-                .contains(&partition.gpu_id);
-            if !partition.is_valid(memory_pressure_active) {
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "resident partition {} is invalid",
-                    partition.partition_id
+                    "resident shard {} is invalid",
+                    shard.shard_id
                 ))));
             }
             let device_memory = self
                 .read_state
                 .residency
-                .partition_device_memory
-                .get(&(table.name.clone(), partition.partition_id))
+                .shard_device_memory
+                .get(&(table.name.clone(), shard.shard_id))
                 .ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "resident partition {} has no retained device memory",
-                        partition.partition_id
+                        "resident shard {} has no retained device memory",
+                        shard.shard_id
                     )))
                 })?;
             Ok(ResidentExecSource {
-                descriptor: Arc::new(self.resident_snapshot_for_partition(partition, &table)),
+                descriptor: Arc::new(self.resident_snapshot_for_shard(shard, &table)),
                 device_memory,
-                row_count: partition.row_count as u64,
+                row_count: shard.row_count as u64,
             })
         };
 
@@ -2083,9 +2083,9 @@ impl Engine {
             )
         };
 
-        // The access path is shape/table-level metadata (it does not depend on the partition data), so
+        // The access path is shape/table-level metadata (it does not depend on the shard data), so
         // compute it once from the (filter-cleared) bound exactly as a probe did (engine_resident_probe.rs
-        // ~846). bound was filter-cleared above; the partitioned shapes carry no ORDER BY / LIMIT.
+        // ~846). bound was filter-cleared above; the sharded shapes carry no ORDER BY / LIMIT.
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
 
@@ -2103,42 +2103,42 @@ impl Engine {
         // The unified int4-only buffer lays the table's int4 columns out in catalog order, each contiguous
         // over `total_row_count` rows after the 8-byte row-count header — exactly the whole-table single
         // store the offset helpers expect. The recompaction indexes source slices POSITIONALLY by int4
-        // ordinal and the unified descriptor labels the buffer with this list, so every partition MUST
-        // carry the SAME `resident_device_int4_columns` (same names, same order) as partition 0 — otherwise
+        // ordinal and the unified descriptor labels the buffer with this list, so every shard MUST
+        // carry the SAME `resident_device_int4_columns` (same names, same order) as shard 0 — otherwise
         // a slice would land in the wrong column's slot (silent wrong data) or read past a too-short source
-        // (the DtoD primitive bounds-checks only the destination). The partitioned benchmark install runs no
-        // layout validation, so we enforce uniformity per partition in the gather loop below (audit F1).
-        let int4_columns = partitions[0].resident_device_int4_columns.clone();
+        // (the DtoD primitive bounds-checks only the destination). The sharded benchmark install runs no
+        // layout validation, so we enforce uniformity per shard in the gather loop below (audit F1).
+        let int4_columns = shards[0].resident_device_int4_columns.clone();
         let num_int4_cols = int4_columns.len();
 
-        // Gather each partition's (device_ptr, row_count) by running the SAME identity/validity precheck the
+        // Gather each shard's (device_ptr, row_count) by running the SAME identity/validity precheck the
         // probes did (via `source_for`), accumulate `total_row_count`, and build the device-to-device copy
-        // plan: for each int4 column ordinal `c` and each partition `p`, copy `p`'s slice of column `c`
+        // plan: for each int4 column ordinal `c` and each shard `p`, copy `p`'s slice of column `c`
         // (`8 + c*p.row_count*4`, len `p.row_count*4`) into the unified slot
-        // (`8 + c*total_row_count*4 + rows_before_p*4`). Empty partitions contribute a zero-length segment
+        // (`8 + c*total_row_count*4 + rows_before_p*4`). Empty shards contribute a zero-length segment
         // (skipped by the primitive). The host never touches the column bytes.
-        let mut partition_ptrs: Vec<(u64, usize)> = Vec::with_capacity(partitions.len());
+        let mut shard_ptrs: Vec<(u64, usize)> = Vec::with_capacity(shards.len());
         let mut total_row_count = 0_usize;
-        for partition in &partitions {
-            let src = source_for(partition)?;
+        for shard in &shards {
+            let src = source_for(shard)?;
             // Uniformity guard (audit F1): the positional ordinal gather + the unified descriptor both
-            // assume every partition's int4 layout equals partition 0's. Reject a mismatch with a clean
+            // assume every shard's int4 layout equals shard 0's. Reject a mismatch with a clean
             // error rather than recompact a slice into the wrong column (or read past a short source).
-            if partition.resident_device_int4_columns != int4_columns {
+            if shard.resident_device_int4_columns != int4_columns {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "resident partition {} int4 column layout {:?} does not match partition 0 layout {:?}",
-                    partition.partition_id, partition.resident_device_int4_columns, int4_columns
+                    "resident shard {} int4 column layout {:?} does not match shard 0 layout {:?}",
+                    shard.shard_id, shard.resident_device_int4_columns, int4_columns
                 ))));
             }
-            partition_ptrs.push((src.device_memory.device_ptr(), partition.row_count));
-            total_row_count = total_row_count.saturating_add(partition.row_count);
+            shard_ptrs.push((src.device_memory.device_ptr(), shard.row_count));
+            total_row_count = total_row_count.saturating_add(shard.row_count);
         }
 
         let mut segments: Vec<gpu_db_execution::RecompactSegment> =
-            Vec::with_capacity(num_int4_cols * partitions.len());
+            Vec::with_capacity(num_int4_cols * shards.len());
         for ordinal in 0..num_int4_cols {
             let mut rows_before = 0_u64;
-            for (device_ptr, row_count) in &partition_ptrs {
+            for (device_ptr, row_count) in &shard_ptrs {
                 let row_count = *row_count as u64;
                 let byte_len = row_count.saturating_mul(4);
                 segments.push(gpu_db_execution::RecompactSegment {
@@ -2162,7 +2162,7 @@ impl Engine {
             .retain_device_memory_recompacted(gpu_id, allocated_bytes, &header, &segments)
             .map_err(|err| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "partitioned resident recompaction into a unified device buffer failed: {err}"
+                    "sharded resident recompaction into a unified device buffer failed: {err}"
                 )))
             })?;
         let proof = unified_mem.metadata().clone();
@@ -2212,7 +2212,7 @@ impl Engine {
                 Some(SqlValue::Int8(n)) => n,
                 other => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "partitioned resident COUNT(*) precheck returned an unexpected value: {other:?}"
+                        "sharded resident COUNT(*) precheck returned an unexpected value: {other:?}"
                     ))));
                 }
             }
@@ -2254,7 +2254,7 @@ impl Engine {
         select: &Select,
         // `None` = look up the table's whole-table single resident store by name (the original callers).
         // `Some(src)` forwards an injected source to the grouped bridge it synthesizes (S10c slice 2b:
-        // the unified multi-partition buffer), so DISTINCT runs on-device over the whole table.
+        // the unified multi-shard buffer), so DISTINCT runs on-device over the whole table.
         src: Option<&ResidentExecSource>,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let SelectProjection::Columns(columns) = &select.projection else {
@@ -3373,7 +3373,7 @@ impl Engine {
         table: &RelationalTable,
         // `None` = look up the table payload (descriptor + device buffer + row count) by name in the
         // SINGLE resident store (the whole-table buffer), as before. `Some(src)` INJECTS them so the
-        // same executor serves one partition slice (S10c). The identity/validity guards run for both.
+        // same executor serves one shard slice (S10c). The identity/validity guards run for both.
         src: Option<&ResidentExecSource>,
         bound: BoundRelationalSelect,
         copin_s: Index,
@@ -3473,7 +3473,7 @@ impl Engine {
         // (its `row_count` + `resident_device_*` section vectors define every column byte-offset) + the
         // row count. `None` looks these up by name in the SINGLE resident store -- byte-identical to the
         // pre-S10c path: one atomic load of the descriptor, then the device-memory cell. `Some(src)`
-        // INJECTS them (S10c: one partition slice). The identity + validity guards run for BOTH, so a
+        // INJECTS them (S10c: one shard slice). The identity + validity guards run for BOTH, so a
         // descriptor that drifted from the catalog or got invalidated is rejected either way. No
         // `host_rows` read on this path: a text GROUP BY key result is materialized ON-DEVICE.
         let (snapshot, device_memory, row_count) = match src {
@@ -5795,7 +5795,7 @@ impl Engine {
         let mut has_hetero_key = false;
         // M3 (doc 21): per-key NULL validity bitmap byte offset (sentinel u64::MAX = the key holds no NULL).
         // The hetero sort comparator reads this ON-DEVICE and orders NULL keys to the PG-default end (last
-        // ASC / first DESC) — GPU-native, no host partition / sentinel. A nullable key of ANY type routes
+        // ASC / first DESC) — GPU-native, no host shard / sentinel. A nullable key of ANY type routes
         // to that comparator (below). A nullable sort EXPRESSION stays a clean-error follow-up (an
         // expression has no single column validity bitmap; a derived one is a follow-up).
         let mut key_null_offs: Vec<u64> = vec![u64::MAX; select.order_by.len()];

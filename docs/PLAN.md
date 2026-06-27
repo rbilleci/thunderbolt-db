@@ -22,8 +22,10 @@ Before deep OLTP-engine investment:
 
 ## 2. STRATA — make the GPU path the production default (DECISIONS ADR-010)
 Spec: ARCHITECTURE §7 + §13.
-- **S-A — vocabulary rename** (`RelationalResidentPartition → ResidentShard`, `partitions → shards`, etc.).
-  Mechanical, behavior-preserving; lands the L1/L2/L3 disambiguation first.
+- **S-A — vocabulary rename ✅ DONE (2026-06-27).** `RelationalResidentPartition → RelationalResidentShard`,
+  `residency.partitions → shards`, `partition_device_memory → shard_device_memory`, `partition_id/count → shard_*`,
+  route shapes `partitioned_* → sharded_*` (engine + observability; MVCC tuple-store "partition" left intact).
+  Behavior-preserving, suite 729/0.
 - **S-B — admission producer v1 (N=1 unified) behind `auto_admit_on_commit` (default OFF).** Commit-triggered,
   post-`publish_committed_seq`, best-effort, via the `&self`+held-catalog-guard seam. Makes the GPU path reachable
   end-to-end via the wire for fits-one-GPU tables (int4 + text). Golden wire tests (below) go green.

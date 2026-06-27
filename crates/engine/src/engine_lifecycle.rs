@@ -409,17 +409,17 @@ impl Engine {
             .filter(|entry| entry.descriptor.gpu_id == gpu_id)
             .map(|entry| entry.descriptor.resident_bytes)
             .sum();
-        let partition_bytes: u64 = self
+        let shard_bytes: u64 = self
             .read_state
             .residency
-            .partitions
+            .shards
             .load()
             .values()
             .flatten()
-            .filter(|partition| partition.gpu_id == gpu_id)
-            .map(|partition| partition.resident_bytes)
+            .filter(|shard| shard.gpu_id == gpu_id)
+            .map(|shard| shard.resident_bytes)
             .sum();
-        snapshot_bytes.saturating_add(partition_bytes)
+        snapshot_bytes.saturating_add(shard_bytes)
     }
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {

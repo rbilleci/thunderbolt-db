@@ -2,7 +2,7 @@
 //! preserving): BoundRelationalSelect (the resolved column/index/filter binding
 //! a resident read executes against) and the resident-route shape matchers
 //! (resident_route_query_shape, ordered/distinct/grouped/count variants, the
-//! partitioned variant) plus the D2H rows/bytes estimates. Pure shape analysis
+//! sharded variant) plus the D2H rows/bytes estimates. Pure shape analysis
 //! over a parsed Select; the Engine routes on the result.
 
 use super::*;
@@ -234,7 +234,7 @@ pub(crate) fn resident_route_ordered_projection_shape(
     .then(|| "int4_ordered_projection".to_string())
 }
 
-pub(crate) fn partitioned_resident_route_query_shape(
+pub(crate) fn sharded_resident_route_query_shape(
     select: &Select,
     table: &RelationalTable,
     bound: &BoundRelationalSelect,
@@ -281,7 +281,7 @@ pub(crate) fn partitioned_resident_route_query_shape(
             && filter_idx != aggregate_idx
             && table.columns[filter_idx].ty == SqlType::Int4
             && matches!(value, SqlValue::Int4(_)))
-        .then(|| "partitioned_int4_equality_sum".to_string());
+        .then(|| "sharded_int4_equality_sum".to_string());
     }
     if matches!(
         &select.projection,
@@ -297,9 +297,9 @@ pub(crate) fn partitioned_resident_route_query_shape(
             && resident_device_i32_comparison(op).is_some()
             && matches!(value, SqlValue::Int4(_)))
         .then(|| match &select.projection {
-            SelectProjection::Avg { .. } => "partitioned_int4_filtered_avg".to_string(),
-            SelectProjection::Min { .. } => "partitioned_int4_filtered_min".to_string(),
-            SelectProjection::Max { .. } => "partitioned_int4_filtered_max".to_string(),
+            SelectProjection::Avg { .. } => "sharded_int4_filtered_avg".to_string(),
+            SelectProjection::Min { .. } => "sharded_int4_filtered_min".to_string(),
+            SelectProjection::Max { .. } => "sharded_int4_filtered_max".to_string(),
             _ => unreachable!("filtered aggregate route prechecked projection"),
         });
     }
@@ -325,7 +325,7 @@ pub(crate) fn partitioned_resident_route_query_shape(
             _ => return None,
         }
     }
-    (lower && upper).then(|| "partitioned_int4_between_avg".to_string())
+    (lower && upper).then(|| "sharded_int4_between_avg".to_string())
 }
 
 pub(crate) fn resident_route_distinct_projection_shape(
