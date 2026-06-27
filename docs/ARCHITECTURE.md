@@ -118,9 +118,17 @@ Protocol layer → Management/observability. Cross-cutting (logging, config, err
   bloom pre-filter for semi/anti-joins; NULL-key and pad-WHERE 3VL on-device (V1–V3, built).
 - **Sort:** bitonic within a block (<32K), multi-pass radix across global memory; stable for deterministic results.
 
-## 9. OLTP execution model _(target — DECISIONS ADR-009)_
+## 9. OLTP execution model _(read data-plane PROVEN 2026-06-27; full engine = target — DECISIONS ADR-009)_
 The execution/transaction model the OLTP bet requires. **Parallelism comes from many transactions at once, not
 inside one** → a **batch-of-transactions machine**.
+
+**Read data-plane proven (DECISIONS ADR-008 "Wave-engine data-plane proof").** Isolated standalone probes
+(`crates/execution/examples/wave_{lifecycle,dataplane,index}_probe.rs`) validated the core: a persistent kernel exits
+cleanly on a doorbell in ~3.5µs (+ `%globaltimer` backstop = zombie-safe on the `--gpu-reset`-denied box); threads
+lock-free-claim requests and write packed atomic results with no per-request host work; **a GPU hash index makes point
+lookups O(1) → ~10.5M/s FLAT across 1M/4M/16M-row tables, ~13.6× the CPU.** The host-serial cap is gone; the residual
+bottleneck is GPU-architectural (host-mapped atomics). Still **target:** engine integration, the slot→wire mapping,
+concurrent index maintenance on writes (lock-free CAS inserts below), and the deterministic-CC write path.
 - **Wave engine:** a **persistent kernel** drains a host-pinned lock-free submission ring; transactions are
   enqueued, not launched (kills per-op launch cost). It is a **throughput engine for homogeneous waves** (route-
   grouped sub-waves to avoid warp divergence), not sub-µs for arbitrary transactions; single-txn p50 is bounded by
