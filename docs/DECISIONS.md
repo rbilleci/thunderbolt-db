@@ -243,6 +243,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   result-slot done flag; no central coalescer, no per-wave DtoH gate), measured (c) vs the BATCHER's 156k concurrent cap
   under concurrency. What DOES stand from the gate: synchronous single-flight wave is genuinely bad (round-trip > launch),
   and the freeze root cause (`cuMemAlloc`/`cuMemFree` device-sync) is real.
+- **R2.2 PROPER PORT — the verdict FLIPS: the wave WINS at small (OLTP) batches (2026-06-27, commits `5e6b2302` +
+  `bcc12af5`, `wave_vs_launch_per_batch_throughput`).** Did the proper port the review demanded: (1) optimized drain —
+  clamped-batched CAS claim `[c, min(c+K,head))` + ONE `membar.sys`/`atom.add(completed)` per batch (520k -> ~2.27M/s,
+  4.7x); (2) async `submit_async`/`harvest` API; (3) completion via a HOST-MAPPED `completed` MIRROR on its OWN cacheline
+  (harvest reads local RAM, no DtoH; the cacheline split fixed a false-sharing per-wave-latency pathology). All
+  byte-identical to the R1 index probe. **CORRECTED single-flight measurement (release, 1M rows, wave vs lpb lookups/s,
+  wave/lpb):** batch1 124k/39k = **3.20x**; batch8 448k/309k = **1.45x**; batch32 1.21M/1.19M = **1.02x**; batch256
+  2.06M/6.94M = 0.30x; batch65536 2.27M/23.4M = 0.10x. **The persistent kernel WINS at small batches** (the OLTP
+  point-lookup regime) because it has NO per-batch launch: 8us/submit at batch 1 vs lpb's fixed ~25us launch+sync. lpb
+  wins only at LARGE batches (launch amortized; the GPU index probe is bandwidth-bound at 23M while the wave hits its
+  ~2.27M drain ceiling — CAS contention on the single `claim` counter; sharded counters are the lever to lift it). At
+  batch 8-32 the wave (0.45-1.2M) is already 3-8x the batcher's 156k host-coalescer cap. **So the earlier naive-port
+  "wave loses 118x" was the wrong regime + a crippled impl; the proper port is competitive-to-winning exactly where OLTP
+  lives.** STILL DEFERRED: the CONCURRENT/pipelined depth-K test (many producers -> the wave's full advantage over the
+  host-serial coalescer, the regime that would show the biggest win) — its harness had a bug (the engine itself is fine,
+  ~8-26us/submit); rebuilding it is the remaining R2.2 step before any engine wiring (R2.2b).
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

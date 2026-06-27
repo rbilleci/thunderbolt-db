@@ -136,18 +136,17 @@ Spec: ARCHITECTURE §7 + §13.
   growth / overflow free), and the wave path is alloc-free → **R2.2 path: pre-warm the pool + suppress pool shrink while
   a wave kernel is resident** (pragmatic), or move engine device alloc to `cuMemAllocAsync` (robust). "Replace per-batch"
   alone is insufficient (other engine activity still allocs).
-- **R2.2 evidence gate — first verdict RETRACTED; wave NOT fairly tested; UN-PARKED (2026-06-27, DECISIONS ADR-008 "R2.2
-  evidence gate CORRECTION").** I first measured the wave in synchronous single-flight vs the raw 1-thread index probe
-  and concluded "wave loses 118x, park" — improper on 3 counts: wrong regime (single-flight, not continuous-fill under
-  concurrency), wrong baseline (raw index probe 7-24M/s, not the **156k single-coalescer batcher cap** the wave is meant
-  to beat), and a NAIVE wave port that plateaus at ~520k/s (a per-needle drain ceiling, congestion-bound, ~85x below the
-  proven probe's 45M/s — it dropped the 1d batched-claiming/device-atomics optimizations and added a `membar.sys` +
-  32-byte host-mapped record per needle). The wave engine IS R1's index probe on a persistent kernel; the OPEN question
-  stands: can GPU-side coalescing beat the host-serial 156k coalescer under concurrency? A FAIR test = optimized drain
-  (1d optimizations) + a concurrent lock-free enqueue model (no central coalescer, no per-wave DtoH gate) vs the 156k
-  batcher under concurrency. What stands: synchronous single-flight wave is bad (round-trip > launch); the freeze
-  (`cuMemAlloc`/`cuMemFree` device-sync) is real. **NEXT = (A) the fair test, or (B) R3 writes (independent). The
-  point-read bet is already settled by R1.**
+- **R2.2 PROPER PORT — verdict FLIPS: the wave WINS at small (OLTP) batches (2026-06-27, `5e6b2302`+`bcc12af5`,
+  DECISIONS ADR-008 "R2.2 PROPER PORT").** The first "wave loses 118x, park" was a naive per-needle port measured in the
+  wrong regime vs the wrong baseline (retracted). The proper port = optimized drain (clamped-batched CAS claim + amortized
+  membar, 520k->2.27M/s) + async `submit_async`/`harvest` + host-mapped `completed` mirror on its own cacheline
+  (fixed a false-sharing latency pathology). Single-flight, 1M rows, wave vs lpb: **batch1 124k/39k=3.20x, batch8
+  448k/309k=1.45x, batch32 1.21M/1.19M=1.02x**, batch256 0.30x, batch65536 0.10x. The persistent kernel WINS at small
+  batches (no per-batch launch: 8us/submit vs lpb ~25us) — exactly the OLTP point-lookup regime; lpb wins only at large
+  batches (GPU-bound 23M vs the wave's ~2.27M drain ceiling, CAS-contention-limited). At batch 8-32 the wave is already
+  3-8x the batcher's 156k. **STILL DEFERRED:** the CONCURRENT/pipelined depth-K test (many producers -> the wave's full
+  advantage over the host coalescer) — harness had a bug, rebuild it before R2.2b wiring. **NEXT = (A) rebuild the
+  concurrent harness + decide on wiring, or (B) R3 writes (independent).**
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
