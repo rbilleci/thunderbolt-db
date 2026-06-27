@@ -5,7 +5,9 @@
 //! barriers — a barrier deadlock in a persistent kernel would evade the `%globaltimer` wall-clock
 //! backstop and zombie the context on this `--gpu-reset`-denied box), serial-scans a resident key column
 //! for its needle, gathers a payload column at the match, and writes the result. `(done, value)` is
-//! packed into ONE atomic 8-byte store, so the host never sees a torn slot (no `membar.sys` needed).
+//! packed into ONE atomic 8-byte store so the host never sees a TORN slot; a `membar.sys` then orders
+//! that store before the `completed` bump so `completed >= requests` truly means all result stores have
+//! landed (cross-location ordering — the packed-store atomicity alone does NOT give that, per audit).
 //! The host enqueues needles + reads results back — NO per-request host materialization (the wave model).
 //!
 //! Verifies present needles (gather correct) AND absent needles (not-found, not a wrong row), then
@@ -103,6 +105,7 @@ $L_write:
     mul.wide.u32 %rd15, %r7, 8;
     add.u64 %rd16, %rd3, %rd15;
     st.volatile.global.u64 [%rd16], %rd20;
+    membar.sys;
     atom.global.add.u32 %r13, [%rd1+12], 1;
     bra $L_loop;
 
@@ -187,7 +190,7 @@ fn main() {
     let requests = env_u32("GPU_DB_WAVE_REQUESTS", 200_000);
     let rows = env_u32("GPU_DB_WAVE_ROWS", 20_000);
     let ring = (requests + 8).next_power_of_two();
-    let absent_from = requests - 4;
+    let absent_from = requests - (requests / 100).clamp(4, requests); // ~1% absent (not-found coverage)
 
     let lib: &'static Library = Box::leak(Box::new(
         unsafe { Library::new("libcuda.so.1") }
