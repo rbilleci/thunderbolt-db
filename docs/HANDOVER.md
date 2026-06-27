@@ -93,19 +93,24 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   the 30s backstop + 20s wave-2 timeout.) **R2.2 path:** the engine's device-buffer pool amortizes `cuMemAlloc` (steady
   state reuses pooled buffers; syncs only on cold growth / overflow free), and the wave path is itself alloc-free
   (pre-allocated device-mapped ring) — so **pre-warm the pool + suppress pool shrink while a wave kernel is resident**
-  (pragmatic), or migrate engine device alloc to `cuMemAllocAsync` (robust). Rather than build either, MEASURED first
-  (evidence gate). **R2.2 EVIDENCE GATE ❌ — wave LOSES; wave-in-engine PARKED (DECISIONS ADR-008 "R2.2 EVIDENCE
-  GATE"):** `wave::tests::wave_vs_launch_per_batch_throughput` (release, 1M rows) — persistent `WaveReadEngine` vs the
-  launch-per-batch R1 index probe, same table/index/needles: batch256 = **60k vs 7.08M lookups/s (0.01x — wave 118x
-  SLOWER)**; wave per-submit ~116µs→4.3ms vs launch ~25-36µs. In request-response (submit a batch, wait), each wave pays
-  a host↔device round-trip (~116µs) WORSE than a kernel launch+stream-sync (~25µs), and the 1024 persistent threads'
-  continuous PCIe polling congests the bus. The probes' ~45M req/s was ONE GIANT continuous-fill wave (round-trip
-  amortized); request-response doesn't amortize. **Decision: do NOT wire the wave engine, do NOT do the async-alloc fix
-  — R1's launch-per-batch GPU index probe (shipped: 2.3M end-to-end, ~7M execution-layer, O(1)) IS the point-read
-  winner.** R2's premise ("persistent kernel breaks the floor") does NOT hold for request-response. The wave engine would
-  only win under sustained continuous-fill high concurrency with async result delivery (big architectural change,
-  unproven need) → PARKED. R2.1/R2.2a code kept as proven/audited building blocks. (3) **R3** — writes (concurrent index
-  maintenance proven fast) + deterministic CC — independent of the wave read path; the natural NEXT now.
+  (pragmatic), or migrate engine device alloc to `cuMemAllocAsync` (robust). **R2.2 EVIDENCE GATE — first verdict
+  RETRACTED; the wave engine was NOT fairly tested (DECISIONS ADR-008 "R2.2 evidence gate CORRECTION").** I first
+  measured the wave in SYNCHRONOUS single-flight (submit a batch, block on a DtoH round-trip) vs the raw single-threaded
+  index probe and concluded "wave loses 118x, PARK" — but that comparison was improper on three counts: (1) wrong regime
+  (single-flight, not the continuous-fill-under-concurrency the wave is FOR); (2) wrong baseline (raw 1-thread index
+  probe 7-24M/s, not the **156k single-coalescer batcher cap** the wave is meant to beat); (3) my wave port is NAIVE —
+  large-batch sweep shows it plateaus at **~520k/s flat** (a per-needle DRAIN ceiling, congestion-bound, WORSE with more
+  threads), ~85x below the proven probe's 45M/s, because it dropped the 1d optimizations (batched claiming, device
+  atomics) and added a `membar.sys` + 32-byte host-mapped record per needle. So the gate measured a crippled impl in the
+  wrong regime vs the wrong baseline. **UN-PARKED.** Conceptually the wave engine IS R1's index probe on a persistent
+  kernel; the OPEN question stands: can GPU-side coalescing beat the host-serial 156k coalescer under concurrency? A
+  FAIR test needs (a) an OPTIMIZED drain (port 1d-ii batched claiming + 1d-i device atomics + leaner result records ->
+  tens-of-M/s), (b) a CONCURRENT lock-free enqueue host model (N threads claim ring slots + spin on their own done flag;
+  no central coalescer, no per-wave DtoH gate), measured (c) vs the 156k batcher under concurrency. What stands:
+  synchronous single-flight wave is genuinely bad (round-trip > launch); the freeze root cause (`cuMemAlloc`/`cuMemFree`
+  device-sync) is real. **NEXT options: (A) build the fair test (optimized drain + concurrent enqueue vs 156k) — the
+  real R2 evaluation; (B) R3 writes (independent). The point-read bet is already settled by R1 (O(1) index, shipped)
+  regardless.** (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
   only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The

@@ -219,6 +219,30 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   the ring full, host reading slots without per-batch waits) — a much larger architectural change, unproven to be
   needed, so PARKED. "Measure first" saved the async-alloc refactor + the wiring. (R2.1/R2.2a code retained as proven,
   audited building blocks; R3 writes + deterministic CC are independent of this.)
+- **R2.2 evidence gate CORRECTION (2026-06-27) — the prior verdict's COMPARISON WAS IMPROPER; "wave loses / PARK" is
+  RETRACTED, the wave engine was NOT fairly tested.** (Self-correction after review.) Three flaws in the entry above:
+  (1) **Wrong regime** — it ran the wave engine in SYNCHRONOUS single-flight (submit one batch, block on a DtoH
+  round-trip, repeat), the *worst* mode for a persistent kernel; the wave's thesis (ADR-009) is continuous fill under
+  CONCURRENCY (many in flight, no per-batch wait). (2) **Wrong baseline** — it compared against the raw single-threaded
+  execution-layer index probe (7-24M/s, which has NO coalescer because it's one thread submitting directly), not the
+  thing the wave engine is designed to beat: the **batcher's 156k single-coalescer concurrent cap** (the host-serial
+  bottleneck). (3) **A naive, unoptimized wave port** — a large-batch / thread-count sweep
+  (`wave_vs_launch_per_batch_throughput`, 128 threads, 1M rows) shows the wave throughput PLATEAUS at **~520k/s FLAT
+  across batch 256/4096/65536** — i.e. NOT a per-wave round-trip artifact (that would amortize with batch) but a
+  per-needle DRAIN ceiling of ~2us/needle. The proven probe (1d) hit **~45M/s (~22ns/needle)** — so this in-engine port
+  is **~85x slower than the data plane it was meant to be**, because it dropped the probe's optimizations (1d-ii batched
+  claiming, 1d-i device-memory atomics) and ADDED per-needle cost (a 32-byte multi-word host-mapped result record +
+  `membar.sys` per needle + per-needle CAS). It is CONGESTION-bound: MORE threads make it WORSE (256+ time out on large
+  batches; 1024 timed out), the opposite of the probe (scaled to 8192). **So the gate measured a crippled implementation
+  in the wrong regime against the wrong baseline — it says nothing about whether an OPTIMIZED wave engine beats the
+  batcher.** The conceptual framing stands (the wave engine IS R1's index probe driven by a persistent kernel — same
+  index, same probe/gather), and the OPEN question is unchanged: can GPU-side coalescing (lock-free ring + persistent
+  drain) beat the host-serial single-coalescer (156k) under concurrency? **UN-PARKED.** A FAIR test needs: (a) an
+  OPTIMIZED drain (port 1d-ii batched claiming + 1d-i device atomics + leaner/packed result records -> target
+  tens-of-M/s), (b) a CONCURRENT lock-free enqueue host model (N threads claim ring slots + spin on their own
+  result-slot done flag; no central coalescer, no per-wave DtoH gate), measured (c) vs the BATCHER's 156k concurrent cap
+  under concurrency. What DOES stand from the gate: synchronous single-flight wave is genuinely bad (round-trip > launch),
+  and the freeze root cause (`cuMemAlloc`/`cuMemFree` device-sync) is real.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

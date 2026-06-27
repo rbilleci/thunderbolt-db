@@ -136,15 +136,18 @@ Spec: ARCHITECTURE §7 + §13.
   growth / overflow free), and the wave path is alloc-free → **R2.2 path: pre-warm the pool + suppress pool shrink while
   a wave kernel is resident** (pragmatic), or move engine device alloc to `cuMemAllocAsync` (robust). "Replace per-batch"
   alone is insufficient (other engine activity still allocs).
-- **R2.2 EVIDENCE GATE ❌ — wave LOSES to launch-per-batch; wave-in-engine PARKED (2026-06-27, DECISIONS ADR-008 "R2.2
-  EVIDENCE GATE", `wave::tests::wave_vs_launch_per_batch_throughput`):** persistent `WaveReadEngine` vs the launch-per-
-  batch R1 index probe (1M rows, release) = batch256 **60k vs 7.08M lookups/s (wave 118x SLOWER)**; in request-response
-  each wave's host↔device round-trip (~116µs) is worse than a launch+stream-sync (~25µs) + the persistent threads' PCIe
-  polling congests the bus. **Do NOT wire the wave engine, do NOT do the async-alloc fix — R1's launch-per-batch GPU
-  index probe (shipped, O(1), 2.3M end-to-end) is the point-read winner.** The wave engine would only win under sustained
-  continuous-fill high concurrency with async result delivery (large architectural change, unproven need) → PARKED.
-  R2.1/R2.2a code retained as proven/audited building blocks. **NEXT = §"Write path" (R3) / the parked benchmark items
-  — independent of the wave read path.**
+- **R2.2 evidence gate — first verdict RETRACTED; wave NOT fairly tested; UN-PARKED (2026-06-27, DECISIONS ADR-008 "R2.2
+  evidence gate CORRECTION").** I first measured the wave in synchronous single-flight vs the raw 1-thread index probe
+  and concluded "wave loses 118x, park" — improper on 3 counts: wrong regime (single-flight, not continuous-fill under
+  concurrency), wrong baseline (raw index probe 7-24M/s, not the **156k single-coalescer batcher cap** the wave is meant
+  to beat), and a NAIVE wave port that plateaus at ~520k/s (a per-needle drain ceiling, congestion-bound, ~85x below the
+  proven probe's 45M/s — it dropped the 1d batched-claiming/device-atomics optimizations and added a `membar.sys` +
+  32-byte host-mapped record per needle). The wave engine IS R1's index probe on a persistent kernel; the OPEN question
+  stands: can GPU-side coalescing beat the host-serial 156k coalescer under concurrency? A FAIR test = optimized drain
+  (1d optimizations) + a concurrent lock-free enqueue model (no central coalescer, no per-wave DtoH gate) vs the 156k
+  batcher under concurrency. What stands: synchronous single-flight wave is bad (round-trip > launch); the freeze
+  (`cuMemAlloc`/`cuMemFree` device-sync) is real. **NEXT = (A) the fair test, or (B) R3 writes (independent). The
+  point-read bet is already settled by R1.**
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).

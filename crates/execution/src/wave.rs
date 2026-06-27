@@ -715,12 +715,16 @@ mod tests {
         );
     }
 
-    /// R2.2 evidence gate: does the PERSISTENT wave engine beat the LAUNCH-PER-BATCH R1 index probe?
-    /// Same resident table / index / needles / projection, single-threaded serialized batches, swept
-    /// over batch size. The wave engine's whole thesis is removing the per-batch kernel launch (~72us
-    /// fixed) — this measures whether that materializes end-to-end (results materialized to rows both
-    /// ways). Wave is measured FIRST then shut down, THEN the index probe — so the index probe's
-    /// `cuMemAlloc` (which device-syncs) never runs while the wave kernel is live (the freeze root cause).
+    /// R2.2 diagnostic — persistent wave vs launch-per-batch R1 index probe, swept over (large) batch.
+    /// CAVEAT (DECISIONS ADR-008 "R2.2 evidence gate CORRECTION"): this is SINGLE-THREADED serialized
+    /// submit-and-wait, which is NOT the wave engine's intended regime, and the baseline (raw 1-thread
+    /// index probe) is NOT what the wave is meant to beat (that is the 156k single-coalescer batcher cap
+    /// under concurrency). It is a DIAGNOSTIC: it shows this NAIVE wave port plateaus at ~520k/s FLAT
+    /// across batch size (a per-needle drain ceiling, congestion-bound, ~85x below the proven probe's
+    /// 45M/s — it lacks the 1d batched-claiming/device-atomic optimizations). A FAIR wave evaluation
+    /// needs an optimized drain + a concurrent lock-free enqueue model measured vs the 156k batcher.
+    /// Wave is measured FIRST then shut down, THEN the index probe — so the index probe's `cuMemAlloc`
+    /// (which device-syncs) never runs while the wave kernel is live (the freeze root cause).
     ///
     /// Run: `GPU_DB_WAVE_BENCH_ROWS=1000000 cargo test -p gpu_db_execution \
     ///   wave::tests::wave_vs_launch_per_batch_throughput -- --ignored --nocapture`
@@ -734,10 +738,18 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1_000_000);
-        let iters: usize = std::env::var("GPU_DB_WAVE_BENCH_ITERS")
+        // Persistent-kernel thread count (PCIe-polling congestion suspect — sweep it).
+        // NOTE: this naive port is CONGESTION-bound (per-needle host-mapped record write + `membar.sys`
+        // per needle + per-needle CAS) — MORE threads make it WORSE (256+ times out on large batches),
+        // unlike the optimized probe (batched claiming + device atomics) which scaled to 8192. 128 is the
+        // sweet spot here. The probe hit ~45M/s; this port plateaus ~520k/s (~85x slower) — see the
+        // "R2.2 evidence gate CORRECTION" in DECISIONS: the wave engine was NOT fairly tested.
+        let wave_threads: u32 = std::env::var("GPU_DB_WAVE_BENCH_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3000);
+            .unwrap_or(128);
+        // Adaptive iters so total work per batch size is ~constant (large single waves = continuous fill).
+        let target_lookups: usize = 4_000_000;
         let keys: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(3).wrapping_add(1)).collect();
         let payload: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(1000).wrapping_add(7)).collect();
         let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
@@ -766,15 +778,19 @@ mod tests {
         let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
         let index_resident = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).expect("index"));
 
-        let batch_sizes = [1usize, 8, 64, 256];
+        // Large batches = continuous-fill in ONE wave (amortizes the per-wave round-trip), the regime a
+        // persistent kernel is FOR. Separates "fixed per-wave round-trip" from "per-needle drain".
+        let batch_sizes = [256usize, 4096, 65536];
+        let ring_capacity = 131_072usize;
+        let iters_for = |batch: usize| (target_lookups / batch).max(20);
         let needles_for = |batch: usize, iter: usize| -> Vec<i32> {
             (0..batch)
-                .map(|i| keys[(iter * batch + i) % rows as usize])
+                .map(|i| keys[(iter.wrapping_mul(batch).wrapping_add(i)) % rows as usize])
                 .collect()
         };
 
-        // --- Measure the PERSISTENT wave engine (alloc-free submits) ---
-        let mut wave_lps = [0f64; 4]; // lookups/s per batch size
+        // --- Persistent wave engine (alloc-free submits) ---
+        let mut wave_lps = [0f64; 3];
         {
             let mut engine = WaveReadEngine::new(
                 Arc::clone(&index_resident),
@@ -782,29 +798,38 @@ mod tests {
                 &projections,
                 table_mask,
                 hash_shift,
-                512,
-                1024,
+                ring_capacity,
+                wave_threads,
                 30_000_000_000,
             )
             .expect("wave engine");
             for (bi, &batch) in batch_sizes.iter().enumerate() {
-                for w in 0..8 {
-                    let _ = engine.submit(&needles_for(batch, w)).expect("warmup");
+                let iters = iters_for(batch);
+                // A timeout (Err) records 0 for this config rather than crashing (high thread counts can
+                // congest the persistent kernel past the drain deadline — itself a finding).
+                if (0..4).any(|w| engine.submit(&needles_for(batch, w)).is_err()) {
+                    wave_lps[bi] = 0.0;
+                    continue;
                 }
                 let t = Instant::now();
+                let mut ok = true;
                 for it in 0..iters {
-                    let _ = engine.submit(&needles_for(batch, it)).expect("wave submit");
+                    if engine.submit(&needles_for(batch, it)).is_err() {
+                        ok = false;
+                        break;
+                    }
                 }
                 let secs = t.elapsed().as_secs_f64();
-                wave_lps[bi] = (iters * batch) as f64 / secs;
+                wave_lps[bi] = if ok { (iters * batch) as f64 / secs } else { 0.0 };
             }
             engine.shutdown(); // MUST shut down before the index probe's cuMemAlloc (freeze root cause)
         }
 
-        // --- Measure the LAUNCH-PER-BATCH R1 index probe (cuMemAlloc safe now: no wave kernel alive) ---
-        let mut lpb_lps = [0f64; 4];
+        // --- Launch-per-batch R1 index probe (cuMemAlloc safe now: no wave kernel alive) ---
+        let mut lpb_lps = [0f64; 3];
         for (bi, &batch) in batch_sizes.iter().enumerate() {
-            for w in 0..8 {
+            let iters = iters_for(batch);
+            for w in 0..4 {
                 let s = resident
                     .submit_match_project_i32_index_probe_from_payload(
                         &index_resident, table_mask, hash_shift, &needles_for(batch, w), &projections, rows,
@@ -825,7 +850,7 @@ mod tests {
             lpb_lps[bi] = (iters * batch) as f64 / secs;
         }
 
-        println!("\n# R2.2 gate: persistent WAVE vs LAUNCH-PER-BATCH index probe  rows={rows} iters={iters}");
+        println!("\n# R2.2 gate: persistent WAVE vs LAUNCH-PER-BATCH index probe  rows={rows} wave_threads={wave_threads}");
         println!(
             "  {:>6}  {:>16}  {:>16}  {:>9}  {:>12}  {:>12}",
             "batch", "wave lookups/s", "lpb lookups/s", "speedup", "wave us/sub", "lpb us/call"
@@ -839,6 +864,6 @@ mod tests {
                 wave_lps[bi], lpb_lps[bi]
             );
         }
-        println!("# context: batcher ~156k ops/s (host-serial cap); R1 index end-to-end ~2.3M (engine template path).");
+        println!("# large batch = continuous-fill (the wave's intended regime); batcher ~156k single-coalescer cap.");
     }
 }
