@@ -1113,21 +1113,48 @@ impl Engine {
         };
         let n = pending.members.len();
         let ncols = pending.selected_indexes.len();
+        // Per-needle counts -> prefix-sum ranges + whether ANY needle matched >1 row.
         let mut counts = vec![0u32; n];
         for projected in &projected_rows {
             counts[projected.needle_index] += 1;
         }
         let mut needle_ranges = Vec::with_capacity(n);
         let mut acc = 0u32;
+        let mut any_multi = false;
         for &c in &counts {
             needle_ranges.push((acc, c));
             acc += c;
+            any_multi |= c > 1;
         }
-        let mut order: Vec<&CudaI32BatchProjectionRow> = projected_rows.iter().collect();
-        order.sort_by_key(|projected| (projected.needle_index, projected.row_index));
-        let mut values = Vec::with_capacity(acc as usize * ncols);
-        for projected in order {
-            values.extend(projected.values.iter().copied().map(SqlValue::Int4));
+        let total = acc as usize;
+        // O(n) COUNTING-SORT SCATTER by needle_index — replaces an O(n log n) global
+        // `sort_by_key((needle_index, row_index))` that profiling showed was ~80% of the assembly
+        // (~1800us/65536-batch). `cursor` walks each needle's contiguous range; `slot[d]` indexes into
+        // `projected_rows`. The scatter is stable, so it preserves the kernel's emit order within a needle.
+        let mut slot = vec![0u32; total];
+        let mut cursor: Vec<u32> = needle_ranges.iter().map(|&(start, _)| start).collect();
+        for (i, projected) in projected_rows.iter().enumerate() {
+            let ni = projected.needle_index;
+            let d = cursor[ni] as usize;
+            slot[d] = i as u32;
+            cursor[ni] += 1;
+        }
+        // Byte-identity contract: each needle's rows ascend by row_index. The unique-key point-read case has
+        // <=1 row/needle (already ordered). Only a NON-unique predicate yields multi-row needles, whose
+        // kernel-emit order is atomic-race (not row_index) — sort just those sub-ranges (row_index is unique
+        // within a needle, so this is a total order matching the old global sort). Skipped entirely otherwise.
+        if any_multi {
+            for &(start, count) in &needle_ranges {
+                if count > 1 {
+                    let s = start as usize;
+                    let e = s + count as usize;
+                    slot[s..e].sort_by_key(|&i| projected_rows[i as usize].row_index);
+                }
+            }
+        }
+        let mut values = Vec::with_capacity(total * ncols);
+        for &i in &slot {
+            values.extend(projected_rows[i as usize].values.iter().copied().map(SqlValue::Int4));
         }
         // All members share the same schema Arc (the retained submit builds it once); take any.
         let (columns, access_path) = match pending.members.first() {
