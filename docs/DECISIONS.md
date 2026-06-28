@@ -574,6 +574,21 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   remaining lever to hit the full 30M end-to-end on BOTH routes is collapsing lpb's two round-trips (host-machinery,
   separate). **NET: read-path absolute now ~19.5M (6.5x the session-start 3M); the wave-vs-lpb kernel decision is
   on strong, mostly-unmasked numbers.**
+  **LAST READ LEVER — O(n) SCATTER, IMPLEMENTED + MERGED (`3f719e3a`): instrumented (GPU_DB_PROBE_TIMING, since
+  removed) the engine batched completion at b65536 -> the dominant host cost was NOT lpb's round-trips: it was the
+  assembly's O(n log n) global `sort_by_key((needle_index,row_index))` = ~1800us (~80% of the ~2200us assembly;
+  flatten ~240us, GPU drain ~1775us, members ~360us, payload ~30us). lpb's projected_rows arrive in atomic-add emit
+  order (UNSORTED) so the global sort was its assembly bottleneck; the wave harvests needle-ordered so it was never
+  sort-bound. FIX: replaced the global sort with an O(n) counting-sort scatter (cursor walks each needle's prefix-
+  summed range; a within-needle row_index sort runs ONLY for needles matching >1 row = a non-unique predicate).
+  Byte-identical (row_index unique within a needle => total order; differentials incl the multirow one that
+  exercises the within-needle sort). MEASURED (1M rows): lpb-batched 11.09M -> 14.62M @b65536 (+32%), 10.81M ->
+  15.05M @b4096 (+39%); wave-batched unchanged (already needle-ordered). **BATCHED wave/lpb 1.76x -> 1.33x @b65536,
+  1.21x @b4096 -- CONVERGING ON THE TRUE RAW GPU RATIO (1.26x): both routes are now at their drains, so the ratio
+  reflects the GPU mechanism (wave's ring-harvest vs lpb's 3-sync D2H), not host assembly overhead. THE READ-PATH
+  RATIO IS NOW HONEST.** (Caveat: lpb b65536 p99 spiked to ~30ms vs p50 3.8ms — a blocking-sync tail on the shared
+  box, lpb-path only, not the wave; worth a look if lpb ever becomes default. Remaining marginal levers: members
+  ~360us + flatten/SqlValue ~240us, help both equally, do NOT change the now-honest ratio.)**
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
