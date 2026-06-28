@@ -1152,23 +1152,19 @@ impl Engine {
             any_multi |= c > 1;
         }
         let total = acc as usize;
-        // O(n) COUNTING-SORT SCATTER by needle_index — replaces an O(n log n) global
-        // `sort_by_key((needle_index, row_index))` that profiling showed was ~80% of the assembly
-        // (~1800us/65536-batch). `cursor` walks each needle's contiguous range; `slot[d]` indexes into the
-        // columnar rows. The scatter is stable, so it preserves the kernel's emit order within a needle.
-        let mut slot = vec![0u32; total];
-        let mut cursor: Vec<u32> = needle_ranges.iter().map(|&(start, _)| start).collect();
-        for i in 0..nrows {
-            let ni = projected.needle_indices[i] as usize;
-            let d = cursor[ni] as usize;
-            slot[d] = i as u32;
-            cursor[ni] += 1;
-        }
-        // Byte-identity contract: each needle's rows ascend by row_index. The unique-key point-read case has
-        // <=1 row/needle (already ordered). Only a NON-unique predicate yields multi-row needles, whose
-        // kernel-emit order is atomic-race (not row_index) — sort just those sub-ranges (row_index is unique
-        // within a needle, so this is a total order matching the old global sort). Skipped entirely otherwise.
-        if any_multi {
+        let values = if any_multi {
+            // GENERAL path (a non-unique predicate gave some needle >1 row): O(n) counting-sort scatter by
+            // needle_index (`cursor` walks each needle's range), then sort each multi-row sub-range by
+            // row_index (row_index unique within a needle => the total order the byte-identity contract
+            // wants), then flatten as raw i32.
+            let mut slot = vec![0u32; total];
+            let mut cursor: Vec<u32> = needle_ranges.iter().map(|&(start, _)| start).collect();
+            for i in 0..nrows {
+                let ni = projected.needle_indices[i] as usize;
+                let d = cursor[ni] as usize;
+                slot[d] = i as u32;
+                cursor[ni] += 1;
+            }
             for &(start, count) in &needle_ranges {
                 if count > 1 {
                     let s = start as usize;
@@ -1176,15 +1172,24 @@ impl Engine {
                     slot[s..e].sort_by_key(|&i| projected.row_indices[i as usize]);
                 }
             }
-        }
-        // Flatten as raw i32 (no SqlValue) — `row_values` is already an i32 slice, so this is a plain copy
-        // into the needle-ordered buffer (DECISIONS "Result-path optimization": the fat Vec<SqlValue> write
-        // was ~240us/65536-batch of pure overhead — the int4 route is always i32, mapped to DbValue::Int4
-        // at the batcher).
-        let mut values = Vec::with_capacity(total * ncols);
-        for &i in &slot {
-            values.extend_from_slice(projected.row_values(i as usize));
-        }
+            let mut values = Vec::with_capacity(total * ncols);
+            for &i in &slot {
+                values.extend_from_slice(projected.row_values(i as usize));
+            }
+            values
+        } else {
+            // UNIQUE FAST-PATH (the dominant point read: <=1 row/needle): place each row's i32 values
+            // DIRECTLY at its needle's offset in ONE pass — no `slot`/`cursor` indirection (-512KB allocs at
+            // b65536), no separate flatten. Byte-identical to the general path (count==1 => the scatter would
+            // land row `i` at exactly `needle_ranges[ni].0`, and no within-needle order question arises).
+            let mut values = vec![0i32; total * ncols];
+            for i in 0..nrows {
+                let ni = projected.needle_indices[i] as usize;
+                let dst = needle_ranges[ni].0 as usize * ncols;
+                values[dst..dst + ncols].copy_from_slice(projected.row_values(i));
+            }
+            values
+        };
         RelationalRetainedBatchResult {
             columns,
             access_path,

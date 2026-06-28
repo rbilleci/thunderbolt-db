@@ -4595,3 +4595,43 @@ fn r2_batched_assembly_sorts_multirow_needle_by_row_index() {
     assert_eq!(batched.needle_values(1), &[20, 209]);
     assert!(batched.needle_values(2).is_empty(), "absent needle -> no rows");
 }
+
+// The UNIQUE fast-path of assemble_batched_rows (<=1 row/needle, the dominant point read): each row is
+// placed DIRECTLY at its needle's offset. Prove it scatters by needle_index regardless of emit order +
+// handles an absent needle (count 0) — a regression that kept emit order, or mis-placed the absent gap,
+// fails here. Pure CPU (no GPU).
+#[test]
+fn r2_batched_assembly_unique_fastpath_scatters_by_needle() {
+    let col = |name: &str| RelationalColumn {
+        id: 0,
+        table_oid: 0,
+        attnum: 1,
+        name: name.to_string(),
+        ty: SqlType::Int4,
+        domain: None,
+        default: None,
+        type_oid: 23,
+        type_size: 4,
+    };
+    let shared_cols = std::sync::Arc::new(vec![col("id"), col("v")]);
+    let shared_access = std::sync::Arc::new(RelationalAccessPath::EqualityIndex {
+        table: "t".to_string(),
+        column: "id".to_string(),
+        matched_keys: 1,
+    });
+    // 4 needles, each <=1 row (unique -> fast-path). Emit order is ARBITRARY (needle 2, then 0, then 3);
+    // needle 1 is ABSENT (count 0).
+    let rows = vec![
+        CudaI32BatchProjectionRow { needle_index: 2, row_index: 7, values: vec![22, 202] },
+        CudaI32BatchProjectionRow { needle_index: 0, row_index: 3, values: vec![10, 100] },
+        CudaI32BatchProjectionRow { needle_index: 3, row_index: 1, values: vec![33, 303] },
+    ];
+    let projected = CudaI32BatchProjectionColumns::from_rows(rows);
+    let batched = Engine::assemble_batched_rows(&projected, 4, 2, shared_cols, shared_access, 3);
+    assert_eq!(batched.needle_count(), 4);
+    // Output MUST be needle-ordered (0, [1 empty], 2, 3), NOT emit order (2, 0, 3).
+    assert_eq!(batched.needle_values(0), &[10, 100]);
+    assert!(batched.needle_values(1).is_empty(), "absent needle 1 -> no rows");
+    assert_eq!(batched.needle_values(2), &[22, 202]);
+    assert_eq!(batched.needle_values(3), &[33, 303]);
+}
