@@ -221,6 +221,7 @@ fn measure(
 /// — one flat result + per-needle ranges instead of N per-needle structs (DECISIONS "Result-path
 /// optimization"). Shows how close the per-needle-result-model change gets end-to-end to the GPU drain.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn measure_batched(
     e: &Engine,
     template: &RelationalRetainedReadTemplate,
@@ -231,7 +232,23 @@ fn measure_batched(
     step: u64,
     rows: u64,
 ) -> Result<Lat, Box<dyn Error>> {
+    measure_batched_dense(e, template, mode, batch, batches, warmup, step, rows, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_batched_dense(
+    e: &Engine,
+    template: &RelationalRetainedReadTemplate,
+    mode: Mode,
+    batch: usize,
+    batches: usize,
+    warmup: usize,
+    step: u64,
+    rows: u64,
+    dense: bool,
+) -> Result<Lat, Box<dyn Error>> {
     mode.configure(e);
+    e.set_dense_index_probe_enabled(dense);
     for b in 0..warmup {
         let needles = needles_for_batch(b, batch, step, rows);
         let sub = e.submit_relational_retained_template_point_lookups(template, &needles)?;
@@ -246,7 +263,9 @@ fn measure_batched(
         let _ = e.complete_relational_retained_read_submission_batched(sub)?;
         batch_micros.push(s0.elapsed().as_micros());
     }
-    Ok(summarize(batch_micros, batches * batch, t.elapsed()))
+    let lat = summarize(batch_micros, batches * batch, t.elapsed());
+    e.set_dense_index_probe_enabled(false);
+    Ok(lat)
 }
 
 /// Rows from one batch in `mode`, for the byte-identity gate.
@@ -401,6 +420,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let wave = measure(&e, &template, Mode::Wave, batch, batches, warmup, step, rows_u)?;
         let wave_b = measure_batched(&e, &template, Mode::Wave, batch, batches, warmup, step, rows_u)?;
         let lpb_b = measure_batched(&e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u)?;
+        let lpb_dense_b = measure_batched_dense(
+            &e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u, true,
+        )?;
         let sp_lpb = if lpb.ops_per_s > 0.0 {
             wave.ops_per_s / lpb.ops_per_s
         } else {
@@ -416,6 +438,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         print_lat(Mode::Lpb.label(), &lpb);
         print_lat(Mode::Wave.label(), &wave);
         print_lat("lpb-batched", &lpb_b);
+        print_lat("lpb-DENSE-batched", &lpb_dense_b);
         print_lat("wave-batched", &wave_b);
         let sp_lpb_b = if lpb_b.ops_per_s > 0.0 {
             wave_b.ops_per_s / lpb_b.ops_per_s

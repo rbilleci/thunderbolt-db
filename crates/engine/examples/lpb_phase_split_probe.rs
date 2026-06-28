@@ -135,9 +135,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     for &batch in &batch_sizes {
-        for (label, wave_engine, persistent) in [("lpb", true, false), ("wave", true, true)] {
+        for (label, wave_engine, persistent, dense) in [
+            ("lpb", true, false, false),
+            ("lpb-dense", true, false, true),
+            ("wave", true, true, false),
+        ] {
             e.set_wave_engine_enabled(wave_engine);
             e.set_wave_persistent_engine_enabled(persistent);
+            e.set_dense_index_probe_enabled(dense);
             // warmup (first wave batch builds the engine; lpb builds the index)
             for b in 0..30 {
                 let n = needles_for_batch(b, batch, step, rows_u);
@@ -145,6 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let _ = e.complete_relational_retained_read_submission_batched(sub)?;
             }
             let hits_before = e.wave_route_hits();
+            let dense_before = e.dense_index_probe_hits();
             let mut submit_us = Vec::with_capacity(batches);
             let mut complete_us = Vec::with_capacity(batches);
             for b in 0..batches {
@@ -159,9 +165,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 complete_us.push(c);
             }
             let hits = e.wave_route_hits() - hits_before;
-            // non-vacuity: wave must have served every batch; lpb never hits the wave route.
+            // non-vacuity: wave must have served every batch; lpb never hits the wave route; dense must have
+            // served every dense batch (the dense kernel actually ran, no silent fallback).
             let expect = if persistent { batches as u64 } else { 0 };
             assert_eq!(hits, expect, "{label}: wave_route_hits {hits} != {expect}");
+            let dense_hits = e.dense_index_probe_hits() - dense_before;
+            let dense_expect = if dense { batches as u64 } else { 0 };
+            assert_eq!(
+                dense_hits, dense_expect,
+                "{label}: dense_index_probe_hits {dense_hits} != {dense_expect}"
+            );
+            e.set_dense_index_probe_enabled(false);
             let (s50, s99, s999, smax) = dist(submit_us);
             let (c50, c99, c999, cmax) = dist(complete_us);
             println!(
