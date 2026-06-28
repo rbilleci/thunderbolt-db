@@ -586,6 +586,10 @@ impl Engine {
                     );
                     let mut guard = engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Ok(rows) = guard.submit(needles) {
+                        self.read_state
+                            .residency
+                            .wave_route_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         break 'route RelationalRetainedInt4ProjectionPayload::Materialized(rows);
                     }
                     // else: wave error / harvest timeout -> fall through to the lpb route below (the engine

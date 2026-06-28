@@ -4116,12 +4116,28 @@ fn r2_wave_engine_matches_lpb_differential() {
     // (a) Unique-key differential WITH NULL: DISTINCT present needles (incl id=20 NULL balance), an absent
     // needle (25), and needle 0 (NULL-as-0 key). wave == lpb == scan, byte-identical.
     let unique_needles = vec![10, 20, 30, 40, 25, 0];
+    // `wave_route_hits` proves the ROUTE (not just the engine) served the rows: all three configs are
+    // byte-identical by design, so output equality alone can't tell a wave hit from a silent lpb fallback.
     scan_cfg(&e);
+    let hits = e.wave_route_hits();
     let scan_u = run(&e, &select_unique, &unique_needles);
+    assert_eq!(e.wave_route_hits(), hits, "scan config must NOT hit the wave route");
     lpb_cfg(&e);
+    let hits = e.wave_route_hits();
     let lpb_u = run(&e, &select_unique, &unique_needles);
+    assert_eq!(
+        e.wave_route_hits(),
+        hits,
+        "lpb config must NOT hit the wave route"
+    );
     wave_cfg(&e);
+    let hits = e.wave_route_hits();
     let wave_u = run(&e, &select_unique, &unique_needles);
+    assert_eq!(
+        e.wave_route_hits(),
+        hits + 1,
+        "the wave run was SERVED by the wave route (not a silent lpb fallback)"
+    );
     assert_eq!(lpb_u, scan_u, "lpb index probe == scan (R1 sanity)");
     assert_eq!(
         wave_u, scan_u,
@@ -4175,7 +4191,13 @@ fn r2_wave_engine_matches_lpb_differential() {
     scan_cfg(&e);
     let scan_rev = run(&e, &select_rev, &unique_needles);
     wave_cfg(&e);
+    let hits = e.wave_route_hits();
     let wave_rev = run(&e, &select_rev, &unique_needles);
+    assert_eq!(
+        e.wave_route_hits(),
+        hits + 1,
+        "the proj-rebuild wave run was served by the wave route"
+    );
     assert_eq!(
         wave_rev, scan_rev,
         "wave rebuilds for a new projection set over the same unique col and matches scan"
@@ -4186,22 +4208,11 @@ fn r2_wave_engine_matches_lpb_differential() {
         "reversed projection (balance, id) -> [100, 10] -- a proj-specific rebuild, not stale (id,balance) reuse"
     );
 
-    // (b) Non-unique fallback: `bucket` is duplicated, so the index/wave decline -> scan. wave == scan, and
-    // both rows for bucket = 1 are returned.
-    let dup_needles = vec![1, 2, 9];
-    scan_cfg(&e);
-    let scan_d = run(&e, &select_dup, &dup_needles);
-    wave_cfg(&e);
-    let wave_d = run(&e, &select_dup, &dup_needles);
-    assert_eq!(
-        wave_d, scan_d,
-        "a non-unique key falls back (no wave engine buildable) and stays identical to the scan"
-    );
-    assert_eq!(wave_d[0].len(), 2, "bucket = 1 matches two rows (id 10 and 20)");
-
-    // (c) Generation change + EVICTION: an INSERT commits -> the SERIAL invalidation path evicts the cached
-    // wave engine (tears the kernel down). Re-admission + a wave read rebuilds it over the new buffer; wave
-    // still == scan over the larger table.
+    // (c) Generation change + EVICTION. The cache is currently POPULATED (the (a'') proj-rebuild left an
+    // engine over col 0), so the post-INSERT `cached_wave_col == None` check genuinely exercises the SERIAL-
+    // commit eviction (engine_commit.rs) -- it would FAIL if eviction were broken. The INSERT commits ->
+    // serial invalidation evicts (tears the kernel down); re-admission + a wave read rebuilds over the new
+    // buffer; wave still == scan over the larger table.
     e.execute_text(
         3,
         "INSERT INTO accounts (id, bucket, balance, note) VALUES (50, 3, 500, 'e')",
@@ -4210,14 +4221,20 @@ fn r2_wave_engine_matches_lpb_differential() {
     assert_eq!(
         cached_wave_col(&e),
         None,
-        "the serial commit invalidation EVICTED the wave engine (kernel torn down)"
+        "the serial commit invalidation EVICTED the (populated) wave engine (kernel torn down)"
     );
     e.populate_relational_residency_snapshot("accounts").unwrap();
     let gen_needles = vec![10, 50, 40, 999];
     scan_cfg(&e);
     let scan_g = run(&e, &select_unique, &gen_needles);
     wave_cfg(&e);
+    let hits = e.wave_route_hits();
     let wave_g = run(&e, &select_unique, &gen_needles);
+    assert_eq!(
+        e.wave_route_hits(),
+        hits + 1,
+        "the rebuilt wave run was served by the wave route"
+    );
     assert_eq!(
         wave_g, scan_g,
         "after a generation change the REBUILT wave engine still matches the scan"
@@ -4232,6 +4249,26 @@ fn r2_wave_engine_matches_lpb_differential() {
         vec![vec![SqlValue::Int4(50), SqlValue::Int4(500)]],
         "the newly-inserted row 50 is found by the rebuilt wave engine"
     );
+
+    // (b) Non-unique fallback (LAST -- after (c), so it does not drain the cache before the eviction check
+    // above). `bucket` is duplicated, so the index/wave DECLINE and fall back to the scan: rows == scan AND
+    // the wave route is NOT hit (proves the fallback is taken, not a wrong-result wave).
+    let dup_needles = vec![1, 2, 9];
+    scan_cfg(&e);
+    let scan_d = run(&e, &select_dup, &dup_needles);
+    wave_cfg(&e);
+    let hits = e.wave_route_hits();
+    let wave_d = run(&e, &select_dup, &dup_needles);
+    assert_eq!(
+        e.wave_route_hits(),
+        hits,
+        "a non-unique key must NOT hit the wave route (it declines -> lpb/scan fallback)"
+    );
+    assert_eq!(
+        wave_d, scan_d,
+        "a non-unique key falls back (no wave engine buildable) and stays identical to the scan"
+    );
+    assert_eq!(wave_d[0].len(), 2, "bucket = 1 matches two rows (id 10 and 20)");
 }
 
 // ADR-009 R2.2b: concurrent SAME-SHAPE point lookups (the R2.2b-3 A/B workload: many connections, one
@@ -4287,6 +4324,7 @@ fn r2_wave_engine_concurrent_same_shape_single_flight() {
     e.set_wave_engine_enabled(true);
     e.set_wave_persistent_engine_enabled(true);
     let engine = Arc::new(e);
+    let hits_before = engine.wave_route_hits(); // 0 (baseline ran under scan config)
 
     const READERS: usize = 8;
     const READS_PER_THREAD: usize = 50;
@@ -4321,6 +4359,13 @@ fn r2_wave_engine_concurrent_same_shape_single_flight() {
     for reader in readers {
         reader.join().expect("reader thread panicked (hang/deadlock would time out)");
     }
+    // Every one of the READERS*READS_PER_THREAD reads was SERVED by the wave route (not a silent lpb
+    // fallback): the per-engine Mutex serializes the submits (single-flight) and each succeeds.
+    assert_eq!(
+        engine.wave_route_hits(),
+        hits_before + (READERS * READS_PER_THREAD) as u64,
+        "all concurrent reads were served by the wave route"
+    );
     // EXACTLY ONE persistent wave engine was built despite 8 racing first-readers (build latch +
     // double-checked lookup), over the id filter col.
     let cache = engine

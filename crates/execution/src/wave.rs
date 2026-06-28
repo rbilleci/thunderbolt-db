@@ -827,6 +827,14 @@ impl WaveReadEngine {
     /// Read the per-needle records for a fully-drained wave `[base, base+len)` into rows (found needles
     /// only). Caller MUST have confirmed completion (the `harvest` gate) before calling.
     fn read_records(&self, base: u64, len: u32) -> Vec<CudaI32BatchProjectionRow> {
+        // This is the only driver-touching step of the harvest path (the cuMemcpyDtoHAsync + sync below).
+        // `WaveReadEngine` is `Send` and the engine drives `submit`/`harvest` from CONNECTION threads, which
+        // are not the builder thread `new` set the context current on. cuMemcpy*/cuStreamSynchronize target
+        // the calling thread's CURRENT context, so re-establish the primary context here (matching the
+        // per-query path + `complete_detached`, which do the same). Best-effort (a failed set_current would
+        // surface as the DtoH erroring). Harmless on drivers that auto-bind the primary for an unbound thread;
+        // load-bearing for portability / multi-GPU / the multi-producer routing R2.2b-3 will exercise.
+        let _ = self.primary.set_current();
         let cap = self.ring_capacity;
         let start = (base as usize) & (self.ring_mask as usize);
         let n = len as usize;
@@ -1444,8 +1452,11 @@ mod tests {
         // free context-bound CUDA resources (cuStreamDestroy/cuMemFree/cuMemFreeHost), which target the
         // DROPPING thread's CURRENT context -- only `new` set that, on the builder (here, main). Build on main,
         // then MOVE the bare engine into a fresh thread that NEVER set the context current and let it Drop
-        // there. With the shutdown set_current fix this tears down cleanly; without it the cross-thread frees
-        // hit no/wrong context (CUDA fault / leak). Reaching the end without a fault/hang IS the assertion.
+        // there. Reaching the end without a fault/hang IS the assertion. NOTE: this is a REGRESSION GUARD for
+        // the cross-thread-Drop path; it is vacuous FOR the shutdown set_current fix on a driver that
+        // auto-binds the primary context for an unbound thread (as this box's does -- teardown also succeeds
+        // without the fix). The fix is still required on strict / multi-GPU drivers where an unbound thread
+        // has no current context, so the frees would hit CUDA_ERROR_INVALID_CONTEXT.
         let Ok(runtime) = CudaDriverRuntime::probe() else {
             return;
         };

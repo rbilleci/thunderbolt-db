@@ -523,6 +523,12 @@ pub(crate) struct ResidencyReadState {
     /// launch + the first's later teardown (`cuStreamSynchronize`, infinite backstop) would DEADLOCK. Held
     /// across the drain-existing + launch-new + publish sequence; cache HITS never take it (hot path).
     pub(crate) wave_build_latch: Mutex<()>,
+    /// ADR-009 R2.2b: count of batches actually SERVED by the persistent wave route (one per successful
+    /// `WaveReadEngine::submit`), as opposed to falling through to the lpb index probe / scan. Real telemetry
+    /// for the R2.2b-3 A/B (wave-hit vs fallback rate) AND the test signal that proves the ROUTE (not just the
+    /// engine in isolation) produced the rows — output equality alone can't, since all routes are
+    /// byte-identical by design. `Relaxed` (a monotonic counter, no ordering dependency).
+    pub(crate) wave_route_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

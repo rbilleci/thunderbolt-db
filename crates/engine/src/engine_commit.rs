@@ -345,12 +345,15 @@ impl Engine {
         }
         // ADR-009 R2.2b: deliberately does NOT evict the persistent wave read engine here. Dropping it tears
         // a live kernel down (petter join ~watchdog window + stream sync) — far too costly to do inside the
-        // commit critical section. It is unnecessary for correctness: the device-memory tombstone above makes
-        // `submit_resident_int4_equal_any_payload` return `Ok(None)` (snapshot no longer `is_valid()`) BEFORE
-        // it ever reaches the wave route, so a stale engine is never used; a re-admission allocates a new
-        // resident buffer (new ptr) whose first read misses the ptr-keyed cache and rebuilds, dropping the
-        // stale engine on that read thread. Net cost of skipping eviction here: a stale kernel holds its SM
-        // until the table is re-admitted + read (only when the wave route is enabled — default OFF).
+        // commit critical section. It is unnecessary for correctness: this concurrent path tombstones the
+        // `device_memory` cell (above) but NOT the `snapshots` ArcSwap, so the gate that fires is the
+        // `device_memory.get(...) -> None -> Err` ("relation has no retained resident device memory") at the
+        // TOP of `submit_resident_int4_equal_any_payload`, which returns BEFORE the wave route is reached
+        // (NOT the `!snapshot.is_valid()` check — `is_valid()` reads the untouched descriptor). Either way a
+        // stale engine is never used; a re-admission allocates a new resident buffer (new ptr) whose first
+        // read misses the ptr-keyed cache and rebuilds, dropping the stale engine on that read thread. Net
+        // cost of skipping eviction here: a stale kernel holds its SM until the table is re-admitted + read
+        // (only when the wave route is enabled — default OFF).
     }
 
     /// The set of tables a committed batch invalidates, or `None` to fall back to a

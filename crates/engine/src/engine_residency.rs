@@ -584,6 +584,16 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// ADR-009 R2.2b: total batches served by the persistent wave route (one per successful
+    /// `WaveReadEngine::submit`) vs falling through to lpb/scan. Wave-hit-vs-fallback telemetry for the
+    /// R2.2b-3 A/B; also the test hook proving the ROUTE (not just the engine) produced the rows.
+    pub fn wave_route_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .wave_route_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit
     /// mutated. Runs AFTER `publish_committed_seq` (so it snapshots the new generation) while the
     /// commit_mutex is held; it can NEVER fail the commit — over-budget / memory-pressure / GPU-absent /
