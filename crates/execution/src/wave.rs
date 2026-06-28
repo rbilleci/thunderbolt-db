@@ -69,11 +69,15 @@ use crate::{
 const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 const CU_STREAM_NON_BLOCKING: u32 = 0x01;
 /// Control block bytes (device-mapped pinned), TWO cachelines to avoid false sharing: cacheline 0 =
-/// [doorbell@0, head@4, all_done@8] (GPU polls these every iteration); cacheline 1 = [completed_mirror@64]
+/// [doorbell@0 u32, head@8 u64] (GPU polls these every iteration); cacheline 1 = [completed_mirror@64 u64]
 /// (the host tight-spins reading this in `harvest`). Keeping the host-spun mirror off the GPU-polled
-/// cacheline stops the host spin from starving the kernel's head/doorbell PCIe reads.
+/// cacheline stops the host spin from starving the kernel's head/doorbell PCIe reads. `head`/`completed`
+/// are u64 (cumulative; u32 wraps at ~2^32 lookups ~= 135s at peak -> the `completed < base` gate guard
+/// false-fires -> permanent harvest hang); 8-byte aligned offsets.
 const CTRL_BYTES: usize = 128;
-/// Byte offset of the host-mapped `completed` mirror (its own cacheline).
+/// Byte offset of the host-mapped cumulative `head` (u64, 8-aligned, cacheline 0).
+const HEAD_OFFSET: usize = 8;
+/// Byte offset of the host-mapped `completed` mirror (u64, its own cacheline).
 const COMPLETED_MIRROR_OFFSET: usize = 64;
 /// Max projected int4 columns per needle (matches the R1 index probe's `MAX_PROJECTIONS`).
 const MAX_PROJECTIONS: usize = 4;
@@ -89,8 +93,22 @@ const CLAIM_BATCH: u32 = 8;
 /// turns it into rows once `completed >= base + len`. `Copy` so the host can queue many in flight.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WaveTicket {
-    base: u32,
+    /// Cumulative u64 (never wraps for the engine's lifetime; u32 would wrap at ~2^32 lookups).
+    base: u64,
     len: u32,
+}
+
+/// Harvest completion gate (IN-ORDER / single-flight): a wave `[base, base+len)` is ready iff `completed`
+/// has reached `base+len`. The kernel can lag (it hasn't drained up to this wave's start), i.e.
+/// `completed < base` — that MUST gate to not-ready, else `wrapping_sub` underflows and the gate false-fires
+/// onto UNWRITTEN slots (an independent audit's no-op false-pass). `completed`/`base` are u64 so the
+/// cumulative counters never wrap for the engine's lifetime; with the old u32 they wrapped at ~2^32 lookups
+/// (~135s at peak) and the `completed < base` guard then false-fired forever (permanent hang). Sound ONLY
+/// in-order/single-flight: out-of-order pipelining can satisfy `completed >= base+len` via a later wave's
+/// indices while this wave's own slots are unwritten — that needs a per-slot status gate instead.
+#[inline]
+fn wave_ready(completed: u64, base: u64, len: u32) -> bool {
+    completed >= base && completed.wrapping_sub(base) >= len as u64
 }
 /// Host-side timeout waiting for a wave to drain (the kernel's own backstop is the device-side net).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -105,6 +123,15 @@ type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
 // Async DtoH on a SEPARATE stream so it never blocks on (or device-syncs against) the persistent kernel's
 // stream. Used to bulk-copy a drained wave's records from a DEVICE result buffer to host.
 type CuMemcpyDtoHAsync = unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> i32;
+// Persistent-grid occupancy invariant (C1): EVERY launched block of a grid-stride persistent kernel must be
+// co-resident, else its indices are never drained -> `completed` stalls -> 30s-backstop hang + empty rows.
+// Used at construction to clamp `threads` to `maxActiveBlocksPerSM * SM_count` blocks.
+type CuCtxGetDevice = unsafe extern "C" fn(*mut i32) -> i32;
+type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
+type CuOccupancyMaxActiveBlocksPerMultiprocessor =
+    unsafe extern "C" fn(*mut i32, *mut c_void, i32, usize) -> i32;
+/// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
+const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
 type CuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> i32;
 type CuMemHostGetDevicePointer = unsafe extern "C" fn(*mut u64, *mut c_void, u32) -> i32;
 type CuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -190,42 +217,46 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     mad.lo.u32 %r23, %r23, %r26, %r27;           // r23 = global tid = ctaid*ntid + tid
     mov.u32 %r24, %nctaid.x;
     mul.lo.u32 %r24, %r24, %r26;                // r24 = T = nctaid * ntid (actual total threads)
-    mov.u32 %r12, %r23;                          // r12 = idx (this thread's current index)
+    cvt.u64.u32 %rd40, %r23;                     // rd40 = idx (u64 CUMULATIVE; u32 wraps at ~2^32 lookups -> gate hang)
+    cvt.u64.u32 %rd41, %r24;                     // rd41 = T (u64 grid stride)
     mov.u32 %r25, 0;                             // r25 = cnt_in_batch (processed since last completion flush)
 
 $L_loop:
     // Thread 0 is the SOLE accessor of the host-mapped ctrl block. It (a) mirrors host doorbell+head into
-    // DEVICE memory (counters+12, counters+8) for the other workers to poll, and (b) publishes the device
+    // DEVICE memory (counters+16, counters+8) for the other workers to poll, and (b) publishes the device
     // `completed` counter into the host-mapped mirror (single writer -> monotonic plain store). Every other
     // thread polls ONLY device memory. Reason: 1000s of threads polling the host-mapped ctrl over PCIe
     // congest the bus and starve the host's head write -> 65536-waves never start -> timeouts (the failure
     // the audit traced, and the limiter that capped earlier variants at ~512 threads).
     setp.ne.u32 %p1, %r23, 0;
     @%p1 bra $L_poll;
-    ld.volatile.global.u32 %r28, [%rd1];        // host doorbell
-    st.volatile.global.u32 [%rd2+12], %r28;     // -> device doorbell mirror
-    ld.volatile.global.u32 %r28, [%rd1+4];      // host head
-    st.volatile.global.u32 [%rd2+8], %r28;      // -> device head mirror
-    ld.volatile.global.u32 %r28, [%rd2+4];      // device completed
-    st.volatile.global.u32 [%rd1+64], %r28;     // -> host-mapped completed MIRROR (harvest reads it, no DtoH)
+    // Layout (8-byte aligned for the u64 counters): ctrl [doorbell@0 u32, head@8 u64, mirror@64 u64];
+    // counters [completed@0 u64, dev_head@8 u64, dev_doorbell@16 u32].
+    ld.volatile.global.u32 %r28, [%rd1];        // host doorbell (u32)
+    st.volatile.global.u32 [%rd2+16], %r28;     // -> device doorbell mirror (counters+16)
+    ld.volatile.global.u64 %rd36, [%rd1+8];     // host head (u64, ctrl+8)
+    st.volatile.global.u64 [%rd2+8], %rd36;     // -> device head mirror (u64, counters+8)
+    ld.volatile.global.u64 %rd36, [%rd2];       // device completed (u64, counters+0)
+    st.volatile.global.u64 [%rd1+64], %rd36;    // -> host-mapped completed MIRROR (u64; harvest reads it, no DtoH)
 $L_poll:
-    ld.volatile.global.u32 %r6, [%rd2+12];      // device doorbell mirror (all threads -> device read, no PCIe)
+    ld.volatile.global.u32 %r6, [%rd2+16];      // device doorbell mirror (counters+16; device read, no PCIe)
     setp.ne.s32 %p1, %r6, 0;
     @%p1 bra $L_flush_exit;
     mov.u64 %rd10, %globaltimer;
     sub.u64 %rd11, %rd10, %rd9;
     setp.ge.u64 %p1, %rd11, %rd8;
     @%p1 bra $L_flush_exit;                      // wall-clock backstop -> flush pending + exit
-    ld.volatile.global.u32 %r7, [%rd2+8];       // device head mirror (all threads -> device read, no PCIe)
-    setp.lt.u32 %p1, %r12, %r7;
-    @%p1 bra $L_have;                            // idx < head -> needle ready
+    ld.volatile.global.u64 %rd42, [%rd2+8];     // device head mirror (u64, counters+8; device read, no PCIe)
+    setp.lt.u64 %p1, %rd40, %rd42;              // idx(u64) < head(u64) -> needle ready
+    @%p1 bra $L_have;
     // No needle for idx yet: publish any pending completion so the host sees progress, then back off on the
     // wall clock (NOT a tight head re-poll: many idle threads polling head over PCIe starve the host's head
     // write -- the failure mode the audit traced).
     setp.eq.u32 %p1, %r25, 0;
     @%p1 bra $L_backoff;
     membar.sys;
-    atom.global.add.u32 %r21, [%rd2+4], %r25;   // publish pending to device counter; thread 0 mirrors it to the host
+    cvt.u64.u32 %rd43, %r25;
+    atom.global.add.u64 %rd44, [%rd2], %rd43;   // completed(u64) += pending; thread 0 mirrors it to the host
     mov.u32 %r25, 0;
 $L_backoff:
     mov.u64 %rd33, %globaltimer;
@@ -237,6 +268,7 @@ $L_backoff_spin:
     bra $L_loop;
 
 $L_have:
+    cvt.u32.u64 %r12, %rd40;                     // low 32 bits of idx(u64) -> ring slot addressing
     and.b32 %r13, %r12, %r3;
     mul.wide.u32 %rd12, %r13, 4;
     add.u64 %rd13, %rd3, %rd12;
@@ -299,11 +331,12 @@ $L_probe_next:
 $L_write:
     st.global.u32 [%rd15], %r17;                // status written LAST (record body already stored above)
     add.u32 %r25, %r25, 1;                       // cnt_in_batch++
-    add.u32 %r12, %r12, %r24;                    // grid-stride advance: idx += T
+    add.u64 %rd40, %rd40, %rd41;                 // grid-stride advance: idx(u64) += T(u64)
     setp.lt.u32 %p2, %r25, %r5;                  // keep accumulating until K processed (amortize membar+atom)
     @%p2 bra $L_loop;
     membar.sys;                                  // release this batch's record writes BEFORE the completion bump
-    atom.global.add.u32 %r21, [%rd2+4], %r25;    // completed += cnt_in_batch (cumulative device counter; thread 0 mirrors it)
+    cvt.u64.u32 %rd43, %r25;
+    atom.global.add.u64 %rd44, [%rd2], %rd43;    // completed(u64) += cnt_in_batch (cumulative; thread 0 mirrors it)
     mov.u32 %r25, 0;
     bra $L_loop;
 
@@ -311,7 +344,8 @@ $L_flush_exit:
     setp.eq.u32 %p1, %r25, 0;                    // on exit, publish any unflushed records (else completed lags head -> host hangs)
     @%p1 bra $L_done;
     membar.sys;
-    atom.global.add.u32 %r21, [%rd2+4], %r25;    // finalize device counter on exit (host has already harvested; mirror not needed post-shutdown)
+    cvt.u64.u32 %rd43, %r25;
+    atom.global.add.u64 %rd44, [%rd2], %rd43;    // finalize device counter on exit (u64)
 
 $L_done:
     ret;
@@ -342,7 +376,7 @@ pub(crate) struct WaveReadEngine {
     _index: Arc<CudaResidentDeviceMemory>,
     _resident: Arc<CudaResidentDeviceMemory>,
     stream: *mut c_void,
-    /// Device-mapped pinned control block (host view): [doorbell@0, head@4, all_done@8].
+    /// Device-mapped pinned control block (host view): [doorbell@0 u32, head@8 u64, completed_mirror@64 u64].
     ctrl_host: *mut c_void,
     /// Device-mapped pinned needle ring (host view): i32[ring_capacity].
     req_host: *mut c_void,
@@ -355,13 +389,13 @@ pub(crate) struct WaveReadEngine {
     /// Separate stream for the result DtoH so it never queues behind the never-ending persistent kernel.
     copy_stream: *mut c_void,
     cu_memcpy_dtoh_async: CuMemcpyDtoHAsync,
-    /// Device counters [claim@0, completed@4] (monotonic; never reset).
+    /// Device counters [completed@0 u64, dev_head@8 u64, dev_doorbell@16 u32] (monotonic; never reset).
     counters: u64,
     ring_capacity: usize,
     ring_mask: u32,
     proj_count: u32,
-    /// Cumulative count of needles ever published (host-tracked; mirrors ctrl.head). Monotonic.
-    head: u32,
+    /// Cumulative count of needles ever published (host-tracked; mirrors ctrl.head). Monotonic u64.
+    head: u64,
     cu_stream_synchronize: CuStreamSynchronize,
     cu_stream_destroy: CuStreamDestroy,
     cu_mem_free: CuMemFree,
@@ -426,6 +460,11 @@ impl WaveReadEngine {
         let cu_stream_destroy: CuStreamDestroy =
             unsafe { sym(lib, &[b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0"]) }?;
         let cu_launch_kernel: CuLaunchKernel = unsafe { sym(lib, &[b"cuLaunchKernel\0"]) }?;
+        let cu_ctx_get_device: CuCtxGetDevice = unsafe { sym(lib, &[b"cuCtxGetDevice\0"]) }?;
+        let cu_device_get_attribute: CuDeviceGetAttribute =
+            unsafe { sym(lib, &[b"cuDeviceGetAttribute\0"]) }?;
+        let cu_occupancy: CuOccupancyMaxActiveBlocksPerMultiprocessor =
+            unsafe { sym(lib, &[b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0"]) }?;
 
         let mut ptx = Vec::with_capacity(WAVE_DATAPLANE_PTX.len() + 1);
         ptx.extend_from_slice(WAVE_DATAPLANE_PTX);
@@ -434,8 +473,37 @@ impl WaveReadEngine {
 
         let resident_ptr = resident.device_ptr();
         let index_ptr = index.device_ptr();
+        let mut threads_per_block = threads.min(256);
+        // C1 (persistent-grid occupancy invariant, audit): a grid-stride persistent kernel needs EVERY
+        // launched block co-resident -- a block that doesn't fit at launch is never scheduled, so the
+        // indices it statically owns are never drained and `completed` never reaches `head` (30s-backstop
+        // hang + empty rows). Clamp `threads` so the grid fits: blocks <= maxActiveBlocksPerSM * SM_count.
+        let mut threads = threads;
+        {
+            let mut device: i32 = 0;
+            let mut sm_count: i32 = 0;
+            let mut max_blocks_per_sm: i32 = 0;
+            check_cuda(unsafe { cu_ctx_get_device(&mut device) })?;
+            check_cuda(unsafe {
+                cu_device_get_attribute(
+                    &mut sm_count,
+                    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    device,
+                )
+            })?;
+            check_cuda(unsafe {
+                cu_occupancy(&mut max_blocks_per_sm, function, threads_per_block as i32, 0)
+            })?;
+            if sm_count > 0 && max_blocks_per_sm > 0 {
+                let capacity_blocks = (max_blocks_per_sm as u32).saturating_mul(sm_count as u32);
+                let capacity_threads = capacity_blocks.saturating_mul(threads_per_block);
+                if threads > capacity_threads {
+                    threads = capacity_threads;
+                    threads_per_block = threads.min(256);
+                }
+            }
+        }
         let blocks = threads.div_ceil(256);
-        let threads_per_block = threads.min(256);
 
         let mut counters: u64 = 0;
         let mut ctrl_host: *mut c_void = ptr::null_mut();
@@ -445,13 +513,13 @@ impl WaveReadEngine {
         let mut stream: *mut c_void = ptr::null_mut();
         let mut copy_stream: *mut c_void = ptr::null_mut();
         let setup = (|| -> Result<(), CudaRuntimeProbeError> {
-            // [claim@0, completed@4, dev_head@8, dev_doorbell@12] — claim is unused by the grid-stride
-            // kernel; dev_head/dev_doorbell are DEVICE-memory mirrors of the host-mapped ctrl that thread 0
-            // republishes each iter, so the other (1000s of) worker threads poll DEVICE memory instead of
-            // hammering the host-mapped ctrl over PCIe (which starves the host's head write -> timeouts).
-            check_cuda(unsafe { cu_mem_alloc(&mut counters, 16) })?;
-            let zero = [0u32; 4];
-            check_cuda(unsafe { cu_memcpy_htod(counters, zero.as_ptr().cast::<c_void>(), 16) })?;
+            // [completed@0 u64, dev_head@8 u64, dev_doorbell@16 u32] — dev_head/dev_doorbell are DEVICE-memory
+            // mirrors of the host-mapped ctrl that thread 0 republishes each iter, so the other (1000s of)
+            // worker threads poll DEVICE memory instead of hammering the host-mapped ctrl over PCIe (which
+            // starves the host's head write -> timeouts). u64 completed/head: see CTRL_BYTES (no 2^32 wrap).
+            check_cuda(unsafe { cu_mem_alloc(&mut counters, 32) })?;
+            let zero = [0u64; 4];
+            check_cuda(unsafe { cu_memcpy_htod(counters, zero.as_ptr().cast::<c_void>(), 32) })?;
 
             check_cuda(unsafe {
                 cu_mem_host_alloc(&mut ctrl_host, CTRL_BYTES, CU_MEMHOSTALLOC_DEVICEMAP)
@@ -636,9 +704,15 @@ impl WaveReadEngine {
             }
         }
         fence(Ordering::SeqCst);
-        let new_head = base + needles.len() as u32;
+        let new_head = base + needles.len() as u64;
         self.head = new_head;
-        unsafe { ptr::write_volatile((self.ctrl_host as *mut u32).add(1), new_head) }; // publish head
+        // publish cumulative head (u64) at ctrl+HEAD_OFFSET, after the needle writes are fenced
+        unsafe {
+            ptr::write_volatile(
+                (self.ctrl_host as *mut u8).add(HEAD_OFFSET).cast::<u64>(),
+                new_head,
+            )
+        };
         fence(Ordering::SeqCst);
         Ok(WaveTicket {
             base,
@@ -666,15 +740,9 @@ impl WaveReadEngine {
             return Ok(Some(Vec::new()));
         }
         let completed = unsafe {
-            ptr::read_volatile((self.ctrl_host as *const u8).add(COMPLETED_MIRROR_OFFSET).cast::<u32>())
+            ptr::read_volatile((self.ctrl_host as *const u8).add(COMPLETED_MIRROR_OFFSET).cast::<u64>())
         };
-        // Ready iff `completed` has reached `base + len`. The kernel can fall BEHIND the host (it hasn't
-        // drained up to this wave's start yet), i.e. `completed < base`; that case MUST gate to None.
-        // Without the `completed < base` guard, `wrapping_sub` underflows to ~u32::MAX, the gate
-        // false-fires, and `read_records` returns UNWRITTEN slots (audit finding — a no-op false-pass that
-        // also inflated the benchmark). NOTE: `base`/`completed`/`len` are cumulative u32 — sound for a
-        // session under ~4B lookups; widen to u64 for long-running durability (TODO).
-        if completed < ticket.base || completed.wrapping_sub(ticket.base) < ticket.len {
+        if !wave_ready(completed, ticket.base, ticket.len) {
             return Ok(None);
         }
         Ok(Some(self.read_records(ticket.base, ticket.len)))
@@ -682,7 +750,7 @@ impl WaveReadEngine {
 
     /// Read the per-needle records for a fully-drained wave `[base, base+len)` into rows (found needles
     /// only). Caller MUST have confirmed completion (the `harvest` gate) before calling.
-    fn read_records(&self, base: u32, len: u32) -> Vec<CudaI32BatchProjectionRow> {
+    fn read_records(&self, base: u64, len: u32) -> Vec<CudaI32BatchProjectionRow> {
         let cap = self.ring_capacity;
         let start = (base as usize) & (self.ring_mask as usize);
         let n = len as usize;
@@ -722,8 +790,15 @@ impl WaveReadEngine {
         for i in 0..n {
             let rec = unsafe { (dst as *const u8).add(i * RES_SLOT_BYTES) };
             let status = unsafe { ptr::read_unaligned(rec.cast::<u32>()) };
+            // C3 (audit, defense-in-depth): status 0 = slot the kernel never wrote. The completion gate must
+            // never admit one; if it does (a C1 occupancy breach, or a future out-of-order pipelining change),
+            // fail LOUDLY in tests instead of silently dropping the row (which would return short results).
+            debug_assert!(
+                status != 0,
+                "harvest read an UNWRITTEN slot (status=0) at i={i} -- completion gate admitted an undrained wave",
+            );
             if status != 1 {
-                continue; // 2 = not found (no row, like the R1 index probe); 0 would be a bug
+                continue; // 2 = not found (no row, like the R1 index probe)
             }
             let row_index = unsafe { ptr::read_unaligned(rec.add(8).cast::<u64>()) };
             let mut values = Vec::with_capacity(self.proj_count as usize);
@@ -910,6 +985,122 @@ mod tests {
             spot[0].values,
             vec![keys[5], payload[5]],
             "2-column gather (key, payload) at row 5"
+        );
+    }
+
+    #[test]
+    fn wave_ready_gate_is_wrap_safe() {
+        // C2 (audit): the harvest gate must stay correct across the region where the OLD u32 cumulative
+        // counters wrapped (~2^32 lookups ~= 135s at peak). u64 keeps base/completed distinct; the prior bug
+        // was the `completed < base` guard false-firing once the absolute counter wrapped -> permanent hang.
+        let w = u32::MAX as u64; // 2^32 - 1, the old u32 wrap boundary
+
+        // in-progress (completed within [base, base+len)) -> not ready
+        assert!(!wave_ready(w + 50, w, 100));
+        // exactly drained -> ready
+        assert!(wave_ready(w + 100, w, 100));
+        // a wave that STRADDLES 2^32 -> ready (the case the u32 gate hung on: base below, completed above)
+        assert!(wave_ready(w + 6, w - 5, 11)); // dist = 11 >= len 11
+        assert!(!wave_ready(w + 6, w - 5, 12)); // dist = 11 < len 12 -> not yet
+
+        // kernel BEHIND this wave's start (completed < base) MUST gate to not-ready (the underflow case)
+        assert!(!wave_ready(w - 10, w, 100));
+        // far past 2^32 still correct
+        let big = 10_000_000_000_u64;
+        assert!(wave_ready(big + 5, big, 5));
+        assert!(!wave_ready(big + 4, big, 5));
+        assert!(!wave_ready(big - 1, big, 5)); // behind
+    }
+
+    #[test]
+    fn ctrl_layout_offsets_match_the_kernel_contract() {
+        // Pin the host<->PTX offset contract (audit suggestion): the kernel HARD-CODES ctrl head@8 +
+        // mirror@64. If these host constants drift, the u64 loads misalign or read the wrong field. head must
+        // be 8-aligned (u64), the mirror 8-aligned on its own cacheline, head's 8 bytes must not reach into
+        // the mirror, and the mirror must fit in the ctrl block.
+        assert_eq!(HEAD_OFFSET, 8, "kernel reads host head at ctrl+8");
+        assert_eq!(COMPLETED_MIRROR_OFFSET, 64, "kernel writes the mirror at ctrl+64");
+        assert_eq!(HEAD_OFFSET % 8, 0, "u64 head must be 8-aligned");
+        assert_eq!(COMPLETED_MIRROR_OFFSET % 8, 0, "u64 mirror must be 8-aligned");
+        assert!(
+            HEAD_OFFSET + 8 <= COMPLETED_MIRROR_OFFSET,
+            "head (8B) must not overlap the mirror's cacheline"
+        );
+        assert!(
+            COMPLETED_MIRROR_OFFSET + 8 <= CTRL_BYTES,
+            "mirror (8B) must fit in the ctrl block"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_engine_clamps_oversized_threads_no_hang() {
+        // C1 (audit): a `threads` value far beyond the GPU's resident capacity must NOT silently hang. A
+        // persistent grid-stride kernel needs EVERY launched block co-resident (an un-resident block's
+        // statically-owned indices are never drained -> `completed` stalls below `head` -> 30s-backstop hang
+        // + empty rows). `new()` clamps `threads` to the occupancy capacity, so construct + submit succeed.
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        let rows: u64 = 256;
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r * 3 + 1).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r * 1000 + 7).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &buf)
+                .expect("resident device memory"),
+        );
+        let projections = [0_u64, rows * 4];
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &index_bytes)
+                .expect("index device memory"),
+        );
+
+        // 50M threads = ~195k blocks, vastly beyond any GPU's resident capacity. Without the C1 clamp the
+        // un-resident blocks' indices never drain and this hangs to the 30s backstop; with it, it just works.
+        let mut engine = WaveReadEngine::new(
+            Arc::clone(&index_resident),
+            Arc::clone(&resident),
+            &projections,
+            table_mask,
+            hash_shift,
+            1024,
+            50_000_000,
+            30_000_000_000,
+        )
+        .expect("wave engine constructs with threads clamped to occupancy");
+
+        let needles = vec![keys[1], keys[100], keys[200]];
+        let mut got = engine
+            .submit(&needles)
+            .expect("submit must not hang with oversized threads (clamped grid stays resident)");
+        engine.shutdown();
+        got.sort_by_key(|row| (row.needle_index, row.row_index));
+        assert_eq!(
+            got.len(),
+            3,
+            "all present keys found -> the clamped grid drained every index"
         );
     }
 
