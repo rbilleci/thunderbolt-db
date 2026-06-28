@@ -497,6 +497,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
     gating the SLO and the CPU-engine deletion -- is the priority. Pivot to R3; keep lpb the read default + the wave
     validated behind the flag (its only niche, the multi-producer regime, is itself below where the read SLO bites).**
 
+- **R2.2c CORRECTION — the read path is NOT settled: the GPU drains tens of millions; HOST result materialization caps
+  end-to-end at ~3M (2026-06-28).** The prior "read over-provisioned, pivot to R3" note measured only the
+  materialization-throttled END-TO-END rate (~3M), NOT the GPU drain. The standalone raw-drain benchmark
+  (`wave_vs_launch_per_batch_throughput`, no SqlValue materialization, 1M rows, 8192 threads) shows the real ceiling:
+  wave vs lpb lookups/s = batch8 707k/307k (2.30x), batch32 2.81M/1.18M (2.38x), batch256 12.86M/6.87M (1.87x),
+  batch65536 30.0M/23.7M (1.26x). So **the wave really does tens of millions and is 1.26-2.4x lpb at the GPU level.**
+  BUT through the engine (with `CudaI32BatchProjectionRow` -> `RelationalSelectResult`/`Vec<SqlValue>` materialization,
+  ~270ns/row) BOTH cap at ~3M (batch256 wave 2.76M/lpb 2.35M; batch65536 wave 3.28M/lpb 3.03M). **The bottleneck for
+  end-to-end read throughput is the HOST result materialization, not the GPU** — a ~10x headroom (3M delivered vs 30M
+  GPU-capable), and it is a HOST-SERIAL bottleneck the charter says to FIX (it does not scale with GPU hardware, unlike
+  the GPU drain). The small-batch cap is the per-batch host machinery (~16us round-trips, the earlier phase-split); the
+  large-batch cap is per-row materialization (~270ns/row). NET: read-side decision is RE-OPENED — the wave is the better
+  GPU engine (1.26-2.4x lpb), and the lever to deliver its tens-of-millions end-to-end is GPU-native / streamlined
+  result materialization (likely GPU-side result formatting toward the wire, the charter's "final device->wire
+  readback"), NOT the wave-vs-lpb choice alone. Supersedes "R2.2c throughput at scale/threads" + "host-machinery spike".
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
