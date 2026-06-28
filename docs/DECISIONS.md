@@ -463,6 +463,23 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   before any wave default-flip regardless: measure the wave's SM-coexistence tax on a MIXED workload (~60% loss at 8
   reserved SMs per the coexistence gate) — size the kernel down / spin up only under point-read load, don't flip blind.
 
+- **R2.2c host-machinery spike (phase split) — the lpb->wave gap is ALL in lpb's COMPLETE phase; recoverable
+  without the wave (2026-06-28, `engine/examples/lpb_phase_split_probe`).** Timed SUBMIT vs COMPLETE separately on the
+  REAL retained-template path (1M rows, 3000 batches), lpb vs wave, non-vacuity via `wave_route_hits`. RESULT (p50,
+  batch=1): lpb = 9us submit + 16us complete = 25us; wave = 10us submit + 0us complete = 10us. So lpb SUBMIT ~= wave
+  SUBMIT (~9-10us host enqueue); **the ENTIRE gap is lpb's 16us COMPLETE** = the TWO sync round-trips (DtoH match-count
+  -> sync to size arrays, THEN DtoH the 3 result arrays -> sync) + event-elapsed + materialize. The wave's complete is
+  ~0 because it harvests via its host-mapped per-slot STATUS ring (no count DtoH) and folds its ONE bulk DtoH into
+  submit. (batch=32: lpb 13+20=34 vs wave 16+5=21 — same story.) **So the wave's single-flight win is RECOVERABLE on the
+  lpb path with NO persistent kernel:** (a) collapse the two round-trips into ONE covering sync — over-fetch result
+  arrays to `needles.len()` (valid: the index probe has <=1 match/needle, unlike the scan, so this needs a
+  submission-type flag to not break the equal_any scan path) + DtoH count+results together + trim by count; (b) trim
+  SUBMIT's 5 per-batch device-buffer leases (-> a single arena) + sample event timing instead of per-batch. Estimated
+  lpb-optimized ~12-13us vs wave 10us -> MOST of the gap closes, with no at-most-one / coexistence / SM tax. The wave's
+  only IRREDUCIBLE edge is the multi-PRODUCER regime (gate-2; the wave avoids the per-batch launch entirely). VERDICT:
+  the host-machinery optimization is the genuine "cheaper alternative" — but it is a multi-part change to the SHIPPED R1
+  lpb path (round-trip collapse + buffer arena + event sampling), so weigh it vs R3 (writes) before committing the surgery.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
