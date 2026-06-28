@@ -284,6 +284,24 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   co-resident (modest grids; backstop catches eviction). needles-to-device (toward the 45M bare ceiling) is a further
   lever. **The read-ceiling bet is now demonstrated IN-CRATE on the shared context, not just in standalone probes.**
 
+- **R2.2 FOLLOW-UP REVIEW correctness gates C1/C2/C3 (2026-06-28, commit `6b28832e`; `docs/reviews/r2.2-wave-port-followup-review.md`).**
+  A second independent review accepted the device-result milestone and required correctness fixes BEFORE engine wiring
+  (R2.2b). Done; two independent adversarial audits of the fixes both returned SHIP/SOUND. **C1 (persistent-grid
+  occupancy):** a grid-stride persistent kernel needs EVERY launched block co-resident (index i owned by thread i mod T);
+  an un-resident block's indices never drain -> completed stalls -> 30s hang + empty rows. `new()` now clamps `threads`
+  to `cuOccupancyMaxActiveBlocksPerMultiprocessor * SM_count` (test: 50M threads -> clamped -> correct rows in 0.12s, no
+  hang). NOTE: occupancy is SOLO-device, so this closes the isolated-launch trap, NOT the shared-context coexistence trap
+  (a co-resident fat grid could still evict wave blocks — the open R2 "sidecar-or-replace" question). **C2 (u64
+  counters):** head/completed/base/idx were cumulative u32 and wrap at ~2^32 lookups (~135s at 31M/s), after which the
+  `completed < base` gate guard false-fires -> permanent hang. Widened to u64 across PTX (8-byte-aligned layout: ctrl
+  [doorbell@0, head@8, mirror@64], counters [completed@0, dev_head@8, dev_doorbell@16]; `atom.add.u64`) + host (gate via
+  new `wave_ready()`). Oracle byte-identical, stress gate passes, throughput unchanged (31.1M @ 65536 = 1.32x lpb); unit
+  tests cover the old-u32-boundary/kernel-behind cases + the host<->PTX offset contract. **C3:** `debug_assert!(status
+  != 0)` in `read_records` makes a gate violation fail loudly. **`WaveReadEngine` is now wireable (C1/C2/C3 landed);**
+  the concurrent-regime win remains unproven until P2 (per-slot status gate -> depth-K pipelining) + an offered-rate
+  harness — keep R1's launch-per-batch index probe as the shipped default until then. NEXT levers: P1 needles-to-device
+  (toward ~45M single-flight), then P2 + offered-rate.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.

@@ -114,9 +114,16 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   31.6M/23.4M = 1.35x (peak ~31.8M).** Two audits: number REAL (not a no-op); cross-stream DtoH ordering sound
   (empirically validated). Caveats: completion gate is single-flight/in-order ONLY (depth-K pipelining needs per-slot
   status); thread-0 co-residency assumed (backstop catches eviction). **The read-ceiling bet is now in-crate on the
-  shared context, not just standalone probes — lpb is matched/beaten everywhere.** **NEXT options: (A) needles-to-device
-  (toward the 45M bare ceiling) + per-slot status gate to unlock depth-K pipelining + then R2.2b engine wiring;
-  (B) R3 writes (independent). Point-read bet settled by R1 + this.**
+  shared context, not just standalone probes — lpb is matched/beaten everywhere.**
+  **R2.2 FOLLOW-UP REVIEW correctness gates C1/C2/C3 DONE (`6b28832e`; `docs/reviews/r2.2-wave-port-followup-review.md`;
+  two independent audits = SHIP/SOUND):** C1 = `new()` clamps `threads` to occupancy (`cuOccupancyMaxActiveBlocksPerMultiprocessor
+  * SM_count`) so a too-large grid can't silently hang (un-resident blocks never drain) — but occupancy is SOLO-device,
+  so the shared-context coexistence trap stays the open R2 question; C2 = u64 cumulative counters (u32 wrapped at ~2^32
+  lookups ~=135s -> permanent gate hang); C3 = `debug_assert!(status!=0)`. `WaveReadEngine` is now WIREABLE.
+  **NEXT (review sequence): (P1) needles-to-device (host-mapped needle ring still PCIe-read per needle -> bulk HtoD ->
+  toward the 45M bare ceiling); (P2) per-slot status gate -> depth-K pipelining + an OFFERED-RATE harness = the real
+  premise gate for the concurrent regime (single-flight only proves wave>lpb across the sweep, NOT the concurrent
+  premise); then R2.2b engine wiring. OR (B) R3 writes (independent). Keep R1 lpb as shipped default until P2 lands.**
   (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
