@@ -547,6 +547,17 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   unchanged -- wide (rows is read everywhere) but more tractable than a value-type/GPU->wire rewrite. NEXT: prototype
   flat `rows` on the hot retained path + facade, re-measure end-to-end vs the drain, then the kernel call is on the
   real GPU-bound number.**
+  **ROWBLOCK IMPLEMENTED + MERGED (`c4b0bddb`+`1df5dceb`): `RelationalSelectResult.rows: Vec<Vec<SqlValue>>` ->
+  `RowBlock { values: Vec<SqlValue>, ncols }` (flat row-major; transparent traits iter/Index/PartialEq/From/IntoIterator;
+  manual row-based PartialEq; hot completion builds flat). ~50 consumer sites updated; pgwire byte-identical (protocol
+  71/0). Audit = SHIP (3 sabotages caught; 2 unreachable P3s, one adopted = uniform-width debug_assert in From).
+  MEASURED end-to-end (1M rows): 7.8M -> 10.8M (+37%); **wave/lpb UNMASKED to 1.93x@b32 .. 1.13x@b65536 (was ~1.0-1.08x),
+  tracking the raw-drain 1.26-2.4x -- the wave's edge is now VISIBLE end-to-end.** Did NOT reach the full ~28M drain: the
+  residual (10.8M) is the per-needle `RelationalSelectResult` struct + by-needle grouping/sort, INHERENT to one-result-
+  per-point-read (the batcher dispatches a result per coalesced needle) and EQUAL for lpb+wave, so it caps absolute
+  throughput but no longer HIDES the wave ratio. Going past it needs a per-needle-result-MODEL change (a batcher-contract
+  change = a separate effort). **NET: the wave-vs-lpb kernel decision is now on real, mostly-unmasked numbers
+  (1.13-1.93x). Result-path optimization is DONE for the masking purpose.**
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
