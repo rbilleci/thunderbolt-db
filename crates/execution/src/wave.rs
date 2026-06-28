@@ -373,8 +373,10 @@ unsafe fn sym<T: Copy>(lib: &Library, names: &[&[u8]]) -> Result<T, CudaRuntimeP
 /// circular needle ring against one resident int4 table's hash index, projecting up to `MAX_PROJECTIONS`
 /// columns. `submit` runs one wave at a time (serialized) and reads its rows back.
 pub struct WaveReadEngine {
-    /// Keep the shared context + the index/table device buffers alive for the engine's lifetime.
-    _primary: Arc<GpuPrimaryContext>,
+    /// The shared primary context the kernel + the index/table device buffers live in. Kept alive for the
+    /// engine's lifetime AND re-set-current in `shutdown` so a cross-thread `Drop` (this type is `Send` for
+    /// engine ownership) frees its context-bound CUDA resources against the right context.
+    primary: Arc<GpuPrimaryContext>,
     _index: Arc<CudaResidentDeviceMemory>,
     _resident: Arc<CudaResidentDeviceMemory>,
     stream: *mut c_void,
@@ -704,7 +706,7 @@ impl WaveReadEngine {
         };
 
         Ok(Self {
-            _primary: primary,
+            primary,
             _index: index,
             _resident: resident,
             stream,
@@ -916,6 +918,13 @@ impl WaveReadEngine {
             return;
         }
         self.shut = true;
+        // `WaveReadEngine` is `Send` (engine ownership across connection threads), so `shutdown`/`Drop` can
+        // run on a thread other than the one that built it (e.g. an eviction on the catalog-latch thread, or
+        // an Arc overwrite on a read thread). cuStreamDestroy/cuMemFree/cuMemFreeHost are bound to the calling
+        // thread's CURRENT context, which only `new` set (on the builder thread). Re-establish the primary
+        // context current here so the frees below target the right context regardless of dropping thread;
+        // best-effort (a failed set_current means the frees would fail anyway -- a teardown-path leak, not UB).
+        let _ = self.primary.set_current();
         // Stop + join the watchdog petter BEFORE freeing ctrl_host (the petter writes the heartbeat there).
         self.heartbeat_stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.heartbeat_thread.take() {
@@ -1425,6 +1434,72 @@ mod tests {
             );
         }
         engine.lock().unwrap_or_else(|p| p.into_inner()).shutdown(); // clean teardown (joins the petter)
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_engine_drops_cleanly_on_a_foreign_thread() {
+        // R2.2b Slice 2: `WaveReadEngine` is `Send` so the engine can DROP it (evict on DROP TABLE /
+        // memory-pressure, or overwrite on re-admission) on a thread other than the builder. shutdown()/Drop
+        // free context-bound CUDA resources (cuStreamDestroy/cuMemFree/cuMemFreeHost), which target the
+        // DROPPING thread's CURRENT context -- only `new` set that, on the builder (here, main). Build on main,
+        // then MOVE the bare engine into a fresh thread that NEVER set the context current and let it Drop
+        // there. With the shutdown set_current fix this tears down cleanly; without it the cross-thread frees
+        // hit no/wrong context (CUDA fault / leak). Reaching the end without a fault/hang IS the assertion.
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        let rows: u64 = 256;
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r * 3 + 1).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r * 1000 + 7).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = Arc::new(runtime.retain_device_memory_copy(0, &buf).expect("resident"));
+        let projections = [0_u64, rows * 4];
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).expect("index"));
+
+        // engine-ownership config: near-infinite backstop + a live 2s watchdog.
+        let mut engine = WaveReadEngine::new(
+            Arc::clone(&index_resident),
+            Arc::clone(&resident),
+            &projections,
+            table_mask,
+            hash_shift,
+            1024,
+            1024,
+            u64::MAX,
+            2_000_000_000,
+        )
+        .expect("wave engine");
+        // Prove it is live on the builder thread before handing it off.
+        let got = engine.submit(&[keys[5]]).expect("submit on builder");
+        assert_eq!(got.len(), 1, "engine live before foreign-thread drop");
+
+        // Move the bare engine (Send) into a fresh thread that never set the context current; drop it there.
+        std::thread::spawn(move || {
+            drop(engine); // -> Drop -> shutdown -> set_current(primary) + context-bound frees
+        })
+        .join()
+        .expect("foreign drop thread joined without panic");
+        // No CUDA fault / hang above == the cross-thread teardown set the context current and freed cleanly.
     }
 
     /// R2.2 diagnostic — persistent wave vs launch-per-batch R1 index probe, swept over batch size.
