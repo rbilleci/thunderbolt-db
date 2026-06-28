@@ -44,9 +44,13 @@
 //! flagged); the `claim_batch`/`all_done` params are vestigial (unused by the per-slot kernel).
 //!
 //! ## Safety net (the `--gpu-reset`-denied-box rule, proven in probe 1a)
-//! The kernel ALWAYS self-terminates: host doorbell OR a `%globaltimer` wall-clock backstop (`backstop_ns`).
-//! `shutdown`/`Drop` ring the doorbell and synchronize the stream before freeing. SM-coexistence rule
-//! (DECISIONS ADR-008): keep the persistent footprint small; `threads` is an explicit, modest knob.
+//! The kernel ALWAYS self-terminates by ANY of: (1) the host doorbell (clean `shutdown`/`Drop`); (2) a
+//! crash-safe WATCHDOG (`watchdog_ns` > 0) — a host petter thread increments a heartbeat ~1/s; if it goes
+//! stale (the host died/was SIGKILLed) thread 0 rings the doorbell so the kernel exits within ~`watchdog_ns`
+//! instead of zombie-ing on the shared box; (3) a `%globaltimer` absolute backstop (`backstop_ns`) as the
+//! final net. A LONG-LIVED engine-owned kernel uses the watchdog (so it never dies mid-operation yet exits
+//! fast on crash); standalone tests pass `watchdog_ns=0` and rely on the fixed backstop + explicit shutdown.
+//! SM-coexistence rule (DECISIONS ADR-008): keep the persistent footprint small; `threads` is a modest knob.
 //! ASCII-only PTX (the driver JIT rejects non-ASCII even where the local ptxas tolerates it).
 //!
 //! R2.2a = the data plane with multi-column projection, verified in ISOLATION vs the R1 index-probe
@@ -58,7 +62,7 @@
 
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -77,6 +81,9 @@ const CU_STREAM_NON_BLOCKING: u32 = 0x01;
 const CTRL_BYTES: usize = 128;
 /// Byte offset of the host-mapped cumulative `head` (u64, 8-aligned).
 const HEAD_OFFSET: usize = 8;
+/// Byte offset of the host-mapped crash-safe WATCHDOG heartbeat (u32). The host petter increments it; thread
+/// 0 exits the kernel if it goes stale > `watchdog_ns` (host died/hung). 0 elsewhere in the block.
+const HEARTBEAT_OFFSET: usize = 16;
 /// Max projected int4 columns per needle (matches the R1 index probe's `MAX_PROJECTIONS`).
 const MAX_PROJECTIONS: usize = 4;
 /// Per-needle result record (device-mapped): [status@0 u32, pad@4, row@8 u64, v0@16, v1@20, v2@24, v3@28].
@@ -171,7 +178,8 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     .param .u64 proj_off2,
     .param .u64 proj_off3,
     .param .u32 claim_batch,
-    .param .u64 max_ns
+    .param .u64 max_ns,
+    .param .u64 watchdog_ns
 )
 {
     .reg .pred %p<10>;
@@ -195,7 +203,10 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     ld.param.u64 %rd32, [proj_off3];
     ld.param.u32 %r5, [claim_batch];
     ld.param.u64 %rd8, [max_ns];
+    ld.param.u64 %rd46, [watchdog_ns];          // 0 = disabled; else exit if the host heartbeat goes stale
     mov.u64 %rd9, %globaltimer;
+    mov.u32 %r29, 0;                            // thread-0 watchdog: last heartbeat value seen
+    mov.u64 %rd45, %rd9;                        // thread-0 watchdog: %globaltimer at the last heartbeat change
 
     // Grid-stride claim (ONCE): each thread statically owns indices tid, tid+T, tid+2T, ... where T is the
     // TOTAL launched threads. There is NO claim counter and NO CAS -> zero claim contention -> throughput
@@ -224,6 +235,24 @@ $L_loop:
     st.volatile.global.u32 [%rd2+16], %r28;     // -> device doorbell mirror (counters+16)
     ld.volatile.global.u64 %rd36, [%rd1+8];     // host head (u64, ctrl+8)
     st.volatile.global.u64 [%rd2+8], %rd36;     // -> device head mirror (u64, counters+8)
+    // CRASH-SAFE WATCHDOG (thread 0 only): the host petter increments the heartbeat (ctrl+16) ~1/s. If it
+    // goes stale for > watchdog_ns the host died/hung (e.g. SIGKILL) -> set the device doorbell so ALL threads
+    // self-terminate within ~watchdog_ns, instead of zombie-ing until max_ns on the --gpu-reset-denied box.
+    setp.eq.u64 %p2, %rd46, 0;
+    @%p2 bra $L_poll;                            // watchdog disabled (watchdog_ns == 0)
+    ld.volatile.global.u32 %r30, [%rd1+16];      // host heartbeat
+    setp.ne.u32 %p2, %r30, %r29;
+    @%p2 bra $L_wd_pet;                           // heartbeat changed -> record + reset the staleness timer
+    mov.u64 %rd47, %globaltimer;
+    sub.u64 %rd48, %rd47, %rd45;
+    setp.lt.u64 %p2, %rd48, %rd46;
+    @%p2 bra $L_poll;                            // not yet stale
+    mov.u32 %r28, 1;
+    st.volatile.global.u32 [%rd2+16], %r28;      // STALE -> ring the device doorbell (all threads exit)
+    bra $L_poll;
+$L_wd_pet:
+    mov.u32 %r29, %r30;
+    mov.u64 %rd45, %globaltimer;
 $L_poll:
     ld.volatile.global.u32 %r6, [%rd2+16];      // device doorbell mirror (counters+16; device read, no PCIe)
     setp.ne.s32 %p1, %r6, 0;
@@ -375,6 +404,11 @@ pub(crate) struct WaveReadEngine {
     cu_stream_destroy: CuStreamDestroy,
     cu_mem_free: CuMemFree,
     cu_mem_free_host: CuMemFreeHost,
+    /// Crash-safe watchdog: a background thread increments the host-mapped heartbeat ~1/s so the kernel keeps
+    /// running; `shutdown` flips the stop flag + joins it. If the host process is SIGKILLed (no `shutdown`),
+    /// the heartbeat stops, goes stale, and thread 0 self-terminates the kernel within ~`watchdog_ns`.
+    heartbeat_stop: Arc<AtomicBool>,
+    heartbeat_thread: Option<std::thread::JoinHandle<()>>,
     shut: bool,
 }
 
@@ -383,7 +417,9 @@ impl WaveReadEngine {
     /// (the table whose columns are gathered at `projection_offsets[j] + row*4`), on the SAME shared
     /// context the `index` lives in. `projection_offsets` must be 1..=MAX_PROJECTIONS. `ring_capacity` is
     /// rounded up to a power of two and bounds a single wave. `threads` is the persistent grid (kept
-    /// modest per the SM-coexistence rule). Runs until `shutdown`/`Drop`, or `backstop_ns` elapses.
+    /// modest per the SM-coexistence rule). Runs until `shutdown`/`Drop`, or `backstop_ns` elapses, or (if
+    /// `watchdog_ns` > 0) the host heartbeat goes stale for `watchdog_ns` (crash-safe self-termination;
+    /// spawns a petter thread). Pass `watchdog_ns = 0` to disable the watchdog (fixed-backstop only).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         index: Arc<CudaResidentDeviceMemory>,
@@ -394,6 +430,7 @@ impl WaveReadEngine {
         ring_capacity: usize,
         threads: u32,
         backstop_ns: u64,
+        watchdog_ns: u64,
     ) -> Result<Self, CudaRuntimeProbeError> {
         if projection_offsets.is_empty() || projection_offsets.len() > MAX_PROJECTIONS {
             return Err(CudaRuntimeProbeError::InvalidInputLength(
@@ -559,6 +596,7 @@ impl WaveReadEngine {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(CLAIM_BATCH);
             let mut a_max = backstop_ns;
+            let mut a_watchdog = watchdog_ns;
             let mut params = [
                 (&mut a_ctrl as *mut u64).cast::<c_void>(),
                 (&mut a_counters as *mut u64).cast::<c_void>(),
@@ -577,6 +615,7 @@ impl WaveReadEngine {
                 (&mut a_off3 as *mut u64).cast::<c_void>(),
                 (&mut a_claim_batch as *mut u32).cast::<c_void>(),
                 (&mut a_max as *mut u64).cast::<c_void>(),
+                (&mut a_watchdog as *mut u64).cast::<c_void>(),
             ];
             check_cuda(unsafe {
                 cu_launch_kernel(
@@ -626,6 +665,29 @@ impl WaveReadEngine {
             return Err(err);
         }
 
+        // Crash-safe watchdog petter: increment the host-mapped heartbeat ~3x per `watchdog_ns` window (cap
+        // 1s) so the live kernel keeps running; `shutdown` stops + joins it. If this process is SIGKILLed the
+        // petter dies with it, the heartbeat goes stale, and thread 0 self-terminates the kernel within
+        // ~watchdog_ns. Pass the ctrl address as a usize (raw pointers are not Send); ctrl_host outlives the
+        // thread (shutdown joins it before freeing). watchdog_ns == 0 disables the watchdog (no petter).
+        let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_thread = if watchdog_ns > 0 {
+            let stop = Arc::clone(&heartbeat_stop);
+            let hb_addr = (ctrl_host as usize) + HEARTBEAT_OFFSET;
+            let interval = Duration::from_nanos((watchdog_ns / 3).max(1)).min(Duration::from_secs(1));
+            Some(std::thread::spawn(move || {
+                let hb = hb_addr as *mut u32;
+                let mut counter: u32 = 1;
+                while !stop.load(Ordering::Relaxed) {
+                    unsafe { ptr::write_volatile(hb, counter) };
+                    counter = counter.wrapping_add(1);
+                    std::thread::sleep(interval);
+                }
+            }))
+        } else {
+            None
+        };
+
         Ok(Self {
             _primary: primary,
             _index: index,
@@ -647,6 +709,8 @@ impl WaveReadEngine {
             cu_stream_destroy,
             cu_mem_free,
             cu_mem_free_host,
+            heartbeat_stop,
+            heartbeat_thread,
             shut: false,
         })
     }
@@ -837,6 +901,11 @@ impl WaveReadEngine {
             return;
         }
         self.shut = true;
+        // Stop + join the watchdog petter BEFORE freeing ctrl_host (the petter writes the heartbeat there).
+        self.heartbeat_stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.heartbeat_thread.take() {
+            let _ = t.join();
+        }
         unsafe { ptr::write_volatile(self.ctrl_host as *mut u32, 1) }; // doorbell
         fence(Ordering::SeqCst);
         unsafe {
@@ -851,6 +920,24 @@ impl WaveReadEngine {
             (self.cu_mem_free_host)(self.ctrl_host);
             (self.cu_mem_free)(self.counters);
         }
+    }
+
+    /// Test hook: simulate host death (SIGKILL) -- stop+join the watchdog petter WITHOUT a clean `shutdown`
+    /// (no doorbell), then block on the kernel's stream and return how long it took to drain. If the watchdog
+    /// works, the stale heartbeat makes thread 0 ring the doorbell within ~`watchdog_ns` -> fast drain; if it
+    /// does not, the stream blocks until the fixed backstop. The kernel is dead afterward; `Drop` still cleans
+    /// up (doorbell is idempotent, the petter is already joined).
+    #[cfg(test)]
+    pub(crate) fn simulate_host_death_then_wait_exit(&mut self) -> Duration {
+        self.heartbeat_stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.heartbeat_thread.take() {
+            let _ = t.join();
+        }
+        let t = Instant::now();
+        unsafe {
+            (self.cu_stream_synchronize)(self.stream);
+        }
+        t.elapsed()
     }
 }
 
@@ -953,6 +1040,7 @@ mod tests {
             1024,
             1024,
             30_000_000_000,
+            0, // watchdog disabled (test relies on the fixed backstop + explicit shutdown)
         )
         .expect("wave engine launches on the shared context");
 
@@ -1042,6 +1130,7 @@ mod tests {
             1024,
             1024,
             30_000_000_000,
+            0, // watchdog disabled (test relies on the fixed backstop + explicit shutdown)
         )
         .expect("wave engine");
 
@@ -1151,6 +1240,7 @@ mod tests {
             1024,
             50_000_000,
             30_000_000_000,
+            0, // watchdog disabled (test relies on the fixed backstop + explicit shutdown)
         )
         .expect("wave engine constructs with threads clamped to occupancy");
 
@@ -1164,6 +1254,79 @@ mod tests {
             got.len(),
             3,
             "all present keys found -> the clamped grid drained every index"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_engine_watchdog_self_terminates_on_host_death() {
+        // R2.2b blocker #3: a long-lived engine-owned kernel can't use a fixed backstop (it would die mid-
+        // operation) and must NOT zombie ~30s if the host is SIGKILLed (it perturbs other tenants on the
+        // --gpu-reset-denied box). With a watchdog (500ms) + the host petter running, the kernel stays alive
+        // and serves a submit; when we simulate host death (stop the petter, no clean shutdown), thread 0's
+        // stale-heartbeat watchdog must self-terminate the kernel FAST (~watchdog_ns), not at the 30s backstop.
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        let rows: u64 = 256;
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r * 3 + 1).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r * 1000 + 7).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &buf)
+                .expect("resident device memory"),
+        );
+        let projections = [0_u64, rows * 4];
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &index_bytes)
+                .expect("index device memory"),
+        );
+
+        // backstop 30s (the fixed net), watchdog 500ms (the responsive net) + the petter running.
+        let mut engine = WaveReadEngine::new(
+            Arc::clone(&index_resident),
+            Arc::clone(&resident),
+            &projections,
+            table_mask,
+            hash_shift,
+            1024,
+            1024,
+            30_000_000_000,
+            500_000_000,
+        )
+        .expect("wave engine");
+
+        // Kernel is alive (petter keeps it so): a submit succeeds.
+        let got = engine.submit(&[keys[7]]).expect("submit while watchdog-petted");
+        assert_eq!(got.len(), 1, "present key found while the kernel is petted");
+
+        // Simulate SIGKILL: stop the petter (no clean shutdown) and time the kernel's exit.
+        let exit = engine.simulate_host_death_then_wait_exit();
+        assert!(
+            exit < Duration::from_secs(5),
+            "watchdog must self-terminate the kernel within ~watchdog_ns (took {exit:?}); a fixed-backstop \
+             kernel would block ~30s and zombie the shared box"
         );
     }
 
@@ -1256,6 +1419,7 @@ mod tests {
                 ring_capacity,
                 wave_threads,
                 30_000_000_000,
+                0, // watchdog disabled (benchmark relies on the fixed backstop + explicit shutdown)
             )
             .expect("wave engine");
 
@@ -1458,6 +1622,7 @@ mod tests {
             ring_capacity,
             threads,
             30_000_000_000,
+            0, // watchdog disabled (test relies on the fixed backstop + explicit shutdown)
         )
         .expect("wave engine");
 
