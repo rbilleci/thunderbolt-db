@@ -230,6 +230,14 @@ impl RowBlock {
 impl From<Vec<Vec<SqlValue>>> for RowBlock {
     fn from(rows: Vec<Vec<SqlValue>>) -> Self {
         let ncols = rows.first().map(Vec::len).unwrap_or(0);
+        // `ncols` is inferred from the FIRST row, so a ragged input would silently reshape (and an
+        // empty-first-then-nonempty input would violate the ncols==0-implies-empty invariant). Every live
+        // result path feeds uniform-width rows; assert it so a future ragged producer trips here in tests
+        // (audit P3). Release builds skip the scan.
+        debug_assert!(
+            rows.iter().all(|r| r.len() == ncols),
+            "RowBlock::from requires uniform row width (ragged rows would misreshape the flat buffer)"
+        );
         Self {
             values: rows.into_iter().flatten().collect(),
             ncols,
