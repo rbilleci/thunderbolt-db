@@ -185,6 +185,34 @@ Spec: ARCHITECTURE §7 + §13.
 - **Oracle hygiene (CHARTER):** GPU parity uses GPU-native oracles, never a CPU re-implementation. (The old
   CPU-reference parity stream is **retired/forbidden**, not to be resurrected.)
 
+### 4b. CPU relational-engine retirement (ADR-006) — sequenced deletion plan (scoped 2026-06-28)
+ADR-006 deletes CPU relational execution; it survives ONLY as parity oracle + GPU-fault fallback. Survey finding:
+the big deletion can't start now because **the GPU read path is the FALLBACK, not the default** (residency
+auto-admit / STRATA S-F is default-OFF, so the host SELECT executor is the live serving path), and the **entire
+write/commit path is host-only** (no GPU-native commit exists). The gates are perf + two unbuilt programs, not
+idle deletable code. Named ADR-006 targets: `finalize_relational_select` (host SELECT executor), the MVCC
+`cpu_fallback` (`CpuMvccExecutionBackend`), `FirstCudaSliceParityBackend` (test oracle). Durability/WAL/replication
+stay (control plane). Three tiers:
+- **Tier 1 — NOW (no perf gate):** migrate the ~57 CPU-as-oracle tests to GPU-native oracles (~46 are mechanical —
+  they already carry a hardcoded expected literal, so delete the `let cpu = …` + `assert_eq!(.., cpu.rows)`; ~3 are
+  pure CPU-diff needing a fresh closed-form oracle). Files: `tests/{mvcc_query,mvcc_provenance,sql_catalog,sql_dml}.rs`;
+  choke point `tests/common.rs FirstCudaSliceParityBackend`. PREP only — the assertions guard the LIVE fallback, so
+  they can't fully drop until the path under test is gone (Tier 3a). Effort **M**.
+- **Tier 2 — gated on R3 (GPU-native writes + deterministic CC):** delete the host write/commit/MVCC-store/CC
+  (`engine_write_apply.rs`, `engine_dml_*`, `engine_commit.rs` apply paths, `storage` mutate/visibility,
+  `write_path.rs` ledger). R3 not started. Effort **L** (largest tier).
+- **Tier 3a — gated on S-F (GPU read path = default; itself gated on read perf = the wave/R2.2c work):** delete the
+  host SELECT executor (`engine_select_bind.rs finalize_relational_select` + the cpu_pinned path) + `CpuMvccExecutionBackend`
+  + the backend-chain CPU fallback. BLOCKED FIRST by building GPU-native impls for the read ops still CPU-only:
+  HAVING, ORDER-BY-over-aggregates, cross-type compare, PG-exact AVG, `FollowValueKeyRef*`, non-int4
+  aggregates/DISTINCT/sort. Then drop the orphaned parity assertions + `FirstCudaSliceParityBackend`. Effort **L**.
+- **Tier 3b — gated on the GPU-fault-recovery ADR:** remove the `GpuUnavailable/QueueSaturated/MemoryPressure` → CPU
+  fallback. Needs either the §15 GPU-health→failover path built (large, target-only today) OR a policy decision that
+  a GPU fault returns a client error. Effort **M**.
+Order: Tier 1 now → Tier 3a-prep (GPU impls for the CPU-only read ops, in parallel with wave/R2.2c) → flip S-F →
+Tier 3a delete → Tier 2 after R3 → Tier 3b after the recovery ADR. **The single biggest gate is S-F (read perf),
+which R2.2c feeds.**
+
 ## 5. Product backlog (verify status before starting)
 Grouped, terse. Detail lives in ARCHITECTURE.
 - **Unification:** consolidate the **three pgwire servers → one**; invert the `engine → protocol` dependency; flip
