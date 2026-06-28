@@ -1149,7 +1149,7 @@ impl Engine {
     fn fold_ready_results_batched(
         results: Vec<RelationalSelectResult>,
     ) -> RelationalRetainedBatchResult {
-        let (columns, access_path, gpu_id, ncols) = match results.first() {
+        let (columns, access_path, gpu_id) = match results.first() {
             Some(first) => (
                 Arc::clone(&first.columns),
                 Arc::clone(&first.access_path),
@@ -1157,10 +1157,13 @@ impl Engine {
                     DeviceTarget::Gpu(id) => id,
                     _ => 0,
                 },
-                first.rows.ncols(),
             ),
-            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan), 0, 0),
+            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan), 0),
         };
+        // Width from the first NON-EMPTY result: an empty first result has ncols 0 but a later result may
+        // carry rows, and flattening at ncols 0 would drop them (audit P3). All Ready results of one query
+        // shape share the width, so the first non-zero is authoritative.
+        let ncols = results.iter().map(|r| r.rows.ncols()).find(|&n| n > 0).unwrap_or(0);
         let mut values = Vec::new();
         let mut needle_ranges = Vec::with_capacity(results.len());
         let mut acc = 0u32;

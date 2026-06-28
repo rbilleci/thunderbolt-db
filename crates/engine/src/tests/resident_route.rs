@@ -4489,3 +4489,73 @@ fn r2_batched_completion_matches_per_needle() {
     );
     assert!(batched.needle_values(4).is_empty(), "absent needle 25 -> no rows");
 }
+
+// Multi-row-needle companion to r2_batched_completion_matches_per_needle (audit P2): a NON-unique predicate
+// (bucket) so each needle matches SEVERAL rows with DIFFERING projected values — this exercises the
+// load-bearing intra-needle (needle_index, row_index) sort that the single-row dataset above cannot
+// (there, reversing intra-needle order is invisible). A reversed intra-needle sort diverges from the
+// per-needle path HERE. GPU test.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn r2_batched_completion_matches_per_needle_multirow() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, bucket, balance, note) VALUES \
+         (10, 1, 100, 'a'), (20, 1, 200, 'b'), (30, 2, 300, 'c'), (40, 2, 400, 'd'), (50, 3, 500, 'e')",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("accounts").unwrap();
+    let select = match parse_command("SELECT id, balance FROM accounts WHERE bucket = 1").unwrap() {
+        Command::Select(s) => s,
+        _ => unreachable!(),
+    };
+    if !e.plan_relational_resident_route(&select).accepted {
+        return; // no GPU
+    }
+    e.set_wave_engine_enabled(true);
+    e.set_wave_persistent_engine_enabled(true);
+    let template = e.prepare_relational_retained_read_template(&select).unwrap();
+    // bucket 1 -> 2 rows, bucket 2 -> 2 rows, bucket 3 -> 1 row, bucket 9 -> absent.
+    let needles = vec![1, 2, 3, 9];
+
+    let per_needle = e
+        .complete_relational_retained_read_submission(
+            e.submit_relational_retained_template_point_lookups(&template, &needles)
+                .unwrap(),
+        )
+        .unwrap();
+    let batched = e
+        .complete_relational_retained_read_submission_batched(
+            e.submit_relational_retained_template_point_lookups(&template, &needles)
+                .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(batched.needle_count(), per_needle.len());
+    // Guard against a vacuous run: at least one needle must carry MULTIPLE rows, else the intra-needle sort
+    // is still untested.
+    assert!(
+        (0..batched.needle_count()).any(|i| batched.needle_values(i).len() > batched.ncols()),
+        "test is vacuous: no needle matched >1 row (predicate did not route as multi-row)"
+    );
+    for (i, result) in per_needle.iter().enumerate() {
+        let batched_vals = batched.needle_values(i);
+        let per_needle_vals: Vec<SqlValue> = result.rows.iter().flatten().cloned().collect();
+        assert_eq!(
+            batched_vals,
+            per_needle_vals.as_slice(),
+            "needle {i}: multi-row batched rows must be byte-identical to the per-needle rows"
+        );
+    }
+    // Non-vacuity: bucket=1 carries BOTH rows in ascending row_index (id 10 then 20) — a reversed
+    // intra-needle sort breaks exactly this.
+    assert_eq!(
+        batched.needle_values(0),
+        &[SqlValue::Int4(10), SqlValue::Int4(100), SqlValue::Int4(20), SqlValue::Int4(200)],
+        "bucket=1 -> (10,100),(20,200) in ascending row order"
+    );
+    assert!(batched.needle_values(3).is_empty(), "absent bucket 9 -> no rows");
+}
