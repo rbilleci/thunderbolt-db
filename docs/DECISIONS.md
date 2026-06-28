@@ -611,7 +611,26 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   (batched single-flight wave/lpb 0.85x@b65536, 0.94x@b4096)** -- the per-row Vec had been MASKING lpb's true speed (it
   sat in lpb's critical-path COMPLETE; the wave's was partly hidden in submit). Re-opens the wave-vs-lpb question:
   for the batched single-flight regime lpb is now the faster route. Byte-identical (GPU differentials wave==lpb==scan +
-  batched==per-needle + multirow 3/0; execution wave 8/0; facade 32/0; protocol 71/0). Audit pending at commit time.
+  batched==per-needle + multirow 3/0; execution wave 8/0; facade 32/0; protocol 71/0). Audit = SHIP (P3 into_rows/
+  from_rows zero-width footgun, structurally unreachable, hardened with fail-loud debug_asserts).
+- **The other read levers (user "attempt optimization", after the tail) -> MERGED (`07186f1b`+`c1a27f3a`+`ac1a6901`):**
+  (A) **SLIM THE SUBMISSION (big win):** the template submit built N member tuples (2N Arc clones + a 1.5MB Vec)
+  whose only used content was `members.len()` + the shared schema (the needle value was unused). Replaced
+  `members: Vec<(Arc,Arc,i32)>` with `needle_count` + `shared_columns: Arc` + `shared_access_path: Arc`; cold
+  per-needle completion refcount-clones the schema per needle at completion. MEASURED: lpb submit p50 388us -> 28us;
+  **lpb-batched 44.1M -> 78.5M @b65536 (+78%)**, 35.7M -> 53.4M @b4096; wave 37.4M -> 57.5M. (B) **i32 BATCHED RESULT
+  (byte-identical, memory/batcher win, NOT engine throughput):** the int4 route is always i32 (NULL pre-encoded 0)
+  and the batcher mapped SqlValue::Int4 right back to DbValue::Int4, so `RelationalRetainedBatchResult.rows: RowBlock`
+  -> `values: Vec<i32>`; batcher maps i32->DbValue::Int4 directly. HONEST: the engine A/B is UNCHANGED (78.5M->77.9M,
+  noise) -- post-columnar+members the SqlValue flatten was NOT the engine bottleneck (the ~240us estimate was a stale
+  pre-columnar number). The win is off-A/B: ~6x smaller result buffer (~3MB->512KB/batch, eases allocator pressure +
+  tail) + the batcher drops the SqlValue->DbValue re-map. Audit (both) = SHIP, no P1/P2; the i32-vs-NULL question
+  adjudicated NO (route gated all-Int4, NULL-as-0, old path only ever wrapped SqlValue::Int4, mixed-type routes away
+  from the batcher; 5 sabotages caught). P3: jobs-path (test-only, non-wire) now shares the first job's access_path --
+  valid (each job is single-key so matched_keys==1 for all), documented.
+  **READ-PATH ARC THIS SESSION (lpb-batched @b65536): 11M (pre-result-path) -> 14.6M (tail-fix start) -> 44.1M
+  (columnar) -> 78.5M (slim). The wave-vs-lpb question is OPEN (lpb now wins large batches, wave wins small ~b256);
+  do NOT push it. Other open points remain per the user.**
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
