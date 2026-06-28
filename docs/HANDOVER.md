@@ -139,10 +139,16 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   set) like the R1 index (the kernel bakes projection offsets at launch); own it as `Arc<Mutex<WaveReadEngine>>`
   (single-flight first). **Blocker#3 crash-safe watchdog DONE** (host petter + heartbeat; thread 0 self-terminates the
   kernel ~watchdog_ns after the host dies, not ~30s; independent audit=SHIP, fixed a latent unfenced-petter bug + a
-  startup race -> arm-on-first-pet). **NEXT R2.2b: (1) engine owns the WaveReadEngine lifecycle (pass a near-infinite
-  backstop_ns with the watchdog -- audit RISK a); (2) route point reads through it single-flight, fallback lpb, enforce
-  the in-flight bound (#1) + harvest deadline (#2); (3) end-to-end offered-rate A/B = ship decision. OR (B) R3 writes.
-  Keep R1 lpb default until the A/B clears.**
+  startup race -> arm-on-first-pet). **R2.2b-1 FOUNDATION DONE (`44289772`):** exported `WaveReadEngine`/`WaveTicket`
+  `pub` + `unsafe impl Send` (sound under the engine's `Arc<Mutex<_>>` serialization; petter only touches its own ctrl
+  addr; NOT Sync); test `wave_engine_arc_mutex_send_ownership` (backstop u64::MAX + live 2s watchdog = the engine
+  config) moves the handle to another thread, submits byte-correctly, clean teardown. **NEXT R2.2b-2 (ONE coupled
+  increment): engine-crate per-table cache + lazy accessor (mirror `wave_resident_int4_index`, `Arc<Mutex<WaveReadEngine>>`,
+  near-infinite backstop + watchdog) + invalidation drop + ROUTE through `submit_resident_int4_equal_any_payload` --
+  resolving the IMPEDANCE (that path returns a DEFERRED `CudaI32EqualAnyProjectSubmission`; the wave returns rows
+  SYNCHRONOUSLY -> needs a new return variant / pre-completed-submission), single-flight, fallback lpb, enforce in-flight
+  bound (#1) + harvest deadline (#2). Then R2.2b-3 end-to-end offered-rate A/B = ship decision. OR (B) R3 writes. Keep
+  R1 lpb default until the A/B clears.**
   (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
