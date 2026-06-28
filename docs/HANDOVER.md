@@ -13,9 +13,13 @@ slices — Arc-share schema (3M->7.8M), flat `RowBlock` (7.8M->10.8M), and the P
 (`RelationalRetainedBatchResult` = shared schema once + one flat RowBlock over all needles + per-needle ranges; batcher
 slices per-needle; 10.8M->19.5M wave-batched, +78%, approaching the drain). Byte-identical throughout. NET: wave/lpb is
 now CLEARLY 1.62-1.76x end-to-end (was ~1.0x fully-masked); read-path absolute ~6.5x the session-start 3M. The wave's
-edge is no longer hidden — the kernel decision is on strong numbers.** (Caveat: lpb-batched 11M is still bounded by lpb's
-2-round-trip complete, not its 23M raw drain -> true GPU ratio = raw 1.26-2.4x; collapsing lpb's round-trips = the last
-lever for full-30M-on-both, host-machinery, optional.) R2.2b-3's A/B still stands: **the wave is a STRICT WIN
+edge is no longer hidden — the kernel decision is on strong numbers.** **LAST READ LEVER DONE (`3f719e3a`+`b81774ee`):
+instrumentation found the engine overhead was NOT lpb's round-trips but the assembly's O(n log n) sort (~80% of it);
+replaced with an O(n) counting-sort scatter -> lpb-batched 11M->14.6M (+32%), and wave/lpb dropped 1.76x->1.33x@b65536
+/1.21x@b4096 = CONVERGING ON THE TRUE RAW GPU RATIO (1.26x): BOTH ROUTES NOW AT THEIR DRAINS, the read-path ratio is
+HONEST. Audit SHIP; a CPU unit test now proves the within-needle sort necessary (P3). (Caveat: lpb b65536 p99 ~30ms
+tail, lpb-path only, not the wave; marginal levers left = members ~360us + flatten ~240us, don't change the ratio.) THE
+READ PATH IS NOW SETTLED END-TO-END.** R2.2b-3's A/B still stands: **the wave is a STRICT WIN
 (throughput + latency) for the single-coalescer point-read regime — 2.45x lpb @batch=1 down to 1.02x @batch=4096 — but
 the DEFAULT FLIP is GATED on two R2.2c architectural unlocks.** Keep R1 lpb the default until they clear. The fork:
 
