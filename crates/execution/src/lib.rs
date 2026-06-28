@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 // the root module's private CUDA infra (`gpu_primary_context`, `GpuPrimaryContext` methods, `check_cuda`)
 // while keeping the (unsafe FFI) wave code isolated from this file.
 mod wave;
+// ADR-009 R2.2b: the persistent wave read engine, exported so the engine crate can own one per resident
+// table behind the default-OFF `wave_engine_enabled` flag.
+pub use wave::{WaveReadEngine, WaveTicket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceTarget {

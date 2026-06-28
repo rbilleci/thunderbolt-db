@@ -98,7 +98,7 @@ const CLAIM_BATCH: u32 = 8;
 /// turns it into rows once every slot of the range is marked done in the status ring. `Copy` so the host can
 /// queue many in flight (depth-K) and harvest them in any order.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct WaveTicket {
+pub struct WaveTicket {
     /// Cumulative u64 (never wraps for the engine's lifetime; u32 would wrap at ~2^32 lookups). `head`/`idx`
     /// stay u64 in the kernel for the same reason (the `idx < head` compare).
     base: u64,
@@ -372,7 +372,7 @@ unsafe fn sym<T: Copy>(lib: &Library, names: &[&[u8]]) -> Result<T, CudaRuntimeP
 /// A persistent GPU "wave" read kernel resident on the engine's shared primary context, draining a
 /// circular needle ring against one resident int4 table's hash index, projecting up to `MAX_PROJECTIONS`
 /// columns. `submit` runs one wave at a time (serialized) and reads its rows back.
-pub(crate) struct WaveReadEngine {
+pub struct WaveReadEngine {
     /// Keep the shared context + the index/table device buffers alive for the engine's lifetime.
     _primary: Arc<GpuPrimaryContext>,
     _index: Arc<CudaResidentDeviceMemory>,
@@ -414,6 +414,13 @@ pub(crate) struct WaveReadEngine {
     shut: bool,
 }
 
+// SAFETY: the raw pointers (host-mapped/device buffers, fn pointers) and `head` are owned by the engine and
+// only accessed through `&self`/`&mut self`, which the engine crate serializes behind an `Arc<Mutex<_>>`
+// (one connection thread at a time). The petter thread only touches its own captured ctrl address + the
+// `Arc<AtomicBool>` stop flag, never the struct. So the engine can be MOVED across threads (Send); concurrent
+// access is prevented by the Mutex (which provides Sync). It is deliberately NOT `Sync`.
+unsafe impl Send for WaveReadEngine {}
+
 impl WaveReadEngine {
     /// Launch the persistent kernel over `index` (built with `table_mask`/`hash_shift`) and `resident`
     /// (the table whose columns are gathered at `projection_offsets[j] + row*4`), on the SAME shared
@@ -423,7 +430,7 @@ impl WaveReadEngine {
     /// `watchdog_ns` > 0) the host heartbeat goes stale for `watchdog_ns` (crash-safe self-termination;
     /// spawns a petter thread). Pass `watchdog_ns = 0` to disable the watchdog (fixed-backstop only).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         index: Arc<CudaResidentDeviceMemory>,
         resident: Arc<CudaResidentDeviceMemory>,
         projection_offsets: &[u64],
@@ -734,7 +741,7 @@ impl WaveReadEngine {
     /// finishes (it hit the doorbell/backstop mid-wave) leaves its slots unwritten forever, so a depth-K
     /// caller's `harvest` spin loop must carry its own deadline (the blocking `submit` already bounds this via
     /// `DRAIN_TIMEOUT`).
-    pub(crate) fn submit_async(
+    pub fn submit_async(
         &mut self,
         needles: &[i32],
     ) -> Result<WaveTicket, CudaRuntimeProbeError> {
@@ -796,7 +803,7 @@ impl WaveReadEngine {
     /// read it. If ready, returns the rows (found needles only, byte-identical to the R1 index probe); else
     /// `None` (a not-yet-written slot only delays; the caller retries). LIVENESS: thread 0's block must stay
     /// co-resident (the modest grids the occupancy clamp allows); eviction would stall, caught by the backstop.
-    pub(crate) fn harvest(
+    pub fn harvest(
         &self,
         ticket: WaveTicket,
     ) -> Result<Option<Vec<CudaI32BatchProjectionRow>>, CudaRuntimeProbeError> {
@@ -886,7 +893,7 @@ impl WaveReadEngine {
 
     /// Blocking single-wave submit (`submit_async` + spin-`harvest`). Kept for correctness tests and
     /// request-response callers; for THROUGHPUT use `submit_async`/`harvest` pipelined (depth K).
-    pub(crate) fn submit(
+    pub fn submit(
         &mut self,
         needles: &[i32],
     ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
@@ -904,7 +911,7 @@ impl WaveReadEngine {
     }
 
     /// Ring the doorbell, wait for the kernel to exit, then free the stream + buffers. Idempotent.
-    pub(crate) fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) {
         if self.shut {
             return;
         }
@@ -1346,6 +1353,78 @@ mod tests {
             "watchdog must self-terminate the kernel within ~watchdog_ns (took {exit:?}); a fixed-backstop \
              kernel would block ~30s and zombie the shared box"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_engine_arc_mutex_send_ownership() {
+        // R2.2b-1: the engine owns the WaveReadEngine as `Arc<Mutex<WaveReadEngine>>` shared across connection
+        // threads (raw pointers -> `unsafe impl Send`, sound because the Mutex serializes access). Validate the
+        // model: build it, MOVE the Arc<Mutex> into another thread, submit there, get correct rows, drop clean.
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        let rows: u64 = 256;
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r * 3 + 1).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r * 1000 + 7).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = Arc::new(runtime.retain_device_memory_copy(0, &buf).expect("resident"));
+        let projections = [0_u64, rows * 4];
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).expect("index"));
+
+        // backstop near-infinite + a live watchdog (2s) -- the engine-ownership configuration.
+        let engine = Arc::new(std::sync::Mutex::new(
+            WaveReadEngine::new(
+                Arc::clone(&index_resident),
+                Arc::clone(&resident),
+                &projections,
+                table_mask,
+                hash_shift,
+                1024,
+                1024,
+                u64::MAX,
+                2_000_000_000,
+            )
+            .expect("wave engine"),
+        ));
+
+        // Move the shared handle into another thread (compile-checks + runtime-proves Send) and submit there.
+        let worker = Arc::clone(&engine);
+        let needles = vec![keys[5], keys[100], keys[200]];
+        let mut got = std::thread::spawn(move || {
+            let mut guard = worker.lock().unwrap_or_else(|p| p.into_inner());
+            guard.submit(&needles).expect("submit from another thread")
+        })
+        .join()
+        .expect("worker thread");
+        got.sort_by_key(|row| (row.needle_index, row.row_index));
+        assert_eq!(got.len(), 3, "present keys found via the shared Arc<Mutex> handle");
+        for row in &got {
+            assert_eq!(
+                row.values,
+                vec![keys[row.row_index as usize], payload[row.row_index as usize]]
+            );
+        }
+        engine.lock().unwrap_or_else(|p| p.into_inner()).shutdown(); // clean teardown (joins the petter)
     }
 
     /// R2.2 diagnostic — persistent wave vs launch-per-batch R1 index probe, swept over batch size.
