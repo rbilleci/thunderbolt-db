@@ -1382,4 +1382,157 @@ mod tests {
         }
         println!("# large batch = continuous-fill (the wave's intended regime); batcher ~156k single-coalescer cap.");
     }
+
+    /// P2c — the PREMISE GATE for the concurrent regime the wave engine exists for. Single-flight only proves
+    /// wave > lpb across the sweep; the wave's real advantage is keeping the persistent kernel CONTINUOUSLY
+    /// fed by overlapping host submit/harvest with the GPU drain (depth-K pipelining), which the per-slot gate
+    /// (P2) now allows. This sweeps (batch, depth) and reports the SUSTAINED throughput; depth=1 is the
+    /// single-flight baseline, so the depth-K/depth-1 ratio is the pipelining win. Every harvested wave is
+    /// black_box'd + asserted to return `batch` rows (no-op guard). Then lpb (after shutdown; cuMemAlloc-safe).
+    ///   `GPU_DB_WAVE_BENCH_ROWS=1000000 GPU_DB_WAVE_BENCH_THREADS=8192 cargo test -r -p gpu_db_execution \
+    ///    wave::tests::wave_pipelined_offered_rate -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_pipelined_offered_rate() {
+        use std::collections::VecDeque;
+        use std::hint::black_box;
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        let rows: u64 = std::env::var("GPU_DB_WAVE_BENCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let threads: u32 = std::env::var("GPU_DB_WAVE_BENCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(3).wrapping_add(1)).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r.wrapping_mul(1000).wrapping_add(7)).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = Arc::new(runtime.retain_device_memory_copy(0, &buf).expect("resident"));
+        let payload_offset = rows * 4;
+        let projections = [payload_offset]; // 1-col gather, like the single-flight benchmark
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = Arc::new(runtime.retain_device_memory_copy(0, &index_bytes).expect("index"));
+
+        let needles_for = |batch: usize, iter: usize| -> Vec<i32> {
+            (0..batch)
+                .map(|i| keys[(iter.wrapping_mul(batch).wrapping_add(i)) % rows as usize])
+                .collect()
+        };
+
+        let ring_capacity = 1usize << 17; // 131072: bounds (max depth * max batch) in flight
+        let batch_sizes = [1usize, 8, 32, 256];
+        let depths = [1usize, 4, 16, 64];
+
+        println!(
+            "\n# R2.2 P2c: PIPELINED (depth-K) offered-rate  rows={rows} threads={threads} ring={ring_capacity}"
+        );
+        println!("  batch  depth        lookups/s   x(vs depth=1)      us/wave");
+
+        let mut engine = WaveReadEngine::new(
+            Arc::clone(&index_resident),
+            Arc::clone(&resident),
+            &projections,
+            table_mask,
+            hash_shift,
+            ring_capacity,
+            threads,
+            30_000_000_000,
+        )
+        .expect("wave engine");
+
+        for &batch in &batch_sizes {
+            // target ~1M lookups per (batch,depth) point, clamped to a reasonable wave count
+            let waves: usize = (1_000_000 / batch).clamp(200, 200_000);
+            let mut base_thru = 0f64;
+            for &depth in &depths {
+                // depth*batch must fit the ring (bound on in-flight, the caller contract).
+                if depth * batch > ring_capacity {
+                    continue;
+                }
+                // warm
+                for w in 0..depth.min(waves) {
+                    let _ = engine.submit(&needles_for(batch, w));
+                }
+                let mut inflight: VecDeque<WaveTicket> = VecDeque::with_capacity(depth);
+                let mut submitted = 0usize;
+                let mut harvested = 0usize;
+                let mut ok = true;
+                let t = Instant::now();
+                while harvested < waves {
+                    while inflight.len() < depth && submitted < waves {
+                        match engine.submit_async(&needles_for(batch, submitted)) {
+                            Ok(tk) => {
+                                inflight.push_back(tk);
+                                submitted += 1;
+                            }
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    let front = *inflight.front().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        match engine.harvest(front) {
+                            Ok(Some(r)) => {
+                                assert_eq!(r.len(), batch, "pipelined wave row count (batch={batch} depth={depth})");
+                                black_box(&r);
+                                inflight.pop_front();
+                                harvested += 1;
+                                break;
+                            }
+                            Ok(None) => {
+                                if Instant::now() > deadline {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+                let secs = t.elapsed().as_secs_f64();
+                let thru = if ok { (harvested * batch) as f64 / secs } else { 0.0 };
+                if depth == 1 {
+                    base_thru = thru;
+                }
+                let speedup = if base_thru > 0.0 { thru / base_thru } else { 0.0 };
+                let us_wave = if thru > 0.0 { 1.0e6 / (thru / batch as f64) } else { f64::INFINITY };
+                println!("  {batch:>5}  {depth:>5}  {thru:>15.0}   {speedup:>13.2}x  {us_wave:>11.2}");
+            }
+        }
+        engine.shutdown();
+        println!("# depth=1 is single-flight; depth-K/depth-1 ratio = the pipelining (concurrent-regime) win.");
+    }
 }
