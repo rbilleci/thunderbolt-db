@@ -2589,6 +2589,13 @@ impl CudaI32BatchProjectionColumns {
     /// first row's width (uniform by construction).
     pub fn from_rows(rows: Vec<CudaI32BatchProjectionRow>) -> Self {
         let projection_count = rows.first().map(|row| row.values.len()).unwrap_or(0);
+        // `projection_count` is inferred from the FIRST row, so a ragged or zero-width-with-rows input would
+        // misreshape (and `into_rows` would silently drop rows at width 0). Every live shape is uniform and
+        // >=1 wide; assert it so a future zero/ragged-projection producer trips here in tests (audit P3).
+        debug_assert!(
+            rows.is_empty() || (projection_count > 0 && rows.iter().all(|r| r.values.len() == projection_count)),
+            "from_rows requires uniform, non-zero-width rows (got width {projection_count})"
+        );
         let mut values = Vec::with_capacity(rows.len() * projection_count);
         let mut needle_indices = Vec::with_capacity(rows.len());
         let mut row_indices = Vec::with_capacity(rows.len());
@@ -2607,6 +2614,12 @@ impl CudaI32BatchProjectionColumns {
     /// Bridge back to the per-row form for the cold per-needle completion + tests (re-introduces the per-row
     /// `Vec`, but only off the hot batched path). The arrays were validated when produced.
     pub fn into_rows(self) -> Vec<CudaI32BatchProjectionRow> {
+        // Width 0 with rows present would silently drop them (`chunks(0.max(1))` mis-chunks). Unreachable on
+        // live shapes (projections are >=1 wide); fail loud in tests rather than drop silently (audit P3).
+        debug_assert!(
+            self.projection_count > 0 || self.values.is_empty(),
+            "into_rows: projection_count==0 with non-empty values would silently drop rows"
+        );
         let p = self.projection_count.max(1);
         self.values
             .chunks(p)
