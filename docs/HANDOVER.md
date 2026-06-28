@@ -3,11 +3,35 @@
 > **This is a SINGLE ROLLING file. Overwrite it each session — never date it, never accrete.** Keep it short:
 > where we are, the one next action, and the open decisions. Everything else lives in the other five docs.
 
-**Updated:** 2026-06-27.
+**Updated:** 2026-06-28.
+
+## >>> THE ONE NEXT ACTION: R2.2b-2 (wire + route the wave engine into the read path) <<<
+The wave read engine (`crates/execution/src/wave.rs`, `WaveReadEngine`, now `pub` + `Send`) is BUILT, AUDITED, and
+proven in-crate (exceeds lpb at every batch; depth-K pipelining validated; crash-safe watchdog; export + ownership
+model done). It is NOT yet wired into a query path. R2.2b-2 is ONE coupled increment:
+1. Engine-crate per-table cache + lazy accessor — mirror `wave_resident_int4_index` (engine_retained_read.rs:593):
+   `Arc<Mutex<WaveReadEngine>>`, built lazily per (filter_col, projection set) over the R1 index, with
+   `backstop_ns = u64::MAX` + `watchdog_ns ~= 2s` (the audited engine config). Cache field next to `wave_index`
+   in `ResidencyReadState` (engine_state.rs:502); cache entry like `WaveResidentIndex` (resident_storage.rs:25).
+2. Invalidation drop — mirror `wave_index` removal in engine_commit.rs (`invalidate_relational_residency_table`:261,
+   `..._concurrent`:312). Dropping the cache Arc runs `WaveReadEngine::Drop` -> doorbell + join petter + free.
+3. ROUTE in `submit_resident_int4_equal_any_payload` (engine_retained_read.rs:479) behind `wave_engine_enabled`:
+   **resolve the impedance** — that fn returns a DEFERRED `CudaI32EqualAnyProjectSubmission` (completed by the caller),
+   but `WaveReadEngine::submit` returns `Vec<CudaI32BatchProjectionRow>` SYNCHRONOUSLY. Likely fix: a return enum
+   `Submission(...) | Rows(...)` threaded to the completion site, OR a pre-completed-submission shim. Single-flight
+   first; on `Err`/timeout fall back to the lpb index probe. Enforce blocker#1 (total un-harvested needles <=
+   ring_capacity; trivial single-flight) + blocker#2 (host harvest deadline = `submit`'s `DRAIN_TIMEOUT`).
+4. Differential test: flag-ON (wave) == scan/lpb, byte-identical (reuse the R1 `r1_wave_index_probe_matches_scan_differential`
+   pattern). Then R2.2b-3 = end-to-end offered-rate A/B vs R1 lpb (real connection concurrency = the multi-producer
+   headroom) = the SHIP decision. Keep R1 lpb the default until that clears. Full detail: DECISIONS "R2.2b STARTED".
+DISCIPLINE (charter, non-negotiable): GPU tests under `timeout`, NEVER `--gpu-reset`; ASCII-only PTX (ptxas -arch=sm_70
+check before launch); independent adversarial audit on kernel/protocol changes (never self-audit); commit/push/merge each
+verified increment; do NOT run a GPU test right after a `timeout`-killed one (its kernel zombies ~watchdog/backstop).
 
 ## Where we are
 - Docs are **6 canonical files**: [CHARTER](CHARTER.md), [ARCHITECTURE](ARCHITECTURE.md), [DECISIONS](DECISIONS.md),
-  [PLAN](PLAN.md), [STATUS](STATUS.md), this. Suite **731/0**; `main` == branch == origin.
+  [PLAN](PLAN.md), [STATUS](STATUS.md), this. `main` == branch == origin (`eccd32a1`). Workspace builds; execution
+  non-ignored tests green; the wave GPU tests are `#[ignore]`d (need a local GPU; run with `-- --ignored`).
 - **Workload = high-throughput OLTP** (ADR-008). **Success bar (clarified): same ballpark on TODAY's hardware + a
   GPU-architectural gap that CLOSES with hardware — NOT beat-the-CPU-today** (host-serial gaps are fixes, not losses).
 - GPU-native **resident read path complete for int4** (S1–S10c). **STRATA S-A + S-B landed** (auto-admission producer,
