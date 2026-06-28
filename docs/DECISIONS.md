@@ -631,6 +631,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   **READ-PATH ARC THIS SESSION (lpb-batched @b65536): 11M (pre-result-path) -> 14.6M (tail-fix start) -> 44.1M
   (columnar) -> 78.5M (slim). The wave-vs-lpb question is OPEN (lpb now wins large batches, wave wins small ~b256);
   do NOT push it. Other open points remain per the user.**
+- **lpb timing breakdown (user-requested, b65536 steady, instrumented then reverted): submit ~23us; complete ~688us =
+  drain ~215us (kernel-sync ~18 + count ~5 + result-D2H ~125 [1.3MB, PCIe-bound] + validate ~53) + assemble ~452us
+  (scatter+flatten). The per-row-Vec storm is GONE; the host ASSEMBLE is now the dominant cost.** Two follow-on levers:
+  - **(1) ASSEMBLE unique-key fast-path -> DONE + MERGED + audit SHIP (`92d17f65`):** for `!any_multi` (<=1 row/needle,
+    the dominant point read) write each row's i32 DIRECTLY at its needle's prefix-summed offset in ONE pass — no
+    `slot`/`cursor` (-512KB allocs), no separate flatten. Byte-identical (count==1 => same offset; CPU test
+    r2_batched_assembly_unique_fastpath + GPU differentials, 3 sabotages caught). lpb-batched 77.9M -> 84.6M @b65536
+    (+9%). Smaller than the ~250us estimate — the residual scatter-copy (cache-unfriendly random write by needle
+    offset) + the values buffer remain (inherent: GPU emits in atomic-add order, host must reorder).
+  - **(2) ROW_INDICES elision (the 512KB u64 array, ~48us, used only to sort MULTI-row needles -> waste for unique) ->
+    ANALYZED, RECOMMEND SKIP:** runtime-detection version nets only ~18us (the unique case pays a ~30us count pass the
+    engine then repeats) + adds a conditional 2nd round-trip to the delicate async-D2H drain; metadata version (plumb
+    catalog unique-index flag -> submission -> drain skip) gets the full ~48us but is multi-layer + needs a uniqueness
+    guard (wrong flag -> empty row_indices -> panic). BOTH are ~3-7.5% LARGE-BATCH-ONLY (at small batches row_indices is
+    a few rows = ~0) and touch the safety-critical drain. Deferred in favor of small-batch work. Revisit only if the
+    large-batch case specifically matters.
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
