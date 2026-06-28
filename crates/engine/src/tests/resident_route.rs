@@ -4159,6 +4159,33 @@ fn r2_wave_engine_matches_lpb_differential() {
         Some(0),
         "the wave run BUILT + cached a persistent engine over the id filter col (col 0)"
     );
+    // SCHEMA stamping (audit gap-closer): `run` compares only `result.rows`, so a wrong columns/access_path
+    // from the template-submit path's Arc-SHARED schema would slip through. Assert the full result schema
+    // on the wave route once: projected columns = [id, balance], access_path = the equality-index route.
+    {
+        let template = e.prepare_relational_retained_read_template(&select_unique).unwrap();
+        let results = e
+            .complete_relational_retained_read_submission(
+                e.submit_relational_retained_template_point_lookups(&template, &[10, 30])
+                    .unwrap(),
+            )
+            .unwrap();
+        for result in &results {
+            assert_eq!(
+                result.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                vec!["id", "balance"],
+                "wave route stamps the shared projected schema [id, balance]"
+            );
+            assert!(
+                matches!(
+                    &*result.access_path,
+                    RelationalAccessPath::EqualityIndex { column, .. } if column == "id"
+                ),
+                "wave route stamps the shared equality-index access path over id, got {:?}",
+                result.access_path
+            );
+        }
+    }
     assert_eq!(wave_u[5].len(), 1, "needle 0 -> the NULL-id row via the wave");
     assert_eq!(
         wave_u[4],
