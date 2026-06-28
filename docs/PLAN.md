@@ -38,8 +38,12 @@ Spec: ARCHITECTURE §7 + §13.
   HAZARD clean. Remaining: the full pgwire-socket golden test; flipping the default is **S-F**.
 - **S-C — same-GPU N>1 shards + partial-combine (int4);** incremental shard append.
 - **S-D — text shard recompaction/combine** (per-shard offset rebasing + 8-alignment); removes the int4-only guard.
-- **S-E — cross-shard combine (peer-copy / NCCL) → true spill / multi-GPU;** the missing scale mechanism + the
-  production shard producer for over-VRAM tables.
+- **S-E — streaming executor + cross-shard combine → out-of-core (single-GPU) and multi-GPU spill (DECISIONS
+  ADR-012).** The committed mechanism for working sets **> GPU memory**: a fold over shards (admit → push-down →
+  combine partial → evict → next, prefetching ahead), host/NVMe as the cold STORAGE tier, the GPU the sole execution
+  tier. Replaces the current recompact-ALL-shards-to-unified read path with push-down-to-shard + combine. **Hard
+  precondition for S10d** (alongside S-F): deleting the host *execution* path is unsafe for over-VRAM relations until
+  this exists. Cross-GPU (peer-copy / NCCL) moves only partials, never full data.
 - **S-F — flip `auto_admit_on_commit` ON** + migrate the non-resident test contracts. This is the real precondition
   for **S10d** (delete the host read path; the `FirstCudaSliceParityBackend` tests retire *with* it).
   **HELD OFF (2026-06-27), evidence-gated:** the OLTP benchmark (DECISIONS ADR-008 "First measurement") shows resident

@@ -6,6 +6,31 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
 
 ---
 
+## ADR-012 — Streaming executor: out-of-core execution for working sets > GPU memory
+- **Status:** Accepted (2026-06-29, decision by user).
+- **Context:** STRATA (ADR-010) admits relations that fit a per-GPU **byte budget** and evicts across relations to
+  make room, but a single query whose working set exceeds the budget had no GPU path: admission rejected it and the
+  **host** path *executed* it. That host execution fallback contradicts ADR-006/007 (no CPU steady-state relational
+  execution; the host data path is debt scheduled for deletion at S10d) and ARCHITECTURE §13 ("host … never a
+  co-equal CPU *execution* tier"). The only designed over-VRAM mechanism was multi-GPU spill (S-E), which does not
+  help a single-GPU deployment. **Supporting data volumes larger than GPU memory is a required capability.**
+- **Decision:** Build a **streaming executor** for out-of-core execution. A query whose working set exceeds the GPU
+  byte budget runs as a fold over shards — **admit shard → push the query fragment down → combine the partial →
+  evict shard → next**, prefetching the next shard while the current one executes. Host RAM/NVMe is the **cold
+  STORAGE tier** for shard bytes (DtoH/HtoD); the **GPU is the sole execution tier**. Only one shard's working set
+  need be resident at a time, so a single GPU serves relations far larger than its VRAM. This is explicit
+  STRATA-managed admission (software) — **not** hardware demand-paging and **not** CPU execution — so it is
+  charter-compliant (ADR-006/007) and lets S10d delete the host execution path without losing over-VRAM coverage.
+- **Consequences:** Extends ADR-010. The current sharded read path (recompact ALL shards into one unified resident
+  buffer, ARCHITECTURE §7) must move to **push-down-to-shard + cross-shard combine** (ARCHITECTURE §13) — the same
+  combine primitive serves both the streaming executor (single-GPU) and multi-GPU spill (S-E). Foldable operation
+  classes stream directly (filter/project, associative reductions, grouped/distinct with a persistent group/distinct
+  table, top-K); full ORDER BY needs a k-way run merge. The kernels are already shard-relative (base ptr + row_count
+  + offsets); the missing work is the orchestration (the admit/prefetch/execute/combine/evict loop) + the spec'd GPU
+  memory-manager `prefetch(shard,stream)`/`evict(policy)` API (ARCHITECTURE §18). Becomes a **hard precondition for
+  S10d** alongside S-F (deleting the host execution path is unsafe for over-VRAM relations until this exists). Work
+  item: PLAN §2 S-E (reframed from "multi-GPU spill" to the streaming executor + cross-shard combine).
+
 ## ADR-011 — Checked on-device integer arithmetic (no wrap, no fallback)
 - **Status:** Accepted (decision 2026-06-18; recorded in the ledger 2026-06-26)
 - **Context:** Integer overflow on the GPU must match PostgreSQL semantics (error, not silent wrap) and must never

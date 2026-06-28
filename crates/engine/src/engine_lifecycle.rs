@@ -165,7 +165,11 @@ impl Engine {
             router: DeviceRouter::new(MockGpuRuntime::default()),
             cached_cuda_probe_runtime: OnceLock::new(),
             auto_admit_on_commit: std::sync::atomic::AtomicBool::new(false),
-            wave_engine_enabled: std::sync::atomic::AtomicBool::new(false),
+            // DEFAULT ON (user 2026-06-29: lpb chosen over the wave engine): the R1 unique-key index probe is
+            // the production read path (O(1)/needle vs the O(rows) scan it replaces; byte-identical). The
+            // persistent wave (`wave_persistent_engine_enabled`, nested under this) stays OFF and is being
+            // retired. (This flag gates the INDEX, not the wave — rename pending the wave retirement.)
+            wave_engine_enabled: std::sync::atomic::AtomicBool::new(true),
             wave_persistent_engine_enabled: std::sync::atomic::AtomicBool::new(false),
             // DEFAULT ON (user 2026-06-29): the dense kernel is the default for the lpb unique-index route — a
             // strict win at >=b4096, neutral at b256, byte-identical + audit SHIP. (Independent of whether the

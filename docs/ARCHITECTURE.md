@@ -90,8 +90,12 @@ Protocol layer → Management/observability. Cross-cutting (logging, config, err
   `shard_device_memory` keyed `(table, shard_id)`; ordered by `(row_start, shard_id)`. Each shard lives on exactly
   one GPU.
 - **Cache-manager state machine** (`RelationalResidentCache`): Absent → Admitting → Valid → Invalidated → Refreshing
-  → Evicting. **Admission** (`admit_relational_residency_snapshot`): per-GPU **byte budget**; fits → admit; over →
-  reject (host path serves it); needs room → deterministic eviction by oldest `valid_through_index`. **Invalidation**
+  → Evicting. **Admission** (`admit_relational_residency_snapshot`): per-GPU **byte budget**; fits → admit; needs
+  room → deterministic eviction by oldest `valid_through_index`. **A working set larger than the byte budget is served
+  by the streaming executor (§13, ADR-012): shards are admitted on demand and evicted under budget, with host/NVMe as
+  the cold STORAGE tier — the host is never an execution tier.** _(Interim, until S10d: while the streaming executor is
+  unbuilt and `auto_admit_on_commit` is OFF, an over-budget relation falls back to the host **execution** path — the
+  scheduled-for-deletion GPU-parity debt of ADR-006, NOT a sanctioned steady-state tier.)_ **Invalidation**
   on commit tombstones the mutated relation's shards (both unified + shard maps); residency is rebuilt from the new
   generation, never the source of truth.
 - **The admission producer _(target — the keystone gap)_:** a **commit-triggered**, post-`publish_committed_seq`,
@@ -217,11 +221,20 @@ concurrent index maintenance on writes (lock-free CAS inserts below), and the de
   activation delay, connection draining on failover. WAL sender/receiver wire-compatible with PostgreSQL streaming
   (so `pg_basebackup`/`pg_receivewal` work). Sync replication → RPO 0; async for throughput. Min topology: 3 nodes.
 
-## 13. Multi-GPU & data tiering _(target)_
-- Over-VRAM relations spill into **shards across GPUs**; GPU memory is the hot tier, host memory/NVMe the cold
-  staging/spill (never a co-equal CPU *execution* tier). Unified multi-GPU abstraction maps shards→devices with
-  per-device health + circuit breakers; cache-aware replication keeps critical shards on ≥2 GPUs.
-- **Cross-shard combine (the missing scale mechanism):** push the query fragment to each shard (partial agg / local
+## 13. Out-of-core, multi-GPU & data tiering
+- **REQUIREMENT (ADR-012): working sets larger than GPU memory are supported.** GPU memory is the hot tier; host
+  RAM/NVMe is the cold STORAGE/staging tier (never a co-equal CPU *execution* tier). The GPU is the **sole execution
+  tier**; over-VRAM is handled by moving DATA (shards), never by executing on the host.
+- **Streaming executor — single-GPU out-of-core _(committed, ADR-012; building)_:** a query whose working set exceeds
+  the GPU byte budget runs as a fold over shards — **admit shard → push the query fragment down → combine the partial
+  → evict shard → next**, prefetching the next shard while the current one executes. Host/NVMe holds the cold shards;
+  only one shard's working set need be resident at a time, so a **single GPU serves relations far larger than its
+  VRAM**. Explicit STRATA admission (software-managed) — not hardware demand-paging, not CPU execution — so it is
+  charter-compliant (ADR-006/007) and lets S10d delete the host execution path without losing over-VRAM coverage.
+- **Multi-GPU spill _(target)_:** over-VRAM relations also spill into **shards across GPUs**; unified multi-GPU
+  abstraction maps shards→devices with per-device health + circuit breakers; cache-aware replication keeps critical
+  shards on ≥2 GPUs.
+- **Cross-shard combine (the shared mechanism — used by both the streaming executor and multi-GPU spill):** push the query fragment to each shard (partial agg / local
   filter+project / local top-K), then combine partials — scalar reduce (COUNT/SUM/MIN/MAX), (sum,count) for AVG,
   group-table merge for GROUP BY, set-union for DISTINCT, k-way merge for ORDER BY/top-N, concat for projection.
   Same-GPU shards combine via `cuMemcpyDtoD` (today's recompaction is the projection special case); **cross-GPU

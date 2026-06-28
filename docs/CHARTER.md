@@ -53,6 +53,9 @@ coherence) so it **closes as GPU hardware advances** while the CPU path sits nea
 Coherent CPU–GPU memory (GH200/GB200) is the strategic target and a first-class **fast path — NOT a hot-path
 requirement**; PCIe (dev box: RTX PRO 6000) is the **testable baseline**. **Explicit residency/admission (STRATA),
 not hardware demand-paging, owns placement and the p99 tail** (page faults wreck OLTP tail latency).
+**Data volumes larger than GPU memory are a required capability** — served by the STRATA streaming executor
+(out-of-core: shards admitted on demand, host/NVMe as cold STORAGE, the GPU the sole execution tier; DECISIONS
+ADR-012), never by CPU execution or hardware demand-paging.
 
 ## Execution discipline (non-negotiable)
 - **GPU-native or it does not land.** No host stub committed as "done"; no "deferred/follow-up/clean-error-for-now"
