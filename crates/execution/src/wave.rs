@@ -68,17 +68,12 @@ use crate::{
 
 const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 const CU_STREAM_NON_BLOCKING: u32 = 0x01;
-/// Control block bytes (device-mapped pinned), TWO cachelines to avoid false sharing: cacheline 0 =
-/// [doorbell@0 u32, head@8 u64] (GPU polls these every iteration); cacheline 1 = [completed_mirror@64 u64]
-/// (the host tight-spins reading this in `harvest`). Keeping the host-spun mirror off the GPU-polled
-/// cacheline stops the host spin from starving the kernel's head/doorbell PCIe reads. `head`/`completed`
-/// are u64 (cumulative; u32 wraps at ~2^32 lookups ~= 135s at peak -> the `completed < base` gate guard
-/// false-fires -> permanent harvest hang); 8-byte aligned offsets.
+/// Control block bytes (device-mapped pinned): [doorbell@0 u32, head@8 u64]. The host publishes `head` (u64,
+/// cumulative; u32 would wrap at ~2^32 lookups) at `HEAD_OFFSET`; thread 0 mirrors doorbell+head into device
+/// memory for the workers. Completion is the PER-SLOT status ring (P2), not a counter in this block.
 const CTRL_BYTES: usize = 128;
-/// Byte offset of the host-mapped cumulative `head` (u64, 8-aligned, cacheline 0).
+/// Byte offset of the host-mapped cumulative `head` (u64, 8-aligned).
 const HEAD_OFFSET: usize = 8;
-/// Byte offset of the host-mapped `completed` mirror (u64, its own cacheline).
-const COMPLETED_MIRROR_OFFSET: usize = 64;
 /// Max projected int4 columns per needle (matches the R1 index probe's `MAX_PROJECTIONS`).
 const MAX_PROJECTIONS: usize = 4;
 /// Per-needle result record (device-mapped): [status@0 u32, pad@4, row@8 u64, v0@16, v1@20, v2@24, v3@28].
@@ -93,22 +88,10 @@ const CLAIM_BATCH: u32 = 8;
 /// turns it into rows once `completed >= base + len`. `Copy` so the host can queue many in flight.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WaveTicket {
-    /// Cumulative u64 (never wraps for the engine's lifetime; u32 would wrap at ~2^32 lookups).
+    /// Cumulative u64 (never wraps for the engine's lifetime; u32 would wrap at ~2^32 lookups). `head`/`idx`
+    /// stay u64 in the kernel for the same reason (the `idx < head` compare).
     base: u64,
     len: u32,
-}
-
-/// Harvest completion gate (IN-ORDER / single-flight): a wave `[base, base+len)` is ready iff `completed`
-/// has reached `base+len`. The kernel can lag (it hasn't drained up to this wave's start), i.e.
-/// `completed < base` — that MUST gate to not-ready, else `wrapping_sub` underflows and the gate false-fires
-/// onto UNWRITTEN slots (an independent audit's no-op false-pass). `completed`/`base` are u64 so the
-/// cumulative counters never wrap for the engine's lifetime; with the old u32 they wrapped at ~2^32 lookups
-/// (~135s at peak) and the `completed < base` guard then false-fired forever (permanent hang). Sound ONLY
-/// in-order/single-flight: out-of-order pipelining can satisfy `completed >= base+len` via a later wave's
-/// indices while this wave's own slots are unwritten — that needs a per-slot status gate instead.
-#[inline]
-fn wave_ready(completed: u64, base: u64, len: u32) -> bool {
-    completed >= base && completed.wrapping_sub(base) >= len as u64
 }
 /// Host-side timeout waiting for a wave to drain (the kernel's own backstop is the device-side net).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -153,16 +136,18 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> i32;
 
-/// The persistent multi-projection data-plane kernel. Each thread processes a GRID-STRIDE slice of the index
-/// space (`idx = tid, tid+T, ...`; no claim counter, no CAS), per index doing R1's 4-way-unrolled
-/// multi-column gather + a per-needle record [status,row,v0..v3]; after every K processed indices it does
-/// ONE `membar.sys` + ONE `atom.add(completed, cnt)`. Thread 0 is the coordinator: it mirrors host
-/// doorbell+head into device memory for the other workers (so they never poll the host-mapped ctrl over
-/// PCIe) and publishes `completed` to the host-mapped MIRROR (`ctrl+64`). record-writes -> `membar.sys` ->
-/// `completed`-bump ordering preserves the ordering audit's counter-acquire. Pure ASCII.
+/// The persistent multi-projection data-plane kernel (P2 per-slot status gate). Each thread processes a
+/// GRID-STRIDE slice of the index space (`idx = tid, tid+T, ...`; no claim counter, no CAS), per index doing
+/// R1's 4-way-unrolled multi-column gather, writing the record body (row, v0..v3) to the DEVICE result ring,
+/// then a `st.release.sys` of the per-slot STATUS (1=found, 2=not-found) into a host-mapped STATUS RING. The
+/// release orders the body BEFORE the status, so when the host observes a slot's status != 0 it may safely
+/// DtoH that slot's body -- a PER-SLOT completion signal sound for ANY number of in-flight waves (depth-K
+/// pipelining), unlike a cumulative counter. Thread 0 is the coordinator: it mirrors host doorbell+head into
+/// device memory so the other workers never poll the host-mapped ctrl over PCIe. `.target sm_70` for
+/// release/acquire (also drops the bare-`membar.sys` cumulativity assumption an earlier audit flagged). ASCII.
 const WAVE_DATAPLANE_PTX: &[u8] = br#"
 .version 6.0
-.target sm_30
+.target sm_70
 .address_size 64
 
 .visible .entry gpu_db_wave_read_dataplane(
@@ -170,6 +155,7 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     .param .u64 counters,
     .param .u64 req,
     .param .u64 res,
+    .param .u64 status,
     .param .u64 resident,
     .param .u64 index,
     .param .u32 hash_shift,
@@ -192,6 +178,7 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     ld.param.u64 %rd2, [counters];
     ld.param.u64 %rd3, [req];
     ld.param.u64 %rd4, [res];
+    ld.param.u64 %rd37, [status];
     ld.param.u64 %rd5, [resident];
     ld.param.u64 %rd6, [index];
     ld.param.u32 %r1, [hash_shift];
@@ -217,27 +204,22 @@ const WAVE_DATAPLANE_PTX: &[u8] = br#"
     mad.lo.u32 %r23, %r23, %r26, %r27;           // r23 = global tid = ctaid*ntid + tid
     mov.u32 %r24, %nctaid.x;
     mul.lo.u32 %r24, %r24, %r26;                // r24 = T = nctaid * ntid (actual total threads)
-    cvt.u64.u32 %rd40, %r23;                     // rd40 = idx (u64 CUMULATIVE; u32 wraps at ~2^32 lookups -> gate hang)
+    cvt.u64.u32 %rd40, %r23;                     // rd40 = idx (u64 CUMULATIVE; u32 wraps at ~2^32 lookups)
     cvt.u64.u32 %rd41, %r24;                     // rd41 = T (u64 grid stride)
-    mov.u32 %r25, 0;                             // r25 = cnt_in_batch (processed since last completion flush)
 
 $L_loop:
-    // Thread 0 is the SOLE accessor of the host-mapped ctrl block. It (a) mirrors host doorbell+head into
-    // DEVICE memory (counters+16, counters+8) for the other workers to poll, and (b) publishes the device
-    // `completed` counter into the host-mapped mirror (single writer -> monotonic plain store). Every other
-    // thread polls ONLY device memory. Reason: 1000s of threads polling the host-mapped ctrl over PCIe
-    // congest the bus and starve the host's head write -> 65536-waves never start -> timeouts (the failure
-    // the audit traced, and the limiter that capped earlier variants at ~512 threads).
+    // Thread 0 is the SOLE accessor of the host-mapped ctrl block: it mirrors host doorbell+head into DEVICE
+    // memory (counters+16, counters+8) for the other workers to poll. Every other thread polls ONLY device
+    // memory. Reason: 1000s of threads polling the host-mapped ctrl over PCIe congest the bus and starve the
+    // host's head write -> waves never start -> timeouts (the failure an audit traced; the limiter that
+    // capped earlier variants at ~512 threads). Completion is now per-slot (the status ring), not a counter.
     setp.ne.u32 %p1, %r23, 0;
     @%p1 bra $L_poll;
-    // Layout (8-byte aligned for the u64 counters): ctrl [doorbell@0 u32, head@8 u64, mirror@64 u64];
-    // counters [completed@0 u64, dev_head@8 u64, dev_doorbell@16 u32].
+    // Layout: ctrl [doorbell@0 u32, head@8 u64]; counters [dev_head@8 u64, dev_doorbell@16 u32].
     ld.volatile.global.u32 %r28, [%rd1];        // host doorbell (u32)
     st.volatile.global.u32 [%rd2+16], %r28;     // -> device doorbell mirror (counters+16)
     ld.volatile.global.u64 %rd36, [%rd1+8];     // host head (u64, ctrl+8)
     st.volatile.global.u64 [%rd2+8], %rd36;     // -> device head mirror (u64, counters+8)
-    ld.volatile.global.u64 %rd36, [%rd2];       // device completed (u64, counters+0)
-    st.volatile.global.u64 [%rd1+64], %rd36;    // -> host-mapped completed MIRROR (u64; harvest reads it, no DtoH)
 $L_poll:
     ld.volatile.global.u32 %r6, [%rd2+16];      // device doorbell mirror (counters+16; device read, no PCIe)
     setp.ne.s32 %p1, %r6, 0;
@@ -249,15 +231,8 @@ $L_poll:
     ld.volatile.global.u64 %rd42, [%rd2+8];     // device head mirror (u64, counters+8; device read, no PCIe)
     setp.lt.u64 %p1, %rd40, %rd42;              // idx(u64) < head(u64) -> needle ready
     @%p1 bra $L_have;
-    // No needle for idx yet: publish any pending completion so the host sees progress, then back off on the
-    // wall clock (NOT a tight head re-poll: many idle threads polling head over PCIe starve the host's head
-    // write -- the failure mode the audit traced).
-    setp.eq.u32 %p1, %r25, 0;
-    @%p1 bra $L_backoff;
-    membar.sys;
-    cvt.u64.u32 %rd43, %r25;
-    atom.global.add.u64 %rd44, [%rd2], %rd43;   // completed(u64) += pending; thread 0 mirrors it to the host
-    mov.u32 %r25, 0;
+    // No needle for idx yet: back off on the wall clock (NOT a tight head re-poll: many idle threads polling
+    // head over PCIe starve the host's head write). Per-slot statuses are released per index -> nothing to flush.
 $L_backoff:
     mov.u64 %rd33, %globaltimer;
 $L_backoff_spin:
@@ -329,24 +304,16 @@ $L_probe_next:
     bra $L_probe;
 
 $L_write:
-    st.global.u32 [%rd15], %r17;                // status written LAST (record body already stored above)
-    add.u32 %r25, %r25, 1;                       // cnt_in_batch++
+    // RELEASE the per-slot status into the host-mapped STATUS RING. release.sys orders the record body
+    // (row/v0.. -> res_dev, stored above) BEFORE this store, so the host observing status[slot]!=0 may safely
+    // DtoH that slot's body. rd12 = slot*4 (computed at $L_have; u32 status, same stride as the u32 needle).
+    // Per-slot signal -> sound for any number of in-flight waves (depth-K pipelining), no cumulative counter.
+    add.u64 %rd23, %rd37, %rd12;
+    st.release.sys.global.u32 [%rd23], %r17;
     add.u64 %rd40, %rd40, %rd41;                 // grid-stride advance: idx(u64) += T(u64)
-    setp.lt.u32 %p2, %r25, %r5;                  // keep accumulating until K processed (amortize membar+atom)
-    @%p2 bra $L_loop;
-    membar.sys;                                  // release this batch's record writes BEFORE the completion bump
-    cvt.u64.u32 %rd43, %r25;
-    atom.global.add.u64 %rd44, [%rd2], %rd43;    // completed(u64) += cnt_in_batch (cumulative; thread 0 mirrors it)
-    mov.u32 %r25, 0;
     bra $L_loop;
 
 $L_flush_exit:
-    setp.eq.u32 %p1, %r25, 0;                    // on exit, publish any unflushed records (else completed lags head -> host hangs)
-    @%p1 bra $L_done;
-    membar.sys;
-    cvt.u64.u32 %rd43, %r25;
-    atom.global.add.u64 %rd44, [%rd2], %rd43;    // finalize device counter on exit (u64)
-
 $L_done:
     ret;
 }
@@ -380,6 +347,10 @@ pub(crate) struct WaveReadEngine {
     ctrl_host: *mut c_void,
     /// Device-mapped pinned needle ring (host view): i32[ring_capacity].
     req_host: *mut c_void,
+    /// Device-mapped pinned per-slot STATUS RING (host view): u32[ring_capacity]. The kernel `st.release.sys`
+    /// writes status[slot] (1=found, 2=not-found) per index; `harvest` reads it locally (the per-slot
+    /// completion gate, sound for depth-K pipelining); `submit_async` clears a wave's slots before publishing.
+    status_host: *mut c_void,
     /// PINNED host staging buffer for the DtoH of a drained wave's records (RES_SLOT_BYTES * ring_capacity).
     /// No longer kernel-written (the kernel writes the DEVICE `res_dev` buffer); this is the DtoH target.
     res_host: *mut c_void,
@@ -508,6 +479,7 @@ impl WaveReadEngine {
         let mut counters: u64 = 0;
         let mut ctrl_host: *mut c_void = ptr::null_mut();
         let mut req_host: *mut c_void = ptr::null_mut();
+        let mut status_host: *mut c_void = ptr::null_mut();
         let mut res_host: *mut c_void = ptr::null_mut();
         let mut res_dev: u64 = 0;
         let mut stream: *mut c_void = ptr::null_mut();
@@ -532,6 +504,13 @@ impl WaveReadEngine {
             check_cuda(unsafe {
                 cu_mem_host_alloc(&mut req_host, ring_capacity * 4, CU_MEMHOSTALLOC_DEVICEMAP)
             })?;
+            // Host-mapped per-slot STATUS RING (u32/slot). Kernel release-writes it; harvest reads it locally.
+            check_cuda(unsafe {
+                cu_mem_host_alloc(&mut status_host, ring_capacity * 4, CU_MEMHOSTALLOC_DEVICEMAP)
+            })?;
+            unsafe {
+                ptr::write_bytes(status_host as *mut u8, 0, ring_capacity * 4);
+            }
             check_cuda(unsafe {
                 cu_mem_host_alloc(
                     &mut res_host,
@@ -548,8 +527,10 @@ impl WaveReadEngine {
 
             let mut ctrl_dptr: u64 = 0;
             let mut req_dptr: u64 = 0;
+            let mut status_dptr: u64 = 0;
             check_cuda(unsafe { cu_mem_host_get_device_pointer(&mut ctrl_dptr, ctrl_host, 0) })?;
             check_cuda(unsafe { cu_mem_host_get_device_pointer(&mut req_dptr, req_host, 0) })?;
+            check_cuda(unsafe { cu_mem_host_get_device_pointer(&mut status_dptr, status_host, 0) })?;
 
             check_cuda(unsafe { cu_stream_create(&mut stream, CU_STREAM_NON_BLOCKING) })?;
             check_cuda(unsafe { cu_stream_create(&mut copy_stream, CU_STREAM_NON_BLOCKING) })?;
@@ -558,6 +539,7 @@ impl WaveReadEngine {
             let mut a_counters = counters;
             let mut a_req = req_dptr;
             let mut a_res = res_dev;
+            let mut a_status = status_dptr;
             let mut a_resident = resident_ptr;
             let mut a_index = index_ptr;
             let mut a_shift = hash_shift;
@@ -578,6 +560,7 @@ impl WaveReadEngine {
                 (&mut a_counters as *mut u64).cast::<c_void>(),
                 (&mut a_req as *mut u64).cast::<c_void>(),
                 (&mut a_res as *mut u64).cast::<c_void>(),
+                (&mut a_status as *mut u64).cast::<c_void>(),
                 (&mut a_resident as *mut u64).cast::<c_void>(),
                 (&mut a_index as *mut u64).cast::<c_void>(),
                 (&mut a_shift as *mut u32).cast::<c_void>(),
@@ -623,6 +606,9 @@ impl WaveReadEngine {
                 if !res_host.is_null() {
                     cu_mem_free_host(res_host);
                 }
+                if !status_host.is_null() {
+                    cu_mem_free_host(status_host);
+                }
                 if !req_host.is_null() {
                     cu_mem_free_host(req_host);
                 }
@@ -643,6 +629,7 @@ impl WaveReadEngine {
             stream,
             ctrl_host,
             req_host,
+            status_host,
             res_host,
             res_dev,
             copy_stream,
@@ -685,22 +672,25 @@ impl WaveReadEngine {
             return Err(CudaRuntimeProbeError::InvalidInputLength(needles.len()));
         }
         let base = self.head;
-        // Bulk-copy needles into the (contiguous modulo ring wraparound) slots in one/two memcpys instead of
-        // a per-item volatile loop -- the per-item host I/O, NOT the GPU, was the large-batch drain cap.
-        // The per-slot status clear is dropped: the harvest gate (completed >= base+len) guarantees the
-        // kernel freshly wrote every record of THIS wave before read_records runs, so a stale-slot read is
-        // impossible (the clear only masked the now-fixed gate underflow).
+        // Bulk-copy needles into the (contiguous modulo ring wraparound) slots, AND CLEAR this wave's status
+        // slots to 0, BEFORE publishing head. The clear is mandatory for the per-slot gate: a slot reused from
+        // an earlier wave still holds that wave's status (1/2); clearing to 0 makes `harvest` see "not yet
+        // written" until the kernel release-writes this wave's status. (Host-local writes to the mapped rings.)
         let req = self.req_host as *mut i32;
+        let status = self.status_host as *mut u32;
         let cap = self.ring_capacity;
         let start = (base as usize) & (self.ring_mask as usize);
         let n = needles.len();
         unsafe {
             if start + n <= cap {
                 ptr::copy_nonoverlapping(needles.as_ptr(), req.add(start), n);
+                ptr::write_bytes(status.add(start), 0, n);
             } else {
                 let first = cap - start;
                 ptr::copy_nonoverlapping(needles.as_ptr(), req.add(start), first);
                 ptr::copy_nonoverlapping(needles.as_ptr().add(first), req, n - first);
+                ptr::write_bytes(status.add(start), 0, first);
+                ptr::write_bytes(status, 0, n - first);
             }
         }
         fence(Ordering::SeqCst);
@@ -720,18 +710,16 @@ impl WaveReadEngine {
         })
     }
 
-    /// Non-blocking completion check + read for a `submit_async` ticket. The COMPLETION SIGNAL is the
-    /// HOST-MAPPED `completed` mirror — a local system-RAM read (~ns), no DtoH, published by thread 0 (the
-    /// sole writer; monotonic). A worker releases its record writes via `membar.sys` ahead of its device
-    /// `completed` bump, so once the host observes `completed >= base+len`, this wave's records are committed
-    /// to global memory; `read_records` then bulk-DtoHs them. The cross-engine ordering (worker SM writes ->
-    /// `membar.sys` -> bump -> host observes -> DtoH copy engine reads) relies on `membar.sys` system-scope
-    /// cumulativity reaching the copy engine; this is EMPIRICALLY VALIDATED by the benchmark's byte-identical
-    /// stress gate (thousands of reused-slot waves at K=1, max threads, where a stale/torn copy would carry a
-    /// prior wave's bytes). If ready, returns the rows (found needles only, byte-identical to the R1 index
-    /// probe); else `None`. The mirror can briefly under-read (delays, never early); the caller retries.
-    /// LIVENESS: thread 0's block must stay co-resident (true for the modest grids the SM-coexistence rule
-    /// allows); if it were evicted, head/doorbell mirroring + completion would stall (caught by the backstop).
+    /// Non-blocking completion check + read for a `submit_async` ticket. The completion gate is PER-SLOT: the
+    /// wave is done iff EVERY one of its slots' status (the kernel `st.release.sys`-writes 1=found/2=not-found
+    /// into the host-mapped status ring per index) is non-zero. Host-local reads (~ns), no DtoH. This is sound
+    /// for ANY number of in-flight waves (depth-K pipelining, harvest in any order): a per-slot signal, unlike
+    /// a cumulative counter which a LATER wave's indices can push past this wave's range while a slot here is
+    /// still unwritten. The kernel's release orders each slot's record body (-> `res_dev`) BEFORE its status,
+    /// so observing status != 0 means the body is committed; the `Acquire` fence + `read_records`' DtoH then
+    /// read it. If ready, returns the rows (found needles only, byte-identical to the R1 index probe); else
+    /// `None` (a not-yet-written slot only delays; the caller retries). LIVENESS: thread 0's block must stay
+    /// co-resident (the modest grids the occupancy clamp allows); eviction would stall, caught by the backstop.
     pub(crate) fn harvest(
         &self,
         ticket: WaveTicket,
@@ -739,12 +727,15 @@ impl WaveReadEngine {
         if ticket.len == 0 {
             return Ok(Some(Vec::new()));
         }
-        let completed = unsafe {
-            ptr::read_volatile((self.ctrl_host as *const u8).add(COMPLETED_MIRROR_OFFSET).cast::<u64>())
-        };
-        if !wave_ready(completed, ticket.base, ticket.len) {
-            return Ok(None);
+        let status_ring = self.status_host as *const u32;
+        let mask = self.ring_mask as usize;
+        for i in 0..ticket.len as usize {
+            let slot = (ticket.base as usize).wrapping_add(i) & mask;
+            if unsafe { ptr::read_volatile(status_ring.add(slot)) } == 0 {
+                return Ok(None); // this slot not yet released by the kernel -> wave not complete
+            }
         }
+        fence(Ordering::Acquire); // observed-status -> read-body ordering (pairs with the kernel's release.sys)
         Ok(Some(self.read_records(ticket.base, ticket.len)))
     }
 
@@ -786,13 +777,15 @@ impl WaveReadEngine {
             }
             (self.cu_stream_synchronize)(self.copy_stream);
         }
+        // Found/not-found comes from the host-mapped STATUS RING (the kernel no longer writes status into the
+        // device record); row/values come from the DtoH'd body. The gate already confirmed every slot != 0.
+        let status_ring = self.status_host as *const u32;
         let mut rows = Vec::new();
         for i in 0..n {
-            let rec = unsafe { (dst as *const u8).add(i * RES_SLOT_BYTES) };
-            let status = unsafe { ptr::read_unaligned(rec.cast::<u32>()) };
-            // C3 (audit, defense-in-depth): status 0 = slot the kernel never wrote. The completion gate must
-            // never admit one; if it does (a C1 occupancy breach, or a future out-of-order pipelining change),
-            // fail LOUDLY in tests instead of silently dropping the row (which would return short results).
+            let slot = (base as usize).wrapping_add(i) & (self.ring_mask as usize);
+            let status = unsafe { ptr::read_volatile(status_ring.add(slot)) };
+            // C3 (audit, defense-in-depth): status 0 = slot the kernel never wrote. The gate must never admit
+            // one; if it does, fail LOUDLY in tests instead of silently dropping the row (short results).
             debug_assert!(
                 status != 0,
                 "harvest read an UNWRITTEN slot (status=0) at i={i} -- completion gate admitted an undrained wave",
@@ -800,6 +793,7 @@ impl WaveReadEngine {
             if status != 1 {
                 continue; // 2 = not found (no row, like the R1 index probe)
             }
+            let rec = unsafe { (dst as *const u8).add(i * RES_SLOT_BYTES) };
             let row_index = unsafe { ptr::read_unaligned(rec.add(8).cast::<u64>()) };
             let mut values = Vec::with_capacity(self.proj_count as usize);
             for j in 0..self.proj_count as usize {
@@ -848,6 +842,7 @@ impl WaveReadEngine {
             (self.cu_stream_destroy)(self.stream);
             (self.cu_mem_free)(self.res_dev);
             (self.cu_mem_free_host)(self.res_host);
+            (self.cu_mem_free_host)(self.status_host);
             (self.cu_mem_free_host)(self.req_host);
             (self.cu_mem_free_host)(self.ctrl_host);
             (self.cu_mem_free)(self.counters);
@@ -989,47 +984,111 @@ mod tests {
     }
 
     #[test]
-    fn wave_ready_gate_is_wrap_safe() {
-        // C2 (audit): the harvest gate must stay correct across the region where the OLD u32 cumulative
-        // counters wrapped (~2^32 lookups ~= 135s at peak). u64 keeps base/completed distinct; the prior bug
-        // was the `completed < base` guard false-firing once the absolute counter wrapped -> permanent hang.
-        let w = u32::MAX as u64; // 2^32 - 1, the old u32 wrap boundary
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_engine_depth_k_pipelined_out_of_order_matches_oracle() {
+        // P2b: keep K waves IN FLIGHT (submit_async x K, no harvest between), then harvest them in REVERSE
+        // order, asserting each is byte-identical to a CPU oracle, across many rounds that REUSE ring slots.
+        // A cumulative-counter gate (a later wave's indices pushing it past an earlier wave's range) OR a
+        // stale slot would mismatch here. Proves the per-slot status gate is sound for out-of-order depth-K
+        // pipelining. (CPU oracle, not the R1 probe -> no cuMemAlloc while the kernel is live.)
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        let rows: u64 = 1000;
+        let keys: Vec<i32> = (0..rows as i32).map(|r| r * 3 + 1).collect();
+        let payload: Vec<i32> = (0..rows as i32).map(|r| r * 1000 + 7).collect();
+        let mut buf: Vec<u8> = Vec::with_capacity(rows as usize * 8);
+        for &k in &keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        for &v in &payload {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &buf)
+                .expect("resident device memory"),
+        );
+        let projections = [0_u64, rows * 4]; // [key, payload]
+        let table_size = ((rows * 2) as u32).next_power_of_two();
+        let table_mask = table_size - 1;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0_u64; table_size as usize];
+        for (r, &k) in keys.iter().enumerate() {
+            let key = k as u32;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            while index[h as usize] != 0 {
+                h = (h + 1) & table_mask;
+            }
+            index[h as usize] = ((key as u64) << 32) | (r as u64 + 1);
+        }
+        let index_bytes: Vec<u8> = index.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let index_resident = Arc::new(
+            runtime
+                .retain_device_memory_copy(0, &index_bytes)
+                .expect("index device memory"),
+        );
 
-        // in-progress (completed within [base, base+len)) -> not ready
-        assert!(!wave_ready(w + 50, w, 100));
-        // exactly drained -> ready
-        assert!(wave_ready(w + 100, w, 100));
-        // a wave that STRADDLES 2^32 -> ready (the case the u32 gate hung on: base below, completed above)
-        assert!(wave_ready(w + 6, w - 5, 11)); // dist = 11 >= len 11
-        assert!(!wave_ready(w + 6, w - 5, 12)); // dist = 11 < len 12 -> not yet
+        let mut engine = WaveReadEngine::new(
+            Arc::clone(&index_resident),
+            Arc::clone(&resident),
+            &projections,
+            table_mask,
+            hash_shift,
+            1024,
+            1024,
+            30_000_000_000,
+        )
+        .expect("wave engine");
 
-        // kernel BEHIND this wave's start (completed < base) MUST gate to not-ready (the underflow case)
-        assert!(!wave_ready(w - 10, w, 100));
-        // far past 2^32 still correct
-        let big = 10_000_000_000_u64;
-        assert!(wave_ready(big + 5, big, 5));
-        assert!(!wave_ready(big + 4, big, 5));
-        assert!(!wave_ready(big - 1, big, 5)); // behind
+        let k = 8usize; // waves in flight
+        let wlen = 5usize; // needles per wave
+        let rounds = 64usize; // > ring_capacity/(k*wlen) -> slots are reused many times
+        let mut counter = 0usize;
+        for round in 0..rounds {
+            // Submit K waves; keep all in flight. needles map slot->row deterministically; distinct per wave.
+            let mut inflight: Vec<(WaveTicket, usize)> = Vec::with_capacity(k);
+            for _w in 0..k {
+                let base_idx = counter;
+                counter += wlen;
+                let needles: Vec<i32> =
+                    (0..wlen).map(|i| keys[(base_idx + i) % rows as usize]).collect();
+                let ticket = engine.submit_async(&needles).expect("submit_async");
+                inflight.push((ticket, base_idx));
+            }
+            // Harvest in REVERSE submission order (exercises out-of-order completion).
+            for (ticket, base_idx) in inflight.into_iter().rev() {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let got = loop {
+                    if let Some(r) = engine.harvest(ticket).expect("harvest") {
+                        break r;
+                    }
+                    assert!(Instant::now() < deadline, "harvest timed out (round {round})");
+                };
+                assert_eq!(got.len(), wlen, "wave row count (round {round})");
+                for (j, row) in got.iter().enumerate() {
+                    let want_row = (base_idx + j) % rows as usize;
+                    assert_eq!(row.needle_index, j, "needle_index (round {round})");
+                    assert_eq!(row.row_index, want_row as u64, "row_index (round {round})");
+                    assert_eq!(
+                        row.values,
+                        vec![keys[want_row], payload[want_row]],
+                        "[key,payload] gather (round {round}, j {j}) -- stale/out-of-order slot?"
+                    );
+                }
+            }
+        }
+        engine.shutdown();
     }
 
     #[test]
     fn ctrl_layout_offsets_match_the_kernel_contract() {
-        // Pin the host<->PTX offset contract (audit suggestion): the kernel HARD-CODES ctrl head@8 +
-        // mirror@64. If these host constants drift, the u64 loads misalign or read the wrong field. head must
-        // be 8-aligned (u64), the mirror 8-aligned on its own cacheline, head's 8 bytes must not reach into
-        // the mirror, and the mirror must fit in the ctrl block.
+        // Pin the host<->PTX offset contract (audit suggestion): the kernel HARD-CODES ctrl head@8. If this
+        // host constant drifts, the u64 head load misaligns or reads the wrong field. head must be 8-aligned
+        // (u64) and its 8 bytes must fit in the ctrl block.
         assert_eq!(HEAD_OFFSET, 8, "kernel reads host head at ctrl+8");
-        assert_eq!(COMPLETED_MIRROR_OFFSET, 64, "kernel writes the mirror at ctrl+64");
         assert_eq!(HEAD_OFFSET % 8, 0, "u64 head must be 8-aligned");
-        assert_eq!(COMPLETED_MIRROR_OFFSET % 8, 0, "u64 mirror must be 8-aligned");
-        assert!(
-            HEAD_OFFSET + 8 <= COMPLETED_MIRROR_OFFSET,
-            "head (8B) must not overlap the mirror's cacheline"
-        );
-        assert!(
-            COMPLETED_MIRROR_OFFSET + 8 <= CTRL_BYTES,
-            "mirror (8B) must fit in the ctrl block"
-        );
+        assert!(HEAD_OFFSET + 8 <= CTRL_BYTES, "head (8B) must fit in the ctrl block");
     }
 
     #[test]
