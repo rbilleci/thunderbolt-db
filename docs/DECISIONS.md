@@ -590,6 +590,29 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   box, lpb-path only, not the wave; worth a look if lpb ever becomes default. Remaining marginal levers: members
   ~360us + flatten/SqlValue ~240us, help both equally, do NOT change the now-honest ratio.)**
 
+## Tail latency (SHOWSTOPPER, user 2026-06-28) -> COLUMNAR RESULT, IMPLEMENTED + MERGED (`10c724e6`)
+- **Context:** user flagged the lpb b65536 p99 tail (~30ms vs ~3.8ms p50; the wave was clean) as a SHOWSTOPPER to fix
+  BEFORE the other levers, and to treat as a real defect not shared-box jitter. ([[working-agreement-sequencing]].)
+- **Root-cause (MEASURED, `lpb_phase_split_probe` percentiles + drain sub-phase instrumentation, since removed):** NOT
+  the GPU (kernel-drain `cuStreamSynchronize` = 1-6us even on tail events) and NOT shared-box jitter. The drain
+  (`complete_detached`) built **65536 owned `CudaI32BatchProjectionRow` structs (one heap `Vec<i32>` each)** from the 3
+  flat D2H arrays it ALREADY had -- which the engine then immediately re-flattened. That per-row allocation storm was
+  **~1585us of EVERY batch's drain (the single biggest cost)** and ballooned to ~3850us under allocator pressure = the
+  tail. (Steady-state sub-phase split @b65536: rows-assembly ~1585us, result-D2H ~130us, count ~6us, sync1 ~0us.)
+- **Decision/FIX:** carry matched rows COLUMNAR end-to-end (the 3 flat arrays), never per-row.
+  `CudaI32BatchProjectionColumns {values, needle_indices, row_indices, projection_count}` (+ from_rows/into_rows
+  bridges); `complete_detached_columnar` drains to it (index-array validation in a tight alloc-free loop, same
+  invariants); the wave's `read_records`/`submit_columnar`/`harvest_columnar` build it directly; the engine's
+  Materialized payload + batched completion + `assemble_batched_rows` consume columnar. `complete_detached`/`submit`/
+  `harvest` kept as thin `into_rows` wrappers for the cold per-needle path + tests/probes (no churn).
+- **MEASURED (1M rows, b65536):** lpb COMPLETE **max 9073us -> 1785us**, p99.9 4292 -> 1245 (TAIL FIXED). BONUS (the
+  per-row Vec was also the steady-state cap + forced a cache-hostile re-read of 65536 scattered Vecs): lpb-batched
+  **14.6M -> 44.1M (+3x)**, wave-batched 19.5M -> 37.4M (+~2x). **REVERSAL: with the boxing gone, lpb now BEATS the wave
+  (batched single-flight wave/lpb 0.85x@b65536, 0.94x@b4096)** -- the per-row Vec had been MASKING lpb's true speed (it
+  sat in lpb's critical-path COMPLETE; the wave's was partly hidden in submit). Re-opens the wave-vs-lpb question:
+  for the batched single-flight regime lpb is now the faster route. Byte-identical (GPU differentials wave==lpb==scan +
+  batched==per-needle + multirow 3/0; execution wave 8/0; facade 32/0; protocol 71/0). Audit pending at commit time.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
