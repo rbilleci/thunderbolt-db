@@ -429,6 +429,23 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
     remove the gates and become the point-read fast-path default.** This is the charter trajectory bet: the wave is the
     better engine for the regime, gated on the concurrency architecture, not on raw GPU speed.
 
+- **R2.2c gate-1 PROBE — K-coexisting-minimal-kernel approach REJECTED (negative result, 2026-06-28,
+  `execution/examples/wave_multikernel_probe`).** To lift the at-most-one-resident invariant (so multiple point-read
+  SHAPES each own a coexisting wave engine = no thrash), the obvious fix was minimal-grid (1-SM) kernels so K leave SMs
+  free. The probe measured two unknowns for minimal (threads=256, 1 block) vs fat (threads=8192): (1) BUILD a 2nd engine
+  while the 1st runs, (2) TEAR one down while the other runs, finite 4s backstop, timed. RESULT: (1) build-while-running
+  = 0ms for BOTH -> `cuMemAlloc` did NOT device-sync (contra the earlier freeze worry; two kernels DO run concurrently —
+  e1 served correctly while e0 spun); (2) teardown-while-running = 4000ms (=backstop) for BOTH minimal AND fat, and the
+  survivor then failed. So **the torn-down kernel's DOORBELL EXIT fails whenever a second wave kernel is resident — it
+  dies only via the backstop — and that cascades to break the survivor.** Single-engine teardown is fast (proven by the
+  Send/foreign-drop tests), so it is coexistence-specific, NOT SM starvation (minimal kernels have ~all 188 SMs free) and
+  NOT the alloc device-sync. **Conclusion: lifting at-most-one is NOT a grid-size change; the at-most-one invariant is
+  VINDICATED.** Gate-1 options now: (a) diagnose+fix the coexistence doorbell/teardown (uncertain; deep GPU-scheduling/
+  zero-copy-visibility question), (b) a single SHARED multi-shape kernel (one persistent kernel draining K rings — big
+  redesign), or (c) a no-rebuild "one sticky/hottest shape gets the wave, all others use lpb" policy (small accessor
+  change: on a DIFFERENT-shape miss return None->lpb instead of drain+rebuild; keeps at-most-one, captures the
+  dominant-shape win without coexistence). The wave remains a validated single-shape single-coalescer win behind the flag.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
