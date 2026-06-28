@@ -528,6 +528,14 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   question): materialization-first is right + cheap, and solving it makes end-to-end GPU-DRAIN-bound -> the persistent-
   kernel decision UNMASKS to wave 30M vs lpb 23M (1.26x large batch, up to 2.4x small batch), measurable for the first
   time. NEXT: implement the Arc-share + re-measure end-to-end, then decide the persistent kernel on the real number.**
+  **IMPLEMENTED (`a59add53`): `RelationalSelectResult.{columns,access_path}` -> `Arc`, retained-read batched path shares
+  ONE Arc/batch (refcount-clone per needle). Measured end-to-end (1M rows): batch256 lpb 2.35M->4.06M / wave
+  2.76M->5.42M; batch4096 lpb 3.17M->7.15M / wave 3.32M->7.84M; batch65536 similar. ~2.4x; the wave edge is now PARTLY
+  unmasked (wave/lpb 1.10x large -> 1.83x batch32, trending toward the raw-drain 1.26-2.4x). Behavior-preserving (engine
+  438/0, GPU differential byte-identical 3x). Residual ~127ns/row cap (7.8M, still < the 30M drain) = the per-row
+  `Vec<SqlValue>` + completion grouping/sort/round-trips (the "flat"/columnar layer the prototype showed at 1.8ns/row) --
+  a FURTHER, bigger change (rows representation) if the full GPU drain end-to-end is wanted. Kernel decision: still
+  trending wave-favorable; full unmask needs the per-row layer.**
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
