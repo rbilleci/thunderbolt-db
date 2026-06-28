@@ -480,6 +480,23 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   the host-machinery optimization is the genuine "cheaper alternative" — but it is a multi-part change to the SHIPPED R1
   lpb path (round-trip collapse + buffer arena + event sampling), so weigh it vs R3 (writes) before committing the surgery.
 
+- **R2.2c throughput at scale/threads -> the read path is ALREADY over the OLTP SLO; read-side opt is polish, R3 is the
+  bottleneck (2026-06-28, `engine/examples/r2_wave_engine_ab` swept over rows x batch x threads).** Data (RTX PRO 6000):
+  - SINGLE-FLIGHT, wave/lpb ratio is TABLE-SIZE-INDEPENDENT (both O(1)): batch1 ~2.4x, batch32 ~1.6x, batch256 ~1.17x,
+    batch4096 ~1.05x across 256k/1M/4M rows. Absolute SATURATES ~3.1-3.3M lookups/s at batch4096 (GPU-bound, scale-
+    independent). lpb absolute by batch (~scale-independent): b1 ~36k, b32 ~0.9M, b256 ~2.35M, b4096 ~3.15M. (Only the
+    SCAN baseline degrades with scale: wave/scan grows 2.4x->4x as rows 256k->4M; but lpb is the shipped baseline.)
+  - CONCURRENT (batch=32, O(1) -> scale-independent), lookups/s by threads: lpb 840k(1t) -> 1.02M(2t) -> 1.45M(4t) ->
+    1.67M(8t) -> 1.83M(16t) = SCALES with threads (pipelined launches); the wired single-flight wave PLATEAUS ~1.35M
+    (per-engine Mutex) and crosses UNDER lpb at ~4t (wave/lpb 1.58x@1t -> 0.95x@4t -> 0.67x@16t).
+  - vs the SLO (100k sustained / 400k peak TPS; a point-read txn ~= 1-several lookups -> ~100k-2M lookups/s): the read
+    path delivers ~0.9M-3.3M lookups/s at batch>=32 across ALL scales AND scales with threads to ~1.8M+ -> comfortably
+    2-30x the SLO. The ONLY sub-SLO regime is un-batched batch=1 single-flight (~36k lpb / ~88k wave) -- exactly what the
+    coalescer batches away under real load. So NEITHER the wave NOR an lpb host-machinery opt addresses an SLO
+    bottleneck; the read half is settled AND over-provisioned. **DECISION: the write half (R3) -- entirely unmeasured,
+    gating the SLO and the CPU-engine deletion -- is the priority. Pivot to R3; keep lpb the read default + the wave
+    validated behind the flag (its only niche, the multi-producer regime, is itself below where the read SLO bites).**
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
