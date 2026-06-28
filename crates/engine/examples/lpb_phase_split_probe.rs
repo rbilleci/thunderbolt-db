@@ -89,6 +89,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
+    let batch_sizes: Vec<usize> = env::var("GPU_DB_BENCH_BATCH")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![1, 32]);
 
     let rows_u = rows as u64;
     let mut step = 0x9E37_79B1u64 % rows_u.max(2);
@@ -114,7 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "mode", "batch", "submit p50 us", "complete p50 us", "total p50 us", "route_hits"
     );
 
-    for &batch in &[1usize, 32] {
+    for &batch in &batch_sizes {
         for (label, wave_engine, persistent) in
             [("lpb", true, false), ("wave", true, true)]
         {

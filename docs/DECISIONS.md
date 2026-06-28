@@ -513,6 +513,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   result materialization (likely GPU-side result formatting toward the wire, the charter's "final device->wire
   readback"), NOT the wave-vs-lpb choice alone. Supersedes "R2.2c throughput at scale/threads" + "host-machinery spike".
 
+- **Result-path optimization — the ~3M end-to-end cap is the per-needle SCHEMA DEEP-CLONE; Arc-sharing it recovers 15x
+  (>GPU drain) (2026-06-28, `engine/examples/{lpb_phase_split_probe,result_assembly_probe}`).** Phase-split across batch
+  sizes localized the host overhead per row at batch=65536: lpb SUBMIT ~107ns/row (the per-needle
+  `template.result_columns.clone()` + `access_path.clone()` in member-building — cloning identical template data once
+  per needle) + COMPLETE ~226ns/row (`Vec<SqlValue>`-per-row + per-needle `RelationalSelectResult` assembly). CPU
+  prototype (N=65536 point-read results): CURRENT (deep-clone columns/access_path per needle + Vec<SqlValue>/row) =
+  399ns/row -> 2.5M/s (matches the engine's ~3M end-to-end); LEAN-ARC (Arc-share columns + access_path, same
+  Vec<SqlValue>) = 25.8ns/row -> **38.8M/s (15.5x)**; FLAT (+drop per-row Vec) = 1.8ns/row. **So the entire end-to-end
+  read cap is the per-needle SCHEMA DEEP-CLONE (each RelationalColumn has String fields -> heap allocs, x N needles);
+  the per-row Vec<SqlValue> is NOT the bottleneck.** Arc-sharing the result schema (`RelationalSelectResult.columns` ->
+  `Arc<Vec<RelationalColumn>>`, `access_path` -> Arc) is a CONTAINED change (~21 construction sites; reads deref
+  transparently) that lifts the host path to 38.8M/s -- ABOVE the GPU drain (30M). **CONSEQUENCE (answers the sequencing
+  question): materialization-first is right + cheap, and solving it makes end-to-end GPU-DRAIN-bound -> the persistent-
+  kernel decision UNMASKS to wave 30M vs lpb 23M (1.26x large batch, up to 2.4x small batch), measurable for the first
+  time. NEXT: implement the Arc-share + re-measure end-to-end, then decide the persistent kernel on the real number.**
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
