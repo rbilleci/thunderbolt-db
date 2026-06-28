@@ -167,7 +167,10 @@ impl Engine {
             auto_admit_on_commit: std::sync::atomic::AtomicBool::new(false),
             wave_engine_enabled: std::sync::atomic::AtomicBool::new(false),
             wave_persistent_engine_enabled: std::sync::atomic::AtomicBool::new(false),
-            dense_index_probe_enabled: std::sync::atomic::AtomicBool::new(false),
+            // DEFAULT ON (user 2026-06-29): the dense kernel is the default for the lpb unique-index route — a
+            // strict win at >=b4096, neutral at b256, byte-identical + audit SHIP. (Independent of whether the
+            // index route itself is enabled via `wave_engine_enabled`, which stays gated.)
+            dense_index_probe_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 

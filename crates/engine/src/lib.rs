@@ -327,8 +327,9 @@ pub struct Engine {
     wave_persistent_engine_enabled: AtomicBool,
     /// DECISIONS "lpb read levers" #1: when true, the lpb unique index probe uses the DENSE-emit kernel
     /// (thread `i` -> slot `i`, no atomic, no needle_indices/row_indices/count; host compacts sequentially)
-    /// instead of the atomic-compaction kernel. Byte-identical; default off (the A/B / safety lever). Only the
-    /// unique index route honors it — the non-unique scan always keeps the atomic kernel. Interior-mutable.
+    /// instead of the atomic-compaction kernel. Byte-identical; DEFAULT ON (user 2026-06-29: strict win
+    /// >=b4096, audit SHIP) — set false to A/B against the atomic kernel. Only the unique index route honors
+    /// it — the non-unique scan always keeps the atomic kernel. Interior-mutable.
     dense_index_probe_enabled: AtomicBool,
 }
 
