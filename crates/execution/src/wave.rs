@@ -916,6 +916,7 @@ impl WaveReadEngine {
             needle_indices,
             row_indices,
             projection_count: proj,
+            status: Vec::new(),
         }
     }
 

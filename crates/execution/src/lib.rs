@@ -2594,6 +2594,12 @@ pub struct CudaI32BatchProjectionColumns {
     pub needle_indices: Vec<u32>,
     pub row_indices: Vec<u64>,
     pub projection_count: usize,
+    /// DENSE LAYOUT marker (DECISIONS "lpb read levers" #1): EMPTY for the compacted atomic/wave form above.
+    /// When NON-empty, `values` is the DENSE form — one slot per needle (`status.len()` needles, gaps for
+    /// absent), so `values[i*projection_count..]` is NEEDLE `i`'s projection and `status[i]` is 1 (found) /
+    /// 2 (not-found); `needle_indices`/`row_indices` are empty. The engine assemble compacts it in ONE
+    /// sequential pass (no host scatter), instead of re-compacting an already-compacted result.
+    pub status: Vec<u32>,
 }
 
 impl CudaI32BatchProjectionColumns {
@@ -2630,6 +2636,7 @@ impl CudaI32BatchProjectionColumns {
             needle_indices,
             row_indices,
             projection_count,
+            status: Vec::new(),
         }
     }
     /// Bridge back to the per-row form for the cold per-needle completion + tests (re-introduces the per-row
@@ -2641,6 +2648,22 @@ impl CudaI32BatchProjectionColumns {
             self.projection_count > 0 || self.values.is_empty(),
             "into_rows: projection_count==0 with non-empty values would silently drop rows"
         );
+        // DENSE layout (status set): slot `i` is needle `i`; keep status==1. Cold per-needle path; row_index
+        // synthesized 0 (unique => never read).
+        if !self.status.is_empty() {
+            let p = self.projection_count.max(1);
+            let mut rows = Vec::new();
+            for i in 0..self.status.len() {
+                if self.status[i] == 1 {
+                    rows.push(CudaI32BatchProjectionRow {
+                        needle_index: i,
+                        row_index: 0,
+                        values: self.values[i * p..i * p + p].to_vec(),
+                    });
+                }
+            }
+            return rows;
+        }
         // The DENSE index-probe produces no `row_indices` (unique => no within-needle sort needs them); the
         // cold per-needle path that calls `into_rows` synthesizes 0 (the value is never read — a 1-row needle
         // is trivially ordered, and the differentials compare projected values, not row_index).
@@ -2926,6 +2949,7 @@ impl CudaI32EqualAnyProjectSubmission {
             needle_indices,
             row_indices,
             projection_count: self.projection_count,
+            status: Vec::new(),
         };
         Ok((columns, elapsed_us))
     }
@@ -10396,25 +10420,16 @@ impl CudaI32IndexProbeDenseSubmission {
         })
         .map_err(drain_err)?;
 
-        // Sequential compaction: read slot 0..nc in order (cache-friendly), keep `status==1` (found). A
-        // `status==0` slot means a thread never wrote it — a kernel/launch bug; fail LOUD in tests.
-        let mut values = Vec::with_capacity(values_raw.len());
-        let mut needle_indices = Vec::with_capacity(nc);
-        for i in 0..nc {
-            debug_assert!(
-                status[i] != 0,
-                "dense index-probe: status slot {i} never written (gap) — completion read an undrained kernel",
-            );
-            if status[i] == 1 {
-                values.extend_from_slice(&values_raw[i * proj..i * proj + proj]);
-                needle_indices.push(i as u32);
-            }
-        }
+        // Return the DENSE LAYOUT as-is (NO compaction here): `values_raw` is one slot per needle (gaps) +
+        // `status`. The engine's `assemble_batched_rows` compacts it in ONE sequential pass — compacting here
+        // AND letting the engine re-scatter would be two passes (measured slower than the atomic scatter). The
+        // gap guard (`status != 0`) lives at the compaction site.
         let columns = CudaI32BatchProjectionColumns {
-            values,
-            needle_indices,
+            values: values_raw,
+            needle_indices: Vec::new(),
             row_indices: Vec::new(),
             projection_count: proj,
+            status,
         };
         Ok((columns, elapsed_us))
     }

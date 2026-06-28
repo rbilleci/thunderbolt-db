@@ -1182,6 +1182,36 @@ impl Engine {
         access_path: Arc<RelationalAccessPath>,
         gpu_id: u16,
     ) -> RelationalRetainedBatchResult {
+        // DENSE LAYOUT (DECISIONS "lpb read levers" #1): `values` is one slot per needle (gaps), `status[i]`
+        // is 1 (found) / 2 (not-found). Compact in ONE sequential pass — read slot `i` in order (cache-
+        // friendly), keep status==1, write packed. No host scatter, no `needle_indices` (slot == needle), no
+        // count. (The atomic/wave compacted form has empty `status` and takes the scatter path below.)
+        if !projected.status.is_empty() {
+            debug_assert_eq!(projected.status.len(), n, "dense status must be one per needle");
+            let mut values = Vec::with_capacity(projected.values.len());
+            let mut needle_ranges = Vec::with_capacity(n);
+            let mut acc = 0u32;
+            for i in 0..n {
+                debug_assert!(
+                    projected.status[i] != 0,
+                    "dense index-probe: status slot {i} never written (gap) — undrained kernel",
+                );
+                let present = projected.status[i] == 1;
+                needle_ranges.push((acc, u32::from(present)));
+                if present {
+                    values.extend_from_slice(&projected.values[i * ncols..i * ncols + ncols]);
+                    acc += 1;
+                }
+            }
+            return RelationalRetainedBatchResult {
+                columns,
+                access_path,
+                gpu_id,
+                values,
+                ncols,
+                needle_ranges,
+            };
+        }
         let nrows = projected.nrows();
         // Per-needle counts -> prefix-sum ranges + whether ANY needle matched >1 row.
         let mut counts = vec![0u32; n];
