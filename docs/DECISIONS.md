@@ -446,6 +446,23 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   change: on a DIFFERENT-shape miss return None->lpb instead of drain+rebuild; keeps at-most-one, captures the
   dominant-shape win without coexistence). The wave remains a validated single-shape single-coalescer win behind the flag.
 
+- **R2.2c graphs spike — CUDA graphs do NOT close the lpb->wave gap; the gap is HOST MACHINERY, not launch
+  (negative result, 2026-06-28, `execution/examples/lpb_cudagraph_probe`).** Hypothesis (user): the wave's
+  single-coalescer win is launch-overhead avoidance (lpb 27us vs wave 10us), so a CUDA-graph-captured lpb launch
+  (~2-5us) would close it with none of the persistent-kernel complexity. Spike: a gather op (same shape as the lpb
+  point read — HtoD needles -> kernel gathers table[needle&mask] -> DtoH), per-batch p50 DIRECT (HtoDAsync+launch+
+  DtoHAsync+sync) vs GRAPH (cuGraphLaunch+sync), byte-identical. RESULT: DIRECT == GRAPH == ~7us at batch 1/8/32
+  (graph speedup 1.00x; 1.14x at 256). So **the raw GPU op floor is ~7us and it is the GPU ROUND-TRIP (sync-bound),
+  not CPU-side launch submission** — graphs only collapse submission (~2 async ops, <1us for a single-launch batch),
+  dwarfed by the round-trip. The premise is FALSIFIED: raw launch is 7us (not 27, not 2-5), graphs can't reduce it.
+  **KEY BYPRODUCT: lpb's A/B 27us vs the raw 7us => ~20us is per-batch ENGINE HOST MACHINERY** (per-batch
+  `cuMemAlloc` for result buffers + pooled-stream lease + event timing + deferred-complete), which the wave avoids via
+  its pre-allocated ring (-> ~10us). So the genuine "cheaper alternative" to the wave for the single-coalescer regime
+  is NOT graphs — it is **pooling/optimizing lpb's per-batch host machinery** (no persistent kernel, no at-most-one, no
+  coexistence, no SM tax). The wave's unique remaining edge is the multi-PRODUCER concurrent regime (gate-2). Open
+  before any wave default-flip regardless: measure the wave's SM-coexistence tax on a MIXED workload (~60% loss at 8
+  reserved SMs per the coexistence gate) — size the kernel down / spin up only under point-read load, don't flip blind.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
