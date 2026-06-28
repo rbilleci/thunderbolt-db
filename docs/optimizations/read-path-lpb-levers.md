@@ -9,6 +9,24 @@ Companion doc for the batch=1 / small-batch latency deep-dive:
 **Status when written:** 2026-06-28, branch context post-`ec4b1a8c`. Analysis is **code-only** (no benchmarks
 run — another agent is actively optimizing; do not collide on the result-assembly code they touch).
 
+## STATUS UPDATE (2026-06-29) — DECISIONS "lpb read levers"
+- **#1 (dense per-needle emit) + #2 (single sync) + #4-folded + the `row_indices` elision → DONE + MERGED
+  default-OFF + AUDIT SHIP (`3603732f`+`7053743f`).** Built as the dense `gpu_db_resident_i32_index_probe_dense`
+  kernel + a `status` field on `CudaI32BatchProjectionColumns` + a SINGLE-PASS engine compaction, behind
+  `dense_index_probe_enabled` (+ `dense_index_probe_hits` counter). Byte-identical (4/0 GPU differentials).
+  MEASURED: lpb 627µs→411µs @b65536 (−34%, ~160M l/s), beats the wave at ≥b4096 with no persistent kernel; tail
+  tightens (max 986→609); b256 ~neutral. **Key simplification found: the index route is ALREADY unique-only, so
+  no catalog uniqueness flag was needed — which kernel ran encodes it.** First cut compacted in the drain (a
+  regression — two passes); fixed via the single-pass. Flip-to-default is the user's call.
+- **#3 (spin-poll for the p99 tail) → OBSOLETE.** Its premise (the ~30ms tail is a blocking-sync issue) was
+  WRONG: the tail was root-caused to the per-row `Vec` allocation storm (host allocator), not the sync, and
+  FIXED by the columnar drain (`10c724e6`; complete max 9073µs→1785µs). Drain instrumentation showed sync #1 was
+  1–6µs even on tail events, contradicting the "host blocks behind other processes' kernels" theory. A spin-poll
+  could still help a residual contention tail, but it is no longer the showstopper this lever claims.
+- **#5 (avoid the pinned→pageable copy) → MEASURED ~52µs, NOT pursued standalone:** `copy_pinned_into` is ~52µs/
+  batch at b65536 (not "minor"), but #1's dense path already removes 2 of its 3 copies (no `needle_indices`/
+  `row_indices`); a standalone pinned-lifetime refactor wasn't worth it.
+
 ---
 
 ## Context — what this session already did (DO NOT redo)

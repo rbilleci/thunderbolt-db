@@ -647,6 +647,24 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
     guard (wrong flag -> empty row_indices -> panic). BOTH are ~3-7.5% LARGE-BATCH-ONLY (at small batches row_indices is
     a few rows = ~0) and touch the safety-critical drain. Deferred in favor of small-batch work. Revisit only if the
     large-batch case specifically matters.
+  - **(3) DENSE-EMIT UNIQUE INDEX PROBE (read-path-lpb-levers.md #1 + #2 + row_indices elision) -> DONE + MERGED
+    default-OFF + AUDIT SHIP (`3603732f`+`7053743f`):** the lpb index route is ALREADY unique-only (non-unique ->
+    scan kernel), so `which kernel ran` encodes uniqueness — no catalog flag. New PTX
+    `gpu_db_resident_i32_index_probe_dense`: thread i writes values[i*proj]+status[i] (1/2) to its OWN slot — NO
+    atom.global.add, NO needle_indices, NO out_count, NO row_indices (folds in #2 single-sync + row_indices
+    elision; the non-unique scan keeps the atomic kernel). Host compacts in ONE sequential pass. Other-agent
+    feedback adopted: dropped release-ordering worry (cuStreamSynchronize is the barrier, plain st.global);
+    PTX scrutiny on GAPS (status memset 0 + every in-bounds thread writes 1/2 + debug_assert!=0) / BOUNDS /
+    PROBE-PARITY. **First cut compacted in the DRAIN = a REGRESSION (two passes); fixed via SINGLE-PASS (dense
+    layout = values gaps + a new `status` field on CudaI32BatchProjectionColumns flows to assemble_batched_rows,
+    ONE compaction).** MEASURED (1M all-present): lpb-atomic 627us -> lpb-DENSE **411us @b65536 (-34%, ~160M l/s)**,
+    60->50us @b4096 (beats the wave 65us, NO persistent kernel); tail tightens (max 986->609); b256 ~neutral
+    (assemble tiny). Byte-identical (r2_dense_index_probe_matches_atomic: all-match/none/gap/NULL-as-0/singles +
+    wave==lpb==scan, 4/0; dense_index_probe_hits non-vacuity). Audit SHIP, no P1/P2/P3 (PTX byte-identical by
+    mechanical diff; no gap path; hash is performance- not correctness-load-bearing so a hash divergence can't be
+    caught by a correctness test — the mechanical diff is the proof). **DEFAULT-OFF behind
+    `dense_index_probe_enabled`; flip = strict win for the index route at >=b4096 (the production point-read
+    regime), neutral at b256. The flip decision is the user's.**
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
