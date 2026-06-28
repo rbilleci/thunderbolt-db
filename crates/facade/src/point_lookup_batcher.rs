@@ -49,7 +49,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use gpu_db_batching::{Batch, DualTriggerBatcher};
-use gpu_db_engine::{Engine, ExecuteError, RelationalSelectResult};
+use gpu_db_engine::{Engine, ExecuteError, RelationalRetainedBatchResult};
 use gpu_db_sql::Select;
 use tokio::sync::oneshot;
 
@@ -510,15 +510,15 @@ fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
     }
     // Deduplicate needles into one submission, then map each request back to its needle's result.
     let (distinct_needles, request_result_index) = dedup_needles(&group);
-    let results = match submit_and_complete_template(engine, &template, &distinct_needles) {
-        Ok(results) => results,
+    let batched = match submit_and_complete_template_batched(engine, &template, &distinct_needles) {
+        Ok(batched) => batched,
         Err(err) => {
             fail_group(group, err);
             return;
         }
     };
-    debug_assert_eq!(results.len(), distinct_needles.len());
-    distribute_results(group, request_result_index, results);
+    debug_assert_eq!(batched.needle_count(), distinct_needles.len());
+    distribute_results_batched(group, request_result_index, batched);
 }
 
 /// Deduplicate a group's needles, returning the distinct needles (first-seen order) and, per request,
@@ -542,24 +542,38 @@ fn dedup_needles(group: &[PointLookupRequest]) -> (Vec<i32>, Vec<usize>) {
     (distinct_needles, request_result_index)
 }
 
-/// One `RelationalSelectResult` per distinct needle, in needle order: map each request to its needle's
-/// result and answer its oneshot. A dropped receiver (client disconnected while parked) makes `send`
-/// fail harmlessly.
-fn distribute_results(
+/// Dispatch a BATCHED retained-read result to each request: map the SHARED projected schema to wire ONCE
+/// (was per-needle), then slice the one flat `RowBlock` by each needle's range to build that request's
+/// `QueryOutcome::Rows` — avoiding the N per-needle `RelationalSelectResult` structs + N column re-maps.
+/// Byte-identical neutral output to the per-query path. A dropped receiver makes `send` fail harmlessly.
+fn distribute_results_batched(
     group: Vec<PointLookupRequest>,
     request_result_index: Vec<usize>,
-    results: Vec<RelationalSelectResult>,
+    batched: RelationalRetainedBatchResult,
 ) {
+    let columns: Vec<_> = batched.columns.iter().map(map_column).collect();
+    let ncols = batched.ncols();
     for (request, result_idx) in group.into_iter().zip(request_result_index) {
-        let outcome = results
-            .get(result_idx)
-            .map(map_select_result_to_outcome)
-            .unwrap_or_else(|| {
-                Err(DbError {
-                    category: ErrorCategory::Internal,
-                    message: "batched point-lookup result slice missing for request".to_string(),
-                })
-            });
+        let outcome = if result_idx < batched.needle_count() {
+            // This needle's rows as a flat slice -> chunk into rows, map each value to wire.
+            let vals = batched.needle_values(result_idx);
+            let rows: Vec<Vec<_>> = if ncols == 0 {
+                Vec::new()
+            } else {
+                vals.chunks(ncols)
+                    .map(|row| row.iter().cloned().map(map_value).collect())
+                    .collect()
+            };
+            Ok(QueryOutcome::Rows {
+                columns: columns.clone(),
+                rows,
+            })
+        } else {
+            Err(DbError {
+                category: ErrorCategory::Internal,
+                message: "batched point-lookup result slice missing for request".to_string(),
+            })
+        };
         let _ = request.respond.send(outcome);
     }
 }
@@ -572,28 +586,15 @@ fn fail_group(group: Vec<PointLookupRequest>, err: ExecuteError) {
     }
 }
 
-/// Submit then complete a template+needles batch. Kept as one call so the read view spans the whole
+/// Submit then complete (BATCHED) a template+needles batch. One call so the read view spans the whole
 /// submit→complete window (the engine API takes `&self`).
-fn submit_and_complete_template(
+fn submit_and_complete_template_batched(
     engine: &Engine,
     template: &gpu_db_engine::RelationalRetainedReadTemplate,
     needles: &[i32],
-) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+) -> Result<RelationalRetainedBatchResult, ExecuteError> {
     let submission = engine.submit_relational_retained_template_point_lookups(template, needles)?;
-    engine.complete_relational_retained_read_submission(submission)
-}
-
-/// Map one engine relational select result into a neutral [`QueryOutcome::Rows`],
-/// reusing the façade's `map_column`/`map_value` so the batched path produces
-/// byte-identical neutral output to the per-query path.
-fn map_select_result_to_outcome(result: &RelationalSelectResult) -> Result<QueryOutcome, DbError> {
-    let columns = result.columns.iter().map(map_column).collect();
-    let rows = result
-        .rows
-        .iter()
-        .map(|row| row.iter().cloned().map(map_value).collect())
-        .collect();
-    Ok(QueryOutcome::Rows { columns, rows })
+    engine.complete_relational_retained_read_submission_batched(submission)
 }
 
 fn fail_all(requests: Vec<PointLookupRequest>, err: DbError) {
