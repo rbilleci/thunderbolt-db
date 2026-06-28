@@ -536,6 +536,17 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   `Vec<SqlValue>` + completion grouping/sort/round-trips (the "flat"/columnar layer the prototype showed at 1.8ns/row) --
   a FURTHER, bigger change (rows representation) if the full GPU drain end-to-end is wanted. Kernel decision: still
   trending wave-favorable; full unmask needs the per-row layer.**
+  **STEP-1 BREAKDOWN (`result_materialization_probe`, CPU, N=65536): current `Vec<Vec<SqlValue>>` + group/sort =
+  153ns/row (6.5M); FLAT-SQLVALUE (one row-major `Vec<SqlValue>` + per-needle ranges) = 2.3ns/row (433M, 66.5x);
+  FLAT-I32 (raw, no enum-wrap) = 0.8ns/row (186x). So the residual is ENTIRELY the per-row `Vec<SqlValue>` boxing +
+  per-needle grouping/sort -- NOT the SqlValue conversion (the enum-wrap is only a further 3x). FLATTENING THE `rows`
+  CONTAINER to a row-major `Vec<SqlValue>` (KEEPING SqlValue -> wire value-type + encoding unchanged) recovers 66.5x ->
+  2.3ns/row, FAR below the GPU drain (33ns/row) -> the engine materialization becomes negligible and end-to-end goes
+  GPU-DRAIN-bound (wave 30M / lpb 23M fully unmasked). flat-i32/GPU->wire is a further 3x, NOT needed to reach the
+  drain. So the columnar layer = a `rows`-CONTAINER flatten (Vec<Vec<SqlValue>> -> flat + shape), value semantics
+  unchanged -- wide (rows is read everywhere) but more tractable than a value-type/GPU->wire rewrite. NEXT: prototype
+  flat `rows` on the hot retained path + facade, re-measure end-to-end vs the drain, then the kernel call is on the
+  real GPU-bound number.**
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
