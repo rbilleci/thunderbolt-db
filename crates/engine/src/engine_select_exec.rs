@@ -173,12 +173,12 @@ impl Engine {
                 )));
             }
             return Ok(RelationalSelectResult {
-                columns: view.columns,
+                columns: Arc::new(view.columns),
                 rows: view.rows,
                 planned_target: DeviceTarget::Cpu,
                 executed_target: DeviceTarget::Cpu,
                 fallback_reason: Some(FallbackReason::NotGpuEligible),
-                access_path: RelationalAccessPath::FullTableScan,
+                access_path: Arc::new(RelationalAccessPath::FullTableScan),
             });
         }
         // Phase-3 M2: a SELECT against a synthesized pg_catalog/information_schema relation
@@ -283,7 +283,7 @@ impl Engine {
         let value = parse_bounded_sql_function_body(&function.body, function.return_type)?;
         self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
         Ok(RelationalSelectResult {
-            columns: vec![RelationalColumn {
+            columns: Arc::new(vec![RelationalColumn {
                 id: 0,
                 table_oid: function.oid,
                 attnum: 1,
@@ -293,12 +293,12 @@ impl Engine {
                 default: None,
                 type_oid: function.return_type.postgres_oid(),
                 type_size: function.return_type.type_size(),
-            }],
+            }]),
             rows: vec![vec![value]],
             planned_target: DeviceTarget::Cpu,
             executed_target: DeviceTarget::Cpu,
             fallback_reason: Some(FallbackReason::NotGpuEligible),
-            access_path: RelationalAccessPath::FullTableScan,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
         })
     }
 

@@ -122,7 +122,7 @@ impl Engine {
         })?;
         let mut columns = Vec::with_capacity(result.columns.len());
         let mut next_column_id = cat.relational_next_column_id;
-        for (idx, column) in result.columns.into_iter().enumerate() {
+        for (idx, column) in result.columns.iter().cloned().enumerate() {
             let attnum = i16::try_from(idx + 1).map_err(|_| {
                 EngineError::ApplyFailed(
                     "too many columns for bootstrap materialized view".to_string(),

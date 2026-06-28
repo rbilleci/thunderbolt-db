@@ -196,7 +196,7 @@ fn relational_index_access_path_survives_wal_recovery() {
     let result = recovered.execute_relational_select(&select).unwrap();
 
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),

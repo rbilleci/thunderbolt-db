@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
@@ -1204,12 +1205,12 @@ fn expected_result_for_case(
         other => return Err(format!("no formula-backed expected result for {other}").into()),
     };
     Ok(RelationalSelectResult {
-        columns: Vec::new(),
+        columns: Arc::new(Vec::new()),
         rows: vec![vec![value]],
         planned_target: gpu_db_execution::DeviceTarget::Cpu,
         executed_target: gpu_db_execution::DeviceTarget::Cpu,
         fallback_reason: None,
-        access_path: gpu_db_engine::RelationalAccessPath::FullTableScan,
+        access_path: Arc::new(gpu_db_engine::RelationalAccessPath::FullTableScan),
     })
 }
 

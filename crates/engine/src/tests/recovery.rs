@@ -30,7 +30,7 @@ fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
     let result = recovered.execute_relational_select(&select).unwrap();
 
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -230,7 +230,7 @@ fn relational_state_recovers_from_wal_checkpoint_control_after_restart() {
     let result = recovered.execute_relational_select(&select).unwrap();
 
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -277,7 +277,7 @@ fn relational_state_recovers_from_multi_segment_wal_archive() {
     let result = recovered.execute_relational_select(&select).unwrap();
 
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -344,7 +344,7 @@ fn relational_state_recovers_from_wal_archive_object_backup() {
     let result = recovered.execute_relational_select(&select).unwrap();
 
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -425,7 +425,7 @@ fn relational_state_recovers_after_wal_archive_segment_ingestion() {
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -485,7 +485,7 @@ fn relational_state_recovers_from_wal_archive_transaction_target() {
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -553,7 +553,7 @@ fn relational_state_recovers_from_wal_archive_timestamp_target() {
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -712,7 +712,7 @@ fn relational_state_recovers_from_forked_wal_archive_timeline_branch() {
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -778,7 +778,7 @@ fn relational_state_recovers_from_base_checkpoint_plus_wal_archive_transaction_t
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -952,7 +952,7 @@ fn relational_state_recovers_after_wal_archive_retention_cleanup() {
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -1028,7 +1028,7 @@ fn relational_state_recovers_after_timestamp_wal_archive_retention_cleanup() {
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -1113,7 +1113,7 @@ fn relational_state_recovers_after_base_checkpoint_archive_retention_cleanup() {
     };
     let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
     assert_eq!(
-        grace_result.access_path,
+        *grace_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),

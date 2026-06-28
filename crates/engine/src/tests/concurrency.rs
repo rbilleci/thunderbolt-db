@@ -124,11 +124,11 @@ fn execute_relational_select_cpu_pinned_matches_the_public_select() {
             "{sql}: CPU-fallback rows must equal the public select"
         );
         assert_eq!(
-            via_fallback.columns, via_public.columns,
+            *via_fallback.columns, *via_public.columns,
             "{sql}: CPU-fallback columns must equal the public select"
         );
         assert_eq!(
-            via_fallback.access_path, via_public.access_path,
+            *via_fallback.access_path, *via_public.access_path,
             "{sql}: CPU-fallback access path must equal the public select"
         );
     }
@@ -343,7 +343,7 @@ fn stage3_resident_equality_read_still_uses_value_index_fast_path() {
     // only the 2 matching keys (index-targeted, not a 200-row scan).
     assert!(
         matches!(
-            result.access_path,
+            *result.access_path,
             RelationalAccessPath::EqualityIndex {
                 matched_keys: 2,
                 ..

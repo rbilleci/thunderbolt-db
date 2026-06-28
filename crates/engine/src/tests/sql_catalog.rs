@@ -355,7 +355,7 @@ fn relational_sql_equality_predicate_and_limit_push_down_to_gpu_bridge() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "id".to_string(),
@@ -390,7 +390,7 @@ fn relational_sql_gpu_bridge_range_predicate_uses_filtered_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::FilteredKeyBatch {
             table: "people".to_string(),
             predicate_column: "id".to_string(),
@@ -428,7 +428,7 @@ fn relational_sql_gpu_bridge_range_predicate_with_order_uses_ordered_key_batch()
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("id".to_string()),
@@ -465,7 +465,7 @@ fn relational_sql_gpu_bridge_and_predicates_use_conjunctive_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::ConjunctiveFilteredKeyBatch {
             table: "people".to_string(),
             predicate_count: 2,
@@ -500,7 +500,7 @@ fn relational_sql_gpu_bridge_and_predicates_with_order_use_ordered_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("<conjunction>".to_string()),
@@ -540,7 +540,7 @@ fn relational_sql_gpu_bridge_or_predicates_use_disjunctive_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::DisjunctiveFilteredKeyBatch {
             table: "people".to_string(),
             predicate_group_count: 2,
@@ -578,7 +578,7 @@ fn relational_sql_gpu_bridge_same_column_or_equality_uses_index_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "id".to_string(),
@@ -616,7 +616,7 @@ fn relational_sql_gpu_bridge_same_column_or_equality_with_order_uses_ordered_ind
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("id".to_string()),
@@ -656,7 +656,7 @@ fn relational_sql_gpu_bridge_in_membership_uses_index_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("id".to_string()),
@@ -698,7 +698,7 @@ fn relational_sql_gpu_bridge_between_predicate_uses_conjunctive_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("<conjunction>".to_string()),
@@ -740,7 +740,7 @@ fn relational_sql_gpu_bridge_prefix_like_predicate_uses_filtered_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -781,7 +781,7 @@ fn relational_sql_gpu_bridge_or_predicates_with_order_use_ordered_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("<disjunction>".to_string()),
@@ -852,7 +852,7 @@ fn relational_sql_gpu_bridge_nested_boolean_predicates_use_disjunctive_key_batch
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("<disjunction>".to_string()),
@@ -1868,7 +1868,7 @@ fn relational_catalog_renames_index_and_replays_from_wal() {
     };
     let result = e.execute_relational_select(&select).unwrap();
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "name".to_string(),
@@ -3585,7 +3585,7 @@ fn relational_catalog_replays_from_durable_wal_with_table_data() {
         ]
     );
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: None,

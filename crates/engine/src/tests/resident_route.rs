@@ -222,7 +222,7 @@ fn p8_default_resident_route_executes_accepted_shapes() {
             assert_eq!(default.rows, expected_rows, "{sql}");
             // Columns: GPU-vs-GPU consistency between the resident route and the default (also-GPU)
             // path -- no host/CPU oracle (S9).
-            assert_eq!(resident.columns, default.columns, "{sql}");
+            assert_eq!(*resident.columns, *default.columns, "{sql}");
             assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
             assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
             assert_eq!(resident.fallback_reason, None, "{sql}");
@@ -3510,7 +3510,7 @@ fn s10c_2b_assert_sharded_matches_oracle(
     assert_eq!(part.fallback_reason, None, "{sql}");
 
     let want = oracle.execute_relational_select(&select).unwrap();
-    assert_eq!(part.columns, want.columns, "{sql}: columns diverged");
+    assert_eq!(*part.columns, *want.columns, "{sql}: columns diverged");
     assert_eq!(part.rows, want.rows, "{sql}: rows diverged from oracle");
 }
 
@@ -3965,9 +3965,20 @@ fn r2_materialized_payload_arm_materializes_identically() {
         matched_keys: 1,
     };
     // Two needles (needle_index 0, 1). The shared (needle-invariant) projected columns are [id, v].
+    // The schema is now `Arc`-shared across needles (DECISIONS "Result-path optimization").
+    let shared_cols = std::sync::Arc::new(vec![col("id"), col("v")]);
+    let shared_access = std::sync::Arc::new(access.clone());
     let members = vec![
-        (vec![col("id"), col("v")], access.clone(), 10),
-        (vec![col("id"), col("v")], access.clone(), 20),
+        (
+            std::sync::Arc::clone(&shared_cols),
+            std::sync::Arc::clone(&shared_access),
+            10,
+        ),
+        (
+            std::sync::Arc::clone(&shared_cols),
+            std::sync::Arc::clone(&shared_access),
+            20,
+        ),
     ];
     // Rows arrive in `atom.add` SCHEDULE order (non-deterministic), so needle 0's two rows are
     // delivered HIGH `row_index` first to prove the completion re-sorts ascending by `row_index`.
@@ -4031,8 +4042,8 @@ fn r2_materialized_payload_arm_materializes_identically() {
     // The shared (needle-invariant) columns + access path are stamped onto every result, and the
     // device target reflects the submission's `snapshot_gpu_id`.
     for result in &completion.results {
-        assert_eq!(result.columns, vec![col("id"), col("v")]);
-        assert_eq!(result.access_path, access);
+        assert_eq!(*result.columns, vec![col("id"), col("v")]);
+        assert_eq!(*result.access_path, access);
         assert_eq!(result.planned_target, DeviceTarget::Gpu(3));
         assert_eq!(result.executed_target, DeviceTarget::Gpu(3));
         assert!(result.fallback_reason.is_none());

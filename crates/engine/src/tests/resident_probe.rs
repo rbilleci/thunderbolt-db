@@ -556,7 +556,7 @@ fn gpu_s10a_ordered_projection_drops_nulls_pg_correct() {
         // The bridge (live dispatch) must match the engine's SQL->Expr general path byte-for-byte.
         let general = e.execute_resident_expr_select_sql(sql).unwrap();
         assert_eq!(dispatch.rows, general.rows, "bridge != general on NULL data: {sql}");
-        assert_eq!(dispatch.columns, general.columns, "bridge cols != general: {sql}");
+        assert_eq!(*dispatch.columns, *general.columns, "bridge cols != general: {sql}");
     }
 }
 
@@ -653,12 +653,12 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
     let mut grouped = e
         .execute_resident_expr_select_sql("SELECT a, COUNT(*) FROM p2 GROUP BY a ORDER BY a")
         .unwrap();
-    grouped.columns.truncate(1);
+    std::sync::Arc::make_mut(&mut grouped.columns).truncate(1);
     for row in &mut grouped.rows {
         row.truncate(1);
     }
     assert_eq!(dispatch.rows, grouped.rows, "DISTINCT bridge != explicit GROUP BY (NULL): {sql}");
-    assert_eq!(dispatch.columns, grouped.columns, "bridge cols != GROUP BY cols: {sql}");
+    assert_eq!(*dispatch.columns, *grouped.columns, "bridge cols != GROUP BY cols: {sql}");
 
     // Filtered DISTINCT: a NULL fails `a >= 2` (3VL) -> excluded; result has no NULL and no phantom 0.
     let fsql = "SELECT DISTINCT a FROM p2 WHERE a >= 2 ORDER BY a";

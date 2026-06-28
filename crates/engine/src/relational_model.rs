@@ -169,12 +169,17 @@ pub enum RelationalCommentTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalSelectResult {
-    pub columns: Vec<RelationalColumn>,
+    /// `Arc`-shared so a BATCHED point-read (one result per needle, all sharing the same projected schema)
+    /// refcount-clones the columns instead of DEEP-cloning the `String`-bearing `RelationalColumn`s per
+    /// needle — that per-needle schema deep-clone was the entire ~3M end-to-end read cap (DECISIONS
+    /// "Result-path optimization"; Arc-share = 15x, above the GPU drain). Reads deref transparently.
+    pub columns: Arc<Vec<RelationalColumn>>,
     pub rows: Vec<Vec<SqlValue>>,
     pub planned_target: DeviceTarget,
     pub executed_target: DeviceTarget,
     pub fallback_reason: Option<FallbackReason>,
-    pub access_path: RelationalAccessPath,
+    /// `Arc`-shared for the same reason as `columns` (a batched point-read shares one access path).
+    pub access_path: Arc<RelationalAccessPath>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -359,7 +364,10 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
     pub(crate) table: RelationalTable,
     pub(crate) snapshot_gpu_id: u16,
     pub(crate) selected_indexes: Vec<usize>,
-    pub(crate) members: Vec<(Vec<RelationalColumn>, RelationalAccessPath, i32)>,
+    /// One entry per needle, but the schema (columns, access_path) is `Arc`-SHARED across all of them
+    /// (built once per batch, refcount-cloned per needle) — so the result materialization never
+    /// deep-clones the projected schema N times (DECISIONS "Result-path optimization").
+    pub(crate) members: Vec<(Arc<Vec<RelationalColumn>>, Arc<RelationalAccessPath>, i32)>,
     pub(crate) before_metrics: RuntimeMetricsSnapshot,
     pub(crate) batch_started: Instant,
     pub(crate) payload: RelationalRetainedInt4ProjectionPayload,

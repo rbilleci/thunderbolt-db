@@ -303,7 +303,11 @@ impl Engine {
             batch_selected_indexes = Some(bound.selected_indexes.clone());
             let (_query, access_path) =
                 self.relational_select_mvcc_query_pinned(&job.select, &table, &bound, copin_s)?;
-            members.push((bound.selected_columns, access_path, needle));
+            members.push((
+                Arc::new(bound.selected_columns),
+                Arc::new(access_path),
+                needle,
+            ));
         }
 
         let table = batch_table.expect("non-empty batch has table");
@@ -454,13 +458,18 @@ impl Engine {
                     template.table.name
                 )))
             })?;
-        // Stamp every per-needle result with the shared (needle-invariant) columns + access path.
+        // Stamp every per-needle result with the shared (needle-invariant) columns + access path. The
+        // schema is `Arc`-SHARED across all needles (built ONCE here, refcount-cloned per needle) — not
+        // deep-cloned N times — which is what makes the result materialization scale (DECISIONS
+        // "Result-path optimization": the per-needle schema deep-clone was the entire ~3M end-to-end cap).
+        let shared_columns = Arc::new(template.result_columns.clone());
+        let shared_access_path = Arc::new(template.access_path.clone());
         let members = needles
             .iter()
             .map(|needle| {
                 (
-                    template.result_columns.clone(),
-                    template.access_path.clone(),
+                    Arc::clone(&shared_columns),
+                    Arc::clone(&shared_access_path),
                     *needle,
                 )
             })

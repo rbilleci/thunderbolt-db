@@ -2091,12 +2091,12 @@ impl Engine {
 
         let finalize = |rows: Vec<Vec<SqlValue>>| -> RelationalSelectResult {
             RelationalSelectResult {
-                columns: bound.selected_columns.clone(),
+                columns: Arc::new(bound.selected_columns.clone()),
                 rows,
                 planned_target: DeviceTarget::Gpu(gpu_id),
                 executed_target: DeviceTarget::Gpu(gpu_id),
                 fallback_reason: None,
-                access_path: access_path.clone(),
+                access_path: Arc::new(access_path.clone()),
             }
         };
 
@@ -2281,7 +2281,9 @@ impl Engine {
         };
         let mut result = self.execute_resident_grouped_via_general(&grouped, src)?;
         // Drop the trailing COUNT(*) column -> the bare distinct keys (column 0 is the group key).
-        result.columns.truncate(1);
+        // `columns` is now `Arc`-shared; `make_mut` gives an owned `&mut Vec` (no clone — this freshly
+        // produced result holds the only reference).
+        Arc::make_mut(&mut result.columns).truncate(1);
         for row in &mut result.rows {
             row.truncate(1);
         }
@@ -3357,12 +3359,12 @@ impl Engine {
             result_rows = windowed;
         }
         Ok(RelationalSelectResult {
-            columns,
+            columns: Arc::new(columns),
             rows: result_rows,
             planned_target: DeviceTarget::Gpu(gpu_id),
             executed_target: DeviceTarget::Gpu(gpu_id),
             fallback_reason: None,
-            access_path: RelationalAccessPath::FullTableScan,
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
         })
     }
 
@@ -5479,12 +5481,12 @@ impl Engine {
                 rows = windowed;
             }
             return Ok(RelationalSelectResult {
-                columns: bound.selected_columns,
+                columns: Arc::new(bound.selected_columns),
                 rows,
                 planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 fallback_reason: None,
-                access_path,
+                access_path: Arc::new(access_path),
             });
         }
 
@@ -5699,12 +5701,12 @@ impl Engine {
                 ),
             };
             return Ok(RelationalSelectResult {
-                columns: bound.selected_columns,
+                columns: Arc::new(bound.selected_columns),
                 rows: vec![vec![value]],
                 planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 fallback_reason: None,
-                access_path,
+                access_path: Arc::new(access_path),
             });
         }
 
@@ -6212,12 +6214,12 @@ impl Engine {
         // OFFSET/LIMIT was already applied as a control-plane window of `indices_u64` above (before the
         // gather), so `rows` is the final windowed result -- no host drain/truncate on result data.
         Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
+            columns: Arc::new(bound.selected_columns),
             rows,
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
-            access_path,
+            access_path: Arc::new(access_path),
         })
     }
 

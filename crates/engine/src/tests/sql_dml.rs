@@ -51,7 +51,7 @@ fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
         Some(FallbackReason::GpuMvccReadParityGap)
     );
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("id".to_string()),
@@ -144,7 +144,7 @@ fn relational_copy_rows_commit_through_engine_wal_mvcc() {
         ]]
     );
     assert_eq!(
-        indexed_result.access_path,
+        *indexed_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "id".to_string(),
@@ -815,7 +815,7 @@ fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
         ]]
     );
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "renamed_table_people".to_string(),
             column: "id".to_string(),
@@ -916,7 +916,7 @@ fn relational_rename_column_updates_catalog_indexes_and_replays() {
         vec![vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())]]
     );
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "rename_column_people".to_string(),
             column: "person_id".to_string(),
@@ -1159,7 +1159,7 @@ fn relational_sql_delete_uses_wal_before_visibility_and_rebuilds_from_wal() {
     let index_result = recovered.execute_relational_select(&index_select).unwrap();
     assert!(index_result.rows.is_empty());
     assert_eq!(
-        index_result.access_path,
+        *index_result.access_path,
         RelationalAccessPath::EqualityIndex {
             table: "people".to_string(),
             column: "id".to_string(),
@@ -1220,7 +1220,7 @@ fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
         ]
     );
     assert_eq!(
-        index_result.access_path,
+        *index_result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -2152,7 +2152,7 @@ fn relational_sql_gpu_bridge_order_by_decoded_column_uses_ordered_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("id".to_string()),
@@ -2192,7 +2192,7 @@ fn relational_sql_gpu_bridge_full_scan_order_by_uses_ordered_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: None,
@@ -2232,7 +2232,7 @@ fn relational_sql_gpu_bridge_ordered_limit_offset_uses_ordered_key_batch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: None,
@@ -2270,7 +2270,7 @@ fn relational_sql_gpu_bridge_filtered_offset_without_limit_skips_after_order() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: Some("name".to_string()),
@@ -2314,7 +2314,7 @@ fn relational_sql_gpu_bridge_distinct_projection_keeps_gpu_row_fetch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::OrderedKeyBatch {
             table: "people".to_string(),
             predicate_column: None,
@@ -2355,7 +2355,7 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
     assert_eq!(
-        result.access_path,
+        *result.access_path,
         RelationalAccessPath::FilteredKeyBatch {
             table: "people".to_string(),
             predicate_column: "id".to_string(),

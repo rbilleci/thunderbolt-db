@@ -698,12 +698,12 @@ impl Engine {
             }
 
             return Ok(RelationalSelectResult {
-                columns: bound.selected_columns,
+                columns: Arc::new(bound.selected_columns),
                 rows: aggregate_rows,
                 planned_target: mvcc_result.planned_target,
                 executed_target: mvcc_result.executed_target,
                 fallback_reason: mvcc_result.fallback_reason,
-                access_path,
+                access_path: Arc::new(access_path),
             });
         }
 
@@ -741,12 +741,12 @@ impl Engine {
             }
 
             return Ok(RelationalSelectResult {
-                columns: bound.selected_columns,
+                columns: Arc::new(bound.selected_columns),
                 rows: projected,
                 planned_target: mvcc_result.planned_target,
                 executed_target: mvcc_result.executed_target,
                 fallback_reason: mvcc_result.fallback_reason,
-                access_path,
+                access_path: Arc::new(access_path),
             });
         }
 
@@ -788,12 +788,12 @@ impl Engine {
         }
 
         Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
+            columns: Arc::new(bound.selected_columns),
             rows,
             planned_target: mvcc_result.planned_target,
             executed_target: mvcc_result.executed_target,
             fallback_reason,
-            access_path,
+            access_path: Arc::new(access_path),
         })
     }
 }

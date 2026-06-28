@@ -496,12 +496,12 @@ impl Engine {
         };
 
         Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
+            columns: Arc::new(bound.selected_columns),
             rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
             fallback_reason: None,
-            access_path,
+            access_path: Arc::new(access_path),
         })
     }
 
@@ -813,12 +813,12 @@ impl Engine {
         access_path: RelationalAccessPath,
     ) -> RelationalSelectResult {
         RelationalSelectResult {
-            columns: bound.selected_columns,
+            columns: Arc::new(bound.selected_columns),
             rows: vec![vec![value]],
             planned_target: DeviceTarget::Gpu(gpu_id),
             executed_target: DeviceTarget::Gpu(gpu_id),
             fallback_reason: None,
-            access_path,
+            access_path: Arc::new(access_path),
         }
     }
 
@@ -939,12 +939,12 @@ impl Engine {
         })?;
 
         Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
+            columns: Arc::new(bound.selected_columns),
             rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
-            access_path,
+            access_path: Arc::new(access_path),
         })
     }
 
@@ -1081,12 +1081,12 @@ impl Engine {
         })?;
 
         Ok(RelationalSelectResult {
-            columns: bound.selected_columns,
+            columns: Arc::new(bound.selected_columns),
             rows: vec![vec![SqlValue::Int8(count)]],
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
-            access_path,
+            access_path: Arc::new(access_path),
         })
     }
 
@@ -1633,12 +1633,12 @@ impl Engine {
             .zip(rows_by_select)
             .map(
                 |((bound, access_path, _needle), rows)| RelationalSelectResult {
-                    columns: bound.selected_columns,
+                    columns: Arc::new(bound.selected_columns),
                     rows,
                     planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
                     executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
                     fallback_reason: None,
-                    access_path,
+                    access_path: Arc::new(access_path),
                 },
             )
             .collect())
