@@ -144,9 +144,28 @@ Spec: ARCHITECTURE §7 + §13.
   448k/309k=1.45x, batch32 1.21M/1.19M=1.02x**, batch256 0.30x, batch65536 0.10x. The persistent kernel WINS at small
   batches (no per-batch launch: 8us/submit vs lpb ~25us) — exactly the OLTP point-lookup regime; lpb wins only at large
   batches (GPU-bound 23M vs the wave's ~2.27M drain ceiling, CAS-contention-limited). At batch 8-32 the wave is already
-  3-8x the batcher's 156k. **STILL DEFERRED:** the CONCURRENT/pipelined depth-K test (many producers -> the wave's full
-  advantage over the host coalescer) — harness had a bug, rebuild it before R2.2b wiring. **NEXT = (A) rebuild the
-  concurrent harness + decide on wiring, or (B) R3 writes (independent).**
+  3-8x the batcher's 156k. (Single-flight improved further with the device result ring + per-slot gate below.)
+- **R2.2 device result ring + P2 per-slot gate / depth-K pipelining ✅ DONE (2026-06-28) — CONCURRENT PREMISE VALIDATED.**
+  Device result ring + separate-stream DtoH harvest lifted single-flight drain to ~31.8M (exceeds lpb across the sweep);
+  the follow-up-review correctness gates landed (C1 occupancy clamp, C2 u64 counters, C3 status-0 assert); **P1
+  needles-to-device TRIED + REJECTED** (needle read is 4B/coalesced/L2-cacheable, not the cap — ~31.8M is the realistic
+  in-crate ceiling for the row-materializing workload; 45M was a simpler single-u64 probe). **P2 per-slot status gate
+  (sm_70 `st.release.sys`) replaces the single-flight cumulative gate → depth-K pipelining (harvest any order):** the
+  offered-rate benchmark shows pipelining 1.15–2.0× over single-flight, **2.6–4.6× lpb / 9–32× the 156k batcher in the
+  concurrent regime** — the regime the wave exists for, now directly benchmarked. Independent re-review concurs (qualitative
+  result robust; reviews `docs/reviews/r2.2-wave-port-followup-review.md` + the P2 follow-up).
+- **THROUGHPUT HEADROOM (≈5–10×) — realize IN R2.2b, do NOT chase in an isolated probe.** The offered rate **saturates at
+  depth-4** because a SINGLE host thread's submit+harvest loop is the cap (3–6M mid/large batch), far below the GPU's ~30M
+  single-flight drain ceiling. The lever is **multi-producer host submission** (concurrent ring with atomic head
+  reservation, many producer threads) — which real OLTP connections provide for free. So realize it as part of the wiring
+  and measure end-to-end, not as another synthetic multi-thread probe.
+- **R2.2b = wire `WaveReadEngine` into the engine read path** (behind the existing default-OFF flag, with R1's lpb index
+  probe as the fallback) and run the END-TO-END offered-rate A/B vs R1, real connection concurrency = the multi-producer
+  load — the ship/no-ship decision. **Wiring BLOCKERS (must land in R2.2b):** (1) enforce the in-flight bound
+  (un-harvested needles ≤ ring_capacity, else circular slots clobber → wrong rows); (2) a host-side harvest DEADLINE
+  (a stalled wave must not spin forever); (3) crash/`SIGKILL`-safe shutdown (a killed process leaves the persistent
+  kernel zombied until the 30s backstop, perturbing other GPU tenants — the `--gpu-reset`-denied risk in practice).
+  **NEXT = R2.2b (above), or R3 writes (independent).**
 - Deterministic spine + MV dependency-graph concurrency control (BOHM/PWV); host sequencing materializes
   non-deterministic inputs; the order is the replication log.
 - GPU index + point-access path; resident **layout decided by measurement** (PAX vs columnar).
