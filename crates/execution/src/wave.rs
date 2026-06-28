@@ -8,37 +8,40 @@
 //! index space (no claim counter, no block barriers — a barrier deadlock would evade the backstop and zombie
 //! the shared context), hash-probes the index, **gathers up to `MAX_PROJECTIONS` int4 columns** at the
 //! matched row (exactly like the R1 `gpu_db_resident_i32_index_probe` kernel), and writes a per-needle
-//! result record (status + row_index + values) into a **DEVICE result ring** (full device-memory bandwidth
-//! — per-needle host-mapped record writes capped the drain ~7.5M). `submit_async` enqueues a wave and
-//! returns a `WaveTicket` immediately; `harvest`, once the completion mirror says the wave drained,
-//! bulk-`DtoH`s its records (on a separate stream) and returns `CudaI32BatchProjectionRow`s — byte-identical
-//! to the R1 index probe, one row per found needle. This device-result path lifts the large-batch drain to
-//! ~31.8M (1.35x the launch-per-batch index probe) while every smaller batch also beats it ~1.7-1.85x; the
-//! blocking `submit` is `submit_async` + spin-`harvest`.
+//! result record: the BODY (row_index + values) into a **DEVICE result ring** (full device-memory bandwidth
+//! — per-needle host-mapped record writes capped the drain ~7.5M), then a per-slot STATUS into a host-mapped
+//! status ring. `submit_async` enqueues a wave and returns a `WaveTicket` immediately; `harvest`, once every
+//! slot of the wave is marked done, bulk-`DtoH`s its bodies (on a separate stream) and returns
+//! `CudaI32BatchProjectionRow`s — byte-identical to the R1 index probe, one row per found needle. This
+//! device-result path lifts the large-batch drain to ~30M (1.25-1.35x the launch-per-batch index probe);
+//! smaller batches beat it ~1.9-2.5x. The blocking `submit` is `submit_async` + spin-`harvest`.
 //!
-//! ## Completion gate (DECISIONS ADR-008 "R2 all_done ordering audit") — load-bearing
-//! `completed` is a **monotonic / cumulative** device-memory atomic, never reset; the ring is **circular**
-//! (`idx & ring_mask`). `submit_async` advances a cumulative `head`; a wave is complete once
-//! `completed >= base+len`. Each worker releases its record writes ahead of its `completed` bump
-//! (`membar.sys`), so `completed >= base+len` means this wave's records are host-visible (the audit's
-//! counter-acquire). **Thread 0** publishes the device `completed` into a **host-mapped MIRROR**, and
-//! `harvest` reads that mirror DIRECTLY (a local system-RAM read, no DtoH — a DtoH spin congests with the
-//! kernel's PCIe polling). The harvest gate is `completed >= base+len` AND `completed >= base` — the second
-//! guard is mandatory: when the kernel lags the host (`completed < base`) the wrapping subtraction would
-//! underflow and FALSE-fire, returning unwritten slots (an independent audit caught this — it had inflated
-//! the throughput benchmark into a no-op false-pass).
+//! ## Completion gate (P2): PER-SLOT status ring, sound for depth-K pipelining
+//! Per processed index the kernel writes the record body to `res_dev`, then `st.release.sys` writes the slot
+//! STATUS (1=found, 2=not-found) into a host-mapped STATUS RING (`idx & ring_mask`). The release orders the
+//! body BEFORE the status, so a host that observes `status[slot] != 0` may safely DtoH that slot's body.
+//! `harvest(ticket)` is ready iff EVERY slot of `[base, base+len)` is non-zero — a PER-SLOT signal, sound for
+//! ANY number of in-flight waves harvested in ANY order (depth-K pipelining), unlike a cumulative counter
+//! (which a later wave's indices can push past an earlier wave's range while a slot there is still unwritten).
+//! `submit_async` CLEARS a wave's status slots to 0 before publishing `head`, so a reused ring slot's prior
+//! status can't be read as a false-ready. CROSS-ENGINE ORDERING NOTE: the body lives in device memory and is
+//! read by the DtoH copy engine on a separate stream (no event edge to the worker kernel); body visibility
+//! rests on `.sys`-scope release flushing the body ahead of the host-visible status, plus `harvest`'s
+//! `cuStreamSynchronize` — the same cross-engine cumulativity property the device-result design relies on,
+//! EMPIRICALLY VALIDATED by the byte-identical stale-DtoH stress gate + the depth-K reused-slot test (a stale
+//! or torn body would mismatch). CALLER CONTRACT: bound total un-harvested needles to `ring_capacity` (else
+//! the circular ring overwrites an un-read wave) and harvest each ticket exactly once.
 //!
 //! ## Grid-stride claim (no claim counter, no CAS) + thread-0 coordinator
 //! Each thread STATICALLY owns indices `tid, tid+T, tid+2T, ...` (T = total launched threads); index `i` is
 //! processed by exactly thread `i mod T`, exactly once. There is **no claim counter and no CAS**, so claim
 //! contention is eliminated and the drain no longer collapses past ~512 threads (the prior clamped-`atom.cas`
-//! variant capped ~3.2M at 128 threads and DEGRADED/timed out beyond that). A thread accumulates up to
-//! `CLAIM_BATCH` processed indices, then does ONE `membar.sys` + ONE `atom.add(completed, cnt)` (the audited
-//! record-writes -> `membar.sys` -> `completed`-bump ordering). **Only thread 0 touches the host-mapped ctrl
-//! block**: it mirrors host `doorbell`+`head` into DEVICE memory (which every other worker polls — device
-//! reads, no PCIe) and publishes `completed` to the host mirror. Reason: thousands of workers polling the
-//! host-mapped ctrl over PCIe congest the bus and starve the host's `head` write -> waves never start ->
-//! timeouts. The `all_done` flag and the `claim` counter are unused.
+//! variant capped ~3.2M at 128 threads and DEGRADED/timed out beyond that). **Only thread 0 touches the
+//! host-mapped ctrl block**: it mirrors host `doorbell`+`head` into DEVICE memory (which every other worker
+//! polls — device reads, no PCIe). Reason: thousands of workers polling the host-mapped ctrl over PCIe
+//! congest the bus and starve the host's `head` write -> waves never start -> timeouts. The kernel targets
+//! `sm_70` for `st.release.sys` (also drops the bare-`membar.sys` cumulativity assumption an earlier audit
+//! flagged); the `claim_batch`/`all_done` params are vestigial (unused by the per-slot kernel).
 //!
 //! ## Safety net (the `--gpu-reset`-denied-box rule, proven in probe 1a)
 //! The kernel ALWAYS self-terminates: host doorbell OR a `%globaltimer` wall-clock backstop (`backstop_ns`).
@@ -85,7 +88,8 @@ const RES_SLOT_BYTES: usize = 32;
 const CLAIM_BATCH: u32 = 8;
 
 /// Handle to an in-flight `submit_async` wave: its cumulative ring range `[base, base+len)`. `harvest`
-/// turns it into rows once `completed >= base + len`. `Copy` so the host can queue many in flight.
+/// turns it into rows once every slot of the range is marked done in the status ring. `Copy` so the host can
+/// queue many in flight (depth-K) and harvest them in any order.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WaveTicket {
     /// Cumulative u64 (never wraps for the engine's lifetime; u32 would wrap at ~2^32 lookups). `head`/`idx`
@@ -648,16 +652,16 @@ impl WaveReadEngine {
     }
 
     /// Enqueue a wave of `needles` (each a key value) and return IMMEDIATELY (non-blocking) with a
-    /// `WaveTicket`. The caller must bound total un-harvested needles to `ring_capacity` so the circular ring
-    /// never overwrites an un-read wave. `needle_index` in the harvested rows is the position within THIS
+    /// `WaveTicket`. Many tickets may be in flight (depth-K) and harvested in ANY order — the PER-SLOT status
+    /// gate makes that sound (see `harvest`). `needle_index` in the harvested rows is the position within THIS
     /// `needles` slice.
     ///
-    /// IN-ORDER ONLY (audit): `harvest`'s completion gate compares the single cumulative `completed` counter
-    /// to `base+len`. That is sound only when no EARLIER wave's indices can still be in flight — i.e. submit
-    /// and harvest strictly in order (the engine's current single-flight use). True out-of-order depth-K
-    /// pipelining (harvesting an earlier ticket while a later one is mid-drain) would need a PER-SLOT status
-    /// gate instead, because the global counter can pass `base+len` via a later wave's indices while this
-    /// wave's own slots are still unwritten. Do NOT harvest tickets out of submission order with this gate.
+    /// CALLER CONTRACT (currently UNENFORCED — debug-assert/track when this is wired into a query path, R2.2b):
+    /// bound the total un-harvested needles across all in-flight tickets to `ring_capacity`, else the circular
+    /// ring overwrites an un-read wave's slots; and harvest each ticket exactly once. A wave the kernel never
+    /// finishes (it hit the doorbell/backstop mid-wave) leaves its slots unwritten forever, so a depth-K
+    /// caller's `harvest` spin loop must carry its own deadline (the blocking `submit` already bounds this via
+    /// `DRAIN_TIMEOUT`).
     pub(crate) fn submit_async(
         &mut self,
         needles: &[i32],
@@ -747,11 +751,11 @@ impl WaveReadEngine {
         let n = len as usize;
         let dst = self.res_host as *mut u8;
         let bytes = RES_SLOT_BYTES;
-        // Bulk-DtoH the drained wave's records from the DEVICE result ring into the pinned host staging, on
-        // the copy stream (so it never queues behind the never-ending persistent kernel). Two copies if the
-        // wave wraps the ring; the staging lands the records contiguously at [0, n*32). The kernel's
-        // `membar.sys` (ahead of the `completed` bump this wave's gate already confirmed) makes the records
-        // visible to the copy engine; `cu_stream_synchronize` then orders the copy before the host parse.
+        // Bulk-DtoH the drained wave's bodies from the DEVICE result ring into the pinned host staging, on the
+        // copy stream (so it never queues behind the never-ending persistent kernel). Two copies if the wave
+        // wraps the ring; the staging lands the bodies contiguously at [0, n*32). The kernel's `st.release.sys`
+        // of each slot's status (which this wave's gate already observed != 0) ordered that slot's body ahead
+        // of it; `cu_stream_synchronize` then orders the copy before the host parse.
         unsafe {
             if start + n <= cap {
                 (self.cu_memcpy_dtoh_async)(
