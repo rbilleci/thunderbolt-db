@@ -3927,3 +3927,114 @@ fn r1_wave_index_probe_matches_scan_differential() {
         "the index rebuilt over col 0 for the new generation"
     );
 }
+
+// ADR-009 R2.2b Slice 1 (impedance plumbing): the `Materialized` payload arm of the int4
+// projection completion materializes its already-harvested `CudaI32BatchProjectionRow`s through the
+// SAME downstream path (stable sort by `row_index`, `SqlValue::Int4` mapping, per-needle grouping,
+// shared columns/access-path) that the `Deferred` (lpb/scan/R1-index) arm feeds — so routing the
+// persistent wave engine through `Materialized` (Slice 3) is byte-identical to the lpb route by
+// construction. This is a CPU-only unit test of that arm (no GPU): it asserts the grouping/sort/
+// mapping and that there is NO per-batch kernel-event timing on this arm (the persistent kernel is
+// not timed per wave -> `None`).
+#[test]
+fn r2_materialized_payload_arm_materializes_identically() {
+    let col = |name: &str| RelationalColumn {
+        id: 0,
+        table_oid: 0,
+        attnum: 1,
+        name: name.to_string(),
+        ty: SqlType::Int4,
+        domain: None,
+        default: None,
+        type_oid: 23,
+        type_size: 4,
+    };
+    let table = RelationalTable {
+        schema: "public".to_string(),
+        name: "t".to_string(),
+        oid: 1,
+        columns: vec![col("id"), col("v")],
+        indexes: Vec::new(),
+        check_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+        acl: std::collections::BTreeMap::new(),
+    };
+    let access = RelationalAccessPath::EqualityIndex {
+        table: "t".to_string(),
+        column: "id".to_string(),
+        matched_keys: 1,
+    };
+    // Two needles (needle_index 0, 1). The shared (needle-invariant) projected columns are [id, v].
+    let members = vec![
+        (vec![col("id"), col("v")], access.clone(), 10),
+        (vec![col("id"), col("v")], access.clone(), 20),
+    ];
+    // Rows arrive in `atom.add` SCHEDULE order (non-deterministic), so needle 0's two rows are
+    // delivered HIGH `row_index` first to prove the completion re-sorts ascending by `row_index`.
+    let rows = vec![
+        CudaI32BatchProjectionRow {
+            needle_index: 0,
+            row_index: 5,
+            values: vec![10, 105],
+        },
+        CudaI32BatchProjectionRow {
+            needle_index: 0,
+            row_index: 2,
+            values: vec![10, 102],
+        },
+        CudaI32BatchProjectionRow {
+            needle_index: 1,
+            row_index: 9,
+            values: vec![20, 209],
+        },
+    ];
+
+    let e = Engine::new_local();
+    let pending = RelationalRetainedInt4ProjectionSubmission {
+        table,
+        snapshot_gpu_id: 3,
+        selected_indexes: vec![0, 1],
+        members,
+        before_metrics: e.metrics.snapshot(),
+        batch_started: std::time::Instant::now(),
+        payload: RelationalRetainedInt4ProjectionPayload::Materialized(rows),
+    };
+
+    let completion =
+        Engine::complete_relational_retained_int4_projection_submission_detached(pending).unwrap();
+
+    // No per-batch kernel event on the Materialized arm (the persistent kernel is not timed per wave).
+    assert!(
+        completion.kernel_event_elapsed_us.is_none(),
+        "Materialized arm has no per-batch kernel-event timing"
+    );
+    assert_eq!(completion.total_rows, 3);
+    assert_eq!(completion.int4_result_columns, 2);
+    assert_eq!(completion.table_name, "t");
+    assert_eq!(completion.results.len(), 2, "one result per needle/member");
+
+    // needle 0: BOTH its rows, re-sorted ASCENDING by row_index (2 before 5), values mapped to Int4.
+    assert_eq!(
+        completion.results[0].rows,
+        vec![
+            vec![SqlValue::Int4(10), SqlValue::Int4(102)],
+            vec![SqlValue::Int4(10), SqlValue::Int4(105)],
+        ],
+        "needle 0 rows sorted ascending by row_index"
+    );
+    // needle 1: its single row.
+    assert_eq!(
+        completion.results[1].rows,
+        vec![vec![SqlValue::Int4(20), SqlValue::Int4(209)]],
+        "needle 1 single row"
+    );
+    // The shared (needle-invariant) columns + access path are stamped onto every result, and the
+    // device target reflects the submission's `snapshot_gpu_id`.
+    for result in &completion.results {
+        assert_eq!(result.columns, vec![col("id"), col("v")]);
+        assert_eq!(result.access_path, access);
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(3));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(3));
+        assert!(result.fallback_reason.is_none());
+    }
+}

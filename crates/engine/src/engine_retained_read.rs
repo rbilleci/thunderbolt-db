@@ -295,7 +295,7 @@ impl Engine {
             .iter()
             .map(|(_columns, _access_path, needle)| *needle)
             .collect::<Vec<_>>();
-        let (snapshot_gpu_id, before_metrics, batch_started, cuda_submission) = match self
+        let (snapshot_gpu_id, before_metrics, batch_started, payload) = match self
             .submit_resident_int4_equal_any_payload(&table, &selected_indexes, filter_idx, &needles)?
         {
             Some(out) => out,
@@ -323,7 +323,7 @@ impl Engine {
                     members,
                     before_metrics,
                     batch_started,
-                    submission: cuda_submission,
+                    payload,
                 },
             )),
         }))
@@ -423,7 +423,7 @@ impl Engine {
                 template.table.name
             ))));
         }
-        let (snapshot_gpu_id, before_metrics, batch_started, cuda_submission) = self
+        let (snapshot_gpu_id, before_metrics, batch_started, payload) = self
             .submit_resident_int4_equal_any_payload(
                 &template.table,
                 &template.selected_indexes,
@@ -465,7 +465,7 @@ impl Engine {
                     members,
                     before_metrics,
                     batch_started,
-                    submission: cuda_submission,
+                    payload,
                 },
             )),
         })
@@ -483,7 +483,12 @@ impl Engine {
         filter_idx: usize,
         needles: &[i32],
     ) -> Result<
-        Option<(u16, RuntimeMetricsSnapshot, Instant, CudaI32EqualAnyProjectSubmission)>,
+        Option<(
+            u16,
+            RuntimeMetricsSnapshot,
+            Instant,
+            RelationalRetainedInt4ProjectionPayload,
+        )>,
         ExecuteError,
     > {
         let snapshot = self
@@ -579,7 +584,7 @@ impl Engine {
             snapshot_gpu_id,
             before_metrics,
             batch_started,
-            cuda_submission,
+            RelationalRetainedInt4ProjectionPayload::Deferred(cuda_submission),
         )))
     }
 
@@ -788,10 +793,18 @@ impl Engine {
     pub(crate) fn complete_relational_retained_int4_projection_submission_detached(
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<RelationalRetainedInt4ProjectionCompletion, ExecuteError> {
-        let (projected_rows, kernel_event_elapsed_us) = pending
-            .submission
-            .complete_detached()
-            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        // ADR-009 R2.2b: both payload arms yield the SAME `Vec<CudaI32BatchProjectionRow>` — the
+        // `Deferred` (lpb/scan/R1-index) arm drains its enqueued GPU submission here; the `Materialized`
+        // (persistent wave engine) arm already drained the wave synchronously in `submit`, so the rows are
+        // in hand and there is no per-batch kernel event (the persistent kernel is not timed per wave ->
+        // `None`). Everything downstream (stable sort by `row_index`, `SqlValue::Int4` mapping, metrics,
+        // results assembly) is shared and arm-agnostic, so the two routes are byte-identical by construction.
+        let (projected_rows, kernel_event_elapsed_us) = match pending.payload {
+            RelationalRetainedInt4ProjectionPayload::Deferred(submission) => submission
+                .complete_detached()
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+            RelationalRetainedInt4ProjectionPayload::Materialized(rows) => (rows, None),
+        };
         let batch_micros = pending
             .batch_started
             .elapsed()

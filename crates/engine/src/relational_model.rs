@@ -362,7 +362,24 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
     pub(crate) members: Vec<(Vec<RelationalColumn>, RelationalAccessPath, i32)>,
     pub(crate) before_metrics: RuntimeMetricsSnapshot,
     pub(crate) batch_started: Instant,
-    pub(crate) submission: CudaI32EqualAnyProjectSubmission,
+    pub(crate) payload: RelationalRetainedInt4ProjectionPayload,
+}
+
+/// ADR-009 R2.2b: how a resident int4 equality-projection batch's matched rows are obtained. Both arms
+/// converge on the SAME `Vec<CudaI32BatchProjectionRow>` the completion materializes, so the choice of arm
+/// NEVER changes results — only HOW/WHEN the rows are produced:
+/// - `Deferred`: the lpb / scan / R1-index route enqueued a GPU submission whose work is drained later by
+///   `complete_detached()` (the existing default; carries the per-batch kernel-event elapsed timing).
+/// - `Materialized`: the persistent wave engine already drained the wave SYNCHRONOUSLY inside `submit`
+///   (`WaveReadEngine::submit` is blocking single-flight), so the rows are in hand — there is no deferred
+///   GPU work and no per-batch kernel event (the persistent kernel is not timed per wave), hence the
+///   completion supplies `None` for the elapsed-time metric on this arm.
+pub(crate) enum RelationalRetainedInt4ProjectionPayload {
+    Deferred(CudaI32EqualAnyProjectSubmission),
+    // Constructed by the wave-engine route in R2.2b Slice 3 (the lib build has no constructor until
+    // then; the Slice 1 CPU test does exercise it). REMOVE this `allow` when Slice 3 wires the route.
+    #[allow(dead_code)]
+    Materialized(Vec<CudaI32BatchProjectionRow>),
 }
 
 pub(crate) struct RelationalRetainedInt4ProjectionCompletion {
