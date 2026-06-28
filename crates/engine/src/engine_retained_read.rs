@@ -308,7 +308,11 @@ impl Engine {
             let (_query, access_path) =
                 self.relational_select_mvcc_query_pinned(&job.select, &table, &bound, copin_s)?;
             needles.push(needle);
-            // Identical-shape across jobs (asserted above) -> capture the shared schema once.
+            // Identical-shape across jobs (asserted above) -> capture the shared schema once. The
+            // `access_path` is shared too: each job is a SINGLE-key point read (`job.params.len() == 1`,
+            // checked above), so every job's `EqualityIndex { matched_keys: 1, .. }` is identical — the
+            // first is representative. (audit P3: `access_path` is a diagnostic field, never on the wire;
+            // the production batcher uses the needle-invariant template path, not this jobs path.)
             if shared_schema.is_none() {
                 shared_schema = Some((Arc::new(bound.selected_columns), Arc::new(access_path)));
             }
