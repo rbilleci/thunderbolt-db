@@ -4559,3 +4559,45 @@ fn r2_batched_completion_matches_per_needle_multirow() {
     );
     assert!(batched.needle_values(3).is_empty(), "absent bucket 9 -> no rows");
 }
+
+// audit P3 (batched scatter): a GPU fixture's 2-row emit order coincidentally equals ascending row_index, so
+// a "no-sort" regression on multi-row needles slips past the GPU differentials. This PURE-CPU test proves the
+// within-needle sort is NECESSARY by feeding assemble_batched_rows a multi-row needle in DESCENDING emit order:
+// the output MUST be ascending row_index, which only holds if the sort runs (a no-sort regression yields emit
+// order and fails here). Complements r2_materialized_payload_arm (same idea for the per-needle path).
+#[test]
+fn r2_batched_assembly_sorts_multirow_needle_by_row_index() {
+    let col = |name: &str| RelationalColumn {
+        id: 0,
+        table_oid: 0,
+        attnum: 1,
+        name: name.to_string(),
+        ty: SqlType::Int4,
+        domain: None,
+        default: None,
+        type_oid: 23,
+        type_size: 4,
+    };
+    let shared_cols = std::sync::Arc::new(vec![col("id"), col("v")]);
+    let shared_access = std::sync::Arc::new(RelationalAccessPath::EqualityIndex {
+        table: "t".to_string(),
+        column: "id".to_string(),
+        matched_keys: 1,
+    });
+    // needle 0: TWO rows, DESCENDING emit order (row_index 5 then 2); needle 1: one row; needle 2: ABSENT.
+    let rows = vec![
+        CudaI32BatchProjectionRow { needle_index: 0, row_index: 5, values: vec![10, 105] },
+        CudaI32BatchProjectionRow { needle_index: 0, row_index: 2, values: vec![10, 102] },
+        CudaI32BatchProjectionRow { needle_index: 1, row_index: 9, values: vec![20, 209] },
+    ];
+    let batched = Engine::assemble_batched_rows(&rows, 3, 2, shared_cols, shared_access, 3);
+    assert_eq!(batched.needle_count(), 3);
+    // needle 0 MUST ascend by row_index: row 2's values THEN row 5's. A no-sort regression -> [10,105,10,102].
+    assert_eq!(
+        batched.needle_values(0),
+        &[SqlValue::Int4(10), SqlValue::Int4(102), SqlValue::Int4(10), SqlValue::Int4(105)],
+        "multi-row needle must be sorted ascending by row_index (the within-needle sort is NECESSARY)"
+    );
+    assert_eq!(batched.needle_values(1), &[SqlValue::Int4(20), SqlValue::Int4(209)]);
+    assert!(batched.needle_values(2).is_empty(), "absent needle -> no rows");
+}

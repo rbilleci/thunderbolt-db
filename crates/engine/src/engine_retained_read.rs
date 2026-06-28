@@ -1113,9 +1113,36 @@ impl Engine {
         };
         let n = pending.members.len();
         let ncols = pending.selected_indexes.len();
+        // All members share the same schema Arc (the retained submit builds it once); take any.
+        let (columns, access_path) = match pending.members.first() {
+            Some((columns, access_path, _needle)) => (Arc::clone(columns), Arc::clone(access_path)),
+            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan)),
+        };
+        Ok(Self::assemble_batched_rows(
+            &projected_rows,
+            n,
+            ncols,
+            columns,
+            access_path,
+            pending.snapshot_gpu_id,
+        ))
+    }
+
+    /// Group `projected_rows` (in kernel emit order) into the flat needle-ordered `RelationalRetainedBatchResult`.
+    /// Pure (no GPU) so it is unit-testable with a hand-built UNSORTED input — which is the ONLY way to prove the
+    /// within-needle sort is NECESSARY (a GPU fixture's 2-row emit order coincidentally equals ascending row_index,
+    /// so a `no-sort` regression slips past the differentials — audit P3).
+    pub(crate) fn assemble_batched_rows(
+        projected_rows: &[CudaI32BatchProjectionRow],
+        n: usize,
+        ncols: usize,
+        columns: Arc<Vec<RelationalColumn>>,
+        access_path: Arc<RelationalAccessPath>,
+        gpu_id: u16,
+    ) -> RelationalRetainedBatchResult {
         // Per-needle counts -> prefix-sum ranges + whether ANY needle matched >1 row.
         let mut counts = vec![0u32; n];
-        for projected in &projected_rows {
+        for projected in projected_rows {
             counts[projected.needle_index] += 1;
         }
         let mut needle_ranges = Vec::with_capacity(n);
@@ -1156,18 +1183,13 @@ impl Engine {
         for &i in &slot {
             values.extend(projected_rows[i as usize].values.iter().copied().map(SqlValue::Int4));
         }
-        // All members share the same schema Arc (the retained submit builds it once); take any.
-        let (columns, access_path) = match pending.members.first() {
-            Some((columns, access_path, _needle)) => (Arc::clone(columns), Arc::clone(access_path)),
-            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan)),
-        };
-        Ok(RelationalRetainedBatchResult {
+        RelationalRetainedBatchResult {
             columns,
             access_path,
-            gpu_id: pending.snapshot_gpu_id,
+            gpu_id,
             rows: RowBlock::flat(values, ncols),
             needle_ranges,
-        })
+        }
     }
 
     /// Fold already-materialized `Ready` results (general-query / empty-batch path) into the batched layout:
