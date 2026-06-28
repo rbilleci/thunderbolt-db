@@ -217,6 +217,38 @@ fn measure(
     Ok(summarize(batch_micros, batches * batch, wall))
 }
 
+/// Like `measure` but completes via the BATCHED path (`complete_relational_retained_read_submission_batched`)
+/// — one flat result + per-needle ranges instead of N per-needle structs (DECISIONS "Result-path
+/// optimization"). Shows how close the per-needle-result-model change gets end-to-end to the GPU drain.
+#[allow(clippy::too_many_arguments)]
+fn measure_batched(
+    e: &Engine,
+    template: &RelationalRetainedReadTemplate,
+    mode: Mode,
+    batch: usize,
+    batches: usize,
+    warmup: usize,
+    step: u64,
+    rows: u64,
+) -> Result<Lat, Box<dyn Error>> {
+    mode.configure(e);
+    for b in 0..warmup {
+        let needles = needles_for_batch(b, batch, step, rows);
+        let sub = e.submit_relational_retained_template_point_lookups(template, &needles)?;
+        let _ = e.complete_relational_retained_read_submission_batched(sub)?;
+    }
+    let mut batch_micros = Vec::with_capacity(batches);
+    let t = Instant::now();
+    for b in 0..batches {
+        let needles = needles_for_batch(b, batch, step, rows);
+        let s0 = Instant::now();
+        let sub = e.submit_relational_retained_template_point_lookups(template, &needles)?;
+        let _ = e.complete_relational_retained_read_submission_batched(sub)?;
+        batch_micros.push(s0.elapsed().as_micros());
+    }
+    Ok(summarize(batch_micros, batches * batch, t.elapsed()))
+}
+
 /// Rows from one batch in `mode`, for the byte-identity gate.
 fn rows_once(
     e: &Engine,
@@ -367,6 +399,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let scan = measure(&e, &template, Mode::Scan, batch, batches, warmup, step, rows_u)?;
         let lpb = measure(&e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u)?;
         let wave = measure(&e, &template, Mode::Wave, batch, batches, warmup, step, rows_u)?;
+        let wave_b = measure_batched(&e, &template, Mode::Wave, batch, batches, warmup, step, rows_u)?;
+        let lpb_b = measure_batched(&e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u)?;
         let sp_lpb = if lpb.ops_per_s > 0.0 {
             wave.ops_per_s / lpb.ops_per_s
         } else {
@@ -381,7 +415,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         print_lat(Mode::Scan.label(), &scan);
         print_lat(Mode::Lpb.label(), &lpb);
         print_lat(Mode::Wave.label(), &wave);
+        print_lat("lpb-batched", &lpb_b);
+        print_lat("wave-batched", &wave_b);
+        let sp_lpb_b = if lpb_b.ops_per_s > 0.0 {
+            wave_b.ops_per_s / lpb_b.ops_per_s
+        } else {
+            0.0
+        };
         println!("  wave/lpb: {sp_lpb:.2}x lookups/s    wave/scan: {sp_scan:.2}x");
+        println!("  BATCHED wave/lpb: {sp_lpb_b:.2}x    (batched completion = one flat result, no per-needle structs)");
         headline.push((batch, scan.ops_per_s, lpb.ops_per_s, wave.ops_per_s));
     }
 

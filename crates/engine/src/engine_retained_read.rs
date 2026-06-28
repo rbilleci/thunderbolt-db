@@ -1077,4 +1077,107 @@ impl Engine {
             results,
         })
     }
+
+    /// BATCHED completion (DECISIONS "Result-path optimization"): like
+    /// `complete_relational_retained_read_submission` but returns a SINGLE flat `RelationalRetainedBatchResult`
+    /// (shared schema once + one flat `RowBlock` over all needles + per-needle ranges) the batcher slices per
+    /// needle — avoiding the N per-needle `RelationalSelectResult` structs + N grouping Vecs + 2N Arc clones +
+    /// N column re-maps that capped end-to-end point reads below the GPU drain. An already-`Ready` submission
+    /// (general query / empty batch) folds its per-result rows into the batched layout.
+    pub fn complete_relational_retained_read_submission_batched(
+        &self,
+        submission: RelationalRetainedReadSubmission,
+    ) -> Result<RelationalRetainedBatchResult, ExecuteError> {
+        match submission.inner {
+            RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
+                Self::complete_int4_projection_batched_detached(*pending)
+            }
+            RelationalRetainedReadSubmissionInner::Ready(results) => {
+                Ok(Self::fold_ready_results_batched(results))
+            }
+        }
+    }
+
+    /// Build the batched result from a drained int4 point-read submission: ONE sort by
+    /// `(needle_index, row_index)` (groups needles contiguously AND gives each needle's rows the ascending
+    /// row_index order the byte-identity contract requires) + ONE flat value buffer + per-needle ranges. The
+    /// per-needle rows are byte-identical to `..._detached`'s `RelationalSelectResult.rows`.
+    pub(crate) fn complete_int4_projection_batched_detached(
+        pending: RelationalRetainedInt4ProjectionSubmission,
+    ) -> Result<RelationalRetainedBatchResult, ExecuteError> {
+        let (projected_rows, _kernel_event_elapsed_us) = match pending.payload {
+            RelationalRetainedInt4ProjectionPayload::Deferred(submission) => submission
+                .complete_detached()
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+            RelationalRetainedInt4ProjectionPayload::Materialized(rows) => (rows, None),
+        };
+        let n = pending.members.len();
+        let ncols = pending.selected_indexes.len();
+        let mut counts = vec![0u32; n];
+        for projected in &projected_rows {
+            counts[projected.needle_index] += 1;
+        }
+        let mut needle_ranges = Vec::with_capacity(n);
+        let mut acc = 0u32;
+        for &c in &counts {
+            needle_ranges.push((acc, c));
+            acc += c;
+        }
+        let mut order: Vec<&CudaI32BatchProjectionRow> = projected_rows.iter().collect();
+        order.sort_by_key(|projected| (projected.needle_index, projected.row_index));
+        let mut values = Vec::with_capacity(acc as usize * ncols);
+        for projected in order {
+            values.extend(projected.values.iter().copied().map(SqlValue::Int4));
+        }
+        // All members share the same schema Arc (the retained submit builds it once); take any.
+        let (columns, access_path) = match pending.members.first() {
+            Some((columns, access_path, _needle)) => (Arc::clone(columns), Arc::clone(access_path)),
+            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan)),
+        };
+        Ok(RelationalRetainedBatchResult {
+            columns,
+            access_path,
+            gpu_id: pending.snapshot_gpu_id,
+            rows: RowBlock::flat(values, ncols),
+            needle_ranges,
+        })
+    }
+
+    /// Fold already-materialized `Ready` results (general-query / empty-batch path) into the batched layout:
+    /// each result is one needle, rows concatenated, schema from the first (the batcher's `Ready` case is the
+    /// empty batch -> 0 needles; the general fold is defensive).
+    fn fold_ready_results_batched(
+        results: Vec<RelationalSelectResult>,
+    ) -> RelationalRetainedBatchResult {
+        let (columns, access_path, gpu_id, ncols) = match results.first() {
+            Some(first) => (
+                Arc::clone(&first.columns),
+                Arc::clone(&first.access_path),
+                match first.executed_target {
+                    DeviceTarget::Gpu(id) => id,
+                    _ => 0,
+                },
+                first.rows.ncols(),
+            ),
+            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan), 0, 0),
+        };
+        let mut values = Vec::new();
+        let mut needle_ranges = Vec::with_capacity(results.len());
+        let mut acc = 0u32;
+        for result in &results {
+            let count = result.rows.len() as u32;
+            needle_ranges.push((acc, count));
+            acc += count;
+            for row in result.rows.iter() {
+                values.extend_from_slice(row);
+            }
+        }
+        RelationalRetainedBatchResult {
+            columns,
+            access_path,
+            gpu_id,
+            rows: RowBlock::flat(values, ncols),
+            needle_ranges,
+        }
+    }
 }

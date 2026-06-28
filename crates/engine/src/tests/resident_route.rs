@@ -4419,3 +4419,73 @@ fn r2_wave_engine_concurrent_same_shape_single_flight() {
         "the single wave engine is over the id filter col"
     );
 }
+
+// ADR-009 Result-path: the BATCHED completion (one flat RelationalRetainedBatchResult + per-needle ranges)
+// must produce BYTE-IDENTICAL per-needle rows to the per-needle `complete_relational_retained_read_submission`
+// path (same ascending row_index order, same NULL-as-0 + absent handling). Two submits of the SAME needles
+// (the wave is deterministic) -> one completed per-needle, one batched -> compare slice-by-slice. GPU test.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn r2_batched_completion_matches_per_needle() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, bucket, balance, note) VALUES \
+         (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("accounts").unwrap();
+    let select = match parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(s) => s,
+        _ => unreachable!(),
+    };
+    if !e.plan_relational_resident_route(&select).accepted {
+        return; // no GPU
+    }
+    e.set_wave_engine_enabled(true);
+    e.set_wave_persistent_engine_enabled(true);
+    let template = e.prepare_relational_retained_read_template(&select).unwrap();
+    // distinct needles incl an ABSENT one (25) and NULL-as-0 (0, the NULL-id row).
+    let needles = vec![10, 20, 30, 40, 25, 0];
+
+    let per_needle = e
+        .complete_relational_retained_read_submission(
+            e.submit_relational_retained_template_point_lookups(&template, &needles)
+                .unwrap(),
+        )
+        .unwrap();
+    let batched = e
+        .complete_relational_retained_read_submission_batched(
+            e.submit_relational_retained_template_point_lookups(&template, &needles)
+                .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        batched.needle_count(),
+        per_needle.len(),
+        "batched needle count == per-needle result count"
+    );
+    assert_eq!(
+        batched.columns, per_needle[0].columns,
+        "batched shares the per-needle projected schema"
+    );
+    for (i, result) in per_needle.iter().enumerate() {
+        let batched_vals = batched.needle_values(i);
+        let per_needle_vals: Vec<SqlValue> = result.rows.iter().flatten().cloned().collect();
+        assert_eq!(
+            batched_vals,
+            per_needle_vals.as_slice(),
+            "needle {i}: batched rows must be byte-identical to the per-needle rows"
+        );
+    }
+    // Non-vacuity spot checks: needle 0 (NULL-as-0) -> the NULL-id row [0, 500]; absent 25 -> empty.
+    assert_eq!(
+        batched.needle_values(5),
+        &[SqlValue::Int4(0), SqlValue::Int4(500)],
+        "needle 0 -> the NULL-id row via the batched path"
+    );
+    assert!(batched.needle_values(4).is_empty(), "absent needle 25 -> no rows");
+}

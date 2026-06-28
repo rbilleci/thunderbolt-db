@@ -225,6 +225,42 @@ impl RowBlock {
         }
         self.values.chunks(self.ncols).map(<[SqlValue]>::to_vec).collect()
     }
+    /// The `count` rows starting at row `start` as a flat `&[SqlValue]` slice (`count*ncols` values) — for
+    /// slicing a multi-needle batched block into one needle's rows, zero-copy.
+    pub fn rows_slice(&self, start: usize, count: usize) -> &[SqlValue] {
+        let nc = self.ncols;
+        &self.values[start * nc..(start + count) * nc]
+    }
+}
+
+/// A BATCHED retained-read result: ONE shared schema + ONE flat [`RowBlock`] over ALL needles' rows (in
+/// needle order) + per-needle row ranges. Replaces the N-per-needle `RelationalSelectResult` structs +
+/// by-needle grouping + 2N `Arc` clones + N column re-maps — the residual that capped end-to-end point
+/// reads at ~10.8M below the GPU drain (DECISIONS "Result-path optimization"). The batcher slices `rows`
+/// by `needle_ranges[i]` to answer needle `i`'s request, mapping the shared schema ONCE.
+#[derive(Debug, Clone)]
+pub struct RelationalRetainedBatchResult {
+    pub columns: Arc<Vec<RelationalColumn>>,
+    pub access_path: Arc<RelationalAccessPath>,
+    pub gpu_id: u16,
+    /// All needles' rows, flat and row-major, concatenated in needle order.
+    pub rows: RowBlock,
+    /// Per needle (needle order): `(start_row, row_count)` into `rows`.
+    pub needle_ranges: Vec<(u32, u32)>,
+}
+
+impl RelationalRetainedBatchResult {
+    pub fn needle_count(&self) -> usize {
+        self.needle_ranges.len()
+    }
+    /// Needle `i`'s rows as a flat `&[SqlValue]` (`row_count*ncols` values).
+    pub fn needle_values(&self, i: usize) -> &[SqlValue] {
+        let (start, count) = self.needle_ranges[i];
+        self.rows.rows_slice(start as usize, count as usize)
+    }
+    pub fn ncols(&self) -> usize {
+        self.rows.ncols()
+    }
 }
 
 impl From<Vec<Vec<SqlValue>>> for RowBlock {
