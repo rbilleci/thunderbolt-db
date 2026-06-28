@@ -1173,15 +1173,20 @@ impl Engine {
                 }
             }
         }
+        // Flatten as raw i32 (no SqlValue) — `row_values` is already an i32 slice, so this is a plain copy
+        // into the needle-ordered buffer (DECISIONS "Result-path optimization": the fat Vec<SqlValue> write
+        // was ~240us/65536-batch of pure overhead — the int4 route is always i32, mapped to DbValue::Int4
+        // at the batcher).
         let mut values = Vec::with_capacity(total * ncols);
         for &i in &slot {
-            values.extend(projected.row_values(i as usize).iter().copied().map(SqlValue::Int4));
+            values.extend_from_slice(projected.row_values(i as usize));
         }
         RelationalRetainedBatchResult {
             columns,
             access_path,
             gpu_id,
-            rows: RowBlock::flat(values, ncols),
+            values,
+            ncols,
             needle_ranges,
         }
     }
@@ -1207,7 +1212,7 @@ impl Engine {
         // carry rows, and flattening at ncols 0 would drop them (audit P3). All Ready results of one query
         // shape share the width, so the first non-zero is authoritative.
         let ncols = results.iter().map(|r| r.rows.ncols()).find(|&n| n > 0).unwrap_or(0);
-        let mut values = Vec::new();
+        let mut values: Vec<i32> = Vec::new();
         let mut needle_ranges = Vec::with_capacity(results.len());
         let mut acc = 0u32;
         for result in &results {
@@ -1215,14 +1220,26 @@ impl Engine {
             needle_ranges.push((acc, count));
             acc += count;
             for row in result.rows.iter() {
-                values.extend_from_slice(row);
+                for value in row {
+                    // The int4 batched route is always Int4; the batcher's only Ready case is the EMPTY
+                    // batch (0 rows), so this defensive non-empty fold never runs in production.
+                    debug_assert!(
+                        matches!(value, SqlValue::Int4(_)),
+                        "batched int4 result expects Int4 values, got {value:?}"
+                    );
+                    values.push(match value {
+                        SqlValue::Int4(v) => *v,
+                        _ => 0,
+                    });
+                }
             }
         }
         RelationalRetainedBatchResult {
             columns,
             access_path,
             gpu_id,
-            rows: RowBlock::flat(values, ncols),
+            values,
+            ncols,
             needle_ranges,
         }
     }

@@ -4465,18 +4465,19 @@ fn r2_batched_completion_matches_per_needle() {
         "batched shares the per-needle projected schema"
     );
     for (i, result) in per_needle.iter().enumerate() {
-        let batched_vals = batched.needle_values(i);
+        // batched is raw i32; map to SqlValue::Int4 to compare with the per-needle SqlValue rows.
+        let batched_vals: Vec<SqlValue> =
+            batched.needle_values(i).iter().map(|&v| SqlValue::Int4(v)).collect();
         let per_needle_vals: Vec<SqlValue> = result.rows.iter().flatten().cloned().collect();
         assert_eq!(
-            batched_vals,
-            per_needle_vals.as_slice(),
+            batched_vals, per_needle_vals,
             "needle {i}: batched rows must be byte-identical to the per-needle rows"
         );
     }
     // Non-vacuity spot checks: needle 0 (NULL-as-0) -> the NULL-id row [0, 500]; absent 25 -> empty.
     assert_eq!(
         batched.needle_values(5),
-        &[SqlValue::Int4(0), SqlValue::Int4(500)],
+        &[0, 500],
         "needle 0 -> the NULL-id row via the batched path"
     );
     assert!(batched.needle_values(4).is_empty(), "absent needle 25 -> no rows");
@@ -4534,11 +4535,11 @@ fn r2_batched_completion_matches_per_needle_multirow() {
         "test is vacuous: no needle matched >1 row (predicate did not route as multi-row)"
     );
     for (i, result) in per_needle.iter().enumerate() {
-        let batched_vals = batched.needle_values(i);
+        let batched_vals: Vec<SqlValue> =
+            batched.needle_values(i).iter().map(|&v| SqlValue::Int4(v)).collect();
         let per_needle_vals: Vec<SqlValue> = result.rows.iter().flatten().cloned().collect();
         assert_eq!(
-            batched_vals,
-            per_needle_vals.as_slice(),
+            batched_vals, per_needle_vals,
             "needle {i}: multi-row batched rows must be byte-identical to the per-needle rows"
         );
     }
@@ -4546,7 +4547,7 @@ fn r2_batched_completion_matches_per_needle_multirow() {
     // intra-needle sort breaks exactly this.
     assert_eq!(
         batched.needle_values(0),
-        &[SqlValue::Int4(10), SqlValue::Int4(100), SqlValue::Int4(20), SqlValue::Int4(200)],
+        &[10, 100, 20, 200],
         "bucket=1 -> (10,100),(20,200) in ascending row order"
     );
     assert!(batched.needle_values(3).is_empty(), "absent bucket 9 -> no rows");
@@ -4588,9 +4589,9 @@ fn r2_batched_assembly_sorts_multirow_needle_by_row_index() {
     // needle 0 MUST ascend by row_index: row 2's values THEN row 5's. A no-sort regression -> [10,105,10,102].
     assert_eq!(
         batched.needle_values(0),
-        &[SqlValue::Int4(10), SqlValue::Int4(102), SqlValue::Int4(10), SqlValue::Int4(105)],
+        &[10, 102, 10, 105],
         "multi-row needle must be sorted ascending by row_index (the within-needle sort is NECESSARY)"
     );
-    assert_eq!(batched.needle_values(1), &[SqlValue::Int4(20), SqlValue::Int4(209)]);
+    assert_eq!(batched.needle_values(1), &[20, 209]);
     assert!(batched.needle_values(2).is_empty(), "absent needle -> no rows");
 }

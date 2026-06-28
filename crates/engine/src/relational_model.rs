@@ -233,19 +233,22 @@ impl RowBlock {
     }
 }
 
-/// A BATCHED retained-read result: ONE shared schema + ONE flat [`RowBlock`] over ALL needles' rows (in
-/// needle order) + per-needle row ranges. Replaces the N-per-needle `RelationalSelectResult` structs +
-/// by-needle grouping + 2N `Arc` clones + N column re-maps — the residual that capped end-to-end point
-/// reads at ~10.8M below the GPU drain (DECISIONS "Result-path optimization"). The batcher slices `rows`
-/// by `needle_ranges[i]` to answer needle `i`'s request, mapping the shared schema ONCE.
+/// A BATCHED retained-read result: ONE shared schema + ONE flat i32 buffer over ALL needles' rows (in needle
+/// order) + per-needle row ranges. Replaces the N-per-needle `RelationalSelectResult` structs + by-needle
+/// grouping + 2N `Arc` clones + N column re-maps — the residual that capped end-to-end point reads below the
+/// GPU drain (DECISIONS "Result-path optimization"). The int4 point-read route is ALWAYS i32 (NULL already
+/// encoded as 0), so `values` holds raw `i32` rather than a fat `Vec<SqlValue>` (~24-32B/entry, ~3MB/65536-
+/// batch) — the batcher maps `i32 -> DbValue::Int4` directly, skipping the SqlValue intermediate entirely.
+/// The batcher slices `values` by `needle_ranges[i]` to answer needle `i`'s request, mapping the schema ONCE.
 #[derive(Debug, Clone)]
 pub struct RelationalRetainedBatchResult {
     pub columns: Arc<Vec<RelationalColumn>>,
     pub access_path: Arc<RelationalAccessPath>,
     pub gpu_id: u16,
-    /// All needles' rows, flat and row-major, concatenated in needle order.
-    pub rows: RowBlock,
-    /// Per needle (needle order): `(start_row, row_count)` into `rows`.
+    /// All needles' projected i32 values, flat + row-major, concatenated in needle order.
+    pub values: Vec<i32>,
+    pub ncols: usize,
+    /// Per needle (needle order): `(start_row, row_count)` into `values`.
     pub needle_ranges: Vec<(u32, u32)>,
 }
 
@@ -253,13 +256,14 @@ impl RelationalRetainedBatchResult {
     pub fn needle_count(&self) -> usize {
         self.needle_ranges.len()
     }
-    /// Needle `i`'s rows as a flat `&[SqlValue]` (`row_count*ncols` values).
-    pub fn needle_values(&self, i: usize) -> &[SqlValue] {
+    /// Needle `i`'s projected i32 values as a flat slice (`row_count*ncols`).
+    pub fn needle_values(&self, i: usize) -> &[i32] {
         let (start, count) = self.needle_ranges[i];
-        self.rows.rows_slice(start as usize, count as usize)
+        let nc = self.ncols;
+        &self.values[start as usize * nc..(start as usize + count as usize) * nc]
     }
     pub fn ncols(&self) -> usize {
-        self.rows.ncols()
+        self.ncols
     }
 }
 

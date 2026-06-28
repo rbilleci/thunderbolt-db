@@ -53,7 +53,7 @@ use gpu_db_engine::{Engine, ExecuteError, RelationalRetainedBatchResult};
 use gpu_db_sql::Select;
 use tokio::sync::oneshot;
 
-use crate::{map_column, map_value, DbError, ErrorCategory, QueryOutcome, SharedEngine};
+use crate::{map_column, DbError, DbValue, ErrorCategory, QueryOutcome, SharedEngine};
 
 /// Default flush triggers. `max_wait` is now the *ceiling* of an adaptive wait
 /// (see [`AdaptiveWait`]): at connection-count 1 a lone request flushes with
@@ -555,13 +555,15 @@ fn distribute_results_batched(
     let ncols = batched.ncols();
     for (request, result_idx) in group.into_iter().zip(request_result_index) {
         let outcome = if result_idx < batched.needle_count() {
-            // This needle's rows as a flat slice -> chunk into rows, map each value to wire.
+            // This needle's projected i32 values as a flat slice -> chunk into rows, map each i32 straight to
+            // `DbValue::Int4` (the int4 route is always Int4 — DECISIONS "Result-path optimization": no
+            // SqlValue intermediate).
             let vals = batched.needle_values(result_idx);
             let rows: Vec<Vec<_>> = if ncols == 0 {
                 Vec::new()
             } else {
                 vals.chunks(ncols)
-                    .map(|row| row.iter().cloned().map(map_value).collect())
+                    .map(|row| row.iter().map(|&v| DbValue::Int4(v)).collect())
                     .collect()
             };
             Ok(QueryOutcome::Rows {
