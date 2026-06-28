@@ -507,6 +507,16 @@ pub(crate) struct ResidencyReadState {
     /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the
     /// fast cache-hit path; staleness is handled by the per-entry `generation` tag, not by eviction.
     pub(crate) wave_index: Mutex<BTreeMap<String, WaveResidentIndex>>,
+    /// ADR-009 R2.2b: per-table PERSISTENT wave read engine cache for the persistent-kernel point-lookup
+    /// route (built lazily, behind the default-OFF `wave_persistent_engine_enabled` flag nested under
+    /// `wave_engine_enabled`). A plain `Mutex` like `wave_index`, BUT each entry owns a live GPU kernel +
+    /// watchdog petter, so unlike the passive index — which self-invalidates by ptr on the next read — an
+    /// entry MUST be dropped to reclaim its SM/buffers: the serialized-invalidation (catalog-latch) path
+    /// removes + drops it on DDL/drop/memory-pressure; a re-admission rebuild overwrites + drops the stale
+    /// entry. Staleness on the concurrent commit path is handled by the residency tombstone (which makes the
+    /// route unreachable) + ptr-keyed overwrite-on-next-read, NOT by eviction in the commit critical section
+    /// (Drop joins the petter ~watchdog window — too costly to hold there).
+    pub(crate) wave_read_engine: Mutex<BTreeMap<String, WaveResidentReadEngine>>,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

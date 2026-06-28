@@ -31,6 +31,37 @@ pub(crate) struct WaveResidentIndex {
     pub(crate) hash_shift: u32,
 }
 
+/// ADR-009 R2.2b: a cached PERSISTENT wave read engine for one resident int4 key column + projection set,
+/// for the persistent-kernel point-lookup route (default-OFF `wave_persistent_engine_enabled`). Like
+/// [`WaveResidentIndex`] it is keyed + validated by `(column_idx, resident_device_ptr)` — the engine is
+/// built over + gathers through the SAME resident buffer (its address pinned by the engine's own `Arc`, so
+/// a re-admission's new buffer → new ptr → cache miss → rebuild against the live bytes). It is EXTENDED
+/// with `projection_offsets` in the identity because the wave kernel BAKES the projection column offsets at
+/// launch, so a different projection set needs a different engine. Unlike the passive index buffer, the
+/// engine owns a LIVE persistent GPU kernel (+ a watchdog petter thread + device ring buffers), so it MUST
+/// be dropped to reclaim its SM/threads/buffers: dropping the `Arc<Mutex<WaveReadEngine>>` runs
+/// `WaveReadEngine::Drop` (set_current + doorbell + petter join + free). Shared as `Arc<Mutex<_>>` so the
+/// read path can clone+lock it (single-flight) while the cache map is mutated independently.
+pub(crate) struct WaveResidentReadEngine {
+    pub(crate) column_idx: usize,
+    pub(crate) resident_device_ptr: u64,
+    pub(crate) projection_offsets: Vec<u64>,
+    pub(crate) engine: Arc<Mutex<WaveReadEngine>>,
+}
+
+// `WaveReadEngine` holds raw device/host pointers and is not `Debug`, so derive cannot reach through the
+// `Arc<Mutex<_>>`; hand-roll a Debug that prints the identity tags and elides the engine handle (keeps
+// `ResidencyReadState`'s `#[derive(Debug)]` working).
+impl std::fmt::Debug for WaveResidentReadEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaveResidentReadEngine")
+            .field("column_idx", &self.column_idx)
+            .field("resident_device_ptr", &self.resident_device_ptr)
+            .field("projection_offsets", &self.projection_offsets)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
 /// generation. A reader `get`s an owned `Arc` (a refcount bump, no borrow of the map)
 /// so it pins the owner for its whole read; the serialized writer publishes a new

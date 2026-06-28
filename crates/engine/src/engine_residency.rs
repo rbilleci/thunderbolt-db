@@ -569,6 +569,21 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// ADR-009 R2.2b: enable/disable the PERSISTENT wave-kernel point-lookup route (default OFF). Only
+    /// takes effect when `wave_engine_enabled` is ALSO on — it selects the persistent `WaveReadEngine`
+    /// over the launch-per-batch R1 index probe for resident int4 unique-key equality batches, falling
+    /// back to lpb on any wave error / harvest timeout / oversize batch. This is the R2.2b-3 A/B lever
+    /// (wave vs lpb). `&self` (an interior-mutable flag the read path reads).
+    pub fn set_wave_persistent_engine_enabled(&self, on: bool) {
+        self.wave_persistent_engine_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn wave_persistent_engine_enabled(&self) -> bool {
+        self.wave_persistent_engine_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit
     /// mutated. Runs AFTER `publish_committed_seq` (so it snapshots the new generation) while the
     /// commit_mutex is held; it can NEVER fail the commit — over-budget / memory-pressure / GPU-absent /

@@ -376,9 +376,6 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
 ///   completion supplies `None` for the elapsed-time metric on this arm.
 pub(crate) enum RelationalRetainedInt4ProjectionPayload {
     Deferred(CudaI32EqualAnyProjectSubmission),
-    // Constructed by the wave-engine route in R2.2b Slice 3 (the lib build has no constructor until
-    // then; the Slice 1 CPU test does exercise it). REMOVE this `allow` when Slice 3 wires the route.
-    #[allow(dead_code)]
     Materialized(Vec<CudaI32BatchProjectionRow>),
 }
 
