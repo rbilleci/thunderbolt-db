@@ -299,8 +299,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   tests cover the old-u32-boundary/kernel-behind cases + the host<->PTX offset contract. **C3:** `debug_assert!(status
   != 0)` in `read_records` makes a gate violation fail loudly. **`WaveReadEngine` is now wireable (C1/C2/C3 landed);**
   the concurrent-regime win remains unproven until P2 (per-slot status gate -> depth-K pipelining) + an offered-rate
-  harness — keep R1's launch-per-batch index probe as the shipped default until then. NEXT levers: P1 needles-to-device
-  (toward ~45M single-flight), then P2 + offered-rate.
+  harness — keep R1's launch-per-batch index probe as the shipped default until then.
+
+- **R2.2 P1 needles-to-device = TRIED + REJECTED (negative result, 2026-06-28; reverted, not committed).** The
+  follow-up review's P1 hypothesis was that the host-mapped needle ring (kernel PCIe-reads each needle) caps the drain,
+  and moving needles to a DEVICE ring via bulk HtoD would push ~31.8M toward the bare-probe ~45M. Implemented it (device
+  `req_dev` ring + pinned-staged `cuMemcpyHtoDAsync` + `cu_stream_synchronize` before publishing head) and measured at
+  T=8192 vs the host-mapped baseline (wave/lpb): **the needle read is NOT the bottleneck.** Large batch was UNCHANGED
+  (65536: 30.7M vs 31.3M = noise; the ~5us HtoD+sync is negligible against the ~2.1ms drain), while EVERY small/mid batch
+  REGRESSED from the added per-submit HtoD+sync latency (batch1 14.6us->17.6us = 1.72x->1.46x; batch8 1.69x->1.38x;
+  batch32 1.81x->1.32x; batch256 1.72x->1.38x). So device-records already saturated the per-needle path; the residual
+  ~31M cap is the GATHER/RECORD work (multi-col index probe + 32B record), not the needle read. The bare probe's 45M is a
+  SIMPLER kernel (single u64 result, no multi-col row materialization) -> not a reachable target for the real
+  row-materializing workload. **Conclusion: ~31.8M (1.35x lpb at 65536, 1.7-1.85x at smaller) is at/near the realistic
+  in-crate ceiling for this workload; do NOT pursue needles-to-device.** The remaining real lever is **P2** (per-slot
+  status gate -> depth-K pipelining + offered-rate harness) — the CONCURRENT regime the wave exists for, still
+  unbenchmarked. (Oracle + stale-DtoH stress gate stayed green during the P1 experiment.)
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

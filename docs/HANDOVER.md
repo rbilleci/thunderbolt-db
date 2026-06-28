@@ -120,10 +120,14 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   * SM_count`) so a too-large grid can't silently hang (un-resident blocks never drain) — but occupancy is SOLO-device,
   so the shared-context coexistence trap stays the open R2 question; C2 = u64 cumulative counters (u32 wrapped at ~2^32
   lookups ~=135s -> permanent gate hang); C3 = `debug_assert!(status!=0)`. `WaveReadEngine` is now WIREABLE.
-  **NEXT (review sequence): (P1) needles-to-device (host-mapped needle ring still PCIe-read per needle -> bulk HtoD ->
-  toward the 45M bare ceiling); (P2) per-slot status gate -> depth-K pipelining + an OFFERED-RATE harness = the real
-  premise gate for the concurrent regime (single-flight only proves wave>lpb across the sweep, NOT the concurrent
-  premise); then R2.2b engine wiring. OR (B) R3 writes (independent). Keep R1 lpb as shipped default until P2 lands.**
+  **P1 needles-to-device = TRIED + REJECTED (negative result, reverted; DECISIONS "R2.2 P1 ... REJECTED"):** the needle
+  read is NOT the cap — device `req_dev` + bulk HtoD left large batch UNCHANGED (30.7M vs 31.3M) and REGRESSED small/mid
+  batches (HtoD+sync latency: batch1 1.72x->1.46x). device-records already saturated the per-needle path; the residual
+  ~31M is the GATHER/RECORD work, and the bare-probe 45M is a simpler kernel (no multi-col rows) -> ~31.8M is at/near the
+  realistic in-crate ceiling for this workload. **NEXT = (P2) per-slot status gate -> depth-K pipelining + an OFFERED-RATE
+  harness = the real premise gate for the CONCURRENT regime the wave exists for (single-flight only proves wave>lpb across
+  the sweep, NOT the concurrent premise); then R2.2b engine wiring. OR (B) R3 writes (independent). Keep R1 lpb default
+  until P2 lands.**
   (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
