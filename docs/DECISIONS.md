@@ -558,6 +558,22 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   throughput but no longer HIDES the wave ratio. Going past it needs a per-needle-result-MODEL change (a batcher-contract
   change = a separate effort). **NET: the wave-vs-lpb kernel decision is now on real, mostly-unmasked numbers
   (1.13-1.93x). Result-path optimization is DONE for the masking purpose.**
+  **PER-NEEDLE RESULT MODEL -> BATCHED, IMPLEMENTED + MERGED (`d49aed6f`+`98f677c8`+`68b8e455`): replaced the
+  N-per-needle `RelationalSelectResult` model with `RelationalRetainedBatchResult { columns: Arc, access_path: Arc,
+  gpu_id, rows: RowBlock (ALL needles flat, needle-ordered), needle_ranges: Vec<(start_row,count)> }` built by ONE
+  sort by (needle_index, row_index) + one flat buffer + per-needle ranges (vs N grouping Vecs + N RowBlocks + N
+  structs + 2N Arc clones). `complete_relational_retained_read_submission_batched` returns it; the point-lookup
+  batcher (`distribute_results_batched`) slices the flat block per needle + maps the SHARED schema to wire ONCE
+  (was per-needle). MEASURED (1M rows, engine A/B): wave per-needle 10.93M -> wave-BATCHED 19.47M (+78%, approaching
+  the 30M raw drain); BATCHED wave/lpb 1.62x@b256 .. 1.76x@b65536 (was 1.13-1.39x per-needle) -- the wave's edge is
+  now CLEARLY unmasked AND substantial. Byte-identity: r2_batched_completion_matches_per_needle{,_multirow} (GPU,
+  the multirow one closes an audit-found vacuity on intra-needle order: proven by a reversed-sort sabotage that
+  FAILS it) + facade 32/0 (batcher wire byte-identity) + protocol 71/0. Audit = SHIP (no P1; P2 test-vacuity +
+  P3 ncols-from-nonempty both adopted). CAVEAT on the 1.62-1.76x: lpb-batched (11M) is still bounded by lpb's
+  2-round-trip complete, NOT its 23M raw drain -> the TRUE GPU ratio is the raw 1.26x(b65536)..2.4x(small); the
+  remaining lever to hit the full 30M end-to-end on BOTH routes is collapsing lpb's two round-trips (host-machinery,
+  separate). **NET: read-path absolute now ~19.5M (6.5x the session-start 3M); the wave-vs-lpb kernel decision is
+  on strong, mostly-unmasked numbers.**
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)

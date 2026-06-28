@@ -6,11 +6,18 @@
 **Updated:** 2026-06-28.
 
 ## >>> THE ONE NEXT ACTION: pick the fork — R2.2c (unlock the wave default) OR R3 (writes) <<<
-R2.2b is COMPLETE + MERGED. R2.2b-2 wired + routed the persistent `WaveReadEngine` into the resident int4 point-lookup
-path behind default-OFF `wave_persistent_engine_enabled`; R2.2b-3's A/B (`engine/examples/r2_wave_engine_ab`, DECISIONS
-"R2.2b-3 DONE") returned: **the wave is a STRICT WIN (throughput + latency) for the production single-coalescer point-read
-regime — 2.45x lpb @batch=1 down to 1.02x @batch=4096, lower latency at every batch — but the DEFAULT FLIP is GATED on
-two R2.2c architectural unlocks.** Keep R1 lpb the default until they clear. The fork:
+R2.2b COMPLETE + MERGED (wave wired/routed behind default-OFF `wave_persistent_engine_enabled`). **SINCE THEN the
+RESULT-PATH was optimized end-to-end + MERGED (DECISIONS "Result-path optimization", `c4b0bddb`+`d49aed6f`+`98f677c8`+
+`68b8e455`): the wave's 30M GPU drain had been MASKED by host result materialization (~3M cap). Three audited-SHIP
+slices — Arc-share schema (3M->7.8M), flat `RowBlock` (7.8M->10.8M), and the PER-NEEDLE RESULT MODEL -> BATCHED
+(`RelationalRetainedBatchResult` = shared schema once + one flat RowBlock over all needles + per-needle ranges; batcher
+slices per-needle; 10.8M->19.5M wave-batched, +78%, approaching the drain). Byte-identical throughout. NET: wave/lpb is
+now CLEARLY 1.62-1.76x end-to-end (was ~1.0x fully-masked); read-path absolute ~6.5x the session-start 3M. The wave's
+edge is no longer hidden — the kernel decision is on strong numbers.** (Caveat: lpb-batched 11M is still bounded by lpb's
+2-round-trip complete, not its 23M raw drain -> true GPU ratio = raw 1.26-2.4x; collapsing lpb's round-trips = the last
+lever for full-30M-on-both, host-machinery, optional.) R2.2b-3's A/B still stands: **the wave is a STRICT WIN
+(throughput + latency) for the single-coalescer point-read regime — 2.45x lpb @batch=1 down to 1.02x @batch=4096 — but
+the DEFAULT FLIP is GATED on two R2.2c architectural unlocks.** Keep R1 lpb the default until they clear. The fork:
 
 **(A) R2.2c — unlock the wave as the point-read fast-path default. TWO PROBES THIS SESSION SHOWED THE READ-SIDE POLISH
 IS MARGINAL** (DECISIONS "R2.2c gate-1 PROBE" + "R2.2c graphs spike"):
