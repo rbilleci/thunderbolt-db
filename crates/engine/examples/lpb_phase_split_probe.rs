@@ -80,6 +80,16 @@ fn p50(mut v: Vec<u128>) -> u128 {
     }
 }
 
+/// (p50, p99, p99.9, max) — for localizing the TAIL, not just the median.
+fn dist(mut v: Vec<u128>) -> (u128, u128, u128, u128) {
+    if v.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    v.sort_unstable();
+    let at = |q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
+    (at(0.50), at(0.99), at(0.999), v[v.len() - 1])
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let rows: i64 = env::var("GPU_DB_BENCH_ROWS")
         .ok()
@@ -117,55 +127,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let template = e.prepare_relational_retained_read_template(&select)?;
 
-    println!("# R2.2c host-machinery spike — lpb SUBMIT vs COMPLETE phase split (real engine path)");
-    println!("# lpb COMPLETE does 2 sync round-trips (count, then results); wave does 1. rows={rows}\n");
+    println!("# TAIL-LOCALIZATION — lpb vs wave SUBMIT/COMPLETE distribution on the BATCHED path. rows={rows}");
+    println!("# Goal: find WHERE the lpb p99 tail lives (submit vs complete). us = microseconds.\n");
     println!(
-        "  {:>5}  {:>5}  {:>14}  {:>15}  {:>13}  {:>10}",
-        "mode", "batch", "submit p50 us", "complete p50 us", "total p50 us", "route_hits"
+        "  {:>5} {:>6}  {:>26}  {:>26}",
+        "mode", "batch", "submit p50/p99/p99.9/max", "complete p50/p99/p99.9/max"
     );
 
     for &batch in &batch_sizes {
-        for (label, wave_engine, persistent) in
-            [("lpb", true, false), ("wave", true, true)]
-        {
+        for (label, wave_engine, persistent) in [("lpb", true, false), ("wave", true, true)] {
             e.set_wave_engine_enabled(wave_engine);
             e.set_wave_persistent_engine_enabled(persistent);
             // warmup (first wave batch builds the engine; lpb builds the index)
             for b in 0..30 {
                 let n = needles_for_batch(b, batch, step, rows_u);
                 let sub = e.submit_relational_retained_template_point_lookups(&template, &n)?;
-                let _ = e.complete_relational_retained_read_submission(sub)?;
+                let _ = e.complete_relational_retained_read_submission_batched(sub)?;
             }
             let hits_before = e.wave_route_hits();
             let mut submit_us = Vec::with_capacity(batches);
             let mut complete_us = Vec::with_capacity(batches);
-            let mut total_us = Vec::with_capacity(batches);
             for b in 0..batches {
                 let n = needles_for_batch(b, batch, step, rows_u);
                 let t0 = Instant::now();
                 let sub = e.submit_relational_retained_template_point_lookups(&template, &n)?;
                 let s = t0.elapsed().as_micros();
                 let t1 = Instant::now();
-                let _ = e.complete_relational_retained_read_submission(sub)?;
+                let _ = e.complete_relational_retained_read_submission_batched(sub)?;
                 let c = t1.elapsed().as_micros();
                 submit_us.push(s);
                 complete_us.push(c);
-                total_us.push(s + c);
             }
             let hits = e.wave_route_hits() - hits_before;
             // non-vacuity: wave must have served every batch; lpb never hits the wave route.
             let expect = if persistent { batches as u64 } else { 0 };
             assert_eq!(hits, expect, "{label}: wave_route_hits {hits} != {expect}");
+            let (s50, s99, s999, smax) = dist(submit_us);
+            let (c50, c99, c999, cmax) = dist(complete_us);
             println!(
-                "  {label:>5}  {batch:>5}  {:>14}  {:>15}  {:>13}  {:>10}",
-                p50(submit_us),
-                p50(complete_us),
-                p50(total_us),
-                hits
+                "  {label:>5} {batch:>6}  {:>8}/{:>5}/{:>5}/{:>5}  {:>8}/{:>5}/{:>5}/{:>6}",
+                s50, s99, s999, smax, c50, c99, c999, cmax
             );
         }
     }
-    println!("\n# If lpb COMPLETE p50 >> wave COMPLETE p50 (the 2nd round-trip), collapsing lpb's count+result");
-    println!("# DtoH into ONE covering sync (over-fetch results to needles.len, trim by count) is the lever.");
+    let _ = p50(Vec::new()); // (p50 retained for back-compat; dist() drives the tail report)
+    println!("\n# If the lpb COMPLETE max/p99.9 >> its p50 while wave stays flat, the tail is in lpb's");
+    println!("# blocking cuStreamSynchronize drain (shared-GPU contention) — localize drain-vs-sync next.");
     Ok(())
 }
