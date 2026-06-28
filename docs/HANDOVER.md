@@ -124,10 +124,17 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   read is NOT the cap — device `req_dev` + bulk HtoD left large batch UNCHANGED (30.7M vs 31.3M) and REGRESSED small/mid
   batches (HtoD+sync latency: batch1 1.72x->1.46x). device-records already saturated the per-needle path; the residual
   ~31M is the GATHER/RECORD work, and the bare-probe 45M is a simpler kernel (no multi-col rows) -> ~31.8M is at/near the
-  realistic in-crate ceiling for this workload. **NEXT = (P2) per-slot status gate -> depth-K pipelining + an OFFERED-RATE
-  harness = the real premise gate for the CONCURRENT regime the wave exists for (single-flight only proves wave>lpb across
-  the sweep, NOT the concurrent premise); then R2.2b engine wiring. OR (B) R3 writes (independent). Keep R1 lpb default
-  until P2 lands.**
+  realistic in-crate ceiling for this workload.
+  **R2.2 P2 DONE — per-slot status gate + depth-K pipelining; CONCURRENT premise VALIDATED (`65c2b3de`,`494e3c9d`,
+  `38e0f874`; two audits = no new runtime bug; DECISIONS "R2.2 P2"):** replaced the single-flight cumulative gate with a
+  PER-SLOT status ring (kernel `.target sm_70`, `st.release.sys` per slot; harvest = all-slots-set, any order; submit
+  clears slots). BONUS: cut single-flight small-batch latency (batch1 1.72x->2.51x lpb). P2b depth-K test = byte-identical
+  out-of-order across 64 reused-slot rounds. P2c (premise gate): pipelining lifts throughput **1.4-2.1x over single-flight**
+  (saturates ~depth-4); pipelined wave = **2.6-4.6x lpb, 9-32x the 156k batcher**. Open (deferred to R2.2b): enforce the
+  in-flight ring bound + per-ticket-harvest + a depth-K harvest deadline (currently caller contracts). Cross-engine body
+  visibility = the device-result design's property, empirically validated.
+  **NEXT = R2.2b: wire WaveReadEngine into a query path behind the default-OFF flag (enforcing the contracts) and measure
+  end-to-end vs the batcher. OR (B) R3 writes (independent). Keep R1 lpb default until R2.2b lands.**
   (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under

@@ -316,6 +316,29 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   status gate -> depth-K pipelining + offered-rate harness) — the CONCURRENT regime the wave exists for, still
   unbenchmarked. (Oracle + stale-DtoH stress gate stayed green during the P1 experiment.)
 
+- **R2.2 P2 = per-slot status gate + depth-K pipelining: the CONCURRENT premise VALIDATED (2026-06-28, commits
+  `65c2b3de`, `494e3c9d`, `38e0f874`; two independent audits = no new runtime bug).** The cumulative-counter gate was
+  single-flight-only (a later wave's indices push it past an earlier wave's range while a slot there is unwritten). **P2a:**
+  replaced it with a PER-SLOT status ring — the kernel (now `.target sm_70`) `st.release.sys`-writes each slot's status
+  (1=found/2=not-found) into a host-mapped ring after the device record body; `harvest` is ready iff EVERY slot of the wave
+  is non-zero (host-local reads, ANY order); `submit_async` clears the wave's slots before publishing head. Removed the
+  completed counter + thread-0 completed-mirror. BONUS: removing the thread-0 mirror hop CUT single-flight small-batch
+  latency (batch1 14.6us->10.2us = 1.72x->2.51x lpb; batch8 2.46x, batch32 2.40x, batch256 1.90x; batch65536 ~1.25x).
+  **P2b:** a depth-K test keeps 8 waves in flight and harvests them in REVERSE order, byte-identical across 64 reused-slot
+  rounds — proves out-of-order pipelining soundness. **P2c (the premise gate):** depth-K pipelining lifts sustained
+  throughput **1.4-2.1x over single-flight** (batch1 96k->190k=1.97x, batch8 2.08x, batch32 1.74x, batch256 1.42x),
+  saturating ~depth-4 (the single host thread's submit+harvest loop then caps it; multi-producer offered-rate would push
+  further). The PIPELINED wave is **~2.6-4.6x lpb and ~9-32x the 156k batcher** in the concurrent regime. **AUDITS:** two
+  independent adversarial audits found NO new runtime bug (gate completeness, status/body alignment, clear-vs-write
+  ordering, submit timeout all SOUND; the prior false-ready class is closed). Open items, documented + deferred to R2.2b
+  wiring: the in-flight ring bound + per-ticket-harvest are caller contracts (UNENFORCED — assert when wired); depth-K
+  `harvest` spin loops need their own deadline (the kernel writes no terminal status for a backstop-skipped wave). The
+  cross-engine body visibility (DtoH copy engine reads the device body, ordered by the kernel's `.sys`-release of the
+  status + harvest's `cuStreamSynchronize`) is the SAME property the device-result design relies on, empirically validated
+  by the stale-DtoH stress gate + the depth-K reused-slot test. **The wave engine's premise (concurrent point reads beating
+  the host-serial coalescer) is now demonstrated IN-CRATE.** NEXT = R2.2b (wire into a query path behind the default-OFF
+  flag, with the contracts enforced) OR R3 writes.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
