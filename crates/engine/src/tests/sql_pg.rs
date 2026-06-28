@@ -1517,7 +1517,7 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
     if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
         return;
     }
-    let ints = |rows: &[Vec<SqlValue>]| -> Vec<Option<i32>> {
+    let ints = |rows: &RowBlock| -> Vec<Option<i32>> {
         rows.iter()
             .map(|row| match row[0] {
                 SqlValue::Int4(v) => Some(v),
@@ -1573,7 +1573,7 @@ fn gpu_group_by_nullable_composite_key_per_member_null_on_device() {
     if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
         return;
     }
-    let groups = |rows: &[Vec<SqlValue>]| -> Vec<(Option<i32>, Option<i32>, i64)> {
+    let groups = |rows: &RowBlock| -> Vec<(Option<i32>, Option<i32>, i64)> {
         let opt = |v: &SqlValue| match v {
             SqlValue::Int4(x) => Some(*x),
             SqlValue::Null => None,
@@ -1652,7 +1652,7 @@ fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
     if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
         return;
     }
-    let groups = |rows: &[Vec<SqlValue>]| -> Vec<(Option<i32>, i64)> {
+    let groups = |rows: &RowBlock| -> Vec<(Option<i32>, i64)> {
         let mut v: Vec<(Option<i32>, i64)> = rows
             .iter()
             .map(|r| {
@@ -1706,7 +1706,7 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
     if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
         return;
     }
-    let ids = |rows: &[Vec<SqlValue>]| -> Vec<i32> {
+    let ids = |rows: &RowBlock| -> Vec<i32> {
         rows.iter()
             .map(|r| match r[0] {
                 SqlValue::Int4(v) => v,
@@ -1752,7 +1752,7 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
     if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
         return;
     }
-    let keys = |rows: &[Vec<SqlValue>]| -> Vec<Option<i32>> {
+    let keys = |rows: &RowBlock| -> Vec<Option<i32>> {
         rows.iter()
             .map(|r| match r[0] {
                 SqlValue::Int4(x) => Some(x),

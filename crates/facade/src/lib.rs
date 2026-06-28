@@ -273,8 +273,8 @@ pub fn execute_on_engine(
             let columns = result.columns.iter().map(map_column).collect();
             let rows = result
                 .rows
-                .into_iter()
-                .map(|row| row.into_iter().map(map_value).collect())
+                .iter()
+                .map(|row| row.iter().cloned().map(map_value).collect())
                 .collect();
             Ok(QueryOutcome::Rows { columns, rows })
         }
@@ -392,8 +392,8 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
             let columns = result.columns.iter().map(map_column).collect();
             let rows = result
                 .rows
-                .into_iter()
-                .map(|row| row.into_iter().map(map_value).collect())
+                .iter()
+                .map(|row| row.iter().cloned().map(map_value).collect())
                 .collect();
             Ok(QueryOutcome::Rows { columns, rows })
         }
@@ -499,8 +499,8 @@ pub fn execute_select_with_pinned_hook(
     let columns = result.columns.iter().map(map_column).collect();
     let rows = result
         .rows
-        .into_iter()
-        .map(|row| row.into_iter().map(map_value).collect())
+        .iter()
+        .map(|row| row.iter().cloned().map(map_value).collect())
         .collect();
     Ok(QueryOutcome::Rows { columns, rows })
 }

@@ -7496,7 +7496,7 @@ fn gpu_grouped_numeric_min_max() {
         return;
     }
     let i4 = SqlValue::Int4;
-    let numeric_strs = |rows: &[Vec<SqlValue>]| -> Vec<(SqlValue, String)> {
+    let numeric_strs = |rows: &RowBlock| -> Vec<(SqlValue, String)> {
         rows.iter()
             .map(|r| {
                 (
@@ -7558,7 +7558,7 @@ fn gpu_grouped_numeric_min_max_large_high_limb() {
     );
     let i4 = SqlValue::Int4;
     let dec = |m: i128| Decimal128::new(m, 19).to_decimal_string();
-    let numeric_strs = |rows: &[Vec<SqlValue>]| -> Vec<(SqlValue, String)> {
+    let numeric_strs = |rows: &RowBlock| -> Vec<(SqlValue, String)> {
         rows.iter()
             .map(|r| {
                 (
@@ -8567,7 +8567,7 @@ fn audit_s8_filtered_grouped_having_order_limit() {
         e.execute_resident_grouped_via_general(&select, None)
             .unwrap()
             .rows,
-        result.rows
+        result.rows.into_boxed()
     );
 }
 
@@ -8680,7 +8680,7 @@ fn audit_s8_grouped_order_by_aggregate_tie_break() {
         };
         let result = e.execute_relational_select(&select).unwrap();
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "{sql}");
-        result.rows
+        result.rows.into_boxed()
     };
 
     // COUNT ties: k=10 & k=20 both 3 -> ORDER BY count DESC breaks by group ASC -> k=10 first.
@@ -8734,7 +8734,7 @@ fn audit_s8_grouped_materialized_view_via_bridge() {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
-        e.execute_relational_select(&select).unwrap().rows
+        e.execute_relational_select(&select).unwrap().rows.into_boxed()
     };
 
     // Grouped matview: the SELECT runs through the bridge at create time; readback returns stored rows.

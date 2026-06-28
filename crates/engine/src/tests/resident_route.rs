@@ -3818,7 +3818,7 @@ fn r1_wave_index_probe_matches_scan_differential() {
     let select_dup = select_cmd("SELECT id, bucket FROM accounts WHERE bucket = 1");
 
     // Per-needle rows via the retained-template path (the route the index/scan swap lives on).
-    let run = |e: &Engine, select: &Select, needles: &[i32]| -> Vec<Vec<Vec<SqlValue>>> {
+    let run = |e: &Engine, select: &Select, needles: &[i32]| -> Vec<RowBlock> {
         let template = e.prepare_relational_retained_read_template(select).unwrap();
         let submission = e
             .submit_relational_retained_template_point_lookups(&template, needles)
@@ -4089,7 +4089,7 @@ fn r2_wave_engine_matches_lpb_differential() {
     }
     let select_dup = select_cmd("SELECT id, bucket FROM accounts WHERE bucket = 1");
 
-    let run = |e: &Engine, select: &Select, needles: &[i32]| -> Vec<Vec<Vec<SqlValue>>> {
+    let run = |e: &Engine, select: &Select, needles: &[i32]| -> Vec<RowBlock> {
         let template = e.prepare_relational_retained_read_template(select).unwrap();
         let submission = e
             .submit_relational_retained_template_point_lookups(&template, needles)
@@ -4344,7 +4344,7 @@ fn r2_wave_engine_concurrent_same_shape_single_flight() {
     }
     let needles: Vec<i32> = (0..16).map(|i| i * 2 + 1).collect(); // present unique keys
 
-    let run = |e: &Engine, needles: &[i32]| -> Vec<Vec<Vec<SqlValue>>> {
+    let run = |e: &Engine, needles: &[i32]| -> Vec<RowBlock> {
         let template = e.prepare_relational_retained_read_template(&select).unwrap();
         let submission = e
             .submit_relational_retained_template_point_lookups(&template, needles)
@@ -4383,7 +4383,7 @@ fn r2_wave_engine_concurrent_same_shape_single_flight() {
                     let submission = engine
                         .submit_relational_retained_template_point_lookups(&template, &needles)
                         .unwrap();
-                    let rows: Vec<Vec<Vec<SqlValue>>> = engine
+                    let rows: Vec<RowBlock> = engine
                         .complete_relational_retained_read_submission(submission)
                         .unwrap()
                         .iter()

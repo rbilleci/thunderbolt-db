@@ -167,6 +167,97 @@ pub enum RelationalCommentTarget {
     Constraint { table: String, constraint: String },
 }
 
+/// A flat, row-major block of result values: `values` holds `ncols`-wide rows back-to-back, so row `i` is
+/// `values[i*ncols .. (i+1)*ncols]`. Replaces the per-row `Vec<Vec<SqlValue>>` boxing that capped end-to-end
+/// read throughput at ~7.8M (the per-row heap Vec + grouping was 153ns/row; flat is ~2.3ns/row -- DECISIONS
+/// "Result-path optimization" step-1: 66x, drain-bound). Keeps `SqlValue` so the wire value-type + encoder
+/// are unchanged. Transparent-ish: `iter()`/`Index` yield row slices `&[SqlValue]`, `PartialEq<Vec<Vec<..>>>`
+/// + `From<Vec<Vec<..>>>` keep existing construction/asserts working with minimal churn.
+#[derive(Debug, Clone, Default)]
+pub struct RowBlock {
+    values: Vec<SqlValue>,
+    ncols: usize,
+}
+
+// Row-based equality: two blocks are equal iff they hold the same ROWS, regardless of how `ncols` was
+// recorded for an empty block (an empty result may carry ncols=0 from `From<vec![]>` or ncols=N from the
+// schema width). Field-wise derive would wrongly distinguish those, breaking byte-identity asserts.
+impl PartialEq for RowBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+impl Eq for RowBlock {}
+
+impl RowBlock {
+    /// Build directly from a flat row-major value buffer (the fast path: no per-row Vec). `ncols` must be
+    /// > 0 unless `values` is empty.
+    pub fn flat(values: Vec<SqlValue>, ncols: usize) -> Self {
+        debug_assert!(ncols > 0 || values.is_empty(), "RowBlock: ncols=0 with non-empty values");
+        Self { values, ncols }
+    }
+    pub fn len(&self) -> usize {
+        if self.ncols == 0 {
+            0
+        } else {
+            self.values.len() / self.ncols
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn ncols(&self) -> usize {
+        self.ncols
+    }
+    /// Row `i` as a `&[SqlValue]` slice (no alloc).
+    pub fn row(&self, i: usize) -> &[SqlValue] {
+        let n = self.ncols;
+        &self.values[i * n..i * n + n]
+    }
+    /// Iterate rows as `&[SqlValue]` slices.
+    pub fn iter(&self) -> std::slice::Chunks<'_, SqlValue> {
+        self.values.chunks(self.ncols.max(1))
+    }
+    /// Convert back to the boxed `Vec<Vec<SqlValue>>` (for the few paths/tests that still want it).
+    pub fn into_boxed(self) -> Vec<Vec<SqlValue>> {
+        if self.ncols == 0 {
+            return Vec::new();
+        }
+        self.values.chunks(self.ncols).map(<[SqlValue]>::to_vec).collect()
+    }
+}
+
+impl From<Vec<Vec<SqlValue>>> for RowBlock {
+    fn from(rows: Vec<Vec<SqlValue>>) -> Self {
+        let ncols = rows.first().map(Vec::len).unwrap_or(0);
+        Self {
+            values: rows.into_iter().flatten().collect(),
+            ncols,
+        }
+    }
+}
+
+impl PartialEq<Vec<Vec<SqlValue>>> for RowBlock {
+    fn eq(&self, other: &Vec<Vec<SqlValue>>) -> bool {
+        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a == b.as_slice())
+    }
+}
+
+impl std::ops::Index<usize> for RowBlock {
+    type Output = [SqlValue];
+    fn index(&self, i: usize) -> &[SqlValue] {
+        self.row(i)
+    }
+}
+
+impl<'a> IntoIterator for &'a RowBlock {
+    type Item = &'a [SqlValue];
+    type IntoIter = std::slice::Chunks<'a, SqlValue>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalSelectResult {
     /// `Arc`-shared so a BATCHED point-read (one result per needle, all sharing the same projected schema)
@@ -174,7 +265,7 @@ pub struct RelationalSelectResult {
     /// needle — that per-needle schema deep-clone was the entire ~3M end-to-end read cap (DECISIONS
     /// "Result-path optimization"; Arc-share = 15x, above the GPU drain). Reads deref transparently.
     pub columns: Arc<Vec<RelationalColumn>>,
-    pub rows: Vec<Vec<SqlValue>>,
+    pub rows: RowBlock,
     pub planned_target: DeviceTarget,
     pub executed_target: DeviceTarget,
     pub fallback_reason: Option<FallbackReason>,

@@ -133,7 +133,7 @@ fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
         e.execute_relational_select(&select)
             .unwrap()
             .rows
-            .into_iter()
+            .iter()
             .map(|row| match (&row[0], &row[1]) {
                 (SqlValue::Int4(id), SqlValue::Int4(v)) => (*id as i64, *v as i64),
                 other => panic!("unexpected row {other:?}"),

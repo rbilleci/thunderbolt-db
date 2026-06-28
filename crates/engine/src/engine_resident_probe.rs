@@ -497,7 +497,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: Arc::new(bound.selected_columns),
-            rows: vec![vec![SqlValue::Int8(count)]],
+            rows: (vec![vec![SqlValue::Int8(count)]]).into(),
             planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
             fallback_reason: None,
@@ -814,7 +814,7 @@ impl Engine {
     ) -> RelationalSelectResult {
         RelationalSelectResult {
             columns: Arc::new(bound.selected_columns),
-            rows: vec![vec![value]],
+            rows: (vec![vec![value]]).into(),
             planned_target: DeviceTarget::Gpu(gpu_id),
             executed_target: DeviceTarget::Gpu(gpu_id),
             fallback_reason: None,
@@ -940,7 +940,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: Arc::new(bound.selected_columns),
-            rows: vec![vec![SqlValue::Int8(count)]],
+            rows: (vec![vec![SqlValue::Int8(count)]]).into(),
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -1082,7 +1082,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: Arc::new(bound.selected_columns),
-            rows: vec![vec![SqlValue::Int8(count)]],
+            rows: (vec![vec![SqlValue::Int8(count)]]).into(),
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -1634,7 +1634,7 @@ impl Engine {
             .map(
                 |((bound, access_path, _needle), rows)| RelationalSelectResult {
                     columns: Arc::new(bound.selected_columns),
-                    rows,
+                    rows: rows.into(),
                     planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
                     executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
                     fallback_reason: None,

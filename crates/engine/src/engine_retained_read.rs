@@ -1016,24 +1016,25 @@ impl Engine {
         // equals the needle, so this reorder is a no-op on the emitted value sequence (it only
         // makes the output deterministic); for multi-column the projected values differ per row, so
         // the sort is load-bearing for parity.
-        let mut rows_by_select: Vec<Vec<(u64, Vec<SqlValue>)>> =
-            vec![Vec::new(); pending.members.len()];
+        // Materialize FLAT per needle (DECISIONS "Result-path optimization" step-1): group the matched rows
+        // by needle BY REFERENCE (no per-row Vec), sort each needle's slice by `row_index` for the
+        // deterministic byte-identical order (the stable-order contract above), then flatten the projected
+        // i32 values straight into a row-major `RowBlock` — skipping the per-row `Vec<SqlValue>` boxing +
+        // `Vec<Vec<..>>` assembly that capped end-to-end read at ~7.8M (153ns/row -> ~2ns/row).
+        let ncols = pending.selected_indexes.len();
+        let mut by_needle: Vec<Vec<(u64, &[i32])>> = vec![Vec::new(); pending.members.len()];
         for projected in &projected_rows {
-            rows_by_select[projected.needle_index].push((
-                projected.row_index,
-                projected
-                    .values
-                    .iter()
-                    .copied()
-                    .map(SqlValue::Int4)
-                    .collect::<Vec<_>>(),
-            ));
+            by_needle[projected.needle_index].push((projected.row_index, projected.values.as_slice()));
         }
-        let rows_by_select: Vec<Vec<Vec<SqlValue>>> = rows_by_select
+        let row_blocks: Vec<RowBlock> = by_needle
             .into_iter()
             .map(|mut slice| {
                 slice.sort_by_key(|(row_index, _)| *row_index);
-                slice.into_iter().map(|(_, row)| row).collect()
+                let mut values = Vec::with_capacity(slice.len() * ncols);
+                for (_, vals) in slice {
+                    values.extend(vals.iter().copied().map(SqlValue::Int4));
+                }
+                RowBlock::flat(values, ncols)
             })
             .collect();
         let materialization_micros = materialize_started
@@ -1041,12 +1042,12 @@ impl Engine {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
-        let total_rows = rows_by_select.iter().map(Vec::len).sum::<usize>();
+        let total_rows = row_blocks.iter().map(RowBlock::len).sum::<usize>();
         let table_name = pending.table.name.clone();
         let results = pending
             .members
             .into_iter()
-            .zip(rows_by_select)
+            .zip(row_blocks)
             .map(
                 |((columns, access_path, _needle), rows)| RelationalSelectResult {
                     columns,

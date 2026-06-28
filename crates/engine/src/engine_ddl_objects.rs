@@ -148,7 +148,7 @@ impl Engine {
         }
         cat.relational_next_column_id = next_column_id;
         let rows = if create.with_data {
-            result.rows
+            result.rows.into_boxed()
         } else {
             Vec::new()
         };
@@ -206,7 +206,7 @@ impl Engine {
             .relational_materialized_views
             .get_mut(&refresh.name)
             .expect("materialized view existence preflighted");
-        view.rows = result.rows;
+        view.rows = result.rows.into_boxed();
         Ok(())
     }
 

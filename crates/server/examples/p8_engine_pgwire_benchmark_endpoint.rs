@@ -607,7 +607,7 @@ fn execute_retained_read_runtime_batch(
             .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
         let mut bytes = Vec::new();
         let mut writer = BackendWriter::new(&mut bytes);
-        write_select_result_rows(&mut writer, &columns, rows).map_err(|err| err.to_string())?;
+        write_select_result_rows(&mut writer, &columns, &gpu_db_engine::RowBlock::from(rows.clone())).map_err(|err| err.to_string())?;
         writer
             .ready_for_query(false)
             .map_err(|err| err.to_string())?;
@@ -695,7 +695,7 @@ fn execute_retained_read_runtime_text_batch(
             .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
         let mut bytes = Vec::new();
         let mut writer = BackendWriter::new(&mut bytes);
-        write_select_result_rows(&mut writer, &columns, rows).map_err(|err| err.to_string())?;
+        write_select_result_rows(&mut writer, &columns, &gpu_db_engine::RowBlock::from(rows.clone())).map_err(|err| err.to_string())?;
         writer
             .ready_for_query(false)
             .map_err(|err| err.to_string())?;
@@ -2228,7 +2228,7 @@ fn sql_value_text(value: &SqlValue) -> String {
 fn write_select_result_rows<W: Write + ?Sized>(
     writer: &mut BackendWriter<'_, W>,
     columns: &[BackendColumn],
-    rows: &[Vec<SqlValue>],
+    rows: &gpu_db_engine::RowBlock,
 ) -> Result<u64, Box<dyn Error>> {
     writer.row_description(columns)?;
     let materialize_started = Instant::now();

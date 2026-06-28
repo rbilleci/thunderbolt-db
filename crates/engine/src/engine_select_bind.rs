@@ -699,7 +699,7 @@ impl Engine {
 
             return Ok(RelationalSelectResult {
                 columns: Arc::new(bound.selected_columns),
-                rows: aggregate_rows,
+                rows: (aggregate_rows).into(),
                 planned_target: mvcc_result.planned_target,
                 executed_target: mvcc_result.executed_target,
                 fallback_reason: mvcc_result.fallback_reason,
@@ -742,7 +742,7 @@ impl Engine {
 
             return Ok(RelationalSelectResult {
                 columns: Arc::new(bound.selected_columns),
-                rows: projected,
+                rows: (projected).into(),
                 planned_target: mvcc_result.planned_target,
                 executed_target: mvcc_result.executed_target,
                 fallback_reason: mvcc_result.fallback_reason,
@@ -776,7 +776,7 @@ impl Engine {
                     .map(|idx| row[*idx].clone())
                     .collect::<Vec<_>>()
             })
-            .collect();
+            .collect::<Vec<Vec<SqlValue>>>();
 
         let mut fallback_reason = mvcc_result.fallback_reason;
         if fallback_reason.is_none()
@@ -789,7 +789,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: Arc::new(bound.selected_columns),
-            rows,
+            rows: rows.into(),
             planned_target: mvcc_result.planned_target,
             executed_target: mvcc_result.executed_target,
             fallback_reason,

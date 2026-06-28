@@ -827,7 +827,7 @@ fn assert_single_int(
     expected: i64,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows.iter().next() else {
         return Err(format!("{label} returned no rows").into());
     };
     let Some(value) = row.first() else {
@@ -849,7 +849,7 @@ fn assert_single_numeric(
     expected: &str,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows.iter().next() else {
         return Err(format!("{label} returned no rows").into());
     };
     let Some(value) = row.first() else {
@@ -1206,7 +1206,7 @@ fn expected_result_for_case(
     };
     Ok(RelationalSelectResult {
         columns: Arc::new(Vec::new()),
-        rows: vec![vec![value]],
+        rows: (vec![vec![value]]).into(),
         planned_target: gpu_db_execution::DeviceTarget::Cpu,
         executed_target: gpu_db_execution::DeviceTarget::Cpu,
         fallback_reason: None,
@@ -1215,8 +1215,8 @@ fn expected_result_for_case(
 }
 
 fn assert_rows_match(
-    actual: &[Vec<gpu_db_sql::SqlValue>],
-    expected: &[Vec<gpu_db_sql::SqlValue>],
+    actual: &gpu_db_engine::RowBlock,
+    expected: &gpu_db_engine::RowBlock,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
     if actual.len() != expected.len() {

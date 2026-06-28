@@ -654,9 +654,8 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
         .execute_resident_expr_select_sql("SELECT a, COUNT(*) FROM p2 GROUP BY a ORDER BY a")
         .unwrap();
     std::sync::Arc::make_mut(&mut grouped.columns).truncate(1);
-    for row in &mut grouped.rows {
-        row.truncate(1);
-    }
+    let keys: Vec<SqlValue> = grouped.rows.iter().map(|row| row[0].clone()).collect();
+    grouped.rows = RowBlock::flat(keys, 1);
     assert_eq!(dispatch.rows, grouped.rows, "DISTINCT bridge != explicit GROUP BY (NULL): {sql}");
     assert_eq!(*dispatch.columns, *grouped.columns, "bridge cols != GROUP BY cols: {sql}");
 

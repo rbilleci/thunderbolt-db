@@ -36,7 +36,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpu_db_engine::{Engine, RelationalRetainedReadTemplate};
+use gpu_db_engine::{RowBlock, Engine, RelationalRetainedReadTemplate};
 use gpu_db_sql::{parse_command, Command, Select};
 
 fn parse_select(sql: &str) -> Select {
@@ -223,7 +223,7 @@ fn rows_once(
     template: &RelationalRetainedReadTemplate,
     mode: Mode,
     needles: &[i32],
-) -> Result<Vec<Vec<Vec<gpu_db_sql::SqlValue>>>, Box<dyn Error>> {
+) -> Result<Vec<RowBlock>, Box<dyn Error>> {
     mode.configure(e);
     Ok(e
         .complete_relational_retained_read_submission(

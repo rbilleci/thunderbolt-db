@@ -52,9 +52,9 @@ fn select_people_ids(engine: &mut Engine) -> Vec<i32> {
     let result = engine.execute_relational_select(&select).unwrap();
     result
         .rows
-        .into_iter()
-        .map(|row| match row.into_iter().next().unwrap() {
-            SqlValue::Int4(v) => v,
+        .iter()
+        .map(|row| match row.iter().next().unwrap() {
+            SqlValue::Int4(v) => *v,
             other => panic!("expected Int4, got {other:?}"),
         })
         .collect()

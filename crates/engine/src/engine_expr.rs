@@ -2092,7 +2092,7 @@ impl Engine {
         let finalize = |rows: Vec<Vec<SqlValue>>| -> RelationalSelectResult {
             RelationalSelectResult {
                 columns: Arc::new(bound.selected_columns.clone()),
-                rows,
+                rows: rows.into(),
                 planned_target: DeviceTarget::Gpu(gpu_id),
                 executed_target: DeviceTarget::Gpu(gpu_id),
                 fallback_reason: None,
@@ -2208,8 +2208,8 @@ impl Engine {
         let count_bound = bind_relational_select(&table, &count_select)?;
         let matched = {
             let result = run(&count_select, count_bound, &unified_src)?;
-            match result.rows.into_iter().next().and_then(|row| row.into_iter().next()) {
-                Some(SqlValue::Int8(n)) => n,
+            match result.rows.iter().next().and_then(|row| row.first()) {
+                Some(SqlValue::Int8(n)) => *n,
                 other => {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                         "sharded resident COUNT(*) precheck returned an unexpected value: {other:?}"
@@ -2284,9 +2284,10 @@ impl Engine {
         // `columns` is now `Arc`-shared; `make_mut` gives an owned `&mut Vec` (no clone — this freshly
         // produced result holds the only reference).
         Arc::make_mut(&mut result.columns).truncate(1);
-        for row in &mut result.rows {
-            row.truncate(1);
-        }
+        // Drop the trailing COUNT(*) value from every row too — `rows` is a flat RowBlock, so reshape it to
+        // a single column (the bare distinct group key, column 0).
+        let keys: Vec<SqlValue> = result.rows.iter().map(|row| row[0].clone()).collect();
+        result.rows = RowBlock::flat(keys, 1);
         Ok(result)
     }
 
@@ -3360,7 +3361,7 @@ impl Engine {
         }
         Ok(RelationalSelectResult {
             columns: Arc::new(columns),
-            rows: result_rows,
+            rows: (result_rows).into(),
             planned_target: DeviceTarget::Gpu(gpu_id),
             executed_target: DeviceTarget::Gpu(gpu_id),
             fallback_reason: None,
@@ -5482,7 +5483,7 @@ impl Engine {
             }
             return Ok(RelationalSelectResult {
                 columns: Arc::new(bound.selected_columns),
-                rows,
+                rows: rows.into(),
                 planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 fallback_reason: None,
@@ -5702,7 +5703,7 @@ impl Engine {
             };
             return Ok(RelationalSelectResult {
                 columns: Arc::new(bound.selected_columns),
-                rows: vec![vec![value]],
+                rows: (vec![vec![value]]).into(),
                 planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
                 fallback_reason: None,
@@ -6215,7 +6216,7 @@ impl Engine {
         // gather), so `rows` is the final windowed result -- no host drain/truncate on result data.
         Ok(RelationalSelectResult {
             columns: Arc::new(bound.selected_columns),
-            rows,
+            rows: rows.into(),
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,

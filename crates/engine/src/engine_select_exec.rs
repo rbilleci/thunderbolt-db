@@ -174,7 +174,7 @@ impl Engine {
             }
             return Ok(RelationalSelectResult {
                 columns: Arc::new(view.columns),
-                rows: view.rows,
+                rows: (view.rows).into(),
                 planned_target: DeviceTarget::Cpu,
                 executed_target: DeviceTarget::Cpu,
                 fallback_reason: Some(FallbackReason::NotGpuEligible),
@@ -294,7 +294,7 @@ impl Engine {
                 type_oid: function.return_type.postgres_oid(),
                 type_size: function.return_type.type_size(),
             }]),
-            rows: vec![vec![value]],
+            rows: (vec![vec![value]]).into(),
             planned_target: DeviceTarget::Cpu,
             executed_target: DeviceTarget::Cpu,
             fallback_reason: Some(FallbackReason::NotGpuEligible),
