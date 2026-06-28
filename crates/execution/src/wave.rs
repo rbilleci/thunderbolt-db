@@ -243,15 +243,17 @@ $L_loop:
     ld.volatile.global.u32 %r30, [%rd1+16];      // host heartbeat
     setp.ne.u32 %p2, %r30, %r29;
     @%p2 bra $L_wd_pet;                           // heartbeat changed -> record + reset the staleness timer
-    mov.u64 %rd47, %globaltimer;
-    sub.u64 %rd48, %rd47, %rd45;
+    setp.eq.u32 %p2, %r29, 0;
+    @%p2 bra $L_poll;                            // NOT PRIMED yet (no pet seen) -> never fire before the first
+    mov.u64 %rd47, %globaltimer;                 //   pet (the staleness clock is armed by the first pet, so a
+    sub.u64 %rd48, %rd47, %rd45;                 //   slow petter start can't spuriously kill a healthy kernel)
     setp.lt.u64 %p2, %rd48, %rd46;
     @%p2 bra $L_poll;                            // not yet stale
     mov.u32 %r28, 1;
     st.volatile.global.u32 [%rd2+16], %r28;      // STALE -> ring the device doorbell (all threads exit)
     bra $L_poll;
 $L_wd_pet:
-    mov.u32 %r29, %r30;
+    mov.u32 %r29, %r30;                          // record the pet (>= 1, so r29 != 0 == primed)
     mov.u64 %rd45, %globaltimer;
 $L_poll:
     ld.volatile.global.u32 %r6, [%rd2+16];      // device doorbell mirror (counters+16; device read, no PCIe)
@@ -680,7 +682,13 @@ impl WaveReadEngine {
                 let mut counter: u32 = 1;
                 while !stop.load(Ordering::Relaxed) {
                     unsafe { ptr::write_volatile(hb, counter) };
+                    fence(Ordering::SeqCst); // make the heartbeat visible to the GPU over PCIe (as the head publish does)
+                    // Never write 0: 0 is the "no pet seen yet" sentinel the kernel uses to stay un-armed
+                    // before the first pet (skip it on the ~136-year u32 wrap).
                     counter = counter.wrapping_add(1);
+                    if counter == 0 {
+                        counter = 1;
+                    }
                     std::thread::sleep(interval);
                 }
             }))
@@ -1320,6 +1328,16 @@ mod tests {
         // Kernel is alive (petter keeps it so): a submit succeeds.
         let got = engine.submit(&[keys[7]]).expect("submit while watchdog-petted");
         assert_eq!(got.len(), 1, "present key found while the kernel is petted");
+
+        // Let the petter run (interval ~watchdog_ns/3 = 167ms) so thread 0 sees >= 1 real pet and ARMS the
+        // watchdog -- mirrors real use (the kernel runs petted for a long time before any crash). Without a
+        // real pet the watchdog stays un-armed (by design: a never-petted kernel must not self-kill from
+        // launch). The kernel must NOT have fired during this healthy window.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !engine.submit(&[keys[9]]).expect("kernel still alive while petted").is_empty(),
+            "watchdog must NOT fire while the petter is alive"
+        );
 
         // Simulate SIGKILL: stop the petter (no clean shutdown) and time the kernel's exit.
         let exit = engine.simulate_host_death_then_wait_exit();
