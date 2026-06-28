@@ -5,26 +5,33 @@
 
 **Updated:** 2026-06-28.
 
-## >>> THE ONE NEXT ACTION: R2.2b-3 (end-to-end offered-rate A/B = the SHIP decision) <<<
-R2.2b-2 is DONE + MERGED: the persistent `WaveReadEngine` is now WIRED + ROUTED into the resident int4 point-lookup
-read path behind the default-OFF `wave_persistent_engine_enabled` flag (nested UNDER `wave_engine_enabled`, which stays
-the lpb default). Flipping just that inner flag is the A/B lever. Build + audit detail: DECISIONS "R2.2b-2 DONE".
-R2.2b-3 is the measurement that decides whether the wave route ships as a default:
-1. **A/B harness** — extend/clone the offered-rate benchmark (`engine/examples/r1_wave_index_ab` is the closest
-   template) to sweep, on the SAME resident table+shape: scan (both flags off) vs lpb index (`wave_engine_enabled`
-   only) vs wave (both flags). Measure **offered-rate / sustained throughput + p50/p99 latency** under REAL connection
-   concurrency (the multi-producer headroom), not just single-flight micro-timing — that is the regime the wave is
-   meant to win (no per-batch launch). Use `Engine::wave_route_hits()` to confirm the wave actually served (not silent
-   lpb fallback) + measure the fallback rate.
-2. **Decide the flip**: if the wave beats lpb on offered-rate at the OLTP batch sizes with acceptable p99, propose
-   making it the default (size-aware, per the R1 crossover ~1M rows) — else keep R1 lpb default and park the wave
-   behind the flag. Record the numbers in DECISIONS (ADR-008 lineage).
-KNOWN CONSTRAINTS the A/B must respect (DECISIONS "R2.2b-2 DONE"): the wired route is SINGLE-FLIGHT-first and enforces
-**at-most-one persistent wave kernel resident** (two full-occupancy persistent spin-kernels in one context mutually
-starve -> teardown deadlock). So the A/B is one shape/table at a time; multi-shape/table concurrency (and the
-"reader holds an engine across a rebuild" edge) is the central thing R2.2b-3's multi-producer design must confront
-(likely sub-occupancy sizing or a shared multi-table kernel = R2.2c). OR (B) pivot to R3 writes. Keep R1 lpb default
-until the A/B clears.
+## >>> THE ONE NEXT ACTION: pick the fork — R2.2c (unlock the wave default) OR R3 (writes) <<<
+R2.2b is COMPLETE + MERGED. R2.2b-2 wired + routed the persistent `WaveReadEngine` into the resident int4 point-lookup
+path behind default-OFF `wave_persistent_engine_enabled`; R2.2b-3's A/B (`engine/examples/r2_wave_engine_ab`, DECISIONS
+"R2.2b-3 DONE") returned: **the wave is a STRICT WIN (throughput + latency) for the production single-coalescer point-read
+regime — 2.45x lpb @batch=1 down to 1.02x @batch=4096, lower latency at every batch — but the DEFAULT FLIP is GATED on
+two R2.2c architectural unlocks.** Keep R1 lpb the default until they clear. The fork:
+
+**(A) R2.2c — unlock the wave as the point-read fast-path default.** Two gates, both from the at-most-one-resident-kernel
+constraint + the single-flight Mutex:
+  1. **Multi-shape coexistence.** Today one wave engine TOTAL (two full-occupancy persistent spin-kernels in a context
+     mutually starve -> teardown deadlock), so a multi-shape point-read workload THRASHES (the coalescer processes
+     shape-groups sequentially; each shape switch = teardown+launch). Fix = sub-occupancy kernel sizing so K engines
+     coexist, OR a single shared multi-table/shape kernel. This is the gating design problem.
+  2. **Multi-producer ring (the wave's original premise).** The A/B's concurrent regime shows the wired single-flight
+     wave (per-engine `Mutex`) plateaus ~1.4M and crosses UNDER lpb at ~4 direct threads. Winning the concurrent regime
+     needs N producers enqueuing into the lock-free ring with depth-K pipelining (no central coalescer/Mutex) =
+     `submit_async`/`harvest` (already built + audited in `wave.rs`, P2) lifted into the engine.
+  Then re-run the A/B (multi-shape + multi-producer) and flip the default (size/shape-aware).
+
+**(B) R3 — the write path (independent, the larger unmeasured frontier).** Concurrent lock-free index maintenance is
+PROVEN fast (write-probe-1, tens of billions inserts/s); the open problems are GPU-native commit/durability (WAL fsync +
+group commit) and deterministic CC (ADR-009 MV-dependency-graph). The write path is entirely unmeasured — likely the
+bigger bet for the OLTP SLO, and the gate for deleting the CPU engine (see the deletion plan in DECISIONS / ADR-006).
+
+Recommendation: **(B) R3 writes** unless the immediate goal is a shippable read win — the read half of the bet is
+settled (read-ceiling SETTLED + wave validated), the write half is the unknown that the 100k-TPS SLO and the
+CPU-engine deletion both hinge on.
 DISCIPLINE (charter, non-negotiable): GPU tests under `timeout`, NEVER `--gpu-reset`; ASCII-only PTX (ptxas -arch=sm_70
 check before launch); independent adversarial audit on kernel/protocol changes (never self-audit); commit/push/merge each
 verified increment; do NOT run a GPU test right after a `timeout`-killed one (its kernel zombies ~watchdog/backstop).

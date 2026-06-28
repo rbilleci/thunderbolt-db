@@ -403,6 +403,32 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
     engine, all wave-served, no hang (the A/B workload). HAZARD: 3x sequential + 2x concurrent, zero CUDA 700/716/717.
     engine 438/0/297-ignored; execution 25/0/69-ignored; workspace clean. **R1 lpb stays default until the A/B (R2.2b-3).**
 
+- **R2.2b-3 DONE — wave-engine offered-rate A/B; VERDICT = validated WIN for its regime, default-flip GATED on R2.2c
+  (2026-06-28, `57640e0f`, `engine/examples/r2_wave_engine_ab`).** A 3-mode (scan / lpb-index / wave) A/B through the
+  production retained-template path, RTX PRO 6000, 1M-row resident table, 2000 batches/mode. NON-VACUITY built in: every
+  route asserted byte-identical before timing + `Engine::wave_route_hits()` confirms the wave SERVED every batch (aborts
+  on a silent lpb fallback). Methodology cross-checks (the R2.2 "loses 118x" retraction lesson): regime = single-flight
+  is the PRODUCTION single-coalescer path (point reads flow through the facade's one coalescer thread); baseline = lpb
+  (the R1 shipped default) AND scan, not the raw 1-thread probe; impl = the wired device-result + per-slot-gate wave;
+  batch=1 wave/lpb 2.45x ~= the documented P2 single-flight 2.51x (corroborates).
+  - **SINGLE-FLIGHT (production regime) — wave WINS at every batch, biggest small.** wave/lpb lookups/s: b1 2.45x, b8
+    2.08x, b32 1.61x, b256 1.17x, b4096 1.02x (wave/scan 2.0-2.7x). Wave LATENCY is also lower at every batch (b1 p50
+    10us vs lpb 27us; p99 15 vs 35; p99.9 23 vs 47). The win shrinks as batch grows (per-batch launch amortizes) — the
+    wave's edge is exactly the small-batch OLTP point-lookup regime.
+  - **CONCURRENT (per-engine-Mutex ceiling — NOT production) — wave crosses UNDER lpb ~4 threads.** wave/lpb @batch=32:
+    1t 1.69x, 2t 1.26x, 4t 0.93x, 8t 0.66x. The wired wave is single-flight (submits serialized by its `Arc<Mutex<_>>`),
+    so it plateaus ~1.4M while lpb's pipelined per-batch launches scale with threads. (This is the multi-PRODUCER-direct
+    regime, which the production single-coalescer path does NOT use today.)
+  - **VERDICT: the wave is a STRICT WIN (throughput + latency) for the single-coalescer point-read path it is wired for,
+    but DO NOT flip the default yet — two architectural gates remain, both R2.2c:** (1) AT-MOST-ONE-KERNEL -> a
+    multi-shape point-read workload would THRASH (the coalescer processes shape-groups sequentially; each shape switch
+    rebuilds the one wave engine = teardown+launch per batch). Needs per-shape coexistence (sub-occupancy sizing or a
+    shared multi-table kernel). (2) The per-engine-Mutex concurrency ceiling -> a multi-PRODUCER lock-free-ring
+    replacement of the coalescer (the wave's original premise; depth-K pipelining, no central Mutex) is what wins the
+    concurrent regime. **Keep R1 lpb the default; the wave is validated + shipped behind the flag, ready for R2.2c to
+    remove the gates and become the point-read fast-path default.** This is the charter trajectory bet: the wave is the
+    better engine for the regime, gated on the concurrency architecture, not on raw GPU speed.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
