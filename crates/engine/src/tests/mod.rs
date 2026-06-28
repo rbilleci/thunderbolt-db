@@ -2,6 +2,7 @@ use super::*;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use gpu_db_execution::CudaI32BatchProjectionRow;
 use gpu_db_execution::DeviceTarget;
 use gpu_db_metrics::GpuParityIssue;
 use gpu_db_observability::InMemoryTelemetrySink;

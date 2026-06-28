@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32BatchProjectionRow,
+    CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32BatchProjectionColumns,
     CudaI32Comparison,
     CudaI32EqualAnyProjectSubmission, CudaI32GroupedStats, CudaI32Stats, CudaMvccRowBatch,
     CudaOwnedDeviceMemoryChunk,

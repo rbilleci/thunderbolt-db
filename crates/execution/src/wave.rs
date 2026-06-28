@@ -69,8 +69,8 @@ use std::time::{Duration, Instant};
 use libloading::Library;
 
 use crate::{
-    check_cuda, CudaI32BatchProjectionRow, CudaResidentDeviceMemory, CudaResidentReadSource,
-    CudaRuntimeProbeError, GpuPrimaryContext,
+    check_cuda, CudaI32BatchProjectionColumns, CudaI32BatchProjectionRow, CudaResidentDeviceMemory,
+    CudaResidentReadSource, CudaRuntimeProbeError, GpuPrimaryContext,
 };
 
 const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
@@ -805,12 +805,24 @@ impl WaveReadEngine {
     /// read it. If ready, returns the rows (found needles only, byte-identical to the R1 index probe); else
     /// `None` (a not-yet-written slot only delays; the caller retries). LIVENESS: thread 0's block must stay
     /// co-resident (the modest grids the occupancy clamp allows); eviction would stall, caught by the backstop.
+    /// Per-row form (correctness tests / request-response callers). The HOT engine path calls
+    /// `harvest_columnar` to skip the per-row `Vec` allocation (DECISIONS "Tail latency").
     pub fn harvest(
         &self,
         ticket: WaveTicket,
     ) -> Result<Option<Vec<CudaI32BatchProjectionRow>>, CudaRuntimeProbeError> {
+        Ok(self.harvest_columnar(ticket)?.map(CudaI32BatchProjectionColumns::into_rows))
+    }
+
+    pub fn harvest_columnar(
+        &self,
+        ticket: WaveTicket,
+    ) -> Result<Option<CudaI32BatchProjectionColumns>, CudaRuntimeProbeError> {
         if ticket.len == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(CudaI32BatchProjectionColumns {
+                projection_count: self.proj_count as usize,
+                ..Default::default()
+            }));
         }
         let status_ring = self.status_host as *const u32;
         let mask = self.ring_mask as usize;
@@ -824,9 +836,9 @@ impl WaveReadEngine {
         Ok(Some(self.read_records(ticket.base, ticket.len)))
     }
 
-    /// Read the per-needle records for a fully-drained wave `[base, base+len)` into rows (found needles
-    /// only). Caller MUST have confirmed completion (the `harvest` gate) before calling.
-    fn read_records(&self, base: u64, len: u32) -> Vec<CudaI32BatchProjectionRow> {
+    /// Read the per-needle records for a fully-drained wave `[base, base+len)` into the COLUMNAR form (found
+    /// needles only). Caller MUST have confirmed completion (the `harvest` gate) before calling.
+    fn read_records(&self, base: u64, len: u32) -> CudaI32BatchProjectionColumns {
         // This is the only driver-touching step of the harvest path (the cuMemcpyDtoHAsync + sync below).
         // `WaveReadEngine` is `Send` and the engine drives `submit`/`harvest` from CONNECTION threads, which
         // are not the builder thread `new` set the context current on. cuMemcpy*/cuStreamSynchronize target
@@ -873,7 +885,12 @@ impl WaveReadEngine {
         // Found/not-found comes from the host-mapped STATUS RING (the kernel no longer writes status into the
         // device record); row/values come from the DtoH'd body. The gate already confirmed every slot != 0.
         let status_ring = self.status_host as *const u32;
-        let mut rows = Vec::new();
+        let proj = self.proj_count as usize;
+        // COLUMNAR: append directly into the three flat arrays (no per-row `Vec`). `needle_index` here is the
+        // slot position `i` (the wave writes one slot per submitted needle, in order).
+        let mut values = Vec::new();
+        let mut needle_indices = Vec::new();
+        let mut row_indices = Vec::new();
         for i in 0..n {
             let slot = (base as usize).wrapping_add(i) & (self.ring_mask as usize);
             let status = unsafe { ptr::read_volatile(status_ring.add(slot)) };
@@ -888,30 +905,40 @@ impl WaveReadEngine {
             }
             let rec = unsafe { (dst as *const u8).add(i * RES_SLOT_BYTES) };
             let row_index = unsafe { ptr::read_unaligned(rec.add(8).cast::<u64>()) };
-            let mut values = Vec::with_capacity(self.proj_count as usize);
-            for j in 0..self.proj_count as usize {
+            needle_indices.push(i as u32);
+            row_indices.push(row_index);
+            for j in 0..proj {
                 values.push(unsafe { ptr::read_unaligned(rec.add(16 + j * 4).cast::<i32>()) });
             }
-            rows.push(CudaI32BatchProjectionRow {
-                needle_index: i,
-                row_index,
-                values,
-            });
         }
-        rows
+        CudaI32BatchProjectionColumns {
+            values,
+            needle_indices,
+            row_indices,
+            projection_count: proj,
+        }
     }
 
-    /// Blocking single-wave submit (`submit_async` + spin-`harvest`). Kept for correctness tests and
-    /// request-response callers; for THROUGHPUT use `submit_async`/`harvest` pipelined (depth K).
+    /// Blocking single-wave submit (`submit_async` + spin-`harvest`). Per-row form for correctness tests and
+    /// request-response callers; the HOT engine path calls `submit_columnar`. For THROUGHPUT use
+    /// `submit_async`/`harvest` pipelined (depth K).
     pub fn submit(
         &mut self,
         needles: &[i32],
     ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+        Ok(self.submit_columnar(needles)?.into_rows())
+    }
+
+    /// Blocking single-wave submit returning the COLUMNAR form (no per-row `Vec` — DECISIONS "Tail latency").
+    pub fn submit_columnar(
+        &mut self,
+        needles: &[i32],
+    ) -> Result<CudaI32BatchProjectionColumns, CudaRuntimeProbeError> {
         let ticket = self.submit_async(needles)?;
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         loop {
-            if let Some(rows) = self.harvest(ticket)? {
-                return Ok(rows);
+            if let Some(columns) = self.harvest_columnar(ticket)? {
+                return Ok(columns);
             }
             if Instant::now() >= deadline {
                 return Err(CudaRuntimeProbeError::KernelLaunchFailed(-1));

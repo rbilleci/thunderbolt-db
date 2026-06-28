@@ -2561,6 +2561,66 @@ pub struct CudaI32BatchProjectionRow {
     pub values: Vec<i32>,
 }
 
+/// COLUMNAR form of a matched-row batch — the three flat arrays the GPU D2H already produces, kept flat
+/// instead of split into one heap `Vec<i32>` per row. The per-row `CudaI32BatchProjectionRow` split cost
+/// ~1585us/65536-batch (and spiked the p99 tail) for nothing — the engine re-flattens the rows anyway
+/// (DECISIONS "Tail latency"). `values` is row-major: row `i`'s projection is `values[i*projection_count..]`,
+/// matched against needle `needle_indices[i]` at table row `row_indices[i]`. Index arrays are validated
+/// (`needle_index < needles_len`, `row_index < row_count`) when produced, so consumers may trust them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CudaI32BatchProjectionColumns {
+    pub values: Vec<i32>,
+    pub needle_indices: Vec<u32>,
+    pub row_indices: Vec<u64>,
+    pub projection_count: usize,
+}
+
+impl CudaI32BatchProjectionColumns {
+    pub fn nrows(&self) -> usize {
+        self.needle_indices.len()
+    }
+    /// Row `i`'s projected values (`projection_count` wide).
+    pub fn row_values(&self, i: usize) -> &[i32] {
+        let p = self.projection_count;
+        &self.values[i * p..i * p + p]
+    }
+    /// Build the columnar form from the per-row form (the inverse of `into_rows`) — used by the wave/lpb
+    /// differential + materialized-arm tests, which author per-row fixtures. `projection_count` from the
+    /// first row's width (uniform by construction).
+    pub fn from_rows(rows: Vec<CudaI32BatchProjectionRow>) -> Self {
+        let projection_count = rows.first().map(|row| row.values.len()).unwrap_or(0);
+        let mut values = Vec::with_capacity(rows.len() * projection_count);
+        let mut needle_indices = Vec::with_capacity(rows.len());
+        let mut row_indices = Vec::with_capacity(rows.len());
+        for row in rows {
+            needle_indices.push(row.needle_index as u32);
+            row_indices.push(row.row_index);
+            values.extend(row.values);
+        }
+        Self {
+            values,
+            needle_indices,
+            row_indices,
+            projection_count,
+        }
+    }
+    /// Bridge back to the per-row form for the cold per-needle completion + tests (re-introduces the per-row
+    /// `Vec`, but only off the hot batched path). The arrays were validated when produced.
+    pub fn into_rows(self) -> Vec<CudaI32BatchProjectionRow> {
+        let p = self.projection_count.max(1);
+        self.values
+            .chunks(p)
+            .zip(self.needle_indices)
+            .zip(self.row_indices)
+            .map(|((row, needle_index), row_index)| CudaI32BatchProjectionRow {
+                needle_index: needle_index as usize,
+                row_index,
+                values: row.to_vec(),
+            })
+            .collect()
+    }
+}
+
 pub struct CudaI32EqualAnyProjectSubmission {
     projection_count: usize,
     needles_len: usize,
@@ -2620,9 +2680,19 @@ impl CudaI32EqualAnyProjectSubmission {
         Ok(rows)
     }
 
+    /// Per-row form (cold per-needle completion + tests): the columnar drain then `into_rows`. The HOT batched
+    /// path calls `complete_detached_columnar` directly to skip the 65536 per-row allocations (DECISIONS
+    /// "Tail latency").
     pub fn complete_detached(
-        mut self,
+        self,
     ) -> Result<(Vec<CudaI32BatchProjectionRow>, Option<u64>), CudaRuntimeProbeError> {
+        let (columns, elapsed_us) = self.complete_detached_columnar()?;
+        Ok((columns.into_rows(), elapsed_us))
+    }
+
+    pub fn complete_detached_columnar(
+        mut self,
+    ) -> Result<(CudaI32BatchProjectionColumns, Option<u64>), CudaRuntimeProbeError> {
         let primary = Arc::clone(&self.primary);
         primary.set_current()?;
         // Take ownership of the pooled stream out of the submission. This local guard keeps the
@@ -2794,27 +2864,27 @@ impl CudaI32EqualAnyProjectSubmission {
             }
         }
 
-        let rows = values
-            .chunks_exact(self.projection_count)
-            .zip(needle_indices)
-            .zip(row_indices)
-            .map(|((row, needle_index), row_index)| {
-                let needle_index = usize::try_from(needle_index)
-                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-                if needle_index >= self.needles_len {
-                    return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index));
-                }
-                if row_index >= self.row_count {
-                    return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
-                }
-                Ok(CudaI32BatchProjectionRow {
-                    needle_index,
-                    row_index,
-                    values: row.to_vec(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((rows, elapsed_us))
+        // Validate the index arrays in a tight, ALLOCATION-FREE loop (the old per-row path validated while
+        // building 65536 owned `CudaI32BatchProjectionRow`s — that allocation storm was ~1585us/batch + the
+        // p99 tail, DECISIONS "Tail latency"). Same invariants: `needle_index < needles_len`,
+        // `row_index < row_count`. The columnar arrays are returned as-is for the engine to scatter flat.
+        for &needle_index in &needle_indices {
+            if needle_index as usize >= self.needles_len {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index as usize));
+            }
+        }
+        for &row_index in &row_indices {
+            if row_index >= self.row_count {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+            }
+        }
+        let columns = CudaI32BatchProjectionColumns {
+            values,
+            needle_indices,
+            row_indices,
+            projection_count: self.projection_count,
+        };
+        Ok((columns, elapsed_us))
     }
 }
 

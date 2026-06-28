@@ -509,8 +509,8 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
 }
 
 /// ADR-009 R2.2b: how a resident int4 equality-projection batch's matched rows are obtained. Both arms
-/// converge on the SAME `Vec<CudaI32BatchProjectionRow>` the completion materializes, so the choice of arm
-/// NEVER changes results — only HOW/WHEN the rows are produced:
+/// converge on the SAME `CudaI32BatchProjectionColumns` (the flat columnar form — DECISIONS "Tail latency"),
+/// so the choice of arm NEVER changes results — only HOW/WHEN the rows are produced:
 /// - `Deferred`: the lpb / scan / R1-index route enqueued a GPU submission whose work is drained later by
 ///   `complete_detached()` (the existing default; carries the per-batch kernel-event elapsed timing).
 /// - `Materialized`: the persistent wave engine already drained the wave SYNCHRONOUSLY inside `submit`
@@ -519,7 +519,7 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
 ///   completion supplies `None` for the elapsed-time metric on this arm.
 pub(crate) enum RelationalRetainedInt4ProjectionPayload {
     Deferred(CudaI32EqualAnyProjectSubmission),
-    Materialized(Vec<CudaI32BatchProjectionRow>),
+    Materialized(CudaI32BatchProjectionColumns),
 }
 
 pub(crate) struct RelationalRetainedInt4ProjectionCompletion {

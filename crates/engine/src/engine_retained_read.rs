@@ -594,12 +594,12 @@ impl Engine {
                         "wave route requires distinct needles (batcher dedup_needles contract)"
                     );
                     let mut guard = engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Ok(rows) = guard.submit(needles) {
+                    if let Ok(columns) = guard.submit_columnar(needles) {
                         self.read_state
                             .residency
                             .wave_route_hits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        break 'route RelationalRetainedInt4ProjectionPayload::Materialized(rows);
+                        break 'route RelationalRetainedInt4ProjectionPayload::Materialized(columns);
                     }
                     // else: wave error / harvest timeout -> fall through to the lpb route below (the engine
                     // is left cached; a transient timeout does not invalidate it).
@@ -994,11 +994,15 @@ impl Engine {
         // in hand and there is no per-batch kernel event (the persistent kernel is not timed per wave ->
         // `None`). Everything downstream (stable sort by `row_index`, `SqlValue::Int4` mapping, metrics,
         // results assembly) is shared and arm-agnostic, so the two routes are byte-identical by construction.
+        // This per-needle path is COLD (the hot batcher uses the batched completion); it bridges the columnar
+        // Materialized arm back to per-row via `into_rows` (DECISIONS "Tail latency").
         let (projected_rows, kernel_event_elapsed_us) = match pending.payload {
             RelationalRetainedInt4ProjectionPayload::Deferred(submission) => submission
                 .complete_detached()
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
-            RelationalRetainedInt4ProjectionPayload::Materialized(rows) => (rows, None),
+            RelationalRetainedInt4ProjectionPayload::Materialized(columns) => {
+                (columns.into_rows(), None)
+            }
         };
         let batch_micros = pending
             .batch_started
@@ -1105,11 +1109,11 @@ impl Engine {
     pub(crate) fn complete_int4_projection_batched_detached(
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<RelationalRetainedBatchResult, ExecuteError> {
-        let (projected_rows, _kernel_event_elapsed_us) = match pending.payload {
+        let (projected, _kernel_event_elapsed_us) = match pending.payload {
             RelationalRetainedInt4ProjectionPayload::Deferred(submission) => submission
-                .complete_detached()
+                .complete_detached_columnar()
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
-            RelationalRetainedInt4ProjectionPayload::Materialized(rows) => (rows, None),
+            RelationalRetainedInt4ProjectionPayload::Materialized(columns) => (columns, None),
         };
         let n = pending.members.len();
         let ncols = pending.selected_indexes.len();
@@ -1119,7 +1123,7 @@ impl Engine {
             None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan)),
         };
         Ok(Self::assemble_batched_rows(
-            &projected_rows,
+            &projected,
             n,
             ncols,
             columns,
@@ -1128,22 +1132,24 @@ impl Engine {
         ))
     }
 
-    /// Group `projected_rows` (in kernel emit order) into the flat needle-ordered `RelationalRetainedBatchResult`.
-    /// Pure (no GPU) so it is unit-testable with a hand-built UNSORTED input — which is the ONLY way to prove the
-    /// within-needle sort is NECESSARY (a GPU fixture's 2-row emit order coincidentally equals ascending row_index,
-    /// so a `no-sort` regression slips past the differentials — audit P3).
+    /// Group the COLUMNAR matched rows (in kernel emit order) into the flat needle-ordered
+    /// `RelationalRetainedBatchResult` — reading the three flat arrays directly, NO per-row `Vec`
+    /// (DECISIONS "Tail latency"). Pure (no GPU) so it is unit-testable with a hand-built UNSORTED input —
+    /// the ONLY way to prove the within-needle sort is NECESSARY (a GPU fixture's 2-row emit order
+    /// coincidentally equals ascending row_index, so a `no-sort` regression slips past the differentials — P3).
     pub(crate) fn assemble_batched_rows(
-        projected_rows: &[CudaI32BatchProjectionRow],
+        projected: &CudaI32BatchProjectionColumns,
         n: usize,
         ncols: usize,
         columns: Arc<Vec<RelationalColumn>>,
         access_path: Arc<RelationalAccessPath>,
         gpu_id: u16,
     ) -> RelationalRetainedBatchResult {
+        let nrows = projected.nrows();
         // Per-needle counts -> prefix-sum ranges + whether ANY needle matched >1 row.
         let mut counts = vec![0u32; n];
-        for projected in projected_rows {
-            counts[projected.needle_index] += 1;
+        for &needle_index in &projected.needle_indices {
+            counts[needle_index as usize] += 1;
         }
         let mut needle_ranges = Vec::with_capacity(n);
         let mut acc = 0u32;
@@ -1156,12 +1162,12 @@ impl Engine {
         let total = acc as usize;
         // O(n) COUNTING-SORT SCATTER by needle_index — replaces an O(n log n) global
         // `sort_by_key((needle_index, row_index))` that profiling showed was ~80% of the assembly
-        // (~1800us/65536-batch). `cursor` walks each needle's contiguous range; `slot[d]` indexes into
-        // `projected_rows`. The scatter is stable, so it preserves the kernel's emit order within a needle.
+        // (~1800us/65536-batch). `cursor` walks each needle's contiguous range; `slot[d]` indexes into the
+        // columnar rows. The scatter is stable, so it preserves the kernel's emit order within a needle.
         let mut slot = vec![0u32; total];
         let mut cursor: Vec<u32> = needle_ranges.iter().map(|&(start, _)| start).collect();
-        for (i, projected) in projected_rows.iter().enumerate() {
-            let ni = projected.needle_index;
+        for i in 0..nrows {
+            let ni = projected.needle_indices[i] as usize;
             let d = cursor[ni] as usize;
             slot[d] = i as u32;
             cursor[ni] += 1;
@@ -1175,13 +1181,13 @@ impl Engine {
                 if count > 1 {
                     let s = start as usize;
                     let e = s + count as usize;
-                    slot[s..e].sort_by_key(|&i| projected_rows[i as usize].row_index);
+                    slot[s..e].sort_by_key(|&i| projected.row_indices[i as usize]);
                 }
             }
         }
         let mut values = Vec::with_capacity(total * ncols);
         for &i in &slot {
-            values.extend(projected_rows[i as usize].values.iter().copied().map(SqlValue::Int4));
+            values.extend(projected.row_values(i as usize).iter().copied().map(SqlValue::Int4));
         }
         RelationalRetainedBatchResult {
             columns,

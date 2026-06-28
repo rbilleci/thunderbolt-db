@@ -4008,7 +4008,9 @@ fn r2_materialized_payload_arm_materializes_identically() {
         members,
         before_metrics: e.metrics.snapshot(),
         batch_started: std::time::Instant::now(),
-        payload: RelationalRetainedInt4ProjectionPayload::Materialized(rows),
+        payload: RelationalRetainedInt4ProjectionPayload::Materialized(
+            CudaI32BatchProjectionColumns::from_rows(rows),
+        ),
     };
 
     let completion =
@@ -4590,7 +4592,8 @@ fn r2_batched_assembly_sorts_multirow_needle_by_row_index() {
         CudaI32BatchProjectionRow { needle_index: 0, row_index: 2, values: vec![10, 102] },
         CudaI32BatchProjectionRow { needle_index: 1, row_index: 9, values: vec![20, 209] },
     ];
-    let batched = Engine::assemble_batched_rows(&rows, 3, 2, shared_cols, shared_access, 3);
+    let projected = CudaI32BatchProjectionColumns::from_rows(rows);
+    let batched = Engine::assemble_batched_rows(&projected, 3, 2, shared_cols, shared_access, 3);
     assert_eq!(batched.needle_count(), 3);
     // needle 0 MUST ascend by row_index: row 2's values THEN row 5's. A no-sort regression -> [10,105,10,102].
     assert_eq!(
