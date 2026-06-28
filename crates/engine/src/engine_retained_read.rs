@@ -714,11 +714,20 @@ impl Engine {
     /// gathers through the SAME device buffer, whose address the engine's own `Arc` pins), EXTENDED with the
     /// projection set in the identity because the wave kernel BAKES the projection offsets at launch. The
     /// engine is built over the SAME R1 index (reusing `wave_resident_int4_index`), so its NULL-as-0 key +
-    /// gather semantics are byte-identical to the lpb index probe by construction. The kernel launch happens
-    /// OUTSIDE the cache lock (a launch must never hold the map mutex); a concurrent builder for the same
-    /// (col, buffer, proj) is rare (once per residency generation) — the loser's insert overwrites + drops
-    /// the duplicate engine, so two kernels are briefly resident. The returned `Arc<Mutex<WaveReadEngine>>`
-    /// keeps the kernel + its index/resident buffers alive for as long as a reader (or the cache) holds it.
+    /// gather semantics are byte-identical to the lpb index probe by construction.
+    ///
+    /// AT-MOST-ONE-RESIDENT INVARIANT (load-bearing for liveness): two full-occupancy persistent spin-kernels
+    /// in the shared context MUTUALLY STARVE — neither yields its SMs, so a kernel whose blocks lost the SMs
+    /// never runs (can't observe the doorbell / watchdog), and tearing it down (`cuStreamSynchronize`, with an
+    /// infinite backstop) HANGS FOREVER. So on a miss this DRAINS every existing wave engine (each then the
+    /// sole persistent kernel -> clean doorbell teardown) BEFORE launching the new one, all under the
+    /// `wave_build_latch` so two concurrent misses can't both launch. [LIMITATION: this means ONE wave engine
+    /// TOTAL across all tables — alternating tables/projections rebuilds each time. Fine for R2.2b single-
+    /// flight + the one-shape A/B; lifting it (multi-engine coexistence) needs sub-occupancy sizing or a
+    /// shared multi-table kernel — deferred to R2.2c. KNOWN single-flight EDGE: a concurrent reader holding a
+    /// to-be-drained engine across a rebuild keeps it alive past the new launch (-> transient two-kernel
+    /// window); the supported model is single-flight (one submit at a time), so this is out of scope here and
+    /// is the central concern multi-producer R2.2b-3 must resolve.]
     fn wave_read_engine_for(
         &self,
         table_name: &str,
@@ -729,24 +738,56 @@ impl Engine {
         row_count: u64,
     ) -> Option<Arc<Mutex<WaveReadEngine>>> {
         let resident_device_ptr = device_memory.device_ptr();
-        {
+        // Cache lookup with the full (col, buffer, proj) identity check.
+        let lookup = || -> Option<Arc<Mutex<WaveReadEngine>>> {
             let cache = self
                 .read_state
                 .residency
                 .wave_read_engine
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(existing) = cache.get(table_name) {
-                if existing.column_idx == filter_idx
+            cache.get(table_name).and_then(|existing| {
+                (existing.column_idx == filter_idx
                     && existing.resident_device_ptr == resident_device_ptr
-                    && existing.projection_offsets == projection_offsets
-                {
-                    return Some(Arc::clone(&existing.engine));
-                }
-            }
+                    && existing.projection_offsets == projection_offsets)
+                    .then(|| Arc::clone(&existing.engine))
+            })
+        };
+        // Fast path: cache hit (no build latch -> no contention on the hot path).
+        if let Some(engine) = lookup() {
+            return Some(engine);
         }
-        // Miss / different column / buffer / proj-set. Get-or-build the R1 index over THIS buffer (so the
-        // wave gathers with the SAME NULL-as-0 semantics as the scan/index); `None` here -> caller uses lpb.
+        // Miss: serialize the BUILD so two concurrent misses can't both launch a persistent kernel.
+        let _build_guard = self
+            .read_state
+            .residency
+            .wave_build_latch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Re-check under the build latch: another builder may have just published exactly what we need.
+        if let Some(engine) = lookup() {
+            return Some(engine);
+        }
+        // Drain EVERY existing wave engine BEFORE launching the new one (at-most-one-resident invariant).
+        // Take the whole map out under the cache lock, then drop OUTSIDE it: each drained engine is now the
+        // sole persistent kernel, so `WaveReadEngine::Drop` (doorbell + petter join + stream sync) completes
+        // cleanly. Dropping outside the cache lock keeps cache-hit readers unblocked; the build latch (held)
+        // is what serializes builders.
+        let stale = {
+            let mut cache = self
+                .read_state
+                .residency
+                .wave_read_engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *cache)
+        };
+        drop(stale);
+        // Get-or-build the R1 index over THIS buffer (so the wave gathers with the SAME NULL-as-0 semantics
+        // as the scan/index); `None` here -> caller uses lpb. Then launch the persistent kernel — no other
+        // persistent wave kernel is resident now. `WaveReadEngine::new` set_current's the shared primary
+        // context, clamps the grid to occupancy (C1), and runs until Drop / backstop / stale-heartbeat
+        // watchdog.
         let (index, table_mask, hash_shift) = self.wave_resident_int4_index(
             table_name,
             device_memory,
@@ -754,9 +795,6 @@ impl Engine {
             filter_idx,
             row_count,
         )?;
-        // Launch the persistent kernel OUTSIDE the cache lock. `WaveReadEngine::new` set_current's the
-        // shared primary context, clamps the grid to occupancy (C1), and runs until Drop / backstop /
-        // stale-heartbeat watchdog.
         let engine = WaveReadEngine::new(
             index,
             Arc::clone(device_memory),
@@ -770,17 +808,14 @@ impl Engine {
         )
         .ok()?;
         let engine = Arc::new(Mutex::new(engine));
-        // Overwrite any stale entry (a different generation/proj raced in). Capture the displaced value and
-        // drop it AFTER releasing the cache lock, so the rare build-race teardown (`WaveReadEngine::Drop` —
-        // petter join + stream sync) never blocks a concurrent accessor on the cache mutex. The common miss
-        // path displaces nothing (absent slot).
-        let replaced = {
+        {
             let mut cache = self
                 .read_state
                 .residency
                 .wave_read_engine
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The map was drained above and builds are serialized by the latch, so this slot is absent.
             cache.insert(
                 table_name.to_string(),
                 WaveResidentReadEngine {
@@ -789,9 +824,8 @@ impl Engine {
                     projection_offsets: projection_offsets.to_vec(),
                     engine: Arc::clone(&engine),
                 },
-            )
-        };
-        drop(replaced);
+            );
+        }
         Some(engine)
     }
 

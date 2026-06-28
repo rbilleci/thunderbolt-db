@@ -4167,6 +4167,25 @@ fn r2_wave_engine_matches_lpb_differential() {
         );
     }
 
+    // (a'') Projection-set identity: a DIFFERENT projection over the SAME unique col must REBUILD a distinct
+    // wave engine -- the proj-set is BAKED at launch and is part of the cache identity, so the (id, balance)
+    // engine must NOT be reused. Reversed projection (balance, id) -> values [balance, id]; a stale reuse
+    // would yield [id, balance] and the differential would catch it. (Proves the proj-key is load-bearing.)
+    let select_rev = select_cmd("SELECT balance, id FROM accounts WHERE id = 1");
+    scan_cfg(&e);
+    let scan_rev = run(&e, &select_rev, &unique_needles);
+    wave_cfg(&e);
+    let wave_rev = run(&e, &select_rev, &unique_needles);
+    assert_eq!(
+        wave_rev, scan_rev,
+        "wave rebuilds for a new projection set over the same unique col and matches scan"
+    );
+    assert_eq!(
+        wave_rev[0],
+        vec![vec![SqlValue::Int4(100), SqlValue::Int4(10)]],
+        "reversed projection (balance, id) -> [100, 10] -- a proj-specific rebuild, not stale (id,balance) reuse"
+    );
+
     // (b) Non-unique fallback: `bucket` is duplicated, so the index/wave decline -> scan. wave == scan, and
     // both rows for bucket = 1 are returned.
     let dup_needles = vec![1, 2, 9];
@@ -4212,5 +4231,108 @@ fn r2_wave_engine_matches_lpb_differential() {
         wave_g[1],
         vec![vec![SqlValue::Int4(50), SqlValue::Int4(500)]],
         "the newly-inserted row 50 is found by the rebuilt wave engine"
+    );
+}
+
+// ADR-009 R2.2b: concurrent SAME-SHAPE point lookups (the R2.2b-3 A/B workload: many connections, one
+// shape) are SAFE and correct with the wave route on. Proves the build latch + double-checked lookup build
+// exactly ONE persistent engine (no two-kernel mutual-starvation hang) and the per-engine Mutex serializes
+// submits (single-flight) so every concurrent reader gets results byte-identical to the scan. The test
+// completing (no hang) is itself the liveness assertion. GPU test (#[ignore]).
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn r2_wave_engine_concurrent_same_shape_single_flight() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+        .unwrap();
+    let mut values = String::new();
+    for i in 0..256i32 {
+        if i > 0 {
+            values.push_str(", ");
+        }
+        values.push_str(&format!("({}, {})", i * 2 + 1, i * 100));
+    }
+    e.execute_text(
+        2,
+        &format!("INSERT INTO accounts (id, balance) VALUES {values}"),
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("accounts").unwrap();
+
+    let Command::Select(select) =
+        parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap()
+    else {
+        unreachable!()
+    };
+    if !e.plan_relational_resident_route(&select).accepted {
+        return; // no GPU -> skip
+    }
+    let needles: Vec<i32> = (0..16).map(|i| i * 2 + 1).collect(); // present unique keys
+
+    let run = |e: &Engine, needles: &[i32]| -> Vec<Vec<Vec<SqlValue>>> {
+        let template = e.prepare_relational_retained_read_template(&select).unwrap();
+        let submission = e
+            .submit_relational_retained_template_point_lookups(&template, needles)
+            .unwrap();
+        e.complete_relational_retained_read_submission(submission)
+            .unwrap()
+            .iter()
+            .map(|result| result.rows.clone())
+            .collect()
+    };
+    // Baseline (scan), then flip the wave route ON before sharing the engine across threads.
+    e.set_wave_engine_enabled(false);
+    e.set_wave_persistent_engine_enabled(false);
+    let baseline = run(&e, &needles);
+    e.set_wave_engine_enabled(true);
+    e.set_wave_persistent_engine_enabled(true);
+    let engine = Arc::new(e);
+
+    const READERS: usize = 8;
+    const READS_PER_THREAD: usize = 50;
+    let barrier = Arc::new(std::sync::Barrier::new(READERS));
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            let baseline = baseline.clone();
+            let needles = needles.clone();
+            let select = select.clone();
+            std::thread::spawn(move || {
+                barrier.wait(); // maximize overlap so concurrent first-misses race the build latch
+                for _ in 0..READS_PER_THREAD {
+                    let template = engine
+                        .prepare_relational_retained_read_template(&select)
+                        .unwrap();
+                    let submission = engine
+                        .submit_relational_retained_template_point_lookups(&template, &needles)
+                        .unwrap();
+                    let rows: Vec<Vec<Vec<SqlValue>>> = engine
+                        .complete_relational_retained_read_submission(submission)
+                        .unwrap()
+                        .iter()
+                        .map(|result| result.rows.clone())
+                        .collect();
+                    assert_eq!(rows, baseline, "concurrent wave read diverged from the scan");
+                }
+            })
+        })
+        .collect();
+    for reader in readers {
+        reader.join().expect("reader thread panicked (hang/deadlock would time out)");
+    }
+    // EXACTLY ONE persistent wave engine was built despite 8 racing first-readers (build latch +
+    // double-checked lookup), over the id filter col.
+    let cache = engine
+        .read_state
+        .residency
+        .wave_read_engine
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(cache.len(), 1, "concurrent first-readers built exactly one wave engine");
+    assert_eq!(
+        cache.get("accounts").map(|entry| entry.column_idx),
+        Some(0),
+        "the single wave engine is over the id filter col"
     );
 }

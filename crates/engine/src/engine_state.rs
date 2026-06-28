@@ -517,6 +517,12 @@ pub(crate) struct ResidencyReadState {
     /// route unreachable) + ptr-keyed overwrite-on-next-read, NOT by eviction in the commit critical section
     /// (Drop joins the petter ~watchdog window — too costly to hold there).
     pub(crate) wave_read_engine: Mutex<BTreeMap<String, WaveResidentReadEngine>>,
+    /// ADR-009 R2.2b: serializes wave-engine BUILDS (not submits) so two concurrent cache misses cannot
+    /// both launch a persistent kernel. Critical for the AT-MOST-ONE-RESIDENT invariant: two full-occupancy
+    /// persistent spin-kernels in the shared context mutually starve (neither yields its SMs), so the second
+    /// launch + the first's later teardown (`cuStreamSynchronize`, infinite backstop) would DEADLOCK. Held
+    /// across the drain-existing + launch-new + publish sequence; cache HITS never take it (hot path).
+    pub(crate) wave_build_latch: Mutex<()>,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
