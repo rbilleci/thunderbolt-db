@@ -360,6 +360,49 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   (the engine wiring), where they're enforced.** NEXT R2.2b increments: (1) engine owns the WaveReadEngine lifecycle;
   (2) route point reads through it (single-flight, fallback lpb); (3) end-to-end offered-rate A/B = the ship decision.
 
+- **R2.2b-2 DONE + MERGED — wave engine WIRED + ROUTED into the read path (2026-06-28, commits `8feb4131`,`04f20bfc`,
+  `b0ff7bb3`,`50bfdec5`,`f6fd436e`).** The persistent `WaveReadEngine` now serves resident int4 unique-key point
+  lookups behind a new default-OFF `wave_persistent_engine_enabled` flag NESTED under `wave_engine_enabled` (which stays
+  the lpb default) — flipping just the inner flag is the R2.2b-3 A/B lever. Built in audited slices:
+  - **IMPEDANCE (the wiring blocker) resolved at the source.** The read path returns a DEFERRED
+    `CudaI32EqualAnyProjectSubmission` (drained at completion); the wave returns rows SYNCHRONOUSLY. Replaced the
+    submission field with a payload enum `RelationalRetainedInt4ProjectionPayload::{Deferred(submission) |
+    Materialized(Vec<CudaI32BatchProjectionRow>)}`; the completion branches, and BOTH arms feed the identical downstream
+    materialization (stable sort by row_index, SqlValue::Int4 map, per-needle grouping) -> byte-identical by construction.
+  - **LIFECYCLE.** Per-table `Arc<Mutex<WaveReadEngine>>` cache (`WaveResidentReadEngine`), keyed + validated by
+    `(column_idx, resident_device_ptr, projection_offsets)` — proj-set joins the key because the kernel BAKES projection
+    offsets at launch. Lazy accessor `wave_read_engine_for` reuses the R1 index build (same NULL-as-0 + gather semantics).
+    Serial-commit (catalog-latch) path EVICTS (drops the kernel) on DDL/drop/memory-pressure; the concurrent commit path
+    does NOT (the `device_memory.get -> Err` gate makes the route unreachable after a tombstone, and a re-admission's
+    ptr-keyed rebuild reclaims the stale engine — eviction in the commit critical section is too costly: Drop joins the
+    petter ~watchdog window). `WaveReadEngine` is `Send`, so `shutdown`/`read_records` set_current the primary context for
+    cross-thread Drop/harvest (the completion of `unsafe impl Send`; harmless on this auto-binding driver, load-bearing
+    for portability/multi-GPU/multi-producer).
+  - **LIVENESS — at-most-one resident wave kernel (LOAD-BEARING).** Two full-occupancy persistent spin-kernels in one
+    context MUTUALLY STARVE (neither yields its SMs -> the descheduled one can't observe doorbell/watchdog), so tearing
+    one down (`cuStreamSynchronize`, infinite backstop) HANGS FOREVER. A non-vacuity test (a proj-rebuild) caught this
+    as a REAL hang. Fix: the accessor DRAINS every existing wave engine BEFORE launching a new one, under a
+    `wave_build_latch` (serializes builds) + a double-checked lookup. KNOWN LIMITATION (documented): one wave engine
+    TOTAL across tables (alternating shapes rebuild); and a concurrent reader holding a to-be-drained engine across a
+    rebuild is out of scope for single-flight — both are the central concern for multi-producer R2.2b-3 (-> sub-occupancy
+    sizing or a shared multi-table kernel = R2.2c).
+  - **ROUTE.** `submit_resident_int4_equal_any_payload` picks wave (both flags) -> lpb index -> scan; the wave arm
+    enforces blocker#1 (batch <= ring 65536) + blocker#2 (`submit`'s DRAIN_TIMEOUT) and FALLS BACK to lpb on any wave
+    error/timeout/oversize (never a wrong result). `wave_route_hits` (AtomicU64) telemetry counts wave-served batches
+    (vs fallback) — also the test signal that the ROUTE produced the rows (all routes are byte-identical, so output
+    equality alone can't prove it).
+  - **AUDITS (independent, never self-audit).** Slice 1 (impedance) = SHIP (5 sabotages caught). Combined (Slice 2a +
+    lifecycle + routing) = SHIP-WITH-FIXES: confirmed liveness airtight for single-flight (route confined to the facade's
+    single coalescer thread) + the deadlock fix load-bearing (proven by a hang-on-revert); found two VACUOUS test
+    assertions (a silent always-fallback AND a removed eviction both still passed) -> ADOPTED: added `wave_route_hits`
+    asserts + reordered the differential so eviction runs against a populated cache; plus a wrong-mechanism comment + a
+    missing cross-thread set_current, both fixed.
+  - **TESTS.** `r2_wave_engine_matches_lpb_differential` (GPU): wave == lpb == scan byte-identical across NULL projection,
+    NULL-as-0 key (needle 0), absent needle, non-unique fallback, generation rebuild + eviction, proj-set rebuild + a
+    direct-submit non-vacuity. `r2_wave_engine_concurrent_same_shape_single_flight` (GPU): 8 readers x 50, exactly one
+    engine, all wave-served, no hang (the A/B workload). HAZARD: 3x sequential + 2x concurrent, zero CUDA 700/716/717.
+    engine 438/0/297-ignored; execution 25/0/69-ignored; workspace clean. **R1 lpb stays default until the A/B (R2.2b-3).**
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.

@@ -5,25 +5,26 @@
 
 **Updated:** 2026-06-28.
 
-## >>> THE ONE NEXT ACTION: R2.2b-2 (wire + route the wave engine into the read path) <<<
-The wave read engine (`crates/execution/src/wave.rs`, `WaveReadEngine`, now `pub` + `Send`) is BUILT, AUDITED, and
-proven in-crate (exceeds lpb at every batch; depth-K pipelining validated; crash-safe watchdog; export + ownership
-model done). It is NOT yet wired into a query path. R2.2b-2 is ONE coupled increment:
-1. Engine-crate per-table cache + lazy accessor — mirror `wave_resident_int4_index` (engine_retained_read.rs:593):
-   `Arc<Mutex<WaveReadEngine>>`, built lazily per (filter_col, projection set) over the R1 index, with
-   `backstop_ns = u64::MAX` + `watchdog_ns ~= 2s` (the audited engine config). Cache field next to `wave_index`
-   in `ResidencyReadState` (engine_state.rs:502); cache entry like `WaveResidentIndex` (resident_storage.rs:25).
-2. Invalidation drop — mirror `wave_index` removal in engine_commit.rs (`invalidate_relational_residency_table`:261,
-   `..._concurrent`:312). Dropping the cache Arc runs `WaveReadEngine::Drop` -> doorbell + join petter + free.
-3. ROUTE in `submit_resident_int4_equal_any_payload` (engine_retained_read.rs:479) behind `wave_engine_enabled`:
-   **resolve the impedance** — that fn returns a DEFERRED `CudaI32EqualAnyProjectSubmission` (completed by the caller),
-   but `WaveReadEngine::submit` returns `Vec<CudaI32BatchProjectionRow>` SYNCHRONOUSLY. Likely fix: a return enum
-   `Submission(...) | Rows(...)` threaded to the completion site, OR a pre-completed-submission shim. Single-flight
-   first; on `Err`/timeout fall back to the lpb index probe. Enforce blocker#1 (total un-harvested needles <=
-   ring_capacity; trivial single-flight) + blocker#2 (host harvest deadline = `submit`'s `DRAIN_TIMEOUT`).
-4. Differential test: flag-ON (wave) == scan/lpb, byte-identical (reuse the R1 `r1_wave_index_probe_matches_scan_differential`
-   pattern). Then R2.2b-3 = end-to-end offered-rate A/B vs R1 lpb (real connection concurrency = the multi-producer
-   headroom) = the SHIP decision. Keep R1 lpb the default until that clears. Full detail: DECISIONS "R2.2b STARTED".
+## >>> THE ONE NEXT ACTION: R2.2b-3 (end-to-end offered-rate A/B = the SHIP decision) <<<
+R2.2b-2 is DONE + MERGED: the persistent `WaveReadEngine` is now WIRED + ROUTED into the resident int4 point-lookup
+read path behind the default-OFF `wave_persistent_engine_enabled` flag (nested UNDER `wave_engine_enabled`, which stays
+the lpb default). Flipping just that inner flag is the A/B lever. Build + audit detail: DECISIONS "R2.2b-2 DONE".
+R2.2b-3 is the measurement that decides whether the wave route ships as a default:
+1. **A/B harness** — extend/clone the offered-rate benchmark (`engine/examples/r1_wave_index_ab` is the closest
+   template) to sweep, on the SAME resident table+shape: scan (both flags off) vs lpb index (`wave_engine_enabled`
+   only) vs wave (both flags). Measure **offered-rate / sustained throughput + p50/p99 latency** under REAL connection
+   concurrency (the multi-producer headroom), not just single-flight micro-timing — that is the regime the wave is
+   meant to win (no per-batch launch). Use `Engine::wave_route_hits()` to confirm the wave actually served (not silent
+   lpb fallback) + measure the fallback rate.
+2. **Decide the flip**: if the wave beats lpb on offered-rate at the OLTP batch sizes with acceptable p99, propose
+   making it the default (size-aware, per the R1 crossover ~1M rows) — else keep R1 lpb default and park the wave
+   behind the flag. Record the numbers in DECISIONS (ADR-008 lineage).
+KNOWN CONSTRAINTS the A/B must respect (DECISIONS "R2.2b-2 DONE"): the wired route is SINGLE-FLIGHT-first and enforces
+**at-most-one persistent wave kernel resident** (two full-occupancy persistent spin-kernels in one context mutually
+starve -> teardown deadlock). So the A/B is one shape/table at a time; multi-shape/table concurrency (and the
+"reader holds an engine across a rebuild" edge) is the central thing R2.2b-3's multi-producer design must confront
+(likely sub-occupancy sizing or a shared multi-table kernel = R2.2c). OR (B) pivot to R3 writes. Keep R1 lpb default
+until the A/B clears.
 DISCIPLINE (charter, non-negotiable): GPU tests under `timeout`, NEVER `--gpu-reset`; ASCII-only PTX (ptxas -arch=sm_70
 check before launch); independent adversarial audit on kernel/protocol changes (never self-audit); commit/push/merge each
 verified increment; do NOT run a GPU test right after a `timeout`-killed one (its kernel zombies ~watchdog/backstop).
@@ -164,15 +165,24 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   (single-flight first). **Blocker#3 crash-safe watchdog DONE** (host petter + heartbeat; thread 0 self-terminates the
   kernel ~watchdog_ns after the host dies, not ~30s; independent audit=SHIP, fixed a latent unfenced-petter bug + a
   startup race -> arm-on-first-pet). **R2.2b-1 FOUNDATION DONE (`44289772`):** exported `WaveReadEngine`/`WaveTicket`
-  `pub` + `unsafe impl Send` (sound under the engine's `Arc<Mutex<_>>` serialization; petter only touches its own ctrl
-  addr; NOT Sync); test `wave_engine_arc_mutex_send_ownership` (backstop u64::MAX + live 2s watchdog = the engine
-  config) moves the handle to another thread, submits byte-correctly, clean teardown. **NEXT R2.2b-2 (ONE coupled
-  increment): engine-crate per-table cache + lazy accessor (mirror `wave_resident_int4_index`, `Arc<Mutex<WaveReadEngine>>`,
-  near-infinite backstop + watchdog) + invalidation drop + ROUTE through `submit_resident_int4_equal_any_payload` --
-  resolving the IMPEDANCE (that path returns a DEFERRED `CudaI32EqualAnyProjectSubmission`; the wave returns rows
-  SYNCHRONOUSLY -> needs a new return variant / pre-completed-submission), single-flight, fallback lpb, enforce in-flight
-  bound (#1) + harvest deadline (#2). Then R2.2b-3 end-to-end offered-rate A/B = ship decision. OR (B) R3 writes. Keep
-  R1 lpb default until the A/B clears.**
+  `pub` + `unsafe impl Send`.
+  **R2.2b-2 DONE + MERGED (`8feb4131`,`04f20bfc`,`b0ff7bb3`,`50bfdec5`,`f6fd436e`; DECISIONS "R2.2b-2 DONE"):** the wave
+  engine is WIRED + ROUTED into `submit_resident_int4_equal_any_payload` behind the default-OFF
+  `wave_persistent_engine_enabled` flag (nested under `wave_engine_enabled`). (1) IMPEDANCE resolved with a payload enum
+  `RelationalRetainedInt4ProjectionPayload::{Deferred(submission)|Materialized(rows)}` — both arms converge on the same
+  `Vec<CudaI32BatchProjectionRow>` the completion materializes (byte-identical by construction). (2) Lifecycle: per-table
+  `Arc<Mutex<WaveReadEngine>>` cache keyed `(col, resident_ptr, proj-set)`, lazy accessor over the R1 index
+  (`wave_read_engine_for`), serial-path eviction; cross-thread `Drop` made sound (`shutdown`/`read_records` set_current —
+  `WaveReadEngine` is `Send`). (3) Route is single-flight, falls back to lpb on any wave Err/timeout/oversize.
+  **CRITICAL: an at-most-one-persistent-wave-kernel invariant is LOAD-BEARING for liveness** — two full-occupancy
+  persistent spin-kernels in one context mutually starve (neither yields its SMs) -> teardown `cuStreamSynchronize`
+  (infinite backstop) HANGS; the accessor DRAINS existing engines before launching a new one, under a `wave_build_latch`.
+  (A non-vacuity test caught this as a real hang.) Two independent adversarial audits: Slice 1 = SHIP; combined =
+  SHIP-WITH-FIXES, all adopted (added `wave_route_hits` telemetry/test-signal + closed two vacuous assertions). GPU
+  differential `r2_wave_engine_matches_lpb_differential` (wave==lpb==scan byte-identical incl NULL/NULL-as-0/absent/dup-
+  fallback/generation-rebuild/eviction/proj-rebuild) + concurrent same-shape `r2_wave_engine_concurrent_same_shape_single_flight`
+  + HAZARD (3x seq + 2x concurrent, zero CUDA 700/716/717). **R1 lpb stays the default; the A/B (R2.2b-3, above) is the
+  ship decision.**
   (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
