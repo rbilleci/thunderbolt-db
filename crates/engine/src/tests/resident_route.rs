@@ -3964,22 +3964,10 @@ fn r2_materialized_payload_arm_materializes_identically() {
         column: "id".to_string(),
         matched_keys: 1,
     };
-    // Two needles (needle_index 0, 1). The shared (needle-invariant) projected columns are [id, v].
-    // The schema is now `Arc`-shared across needles (DECISIONS "Result-path optimization").
+    // Two needles (needle_index 0, 1). The shared (needle-invariant) projected columns are [id, v] —
+    // the submission now stores the shared schema once + `needle_count` (no per-needle Vec).
     let shared_cols = std::sync::Arc::new(vec![col("id"), col("v")]);
     let shared_access = std::sync::Arc::new(access.clone());
-    let members = vec![
-        (
-            std::sync::Arc::clone(&shared_cols),
-            std::sync::Arc::clone(&shared_access),
-            10,
-        ),
-        (
-            std::sync::Arc::clone(&shared_cols),
-            std::sync::Arc::clone(&shared_access),
-            20,
-        ),
-    ];
     // Rows arrive in `atom.add` SCHEDULE order (non-deterministic), so needle 0's two rows are
     // delivered HIGH `row_index` first to prove the completion re-sorts ascending by `row_index`.
     let rows = vec![
@@ -4005,7 +3993,9 @@ fn r2_materialized_payload_arm_materializes_identically() {
         table,
         snapshot_gpu_id: 3,
         selected_indexes: vec![0, 1],
-        members,
+        needle_count: 2,
+        shared_columns: shared_cols,
+        shared_access_path: shared_access,
         before_metrics: e.metrics.snapshot(),
         batch_started: std::time::Instant::now(),
         payload: RelationalRetainedInt4ProjectionPayload::Materialized(

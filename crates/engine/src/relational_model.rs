@@ -499,10 +499,15 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
     pub(crate) table: RelationalTable,
     pub(crate) snapshot_gpu_id: u16,
     pub(crate) selected_indexes: Vec<usize>,
-    /// One entry per needle, but the schema (columns, access_path) is `Arc`-SHARED across all of them
-    /// (built once per batch, refcount-cloned per needle) — so the result materialization never
-    /// deep-clones the projected schema N times (DECISIONS "Result-path optimization").
-    pub(crate) members: Vec<(Arc<Vec<RelationalColumn>>, Arc<RelationalAccessPath>, i32)>,
+    /// The batch's needle count + the SHARED projected schema (needle-invariant). Earlier this was a
+    /// `Vec<(Arc, Arc, i32)>` with one entry per needle, but every entry held the SAME two `Arc`s and the
+    /// needle value was unused by both completions — so building N tuples (2N `Arc` clones + a 1.5MB Vec at
+    /// b65536) was ~358us of pure per-batch waste (DECISIONS "Result-path optimization"). The hot batched
+    /// completion needs only `needle_count` + the shared schema; the cold per-needle completion refcount-
+    /// clones the schema `needle_count` times at completion instead.
+    pub(crate) needle_count: usize,
+    pub(crate) shared_columns: Arc<Vec<RelationalColumn>>,
+    pub(crate) shared_access_path: Arc<RelationalAccessPath>,
     pub(crate) before_metrics: RuntimeMetricsSnapshot,
     pub(crate) batch_started: Instant,
     pub(crate) payload: RelationalRetainedInt4ProjectionPayload,

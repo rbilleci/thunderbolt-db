@@ -233,7 +233,11 @@ impl Engine {
             }));
         }
 
-        let mut members = Vec::with_capacity(jobs.len());
+        // Cold per-job path. All jobs in a batch are asserted identical-shape below, so the projected schema
+        // is shared (captured once from the first job). Collect just the needles + the shared schema — no
+        // per-needle Vec (DECISIONS "Result-path optimization").
+        let mut needles: Vec<i32> = Vec::with_capacity(jobs.len());
+        let mut shared_schema: Option<(Arc<Vec<RelationalColumn>>, Arc<RelationalAccessPath>)> = None;
         let mut batch_table: Option<RelationalTable> = None;
         let mut batch_filter_idx: Option<usize> = None;
         let mut batch_selected_indexes: Option<Vec<usize>> = None;
@@ -303,20 +307,18 @@ impl Engine {
             batch_selected_indexes = Some(bound.selected_indexes.clone());
             let (_query, access_path) =
                 self.relational_select_mvcc_query_pinned(&job.select, &table, &bound, copin_s)?;
-            members.push((
-                Arc::new(bound.selected_columns),
-                Arc::new(access_path),
-                needle,
-            ));
+            needles.push(needle);
+            // Identical-shape across jobs (asserted above) -> capture the shared schema once.
+            if shared_schema.is_none() {
+                shared_schema = Some((Arc::new(bound.selected_columns), Arc::new(access_path)));
+            }
         }
 
         let table = batch_table.expect("non-empty batch has table");
         let filter_idx = batch_filter_idx.expect("non-empty batch has filter");
         let selected_indexes = batch_selected_indexes.expect("non-empty batch has projections");
-        let needles = members
-            .iter()
-            .map(|(_columns, _access_path, needle)| *needle)
-            .collect::<Vec<_>>();
+        let (shared_columns, shared_access_path) =
+            shared_schema.expect("non-empty batch has a shared schema");
         let (snapshot_gpu_id, before_metrics, batch_started, payload) = match self
             .submit_resident_int4_equal_any_payload(&table, &selected_indexes, filter_idx, &needles)?
         {
@@ -342,7 +344,9 @@ impl Engine {
                     table,
                     snapshot_gpu_id,
                     selected_indexes,
-                    members,
+                    needle_count: needles.len(),
+                    shared_columns,
+                    shared_access_path,
                     before_metrics,
                     batch_started,
                     payload,
@@ -458,22 +462,11 @@ impl Engine {
                     template.table.name
                 )))
             })?;
-        // Stamp every per-needle result with the shared (needle-invariant) columns + access path. The
-        // schema is `Arc`-SHARED across all needles (built ONCE here, refcount-cloned per needle) — not
-        // deep-cloned N times — which is what makes the result materialization scale (DECISIONS
-        // "Result-path optimization": the per-needle schema deep-clone was the entire ~3M end-to-end cap).
+        // The projected schema (columns, access_path) is needle-invariant + `Arc`-SHARED: built ONCE here,
+        // refcount-cloned by the completion — NOT deep-cloned N times, and NO per-needle Vec (DECISIONS
+        // "Result-path optimization"). The hot batched completion needs only `needle_count` + this schema.
         let shared_columns = Arc::new(template.result_columns.clone());
         let shared_access_path = Arc::new(template.access_path.clone());
-        let members = needles
-            .iter()
-            .map(|needle| {
-                (
-                    Arc::clone(&shared_columns),
-                    Arc::clone(&shared_access_path),
-                    *needle,
-                )
-            })
-            .collect::<Vec<_>>();
         Ok(RelationalRetainedReadSubmission {
             route_id: template.route_id.clone(),
             table: template.table.name.clone(),
@@ -489,7 +482,9 @@ impl Engine {
                     table: template.table.clone(),
                     snapshot_gpu_id,
                     selected_indexes: template.selected_indexes.clone(),
-                    members,
+                    needle_count: needles.len(),
+                    shared_columns,
+                    shared_access_path,
                     before_metrics,
                     batch_started,
                     payload,
@@ -1026,7 +1021,7 @@ impl Engine {
         // i32 values straight into a row-major `RowBlock` — skipping the per-row `Vec<SqlValue>` boxing +
         // `Vec<Vec<..>>` assembly that capped end-to-end read at ~7.8M (153ns/row -> ~2ns/row).
         let ncols = pending.selected_indexes.len();
-        let mut by_needle: Vec<Vec<(u64, &[i32])>> = vec![Vec::new(); pending.members.len()];
+        let mut by_needle: Vec<Vec<(u64, &[i32])>> = vec![Vec::new(); pending.needle_count];
         for projected in &projected_rows {
             by_needle[projected.needle_index].push((projected.row_index, projected.values.as_slice()));
         }
@@ -1048,20 +1043,18 @@ impl Engine {
             .unwrap_or(u64::MAX);
         let total_rows = row_blocks.iter().map(RowBlock::len).sum::<usize>();
         let table_name = pending.table.name.clone();
-        let results = pending
-            .members
+        // Cold path: stamp each needle's result with the shared schema (refcount-cloned per needle here, at
+        // completion, instead of N times at submit — DECISIONS "Result-path optimization").
+        let results = row_blocks
             .into_iter()
-            .zip(row_blocks)
-            .map(
-                |((columns, access_path, _needle), rows)| RelationalSelectResult {
-                    columns,
-                    rows,
-                    planned_target: DeviceTarget::Gpu(pending.snapshot_gpu_id),
-                    executed_target: DeviceTarget::Gpu(pending.snapshot_gpu_id),
-                    fallback_reason: None,
-                    access_path,
-                },
-            )
+            .map(|rows| RelationalSelectResult {
+                columns: Arc::clone(&pending.shared_columns),
+                rows,
+                planned_target: DeviceTarget::Gpu(pending.snapshot_gpu_id),
+                executed_target: DeviceTarget::Gpu(pending.snapshot_gpu_id),
+                fallback_reason: None,
+                access_path: Arc::clone(&pending.shared_access_path),
+            })
             .collect();
         let wall_micros = pending
             .batch_started
@@ -1115,19 +1108,14 @@ impl Engine {
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
             RelationalRetainedInt4ProjectionPayload::Materialized(columns) => (columns, None),
         };
-        let n = pending.members.len();
+        let n = pending.needle_count;
         let ncols = pending.selected_indexes.len();
-        // All members share the same schema Arc (the retained submit builds it once); take any.
-        let (columns, access_path) = match pending.members.first() {
-            Some((columns, access_path, _needle)) => (Arc::clone(columns), Arc::clone(access_path)),
-            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan)),
-        };
         Ok(Self::assemble_batched_rows(
             &projected,
             n,
             ncols,
-            columns,
-            access_path,
+            pending.shared_columns,
+            pending.shared_access_path,
             pending.snapshot_gpu_id,
         ))
     }
