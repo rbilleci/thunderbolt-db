@@ -12,33 +12,40 @@ path behind default-OFF `wave_persistent_engine_enabled`; R2.2b-3's A/B (`engine
 regime — 2.45x lpb @batch=1 down to 1.02x @batch=4096, lower latency at every batch — but the DEFAULT FLIP is GATED on
 two R2.2c architectural unlocks.** Keep R1 lpb the default until they clear. The fork:
 
-**(A) R2.2c — unlock the wave as the point-read fast-path default.** Two gates, both from the at-most-one-resident-kernel
-constraint + the single-flight Mutex:
-  1. **Multi-shape coexistence.** Today one wave engine TOTAL (two full-occupancy persistent spin-kernels in a context
-     mutually starve -> teardown deadlock), so a multi-shape point-read workload THRASHES (the coalescer processes
-     shape-groups sequentially; each shape switch = teardown+launch). Fix = sub-occupancy kernel sizing so K engines
-     coexist, OR a single shared multi-table/shape kernel. This is the gating design problem.
-  2. **Multi-producer ring (the wave's original premise).** The A/B's concurrent regime shows the wired single-flight
-     wave (per-engine `Mutex`) plateaus ~1.4M and crosses UNDER lpb at ~4 direct threads. Winning the concurrent regime
-     needs N producers enqueuing into the lock-free ring with depth-K pipelining (no central coalescer/Mutex) =
-     `submit_async`/`harvest` (already built + audited in `wave.rs`, P2) lifted into the engine.
-  Then re-run the A/B (multi-shape + multi-producer) and flip the default (size/shape-aware).
+**(A) R2.2c — unlock the wave as the point-read fast-path default. TWO PROBES THIS SESSION SHOWED THE READ-SIDE POLISH
+IS MARGINAL** (DECISIONS "R2.2c gate-1 PROBE" + "R2.2c graphs spike"):
+  1. **Multi-shape coexistence = a REDESIGN, not a quick fix.** Probe (`wave_multikernel_probe`): two persistent wave
+     kernels RUN concurrently fine, but tearing one down HANGS to backstop (+ corrupts the survivor) — the doorbell exit
+     fails whenever a 2nd wave kernel is resident — even for MINIMAL 1-SM kernels. So it is NOT SM starvation / not a
+     grid-size change; the at-most-one invariant is vindicated. Lifting it needs a coexistence-teardown fix OR a single
+     shared multi-shape kernel (big), OR a small "one-sticky-shape, lpb-the-rest, no-rebuild" policy (captures the
+     dominant-shape win without coexistence).
+  2. **CUDA graphs do NOT help; the cheaper lead is host-machinery pooling.** Probe (`lpb_cudagraph_probe`): graph replay
+     == direct == ~7us (0 speedup) — the floor is the GPU ROUND-TRIP, not launch submission. lpb's A/B 27us vs the raw
+     7us => ~20us is per-batch ENGINE HOST MACHINERY (per-batch `cuMemAlloc` + pooled-stream lease + event timing +
+     deferred-complete). So the genuine cheaper alternative to the wave (single-coalescer regime) is POOLING/optimizing
+     lpb's per-batch machinery — no persistent kernel, no coexistence, no SM tax. The wave's only unique edge left is the
+     multi-PRODUCER concurrent regime (the per-engine `Mutex` plateaus ~1.4M, crosses under lpb at ~4 direct threads).
+  Before ANY wave default-flip: measure the wave's SM-coexistence TAX on a mixed workload (~60% loss at 8 reserved SMs) —
+  size down / spin up only under point-read load, don't flip blind. NET: R2.2c's read-side win is marginal vs its cost.
 
 **(B) R3 — the write path (independent, the larger unmeasured frontier).** Concurrent lock-free index maintenance is
 PROVEN fast (write-probe-1, tens of billions inserts/s); the open problems are GPU-native commit/durability (WAL fsync +
 group commit) and deterministic CC (ADR-009 MV-dependency-graph). The write path is entirely unmeasured — likely the
-bigger bet for the OLTP SLO, and the gate for deleting the CPU engine (see the deletion plan in DECISIONS / ADR-006).
+bigger bet for the OLTP SLO, and the gate for deleting the CPU engine (deletion plan: PLAN §4b / ADR-006).
 
-Recommendation: **(B) R3 writes** unless the immediate goal is a shippable read win — the read half of the bet is
-settled (read-ceiling SETTLED + wave validated), the write half is the unknown that the 100k-TPS SLO and the
-CPU-engine deletion both hinge on.
+Recommendation (STRENGTHENED by the probes): **(B) R3 writes.** The read half is settled (read-ceiling SETTLED + wave
+validated behind the flag); R2.2c's remaining read wins are marginal (coexistence redesign with little payoff; graphs
+ruled out; host-machinery pooling is a minor polish of an already-fast path). The write half is the unknown that the
+100k-TPS SLO and the CPU-engine deletion both hinge on. (Optional cheap detour first: a host-machinery-pooling spike on
+the lpb path — the real version of the graphs idea — if a near-term read default-flip is wanted.)
 DISCIPLINE (charter, non-negotiable): GPU tests under `timeout`, NEVER `--gpu-reset`; ASCII-only PTX (ptxas -arch=sm_70
 check before launch); independent adversarial audit on kernel/protocol changes (never self-audit); commit/push/merge each
 verified increment; do NOT run a GPU test right after a `timeout`-killed one (its kernel zombies ~watchdog/backstop).
 
 ## Where we are
 - Docs are **6 canonical files**: [CHARTER](CHARTER.md), [ARCHITECTURE](ARCHITECTURE.md), [DECISIONS](DECISIONS.md),
-  [PLAN](PLAN.md), [STATUS](STATUS.md), this. `main` == branch == origin (`eccd32a1`). Workspace builds; execution
+  [PLAN](PLAN.md), [STATUS](STATUS.md), this. `main` == branch == origin (`ac7cbfc8`). Workspace builds; execution
   non-ignored tests green; the wave GPU tests are `#[ignore]`d (need a local GPU; run with `-- --ignored`).
 - **Workload = high-throughput OLTP** (ADR-008). **Success bar (clarified): same ballpark on TODAY's hardware + a
   GPU-architectural gap that CLOSES with hardware — NOT beat-the-CPU-today** (host-serial gaps are fixes, not losses).
