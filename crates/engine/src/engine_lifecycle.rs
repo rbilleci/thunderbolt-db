@@ -167,6 +167,7 @@ impl Engine {
             auto_admit_on_commit: std::sync::atomic::AtomicBool::new(false),
             wave_engine_enabled: std::sync::atomic::AtomicBool::new(false),
             wave_persistent_engine_enabled: std::sync::atomic::AtomicBool::new(false),
+            dense_index_probe_enabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

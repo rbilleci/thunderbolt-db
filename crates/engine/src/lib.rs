@@ -11,7 +11,8 @@ use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32BatchProjectionColumns,
     CudaI32Comparison,
-    CudaI32EqualAnyProjectSubmission, CudaI32GroupedStats, CudaI32Stats, CudaMvccRowBatch,
+    CudaI32EqualAnyProjectSubmission, CudaI32GroupedStats, CudaI32IndexProbeDenseSubmission,
+    CudaI32Stats, CudaMvccRowBatch,
     CudaOwnedDeviceMemoryChunk,
     CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
     ExprStep, FilterOperator, LimitOperator,
@@ -324,6 +325,11 @@ pub struct Engine {
     /// Falls back to the lpb index probe on any wave error / harvest timeout / oversize batch. Interior-
     /// mutable (`&self`), read on the read path.
     wave_persistent_engine_enabled: AtomicBool,
+    /// DECISIONS "lpb read levers" #1: when true, the lpb unique index probe uses the DENSE-emit kernel
+    /// (thread `i` -> slot `i`, no atomic, no needle_indices/row_indices/count; host compacts sequentially)
+    /// instead of the atomic-compaction kernel. Byte-identical; default off (the A/B / safety lever). Only the
+    /// unique index route honors it — the non-unique scan always keeps the atomic kernel. Interior-mutable.
+    dense_index_probe_enabled: AtomicBool,
 }
 
 /// The DDL-only catalog working state, serialized behind the engine's **catalog latch**

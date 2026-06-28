@@ -2118,6 +2118,27 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// DENSE-emit unique index probe (DECISIONS "lpb read levers" #1) — same args as the atomic variant.
+    pub fn submit_match_project_i32_index_probe_dense_from_payload(
+        &self,
+        index: &Arc<CudaResidentDeviceMemory>,
+        index_table_mask: u32,
+        index_hash_shift: u32,
+        needles: &[i32],
+        projection_offsets: &[u64],
+        row_count: u64,
+    ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_index_probe_dense(
+            self,
+            index,
+            index_table_mask,
+            index_hash_shift,
+            needles,
+            projection_offsets,
+            row_count,
+        )
+    }
+
     pub fn match_i32_equal_row_indices_from_payload(
         &self,
         filters: &[(u64, i32)],
@@ -2620,14 +2641,18 @@ impl CudaI32BatchProjectionColumns {
             self.projection_count > 0 || self.values.is_empty(),
             "into_rows: projection_count==0 with non-empty values would silently drop rows"
         );
+        // The DENSE index-probe produces no `row_indices` (unique => no within-needle sort needs them); the
+        // cold per-needle path that calls `into_rows` synthesizes 0 (the value is never read — a 1-row needle
+        // is trivially ordered, and the differentials compare projected values, not row_index).
+        let has_row_indices = !self.row_indices.is_empty();
         let p = self.projection_count.max(1);
         self.values
             .chunks(p)
             .zip(self.needle_indices)
-            .zip(self.row_indices)
-            .map(|((row, needle_index), row_index)| CudaI32BatchProjectionRow {
+            .enumerate()
+            .map(|(i, (row, needle_index))| CudaI32BatchProjectionRow {
                 needle_index: needle_index as usize,
-                row_index,
+                row_index: if has_row_indices { self.row_indices[i] } else { 0 },
                 values: row.to_vec(),
             })
             .collect()
@@ -2682,6 +2707,11 @@ pub struct CudaI32EqualAnyProjectSubmission {
 // The resident allocation itself remains owned elsewhere and must outlive
 // completion.
 unsafe impl Send for CudaI32EqualAnyProjectSubmission {}
+// Same as the atomic submission: the dense submission owns pooled device-buffer/stream guards (raw `*mut
+// c_void` ptrs into device memory + a pooled stream). It is moved across connection threads (engine ownership)
+// and completed on whichever thread drains it (which re-binds the primary context); the raw ptrs are only ever
+// touched under that bound context, never shared, so it is `Send`.
+unsafe impl Send for CudaI32IndexProbeDenseSubmission {}
 
 impl CudaI32EqualAnyProjectSubmission {
     pub fn complete(
@@ -9916,6 +9946,496 @@ DONE:
         timed,
         _wave_index_guard: Some(Arc::clone(index)),
     })
+}
+
+/// DENSE-emit variant of the unique int4 index probe (DECISIONS "lpb read levers" #1). A unique index has
+/// <=1 match/needle, so thread `i` writes `values[i*proj]` + `status[i]` (1=found, 2=not-found) to its OWN
+/// slot — NO `atom.global.add`, NO `needle_indices`, NO `out_count`, NO `row_indices`. The host then compacts
+/// sequentially by status (no random scatter). Only valid for the unique index route (the non-unique scan
+/// keeps the atomic kernel + row_indices). The hash/probe logic is byte-identical to
+/// `gpu_db_resident_i32_index_probe`; only the emit differs. Gaps are guarded: `status` is memset to 0, every
+/// in-bounds thread writes a definitive 1/2, and the completion `debug_assert`s `status != 0`.
+pub struct CudaI32IndexProbeDenseSubmission {
+    projection_count: usize,
+    needles_len: usize,
+    primary: Arc<GpuPrimaryContext>,
+    values_guard: PooledDeviceBufferOwned,
+    status_guard: PooledDeviceBufferOwned,
+    _needles_guard: PooledDeviceBufferOwned,
+    stream: Option<PooledStreamOwned>,
+    timed: bool,
+    _wave_index_guard: Option<Arc<CudaResidentDeviceMemory>>,
+}
+
+fn submit_cuda_resident_i32_index_probe_dense<R: CudaResidentReadSource>(
+    resident: &R,
+    index: &Arc<CudaResidentDeviceMemory>,
+    index_table_mask: u32,
+    index_hash_shift: u32,
+    needles: &[i32],
+    projection_offsets: &[u64],
+    row_count: u64,
+) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
+    let index_ptr = index.device_ptr();
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const MAX_PROJECTIONS: usize = 4;
+    // Byte-for-byte the same params/probe as `gpu_db_resident_i32_index_probe` EXCEPT: `out_needle_indices_ptr`
+    // / `out_row_indices_ptr` / `out_count_ptr` are replaced by a single `out_status_ptr`; the FOUND emit
+    // writes to slot `idx` (no atomic) + `status[idx]=1`; a new NOTFOUND block writes `status[idx]=2`. The
+    // out-of-bounds / proj==0 guards still `ret` without writing (those slots are never read).
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_index_probe_dense(
+    .param .u64 resident_ptr,
+    .param .u64 index_ptr,
+    .param .u32 table_mask,
+    .param .u32 hash_shift,
+    .param .u32 needle_count,
+    .param .u32 projection_count,
+    .param .u64 projection_offset0,
+    .param .u64 projection_offset1,
+    .param .u64 projection_offset2,
+    .param .u64 projection_offset3,
+    .param .u64 needles_ptr,
+    .param .u64 out_values_ptr,
+    .param .u64 out_status_ptr
+)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<28>;
+
+    ld.param.u64 %rd1, [resident_ptr];
+    ld.param.u64 %rd2, [index_ptr];
+    ld.param.u32 %r1, [table_mask];
+    ld.param.u32 %r2, [hash_shift];
+    ld.param.u32 %r3, [needle_count];
+    ld.param.u32 %r4, [projection_count];
+    ld.param.u64 %rd3, [projection_offset0];
+    ld.param.u64 %rd4, [projection_offset1];
+    ld.param.u64 %rd5, [projection_offset2];
+    ld.param.u64 %rd6, [projection_offset3];
+    ld.param.u64 %rd7, [needles_ptr];
+    ld.param.u64 %rd8, [out_values_ptr];
+    ld.param.u64 %rd9, [out_status_ptr];
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;
+    setp.ge.u32 %p1, %r8, %r3;
+    @%p1 bra DONE;
+    setp.eq.u32 %p1, %r4, 0;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd12, %r8, 4;
+    add.u64 %rd13, %rd7, %rd12;
+    ld.global.s32 %r9, [%rd13];
+    mul.lo.u32 %r10, %r9, 2654435761;
+    shr.u32 %r11, %r10, %r2;
+    mov.u32 %r12, 0;
+
+PROBE:
+    and.b32 %r11, %r11, %r1;
+    mul.wide.u32 %rd14, %r11, 8;
+    add.u64 %rd15, %rd2, %rd14;
+    ld.global.u64 %rd16, [%rd15];
+    setp.eq.u64 %p2, %rd16, 0;
+    @%p2 bra NOTFOUND;
+    shr.u64 %rd17, %rd16, 32;
+    cvt.u32.u64 %r13, %rd17;
+    setp.eq.s32 %p2, %r13, %r9;
+    @%p2 bra FOUND;
+    add.u32 %r11, %r11, 1;
+    add.u32 %r12, %r12, 1;
+    setp.ge.u32 %p3, %r12, 256;
+    @%p3 bra NOTFOUND;
+    bra PROBE;
+
+FOUND:
+    cvt.u32.u64 %r14, %rd16;
+    sub.u32 %r14, %r14, 1;
+    cvt.u64.u32 %rd18, %r14;
+
+    cvt.u64.u32 %rd19, %r8;
+
+    mul.lo.u64 %rd20, %rd19, 4;
+    add.u64 %rd21, %rd9, %rd20;
+    mov.u32 %r15, 1;
+    st.global.u32 [%rd21], %r15;
+
+    cvt.u64.u32 %rd22, %r4;
+    mul.lo.u64 %rd23, %rd19, %rd22;
+    mul.lo.u64 %rd23, %rd23, 4;
+    mul.lo.u64 %rd24, %rd18, 4;
+
+    add.u64 %rd25, %rd1, %rd3;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    st.global.s32 [%rd26], %r17;
+
+    setp.le.u32 %p4, %r4, 1;
+    @%p4 bra DONE;
+    add.u64 %rd25, %rd1, %rd4;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    add.u64 %rd26, %rd26, 4;
+    st.global.s32 [%rd26], %r17;
+
+    setp.le.u32 %p4, %r4, 2;
+    @%p4 bra DONE;
+    add.u64 %rd25, %rd1, %rd5;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    add.u64 %rd26, %rd26, 8;
+    st.global.s32 [%rd26], %r17;
+
+    setp.le.u32 %p4, %r4, 3;
+    @%p4 bra DONE;
+    add.u64 %rd25, %rd1, %rd6;
+    add.u64 %rd25, %rd25, %rd24;
+    ld.global.s32 %r17, [%rd25];
+    add.u64 %rd26, %rd8, %rd23;
+    add.u64 %rd26, %rd26, 12;
+    st.global.s32 [%rd26], %r17;
+    bra DONE;
+
+NOTFOUND:
+    cvt.u64.u32 %rd19, %r8;
+    mul.lo.u64 %rd20, %rd19, 4;
+    add.u64 %rd21, %rd9, %rd20;
+    mov.u32 %r15, 2;
+    st.global.u32 [%rd21], %r15;
+
+DONE:
+    ret;
+}
+"#;
+
+    if needles.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    if projection_offsets.is_empty() || projection_offsets.len() > MAX_PROJECTIONS {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            projection_offsets.len(),
+        ));
+    }
+    if row_count == 0 || index_ptr == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    for byte_offset in projection_offsets {
+        let bytes = row_count
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .and_then(|bytes| byte_offset.checked_add(bytes))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if bytes > resident.metadata().allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+        }
+    }
+    let needle_count_u32 = u32::try_from(needles.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
+    // DENSE: one slot per needle (gaps for absent), so values is sized `needle_count*proj` (same as the
+    // atomic worst case) and `status` is `needle_count` u32s.
+    let output_cells = (needles.len() as u64)
+        .checked_mul(projection_offsets.len() as u64)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_bytes = usize::try_from(
+        output_cells
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let status_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let needle_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_memset_d8 = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let primary = resident.primary_arc();
+    primary.set_current()?;
+
+    let needles_guard = primary.lease_device_buffer_owned(needle_bytes)?;
+    let values_guard = primary.lease_device_buffer_owned(output_bytes)?;
+    let status_guard = primary.lease_device_buffer_owned(status_bytes)?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function = primary.cached_function(c"gpu_db_resident_i32_index_probe_dense", &ptx)?;
+
+    let mut resident_arg = resident.device_ptr();
+    let mut index_arg = index_ptr;
+    let mut table_mask_arg = index_table_mask;
+    let mut hash_shift_arg = index_hash_shift;
+    let mut needle_count_arg = needle_count_u32;
+    let mut projection_count_arg = u32::try_from(projection_offsets.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(projection_offsets.len()))?;
+    let mut projected_offsets = [0_u64; MAX_PROJECTIONS];
+    for (idx, offset) in projection_offsets.iter().enumerate() {
+        projected_offsets[idx] = *offset;
+    }
+    let mut needles_arg = needles_guard.ptr;
+    let mut output_arg = values_guard.ptr;
+    let mut status_arg = status_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut index_arg as *mut u64).cast::<c_void>(),
+        (&mut table_mask_arg as *mut u32).cast::<c_void>(),
+        (&mut hash_shift_arg as *mut u32).cast::<c_void>(),
+        (&mut needle_count_arg as *mut u32).cast::<c_void>(),
+        (&mut projection_count_arg as *mut u32).cast::<c_void>(),
+        (&mut projected_offsets[0] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[1] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[2] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[3] as *mut u64).cast::<c_void>(),
+        (&mut needles_arg as *mut u64).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut status_arg as *mut u64).cast::<c_void>(),
+    ];
+    let threads_per_block = 128;
+    let blocks = needle_count_u32.div_ceil(threads_per_block);
+
+    let stream_owned = PooledStreamOwned {
+        primary: Arc::clone(&primary),
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let pooled = stream_owned
+        .pooled
+        .as_ref()
+        .expect("pooled stream just leased");
+    let stream = pooled.stream;
+    let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    // GAP GUARD: memset `status` to 0 BEFORE the kernel so any slot a thread fails to write surfaces as 0
+    // (the completion `debug_assert`s != 0). Every in-bounds thread then writes a definitive 1/2.
+    let async_ops = match (primary.cu_memcpy_htod_async, primary.cu_memset_d8_async) {
+        (Some(htod), Some(memset)) => Some((htod, memset)),
+        _ => None,
+    };
+    if let Some((htod_async, memset_async)) = async_ops {
+        check_cuda(unsafe {
+            htod_async(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+                stream,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { memset_async(status_guard.ptr, 0, status_bytes, stream) })
+            .map_err(drain_err)?;
+    } else {
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(status_guard.ptr, 0, status_bytes) }).map_err(drain_err)?;
+    }
+
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })
+            .map_err(drain_err)?;
+    }
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            blocks,
+            1,
+            1,
+            threads_per_block,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })
+            .map_err(drain_err)?;
+    }
+
+    Ok(CudaI32IndexProbeDenseSubmission {
+        projection_count: projection_offsets.len(),
+        needles_len: needles.len(),
+        primary,
+        values_guard,
+        status_guard,
+        _needles_guard: needles_guard,
+        stream: Some(stream_owned),
+        timed,
+        _wave_index_guard: Some(Arc::clone(index)),
+    })
+}
+
+impl CudaI32IndexProbeDenseSubmission {
+    /// Drain the dense output and SEQUENTIALLY compact it (by `status`) into the SAME compacted columnar form
+    /// the atomic path produces — same byte-identical rows, minus `row_indices` (dense unique has no
+    /// within-needle sort, so the engine never needs it). ONE covering `cuStreamSynchronize` (the size is
+    /// `needles_len`, known a priori, so there is no count round-trip — folds in lever #2). `needle_indices`
+    /// comes out ASCENDING (slot order), exactly what the engine's scatter expects.
+    pub fn complete_detached_columnar(
+        mut self,
+    ) -> Result<(CudaI32BatchProjectionColumns, Option<u64>), CudaRuntimeProbeError> {
+        let primary = Arc::clone(&self.primary);
+        primary.set_current()?;
+        let stream_owned = self
+            .stream
+            .take()
+            .expect("pooled stream held until complete");
+        let pooled = stream_owned
+            .pooled
+            .as_ref()
+            .expect("pooled stream held until complete");
+        let stream = pooled.stream;
+
+        // The covering sync is the visibility barrier — plain `st.global` status writes in the kernel are
+        // ordered before the host reads below by this sync (NO release-acquire needed; that machinery is only
+        // for the host-mapped-polling path).
+        check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) })?;
+
+        let elapsed_us = if self.timed {
+            let mut elapsed_ms = 0.0_f32;
+            check_cuda(unsafe {
+                (primary.cu_event_elapsed_time)(
+                    &mut elapsed_ms,
+                    pooled.start_event,
+                    pooled.stop_event,
+                )
+            })?;
+            Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64)
+        } else {
+            None
+        };
+
+        let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+            unsafe {
+                let _ = (primary.cu_stream_synchronize)(stream);
+            }
+            err
+        };
+
+        let nc = self.needles_len;
+        let proj = self.projection_count;
+        let mut values_raw = vec![0_i32; nc.saturating_mul(proj)];
+        let mut status = vec![0_u32; nc];
+        if !values_raw.is_empty() {
+            check_cuda(unsafe {
+                (primary.cu_memcpy_dtoh)(
+                    values_raw.as_mut_ptr().cast::<c_void>(),
+                    self.values_guard.ptr,
+                    values_raw.len() * std::mem::size_of::<i32>(),
+                )
+            })
+            .map_err(drain_err)?;
+        }
+        check_cuda(unsafe {
+            (primary.cu_memcpy_dtoh)(
+                status.as_mut_ptr().cast::<c_void>(),
+                self.status_guard.ptr,
+                status.len() * std::mem::size_of::<u32>(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        // Sequential compaction: read slot 0..nc in order (cache-friendly), keep `status==1` (found). A
+        // `status==0` slot means a thread never wrote it — a kernel/launch bug; fail LOUD in tests.
+        let mut values = Vec::with_capacity(values_raw.len());
+        let mut needle_indices = Vec::with_capacity(nc);
+        for i in 0..nc {
+            debug_assert!(
+                status[i] != 0,
+                "dense index-probe: status slot {i} never written (gap) — completion read an undrained kernel",
+            );
+            if status[i] == 1 {
+                values.extend_from_slice(&values_raw[i * proj..i * proj + proj]);
+                needle_indices.push(i as u32);
+            }
+        }
+        let columns = CudaI32BatchProjectionColumns {
+            values,
+            needle_indices,
+            row_indices: Vec::new(),
+            projection_count: proj,
+        };
+        Ok((columns, elapsed_us))
+    }
+}
+
+impl Drop for CudaI32IndexProbeDenseSubmission {
+    fn drop(&mut self) {
+        // Same drop-without-complete safety drain as `CudaI32EqualAnyProjectSubmission`: if dropped before
+        // `complete` (early `Err`/cancel/panic), sync the held stream BEFORE the field guards return the
+        // device buffers + stream to the SHARED pools (else a concurrent leaser re-leases memory the in-flight
+        // kernel/HtoD/memset still writes). A successful `complete_detached_columnar` `take()`s `stream`, so
+        // this is skipped on the success path. Best-effort, NO PANIC.
+        if let Some(stream_owned) = self.stream.as_ref() {
+            if let Some(pooled) = stream_owned.pooled.as_ref() {
+                let _ = self.primary.set_current();
+                unsafe {
+                    let _ = (self.primary.cu_stream_synchronize)(pooled.stream);
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

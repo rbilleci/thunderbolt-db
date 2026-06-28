@@ -569,6 +569,18 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// DECISIONS "lpb read levers" #1: route the lpb unique index probe through the DENSE-emit kernel. Default
+    /// off; byte-identical to the atomic kernel. `&self` (interior-mutable flag the read path reads).
+    pub fn set_dense_index_probe_enabled(&self, on: bool) {
+        self.dense_index_probe_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn dense_index_probe_enabled(&self) -> bool {
+        self.dense_index_probe_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// ADR-009 R2.2b: enable/disable the PERSISTENT wave-kernel point-lookup route (default OFF). Only
     /// takes effect when `wave_engine_enabled` is ALSO on — it selects the persistent `WaveReadEngine`
     /// over the launch-per-batch R1 index probe for resident int4 unique-key equality batches, falling
@@ -591,6 +603,16 @@ impl Engine {
         self.read_state
             .residency
             .wave_route_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe. The test signal
+    /// that the dense route actually ran (dense and atomic are byte-identical, so output equality can't prove
+    /// which kernel produced the rows).
+    pub fn dense_index_probe_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .dense_index_probe_hits
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

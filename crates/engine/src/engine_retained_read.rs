@@ -605,7 +605,7 @@ impl Engine {
                 }
             }
             // (2)/(3) launch-per-batch: GPU index probe when buildable, else the full scan -> Deferred.
-            let cuda_submission = match self
+            let deferred = match self
                 .wave_engine_enabled()
                 .then(|| {
                     self.wave_resident_int4_index(
@@ -626,29 +626,59 @@ impl Engine {
                         },
                         "wave index route requires distinct needles (batcher dedup_needles contract)"
                     );
+                    // The index route is unique (<=1 match/needle), so it can take the DENSE-emit kernel
+                    // (DECISIONS "lpb read levers" #1) when the flag is on — byte-identical, no atomic/scatter.
+                    if self.dense_index_probe_enabled() {
+                        let dense = device_memory
+                            .submit_match_project_i32_index_probe_dense_from_payload(
+                                &index,
+                                table_mask,
+                                hash_shift,
+                                needles,
+                                &projection_offsets,
+                                row_count,
+                            )
+                            .map_err(|err| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                            })?;
+                        self.read_state
+                            .residency
+                            .dense_index_probe_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        DeferredProbe::Dense(dense)
+                    } else {
+                        DeferredProbe::Atomic(
+                            device_memory
+                                .submit_match_project_i32_index_probe_from_payload(
+                                    &index,
+                                    table_mask,
+                                    hash_shift,
+                                    needles,
+                                    &projection_offsets,
+                                    row_count,
+                                )
+                                .map_err(|err| {
+                                    ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                                })?,
+                        )
+                    }
+                }
+                // The non-unique SCAN keeps the atomic kernel (>1 match/needle needs the atomic compaction +
+                // row_indices for the within-needle sort).
+                None => DeferredProbe::Atomic(
                     device_memory
-                        .submit_match_project_i32_index_probe_from_payload(
-                            &index,
-                            table_mask,
-                            hash_shift,
+                        .submit_match_project_i32_equal_any_from_payload(
+                            filter_offset,
                             needles,
                             &projection_offsets,
                             row_count,
                         )
                         .map_err(|err| {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
-                        })?
-                }
-                None => device_memory
-                    .submit_match_project_i32_equal_any_from_payload(
-                        filter_offset,
-                        needles,
-                        &projection_offsets,
-                        row_count,
-                    )
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+                        })?,
+                ),
             };
-            RelationalRetainedInt4ProjectionPayload::Deferred(cuda_submission)
+            RelationalRetainedInt4ProjectionPayload::Deferred(deferred)
         };
         Ok(Some((snapshot_gpu_id, before_metrics, batch_started, payload)))
     }
@@ -996,9 +1026,17 @@ impl Engine {
         // This per-needle path is COLD (the hot batcher uses the batched completion); it bridges the columnar
         // Materialized arm back to per-row via `into_rows` (DECISIONS "Tail latency").
         let (projected_rows, kernel_event_elapsed_us) = match pending.payload {
-            RelationalRetainedInt4ProjectionPayload::Deferred(submission) => submission
-                .complete_detached()
-                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Atomic(submission)) => {
+                submission
+                    .complete_detached()
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
+            }
+            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Dense(submission)) => {
+                let (columns, elapsed) = submission
+                    .complete_detached_columnar()
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                (columns.into_rows(), elapsed)
+            }
             RelationalRetainedInt4ProjectionPayload::Materialized(columns) => {
                 (columns.into_rows(), None)
             }
@@ -1107,9 +1145,16 @@ impl Engine {
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<RelationalRetainedBatchResult, ExecuteError> {
         let (projected, _kernel_event_elapsed_us) = match pending.payload {
-            RelationalRetainedInt4ProjectionPayload::Deferred(submission) => submission
-                .complete_detached_columnar()
-                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Atomic(submission)) => {
+                submission
+                    .complete_detached_columnar()
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
+            }
+            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Dense(submission)) => {
+                submission
+                    .complete_detached_columnar()
+                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
+            }
             RelationalRetainedInt4ProjectionPayload::Materialized(columns) => (columns, None),
         };
         let n = pending.needle_count;

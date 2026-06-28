@@ -529,6 +529,10 @@ pub(crate) struct ResidencyReadState {
     /// engine in isolation) produced the rows — output equality alone can't, since all routes are
     /// byte-identical by design. `Relaxed` (a monotonic counter, no ordering dependency).
     pub(crate) wave_route_hits: std::sync::atomic::AtomicU64,
+    /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe (vs the atomic
+    /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
+    /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.
+    pub(crate) dense_index_probe_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

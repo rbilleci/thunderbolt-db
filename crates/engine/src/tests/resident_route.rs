@@ -4635,3 +4635,78 @@ fn r2_batched_assembly_unique_fastpath_scatters_by_needle() {
     assert_eq!(batched.needle_values(2), &[22, 202]);
     assert_eq!(batched.needle_values(3), &[33, 303]);
 }
+
+// DECISIONS "lpb read levers" #1: the DENSE-emit unique index probe must be BYTE-IDENTICAL to the atomic
+// index kernel, across the edge cases the kernel must get right: all-match, none-match, absent needles (the
+// GAP case — validates that absent slots are never read as present), and NULL-as-0. The same index route is
+// taken either way (lpb index, wave_engine on / persistent off); only the kernel + host compaction differ.
+// Non-vacuity: dense_index_probe_hits must increment (the dense kernel actually ran — no silent fallback to
+// atomic/scan; output equality alone can't prove it since the two are byte-identical by design). Distinct
+// needles only (the route dedups; the dense kernel handles duplicates per-slot by design but the contract
+// prevents them reaching it, so they're not exercised here). GPU test.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn r2_dense_index_probe_matches_atomic() {
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO accounts (id, balance) VALUES (10, 100), (20, 200), (30, 300), (40, 400), (NULL, 500)",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("accounts").unwrap();
+    let select = match parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap() {
+        Command::Select(s) => s,
+        _ => unreachable!(),
+    };
+    if !e.plan_relational_resident_route(&select).accepted {
+        return; // no GPU
+    }
+    // lpb INDEX route (not the persistent wave): wave_engine on, persistent off.
+    e.set_wave_engine_enabled(true);
+    let template = e.prepare_relational_retained_read_template(&select).unwrap();
+
+    let cases: Vec<Vec<i32>> = vec![
+        vec![10, 20, 30, 40],         // all match (dense fully populated)
+        vec![91, 92, 93],             // none match (every slot status=2)
+        vec![10, 25, 30, 99, 0],      // mix: present + absent gaps (25,99) + NULL-as-0 (0)
+        vec![25],                     // single absent (degenerate gap)
+        vec![0],                      // single NULL-as-0
+    ];
+    for needles in cases {
+        e.set_dense_index_probe_enabled(false);
+        let atomic = e
+            .complete_relational_retained_read_submission_batched(
+                e.submit_relational_retained_template_point_lookups(&template, &needles).unwrap(),
+            )
+            .unwrap();
+
+        e.set_dense_index_probe_enabled(true);
+        let before = e.dense_index_probe_hits();
+        let dense = e
+            .complete_relational_retained_read_submission_batched(
+                e.submit_relational_retained_template_point_lookups(&template, &needles).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            e.dense_index_probe_hits() - before,
+            1,
+            "dense index probe must have served {needles:?} (no silent fallback to atomic/scan)"
+        );
+
+        assert_eq!(
+            dense.needle_count(),
+            atomic.needle_count(),
+            "needle count differs for {needles:?}"
+        );
+        for i in 0..atomic.needle_count() {
+            assert_eq!(
+                dense.needle_values(i),
+                atomic.needle_values(i),
+                "needle {i} (value {}): dense != atomic for batch {needles:?}",
+                needles[i]
+            );
+        }
+    }
+    e.set_dense_index_probe_enabled(false);
+}

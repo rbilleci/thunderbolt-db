@@ -527,8 +527,16 @@ pub(crate) struct RelationalRetainedInt4ProjectionSubmission {
 ///   GPU work and no per-batch kernel event (the persistent kernel is not timed per wave), hence the
 ///   completion supplies `None` for the elapsed-time metric on this arm.
 pub(crate) enum RelationalRetainedInt4ProjectionPayload {
-    Deferred(CudaI32EqualAnyProjectSubmission),
+    Deferred(DeferredProbe),
     Materialized(CudaI32BatchProjectionColumns),
+}
+
+/// The deferred (lpb) GPU submission, either the atomic-compaction kernel (the scan + the original unique
+/// index probe) or the DENSE-emit unique index probe (DECISIONS "lpb read levers" #1). Both drain to the
+/// SAME `CudaI32BatchProjectionColumns` via `complete_detached_columnar`, so the choice never changes results.
+pub(crate) enum DeferredProbe {
+    Atomic(CudaI32EqualAnyProjectSubmission),
+    Dense(CudaI32IndexProbeDenseSubmission),
 }
 
 pub(crate) struct RelationalRetainedInt4ProjectionCompletion {
