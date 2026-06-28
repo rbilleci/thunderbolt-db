@@ -133,8 +133,16 @@ is on, returning **byte-identical** results to the scan; default OFF leaves the 
   (saturates ~depth-4); pipelined wave = **2.6-4.6x lpb, 9-32x the 156k batcher**. Open (deferred to R2.2b): enforce the
   in-flight ring bound + per-ticket-harvest + a depth-K harvest deadline (currently caller contracts). Cross-engine body
   visibility = the device-result design's property, empirically validated.
-  **NEXT = R2.2b: wire WaveReadEngine into a query path behind the default-OFF flag (enforcing the contracts) and measure
-  end-to-end vs the batcher. OR (B) R3 writes (independent). Keep R1 lpb default until R2.2b lands.**
+  **R2.2b STARTED (`3207f457`,`7210d484`; DECISIONS "R2.2b STARTED"):** mapped the wiring (flag lib.rs:316; swap point
+  `submit_resident_int4_equal_any_payload` engine_retained_read.rs; lifecycle in engine_residency/engine_commit; state in
+  engine_state.rs `ResidencyReadState`). Decisions: export `WaveReadEngine` `pub`; build it LAZILY per (filter_col,proj
+  set) like the R1 index (the kernel bakes projection offsets at launch); own it as `Arc<Mutex<WaveReadEngine>>`
+  (single-flight first). **Blocker#3 crash-safe watchdog DONE** (host petter + heartbeat; thread 0 self-terminates the
+  kernel ~watchdog_ns after the host dies, not ~30s; independent audit=SHIP, fixed a latent unfenced-petter bug + a
+  startup race -> arm-on-first-pet). **NEXT R2.2b: (1) engine owns the WaveReadEngine lifecycle (pass a near-infinite
+  backstop_ns with the watchdog -- audit RISK a); (2) route point reads through it single-flight, fallback lpb, enforce
+  the in-flight bound (#1) + harvest deadline (#2); (3) end-to-end offered-rate A/B = ship decision. OR (B) R3 writes.
+  Keep R1 lpb default until the A/B clears.**
   (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
 - **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
   (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under

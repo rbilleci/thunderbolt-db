@@ -339,6 +339,27 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   the host-serial coalescer) is now demonstrated IN-CRATE.** NEXT = R2.2b (wire into a query path behind the default-OFF
   flag, with the contracts enforced) OR R3 writes.
 
+- **R2.2b STARTED — integration map + blocker#3 crash-safe watchdog (2026-06-28, commits `3207f457`,`7210d484`).**
+  Mapped the wiring (Explore): the `wave_engine_enabled` flag (lib.rs:316, default OFF), the swap point
+  `submit_resident_int4_equal_any_payload` (engine_retained_read.rs ~479), the residency lifecycle (build in
+  `populate_relational_residency_snapshot*`, drop in `invalidate_relational_residency_*`, engine_commit.rs), and where
+  per-table read state lives (`ResidencyReadState`, engine_state.rs:502; R1's `WaveResidentIndex` cache,
+  resident_storage.rs:25). DESIGN DECISIONS surfaced: (i) `WaveReadEngine` is `pub(crate)` in execution -> must export
+  `pub`; (ii) the wave kernel BAKES projection offsets at launch but the engine only knows them at probe/template-prepare
+  -> build the wave engine LAZILY per (filter_col, projection set), like the R1 index, NOT at admission; (iii) `submit`
+  takes `&mut self` but residency state is a shared `Arc` -> `Arc<Mutex<WaveReadEngine>>` (serializes submits =
+  single-flight first; the multi-producer headroom comes later from real connection concurrency).
+  **Blocker#3 DONE (crash-safe watchdog):** a long-lived engine-owned kernel can't use a fixed backstop (it would die
+  mid-operation) and must not zombie ~30s on SIGKILL (shared --gpu-reset-denied box). Added a host petter thread +
+  heartbeat (ctrl+16); thread 0 rings the doorbell if the heartbeat goes stale > `watchdog_ns` -> kernel self-terminates
+  in ~watchdog_ns. Independent audit = SHIP; it found a latent bug (petter write wasn't fenced -> GPU didn't see pets;
+  old test passed only via a spurious fire-from-launch) + a startup race -> fixed: ARM the watchdog only after the first
+  real pet, fence the petter, petter skips 0 (sentinel). Test: petted kernel stays alive through a healthy window
+  (no spurious fire), self-terminates ~0.5s after simulated host-death. **Blockers #1 (in-flight ring bound) + #2
+  (host harvest deadline) + audit RISK (pass a near-infinite `backstop_ns` with the watchdog) are deferred to R2.2b-1/2
+  (the engine wiring), where they're enforced.** NEXT R2.2b increments: (1) engine owns the WaveReadEngine lifecycle;
+  (2) route point reads through it (single-flight, fallback lpb); (3) end-to-end offered-rate A/B = the ship decision.
+
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
 - **Context:** A cross-session pattern of deferring the hard GPU kernel and shipping a host-side stub.
