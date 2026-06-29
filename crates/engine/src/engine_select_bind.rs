@@ -533,13 +533,17 @@ impl Engine {
                 }
                 SelectProjection::Sum { column } => {
                     let sum_idx = validate_sum_column(&table, column)?;
-                    let sum = rows
+                    let values = rows
                         .iter()
                         .map(|row| int4_aggregate_value(&row[sum_idx], "SUM").map(i64::from))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .sum::<i64>();
-                    vec![vec![SqlValue::Int8(sum)]]
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // PG: SUM over zero rows is NULL, not 0.
+                    let cell = if values.is_empty() {
+                        SqlValue::Null
+                    } else {
+                        SqlValue::Int8(values.into_iter().sum::<i64>())
+                    };
+                    vec![vec![cell]]
                 }
                 SelectProjection::GroupedSum { sum_column, .. } => {
                     let group_idx = bound
@@ -563,7 +567,13 @@ impl Engine {
                         sum += i128::from(int4_aggregate_value(&row[avg_idx], "AVG")?);
                         count += 1;
                     }
-                    vec![vec![average_sql_value(sum, count)]]
+                    // PG: AVG over zero rows is NULL, not the canonical-zero numeric sentinel.
+                    let cell = if count == 0 {
+                        SqlValue::Null
+                    } else {
+                        average_sql_value(sum, count)
+                    };
+                    vec![vec![cell]]
                 }
                 SelectProjection::GroupedAvg { avg_column, .. } => {
                     let group_idx = bound
@@ -593,7 +603,9 @@ impl Engine {
                             .map(|row| row[value_idx].clone())
                             .max_by(compare_sql_values)
                     }
-                    .unwrap_or_else(|| SqlValue::Text(String::new()));
+                    // PG: MIN/MAX over zero rows is NULL, not an empty-text sentinel (legacy CPU parity,
+                    // interim debt ADR-006; PG-correctness wins -- `sql-spec-over-cpu-parity`).
+                    .unwrap_or(SqlValue::Null);
                     vec![vec![value]]
                 }
                 SelectProjection::GroupedMin { min_column, .. }

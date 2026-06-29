@@ -1482,10 +1482,9 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
         ),
         ("SELECT MIN(amount) FROM events WHERE amount BETWEEN 10 AND 30", SqlValue::Int4(10)),
         ("SELECT MAX(amount) FROM events WHERE amount BETWEEN 10 AND 30", SqlValue::Int4(30)),
-        // Empty (inverted) range: this legacy resident-probe path returns Int8(0) for an empty SUM
-        // (the scalar reduction's identity), NOT SQL NULL -- the general executor returns NULL (M3
-        // tests); behavior-preserving here, the probe path is retired in S10.
-        ("SELECT SUM(amount) FROM events WHERE amount BETWEEN 40 AND 10", SqlValue::Int8(0)),
+        // Empty (inverted) range: SUM over zero rows is SQL NULL (PG), now that
+        // materialize_resident_scalar_stats guards count==0 => Null (was the legacy Int8(0) sentinel).
+        ("SELECT SUM(amount) FROM events WHERE amount BETWEEN 40 AND 10", SqlValue::Null),
     ] {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()

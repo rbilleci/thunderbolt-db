@@ -2168,11 +2168,8 @@ fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() 
         unreachable!()
     };
     let no_match = e.execute_relational_select(&no_match_select).unwrap();
-    // AVG over zero matched rows now yields the canonical-zero numeric sentinel.
-    assert_eq!(
-        no_match.rows,
-        vec![vec![SqlValue::Numeric(Decimal128::ZERO)]]
-    );
+    // AVG over zero matched rows is SQL NULL (PG), not the legacy canonical-zero numeric sentinel.
+    assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
     e.execute_text(
             2,
@@ -2354,7 +2351,8 @@ fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout()
         unreachable!()
     };
     let no_match = e.execute_relational_select(&no_match_select).unwrap();
-    assert_eq!(no_match.rows, vec![vec![SqlValue::Text(String::new())]]);
+    // MAX over zero matched rows is SQL NULL (PG), not the legacy empty-text sentinel.
+    assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
     e.execute_text(
             2,
@@ -2536,7 +2534,8 @@ fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout()
         unreachable!()
     };
     let no_match = e.execute_relational_select(&no_match_select).unwrap();
-    assert_eq!(no_match.rows, vec![vec![SqlValue::Text(String::new())]]);
+    // MIN over zero matched rows is SQL NULL (PG), not the legacy empty-text sentinel.
+    assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
     e.execute_text(
             2,
@@ -2723,11 +2722,8 @@ fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout()
         unreachable!()
     };
     let no_match = e.execute_relational_select(&no_match_select).unwrap();
-    // AVG over zero matched rows now yields the canonical-zero numeric sentinel.
-    assert_eq!(
-        no_match.rows,
-        vec![vec![SqlValue::Numeric(Decimal128::ZERO)]]
-    );
+    // AVG over zero matched rows is SQL NULL (PG), not the legacy canonical-zero numeric sentinel.
+    assert_eq!(no_match.rows, vec![vec![SqlValue::Null]]);
 
     e.execute_text(
             2,
@@ -3185,10 +3181,11 @@ fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
 
 // S10c slice 2a: a sharded int4 aggregate whose predicate matches ZERO rows across ALL
 // shards. The recompacted unified buffer is run ONCE; the COUNT(*) precheck returns 0 and the
-// SUM projection yields the slice-1 / probe placeholder `SqlValue::Int8(0)` (rather than the general
-// SUM's empty-set hard error). This pins the all-empty path byte-identically with slice 1.
+// SUM projection yields SQL NULL (PG: SUM over zero rows is NULL — the COUNT-precheck placeholder is
+// now `SqlValue::Null`, not the legacy Int8(0) sentinel; COUNT(*) still returns 0). This avoids the
+// general SUM's empty-set hard error while staying PG-correct.
 #[test]
-fn p8_sharded_resident_sum_all_empty_returns_zero_placeholder() {
+fn p8_sharded_resident_sum_all_empty_returns_null() {
     let mut e = Engine::new_local();
     e.execute_text(
         1,
@@ -3282,8 +3279,8 @@ fn p8_sharded_resident_sum_all_empty_returns_zero_placeholder() {
     assert_eq!(route.shard_count, 4);
 
     let result = e.execute_relational_select(&select).unwrap();
-    // The all-empty placeholder is the slice-1 / probe value (Int8(0)), not a SUM hard error.
-    assert_eq!(result.rows, vec![vec![SqlValue::Int8(0)]]);
+    // SUM over zero matched rows is SQL NULL (PG), not the legacy Int8(0) placeholder.
+    assert_eq!(result.rows, vec![vec![SqlValue::Null]]);
     assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(result.fallback_reason, None);
 }

@@ -1990,11 +1990,12 @@ impl Engine {
     /// identity/validity prechecks mirror the retired probes (each shard is still validated, to gather
     /// its `device_ptr`).
     ///
-    /// All-empty handling pins byte-identicality with slice 1: the general SUM/MIN/MAX/AVG HARD-ERROR on an
-    /// empty filtered set (NULL is M3). So we first run a `COUNT(*)` over the unified buffer; if it is 0 AND
-    /// the projection is an aggregate, we return the SAME placeholder slice 1 did (MIN/MAX ->
-    /// `SqlValue::Text(String::new())`, AVG -> `average_sql_value(0, 0)`, SUM -> `SqlValue::Int8(0)`,
-    /// COUNT -> `Int8(0)`). Otherwise the executor runs ONCE over the unified buffer with the real
+    /// All-empty handling: the general SUM/MIN/MAX/AVG HARD-ERROR on an empty filtered set (NULL-on-empty
+    /// is an unfinished M3 feature for the general path). So we first run a `COUNT(*)` over the unified
+    /// buffer; if it is 0 AND the projection is an aggregate, we return the PG-correct empty value WITHOUT
+    /// the hard error: SUM/AVG/MIN/MAX -> `SqlValue::Null` (an aggregate of no rows is NULL), COUNT(*) ->
+    /// `Int8(0)`. (Was the legacy empty-text/zero sentinel; PG-correctness wins -- `sql-spec-over-cpu-parity`.)
+    /// Otherwise the executor runs ONCE over the unified buffer with the real
     /// projection and its result is returned directly (it handles COUNT/SUM/MIN/MAX/AVG/projection
     /// on-device). Text columns are DEFERRED in this slice (the unified buffer is int4-only).
     pub(crate) fn execute_resident_sharded_via_general(
@@ -2221,12 +2222,14 @@ impl Engine {
             }
         };
         if matched == 0 {
+            // PG: SUM/AVG/MIN/MAX over zero rows is NULL (never 0 or an empty-text sentinel); only
+            // COUNT(*) is 0. The old non-NULL placeholders were legacy CPU-engine parity (interim debt,
+            // ADR-006); PG-correctness wins (see the `sql-spec-over-cpu-parity` working agreement).
             let placeholder = match &select.projection {
-                SelectProjection::Min { .. } | SelectProjection::Max { .. } => {
-                    Some(SqlValue::Text(String::new()))
-                }
-                SelectProjection::Avg { .. } => Some(average_sql_value(0, 0)),
-                SelectProjection::Sum { .. } => Some(SqlValue::Int8(0)),
+                SelectProjection::Min { .. }
+                | SelectProjection::Max { .. }
+                | SelectProjection::Avg { .. }
+                | SelectProjection::Sum { .. } => Some(SqlValue::Null),
                 SelectProjection::CountAll => Some(SqlValue::Int8(0)),
                 _ => None,
             };

@@ -264,12 +264,18 @@ fn compile_resident_plan(
 }
 
 /// Materialize a SUM/AVG/MIN/MAX result from the retained `CudaI32Stats` a filter/BETWEEN stats
-/// kernel returns (shared by the filtered and BETWEEN scalar-aggregate paths). An empty MIN/MAX
-/// domain yields the empty-text sentinel the CPU engine emits for an empty aggregate.
+/// kernel returns (shared by the filtered and BETWEEN scalar-aggregate paths). `count == 0` (no
+/// surviving rows) ⇒ SQL NULL for every aggregate — PG: an aggregate of no rows is NULL (SUM/AVG/MIN/MAX),
+/// never 0 or an empty-text sentinel. This matches [`finalize_direct_scalar_stats`]; the old empty-text
+/// sentinel was legacy byte-parity with the CPU engine, but that path is interim debt (ADR-006) and
+/// PG-correctness wins over matching it (see the `sql-spec-over-cpu-parity` working agreement).
 fn materialize_resident_scalar_stats(
     aggregate: ResidentScalarAggregate,
     stats: &CudaI32Stats,
 ) -> Result<SqlValue, ExecuteError> {
+    if stats.count == 0 {
+        return Ok(SqlValue::Null);
+    }
     Ok(match aggregate {
         ResidentScalarAggregate::Sum { .. } => SqlValue::Int8(stats.sum),
         ResidentScalarAggregate::Avg { .. } => average_sql_value(
@@ -281,14 +287,8 @@ fn materialize_resident_scalar_stats(
                 )))
             })?,
         ),
-        ResidentScalarAggregate::Min { .. } => stats
-            .min
-            .map(SqlValue::Int4)
-            .unwrap_or_else(|| SqlValue::Text(String::new())),
-        ResidentScalarAggregate::Max { .. } => stats
-            .max
-            .map(SqlValue::Int4)
-            .unwrap_or_else(|| SqlValue::Text(String::new())),
+        ResidentScalarAggregate::Min { .. } => stats.min.map(SqlValue::Int4).unwrap_or(SqlValue::Null),
+        ResidentScalarAggregate::Max { .. } => stats.max.map(SqlValue::Int4).unwrap_or(SqlValue::Null),
         ResidentScalarAggregate::Count => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident scalar stats materialization received COUNT".to_string(),
