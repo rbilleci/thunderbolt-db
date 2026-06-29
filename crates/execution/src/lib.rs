@@ -28178,7 +28178,11 @@ mod tests {
         let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
 
         let needle = 3_i32;
-        let sizes: [u64; 5] = [4_096, 65_536, 1 << 20, 1 << 22, 1 << 24];
+        // Partial-block / sub-256 / odd sizes FIRST (255/257/513/1000): they exercise the per-block tree
+        // reduction's zero-iteration threads + partial last block -- exactly the path the count-skeleton
+        // fix's first (shfl) attempt UNDERCOUNTED. The serial (1,1,1) oracle validates the exact count
+        // there. The large multiples-of-256 sizes (last) keep the speedup hypothesis.
+        let sizes: [u64; 9] = [255, 257, 513, 1_000, 4_096, 65_536, 1 << 20, 1 << 22, 1 << 24];
         println!("p2_m2_parallel_scan_spike: needle={needle} (value[i] = i % 7)");
         println!("| rows | expected | serial ms | parallel ms | speedup |");
         println!("|---:|---:|---:|---:|---:|");
