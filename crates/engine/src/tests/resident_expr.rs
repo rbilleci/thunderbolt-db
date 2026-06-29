@@ -7974,9 +7974,36 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
             rows.iter().map(|r| (r.key, r.count, r.sum)).collect::<Vec<_>>()
         };
         assert_eq!(proj(&a), proj(&b), "single-level and two-level disagree for {key}");
-        let single = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0).unwrap();
-        let two = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0).unwrap();
+        let all = gpu_db_execution::grouped_agg_mask::ALL;
+        let single = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, all).unwrap();
+        let two = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, all).unwrap();
         eprintln!("{:>8}  {:>13.4}  {:>13.4}  {:>8.2}x", a.len(), single, two, single / two);
+    }
+
+    // QUERY-AWARE AGGREGATE PRUNING (this slice): COUNT-only mask vs ALL mask, on BOTH the single-level
+    // (count+sum+min+max) and two-level (count+sum) kernels, across cardinalities. A COUNT-only mask skips
+    // the SUM (+ MIN/MAX, single-level) per-row atomics -> expect COUNT-only <= ALL, most at mid/high card
+    // where the avoided global atomics contend.
+    eprintln!(
+        "\n=== AGG-PRUNE: COUNT-only mask vs ALL mask (kernel-only ms, min of 200) ===\n\
+         single-level computes COUNT+SUM+MIN+MAX; two-level computes COUNT+SUM. speedup = ALL / COUNT-only"
+    );
+    let count = gpu_db_execution::grouped_agg_mask::COUNT;
+    let all = gpu_db_execution::grouped_agg_mask::ALL;
+    eprintln!(
+        "{:>8}  {:>12}  {:>12}  {:>8}   {:>12}  {:>12}  {:>8}",
+        "groups", "1lvl ALL", "1lvl CNT", "spd", "2lvl ALL", "2lvl CNT", "spd"
+    );
+    for key in ["g4", "g64", "g4k", "gall"] {
+        let groups = e.group_by_i32_bench("t", key, "v", false).unwrap().len();
+        let s_all = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, all).unwrap();
+        let s_cnt = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, count).unwrap();
+        let t_all = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, all).unwrap();
+        let t_cnt = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, count).unwrap();
+        eprintln!(
+            "{:>8}  {:>12.4}  {:>12.4}  {:>7.2}x   {:>12.4}  {:>12.4}  {:>7.2}x",
+            groups, s_all, s_cnt, s_all / s_cnt, t_all, t_cnt, t_all / t_cnt
+        );
     }
 
     // SCALE AXIS: fixed LOW cardinality (g4 = 4 groups), growing row count. This is the axis that
@@ -7987,8 +8014,9 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
     );
     eprintln!("{:>9}  {:>13}  {:>13}  {:>9}", "rows", "single ms", "two-lvl ms", "speedup");
     for rows in [25_000usize, 50_000, 100_000, 200_000] {
-        let single = e.group_by_i32_bench_kernel_ms("t", "g4", "v", false, 200, rows).unwrap();
-        let two = e.group_by_i32_bench_kernel_ms("t", "g4", "v", true, 200, rows).unwrap();
+        let all = gpu_db_execution::grouped_agg_mask::ALL;
+        let single = e.group_by_i32_bench_kernel_ms("t", "g4", "v", false, 200, rows, all).unwrap();
+        let two = e.group_by_i32_bench_kernel_ms("t", "g4", "v", true, 200, rows, all).unwrap();
         eprintln!("{:>9}  {:>13.4}  {:>13.4}  {:>8.2}x", rows, single, two, single / two);
     }
     eprintln!();

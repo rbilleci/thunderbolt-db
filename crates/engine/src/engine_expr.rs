@@ -676,6 +676,9 @@ fn composite_group_count_reps(
         .group_by_i32_count_sum_minmax_from_payload(
             0, 0, indices, false, false, false, false, false, false, 0, 0, false, 0, 0,
             key_base_override, 0, comp_w, n_text, text_desc_ptr, None, None,
+            // COUNT(DISTINCT) representative pass: reads only g.key_i128 (no stat field), so the mask is
+            // immaterial -- pass ALL (no prune, fully behavior-preserving for this internal pass).
+            gpu_db_execution::grouped_agg_mask::ALL,
         )
         .map_err(map_err)?;
     Ok(groups.iter().map(|g| g.key_i128 as u64 as u32).collect())
@@ -2342,6 +2345,9 @@ impl Engine {
         two_level: bool,
         runs: u32,
         rows_limit: usize,
+        // Query-aware aggregate-selection mask (`grouped_agg_mask`): `COUNT` times the pruned path,
+        // `ALL` the full-compute path, isolating the per-row atomic savings.
+        agg_mask: u32,
     ) -> Result<f32, ExecuteError> {
         let table = self.relational_catalog_table(table_name).ok_or_else(|| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!("no table {table_name}")))
@@ -2375,7 +2381,7 @@ impl Engine {
         };
         let indices: Vec<u32> = (0..m).collect();
         device_memory
-            .group_by_i32_count_sum_kernel_timed(key_off, val_off, &indices, two_level, runs)
+            .group_by_i32_count_sum_kernel_timed(key_off, val_off, &indices, two_level, runs, agg_mask)
             .map(|(_, ms)| ms)
             .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))
     }
@@ -3706,6 +3712,9 @@ impl Engine {
                     0, // text_desc_ptr
                     None, // value_null_off (COUNT(DISTINCT) over the marked tuple matrix)
                     None, // key_null_off (the marked-tuple matrix key is non-null by construction)
+                    // COUNT(DISTINCT) SUM-of-new-distinct pass: the result builder reads this pass's
+                    // `.sum`, so it must compute SUM (and COUNT). ALL is correct + behavior-preserving.
+                    gpu_db_execution::grouped_agg_mask::ALL,
                 )
                 .map_err(map_err)?;
             drop((g_sorted, new_distinct));
@@ -3725,6 +3734,63 @@ impl Engine {
             } = &select.projection
             else {
                 unreachable!("is_grouped gates on GroupedAggregates on the Expr path");
+            };
+            // QUERY-AWARE AGGREGATE PRUNING (this slice): the DIRECT (hash) GROUP BY kernel computes
+            // count+sum+min+max for one value column, but the executor reads only the field(s) the query
+            // needs. Build a query-wide mask (`grouped_agg_mask`: 1=COUNT 2=SUM 4=MIN 8=MAX) = the OR of
+            // every aggregate's field set, and pass it to EVERY direct pass (each computes a superset of
+            // what its own column needs, and the executor reads only computed fields, so one shared mask
+            // is correct). Bit derivation per aggregate kind:
+            //   Count            -> COUNT
+            //   Sum / Avg        -> SUM   (Avg also divides by count)
+            //   Min              -> MIN
+            //   Max              -> MAX
+            //   CountDistinct    -> {} here (it runs a SEPARATE sort/mark/SUM pass; the direct kernel
+            //                       reads NOTHING for it -- its passes always run their own ALL mask)
+            // COUNT is FORCED ON whenever ANY value aggregate (Sum/Avg/Min/Max) is present, because the
+            // result builder reads `g.count` for EVERY value pass to detect an all-NULL group (count==0 ->
+            // SQL NULL); the count slot inits to 0, so a masked-out COUNT would read 0 and wrongly NULL
+            // every group. (Avg already requires COUNT for its divisor.)
+            //
+            // COMPLETENESS vs HAVING / aggregate-ORDER-BY (the correctness-critical claim): this mask covers
+            // them WITHOUT an ALL-fallback, and here is the proof. HAVING and ORDER BY on a grouped result
+            // do NOT read the kernel's count/sum/min/max directly -- they consume the already-materialized
+            // result `rows` (HAVING builds a transient device relation from `rows`; ORDER BY GPU-sorts result
+            // COLUMNS). Both resolve their referenced column via `result_column_name` to a NAME, which the
+            // executor's `col_index` maps against `bound.selected_columns` (the SELECT result columns). A
+            // HAVING/ORDER-BY reference to an aggregate that is NOT a SELECT result column is a hard error
+            // ("references unknown column"), so EVERY aggregate HAVING/ORDER-BY can reach is necessarily
+            // already in the SELECT list -> already in `aggregates` -> already in this mask. (The grouped SQL
+            // binder also builds `aggregates` only from the SELECT target list; it adds no HAVING/ORDER-BY
+            // aggregate, which is exactly why such an unlisted reference errors rather than introducing a new
+            // kernel field read.) Hence the OR-over-`aggregates` mask is the COMPLETE set the executor reads.
+            let agg_mask: u32 = {
+                use gpu_db_execution::grouped_agg_mask as gm;
+                let mut m = 0u32;
+                let mut any_value_agg = false;
+                for a in aggregates.iter() {
+                    match a.kind {
+                        GroupedAggKind::Count => m |= gm::COUNT,
+                        GroupedAggKind::Sum | GroupedAggKind::Avg => {
+                            m |= gm::SUM;
+                            any_value_agg = true;
+                        }
+                        GroupedAggKind::Min => {
+                            m |= gm::MIN;
+                            any_value_agg = true;
+                        }
+                        GroupedAggKind::Max => {
+                            m |= gm::MAX;
+                            any_value_agg = true;
+                        }
+                        // COUNT(DISTINCT) reads nothing from the direct kernel (separate pass).
+                        GroupedAggKind::CountDistinct => {}
+                    }
+                }
+                if any_value_agg {
+                    m |= gm::COUNT; // the all-NULL-group check reads g.count on every value pass
+                }
+                m
             };
             // Resolve each aggregate's value column to an index (None for COUNT(*)), and the distinct
             // value columns in first-seen order -- one grouping pass per distinct value column, since
@@ -4525,12 +4591,16 @@ impl Engine {
                             widekey_text_desc_ptr,
                             pass_value_null_off,
                             pass_key_null_off,
+                            // The query-wide pruning mask: this pass computes a superset of what its column
+                            // needs; the executor reads only the masked-in field(s) it requested.
+                            agg_mask,
                         )
                     } else {
                         device_memory.group_by_i32_count_sum_from_payload(
                             key_offset,
                             value_offset,
                             &indices,
+                            agg_mask,
                         )
                     }
                     .map_err(map_err)?;
@@ -4659,6 +4729,9 @@ impl Engine {
                                         widekey_text_desc_ptr,
                                         None, // value_null_off (COUNT(DISTINCT) marked-tuple pass)
                                         None, // key_null_off (marked-tuple key non-null by construction)
+                                        // Step-2 GROUP BY g over reps, COUNT(*): the result builder reads
+                                        // `.count` (-> `.sum`). ALL is correct + behavior-preserving.
+                                        gpu_db_execution::grouped_agg_mask::ALL,
                                     )
                                     .map_err(map_err)?
                             };

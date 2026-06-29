@@ -7341,9 +7341,18 @@ het_done:
     // M3 (doc 21) 3VL: the KEY column's NULL validity bitmap byte offset (1 = valid), or sentinel
     // u64::MAX = no bitmap => every key valid. A NULL key routes to the dedicated NULL-KEY slot
     // (index nslots+1 = mask+2), forming ONE group (NULLs group together, distinct from real keys).
-    .param .u64 key_null_off
+    .param .u64 key_null_off,
+    // Query-aware aggregate-selection MASK (grouped_agg_mask: 1=COUNT, 2=SUM, 4=MIN, 8=MAX; ALL=15).
+    // Only the SELECTED fields' per-row update atomics run; the slot CLAIM + GROUP-KEY emit ALWAYS run
+    // (group identity is mask-independent). Masked-out fields stay at their init sentinels (count/sum=0,
+    // min=INT_MAX, max=INT_MIN); the host reads only the masked-in field(s) -> byte-identical for them.
+    // Appended LAST so the twolevel kernel (fewer params) ignores it.
+    .param .u64 agg_mask
 )
 {
+    .reg .u32 %aggm;
+    .reg .u32 %aggt;
+    .reg .pred %pagg;
     .reg .u64 %m3vnoff;
     .reg .u64 %m3vsent;
     .reg .u64 %m3vwd;
@@ -7528,6 +7537,7 @@ het_done:
     ld.param.u64 %mxuptr, [slot_max_uuid_ptr];
     ld.param.u64 %m3vnoff, [value_null_off];
     ld.param.u64 %m3knoff, [key_null_off];
+    ld.param.u32 %aggm, [agg_mask];
     mov.u64 %m3vsent, 0xFFFFFFFFFFFFFFFF;
     ld.param.u64 %ki128, [key_is_i128];
     ld.param.u64 %ski128, [slot_keys_i128_ptr];
@@ -8139,8 +8149,19 @@ do_agg:
     @%m3pnul bra gb_mmdone;             // NULL value -> skip count/sum/min/max (slot stays claimed)
 m3_val_ok:
     mul.lo.u64 %off, %h, 8;
+    // COUNT update (bit 1): guarded -- the slot/group already exists (claim ran), so a masked-out
+    // COUNT leaves count at its 0 init and the host does not read it.
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_skipcount;
     add.u64 %addr, %cptr, %off;
     atom.global.add.u64 %tmp, [%addr], 1;
+gb_skipcount:
+    // SUM update (bit 2): guards the ENTIRE per-row sum (int4 / int8 i128-carry / numeric i128 + overflow
+    // flag). Masked out -> jump straight to the MIN/MAX dispatch; sum slots stay at their 0 init.
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_sumd;
     setp.ne.u64 %pvn, %vn, 0;
     @%pvn bra gb_sumnum;
     setp.ne.u64 %p, %v8, 0;
@@ -8183,11 +8204,25 @@ gb_sumnum:
     setp.lt.s64 %pov, %t1, 0;
     @%pov red.global.or.b32 [%ovptr], 1;
 gb_sumd:
+    // MIN/MAX region (bits 4|8): if NEITHER MIN nor MAX is requested, skip the whole region (the common
+    // COUNT/SUM/AVG prune) -- min/max slots stay at their INT_MAX/INT_MIN init. The text/uuid/numeric
+    // branches compute BOTH together (one loop); the host reads only the requested one, so computing the
+    // other is harmless. The plain-int branch guards MIN and MAX SEPARATELY for a finer prune.
+    and.b32 %aggt, %aggm, 12;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_mmdone;
     @%pvt bra gb_textminmax;
     @%puu bra gb_uuidminmax;
     @%pvn bra gb_numminmax;
+    and.b32 %aggt, %aggm, 4;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_skipmin;
     add.u64 %addr, %mnptr, %off;
     atom.global.min.s64 %cur, [%addr], %val;
+gb_skipmin:
+    and.b32 %aggt, %aggm, 8;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra gb_mmdone;
     add.u64 %addr, %mxptr, %off;
     atom.global.max.s64 %cur, [%addr], %val;
     bra gb_mmdone;
@@ -8491,7 +8526,44 @@ lo_done:
     .param .u64 slot_count_ptr,
     .param .u64 slot_sum_ptr,
     .param .u64 slot_min_ptr,
-    .param .u64 slot_max_ptr
+    .param .u64 slot_max_ptr,
+    // The two-level kernel uses only the 11 params above (COUNT/SUM over an int4 key+value); it shares
+    // the single-level kernel's launch-arg ARRAY, so it MUST declare the SAME positional param list to
+    // read `agg_mask` at the SAME index (37) the launcher places it. Params 11..36 below are accepted
+    // for positional ABI alignment but never loaded (the two-level path never takes the int8/numeric/
+    // uuid/text/composite/NULL branches that use them). agg_mask (index 37) IS loaded + guards COUNT/SUM.
+    .param .u64 value_is_int8_unused,
+    .param .u64 slot_sum_hi_ptr_unused,
+    .param .u64 key_is_int8_unused,
+    .param .u64 value_is_numeric_unused,
+    .param .u64 overflow_flag_ptr_unused,
+    .param .u64 slot_min_hi_ptr_unused,
+    .param .u64 slot_max_hi_ptr_unused,
+    .param .u64 row_slots_ptr_unused,
+    .param .u64 value_is_uuid_unused,
+    .param .u64 slot_min_uuid_ptr_unused,
+    .param .u64 slot_max_uuid_ptr_unused,
+    .param .u64 key_is_i128_unused,
+    .param .u64 slot_keys_i128_ptr_unused,
+    .param .u64 key_is_text_unused,
+    .param .u64 key_offsets_off_unused,
+    .param .u64 key_bytes_off_unused,
+    .param .u64 value_is_text_unused,
+    .param .u64 value_offsets_off_unused,
+    .param .u64 value_bytes_off_unused,
+    .param .u64 key_base_override_unused,
+    .param .u64 value_base_override_unused,
+    .param .u64 comp_w_unused,
+    .param .u64 n_text_unused,
+    .param .u64 text_desc_ptr_unused,
+    .param .u64 value_null_off_unused,
+    .param .u64 key_null_off_unused,
+    // Query-aware aggregate-selection MASK (grouped_agg_mask: 1=COUNT, 2=SUM, 4=MIN, 8=MAX). The two-
+    // level kernel serves only COUNT/SUM (MIN/MAX bits are irrelevant here -- it never computes them).
+    // Index 37 (LAST), matching the single-level signature. Guards BOTH the shared-mem partial atomics
+    // AND the per-block global merge of each field, so a masked-out field is neither aggregated in
+    // shared NOR merged to global (stays 0 init).
+    .param .u64 agg_mask
 )
 {
     // slot_min_ptr / slot_max_ptr are accepted for a uniform launch signature but UNUSED here: the
@@ -8504,6 +8576,9 @@ lo_done:
     .reg .pred %hit;
     .reg .pred %full;
     .reg .pred %empty_slot;
+    .reg .pred %pagg;
+    .reg .u32 %aggm;
+    .reg .u32 %aggt;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -8548,6 +8623,7 @@ lo_done:
     ld.param.u64 %kptr, [slot_keys_ptr];
     ld.param.u64 %cptr, [slot_count_ptr];
     ld.param.u64 %sptr, [slot_sum_ptr];
+    ld.param.u32 %aggm, [agg_mask];
     mov.s64 %empty, -9223372036854775808;
     mov.u32 %lane, %tid.x;
     mov.u32 %bdim, %ntid.x;
@@ -8621,9 +8697,19 @@ local_probe:
     @%full bra overflow;
     bra local_probe;
 local_hit:
+    // Shared-mem partial COUNT (bit 1): masked out -> the shared count stays 0 (and the guarded merge
+    // below adds nothing to the global count). The slot CLAIM above always ran (group identity).
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra local_skipcount;
     mov.u32 %sa, s_count;
     mad.lo.u32 %sa, %j, 8, %sa;
     atom.shared.add.u64 %lcount, [%sa], 1;
+local_skipcount:
+    // Shared-mem partial SUM (bit 2): masked out -> the shared sum stays 0 (merge adds nothing).
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra row_next;
     mov.u32 %sa, s_sum;
     mad.lo.u32 %sa, %j, 8, %sa;
     atom.shared.add.u64 %lcount, [%sa], %val;
@@ -8642,8 +8728,17 @@ ov_probe:
     and.b64 %h, %h, %mask;
     bra ov_probe;
 ov_hit:
+    // Shared-table OVERFLOW path: a row whose key did not fit the 1024-slot shared table aggregates
+    // DIRECTLY into the global table. Guard COUNT (bit 1) and SUM (bit 2) the same way as local_hit.
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra ov_skipcount;
     add.u64 %addr, %cptr, %off;
     atom.global.add.u64 %lcount, [%addr], 1;
+ov_skipcount:
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra row_next;
     add.u64 %addr, %sptr, %off;
     atom.global.add.u64 %lcount, [%addr], %val;
 row_next:
@@ -8689,8 +8784,19 @@ merge_probe:
     and.b64 %h, %h, %mask;
     bra merge_probe;
 merge_hit:
+    // Per-block GLOBAL MERGE: flush this block's shared partials to the global table. Guard each field's
+    // merge by its bit (bit 1 = COUNT, bit 2 = SUM) -- so a masked-out field is neither aggregated in
+    // shared (above) NOR merged here (its global slot stays 0 init, consistent with the single-level
+    // kernel's masked-out count/sum behavior).
+    and.b32 %aggt, %aggm, 1;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra merge_skipcount;
     add.u64 %addr, %cptr, %off;
     atom.global.add.u64 %lkey, [%addr], %lcount;
+merge_skipcount:
+    and.b32 %aggt, %aggm, 2;
+    setp.eq.u32 %pagg, %aggt, 0;
+    @%pagg bra merge_next;
     add.u64 %addr, %sptr, %off;
     atom.global.add.u64 %lkey, [%addr], %lsum;
 merge_next:

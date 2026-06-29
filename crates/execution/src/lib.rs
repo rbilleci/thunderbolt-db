@@ -1659,6 +1659,10 @@ impl CudaResidentDeviceMemory {
         key_byte_offset: u64,
         sum_byte_offset: u64,
         indices: &[u32],
+        // Query-aware aggregate-selection mask (`grouped_agg_mask`). The two-level kernel serves only
+        // COUNT/SUM (its MIN/MAX bits are no-ops); the executor passes the query-wide mask so a
+        // COUNT(*)-only query prunes the SUM atomics.
+        agg_mask: u32,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1684,6 +1688,7 @@ impl CudaResidentDeviceMemory {
             0,     // text_desc_ptr
             None,  // value_null_off (bench: non-nullable)
             None,  // key_null_off (bench: non-nullable)
+            agg_mask,
         )
     }
 
@@ -1724,6 +1729,9 @@ impl CudaResidentDeviceMemory {
         // M3 (doc 21): `Some(off)` = the KEY column's NULL validity bitmap — a NULL key forms its own
         // NULL-KEY group (rendered SqlValue::Null); `None` = every key valid.
         key_null_off: Option<u64>,
+        // Query-aware aggregate-selection mask (`grouped_agg_mask`): only the masked-in count/sum/min/max
+        // fields' per-row atomics run; the executor reads only what it requested.
+        agg_mask: u32,
     ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
         launch_cuda_group_by_i32_count_sum(
             self,
@@ -1749,6 +1757,7 @@ impl CudaResidentDeviceMemory {
             text_desc_ptr,
             value_null_off,
             key_null_off,
+            agg_mask,
         )
     }
 
@@ -1791,6 +1800,7 @@ impl CudaResidentDeviceMemory {
             0, // text_desc_ptr
             None, // value_null_off (bench: non-nullable)
             None, // key_null_off (bench: non-nullable)
+            grouped_agg_mask::ALL, // bench computes every field
         )
     }
 
@@ -1804,6 +1814,9 @@ impl CudaResidentDeviceMemory {
         indices: &[u32],
         two_level: bool,
         runs: u32,
+        // Query-aware aggregate-selection mask (`grouped_agg_mask`): pass `COUNT` to time the pruned
+        // path vs `ALL` for the full-compute path, isolating the per-row atomic savings.
+        agg_mask: u32,
     ) -> Result<(Vec<GroupByI32Row>, f32), CudaRuntimeProbeError> {
         let kernel = if two_level {
             c"gpu_db_group_by_i32_count_sum_twolevel"
@@ -1817,6 +1830,7 @@ impl CudaResidentDeviceMemory {
             indices,
             kernel,
             runs,
+            agg_mask,
         )
     }
 
@@ -7903,6 +7917,11 @@ fn launch_cuda_group_by_i32_count_sum(
     // `None` = no bitmap ⇒ every key valid. Only the single-level kernel honors it; the engine passes
     // it only for a plain int4/int8 COLUMN key (sentinel for expr/composite/text/i128 keys).
     key_null_off: Option<u64>,
+    // Query-aware aggregate-selection MASK (`grouped_agg_mask`: 1=COUNT, 2=SUM, 4=MIN, 8=MAX; ALL=15).
+    // Only the masked-in fields' per-row update atomics run in BOTH kernels; the slot claim + group-key
+    // emit always run (group identity is mask-independent). Masked-out fields stay at their init
+    // sentinels; the executor reads only what it requested, so a reduced mask is byte-identical for it.
+    agg_mask: u32,
 ) -> Result<Vec<GroupByI32Row>, CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -8130,6 +8149,9 @@ fn launch_cuda_group_by_i32_count_sum(
             off
         }
     };
+    // Query-aware aggregate-selection mask (grouped_agg_mask). Passed as the LAST kernel arg (a37) to
+    // BOTH the single-level and two-level kernels; widened to u64 for the uniform u64 launch-arg array.
+    let mut a37 = u64::from(agg_mask);
     // gpu_db_fill_i128(slot_keys_i128, alloc_slots, lo=0, hi=i64::MIN) -> EMPTY128 = i128::MIN.
     let mut g0 = slot_keys_i128.ptr;
     let mut g1 = alloc_slots_u64;
@@ -8179,6 +8201,7 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut a34 as *mut u64).cast::<c_void>(),
         (&mut a35 as *mut u64).cast::<c_void>(),
         (&mut a36 as *mut u64).cast::<c_void>(),
+        (&mut a37 as *mut u64).cast::<c_void>(),
     ];
     // Pass 2 (numeric MIN/MAX only): a second, LOCK-FREE kernel that resolves the i128 low limb after
     // pass 1 (the main kernel) finalized the high limbs. Cached + its args built only for numeric.
@@ -8532,6 +8555,8 @@ fn launch_cuda_group_by_kernel_timed(
     indices: &[u32],
     kernel: &'static CStr,
     runs: u32,
+    // Query-aware aggregate-selection mask (`grouped_agg_mask`), passed as the LAST kernel arg.
+    agg_mask: u32,
 ) -> Result<(Vec<GroupByI32Row>, f32), CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void, *mut *mut c_void, *mut *mut c_void,
@@ -8660,6 +8685,7 @@ fn launch_cuda_group_by_kernel_timed(
         0, // text_desc_ptr = 0
         u64::MAX, // M3 value_null_off = sentinel (the timed bench is non-nullable -> no value skip)
         u64::MAX, // M3 key_null_off = sentinel (the timed bench is non-nullable -> no NULL-key group)
+        u64::from(agg_mask), // query-aware aggregate-selection mask (a37, LAST kernel arg)
     ];
     let mut group_args: Vec<*mut c_void> =
         a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
