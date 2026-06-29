@@ -323,6 +323,209 @@ done_g:
     ret;
 }
 
+// out[i] = column[indices[i]] : GATHER a resident int8 column (8-byte elements) at the given row
+// indices, copied as two 4-byte words so only 4-byte alignment is required (a column after an odd-count
+// int4 column is 4-aligned, not 8 -> an 8-byte ld would fault with CUDA 716). Grid-stride; see the i32
+// gather. Caller bounds-checks the indices host-side.
+.visible .entry gpu_db_resident_i64_gather_rows(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u64 %src;
+    .reg .u64 %idxbase;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %idx;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %src, [resident_ptr];
+    ld.param.u64 %off, [byte_offset];
+    add.u64 %src, %src, %off;
+    ld.param.u64 %idxbase, [indices_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_g64:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_g64;
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %idxbase, %off;
+    ld.global.u64 %idx, [%addr];
+    mul.lo.u64 %off, %idx, 8;
+    add.u64 %addr, %src, %off;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %out, %off;
+    st.global.u32 [%addr], %w0;
+    st.global.u32 [%addr+4], %w1;
+    add.u64 %i, %i, %stride;
+    bra loop_g64;
+done_g64:
+    ret;
+}
+
+// out[i] = column[indices[i]] : GATHER a resident i128 column (16-byte numeric/uuid elements), copied
+// as four 4-byte words so only 4-byte element alignment is required (numeric columns are 4-aligned, not
+// 8 -- an 8-byte ld faults with CUDA 716; the prior per-row cuMemcpyDtoH was alignment-agnostic).
+// Grid-stride; see the i32 gather.
+.visible .entry gpu_db_resident_i128_gather_rows(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %w0;
+    .reg .u32 %w1;
+    .reg .u32 %w2;
+    .reg .u32 %w3;
+    .reg .u64 %src;
+    .reg .u64 %idxbase;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %idx;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+    .reg .u64 %oaddr;
+
+    ld.param.u64 %src, [resident_ptr];
+    ld.param.u64 %off, [byte_offset];
+    add.u64 %src, %src, %off;
+    ld.param.u64 %idxbase, [indices_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_g128:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_g128;
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %idxbase, %off;
+    ld.global.u64 %idx, [%addr];
+    mul.lo.u64 %off, %idx, 16;
+    add.u64 %addr, %src, %off;
+    ld.global.u32 %w0, [%addr];
+    ld.global.u32 %w1, [%addr+4];
+    ld.global.u32 %w2, [%addr+8];
+    ld.global.u32 %w3, [%addr+12];
+    mul.lo.u64 %off, %i, 16;
+    add.u64 %oaddr, %out, %off;
+    st.global.u32 [%oaddr], %w0;
+    st.global.u32 [%oaddr+4], %w1;
+    st.global.u32 [%oaddr+8], %w2;
+    st.global.u32 [%oaddr+12], %w3;
+    add.u64 %i, %i, %stride;
+    bra loop_g128;
+done_g128:
+    ret;
+}
+
+// out[i] = bitmap_bit(indices[i]) : GATHER a resident bool BITMAP (1 bit/row) at the given indices into
+// a u8-per-row buffer. word = *(u32*)(base + bitmap_byte_offset + (idx>>5)*4); out[i]=(word>>(idx&31))&1.
+// Grid-stride; see the i32 gather. Caller bounds-checks the WORD offset host-side.
+.visible .entry gpu_db_resident_bool_gather_rows(
+    .param .u64 resident_ptr,
+    .param .u64 bitmap_byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .u32 %word;
+    .reg .u32 %sft;
+    .reg .u16 %b16;
+    .reg .u64 %src;
+    .reg .u64 %idxbase;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %idx;
+    .reg .u64 %widx;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %src, [resident_ptr];
+    ld.param.u64 %off, [bitmap_byte_offset];
+    add.u64 %src, %src, %off;
+    ld.param.u64 %idxbase, [indices_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_gb:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_gb;
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %idxbase, %off;
+    ld.global.u64 %idx, [%addr];
+    shr.u64 %widx, %idx, 5;
+    mul.lo.u64 %off, %widx, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.u32 %word, [%addr];
+    cvt.u32.u64 %sft, %idx;
+    and.b32 %sft, %sft, 31;
+    shr.u32 %word, %word, %sft;
+    and.b32 %word, %word, 1;
+    cvt.u16.u32 %b16, %word;
+    add.u64 %addr, %out, %i;
+    st.global.u8 [%addr], %b16;
+    add.u64 %i, %i, %stride;
+    bra loop_gb;
+done_gb:
+    ret;
+}
+
 // out[i] = a[i] <op> b[i] : elementwise binary over two intermediate buffers (absolute ptrs).
 // CHECKED int4 arithmetic: each op is evaluated in 64-bit and range-checked; an int4-overflowing
 // result ORs 1 into out_overflow_ptr[0] (Postgres `integer out of range`). Stored i32 is wrapped.
