@@ -20603,6 +20603,14 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
     needle: i32,
     comparison: u32,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    // Load-bearing precondition (audit P3): the scatter kernel stores each surviving ROW INDEX as a u32
+    // (`cvt.u32.u64` then `st.global.b32`), so it would silently truncate past u32::MAX. The grid sizing
+    // grows `chunk` for arbitrarily large row_count and does NOT cap it, so assert here (~17 GB for one
+    // i32 column = unreachable on a single GPU today, but make the invariant explicit, not a comment).
+    debug_assert!(
+        row_count <= u64::from(u32::MAX),
+        "ordered-index compaction stores row indices as u32; row_count {row_count} exceeds u32::MAX"
+    );
     let slots = launch_cuda_resident_i32_compare_ordered_core(
         resident,
         byte_offset,
