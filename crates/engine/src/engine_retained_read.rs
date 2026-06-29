@@ -537,7 +537,7 @@ impl Engine {
         let batch_started = Instant::now();
         // ADR-009 R1: route this resident int4 unique-key batch among two byte-identical producers (each
         // returns the SAME matched rows; only HOW they're found differs):
-        //   (1) lpb GPU hash-index probe — `wave_engine_enabled` ON, column unique/buildable: O(1)/needle.
+        //   (1) lpb GPU hash-index probe — `index_probe_enabled` ON, column unique/buildable: O(1)/needle.
         //   (2) full-scan kernel        — flag off, or column non-unique / un-buildable: O(rows).
         // Both are DEFERRED submissions drained at completion.
         // CONTRACT: the index route requires `needles` to be DISTINCT — the facade batcher's `dedup_needles`
@@ -549,7 +549,7 @@ impl Engine {
         // launch-per-batch: GPU index probe when buildable, else the full scan -> a DeferredProbe.
         let payload = {
             match self
-                .wave_engine_enabled()
+                .index_probe_enabled()
                 .then(|| {
                     self.wave_resident_int4_index(
                         &table.name,

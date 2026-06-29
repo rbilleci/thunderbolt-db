@@ -1,7 +1,7 @@
 //! R1 wave-index A/B — the end-to-end O(rows)→O(1) measurement (ADR-009 R1).
 //!
 //! R1 wired the GPU hash-index probe into the resident int4 unique-key point-lookup route behind the
-//! default-OFF `wave_engine_enabled` flag (`submit_resident_int4_equal_any_payload`). The standalone
+//! default-OFF `index_probe_enabled` flag (`submit_resident_int4_equal_any_payload`). The standalone
 //! probe (`crates/execution/examples/wave_index_probe.rs`) already showed the index is O(1) and the
 //! scan is O(rows) at the data-plane level; this measures the SAME swap **through the engine** — the
 //! real retained-read template path the production batcher drives — so the win is end-to-end, results
@@ -146,7 +146,7 @@ fn measure(
     step: u64,
     rows: u64,
 ) -> Result<Lat, Box<dyn Error>> {
-    e.set_wave_engine_enabled(flag);
+    e.set_index_probe_enabled(flag);
     // Warmup: the first ON batch builds + caches the index (DtoH key read + hash); also JIT/allocator.
     for b in 0..warmup {
         let needles = needles_for_batch(b, batch, step, rows);
@@ -226,7 +226,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Correctness: OFF and ON must return byte-identical rows (catches a silent wrong/empty index
         // before any timing claim). Same needles, both routes.
         let probe = needles_for_batch(0, batch, step, rows_u);
-        e.set_wave_engine_enabled(false);
+        e.set_index_probe_enabled(false);
         let off_rows: Vec<_> = e
             .complete_relational_retained_read_submission(
                 e.submit_relational_retained_template_point_lookups(&template, &probe)?,
@@ -234,7 +234,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into_iter()
             .map(|r| r.rows)
             .collect();
-        e.set_wave_engine_enabled(true);
+        e.set_index_probe_enabled(true);
         let on_rows: Vec<_> = e
             .complete_relational_retained_read_submission(
                 e.submit_relational_retained_template_point_lookups(&template, &probe)?,

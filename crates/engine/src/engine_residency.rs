@@ -559,13 +559,13 @@ impl Engine {
     /// resident int4 unique-key equality batch probes a cached GPU hash index instead of full-scanning;
     /// non-unique columns / un-buildable indexes transparently fall back to the scan. `&self` (an
     /// interior-mutable flag the read path reads).
-    pub fn set_wave_engine_enabled(&self, on: bool) {
-        self.wave_engine_enabled
+    pub fn set_index_probe_enabled(&self, on: bool) {
+        self.index_probe_enabled
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn wave_engine_enabled(&self) -> bool {
-        self.wave_engine_enabled
+    pub(crate) fn index_probe_enabled(&self) -> bool {
+        self.index_probe_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

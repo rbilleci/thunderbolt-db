@@ -313,9 +313,11 @@ pub struct Engine {
     auto_admit_on_commit: AtomicBool,
     /// ADR-009 R1: when true, a resident int4 unique-key equality point lookup probes a GPU hash index
     /// (built lazily from the resident column, cached per generation) instead of a full-scan kernel —
-    /// the per-batch device cost drops O(rows)→O(1). Default off; falls back to the scan whenever the
-    /// column is non-unique or the index cannot be built. Interior-mutable (`&self`), read on the read path.
-    wave_engine_enabled: AtomicBool,
+    /// the per-batch device cost drops O(rows)→O(1). DEFAULT ON (user 2026-06-29: lpb chosen over the wave
+    /// engine — the production read path); falls back to the scan whenever the column is non-unique or the
+    /// index cannot be built. (Was `wave_engine_enabled` — renamed after the wave retirement; it always gated
+    /// the INDEX, never the persistent wave.) Interior-mutable (`&self`), read on the read path.
+    index_probe_enabled: AtomicBool,
     /// DECISIONS "lpb read levers" #1: when true, the lpb unique index probe uses the DENSE-emit kernel
     /// (thread `i` -> slot `i`, no atomic, no needle_indices/row_indices/count; host compacts sequentially)
     /// instead of the atomic-compaction kernel. Byte-identical; DEFAULT ON (user 2026-06-29: strict win

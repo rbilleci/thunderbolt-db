@@ -3775,7 +3775,7 @@ fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
     assert_eq!(e.execute_relational_select(&proj).unwrap().rows, expected);
 }
 
-/// ADR-009 R1: the GPU index-probe point-lookup route (`wave_engine_enabled` ON) must return
+/// ADR-009 R1: the GPU index-probe point-lookup route (`index_probe_enabled` ON) must return
 /// BYTE-IDENTICAL results to the full-scan route (OFF) — including NULL projections, absent needles,
 /// repeated needles, the duplicate-key fallback (a non-unique column makes the index abandon so the
 /// scan runs), and across a generation change (an INSERT re-admits, so the per-generation index cache
@@ -3845,9 +3845,9 @@ fn r1_wave_index_probe_matches_scan_differential() {
     // must agree). Needles are distinct by contract — the batcher's `dedup_needles` collapses identical
     // point lookups — so the thread-per-needle index and the thread-per-row scan are a bijection.
     let unique_needles = vec![10, 20, 30, 40, 25, 0];
-    e.set_wave_engine_enabled(false);
+    e.set_index_probe_enabled(false);
     let scan_unique = run(&e, &select_unique, &unique_needles);
-    e.set_wave_engine_enabled(true);
+    e.set_index_probe_enabled(true);
     let index_unique = run(&e, &select_unique, &unique_needles);
     assert_eq!(
         index_unique, scan_unique,
@@ -3884,9 +3884,9 @@ fn r1_wave_index_probe_matches_scan_differential() {
     // (b) Duplicate-key fallback: `bucket` is non-unique, so the index build abandons (None) and the
     // scan runs -- flag on must STILL match flag off (and return BOTH rows for bucket = 1).
     let dup_needles = vec![1, 2, 9];
-    e.set_wave_engine_enabled(false);
+    e.set_index_probe_enabled(false);
     let scan_dup = run(&e, &select_dup, &dup_needles);
-    e.set_wave_engine_enabled(true);
+    e.set_index_probe_enabled(true);
     let index_dup = run(&e, &select_dup, &dup_needles);
     assert_eq!(
         index_dup, scan_dup,
@@ -3908,9 +3908,9 @@ fn r1_wave_index_probe_matches_scan_differential() {
     .unwrap();
     e.populate_relational_residency_snapshot("accounts").unwrap();
     let gen_needles = vec![10, 50, 40, 999];
-    e.set_wave_engine_enabled(false);
+    e.set_index_probe_enabled(false);
     let scan_gen = run(&e, &select_unique, &gen_needles);
-    e.set_wave_engine_enabled(true);
+    e.set_index_probe_enabled(true);
     let index_gen = run(&e, &select_unique, &gen_needles);
     assert_eq!(
         index_gen, scan_gen,
@@ -3979,10 +3979,10 @@ fn r2_wave_engine_matches_lpb_differential() {
     // Two flag configs: scan (index off) and lpb (index on). The dense kernel is the index route's default,
     // so `dense_index_probe_hits` increments once per index-served batch -- the non-vacuity signal.
     let scan_cfg = |e: &Engine| {
-        e.set_wave_engine_enabled(false);
+        e.set_index_probe_enabled(false);
     };
     let lpb_cfg = |e: &Engine| {
-        e.set_wave_engine_enabled(true);
+        e.set_index_probe_enabled(true);
     };
 
     // (a) Unique-key differential WITH NULL: DISTINCT present needles (incl id=20 NULL balance), an absent
@@ -4132,7 +4132,7 @@ fn r2_batched_completion_matches_per_needle() {
         return; // no GPU
     }
     // lpb INDEX route (unique key `id`): wave_engine on.
-    e.set_wave_engine_enabled(true);
+    e.set_index_probe_enabled(true);
     let template = e.prepare_relational_retained_read_template(&select).unwrap();
     // distinct needles incl an ABSENT one (25) and NULL-as-0 (0, the NULL-id row).
     let needles = vec![10, 20, 30, 40, 25, 0];
@@ -4204,7 +4204,7 @@ fn r2_batched_completion_matches_per_needle_multirow() {
         return; // no GPU
     }
     // Non-unique `bucket` -> the index declines and the SCAN serves; wave_engine on exercises that fallback.
-    e.set_wave_engine_enabled(true);
+    e.set_index_probe_enabled(true);
     let template = e.prepare_relational_retained_read_template(&select).unwrap();
     // bucket 1 -> 2 rows, bucket 2 -> 2 rows, bucket 3 -> 1 row, bucket 9 -> absent.
     let needles = vec![1, 2, 3, 9];
@@ -4358,7 +4358,7 @@ fn r2_dense_index_probe_matches_atomic() {
         return; // no GPU
     }
     // lpb INDEX route (not the persistent wave): wave_engine on, persistent off.
-    e.set_wave_engine_enabled(true);
+    e.set_index_probe_enabled(true);
     let template = e.prepare_relational_retained_read_template(&select).unwrap();
 
     let cases: Vec<Vec<i32>> = vec![

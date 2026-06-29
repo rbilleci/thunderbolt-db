@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ("lpb", true, false),
             ("lpb-dense", true, true),
         ] {
-            e.set_wave_engine_enabled(wave_engine);
+            e.set_index_probe_enabled(wave_engine);
             e.set_dense_index_probe_enabled(dense);
             // warmup (lpb builds the index)
             for b in 0..30 {

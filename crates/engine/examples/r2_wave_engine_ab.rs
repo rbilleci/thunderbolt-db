@@ -2,8 +2,8 @@
 //!
 //! This benchmark measures the resident int4 unique-key point-lookup route **through the engine** — the
 //! real retained-read template path the production batcher drives — across two byte-identical routes:
-//!   - `scan`      : index off (`wave_engine_enabled` off)  -> full-scan equal_any  (O(rows)/batch)
-//!   - `lpb-index` : `wave_engine_enabled` on               -> launch-per-batch GPU hash-index (O(1)/needle)
+//!   - `scan`      : index off (`index_probe_enabled` off)  -> full-scan equal_any  (O(rows)/batch)
+//!   - `lpb-index` : `index_probe_enabled` on               -> launch-per-batch GPU hash-index (O(1)/needle)
 //! It also sweeps the index route's atomic vs DENSE completion kernel on the batched path.
 //!
 //! WHAT THIS MEASURES (and what it does NOT). In production, point reads flow through the facade's SINGLE
@@ -65,10 +65,10 @@ impl Mode {
     fn configure(self, e: &Engine) {
         match self {
             Mode::Scan => {
-                e.set_wave_engine_enabled(false);
+                e.set_index_probe_enabled(false);
             }
             Mode::Lpb => {
-                e.set_wave_engine_enabled(true);
+                e.set_index_probe_enabled(true);
             }
         }
     }
@@ -351,7 +351,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "# lpb-index A/B  rows={rows}  batches={batch_sizes:?}  measured_batches={batches}  warmup={warmup}"
     );
-    println!("# scan=index off | lpb-index=wave_engine_enabled (GPU hash-index probe)");
+    println!("# scan=index off | lpb-index=index_probe_enabled (GPU hash-index probe)");
     println!("# single-flight = the production single-coalescer path; concurrent = the multi-producer ceiling\n");
 
     let rows_u = rows as u64;
