@@ -17,6 +17,91 @@
 use std::time::Instant;
 use gpu_db_sql::SqlValue;
 
+/// HIGH-OUTPUT (the cross-kernel-result-path-transfer doc's target): the GENERAL non-unique route
+/// (`engine_resident_probe.rs:1367`+`:1519`) materializes `m` needles x `k` matched rows each. Mirrors the
+/// real boxed path (CURRENT) vs lpb's flat assemble (`assemble_batched_rows`, general arm). `row_index` is
+/// shuffled within each needle (the kernel's `atom.global.add` schedule order) so the within-needle sort that
+/// BOTH paths must do is real — isolating the per-row `Vec<SqlValue>` boxing + enum-wrap as the differentiator.
+fn high_output(m: usize, k: usize) {
+    let ncols = 2usize;
+    let n = m * k;
+    let iters = 20usize;
+    // Synthetic kernel output in schedule order: row i carries (needle_index, row_index, values). Interleave
+    // needles (round-robin) and shuffle row_index within a needle via a hash permutation.
+    let needle_indices: Vec<u32> = (0..n).map(|i| (i % m) as u32).collect();
+    let row_indices: Vec<u64> =
+        (0..n).map(|i| ((i / m) as u64).wrapping_mul(2_654_435_761) % k as u64).collect();
+    let row_values: Vec<i32> = (0..n).flat_map(|i| [i as i32, (i as i32).wrapping_mul(7)]).collect();
+    let rv = |i: usize| &row_values[i * ncols..i * ncols + ncols];
+
+    let per = |total_ns: u128| total_ns as f64 / n as f64;
+    let lps = |ns: f64| if ns > 0.0 { 1.0e9 / ns } else { 0.0 };
+
+    // CURRENT — exactly engine_resident_probe.rs:1367 (boxed group + i32->SqlValue per row) + :1519 sort.
+    let mut current = u128::MAX;
+    let mut sink = 0i64;
+    for _ in 0..iters {
+        let t = Instant::now();
+        let mut rows_by_select: Vec<Vec<(u64, Vec<SqlValue>)>> = vec![Vec::new(); m];
+        for i in 0..n {
+            rows_by_select[needle_indices[i] as usize]
+                .push((row_indices[i], rv(i).iter().copied().map(SqlValue::Int4).collect()));
+        }
+        let assembled: Vec<Vec<Vec<SqlValue>>> = rows_by_select
+            .into_iter()
+            .map(|mut s| {
+                s.sort_by_key(|(ri, _)| *ri);
+                s.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect();
+        current = current.min(t.elapsed().as_nanos());
+        sink += assembled.iter().map(|s| s.len() as i64).sum::<i64>();
+    }
+
+    // FLAT — assemble_batched_rows general arm: O(n) counting-sort scatter by needle + within-needle index
+    // sort by row_index + raw-i32 flatten (no per-row Vec, no SqlValue enum-wrap).
+    let mut flat = u128::MAX;
+    for _ in 0..iters {
+        let t = Instant::now();
+        let mut counts = vec![0u32; m];
+        for &ni in &needle_indices {
+            counts[ni as usize] += 1;
+        }
+        let mut ranges = Vec::with_capacity(m);
+        let mut acc = 0u32;
+        for &c in &counts {
+            ranges.push((acc, c));
+            acc += c;
+        }
+        let total = acc as usize;
+        let mut slot = vec![0u32; total];
+        let mut cursor: Vec<u32> = ranges.iter().map(|&(s, _)| s).collect();
+        for i in 0..n {
+            let ni = needle_indices[i] as usize;
+            slot[cursor[ni] as usize] = i as u32;
+            cursor[ni] += 1;
+        }
+        for &(start, count) in &ranges {
+            if count > 1 {
+                let s = start as usize;
+                slot[s..s + count as usize].sort_by_key(|&i| row_indices[i as usize]);
+            }
+        }
+        let mut values = Vec::with_capacity(total * ncols);
+        for &i in &slot {
+            values.extend_from_slice(rv(i as usize));
+        }
+        flat = flat.min(t.elapsed().as_nanos());
+        sink += values.len() as i64;
+    }
+
+    println!("\n# HIGH-OUTPUT general non-unique route: m={m} needles x k={k} rows = {n} rows x {ncols} cols");
+    println!("  {:<14} {:>10} {:>14}", "variant", "ns/row", "implied rows/s");
+    println!("  {:<14} {:>10.1} {:>14.0}", "current(boxed)", per(current), lps(per(current)));
+    println!("  {:<14} {:>10.1} {:>14.0}", "flat-i32", per(flat), lps(per(flat)));
+    println!("  current/flat: {:.1}x   (sink {sink})", per(current) / per(flat).max(0.01));
+}
+
 fn main() {
     let n: usize = std::env::var("N").ok().and_then(|v| v.parse().ok()).unwrap_or(65536);
     let ncols = 2usize;
@@ -95,4 +180,8 @@ fn main() {
     );
     println!("\n# current->flat-sqlvalue = the per-row Vec<SqlValue> boxing+group+sort cost (host-flat win,");
     println!("# wire path unchanged). flat-sqlvalue->flat-i32 = the SqlValue enum-wrap (needs GPU->wire to remove).");
+
+    let m: usize = std::env::var("NEEDLES").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let k: usize = std::env::var("ROWS_PER_NEEDLE").ok().and_then(|v| v.parse().ok()).unwrap_or(16384);
+    high_output(m, k);
 }
