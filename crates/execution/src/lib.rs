@@ -5094,15 +5094,23 @@ fn launch_cuda_resident_i32_equal_count(
     .param .u64 null_bitmap_offset
 )
 {
+    // Per-block reduction scratch: one u32 partial slot per thread (block <= 1024 threads).
+    .shared .align 4 .b32 s_part[1024];
+
     .reg .pred %p_done;
     .reg .pred %p_match;
     .reg .pred %p_no_bitmap;
     .reg .pred %p_valid;
+    .reg .pred %p_active;
+    .reg .pred %p_isthr0;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
     .reg .u32 %gdim;
     .reg .u32 %tmp32;
+    .reg .u32 %part32;
+    .reg .u32 %rstride;
+    .reg .u32 %peer;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
@@ -5117,6 +5125,10 @@ fn launch_cuda_resident_i32_equal_count(
     .reg .u64 %sentinel;
     .reg .u64 %word_byte;
     .reg .u64 %bitmap_addr;
+    .reg .u64 %sh_base;
+    .reg .u64 %sh_self;
+    .reg .u64 %sh_peer;
+    .reg .u64 %block_tot;
     .reg .u32 %bitmap_word;
     .reg .u32 %bit_pos;
     .reg .u32 %valid_bit;
@@ -5174,7 +5186,52 @@ next:
     bra loop;
 
 done:
-    red.global.add.u64 [%out], %matches;
+    // ---- per-block reduction: sum every thread's %matches partial, then ONE atomic per block ----
+    // The grid is clamped to a saturating constant, so each thread's partial = ceil(rows/(grid*BLOCK))
+    // rows of matches, which fits u32 for any plausible row_count (the per-block sum likewise:
+    // BLOCK=256 threads * partial << 2^32). The block total is widened to u64 for the single global
+    // red.add so the global COUNT stays exact and byte-identical to the old per-thread accumulation
+    // (sum is associative/commutative - only the grouping of the adds changed).
+    //
+    // This is a barrier-synchronized SHARED-MEMORY tree reduction, NOT a warp shuffle: the
+    // grid-stride loop exits per-thread (idx >= rows), so lanes within a warp execute a DIFFERENT
+    // number of iterations and are NOT guaranteed converged at done: -- a shfl.sync here would
+    // silently drop partials. bar.sync synchronizes the WHOLE block regardless of how many
+    // iterations each thread ran, and every barrier below is on the straight-line path (outside the
+    // @!%p_active guard), so all threads reach it. %lane holds %tid.x (the in-block thread id).
+    cvt.u32.u64 %part32, %matches;
+    mov.u64 %sh_base, s_part;
+    mul.wide.u32 %sh_self, %lane, 4;
+    add.u64 %sh_self, %sh_base, %sh_self;
+    st.shared.u32 [%sh_self], %part32;
+    bar.sync 0;
+
+    // tree reduce: for rstride = bdim/2, bdim/4, ..., 1: s_part[t] += s_part[t + rstride] for t < rstride.
+    shr.u32 %rstride, %bdim, 1;
+red_loop:
+    setp.eq.u32 %p_done, %rstride, 0;
+    @%p_done bra red_done;
+    setp.lt.u32 %p_active, %lane, %rstride;
+    @!%p_active bra red_skip;
+    add.u32 %peer, %lane, %rstride;
+    mul.wide.u32 %sh_peer, %peer, 4;
+    add.u64 %sh_peer, %sh_base, %sh_peer;
+    ld.shared.u32 %tmp32, [%sh_peer];
+    ld.shared.u32 %part32, [%sh_self];
+    add.u32 %part32, %part32, %tmp32;
+    st.shared.u32 [%sh_self], %part32;
+red_skip:
+    bar.sync 0;
+    shr.u32 %rstride, %rstride, 1;
+    bra red_loop;
+red_done:
+    // thread 0 holds the block total at s_part[0]; widen to u64 and do the single global red.add.
+    setp.eq.u32 %p_isthr0, %lane, 0;
+    @!%p_isthr0 bra block_done;
+    ld.shared.u32 %part32, [%sh_base];
+    cvt.u64.u32 %block_tot, %part32;
+    red.global.add.u64 [%out], %block_tot;
+block_done:
     ret;
 }
 "#;
@@ -5208,13 +5265,15 @@ done:
         .cached_function(c"gpu_db_resident_i32_equal_count_parallel", &ptx)?;
     let null_bitmap_kernel_arg = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
 
-    // The grid-stride loop covers any row_count regardless of grid size, so clamping the
-    // grid is correctness-safe (extra rows are handled by wrapping). The kernel computes
-    // `stride = gridDim * blockDim` in u32: with grid ≤ 65_535 and BLOCK ≤ 1024 (the CUDA
-    // block-size max) the product stays ≤ ~67M, well within u32 — do not raise BLOCK such
-    // that `65_535 * BLOCK` could overflow u32.
+    // SATURATING grid (not one-thread-per-row): clamp to a moderate constant that fills the GPU.
+    // The grid-stride loop covers any row_count regardless of grid size, so clamping is
+    // correctness-safe — each thread now strides over `ceil(row_count/(grid*BLOCK))` rows = a REAL
+    // partial, and the in-kernel per-block reduction means each block does ONE global atomic. Before:
+    // `clamp(1, 65_535)` = one thread per row => ~N serialized `red.global.add` on a single address
+    // (the ~60x-below-roofline bug). The kernel computes `stride = gridDim * blockDim` in u32: with
+    // grid ≤ 4096 and BLOCK = 256 the product is ≤ ~1M, well within u32.
     const BLOCK: u32 = 256;
-    let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 4096) as u32;
 
     let mut output_bytes = [0_u8; std::mem::size_of::<u64>()];
     launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
@@ -5303,6 +5362,9 @@ fn launch_cuda_resident_i32_compare_count(
     .param .u64 out_ptr
 )
 {
+    // Per-block reduction scratch: one u32 partial slot per thread (block <= 1024 threads).
+    .shared .align 4 .b32 s_part[1024];
+
     .reg .pred %p_done;
     .reg .pred %p_lt;
     .reg .pred %p_lte;
@@ -5313,11 +5375,16 @@ fn launch_cuda_resident_i32_compare_count(
     .reg .pred %p_code_gt;
     .reg .pred %p_code_gte;
     .reg .pred %p_match;
+    .reg .pred %p_active;
+    .reg .pred %p_isthr0;
     .reg .u32 %lane;
     .reg .u32 %bdim;
     .reg .u32 %bid;
     .reg .u32 %gdim;
     .reg .u32 %tmp32;
+    .reg .u32 %part32;
+    .reg .u32 %rstride;
+    .reg .u32 %peer;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
@@ -5328,6 +5395,10 @@ fn launch_cuda_resident_i32_compare_count(
     .reg .u64 %addr;
     .reg .u64 %off_bytes;
     .reg .u64 %matches;
+    .reg .u64 %sh_base;
+    .reg .u64 %sh_self;
+    .reg .u64 %sh_peer;
+    .reg .u64 %block_tot;
     .reg .u32 %comparison;
     .reg .s32 %needle;
     .reg .s32 %r_value;
@@ -5383,7 +5454,52 @@ next:
     bra loop;
 
 done:
-    red.global.add.u64 [%out], %matches;
+    // ---- per-block reduction: sum every thread's %matches partial, then ONE atomic per block ----
+    // The grid is clamped to a saturating constant, so each thread's partial = ceil(rows/(grid*BLOCK))
+    // rows of matches, which fits u32 for any plausible row_count (the per-block sum likewise:
+    // BLOCK=256 threads * partial << 2^32). The block total is widened to u64 for the single global
+    // red.add so the global COUNT stays exact and byte-identical to the old per-thread accumulation
+    // (sum is associative/commutative - only the grouping of the adds changed).
+    //
+    // This is a barrier-synchronized SHARED-MEMORY tree reduction, NOT a warp shuffle: the
+    // grid-stride loop exits per-thread (idx >= rows), so lanes within a warp execute a DIFFERENT
+    // number of iterations and are NOT guaranteed converged at done: -- a shfl.sync here would
+    // silently drop partials. bar.sync synchronizes the WHOLE block regardless of how many
+    // iterations each thread ran, and every barrier below is on the straight-line path (outside the
+    // @!%p_active guard), so all threads reach it. %lane holds %tid.x (the in-block thread id).
+    cvt.u32.u64 %part32, %matches;
+    mov.u64 %sh_base, s_part;
+    mul.wide.u32 %sh_self, %lane, 4;
+    add.u64 %sh_self, %sh_base, %sh_self;
+    st.shared.u32 [%sh_self], %part32;
+    bar.sync 0;
+
+    // tree reduce: for rstride = bdim/2, bdim/4, ..., 1: s_part[t] += s_part[t + rstride] for t < rstride.
+    shr.u32 %rstride, %bdim, 1;
+red_loop:
+    setp.eq.u32 %p_done, %rstride, 0;
+    @%p_done bra red_done;
+    setp.lt.u32 %p_active, %lane, %rstride;
+    @!%p_active bra red_skip;
+    add.u32 %peer, %lane, %rstride;
+    mul.wide.u32 %sh_peer, %peer, 4;
+    add.u64 %sh_peer, %sh_base, %sh_peer;
+    ld.shared.u32 %tmp32, [%sh_peer];
+    ld.shared.u32 %part32, [%sh_self];
+    add.u32 %part32, %part32, %tmp32;
+    st.shared.u32 [%sh_self], %part32;
+red_skip:
+    bar.sync 0;
+    shr.u32 %rstride, %rstride, 1;
+    bra red_loop;
+red_done:
+    // thread 0 holds the block total at s_part[0]; widen to u64 and do the single global red.add.
+    setp.eq.u32 %p_isthr0, %lane, 0;
+    @!%p_isthr0 bra block_done;
+    ld.shared.u32 %part32, [%sh_base];
+    cvt.u64.u32 %block_tot, %part32;
+    red.global.add.u64 [%out], %block_tot;
+block_done:
     ret;
 }
 "#;
@@ -5416,13 +5532,15 @@ done:
         .primary()
         .cached_function(c"gpu_db_resident_i32_compare_count_parallel", &ptx)?;
 
-    // The grid-stride loop covers any row_count regardless of grid size, so clamping the
-    // grid is correctness-safe (extra rows are handled by wrapping). The kernel computes
-    // `stride = gridDim * blockDim` in u32: with grid ≤ 65_535 and BLOCK ≤ 1024 (the CUDA
-    // block-size max) the product stays ≤ ~67M, well within u32 — do not raise BLOCK such
-    // that `65_535 * BLOCK` could overflow u32.
+    // SATURATING grid (not one-thread-per-row): clamp to a moderate constant that fills the GPU.
+    // The grid-stride loop covers any row_count regardless of grid size, so clamping is
+    // correctness-safe — each thread now strides over `ceil(row_count/(grid*BLOCK))` rows = a REAL
+    // partial, and the in-kernel per-block reduction means each block does ONE global atomic. Before:
+    // `clamp(1, 65_535)` = one thread per row => ~N serialized `red.global.add` on a single address
+    // (the ~60x-below-roofline bug). The kernel computes `stride = gridDim * blockDim` in u32: with
+    // grid ≤ 4096 and BLOCK = 256 the product is ≤ ~1M, well within u32.
     const BLOCK: u32 = 256;
-    let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 4096) as u32;
 
     let mut output_bytes = [0_u8; std::mem::size_of::<u64>()];
     launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
