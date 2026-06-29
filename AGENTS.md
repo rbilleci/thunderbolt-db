@@ -58,3 +58,44 @@ Before major runtime, storage, or scheduler changes, read:
 
 When a change intentionally favors CPU-first behavior, document why it is a
 fallback, bootstrap step, or product-scope exception.
+
+## Read-path performance regression benchmark (standard)
+
+There is ONE standard read-kernel benchmark; run it before/after any change that touches a
+read kernel, the residency layout, or the result path, and compare to the baseline below.
+
+```
+timeout 300 cargo run --release --example read_kernel_roofline -p gpu_db_execution
+#   (no GPU? it prints a skip line. Never use --gpu-reset. ROWS=/SORT_N=/ITERS= override.)
+```
+
+It drives each read-kernel FAMILY directly on a resident column (kernel-only timing) and reports
+effective GB/s (bandwidth-bound scans / gather) or M-elem/s (sort / join / grouped). The first
+line, `equal_any`, is a pure coalesced read = the measured **streaming roofline** for the box.
+
+**Compare by RATIO, not absolute GB/s.** Absolute bandwidth varies by GPU/driver, so the portable
+signal is `kernel_GB_s / equal_any_roofline_in_the_same_run`. A material drop in a kernel's ratio
+(or in the algorithmic M-elem/s) vs the baseline is a regression to investigate.
+
+Baseline (8M i32 rows, captured 2026-06-29; roofline `equal_any` was ~640 GB/s on that box):
+
+| family | kernel | ratio-to-roofline (or Melem/s) | note |
+|---|---|---|---|
+| scan (ROOFLINE) | `equal_any` | 1.00 | — |
+| scan-project ordered (1% sel) | `project_compare` | ~0.29 (2-pass) | near roof/pass — SATURATED |
+| ordered compaction (50% sel) | `compare_indices_ordered` | ~0.06 (2-pass) | output-bound — expected |
+| arith VM | `arith_filter` | ~0.05 (2-pass) | ok |
+| scalar reduce | `sum_i32` | ~0.36 | mild headroom |
+| **scalar filter/count** | `count_i32_compare` | **~0.013** | KNOWN HEADROOM (not a regression) |
+| | `count_i32_between` | **~0.007** | KNOWN HEADROOM |
+| | `expr_i64_compare_scalar` | **~0.003** | KNOWN HEADROOM |
+| | `expr_i128_compare_scalar` | **~0.005** | KNOWN HEADROOM |
+| gather (scattered) | `gather_i32` / `gather_i64` | ~0.004 / ~0.005 | access-bound (inherent) |
+| algorithmic | sort / join / grouped | ~346 / ~255 / ~267 Melem/s | separate programs |
+
+The `scalar filter/count` family is a KNOWN optimization target, NOT a regression — its low
+ratios are expected until optimized. `count_i32_compare` is root-caused (`launch_cuda_resident_
+i32_compare_count` launches grid=row_count/256 = one thread/row + a per-thread `red.global.add`
+on a single counter = ~N atomics serialized); the `between` / i64 / i128 filters are measured-
+slow too but not yet individually root-caused (likely the same pattern). Treat a ratio FALLING
+below these as the regression signal; a ratio rising (e.g. after that fix) is the win.
