@@ -578,10 +578,10 @@ impl Engine {
                 | ResidentScalarAggregate::Max { .. } => {
                     // DIRECT scalar-stats reduction (the MIN/MAX/AVG analogue of the SUM kernel above):
                     // one grid-stride streaming pass computes (count, sum, min, max) at the memory-bound
-                    // roofline. This REPLACES the old self-grouped hash kernel
-                    // (`grouped_stats_i32_from_payload(off, off, rows, <mask>)` with group == value),
-                    // which built an O(distinct)-entry hash table just to reduce — collapsing to ~182
-                    // Melem/s and falling at high distinctness (e.g. a unique 8M-row id). The result is
+                    // roofline. This REPLACED the old (now-removed) self-grouped hash kernel
+                    // with group == value, which built an O(distinct)-entry hash table just to reduce —
+                    // collapsing to ~182 Melem/s and falling at high distinctness (e.g. a unique 8M-row
+                    // id). The result is
                     // byte-identical: the kernel's (count, sum, min, max) equals what the self-grouped
                     // path produced and the host reduced (same i64 two's-complement sum, same min/max,
                     // same AVG rounding via `average_sql_value`). D2H is now a fixed 24-byte stats struct
@@ -634,9 +634,8 @@ impl Engine {
                 // DIRECT NULL-aware scalar-stats reduction (the nullable analogue of the fast path
                 // above): one grid-stride streaming pass that skips NULL rows ON-DEVICE via the
                 // validity bitmap, computing (count, sum, min, max) over only the non-NULL rows at the
-                // memory-bound roofline. REPLACES the self-grouped NULL-aware hash kernel
-                // (`grouped_stats_i32_nullable_from_payload(off, off, rows, bitmap, <mask>)` with
-                // group == value), which built an O(distinct)-entry hash table just to reduce. count is
+                // memory-bound roofline. REPLACED the (now-removed) self-grouped NULL-aware hash kernel
+                // with group == value, which built an O(distinct)-entry hash table just to reduce. count is
                 // the SURVIVING (non-NULL) row count; count == 0 (all-NULL column) ⇒ SQL NULL for every
                 // aggregate. Byte-identical to the reduced self-grouped totals, INCLUDING the empty case
                 // (the old `reduce_nullable_grouped_stats` already returned NULL for zero survivors).
@@ -664,8 +663,8 @@ impl Engine {
             } if agg_null_offset.is_some() => {
                 // DIRECT filtered + NULL-aware scalar-stats reduction: one grid-stride pass evaluates
                 // the filter `<value> <cmp> needle` AND skips NULL rows ON-DEVICE, so the (count, sum,
-                // min, max) covers only the surviving non-NULL matches. REPLACES the self-grouped
-                // NULL-aware filtered hash kernel (`filtered_grouped_stats_i32_nullable_from_payload`).
+                // min, max) covers only the surviving non-NULL matches. REPLACED the (now-removed)
+                // self-grouped NULL-aware filtered hash kernel.
                 // count == 0 (zero matches / all-NULL survivors) ⇒ SQL NULL. Byte-identical to the
                 // reduced self-grouped totals for non-empty, and the old reduction already mapped zero
                 // survivors to NULL — so the empty corner is unchanged here too.

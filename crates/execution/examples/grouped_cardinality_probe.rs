@@ -1,9 +1,10 @@
-//! Grouped-aggregation cardinality probe: the roofline sweep measured grouped_stats at ~1M groups
-//! (267 Melem/s). That is the HIGH-cardinality case = random-access + atomic bound on a large table.
-//! The hypothesis: the real headroom is at LOW/MEDIUM cardinality, where the per-row global atomics
-//! (1 CAS probe + add/add/min/max) hammer FEW slots = severe contention, and a per-block shared-memory
-//! pre-aggregation would help a lot. This drives grouped_stats_i32 over the SAME 8M rows but group
-//! columns of varying distinct-count (row % C) to see the throughput vs cardinality curve.
+//! Grouped-aggregation cardinality probe for the LIVE per-group GROUP BY kernel
+//! (`gpu_db_group_by_i32_count_sum_twolevel`, via `group_by_i32_count_sum_from_payload`) -- the kernel the
+//! engine actually uses. Sweeps the SAME 8M rows but group columns of varying distinct-count (row % C) to
+//! see the throughput-vs-cardinality curve. The two-level shared-mem kernel pre-aggregates per block, so
+//! the per-row global-atomic contention that the old `grouped_stats` hash-agg hit at low cardinality is
+//! exactly what it targets. (This repointed from the removed `grouped_stats_i32` hash-agg family; the
+//! two-level kernel serves COUNT/SUM -- its MIN bit is a no-op, so the MIN column tracks ALL here.)
 //!
 //!   timeout 200 cargo run --release --example grouped_cardinality_probe -p gpu_db_execution
 
@@ -60,7 +61,10 @@ fn main() {
         .retain_device_memory_chunks(0, allocated, &chunks)
         .expect("retain resident device memory");
 
-    println!("# grouped_stats_i32 cardinality sweep. rows={rows}, iters={iters}");
+    // Full-table scan: indices = 0..rows (no WHERE), as the executor passes for an unfiltered GROUP BY.
+    let indices: Vec<u32> = (0..rows as u32).collect();
+
+    println!("# two-level GROUP BY cardinality sweep. rows={rows}, iters={iters}");
     println!(
         "# aggregate-selection mask: ALL = count+sum+min+max (4 update atomics/row); MIN = 1 atomic;"
     );
@@ -83,7 +87,7 @@ fn main() {
     let bench = |goff: u64, mask: u32| -> (f64, f64, usize) {
         let run = || {
             resident
-                .grouped_stats_i32_from_payload(goff, off_value, rows, mask)
+                .group_by_i32_count_sum_from_payload(goff, off_value, &indices, mask)
                 .unwrap()
                 .len()
         };

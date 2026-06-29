@@ -1,19 +1,19 @@
-//! Direct scalar-stats reduction vs the self-grouped hash path, over a HIGH-DISTINCT i32 column.
+//! Direct scalar-stats reduction over a HIGH-DISTINCT i32 column, vs a HOST oracle + the sum roofline.
 //!
-//! `SELECT MIN/MAX/AVG(col)` (scalar, no GROUP BY, non-nullable, unfiltered) used to run the
-//! self-grouped hash kernel `grouped_stats_i32_from_payload(off, off, rows, ALL)` with group == value
-//! -- it builds an O(distinct)-entry HASH TABLE of every distinct value just to reduce. Over a unique
-//! 8M-row column that is an 8M-entry hash table (~182 Melem/s and falling). The new direct kernel
-//! `scalar_stats_i32_from_payload` is a grid-stride streaming pass + a bar.sync block tree reduction of
-//! (count, sum, min, max) + one set of 4 atomics/block -- memory-bound, distinctness-independent. This
-//! probe drives BOTH over the same unique/scrambled 8M column and reports Melem/s, with the audited
-//! direct `sum_i32_from_payload` as the roofline reference.
+//! `SELECT MIN/MAX/AVG(col)` (scalar, no GROUP BY, non-nullable, unfiltered) used to run a self-grouped
+//! hash kernel with group == value -- it built an O(distinct)-entry HASH TABLE of every distinct value
+//! just to reduce. Over a unique 8M-row column that was an 8M-entry hash table (~182 Melem/s and falling).
+//! The direct kernel `scalar_stats_i32_from_payload` is a grid-stride streaming pass + a bar.sync block
+//! tree reduction of (count, sum, min, max) + one set of 4 atomics/block -- memory-bound,
+//! distinctness-independent. This probe drives it over a unique/scrambled 8M column and reports Melem/s,
+//! with the audited direct `sum_i32_from_payload` as the roofline reference. (The dead self-grouped A/B
+//! arm was dropped with the `grouped_stats` family; a host oracle now pins the direct (count,sum,min,max).)
 //!
 //!   timeout 200 cargo run --release --example scalar_stats_direct_probe -p gpu_db_execution
 
 use std::time::Instant;
 
-use gpu_db_execution::{grouped_agg_mask, CudaDeviceMemoryChunk, CudaDriverRuntime};
+use gpu_db_execution::{CudaDeviceMemoryChunk, CudaDriverRuntime};
 
 fn p50(mut v: Vec<u128>) -> u128 {
     v.sort_unstable();
@@ -51,25 +51,38 @@ fn main() {
         .retain_device_memory_chunks(0, allocated, &chunks)
         .expect("retain resident device memory");
 
-    // Cross-check the two paths agree on (count, sum, min, max) before timing (byte-identity sanity).
+    // Distinct-count of the scrambled column (host): the odd-multiplier hash is a bijection on u32, so
+    // every row is a distinct value => ~rows distinct.
+    let distinct = {
+        let mut s: Vec<i32> =
+            (0..rows).map(|row| (row as u32).wrapping_mul(2_654_435_761) as i32).collect();
+        s.sort_unstable();
+        s.dedup();
+        s.len()
+    };
+
+    // Cross-check the direct kernel against an independent HOST oracle (count, sum, min, max) before
+    // timing (byte-identity sanity).
     let (d_count, d_sum, d_min, d_max) =
         resident.scalar_stats_i32_from_payload(off_value, rows).expect("direct scalar stats");
-    let grouped = resident
-        .grouped_stats_i32_from_payload(off_value, off_value, rows, grouped_agg_mask::ALL)
-        .expect("self-grouped stats");
-    let g_count: u64 = grouped.iter().map(|g| g.count).sum();
-    let g_sum: i64 = grouped.iter().map(|g| g.sum).sum();
-    let g_min = grouped.iter().map(|g| g.min).min().unwrap();
-    let g_max = grouped.iter().map(|g| g.max).max().unwrap();
+    let (h_count, h_sum, h_min, h_max) = {
+        let mut sum = 0_i64;
+        let mut min = i32::MAX;
+        let mut max = i32::MIN;
+        for row in 0..rows {
+            let v = (row as u32).wrapping_mul(2_654_435_761) as i32;
+            sum = sum.wrapping_add(i64::from(v));
+            min = min.min(v);
+            max = max.max(v);
+        }
+        (rows, sum, min, max)
+    };
     assert_eq!(
         (d_count, d_sum, d_min, d_max),
-        (g_count, g_sum, g_min, g_max),
-        "direct scalar stats must equal the reduced self-grouped stats"
+        (h_count, h_sum, h_min, h_max),
+        "direct scalar stats must equal the host oracle"
     );
-    println!(
-        "# parity OK: count={d_count} sum={d_sum} min={d_min} max={d_max}; distinct groups={}",
-        grouped.len()
-    );
+    println!("# parity OK: count={d_count} sum={d_sum} min={d_min} max={d_max}; distinct={distinct}");
 
     let p50_us = |mut f: Box<dyn FnMut()>| -> f64 {
         for _ in 0..3 {
@@ -90,13 +103,6 @@ fn main() {
             r.scalar_stats_i32_from_payload(off_value, rows).unwrap();
         }))
     };
-    let grouped_us = {
-        let r = &resident;
-        p50_us(Box::new(move || {
-            r.grouped_stats_i32_from_payload(off_value, off_value, rows, grouped_agg_mask::ALL)
-                .unwrap();
-        }))
-    };
     let sum_us = {
         let r = &resident;
         p50_us(Box::new(move || {
@@ -105,27 +111,18 @@ fn main() {
     };
 
     let mps = |us: f64| rows as f64 / us;
-    println!(
-        "# rows={rows} (~{} distinct), iters={iters}, p50 latency",
-        grouped.len()
-    );
+    println!("# rows={rows} (~{distinct} distinct), iters={iters}, p50 latency");
     println!("  {:<28} {:>10}  {:>12}", "path", "p50 us", "Melem/s");
     println!(
         "  {:<28} {:>9.0}us  {:>12.1}",
-        "direct scalar_stats (NEW)", direct_us, mps(direct_us)
-    );
-    println!(
-        "  {:<28} {:>9.0}us  {:>12.1}",
-        "self-grouped ALL (OLD)", grouped_us, mps(grouped_us)
+        "direct scalar_stats", direct_us, mps(direct_us)
     );
     println!(
         "  {:<28} {:>9.0}us  {:>12.1}  (roofline ref)",
         "direct sum (audited)", sum_us, mps(sum_us)
     );
     println!(
-        "\n# direct scalar_stats is {:.1}x the self-grouped hash path at ~{}-distinct, and {:.0}% of the sum roofline.",
-        grouped_us / direct_us,
-        grouped.len(),
+        "\n# direct scalar_stats is {:.0}% of the sum roofline at ~{distinct}-distinct.",
         100.0 * mps(direct_us) / mps(sum_us),
     );
 }

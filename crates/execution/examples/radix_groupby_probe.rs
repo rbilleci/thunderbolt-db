@@ -139,12 +139,11 @@ fn main() {
 
     println!("# radix-partitioned GROUP BY potential probe. rows={rows}, iters={iters}, kruns={kruns}");
     println!("# 8M i32 value column; group key = hash(row) %% C (high-entropy, exactly C distinct).");
-    println!("# TWO-LEVEL = gpu_db_group_by_i32_count_sum_twolevel (CUDA-event kernel-only ms). NOTE: this");
-    println!("#   path sizes its GLOBAL hash table to row_count*2 (=16M slots) -> it does NOT exhibit a");
-    println!("#   shared-mem-overflow cliff; it is already a row-count-sized global hash.");
-    println!("# HASH-AGG  = gpu_db_resident_i32_grouped_hash_* GLOBAL open-addressing hash (the cliff path;");
-    println!("#   produced the 182 number on the older box). Also a 16M-slot global table; slows at high");
-    println!("#   distinct from CAS-collision + cache-miss random access = exactly radix's target.");
+    println!("# TWO-LEVEL = gpu_db_group_by_i32_count_sum_twolevel (CUDA-event kernel-only ms) -- the LIVE");
+    println!("#   per-group GROUP BY kernel the engine uses. NOTE: this path sizes its GLOBAL hash table to");
+    println!("#   row_count*2 (=16M slots) -> it does NOT exhibit a shared-mem-overflow cliff; it is already");
+    println!("#   a row-count-sized global hash. (The old `grouped_stats` GLOBAL open-addressing hash-agg");
+    println!("#   A/B arm -- the engine-dead 182-number path -- was removed with that kernel family.)");
     println!("# RADIX PIPELINE = radix-argsort(8M i64 keys) + gather(value by perm) + seg-reduce[PROXY].");
     println!("#   seg-reduce PROXY = scalar_stats 1-pass streaming scan (count+sum+min+max) over 8M i32.");
     println!("#   gather here ROUND-TRIPS the perm host->device + values device->host (~96MB PCIe) so it");
@@ -153,8 +152,8 @@ fn main() {
     println!("#   on-device gather+reduce lower bound).\n");
 
     println!(
-        "  {:<10} {:>8} | {:>9} {:>9} | {:>9} {:>9} {:>9} {:>9} | {:>9} | {:>9} {:>9}",
-        "card", "groups", "2lvl ms", "hash ms", "radix ms", "  sort", "gather", "reduce", "integ ms", "2lvl/integ", "hash/integ",
+        "  {:<10} {:>8} | {:>9} | {:>9} {:>9} {:>9} {:>9} | {:>9} | {:>10}",
+        "card", "groups", "2lvl ms", "radix ms", "  sort", "gather", "reduce", "integ ms", "2lvl/integ",
     );
 
     for (k, &c) in cards.iter().enumerate() {
@@ -166,12 +165,6 @@ fn main() {
             .group_by_i32_count_sum_kernel_timed(goff32, off_value, &indices, true, kruns, grouped_agg_mask::ALL)
             .expect("two-level kernel");
         assert_eq!(twolevel_rows.len(), host_groups[k], "two-level group count mismatch @card {c}");
-
-        // ---- HASH-AGG path (wall p50; the 182-number path) ----
-        let (hash_us, hg) = timed_us(iters, || {
-            resident.grouped_stats_i32_from_payload(goff32, off_value, rows, grouped_agg_mask::ALL).unwrap().len()
-        });
-        assert_eq!(hg, host_groups[k], "hash-agg group count mismatch @card {c}");
 
         // ---- RADIX PIPELINE ----
         // (1) sort: the proven LSD-radix argsort (order_by_sort_i64 dispatches RADIX at n >= 10k).
@@ -210,17 +203,15 @@ fn main() {
         // since neither host round-trip is paid. Sort dominates this estimate.
         let integ_us = sort_us + 2.0 * reduce_us;
         println!(
-            "  {c:<10} {:>8} | {:>9.3} {:>9.3} | {:>9.3} {:>9.3} {:>9.3} {:>9.3} | {:>9.3} | {:>8.2}x {:>8.2}x",
+            "  {c:<10} {:>8} | {:>9.3} | {:>9.3} {:>9.3} {:>9.3} {:>9.3} | {:>9.3} | {:>9.2}x",
             host_groups[k],
             twolevel_ms,
-            hash_us / 1000.0,
             radix_us / 1000.0,
             sort_us / 1000.0,
             gather_us / 1000.0,
             reduce_us / 1000.0,
             integ_us / 1000.0,
             (twolevel_ms as f64) / (integ_us / 1000.0),
-            (hash_us / 1000.0) / (integ_us / 1000.0),
         );
     }
 
@@ -237,6 +228,6 @@ fn main() {
     );
     println!("# integ ms = sort + 2x reduce-scan (fused on-device gather+reduce lower bound). The radix");
     println!("#   pipeline is SORT-DOMINATED: sort is ~95%+ of integ, gather+reduce are sub-ms on-device.");
-    println!("# 2lvl/integ and hash/integ > 1 => radix beats that kernel at that cardinality (vs the");
-    println!("#   integrated estimate; the measured 'radix ms' is inflated by host PCIe round-trips).");
+    println!("# 2lvl/integ > 1 => radix beats the two-level kernel at that cardinality (vs the integrated");
+    println!("#   estimate; the measured 'radix ms' is inflated by host PCIe round-trips).");
 }

@@ -112,7 +112,7 @@ fn p8_default_resident_route_executes_accepted_shapes() {
     // Bucket 1 (10+20) and bucket 2 (30) both sum to 30 — a deliberate tie that all three paths
     // (resident GPU probe, cuda-driver-probe, default host) must resolve IDENTICALLY: equal SUMs
     // break by group ASC, so `... ORDER BY sum DESC LIMIT 1` is deterministically bucket 1. The
-    // resident path finalizes this in `launch_cuda_resident_i32_grouped_stats`; the host paths in
+    // resident path finalizes this in the per-group two-level GROUP BY kernel; the host paths in
     // `finalize_relational_select` (direction applied to the aggregate, group-ASC tie-break kept).
     e.execute_text(
             2,

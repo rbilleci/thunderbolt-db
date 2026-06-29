@@ -151,7 +151,14 @@ fn main() {
             }
         }));
     }
-    throughput("grouped_stats_i32 (~1M groups)", rows, Box::new(|| resident.grouped_stats_i32_from_payload(off_a, off_b, rows, gpu_db_execution::grouped_agg_mask::ALL).unwrap().len()));
+    // LIVE per-group GROUP BY kernel (the two-level shared-mem kernel the engine uses), grouping by the
+    // ~1M-distinct key column A and summing B over a full-table scan (indices = 0..rows, as the executor
+    // passes for an unfiltered GROUP BY). Replaces the removed `grouped_stats_i32` hash-agg measurement.
+    let gb_indices: Vec<u32> = (0..rows as u32).collect();
+    {
+        let gi = &gb_indices;
+        throughput("group_by_i32_count_sum_twolevel (~1M groups)", rows, Box::new(|| resident.group_by_i32_count_sum_from_payload(off_a, off_b, gi, gpu_db_execution::grouped_agg_mask::ALL).unwrap().len()));
+    }
 
     println!("\n# roofline = {roof:.0} GB/s (equal_any read). >=~80% on a 1-pass scan = saturated.");
 }
