@@ -28883,6 +28883,145 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_i32_sum_byte_identical_to_host_wrapping_oracle() {
+        // ADVERSARIAL AUDIT (commit 12d2034a — per-block tree reduction for the i32 sum kernel).
+        // The shipped closed-form test uses value[i] = i % 7 (all NON-negative, never wraps), so it
+        // does NOT exercise the load-bearing CLAIM: that the barrier-synchronized SHARED-MEMORY tree
+        // (u64 partials) is byte-identical to the old per-thread atom.add.u64 storm BECAUSE
+        // two's-complement (u64) addition is associative AND commutative (mod 2^64). This oracle drives
+        // `sum_i32_from_payload` and asserts the EXACT i64 against the host computed by `i64::wrapping_add`
+        // over the column in LINEAR order. If the kernel's tree grouping/order produced a different bit
+        // pattern under sign-reinterpretation or modular overflow, the linear host oracle would diverge.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Host oracle: sum i32 values widened to i64, modulo 2^64 (wrapping) in LINEAR order. The kernel
+        // groups/orders the adds differently (per-thread grid-stride, then a per-block halving tree, then
+        // one atomic per block); equality here is exactly the associativity/commutativity claim.
+        let host_wrapping_sum = |values: &[i32]| -> i64 {
+            values
+                .iter()
+                .fold(0_i64, |acc, &v| acc.wrapping_add(i64::from(v)))
+        };
+
+        let run = |values: &[i32]| -> i64 {
+            let n = values.len() as u64;
+            // SAFETY: `i32` is POD; native (little-endian) bytes match the resident column layout, and
+            // `values` outlives the synchronous retain copy.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let allocated = std::mem::size_of::<u64>() as u64 + column_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated.max(std::mem::size_of::<u64>() as u64),
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: std::mem::size_of::<u64>() as u64,
+                            bytes: column_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident column");
+            resident
+                .sum_i32_from_payload(std::mem::size_of::<u64>() as u64, n)
+                .expect("gpu sum")
+        };
+
+        let check = |values: &[i32], label: &str| {
+            let expected = host_wrapping_sum(values);
+            let gpu = run(values);
+            assert_eq!(
+                gpu, expected,
+                "GPU sum != host wrapping oracle for case '{label}' (n={})",
+                values.len()
+            );
+        };
+
+        // --- EDGE: row_count = 0 (grid clamped to 1 block; loop runs zero iterations in every thread;
+        // every s_part[tid] must be the zero-init %sum). Expect 0. ---
+        check(&[], "zero rows");
+
+        // --- EDGE: row_count < 256 (most threads contribute 0 -- their s_part[tid] MUST be the
+        // `mov.s64 %sum,0` init, not garbage). Mixed sign so the zero contributors are distinguishable
+        // from a hypothetical garbage add. ---
+        check(&[5], "single row");
+        check(&[i32::MIN], "single i32::MIN (negative -> high-bit-set u64 partial)");
+        check(&[i32::MAX, i32::MIN, -1, 1, 7], "5 rows mixed sign");
+        check(&[-7; 100], "100 negative rows (< one warp-block tail of 256)");
+        check(&[i32::MIN; 255], "255 negative rows (one short of a full block)");
+
+        // --- EDGE: partial last block (not a multiple of 256) + odd counts. ---
+        check(
+            &(0..257).map(|i| if i % 2 == 0 { i32::MAX } else { i32::MIN }).collect::<Vec<_>>(),
+            "257 alternating MAX/MIN (partial block, odd)",
+        );
+        check(
+            &(0..1001).map(|i| (i as i32) - 500).collect::<Vec<_>>(),
+            "1001 rows -500..500 (partial block, odd, mixed sign, true sum 500)",
+        );
+
+        // --- GRID-STRIDE WRAP: > 262144 rows (=1024 blocks * 256 threads), so each thread sums MANY
+        // rows into a large i64 partial. 4M+1 is NOT a multiple of the grid width nor of 256 (partial
+        // tail), with large-magnitude alternating values so partials are big and sign-mixed. ---
+        let big: Vec<i32> = (0..4_000_001_u64)
+            .map(|i| if i % 2 == 0 { i32::MAX - (i % 17) as i32 } else { i32::MIN + (i % 13) as i32 })
+            .collect();
+        check(&big, "4_000_001 large alternating (grid-stride wrap, partial tail)");
+
+        // --- THE CORE CLAIM: genuine mod-2^64 OVERFLOW in the u64 tree adds. A pure i32 sum cannot
+        // overflow i64 at feasible row counts (would need ~2^32 rows of i32::MAX, ~17GB), so a true i64
+        // wrap of the FINAL value is infeasible. BUT the tree/atomic adds happen in u64 and a NEGATIVE
+        // true sum is stored as a high-bit-set u64 (e.g. -10 -> 2^64-10); summing many such negative
+        // per-thread/per-block partials overflows 2^64 at EACH tree level and EACH block atomic and must
+        // wrap-around to land on the correct negative i64 bits. This column has a large NEGATIVE true sum
+        // produced by hundreds of thousands of threads each holding a negative partial, so the modular
+        // wrap in the tree is genuinely exercised; the linear host `wrapping_add` oracle is the only
+        // correct answer. We additionally assert below (non-vacuity) that the u64 intermediate sum of the
+        // raw partials really does exceed 2^64. ---
+        let neg_n = 2_000_003_u64; // > grid width, odd, partial tail
+        let neg: Vec<i32> = (0..neg_n).map(|_| i32::MIN).collect();
+        let expected_neg = host_wrapping_sum(&neg); // = (i32::MIN as i64) * neg_n, fits i64 (no FINAL wrap)
+        let gpu_neg = run(&neg);
+        assert_eq!(
+            gpu_neg, expected_neg,
+            "GPU sum != host oracle for the all-i32::MIN negative-partial wrap case (n={neg_n})"
+        );
+        // NON-VACUITY of the modular wrap: the sum of the per-thread u64 partials (each a negative-as-u64
+        // value) really does overflow 2^64. With the grid clamped to 1024*256 = 262144 threads, every
+        // active thread's partial is negative, and the u64 sum of all 262144 partials (= the same number
+        // as `expected_neg` reinterpreted, but the INTERMEDIATE u64 accumulation across positive-as-u64
+        // reinterpretations) crosses 2^64. Concretely: there are 262144 active threads, each holding a
+        // partial whose u64 value is >= 2^63 (negative), so summing just two of them already exceeds
+        // 2^64 -- the tree MUST wrap mod 2^64 at the very first level for the bits to stay correct.
+        let threads = 262_144_u128;
+        let min_partial_u64 = (i64::from(i32::MIN)) as u64 as u128; // negative -> ~2^63..2^64
+        assert!(
+            min_partial_u64 >= (1_u128 << 63),
+            "expected i32::MIN partial to set the u64 high bit (got {min_partial_u64:#x})"
+        );
+        assert!(
+            min_partial_u64 * 2 >= (1_u128 << 64),
+            "two negative-as-u64 partials must already overflow 2^64 (proves the tree adds wrap)"
+        );
+        let _ = threads; // documented thread count; the 2-partial overflow above is the load-bearing proof
+
+        // --- CONTROL: a large NON-negative grid-stride-wrap case (matches the shipped oracle's regime
+        // but at a partial-tail odd size), to confirm the wrapping path also stays correct when no high
+        // bit is set. ---
+        check(
+            &(0..3_000_007_u64).map(|i| (i % 7) as i32).collect::<Vec<_>>(),
+            "3_000_007 non-negative i%7 (grid-stride wrap, partial tail, control)",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn gpu_pooled_i32_between_stats_matches_expected() {
         // P2-M2 — between-stats pooled launch-migration correctness gate (GPU-native oracle).
         // The kernel is unchanged (parallel grid-stride count/sum/min/max for the [lo,hi] predicate,
