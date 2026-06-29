@@ -1572,7 +1572,49 @@ impl CudaResidentDeviceMemory {
         byte_offset: u64,
         row_count: u64,
     ) -> Result<(u64, i64, i32, i32), CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_scalar_stats(self, byte_offset, row_count)
+        launch_cuda_resident_i32_scalar_stats(self, byte_offset, row_count, None, None)
+    }
+
+    /// NULL-aware DIRECT scalar (count, sum, min, max) — the unfiltered nullable analogue of
+    /// [`scalar_stats_i32_from_payload`]. A NULL value (per `null_bitmap_offset`, 1 = valid) contributes
+    /// to NO statistic and is NOT counted, modelled EXACTLY on the grouped hash kernel's validity-bitmap
+    /// logic (sentinel `0xFFFF...` = no bitmap = every row valid). Replaces the self-grouped NULL-aware
+    /// hash kernel (`grouped_stats_i32_nullable_from_payload(off, off, rows, bitmap, <mask>)` with
+    /// group==value) on the scalar arm. `count` is the SURVIVING (non-NULL) row count; the caller maps
+    /// `count == 0` (all-NULL column) to SQL NULL. Byte-identical to the reduced self-grouped totals.
+    pub fn nullable_scalar_stats_i32_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        null_bitmap_offset: Option<u64>,
+    ) -> Result<(u64, i64, i32, i32), CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_scalar_stats(self, byte_offset, row_count, None, null_bitmap_offset)
+    }
+
+    /// FILTERED (+ optionally NULL-aware) DIRECT scalar (count, sum, min, max) — the filtered analogue of
+    /// [`scalar_stats_i32_from_payload`]. The filter `<col> <cmp> needle` runs ON-DEVICE (per-row
+    /// predication, comparison codes 1=lt/2=lte/3=gt/4=gte matching the grouped hash kernel EXACTLY) and
+    /// non-matching rows are SKIPPED; a NULL value (per `null_bitmap_offset`, 1 = valid; `None` = no
+    /// bitmap) is ALSO skipped (3VL — a NULL contributes to no statistic). `count` is the count of
+    /// SURVIVING (matching, non-NULL) rows; the caller maps `count == 0` (zero matches / all-NULL
+    /// survivors) to SQL NULL. Replaces the self-grouped filtered hash kernel
+    /// (`filtered_grouped_stats_i32_nullable_from_payload`) and the gather-to-host
+    /// `filtered_stats_i32_compare_from_payload` path. Byte-identical to those for non-empty results.
+    pub fn filtered_scalar_stats_i32_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        needle: i32,
+        comparison: CudaI32Comparison,
+        null_bitmap_offset: Option<u64>,
+    ) -> Result<(u64, i64, i32, i32), CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_scalar_stats(
+            self,
+            byte_offset,
+            row_count,
+            Some((byte_offset, needle, comparison)),
+            null_bitmap_offset,
+        )
     }
 
     /// `SUM` of a resident int4 column over a FILTERED set of row indices (the operator axis, doc 19):
@@ -12545,6 +12587,13 @@ fn launch_cuda_resident_i32_scalar_stats(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
     row_count: u64,
+    // `Some((filter_byte_offset, needle, comparison))` = an on-device per-row filter `<col> <cmp>
+    // needle` (non-matches skipped); `None` = no filter (the unfiltered fast path). The scalar arms
+    // always pass `filter_byte_offset == byte_offset` (the filter and aggregate are the SAME column).
+    filter: Option<(u64, i32, CudaI32Comparison)>,
+    // M3 (doc 21): `Some(off)` = the value column's NULL validity bitmap byte offset (1 = valid); `None`
+    // = no bitmap ⇒ every row valid (the no-NULL fast path). A NULL value contributes to NO statistic.
+    null_bitmap_offset: Option<u64>,
 ) -> Result<(u64, i64, i32, i32), CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -12560,18 +12609,25 @@ fn launch_cuda_resident_i32_scalar_stats(
         *mut *mut c_void,
     ) -> i32;
 
-    // DIRECT scalar-stats reduction — the MIN/MAX/AVG analogue of `gpu_db_resident_i32_sum`. Each
-    // thread accumulates (count, i64 sum, i32 min, i32 max) over its grid-stride slice, then the block
-    // reduces all four partials in a `bar.sync` SHARED-MEMORY tree (NOT shfl — the grid-stride loop
-    // exits per-thread at `done:` so warp lanes run a DIFFERENT iteration count and are NOT converged;
-    // bar.sync synchronizes the WHOLE block and every barrier below is on the straight-line path), and
-    // thread 0 issues ONE set of four global atomics for the block: add count, add sum (u64 two's-
-    // complement), min.s32, max.s32. count/sum atomic-adds are order-independent (mod 2^64), min/max
-    // are associative/commutative, so the result is byte-identical to the self-grouped path's reduced
-    // (count, sum, min, max). Host inits the 24-byte out struct count=0, sum=0, min=INT_MAX,
-    // max=INT_MIN (the min/max sentinels can't be a plain memset, so we H2D the init struct on-stream
-    // before the kernel). `.target sm_60` for the global min/max atomics. Saturating grid (.min) like
-    // sum; row_count==0 leaves the out struct at its init (count 0 => caller maps to SQL NULL).
+    // DIRECT scalar-stats reduction — the MIN/MAX/AVG analogue of `gpu_db_resident_i32_sum`, with an
+    // OPTIONAL on-device per-row filter and an OPTIONAL NULL-skip. Each thread accumulates (count, i64
+    // sum, i32 min, i32 max) over its grid-stride slice; per row it (1) optionally evaluates the filter
+    // `<col> <cmp> needle` (comparison 0=none/1=lt/2=lte/3=gt/4=gte, matching the grouped hash kernel
+    // EXACTLY) and SKIPS non-matches, then (2) optionally reads the validity bit (sentinel `0xFFFF...` =
+    // no bitmap ⇒ valid, modelled on `gpu_db_resident_i32_grouped_hash_aggregate`'s bitmap logic) and
+    // SKIPS NULL rows. Surviving rows do count++, sum+=v, min/max. The block then reduces all four
+    // partials in a `bar.sync` SHARED-MEMORY tree (NOT shfl — the grid-stride loop exits per-thread at
+    // `done:` so warp lanes run a DIFFERENT iteration count and are NOT converged; bar.sync synchronizes
+    // the WHOLE block and every barrier below is on the straight-line path), and thread 0 issues ONE set
+    // of four global atomics for the block: add count, add sum (u64 two's-complement), min.s32, max.s32.
+    // count/sum atomic-adds are order-independent (mod 2^64), min/max are associative/commutative, so the
+    // result is byte-identical to the self-grouped path's reduced (count, sum, min, max). The UNFILTERED
+    // NON-NULLABLE path (comparison==0, null_off==sentinel) takes a fast straight-line branch with NO
+    // per-row filter/bitmap load — byte- and speed-identical to the slice-a kernel. Host inits the
+    // 24-byte out struct count=0, sum=0, min=INT_MAX, max=INT_MIN (the min/max sentinels can't be a
+    // plain memset, so we H2D the init struct on-stream before the kernel). `.target sm_60` for the
+    // global min/max atomics. Saturating grid (.min) like sum; row_count==0 (or zero survivors) leaves
+    // the out struct at its init (count 0 => caller maps to SQL NULL).
     const PTX: &[u8] = br#"
 .version 6.0
 .target sm_60
@@ -12581,12 +12637,20 @@ fn launch_cuda_resident_i32_scalar_stats(
     .param .u64 resident_ptr,
     .param .u64 byte_offset,
     .param .u64 row_count,
-    .param .u64 out_ptr
+    .param .u64 out_ptr,
+    .param .u64 filter_byte_offset,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 value_null_bitmap_offset
 )
 {
     .reg .pred %p_done;
     .reg .pred %p_active;
     .reg .pred %p_isthr0;
+    .reg .pred %p_check;
+    .reg .pred %p_match;
+    .reg .pred %p_no_bitmap;
+    .reg .pred %p_valid;
     .shared .align 8 .b64 s_count[1024];
     .shared .align 8 .b64 s_sum[1024];
     .shared .align 4 .b32 s_min[1024];
@@ -12596,9 +12660,21 @@ fn launch_cuda_resident_i32_scalar_stats(
     .reg .u64 %rows;
     .reg .u64 %out;
     .reg .u64 %base;
+    .reg .u64 %filter_base;
     .reg .u64 %idx;
     .reg .u64 %stride;
     .reg .u64 %addr;
+    .reg .u64 %roff;
+    .reg .u32 %comparison;
+    .reg .s32 %needle;
+    .reg .s32 %filter_value;
+    .reg .u64 %val_null_off;
+    .reg .u64 %sentinel;
+    .reg .u64 %word_byte;
+    .reg .u64 %bitmap_addr;
+    .reg .u32 %bitmap_word;
+    .reg .u32 %bit_pos;
+    .reg .u32 %valid_bit;
     .reg .u32 %r_block;
     .reg .u32 %r_block_dim;
     .reg .u32 %thread;
@@ -12649,8 +12725,14 @@ fn launch_cuda_resident_i32_scalar_stats(
     ld.param.u64 %offset, [byte_offset];
     ld.param.u64 %rows, [row_count];
     ld.param.u64 %out, [out_ptr];
+    ld.param.u64 %filter_base, [filter_byte_offset];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %val_null_off, [value_null_bitmap_offset];
 
     add.u64 %base, %resident, %offset;
+    add.u64 %filter_base, %resident, %filter_base;
+    mov.u64 %sentinel, 0xFFFFFFFFFFFFFFFF;
     mov.u32 %r_block, %ctaid.x;
     mov.u32 %r_block_dim, %ntid.x;
     mov.u32 %thread, %tid.x;
@@ -12670,14 +12752,66 @@ fn launch_cuda_resident_i32_scalar_stats(
 loop:
     setp.ge.u64 %p_done, %idx, %rows;
     @%p_done bra done;
-    mul.lo.u64 %addr, %idx, 4;
-    add.u64 %addr, %base, %addr;
+    mul.lo.u64 %roff, %idx, 4;
+
+    // Optional on-device filter `<col> <cmp> needle` (comparison 0=none/1=lt/2=lte/3=gt/4=gte -- the
+    // SAME mapping as gpu_db_resident_i32_grouped_hash_aggregate). comparison==0 => no filter, fall
+    // straight through (the unfiltered fast branch, no filter load). Non-matches skip this row.
+    setp.eq.u32 %p_check, %comparison, 0;
+    @%p_check bra after_filter;
+    add.u64 %addr, %filter_base, %roff;
+    ld.global.s32 %filter_value, [%addr];
+    mov.pred %p_match, 0;
+    setp.eq.u32 %p_check, %comparison, 1;
+    @%p_check bra f_lt;
+    setp.eq.u32 %p_check, %comparison, 2;
+    @%p_check bra f_lte;
+    setp.eq.u32 %p_check, %comparison, 3;
+    @%p_check bra f_gt;
+    setp.eq.u32 %p_check, %comparison, 4;
+    @%p_check bra f_gte;
+    bra next_row;
+f_lt:
+    setp.lt.s32 %p_match, %filter_value, %needle;
+    bra f_done;
+f_lte:
+    setp.le.s32 %p_match, %filter_value, %needle;
+    bra f_done;
+f_gt:
+    setp.gt.s32 %p_match, %filter_value, %needle;
+    bra f_done;
+f_gte:
+    setp.ge.s32 %p_match, %filter_value, %needle;
+f_done:
+    @!%p_match bra next_row;
+
+after_filter:
+    // Optional NULL-skip (M3 3VL): a NULL value contributes to no statistic. val_null_off == sentinel
+    // (0xFFFF...) => no validity bitmap => every row valid (skip the load). Modelled EXACTLY on the
+    // grouped hash kernel's validity-bitmap logic (1 = valid/present, 0 = NULL).
+    setp.eq.u64 %p_no_bitmap, %val_null_off, %sentinel;
+    @%p_no_bitmap bra accumulate;
+    shr.u64 %word_byte, %idx, 5;          // idx / 32 (the validity word index)
+    mul.lo.u64 %word_byte, %word_byte, 4; // * 4 bytes per u32 word
+    add.u64 %bitmap_addr, %resident, %val_null_off;
+    add.u64 %bitmap_addr, %bitmap_addr, %word_byte;
+    ld.global.u32 %bitmap_word, [%bitmap_addr];
+    cvt.u32.u64 %bit_pos, %idx;
+    and.b32 %bit_pos, %bit_pos, 31;       // idx % 32
+    bfe.u32 %valid_bit, %bitmap_word, %bit_pos, 1;
+    setp.eq.u32 %p_valid, %valid_bit, 1;  // 1 = valid/present, 0 = NULL
+    @!%p_valid bra next_row;              // NULL value => skip this row
+
+accumulate:
+    add.u64 %addr, %base, %roff;
     ld.global.s32 %r_value, [%addr];
     cvt.s64.s32 %wide, %r_value;
     add.s64 %sum, %sum, %wide;
     add.u64 %count, %count, 1;
     min.s32 %min, %min, %r_value;
     max.s32 %max, %max, %r_value;
+
+next_row:
     add.u64 %idx, %idx, %stride;
     bra loop;
 
@@ -12769,6 +12903,27 @@ block_done:
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
 
+    // Filter args: `None` => comparison 0 (no filter; filter_base unused, point it at the value column).
+    // `Some` => the bounds-checked filter column + needle + the comparison `.code()` (1..4, the SAME
+    // mapping the grouped hash kernel uses).
+    let (filter_byte_offset, needle, comparison_code) = match filter {
+        Some((filter_byte_offset, needle, comparison)) => {
+            let filter_bytes = row_count
+                .checked_mul(std::mem::size_of::<i32>() as u64)
+                .and_then(|bytes| filter_byte_offset.checked_add(bytes))
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if filter_bytes > resident.metadata().allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    filter_bytes as usize,
+                ));
+            }
+            (filter_byte_offset, needle, comparison.code())
+        }
+        None => (byte_offset, 0, 0),
+    };
+    // u64::MAX sentinel when there is no validity bitmap; otherwise the bounds-checked byte offset.
+    let null_off_value = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
+
     let cu_launch_kernel = unsafe {
         resident
             .lib()
@@ -12820,11 +12975,19 @@ block_done:
         let mut offset_arg = byte_offset;
         let mut rows_arg = row_count;
         let mut output_arg = output_ptr;
+        let mut filter_off_arg = filter_byte_offset;
+        let mut needle_arg = needle;
+        let mut comparison_arg = comparison_code;
+        let mut null_off_arg = null_off_value;
         let mut args = [
             (&mut resident_arg as *mut u64).cast::<c_void>(),
             (&mut offset_arg as *mut u64).cast::<c_void>(),
             (&mut rows_arg as *mut u64).cast::<c_void>(),
             (&mut output_arg as *mut u64).cast::<c_void>(),
+            (&mut filter_off_arg as *mut u64).cast::<c_void>(),
+            (&mut needle_arg as *mut i32).cast::<c_void>(),
+            (&mut comparison_arg as *mut u32).cast::<c_void>(),
+            (&mut null_off_arg as *mut u64).cast::<c_void>(),
         ];
         unsafe {
             cu_launch_kernel(
@@ -29600,6 +29763,253 @@ mod tests {
         spread[2_500_000] = i32::MAX; // a single real max buried mid-stream
         spread[1_999_999] = i32::MIN; // a single real min buried mid-stream
         check(&spread, "3M spread with single buried i32::MIN/MAX (grid-stride, partial tail)");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_filtered_nullable_scalar_stats_byte_identical_to_self_grouped_and_host_oracle() {
+        // SLICE B (the direct (count,sum,min,max) reduction extended with an on-device FILTER + NULL-skip,
+        // replacing `filtered_grouped_stats_i32_nullable_from_payload` / `grouped_stats_i32_nullable_from_
+        // payload` / the gather-to-host `filtered_stats_i32_compare_from_payload`).
+        //
+        // The load-bearing CLAIM is BYTE-IDENTITY of the SURVIVING-row stats: the new direct kernel's
+        // (count, sum, min, max) over the rows passing `<col> <cmp> needle` AND the validity bitmap must
+        // equal (a) an independent HOST oracle AND (b) the OLD self-grouped path reduced EXACTLY as the
+        // engine arm reduced it (sum of group.count, sum of group.sum, min of group.min, max of group.max).
+        // Focus: NULL-skip (placeholder 0 must never leak), the four comparison codes, negatives, sentinel
+        // i32::MIN/MAX as REAL data, all-survivors-NULL (=> count 0 => SQL NULL), and zero-match filter
+        // (=> count 0 => SQL NULL). A no-bitmap (`None`) variant covers the filtered NON-nullable path.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Retain a self-grouped resident column (group == value == filter) plus its validity bitmap.
+        let retain = |values: &[i32], bitmap: &[u32]| {
+            let n = values.len() as u64;
+            // SAFETY: i32/u32 are POD; native little-endian bytes match the kernels' ld.global; the slices
+            // outlive this synchronous retain.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let bitmap_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(bitmap.as_ptr().cast::<u8>(), bitmap.len() * 4) };
+            let header = n.to_le_bytes();
+            let header_len = std::mem::size_of::<u64>() as u64;
+            let null_offset = header_len + column_bytes.len() as u64;
+            let allocated =
+                (null_offset + bitmap_bytes.len() as u64).max(std::mem::size_of::<u64>() as u64);
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+                        CudaDeviceMemoryChunk { byte_offset: header_len, bytes: column_bytes },
+                        CudaDeviceMemoryChunk { byte_offset: null_offset, bytes: bitmap_bytes },
+                    ],
+                )
+                .expect("retain resident column + validity bitmap");
+            (resident, header_len, null_offset)
+        };
+
+        // Reduce a self-grouped result EXACTLY as the OLD engine arm did. `None` count (no surviving group)
+        // is the zero-survivor case the engine mapped to SQL NULL; we model it as `(0, 0, i32::MAX,
+        // i32::MIN)` to A/B against the direct kernel's init-sentinel output when count == 0.
+        let reduce_grouped = |groups: &[CudaI32GroupedStats]| -> (u64, i64, i32, i32) {
+            let count: u64 = groups.iter().map(|g| g.count).sum();
+            let sum: i64 = groups.iter().map(|g| g.sum).sum();
+            let min = groups.iter().map(|g| g.min).min().unwrap_or(i32::MAX);
+            let max = groups.iter().map(|g| g.max).max().unwrap_or(i32::MIN);
+            (count, sum, min, max)
+        };
+        // HOST oracle over the rows surviving the filter AND the validity predicate.
+        let host_oracle =
+            |values: &[i32], valid: &dyn Fn(usize) -> bool, keep: &dyn Fn(i32) -> bool| -> (u64, i64, i32, i32) {
+                let survivors: Vec<i32> = values
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, &v)| valid(*i) && keep(v))
+                    .map(|(_, &v)| v)
+                    .collect();
+                let count = survivors.len() as u64;
+                let sum = survivors.iter().fold(0_i64, |acc, &v| acc.wrapping_add(i64::from(v)));
+                let min = survivors.iter().copied().min().unwrap_or(i32::MAX);
+                let max = survivors.iter().copied().max().unwrap_or(i32::MIN);
+                (count, sum, min, max)
+            };
+
+        let cmp_keep = |cmp: CudaI32Comparison, needle: i32| -> Box<dyn Fn(i32) -> bool> {
+            match cmp {
+                CudaI32Comparison::Lt => Box::new(move |v| v < needle),
+                CudaI32Comparison::Lte => Box::new(move |v| v <= needle),
+                CudaI32Comparison::Gt => Box::new(move |v| v > needle),
+                CudaI32Comparison::Gte => Box::new(move |v| v >= needle),
+            }
+        };
+
+        // ---------- (A) FILTERED + NULLABLE: A/B the direct kernel vs the self-grouped nullable hash path
+        // and the host oracle, over a column with NULLs (placeholder 0), negatives, and the i32 sentinels.
+        // is_null every 9th row; non-null values include negatives, both sentinels, and zeros-as-real only
+        // on NON-null rows would be ambiguous with the placeholder, so non-null values avoid 0.
+        let n: usize = 4096 + 137; // > one block, odd tail, two grid-stride iters at clamp
+        let is_null = |i: usize| i % 9 == 0;
+        let raw: Vec<i32> = (0..n)
+            .map(|i| {
+                if is_null(i) {
+                    0 // NULL placeholder (must be excluded by the bitmap, never counted)
+                } else {
+                    match i % 11 {
+                        0 => i32::MIN,
+                        1 => i32::MAX,
+                        2 => -1,
+                        3 => -1_000_000,
+                        4 => 500_000,
+                        k => (k as i32) - 5, // small mixed incl negatives, never 0 collides harmlessly
+                    }
+                }
+            })
+            .collect();
+        let mut bitmap = vec![0u32; n.div_ceil(32)];
+        for i in 0..n {
+            if !is_null(i) {
+                bitmap[i / 32] |= 1u32 << (i % 32);
+            }
+        }
+        let (resident, off, null_off) = retain(&raw, &bitmap);
+        let rows = n as u64;
+        let valid = |i: usize| !is_null(i);
+
+        for cmp in [
+            CudaI32Comparison::Lt,
+            CudaI32Comparison::Lte,
+            CudaI32Comparison::Gt,
+            CudaI32Comparison::Gte,
+        ] {
+            for &needle in &[i32::MIN, -1_000_000, -1, 0, 500_000, i32::MAX, 7] {
+                let keep = cmp_keep(cmp, needle);
+                let oracle = host_oracle(&raw, &valid, &keep);
+
+                let direct = resident
+                    .filtered_scalar_stats_i32_from_payload(off, rows, needle, cmp, Some(null_off))
+                    .expect("direct filtered nullable scalar stats");
+                // OLD path: NULL-aware filtered self-grouped (group == value == filter), reduced as the arm.
+                let grouped = resident
+                    .filtered_grouped_stats_i32_nullable_from_payload(
+                        off,
+                        rows,
+                        needle,
+                        cmp,
+                        Some(null_off),
+                        grouped_agg_mask::ALL,
+                    )
+                    .expect("self-grouped filtered nullable stats");
+                let reduced = reduce_grouped(&grouped);
+
+                assert_eq!(
+                    direct, oracle,
+                    "DIRECT filtered+nullable != host oracle (cmp={cmp:?}, needle={needle})"
+                );
+                if oracle.0 > 0 {
+                    // Non-empty: the surviving (count, sum, min, max) is byte-identical to the OLD reduced
+                    // self-grouped totals.
+                    assert_eq!(
+                        direct, reduced,
+                        "DIRECT filtered+nullable != reduced self-grouped (cmp={cmp:?}, needle={needle})"
+                    );
+                } else {
+                    // Zero survivors: the engine maps count==0 to SQL NULL; the kernel leaves the init
+                    // sentinels (count 0, sum 0, min INT_MAX, max INT_MIN) -- and so does the reduced empty
+                    // self-grouped result, so they still agree.
+                    assert_eq!(direct.0, 0, "zero-survivor count must be 0 (=> SQL NULL)");
+                    assert_eq!(
+                        direct, reduced,
+                        "empty direct vs empty reduced self-grouped (cmp={cmp:?}, needle={needle})"
+                    );
+                }
+                // The NULL placeholder 0 must never be folded in: a `<= 0`-ish filter that WOULD admit the
+                // placeholder still excludes it (the bitmap, not the filter, is what drops NULL rows).
+                if matches!(cmp, CudaI32Comparison::Gte) && needle <= 0 {
+                    let n_null = (0..n).filter(|&i| is_null(i)).count() as u64;
+                    let n_nonnull_ge = raw
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, &v)| !is_null(*i) && v >= needle)
+                        .count() as u64;
+                    assert_eq!(
+                        direct.0, n_nonnull_ge,
+                        "NULL placeholders must be excluded (n_null={n_null} not counted)"
+                    );
+                }
+            }
+        }
+
+        // all-survivors-NULL: a needle that ALL non-null rows fail (here `< i32::MIN` is unsatisfiable) =>
+        // zero survivors even ignoring NULLs; AND an all-NULL column => zero survivors via the bitmap.
+        let unsat = resident
+            .filtered_scalar_stats_i32_from_payload(off, rows, i32::MIN, CudaI32Comparison::Lt, Some(null_off))
+            .expect("unsatisfiable filter");
+        assert_eq!(unsat.0, 0, "v < i32::MIN matches nothing => count 0 => SQL NULL");
+
+        // ---------- (B) FILTERED NON-NULLABLE (no bitmap, `None`): A/B vs the NON-null self-grouped path
+        // and host oracle. This is the path that REPLACES the gather-to-host project+CPU reduce.
+        let nn: Vec<i32> = (0..2000)
+            .map(|i| match i % 13 {
+                0 => i32::MIN,
+                1 => i32::MAX,
+                2 => -(i as i32),
+                k => (i as i32) - (k as i32) * 7,
+            })
+            .collect();
+        let nn_bitmap = vec![0u32; nn.len().div_ceil(32)]; // unused (None path), but retain needs a slice
+        let (resident_nn, off_nn, _null_nn) = retain(&nn, &nn_bitmap);
+        let nn_rows = nn.len() as u64;
+        let all_valid = |_: usize| true;
+        for cmp in [
+            CudaI32Comparison::Lt,
+            CudaI32Comparison::Lte,
+            CudaI32Comparison::Gt,
+            CudaI32Comparison::Gte,
+        ] {
+            for &needle in &[i32::MIN, -50, 0, 50, i32::MAX] {
+                let keep = cmp_keep(cmp, needle);
+                let oracle = host_oracle(&nn, &all_valid, &keep);
+                let direct = resident_nn
+                    .filtered_scalar_stats_i32_from_payload(off_nn, nn_rows, needle, cmp, None)
+                    .expect("direct filtered non-nullable scalar stats");
+                let grouped = resident_nn
+                    .filtered_grouped_stats_i32_compare_from_payload(off_nn, off_nn, off_nn, nn_rows, needle, cmp)
+                    .expect("self-grouped filtered non-nullable stats");
+                let reduced = reduce_grouped(&grouped);
+                assert_eq!(
+                    direct, oracle,
+                    "DIRECT filtered non-nullable != host oracle (cmp={cmp:?}, needle={needle})"
+                );
+                assert_eq!(
+                    direct, reduced,
+                    "DIRECT filtered non-nullable != reduced self-grouped (cmp={cmp:?}, needle={needle})"
+                );
+            }
+        }
+
+        // ---------- (C) UNFILTERED NULLABLE (no filter, with bitmap): A/B vs the nullable self-grouped path
+        // -- the `ResidentPredicate::All` nullable arm. Also covers the all-NULL => count 0 => NULL corner.
+        let direct_all = resident
+            .nullable_scalar_stats_i32_from_payload(off, rows, Some(null_off))
+            .expect("direct unfiltered nullable scalar stats");
+        let grouped_all = resident
+            .grouped_stats_i32_nullable_from_payload(off, off, rows, Some(null_off), grouped_agg_mask::ALL)
+            .expect("self-grouped unfiltered nullable stats");
+        let reduced_all = reduce_grouped(&grouped_all);
+        let oracle_all = host_oracle(&raw, &valid, &|_| true);
+        assert_eq!(direct_all, oracle_all, "DIRECT unfiltered nullable != host oracle");
+        assert_eq!(direct_all, reduced_all, "DIRECT unfiltered nullable != reduced self-grouped");
+
+        // all-NULL column => zero survivors => count 0 (=> SQL NULL).
+        let all_null: Vec<i32> = vec![0; 333];
+        let all_null_bitmap = vec![0u32; all_null.len().div_ceil(32)]; // every bit 0 = every row NULL
+        let (resident_an, off_an, null_an) = retain(&all_null, &all_null_bitmap);
+        let direct_an = resident_an
+            .nullable_scalar_stats_i32_from_payload(off_an, all_null.len() as u64, Some(null_an))
+            .expect("direct all-null scalar stats");
+        assert_eq!(direct_an.0, 0, "all-NULL column => count 0 => SQL NULL");
     }
 
     #[test]

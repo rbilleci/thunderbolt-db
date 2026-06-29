@@ -1111,8 +1111,8 @@ fn gpu_s10a_text_prefix_like_count_nullable_text_pg_correct_on_device() {
 #[test]
 fn gpu_resident_empty_nonnullable_scalar_aggregate_min_max_avg_is_null() {
     // AUDIT (commit 75aeb493): the direct scalar-stats path maps `count == 0` (empty input) to
-    // SqlValue::Null. SQL spec: an aggregate over ZERO rows is NULL (matching the NULLABLE path's
-    // all-NULL behavior and `reduce_nullable_grouped_stats`'s "PG: an aggregate of no rows is NULL").
+    // SqlValue::Null via `finalize_direct_scalar_stats`. SQL spec: an aggregate over ZERO rows is NULL
+    // (matching the NULLABLE path's all-NULL behavior — "PG: an aggregate of no rows is NULL").
     // This corner (an EMPTY, NON-nullable, UNFILTERED resident table) was UNTESTED; this pins it so a
     // future regression to the old empty sentinels (MIN/MAX -> Text("") / AVG -> Numeric(0)) is caught.
     let mut e = Engine::new_local();
@@ -1376,12 +1376,14 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(resident.fallback_reason, None);
         assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+        // Slice b: the filtered non-nullable compare arm now reduces on-device via the DIRECT
+        // scalar-stats kernel (was a gather-to-host project + CPU reduce), so the D2H is the fixed
+        // 24-byte (count u64 + sum i64 + min/max i32) stats struct.
         assert_eq!(
             after.d2h_bytes_total - before.d2h_bytes_total,
             (std::mem::size_of::<u64>()
                 + std::mem::size_of::<i64>()
-                + (2 * std::mem::size_of::<i32>())
-                + std::mem::size_of::<u64>()) as u64,
+                + (2 * std::mem::size_of::<i32>())) as u64,
             "{sql}"
         );
         assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
@@ -1423,10 +1425,12 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         .execute_resident_plan(&empty_max)
         .unwrap();
     let after = e.metrics().snapshot();
-    // Closed-form oracle (S9): MAX over no surviving rows (amount >= 1000) returns this legacy probe's
-    // empty-result sentinel -- an empty-text value (a quirk of the resident scalar-aggregate probe; the
-    // general executor returns SQL NULL, see the M3 tests). Behavior-preserved here; retired in S10.
-    assert_eq!(resident.rows, vec![vec![SqlValue::Text(String::new())]]);
+    // Closed-form oracle (S9): MAX over no surviving rows (amount >= 1000) is SQL NULL -- an aggregate of
+    // no rows is NULL (SQL spec). The provably-empty-domain fast path answers from the retained column
+    // stats with NO kernel launch (only the i64 result counter D2H is charged), matching what the direct
+    // filtered kernel finalizes for a zero-match count (slice b: the filtered non-nullable empty corner
+    // is corrected from the old empty-text sentinel to NULL).
+    assert_eq!(resident.rows, vec![vec![SqlValue::Null]]);
     assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(resident.fallback_reason, None);

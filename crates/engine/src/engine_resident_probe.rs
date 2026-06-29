@@ -297,92 +297,41 @@ fn materialize_resident_scalar_stats(
     })
 }
 
-/// The aggregate-selection mask (`grouped_agg_mask`) for a scalar self-grouped reduction: request only
-/// the per-group field(s) the reduction actually reads, so the grouped kernel runs strictly fewer per-row
-/// update atomics (the masked-out fields stay at their init sentinels and are never read). SUM reads sum;
-/// AVG reads count+sum; MIN reads min; MAX reads max; COUNT reads count. Byte-identical to ALL for the
-/// consumed field(s); see [`reduce_nullable_grouped_stats`] and the unfiltered scalar arm.
-fn scalar_aggregate_mask(aggregate: &ResidentScalarAggregate) -> u32 {
-    match aggregate {
-        // SUM and AVG both need COUNT: `reduce_nullable_grouped_stats` uses total_count==0 as the
-        // zero-survivor => SQL NULL test (an aggregate of no non-NULL/matching rows is NULL, never 0).
-        // Masking COUNT out would leave count at its 0 sentinel => total_count 0 => wrongly NULL even
-        // when survivors exist. MIN/MAX instead detect "no survivors" via the empty group LIST, so they
-        // need only their own field.
-        ResidentScalarAggregate::Sum { .. } => grouped_agg_mask::COUNT | grouped_agg_mask::SUM,
-        ResidentScalarAggregate::Avg { .. } => grouped_agg_mask::COUNT | grouped_agg_mask::SUM,
-        ResidentScalarAggregate::Min { .. } => grouped_agg_mask::MIN,
-        ResidentScalarAggregate::Max { .. } => grouped_agg_mask::MAX,
-        ResidentScalarAggregate::Count => grouped_agg_mask::COUNT,
-    }
-}
-
-/// Reduce the NULL-aware self-grouped stats (M3 — doc 21) of a scalar SUM/AVG/MIN/MAX into one value.
-/// The groups cover only the surviving non-NULL (and, when filtered, matching) rows, so a zero-survivor
-/// result is SQL NULL for every aggregate (PG: an aggregate of no rows is NULL — never 0 or the
-/// empty-text sentinel). Shared by the unfiltered-nullable and filtered-compare-nullable paths. COUNT is
-/// not on this path (it routes to `run_resident_count`).
-fn reduce_nullable_grouped_stats(
+/// Finalize a scalar SUM/AVG/MIN/MAX from the DIRECT (count, sum, min, max) reduction kernel
+/// (`gpu_db_resident_i32_scalar_stats`). `count` is the
+/// number of SURVIVING rows (after any on-device filter and NULL-skip), so `count == 0` (no surviving
+/// rows) ⇒ SQL NULL for every aggregate (PG: an aggregate of no rows is NULL — never 0 or the empty-text
+/// sentinel). Otherwise MIN = `Int4(min)`, MAX = `Int4(max)`, SUM = `Int8(sum)`, AVG =
+/// `average_sql_value(i128::from(sum), count)` (the SAME rounding as the self-grouped reduction it
+/// replaces, so non-empty results are byte-identical). COUNT routes to `run_resident_count`, not here.
+fn finalize_direct_scalar_stats(
     aggregate: ResidentScalarAggregate,
-    grouped_stats: &[CudaI32GroupedStats],
+    count: u64,
+    sum: i64,
+    min: i32,
+    max: i32,
 ) -> Result<SqlValue, ExecuteError> {
-    let total_count = grouped_stats.iter().map(|group| group.count).sum::<u64>();
-    let total_sum = grouped_stats.iter().map(|group| group.sum).sum::<i64>();
+    if count == 0 {
+        return Ok(SqlValue::Null);
+    }
     Ok(match aggregate {
-        ResidentScalarAggregate::Sum { .. } => {
-            if total_count == 0 {
-                SqlValue::Null
-            } else {
-                SqlValue::Int8(total_sum)
-            }
-        }
-        ResidentScalarAggregate::Avg { .. } => {
-            if total_count == 0 {
-                SqlValue::Null
-            } else {
-                average_sql_value(
-                    i128::from(total_sum),
-                    usize::try_from(total_count).map_err(|_| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "resident device-memory scalar aggregate count {total_count} exceeds AVG result range"
-                        )))
-                    })?,
-                )
-            }
-        }
-        ResidentScalarAggregate::Min { .. } => grouped_stats
-            .iter()
-            .map(|group| group.min)
-            .min()
-            .map(SqlValue::Int4)
-            .unwrap_or(SqlValue::Null),
-        ResidentScalarAggregate::Max { .. } => grouped_stats
-            .iter()
-            .map(|group| group.max)
-            .max()
-            .map(SqlValue::Int4)
-            .unwrap_or(SqlValue::Null),
+        ResidentScalarAggregate::Sum { .. } => SqlValue::Int8(sum),
+        ResidentScalarAggregate::Avg { .. } => average_sql_value(
+            i128::from(sum),
+            usize::try_from(count).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident device-memory scalar aggregate count {count} exceeds AVG result range"
+                )))
+            })?,
+        ),
+        ResidentScalarAggregate::Min { .. } => SqlValue::Int4(min),
+        ResidentScalarAggregate::Max { .. } => SqlValue::Int4(max),
         ResidentScalarAggregate::Count => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident COUNT routed to scalar path".to_string(),
+                "resident COUNT routed to the direct scalar-stats path".to_string(),
             )));
         }
     })
-}
-
-/// D2H byte estimate for a `grouped_stats` reduction: the group columns (i32 group + u64 count + i64 sum
-/// + 2×i32 min/max) per group plus the u64 group-count header. Shared by the nullable scalar paths.
-fn nullable_grouped_stats_d2h_bytes(copied_group_count: usize) -> u64 {
-    copied_group_count
-        .checked_mul(
-            std::mem::size_of::<i32>()
-                + std::mem::size_of::<u64>()
-                + std::mem::size_of::<i64>()
-                + (2 * std::mem::size_of::<i32>()),
-        )
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .unwrap_or(u64::MAX)
 }
 
 impl Engine {
@@ -559,10 +508,10 @@ impl Engine {
         let agg_null_offset = resident_device_null_column_offset(snapshot, table, agg_col)?;
 
         // MAX over a provably-empty int4 compare domain: the retained column stats already prove the
-        // result is empty, so answer from them with no kernel launch (matches the pre-unification
-        // filtered probe's fast path; only the D2H of the i64 result counter is charged). Non-nullable
-        // only — a nullable column routes through the NULL-aware filtered kernel below (which finalizes
-        // an empty result to SQL NULL, not the empty-text sentinel).
+        // result is empty, so answer from them with no kernel launch (only the D2H of the i64 result
+        // counter is charged). The result is SQL NULL — an aggregate of no rows is NULL (SQL spec) —
+        // matching what the direct filtered kernel below finalizes for a zero-match count. Non-nullable
+        // only; a nullable column routes through the NULL-aware filtered kernel below (also ⇒ NULL).
         if let (
             ResidentScalarAggregate::Max { col },
             ResidentPredicate::Int4Compare {
@@ -578,7 +527,7 @@ impl Engine {
                     .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
                 return Ok(self.resident_scalar_result(
                     bound,
-                    SqlValue::Text(String::new()),
+                    SqlValue::Null,
                     gpu_id,
                     access_path,
                 ));
@@ -682,20 +631,26 @@ impl Engine {
             // SQL NULL for every aggregate (PG: SUM/AVG/MIN/MAX of no rows is NULL; COUNT is not on this
             // path). `agg_null_offset` is `Some` here by the match guard above.
             ResidentPredicate::All => {
+                // DIRECT NULL-aware scalar-stats reduction (the nullable analogue of the fast path
+                // above): one grid-stride streaming pass that skips NULL rows ON-DEVICE via the
+                // validity bitmap, computing (count, sum, min, max) over only the non-NULL rows at the
+                // memory-bound roofline. REPLACES the self-grouped NULL-aware hash kernel
+                // (`grouped_stats_i32_nullable_from_payload(off, off, rows, bitmap, <mask>)` with
+                // group == value), which built an O(distinct)-entry hash table just to reduce. count is
+                // the SURVIVING (non-NULL) row count; count == 0 (all-NULL column) ⇒ SQL NULL for every
+                // aggregate. Byte-identical to the reduced self-grouped totals, INCLUDING the empty case
+                // (the old `reduce_nullable_grouped_stats` already returned NULL for zero survivors).
                 let started = Instant::now();
-                let grouped_stats = device_memory
-                    .grouped_stats_i32_nullable_from_payload(
-                        byte_offset,
-                        byte_offset,
-                        row_count,
-                        agg_null_offset,
-                        scalar_aggregate_mask(&aggregate),
-                    )
+                let (count, sum, min, max) = device_memory
+                    .nullable_scalar_stats_i32_from_payload(byte_offset, row_count, agg_null_offset)
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
                 let elapsed = started.elapsed();
-                let result_value = reduce_nullable_grouped_stats(aggregate, &grouped_stats)?;
-                self.metrics
-                    .observe_d2h_bytes(nullable_grouped_stats_d2h_bytes(grouped_stats.len()));
+                let result_value = finalize_direct_scalar_stats(aggregate, count, sum, min, max)?;
+                let result_d2h_bytes = (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>()))
+                    as u64;
+                self.metrics.observe_d2h_bytes(result_d2h_bytes);
                 self.metrics.observe_kernel_exec_ms(
                     elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
                 );
@@ -707,21 +662,30 @@ impl Engine {
             ResidentPredicate::Int4Compare {
                 needle, comparison, ..
             } if agg_null_offset.is_some() => {
+                // DIRECT filtered + NULL-aware scalar-stats reduction: one grid-stride pass evaluates
+                // the filter `<value> <cmp> needle` AND skips NULL rows ON-DEVICE, so the (count, sum,
+                // min, max) covers only the surviving non-NULL matches. REPLACES the self-grouped
+                // NULL-aware filtered hash kernel (`filtered_grouped_stats_i32_nullable_from_payload`).
+                // count == 0 (zero matches / all-NULL survivors) ⇒ SQL NULL. Byte-identical to the
+                // reduced self-grouped totals for non-empty, and the old reduction already mapped zero
+                // survivors to NULL — so the empty corner is unchanged here too.
                 let started = Instant::now();
-                let grouped_stats = device_memory
-                    .filtered_grouped_stats_i32_nullable_from_payload(
+                let (count, sum, min, max) = device_memory
+                    .filtered_scalar_stats_i32_from_payload(
                         byte_offset,
                         row_count,
                         *needle,
                         *comparison,
                         agg_null_offset,
-                        scalar_aggregate_mask(&aggregate),
                     )
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
                 let elapsed = started.elapsed();
-                let result_value = reduce_nullable_grouped_stats(aggregate, &grouped_stats)?;
-                self.metrics
-                    .observe_d2h_bytes(nullable_grouped_stats_d2h_bytes(grouped_stats.len()));
+                let result_value = finalize_direct_scalar_stats(aggregate, count, sum, min, max)?;
+                let result_d2h_bytes = (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>()))
+                    as u64;
+                self.metrics.observe_d2h_bytes(result_d2h_bytes);
                 self.metrics.observe_kernel_exec_ms(
                     elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
                 );
@@ -730,21 +694,30 @@ impl Engine {
             ResidentPredicate::Int4Compare {
                 needle, comparison, ..
             } => {
+                // DIRECT filtered scalar-stats reduction (non-nullable): one grid-stride pass evaluates
+                // the filter `<value> <cmp> needle` ON-DEVICE and reduces the matches to (count, sum,
+                // min, max). REPLACES `filtered_stats_i32_compare_from_payload`, which projected EVERY
+                // matching value to a host `Vec<i32>` and reduced on the CPU (`CudaI32Stats::from_values`)
+                // — O(matches) D2H + host work. Byte-identical to that for NON-empty results (same i64
+                // sum, same min/max, same AVG rounding). The ONLY result change is the empty corner:
+                // count == 0 (zero matches) now ⇒ SQL NULL (the deliberate SQL-spec correction), where
+                // the old path emitted the empty-text/Int8(0) sentinels for MIN/MAX/AVG.
                 let started = Instant::now();
-                let stats = device_memory
-                    .filtered_stats_i32_compare_from_payload(
+                let (count, sum, min, max) = device_memory
+                    .filtered_scalar_stats_i32_from_payload(
                         byte_offset,
                         row_count,
                         *needle,
                         *comparison,
+                        None,
                     )
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
                 let elapsed = started.elapsed();
-                let result_value = materialize_resident_scalar_stats(aggregate, &stats)?;
+                let result_value = finalize_direct_scalar_stats(aggregate, count, sum, min, max)?;
                 let result_d2h_bytes = (std::mem::size_of::<u64>()
                     + std::mem::size_of::<i64>()
-                    + (2 * std::mem::size_of::<i32>())
-                    + std::mem::size_of::<u64>()) as u64;
+                    + (2 * std::mem::size_of::<i32>()))
+                    as u64;
                 self.metrics.observe_d2h_bytes(result_d2h_bytes);
                 self.metrics
                     .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
