@@ -231,6 +231,10 @@ concurrent index maintenance on writes (lock-free CAS inserts below), and the de
   only one shard's working set need be resident at a time, so a **single GPU serves relations far larger than its
   VRAM**. Explicit STRATA admission (software-managed) — not hardware demand-paging, not CPU execution — so it is
   charter-compliant (ADR-006/007) and lets S10d delete the host execution path without losing over-VRAM coverage.
+  **Mechanism (vs. demand paging, enforceable):** explicit device shards (`cuMemAlloc`) + async bulk copies
+  (`cuMemcpy*Async`) overlapped on a copy stream — **never Unified Memory / `cudaMallocManaged`**; the kernel only
+  ever receives resident-shard pointers, so a page fault is **impossible by construction** (proactive-by-plan, not
+  reactive-by-fault; coarse shard, not a hardware page; never stalls a warp on a miss). See DECISIONS ADR-012.
 - **Multi-GPU spill _(target)_:** over-VRAM relations also spill into **shards across GPUs**; unified multi-GPU
   abstraction maps shards→devices with per-device health + circuit breakers; cache-aware replication keeps critical
   shards on ≥2 GPUs.

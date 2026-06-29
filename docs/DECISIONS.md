@@ -21,6 +21,16 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
   need be resident at a time, so a single GPU serves relations far larger than its VRAM. This is explicit
   STRATA-managed admission (software) — **not** hardware demand-paging and **not** CPU execution — so it is
   charter-compliant (ADR-006/007) and lets S10d delete the host execution path without losing over-VRAM coverage.
+- **Mechanism — how this differs from hardware demand paging (enforceable, for implementers):** the data path uses
+  **explicit device allocations** (`cuMemAlloc` shards) + **explicit async copies** (`cuMemcpyHtoD/DtoHAsync`)
+  overlapped on a copy stream — **never `cudaMallocManaged` / Unified Memory**. Kernels are handed only pointers to
+  already-resident shards, so a page fault is **impossible by construction** — that absence of managed memory in the
+  data path is how an agent *enforces* "this is streaming, not paging." The distinction is the *control model*, not
+  the transport primitive: streaming is **proactive-by-plan** (prefetch shard N+1 before it is needed),
+  **coarse-grained** (a semantic shard, not a hardware page), **never stalls a warp on a miss**, and **app-controls
+  the byte budget + eviction**; demand paging is reactive-by-fault, page-grained, stalls the faulting warp mid-kernel,
+  and is driver-controlled. This is why explicit streaming — not paging — owns the tail on the PCIe baseline (a fault
+  is a synchronous mid-kernel stall, the OLTP tail-latency killer; CHARTER "Target hardware").
 - **Consequences:** Extends ADR-010. The current sharded read path (recompact ALL shards into one unified resident
   buffer, ARCHITECTURE §7) must move to **push-down-to-shard + cross-shard combine** (ARCHITECTURE §13) — the same
   combine primitive serves both the streaming executor (single-GPU) and multi-GPU spill (S-E). Foldable operation
