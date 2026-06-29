@@ -1,0 +1,83 @@
+//! Grouped-aggregation cardinality probe: the roofline sweep measured grouped_stats at ~1M groups
+//! (267 Melem/s). That is the HIGH-cardinality case = random-access + atomic bound on a large table.
+//! The hypothesis: the real headroom is at LOW/MEDIUM cardinality, where the per-row global atomics
+//! (1 CAS probe + add/add/min/max) hammer FEW slots = severe contention, and a per-block shared-memory
+//! pre-aggregation would help a lot. This drives grouped_stats_i32 over the SAME 8M rows but group
+//! columns of varying distinct-count (row % C) to see the throughput vs cardinality curve.
+//!
+//!   timeout 200 cargo run --release --example grouped_cardinality_probe -p gpu_db_execution
+
+use std::time::Instant;
+
+use gpu_db_execution::{CudaDeviceMemoryChunk, CudaDriverRuntime};
+
+fn p50(mut v: Vec<u128>) -> u128 {
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+fn main() {
+    let rows: u64 = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8_388_608);
+    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+    let n = rows as usize;
+    let cards: Vec<u64> = vec![16, 256, 4_096, 65_536, 1 << 18, 1 << 20];
+
+    let Ok(runtime) = CudaDriverRuntime::probe() else {
+        eprintln!("no local NVIDIA driver/GPU; skipping");
+        return;
+    };
+
+    // Layout: [8B row_count][value: N i32][group col per cardinality: N i32 each].
+    let off_value = 8u64;
+    let group_off = |k: usize| off_value + rows * 4 + (k as u64) * rows * 4;
+    let allocated = group_off(cards.len());
+
+    let header = rows.to_le_bytes().to_vec();
+    let mut value = Vec::with_capacity(n * 4);
+    for row in 0..rows {
+        value.extend_from_slice(&((row as i32).wrapping_mul(7)).to_le_bytes());
+    }
+    // One group column per cardinality: group[i] = (i % C). Distinct-count = C.
+    let group_cols: Vec<Vec<u8>> = cards
+        .iter()
+        .map(|&c| {
+            let mut g = Vec::with_capacity(n * 4);
+            for row in 0..rows {
+                g.extend_from_slice(&((row % c) as i32).to_le_bytes());
+            }
+            g
+        })
+        .collect();
+
+    let mut chunks = vec![
+        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+        CudaDeviceMemoryChunk { byte_offset: off_value, bytes: &value },
+    ];
+    for (k, g) in group_cols.iter().enumerate() {
+        chunks.push(CudaDeviceMemoryChunk { byte_offset: group_off(k), bytes: g });
+    }
+    let resident = runtime
+        .retain_device_memory_chunks(0, allocated, &chunks)
+        .expect("retain resident device memory");
+
+    println!("# grouped_stats_i32 cardinality sweep. rows={rows}, iters={iters}");
+    println!("  {:<14} {:>9}  {:>12}  {:>8}", "cardinality", "p50", "Melem/s", "groups");
+
+    for (k, &c) in cards.iter().enumerate() {
+        let goff = group_off(k);
+        let mut run = || resident.grouped_stats_i32_from_payload(goff, off_value, rows).unwrap().len();
+        for _ in 0..3 {
+            run();
+        }
+        let mut s = Vec::with_capacity(iters);
+        let mut groups = 0usize;
+        for _ in 0..iters {
+            let t = Instant::now();
+            groups = run();
+            s.push(t.elapsed().as_nanos());
+        }
+        let us = p50(s) as f64 / 1000.0;
+        println!("  {c:<14} {us:>9.0}us  {:>12.1}  {groups:>8}", rows as f64 / us);
+    }
+    println!("\n# low-card pathological (contention) => shared-mem pre-agg is the win; flat curve => inherent.");
+}
