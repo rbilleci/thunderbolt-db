@@ -1557,6 +1557,24 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_sum(self, byte_offset, row_count)
     }
 
+    /// DIRECT scalar (count, sum, min, max) over a resident, non-nullable, UNFILTERED int4 column in
+    /// ONE streaming pass — the MIN/MAX/AVG analogue of [`sum_i32_from_payload`]. Replaces the
+    /// self-grouped hash kernel (`grouped_stats_i32_from_payload(off, off, rows, ALL)` with
+    /// group==value), which builds an O(distinct)-entry hash table just to reduce; over a high-distinct
+    /// column that hash table dominates (~182 Melem/s and falling at 8M distinct). This is a grid-stride
+    /// scan + a `bar.sync` shared-memory block tree reduction of all four partials + ONE set of four
+    /// global atomics per block (the audited `gpu_db_resident_i32_sum` pattern), so it runs at the same
+    /// memory-bound roofline regardless of distinctness. Returns `(count, sum, min, max)`; `count == 0`
+    /// (empty input) leaves min/max at their `INT_MAX`/`INT_MIN` init sentinels and the caller maps it
+    /// to SQL NULL.
+    pub fn scalar_stats_i32_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+    ) -> Result<(u64, i64, i32, i32), CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_scalar_stats(self, byte_offset, row_count)
+    }
+
     /// `SUM` of a resident int4 column over a FILTERED set of row indices (the operator axis, doc 19):
     /// gather `col[indices[k]]` and reduce on the GPU (each thread sums its strided slice locally, then
     /// one `atom.add.u64` -> a single i64), returned as bigint. The caller must pass a NON-empty
@@ -12521,6 +12539,315 @@ block_done:
     })?;
 
     Ok(i64::from_le_bytes(output_bytes))
+}
+
+fn launch_cuda_resident_i32_scalar_stats(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_count: u64,
+) -> Result<(u64, i64, i32, i32), CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    // DIRECT scalar-stats reduction — the MIN/MAX/AVG analogue of `gpu_db_resident_i32_sum`. Each
+    // thread accumulates (count, i64 sum, i32 min, i32 max) over its grid-stride slice, then the block
+    // reduces all four partials in a `bar.sync` SHARED-MEMORY tree (NOT shfl — the grid-stride loop
+    // exits per-thread at `done:` so warp lanes run a DIFFERENT iteration count and are NOT converged;
+    // bar.sync synchronizes the WHOLE block and every barrier below is on the straight-line path), and
+    // thread 0 issues ONE set of four global atomics for the block: add count, add sum (u64 two's-
+    // complement), min.s32, max.s32. count/sum atomic-adds are order-independent (mod 2^64), min/max
+    // are associative/commutative, so the result is byte-identical to the self-grouped path's reduced
+    // (count, sum, min, max). Host inits the 24-byte out struct count=0, sum=0, min=INT_MAX,
+    // max=INT_MIN (the min/max sentinels can't be a plain memset, so we H2D the init struct on-stream
+    // before the kernel). `.target sm_60` for the global min/max atomics. Saturating grid (.min) like
+    // sum; row_count==0 leaves the out struct at its init (count 0 => caller maps to SQL NULL).
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_scalar_stats(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_active;
+    .reg .pred %p_isthr0;
+    .shared .align 8 .b64 s_count[1024];
+    .shared .align 8 .b64 s_sum[1024];
+    .shared .align 4 .b32 s_min[1024];
+    .shared .align 4 .b32 s_max[1024];
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %out;
+    .reg .u64 %base;
+    .reg .u64 %idx;
+    .reg .u64 %stride;
+    .reg .u64 %addr;
+    .reg .u32 %r_block;
+    .reg .u32 %r_block_dim;
+    .reg .u32 %thread;
+    .reg .u32 %grid_dim;
+    .reg .u64 %wide_block;
+    .reg .u64 %wide_thread;
+    .reg .u64 %wide_block_dim;
+    .reg .u64 %wide_grid_dim;
+    .reg .u64 %count;
+    .reg .u64 %sum_bits;
+    .reg .u64 %ignored64;
+    .reg .s32 %ignored32;
+    .reg .s64 %sum;
+    .reg .s64 %wide;
+    .reg .s32 %r_value;
+    .reg .s32 %min;
+    .reg .s32 %max;
+    .reg .u32 %rstride;
+    .reg .u32 %peer;
+    .reg .u64 %sh_count_base;
+    .reg .u64 %sh_sum_base;
+    .reg .u64 %sh_min_base;
+    .reg .u64 %sh_max_base;
+    .reg .u64 %sh_count_self;
+    .reg .u64 %sh_sum_self;
+    .reg .u64 %sh_min_self;
+    .reg .u64 %sh_max_self;
+    .reg .u64 %sh_count_peer;
+    .reg .u64 %sh_sum_peer;
+    .reg .u64 %sh_min_peer;
+    .reg .u64 %sh_max_peer;
+    .reg .u64 %off8;
+    .reg .u64 %off4;
+    .reg .u64 %peer_count;
+    .reg .u64 %peer_sum;
+    .reg .s32 %peer_min;
+    .reg .s32 %peer_max;
+    .reg .u64 %count_addr;
+    .reg .u64 %sum_addr;
+    .reg .u64 %min_addr;
+    .reg .u64 %max_addr;
+    .reg .u64 %block_count;
+    .reg .u64 %block_sum;
+    .reg .s32 %block_min;
+    .reg .s32 %block_max;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %out, [out_ptr];
+
+    add.u64 %base, %resident, %offset;
+    mov.u32 %r_block, %ctaid.x;
+    mov.u32 %r_block_dim, %ntid.x;
+    mov.u32 %thread, %tid.x;
+    mov.u32 %grid_dim, %nctaid.x;
+    cvt.u64.u32 %wide_block, %r_block;
+    cvt.u64.u32 %wide_thread, %thread;
+    cvt.u64.u32 %wide_block_dim, %r_block_dim;
+    cvt.u64.u32 %wide_grid_dim, %grid_dim;
+    mul.lo.u64 %idx, %wide_block, %wide_block_dim;
+    add.u64 %idx, %idx, %wide_thread;
+    mul.lo.u64 %stride, %wide_grid_dim, %wide_block_dim;
+    mov.u64 %count, 0;
+    mov.s64 %sum, 0;
+    mov.s32 %min, 2147483647;
+    mov.s32 %max, -2147483648;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra done;
+    mul.lo.u64 %addr, %idx, 4;
+    add.u64 %addr, %base, %addr;
+    ld.global.s32 %r_value, [%addr];
+    cvt.s64.s32 %wide, %r_value;
+    add.s64 %sum, %sum, %wide;
+    add.u64 %count, %count, 1;
+    min.s32 %min, %min, %r_value;
+    max.s32 %max, %max, %r_value;
+    add.u64 %idx, %idx, %stride;
+    bra loop;
+
+done:
+    // ---- per-block reduction: tree-reduce all four partials in shared memory, then ONE set of four
+    // atomics per block. Grid is saturating-clamped (<=1024 blocks) so each thread holds a REAL partial
+    // over its grid-stride rows. count/sum (u64 two's-complement add) are associative+commutative mod
+    // 2^64; min/max are associative+commutative; so the tree grouping is byte-identical to a flat
+    // accumulation. %thread = %tid.x (in-block id); %r_block_dim = %ntid.x (a power of two so the tree
+    // terminates). Every barrier below is on the straight-line path (outside the @!%p_active guard) so
+    // all threads in the block reach it even though the grid-stride loop exited per-thread above.
+    mov.u64 %sh_count_base, s_count;
+    mov.u64 %sh_sum_base, s_sum;
+    mov.u64 %sh_min_base, s_min;
+    mov.u64 %sh_max_base, s_max;
+    mul.wide.u32 %off8, %thread, 8;
+    mul.wide.u32 %off4, %thread, 4;
+    add.u64 %sh_count_self, %sh_count_base, %off8;
+    add.u64 %sh_sum_self, %sh_sum_base, %off8;
+    add.u64 %sh_min_self, %sh_min_base, %off4;
+    add.u64 %sh_max_self, %sh_max_base, %off4;
+    cvt.u64.s64 %sum_bits, %sum;
+    st.shared.u64 [%sh_count_self], %count;
+    st.shared.u64 [%sh_sum_self], %sum_bits;
+    st.shared.s32 [%sh_min_self], %min;
+    st.shared.s32 [%sh_max_self], %max;
+    bar.sync 0;
+
+    // tree reduce: for rstride = bdim/2, bdim/4, ..., 1: combine s[t] with s[t + rstride] for t < rstride.
+    shr.u32 %rstride, %r_block_dim, 1;
+red_loop:
+    setp.eq.u32 %p_done, %rstride, 0;
+    @%p_done bra red_done;
+    setp.lt.u32 %p_active, %thread, %rstride;
+    @!%p_active bra red_skip;
+    add.u32 %peer, %thread, %rstride;
+    mul.wide.u32 %off8, %peer, 8;
+    mul.wide.u32 %off4, %peer, 4;
+    add.u64 %sh_count_peer, %sh_count_base, %off8;
+    add.u64 %sh_sum_peer, %sh_sum_base, %off8;
+    add.u64 %sh_min_peer, %sh_min_base, %off4;
+    add.u64 %sh_max_peer, %sh_max_base, %off4;
+    ld.shared.u64 %peer_count, [%sh_count_peer];
+    ld.shared.u64 %peer_sum, [%sh_sum_peer];
+    ld.shared.s32 %peer_min, [%sh_min_peer];
+    ld.shared.s32 %peer_max, [%sh_max_peer];
+    ld.shared.u64 %count, [%sh_count_self];
+    ld.shared.u64 %sum_bits, [%sh_sum_self];
+    ld.shared.s32 %min, [%sh_min_self];
+    ld.shared.s32 %max, [%sh_max_self];
+    add.u64 %count, %count, %peer_count;
+    add.u64 %sum_bits, %sum_bits, %peer_sum;
+    min.s32 %min, %min, %peer_min;
+    max.s32 %max, %max, %peer_max;
+    st.shared.u64 [%sh_count_self], %count;
+    st.shared.u64 [%sh_sum_self], %sum_bits;
+    st.shared.s32 [%sh_min_self], %min;
+    st.shared.s32 [%sh_max_self], %max;
+red_skip:
+    bar.sync 0;
+    shr.u32 %rstride, %rstride, 1;
+    bra red_loop;
+red_done:
+    // thread 0 holds the block totals at index 0; ONE set of four global atomics for the whole block.
+    setp.eq.u32 %p_isthr0, %thread, 0;
+    @!%p_isthr0 bra block_done;
+    ld.shared.u64 %block_count, [%sh_count_base];
+    ld.shared.u64 %block_sum, [%sh_sum_base];
+    ld.shared.s32 %block_min, [%sh_min_base];
+    ld.shared.s32 %block_max, [%sh_max_base];
+    mov.u64 %count_addr, %out;
+    atom.global.add.u64 %ignored64, [%count_addr], %block_count;
+    add.u64 %sum_addr, %out, 8;
+    atom.global.add.u64 %ignored64, [%sum_addr], %block_sum;
+    add.u64 %min_addr, %out, 16;
+    atom.global.min.s32 %ignored32, [%min_addr], %block_min;
+    add.u64 %max_addr, %out, 20;
+    atom.global.max.s32 %ignored32, [%max_addr], %block_max;
+block_done:
+    ret;
+}
+"#;
+
+    let bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if bytes > resident.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+    }
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let htod_async = resident
+        .primary()
+        .cu_memcpy_htod_async
+        .ok_or(CudaRuntimeProbeError::DriverLibraryUnavailable)?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_scalar_stats", &ptx)?;
+
+    let block_dim = 256_u32;
+    let grid_dim = if row_count == 0 {
+        1
+    } else {
+        row_count.div_ceil(u64::from(block_dim)).min(1024) as u32
+    };
+
+    // Init struct H2D'd into the scratch on-stream BEFORE the kernel: count/sum start at 0 (atomic
+    // add), min/max at the INT sentinels (atomic min/max — they can't be a plain memset). `initial`
+    // outlives the helper's covering sync, so the async source stays valid until the copy completes.
+    let initial = CudaI32StatsRaw {
+        count: 0,
+        sum: 0,
+        min: i32::MAX,
+        max: i32::MIN,
+    };
+    let mut output_bytes = [0_u8; std::mem::size_of::<CudaI32StatsRaw>()];
+    launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
+        let htod_rc = unsafe {
+            htod_async(
+                output_ptr,
+                (&initial as *const CudaI32StatsRaw).cast::<c_void>(),
+                std::mem::size_of::<CudaI32StatsRaw>(),
+                stream,
+            )
+        };
+        if htod_rc != 0 {
+            return htod_rc;
+        }
+        let mut resident_arg = resident.device_ptr();
+        let mut offset_arg = byte_offset;
+        let mut rows_arg = row_count;
+        let mut output_arg = output_ptr;
+        let mut args = [
+            (&mut resident_arg as *mut u64).cast::<c_void>(),
+            (&mut offset_arg as *mut u64).cast::<c_void>(),
+            (&mut rows_arg as *mut u64).cast::<c_void>(),
+            (&mut output_arg as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                grid_dim,
+                1,
+                1,
+                block_dim,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+
+    let count = u64::from_le_bytes(output_bytes[0..8].try_into().unwrap());
+    let sum = i64::from_le_bytes(output_bytes[8..16].try_into().unwrap());
+    let min = i32::from_le_bytes(output_bytes[16..20].try_into().unwrap());
+    let max = i32::from_le_bytes(output_bytes[20..24].try_into().unwrap());
+    Ok((count, sum, min, max))
 }
 
 #[repr(C)]

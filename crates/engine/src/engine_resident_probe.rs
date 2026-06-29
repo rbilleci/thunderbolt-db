@@ -627,70 +627,45 @@ impl Engine {
                 ResidentScalarAggregate::Avg { .. }
                 | ResidentScalarAggregate::Min { .. }
                 | ResidentScalarAggregate::Max { .. } => {
-                    // Unfiltered AVG/MIN/MAX reduce the self-grouped stats kernel (group == value
-                    // column), so the D2H scales with the distinct-value count it copies back.
-                    //
-                    // Aggregate-selection mask: this scalar reduction reads only the field(s) it needs,
-                    // so request only those on-device (the kernel runs strictly fewer per-row update
-                    // atomics; the masked-out fields stay at their init sentinels and are never read).
-                    // AVG reads total_count + total_sum (COUNT|SUM); MIN reads group.min (MIN); MAX reads
-                    // group.max (MAX). Byte-identical to ALL for the field(s) actually consumed below.
-                    let agg_mask = match aggregate {
-                        ResidentScalarAggregate::Avg { .. } => {
-                            grouped_agg_mask::COUNT | grouped_agg_mask::SUM
-                        }
-                        ResidentScalarAggregate::Min { .. } => grouped_agg_mask::MIN,
-                        ResidentScalarAggregate::Max { .. } => grouped_agg_mask::MAX,
-                        _ => unreachable!("matched AVG/MIN/MAX above"),
-                    };
+                    // DIRECT scalar-stats reduction (the MIN/MAX/AVG analogue of the SUM kernel above):
+                    // one grid-stride streaming pass computes (count, sum, min, max) at the memory-bound
+                    // roofline. This REPLACES the old self-grouped hash kernel
+                    // (`grouped_stats_i32_from_payload(off, off, rows, <mask>)` with group == value),
+                    // which built an O(distinct)-entry hash table just to reduce — collapsing to ~182
+                    // Melem/s and falling at high distinctness (e.g. a unique 8M-row id). The result is
+                    // byte-identical: the kernel's (count, sum, min, max) equals what the self-grouped
+                    // path produced and the host reduced (same i64 two's-complement sum, same min/max,
+                    // same AVG rounding via `average_sql_value`). D2H is now a fixed 24-byte stats struct
+                    // (count u64 + sum i64 + min/max i32), independent of distinctness.
                     let started = Instant::now();
-                    let grouped_stats = device_memory
-                        .grouped_stats_i32_from_payload(
-                            byte_offset,
-                            byte_offset,
-                            row_count,
-                            agg_mask,
-                        )
+                    let (count, sum, min, max) = device_memory
+                        .scalar_stats_i32_from_payload(byte_offset, row_count)
                         .map_err(|err| {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                         })?;
                     let elapsed = started.elapsed();
-                    let copied_group_count = grouped_stats.len();
-                    let total_count = grouped_stats.iter().map(|group| group.count).sum::<u64>();
-                    let total_sum = grouped_stats.iter().map(|group| group.sum).sum::<i64>();
-                    let result_value = match aggregate {
-                        ResidentScalarAggregate::Avg { .. } => average_sql_value(
-                            i128::from(total_sum),
-                            usize::try_from(total_count).map_err(|_| {
-                                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                    "resident device-memory scalar aggregate count {total_count} exceeds AVG result range"
-                                )))
-                            })?,
-                        ),
-                        ResidentScalarAggregate::Min { .. } => grouped_stats
-                            .iter()
-                            .map(|group| group.min)
-                            .min()
-                            .map(SqlValue::Int4)
-                            .unwrap_or_else(|| SqlValue::Text(String::new())),
-                        ResidentScalarAggregate::Max { .. } => grouped_stats
-                            .iter()
-                            .map(|group| group.max)
-                            .max()
-                            .map(SqlValue::Int4)
-                            .unwrap_or_else(|| SqlValue::Text(String::new())),
-                        _ => unreachable!("matched AVG/MIN/MAX above"),
+                    let result_value = if count == 0 {
+                        // Empty input (empty non-nullable table): SQL aggregate of no rows is NULL.
+                        SqlValue::Null
+                    } else {
+                        match aggregate {
+                            ResidentScalarAggregate::Avg { .. } => average_sql_value(
+                                i128::from(sum),
+                                usize::try_from(count).map_err(|_| {
+                                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                        "resident device-memory scalar aggregate count {count} exceeds AVG result range"
+                                    )))
+                                })?,
+                            ),
+                            ResidentScalarAggregate::Min { .. } => SqlValue::Int4(min),
+                            ResidentScalarAggregate::Max { .. } => SqlValue::Int4(max),
+                            _ => unreachable!("matched AVG/MIN/MAX above"),
+                        }
                     };
-                    let result_d2h_bytes = copied_group_count
-                        .checked_mul(
-                            std::mem::size_of::<i32>()
-                                + std::mem::size_of::<u64>()
-                                + std::mem::size_of::<i64>()
-                                + (2 * std::mem::size_of::<i32>()),
-                        )
-                        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
-                        .and_then(|bytes| u64::try_from(bytes).ok())
-                        .unwrap_or(u64::MAX);
+                    let result_d2h_bytes = (std::mem::size_of::<u64>()
+                        + std::mem::size_of::<i64>()
+                        + (2 * std::mem::size_of::<i32>()))
+                        as u64;
                     self.metrics.observe_d2h_bytes(result_d2h_bytes);
                     self.metrics.observe_kernel_exec_ms(
                         elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
