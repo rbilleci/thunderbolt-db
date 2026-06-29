@@ -12284,6 +12284,9 @@ fn launch_cuda_resident_i32_sum(
 )
 {
     .reg .pred %p_done;
+    .reg .pred %p_active;
+    .reg .pred %p_isthr0;
+    .shared .align 8 .b64 s_part[1024];
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
@@ -12305,6 +12308,13 @@ fn launch_cuda_resident_i32_sum(
     .reg .s64 %sum;
     .reg .s64 %wide;
     .reg .s32 %r_value;
+    .reg .u32 %rstride;
+    .reg .u32 %peer;
+    .reg .u64 %sh_base;
+    .reg .u64 %sh_self;
+    .reg .u64 %sh_peer;
+    .reg .u64 %peer_val;
+    .reg .u64 %block_tot;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %offset, [byte_offset];
@@ -12337,8 +12347,49 @@ loop:
     bra loop;
 
 done:
+    // ---- per-block reduction: sum every thread's i64 partial, then ONE atomic per block ----
+    // The grid is clamped to a saturating constant (<=1024 blocks), so each thread accumulates a REAL
+    // i64 partial over its grid-stride rows. Summing the per-thread partials in a barrier-synchronized
+    // SHARED-MEMORY tree, then a single atom.add per block, replaces the old one-atomic-per-thread storm
+    // (grid*BLOCK atomics on one address). Byte-identical to the old per-thread accumulation: two's-
+    // complement (u64) addition is associative AND commutative, so the i64 sum is independent of the
+    // grouping/order of the adds (mod 2^64). A shfl.sync would be WRONG here -- the grid-stride loop
+    // exits per-thread (idx >= rows), so lanes within a warp run a DIFFERENT number of iterations and are
+    // NOT converged at done:; bar.sync synchronizes the WHOLE block regardless, and every barrier below
+    // is on the straight-line path (outside the @!%p_active guard) so all threads reach it. %thread =
+    // %tid.x (in-block id); %r_block_dim = %ntid.x (block width, a power of two so the tree terminates).
     cvt.u64.s64 %sum_bits, %sum;
-    atom.global.add.u64 %ignored, [%out], %sum_bits;
+    mov.u64 %sh_base, s_part;
+    mul.wide.u32 %sh_self, %thread, 8;
+    add.u64 %sh_self, %sh_base, %sh_self;
+    st.shared.u64 [%sh_self], %sum_bits;
+    bar.sync 0;
+
+    // tree reduce: for rstride = bdim/2, bdim/4, ..., 1: s_part[t] += s_part[t + rstride] for t < rstride.
+    shr.u32 %rstride, %r_block_dim, 1;
+red_loop:
+    setp.eq.u32 %p_done, %rstride, 0;
+    @%p_done bra red_done;
+    setp.lt.u32 %p_active, %thread, %rstride;
+    @!%p_active bra red_skip;
+    add.u32 %peer, %thread, %rstride;
+    mul.wide.u32 %sh_peer, %peer, 8;
+    add.u64 %sh_peer, %sh_base, %sh_peer;
+    ld.shared.u64 %peer_val, [%sh_peer];
+    ld.shared.u64 %sum_bits, [%sh_self];
+    add.u64 %sum_bits, %sum_bits, %peer_val;
+    st.shared.u64 [%sh_self], %sum_bits;
+red_skip:
+    bar.sync 0;
+    shr.u32 %rstride, %rstride, 1;
+    bra red_loop;
+red_done:
+    // thread 0 holds the block total at s_part[0]; ONE global atomic add for the whole block.
+    setp.eq.u32 %p_isthr0, %thread, 0;
+    @!%p_isthr0 bra block_done;
+    ld.shared.u64 %block_tot, [%sh_base];
+    atom.global.add.u64 %ignored, [%out], %block_tot;
+block_done:
     ret;
 }
 "#;
