@@ -117,8 +117,8 @@ fn main() {
     bench("sum_i32 (1-pass read+reduce)", g4, Box::new(|| resident.sum_i32_from_payload(off_a, rows).unwrap() as usize));
     bench("count_i32_compare (1-pass)", g4, Box::new(|| resident.count_i32_compare_from_payload(off_a, rows, 1 << 19, CudaI32Comparison::Lt).unwrap() as usize));
     bench("count_i32_between (1-pass)", g4, Box::new(|| resident.count_i32_between_from_payload(off_a, rows, 0, 1 << 19).unwrap() as usize));
-    bench("expr_i64_compare_scalar (8B col, 1-pass)", g8, Box::new(|| resident.expr_i64_compare_scalar_filter(off_c, i64::MAX / 2, false, 1, rows).unwrap().len()));
-    bench("expr_i128_compare_scalar (16B col, 1-pass)", g16, Box::new(|| resident.expr_i128_compare_scalar_filter(off_d, i128::MAX / 2, false, 1, rows).unwrap().len()));
+    bench("expr_i64_compare_scalar (8B, ~1% sel)", g8, Box::new(|| resident.expr_i64_compare_scalar_filter(off_c, 80_000_i64 * 2_654_435_761, false, 1, rows).unwrap().len()));
+    bench("expr_i128_compare_scalar (16B, ~1% sel)", g16, Box::new(|| resident.expr_i128_compare_scalar_filter(off_d, 80_000_i128 * 11, false, 1, rows).unwrap().len()));
     let arith = vec![ExprStep::LoadColumn { byte_offset: off_a }, ExprStep::ScalarBinary { op: 0, scalar: 5, scalar_on_left: false }];
     bench("arith_filter a+5<k (load+binop, 2-pass)", 2.0 * g4, Box::new(|| resident.run_expr_arith_filter(&arith, rows, 1, 1 << 19).unwrap().len()));
     bench("compare_indices_ordered (2-pass, ~50% sel)", 2.0 * g4, Box::new(|| resident.compare_indices_ordered_from_payload(off_a, rows, 1 << 19, 1).unwrap().len()));

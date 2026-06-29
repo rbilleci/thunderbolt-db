@@ -86,16 +86,18 @@ Baseline (8M i32 rows, captured 2026-06-29; roofline `equal_any` was ~640 GB/s o
 | ordered compaction (50% sel) | `compare_indices_ordered` | ~0.06 (2-pass) | output-bound — expected |
 | arith VM | `arith_filter` | ~0.05 (2-pass) | ok |
 | scalar reduce | `sum_i32` | ~0.36 | mild headroom |
-| **scalar filter/count** | `count_i32_compare` | **~0.013** | KNOWN HEADROOM (not a regression) |
-| | `count_i32_between` | **~0.007** | KNOWN HEADROOM |
-| | `expr_i64_compare_scalar` | **~0.003** | KNOWN HEADROOM |
-| | `expr_i128_compare_scalar` | **~0.005** | KNOWN HEADROOM |
+| **scalar COUNT (reduce)** | `count_i32_compare` | **~0.013** | KNOWN HEADROOM (count skeleton) |
+| | `count_i32_between` | **~0.007** | KNOWN HEADROOM (calls count x2) |
+| filter -> indices | `expr_i64_compare_scalar` (1% sel) | ~0.25 | ok (8B col) |
+| | `expr_i128_compare_scalar` (1% sel) | ~0.43 | ok (16B col) |
 | gather (scattered) | `gather_i32` / `gather_i64` | ~0.004 / ~0.005 | access-bound (inherent) |
 | algorithmic | sort / join / grouped | ~346 / ~255 / ~267 Melem/s | separate programs |
 
-The `scalar filter/count` family is a KNOWN optimization target, NOT a regression — its low
-ratios are expected until optimized. `count_i32_compare` is root-caused (`launch_cuda_resident_
-i32_compare_count` launches grid=row_count/256 = one thread/row + a per-thread `red.global.add`
-on a single counter = ~N atomics serialized); the `between` / i64 / i128 filters are measured-
-slow too but not yet individually root-caused (likely the same pattern). Treat a ratio FALLING
-below these as the regression signal; a ratio rising (e.g. after that fix) is the win.
+The scalar COUNT reductions (`count_i32_compare`, `count_i32_between`, `equal_count`) are a KNOWN
+optimization target, NOT a regression — they share ONE root-caused skeleton: `launch_cuda_
+resident_i32_compare_count` (and the equal/between variants) launch grid=row_count/256 = one
+thread/row + a per-thread `red.global.add` on a single counter = ~N atomics serialized
+(`between` calls `count` twice). One block-reduction fix lifts all of them. (The i64/i128 FILTERS
+are NOT in this set — earlier "slow" numbers were a 100%-selectivity output artifact; at ~1% sel
+they are fine.) Treat a ratio FALLING below the baseline as the regression signal; a COUNT ratio
+rising (after the skeleton fix) is the win.
