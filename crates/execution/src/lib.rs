@@ -29160,6 +29160,94 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_grouped_stats_reduced_mask_matches_all_for_read_field_no_sentinel_leak() {
+        // Audit follow-up (commit 9e880adf, agg-pruning slice 1): the permanent suite covered the
+        // reduced-mask path only with POSITIVE values, so a mislabeled skip (e.g. min -> skip_max) or
+        // an init-sentinel leak would NOT be caught. Drive grouped_stats with each REDUCED mask over a
+        // value column containing NEGATIVES, POSITIVES, and the exact init sentinels (i32::MIN = the
+        // max-fill, i32::MAX = the min-fill) AS REAL VALUES, and assert the masked-in field is byte-
+        // identical to mask=ALL PER GROUP -- both the mask-correctness gate AND the no-leak proof
+        // (ALL.min/max is the validated truth; a skipped atomic would leave the field at its sentinel).
+        use std::collections::HashMap;
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let rows: u64 = 100_003; // odd => partial last block; multi-block
+        let mut group_bytes = Vec::with_capacity(rows as usize * 4);
+        let mut value_bytes = Vec::with_capacity(rows as usize * 4);
+        for row in 0..rows {
+            let g = (row % 8) as i32;
+            let v = if row == 0 {
+                i32::MIN // sentinel-equal real value (the MAX field's init fill 0x80000000)
+            } else if row == 1 {
+                i32::MAX // sentinel-equal real value (the MIN field's init fill 0x7FFFFFFF)
+            } else {
+                match g {
+                    2 => -(1 + (row % 1000) as i32), // all-NEGATIVE group: real max < 0
+                    3 => 1 + (row % 1000) as i32,    // all-POSITIVE group: real min > 0
+                    _ => (row as i64).wrapping_mul(2_654_435_761) as i32, // full-range spread
+                }
+            };
+            group_bytes.extend_from_slice(&g.to_le_bytes());
+            value_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let header = rows.to_le_bytes();
+        let group_off = std::mem::size_of::<u64>() as u64;
+        let value_off = group_off + rows * 4;
+        let allocated = value_off + rows * 4;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated,
+                &[
+                    CudaDeviceMemoryChunk { byte_offset: 0, bytes: header.as_slice() },
+                    CudaDeviceMemoryChunk { byte_offset: group_off, bytes: group_bytes.as_slice() },
+                    CudaDeviceMemoryChunk { byte_offset: value_off, bytes: value_bytes.as_slice() },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        let to_map = |v: Vec<CudaI32GroupedStats>| -> HashMap<i32, CudaI32GroupedStats> {
+            v.into_iter().map(|g| (g.group, g)).collect()
+        };
+        let all = to_map(
+            resident
+                .grouped_stats_i32_from_payload(group_off, value_off, rows, grouped_agg_mask::ALL)
+                .expect("ALL grouped_stats"),
+        );
+        assert_eq!(all.len(), 8, "expected 8 groups");
+        // Non-vacuity: the dataset really exercises the leak cases.
+        assert!(all[&2].max < 0, "group 2 all-negative => a skipped MAX would leak INT_MIN (caught)");
+        assert!(all[&3].min > 0, "group 3 all-positive => a skipped MIN would leak INT_MAX (caught)");
+        assert_eq!(all[&0].min, i32::MIN, "group 0 holds i32::MIN as a REAL value");
+        assert_eq!(all[&1].max, i32::MAX, "group 1 holds i32::MAX as a REAL value");
+
+        for &(mask, name) in &[
+            (grouped_agg_mask::MIN, "MIN"),
+            (grouped_agg_mask::MAX, "MAX"),
+            (grouped_agg_mask::COUNT, "COUNT"),
+            (grouped_agg_mask::SUM, "SUM"),
+        ] {
+            let masked = to_map(
+                resident
+                    .grouped_stats_i32_from_payload(group_off, value_off, rows, mask)
+                    .unwrap_or_else(|e| panic!("mask {name} grouped_stats failed: {e:?}")),
+            );
+            assert_eq!(masked.len(), all.len(), "mask {name}: group SET must be mask-independent");
+            for (g, refstat) in &all {
+                let m = masked.get(g).unwrap_or_else(|| panic!("mask {name}: group {g} missing"));
+                match name {
+                    "MIN" => assert_eq!(m.min, refstat.min, "mask MIN: group {g} min (sentinel leak?)"),
+                    "MAX" => assert_eq!(m.max, refstat.max, "mask MAX: group {g} max (sentinel leak?)"),
+                    "COUNT" => assert_eq!(m.count, refstat.count, "mask COUNT: group {g} count"),
+                    "SUM" => assert_eq!(m.sum, refstat.sum, "mask SUM: group {g} sum"),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn gpu_hash_i32_grouped_stats_matches_serial_and_wins_on_large_tables() {
         // P2-M2/S1 — grouped_stats parallel hash-aggregation parity + perf gate (GPU-native oracle).
         // A/Bs the parallel atomic open-addressing hash aggregation against the retained serial
