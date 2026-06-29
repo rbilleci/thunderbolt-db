@@ -7549,6 +7549,40 @@ impl Engine {
             }
         }
 
+        // PEEPHOLE fast-path (the `category = 0` shape): the exact predicate `int4col <cmp> literal`
+        // (and the flipped `literal <cmp> int4col`, comparison flipped) lowers to the ORDERED parallel
+        // compaction that emits surviving ROW INDICES ascending with NO host sort — replacing the
+        // general `run_expr_arith_filter` path (which atomic-appends matching indices and then
+        // host-`sort_unstable`s them; ~93% of that path's compaction cost is the host sort). The
+        // ordered compaction guarantees ascending output BY CONSTRUCTION (the contiguous block
+        // partition + ordered intra-block prefix sum), which is exactly the contract the gather +
+        // assembly depend on, so the result is byte-identical to the prior path. Only a PLAIN resident
+        // int4 column qualifies: nullable columns / date / int2 / int8 / other types are routed by the
+        // earlier type paths and never reach here, but the `SqlType::Int4` guard makes that explicit so
+        // a future reordering can't silently feed a date/int2 column (same i32 section) into this path.
+        let plain_int4_column = |expr: &ResidentExpr| -> Option<usize> {
+            if let ResidentExpr::Column(col) = expr {
+                if table.columns.get(*col).map(|column| column.ty) == Some(SqlType::Int4) {
+                    return Some(*col);
+                }
+            }
+            None
+        };
+        let ordered_indices = match (lhs.as_ref(), rhs.as_ref()) {
+            (col_expr, ResidentExpr::Int4Literal(needle)) => {
+                plain_int4_column(col_expr).map(|col| (col, *needle, comparison))
+            }
+            (ResidentExpr::Int4Literal(needle), col_expr) => plain_int4_column(col_expr)
+                .map(|col| (col, *needle, flip_comparison_code(comparison))),
+            _ => None,
+        };
+        if let Some((col, needle, cmp_code)) = ordered_indices {
+            let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;
+            return device_memory
+                .compare_indices_ordered_from_payload(byte_offset, row_count, needle, cmp_code)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
+        }
+
         // GENERAL path: compile the arithmetic side(s) to bytecode and run the device VM.
         //   - `arith_tree <cmp> literal`        -> arith VM (one value buffer vs scalar)
         //   - `literal <cmp> arith_tree`        -> arith VM, comparison flipped

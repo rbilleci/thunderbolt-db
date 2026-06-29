@@ -2503,6 +2503,25 @@ impl CudaResidentDeviceMemory {
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         Ok(values.into_iter().skip(offset).take(limit).collect())
     }
+
+    /// Evaluate a SIMPLE `int4col <cmp> needle` predicate over a resident int4 column and return the
+    /// surviving ROW INDICES in ASCENDING ORDER, with NO host sort. Runs the same ordered parallel
+    /// compaction as the value path (`project_i32_compare_*`), but the scatter kernel stores each
+    /// match's row index instead of its value (`out_is_index = 1`). The ascending order is guaranteed
+    /// by construction (the contiguous block partition + ordered intra-block prefix sum), so this is a
+    /// drop-in replacement for the atomic-append + host-`sort_unstable` index path. `comparison` is the
+    /// raw kernel code: 0=eq, 1=lt, 2=lte, 3=gt, 4=gte, 5=ne.
+    pub fn compare_indices_ordered_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        needle: i32,
+        comparison: u32,
+    ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_compare_indices_ordered(
+            self, byte_offset, row_count, needle, comparison,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20124,63 +20143,16 @@ fn launch_cuda_resident_having_filter(
     Ok(indices)
 }
 
-fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
-    resident: &R,
-    byte_offset: u64,
-    row_count: u64,
-    needle: i32,
-    comparison: CudaI32Comparison,
-) -> Result<Vec<i32>, CudaRuntimeProbeError> {
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
-    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
-    type CuLaunchKernel = unsafe extern "C" fn(
-        *mut c_void,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        *mut c_void,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> i32;
-
-    // P2-M2 (compare-route parallel-kernel lever): the legacy kernel was a single-thread
-    // `<<<1,1,1>>>` ascending scan that ordered-appended every matching i32 VALUE, so its output
-    // is the matches in ASCENDING ROW ORDER. That serialized the whole 50k-row scan into one thread
-    // (~277 µs kernel; the route plateaued serial-kernel-bound). This route now runs an ORDERED
-    // PARALLEL COMPACTION over a CONTIGUOUS block partition — byte-identical ascending output, no
-    // atomic-append (which would yield non-deterministic atomic-SCHEDULE order, the hazard fixed in
-    // `row_indices`). The partition is the ordering backbone: block `b` owns the contiguous row
-    // range `[b*chunk, min(b*chunk+chunk, rows))`, so "block order" == "row order".
-    //
-    //   Pass A (`..._count_blocks`, parallel: G blocks x BLOCK threads): each block grid-strides
-    //   its own range and `red.global.add`s its local match count into `block_counts[b]`. This is
-    //   the parallel scan of all rows (analogous to `equal_count`'s parallel reduction).
-    //
-    //   Host (between passes): exclusive-scan `block_counts[0..G]` -> `block_base[b]` = number of
-    //   matches in all blocks `< b` (the base output slot for block `b`); the total match count is
-    //   `block_base[G-1] + block_counts[G-1]`. Tiny (G is the block count), so a host scan avoids a
-    //   third device scan kernel + a hand-authored shared-memory prefix sum.
-    //
-    //   Pass B (`..._scatter_blocks`, G blocks x BLOCK threads): block `b` compacts ITS range in
-    //   PARALLEL via an ORDERED intra-block prefix-sum — each thread tests its row(s) to a 0/1 flag,
-    //   an intra-block EXCLUSIVE scan (warp `shfl` scan + a tiny shared cross-warp combine) gives
-    //   each match its within-block rank, and the value is scattered at `block_base[b] + rank`
-    //   (+ a per-iteration running base when `chunk > blockDim`). The scan is monotonic in row index,
-    //   so the within-block order is ASCENDING BY CONSTRUCTION (no atomics in the ordering path), and
-    //   disjoint `block_base` ranges keep blocks independent — so the global output is exactly the
-    //   ascending per-row matches, byte-identical to the old serial kernel for ANY row_count and
-    //   match pattern. The serial span drops from one `chunk` (the prior one-thread-per-block scan)
-    //   to `ceil(chunk / blockDim)` ordered-scan steps.
-    //
-    // Both kernels loop over `[start, end)` (block grid-stride), so they are correct for any
-    // `chunk`/grid; the host sizes `chunk` so `G = ceil(rows/chunk) <= 65535` for every row_count
-    // (the CUDA grid-x max), rounding `chunk` up when rows would exceed `65535 * CHUNK_ROWS`.
-    const PTX: &[u8] = br#"
+/// Ordered parallel-compaction PTX shared by the VALUE-emit launch
+/// (`launch_cuda_resident_i32_compare_project`) and the INDEX-emit launch
+/// (`launch_cuda_resident_i32_compare_indices_ordered`). One module, two `.entry`
+/// kernels (`..._count_blocks` Pass A, `..._scatter_blocks` Pass B). The scatter kernel's
+/// trailing `out_is_index` param selects what it stores at each ascending output slot: the
+/// matching i32 VALUE (mode 0) or the surviving ROW INDEX as u32 (mode != 0). Both kernels
+/// support comparison codes 0=eq, 1=lt, 2=lte, 3=gt, 4=gte, 5=ne (eq/ne are folded into
+/// `p_match` IDENTICALLY in count and scatter, so Pass A's per-block count equals Pass B's
+/// per-block scatter count for every predicate).
+const COMPARE_ORDERED_PTX: &[u8] = br#"
 .version 6.0
 .target sm_60
 .address_size 64
@@ -20200,10 +20172,14 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     .reg .pred %p_lte;
     .reg .pred %p_gt;
     .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_ne;
     .reg .pred %p_code_lt;
     .reg .pred %p_code_lte;
     .reg .pred %p_code_gt;
     .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_code_ne;
     .reg .pred %p_match;
     .reg .u32 %lane;
     .reg .u32 %bdim;
@@ -20263,11 +20239,17 @@ loop:
     setp.le.s32 %p_lte, %r_value, %needle;
     setp.gt.s32 %p_gt, %r_value, %needle;
     setp.ge.s32 %p_gte, %r_value, %needle;
+    setp.eq.s32 %p_eq, %r_value, %needle;
+    setp.ne.s32 %p_ne, %r_value, %needle;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
     setp.eq.u32 %p_code_lt, %comparison, 1;
     setp.eq.u32 %p_code_lte, %comparison, 2;
     setp.eq.u32 %p_code_gt, %comparison, 3;
     setp.eq.u32 %p_code_gte, %comparison, 4;
+    setp.eq.u32 %p_code_ne, %comparison, 5;
     mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
     and.pred %p_lt, %p_lt, %p_code_lt;
     or.pred %p_match, %p_match, %p_lt;
     and.pred %p_lte, %p_lte, %p_code_lte;
@@ -20276,6 +20258,8 @@ loop:
     or.pred %p_match, %p_match, %p_gt;
     and.pred %p_gte, %p_gte, %p_code_gte;
     or.pred %p_match, %p_match, %p_gte;
+    and.pred %p_ne, %p_ne, %p_code_ne;
+    or.pred %p_match, %p_match, %p_ne;
     @!%p_match bra next;
     add.u64 %matches, %matches, 1;
 
@@ -20323,7 +20307,8 @@ done:
     .param .s32 needle,
     .param .u32 comparison,
     .param .u64 block_base_ptr,
-    .param .u64 out_values_ptr
+    .param .u64 out_values_ptr,
+    .param .u32 out_is_index
 )
 {
     // shared scratch: [0..32) warp totals, [32..64) per-warp exclusive prefixes, [64] block total.
@@ -20334,16 +20319,21 @@ done:
     .reg .pred %p_lte;
     .reg .pred %p_gt;
     .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_ne;
     .reg .pred %p_code_lt;
     .reg .pred %p_code_lte;
     .reg .pred %p_code_gt;
     .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_code_ne;
     .reg .pred %p_match;
     .reg .pred %p_recv;
     .reg .pred %p_inrange;
     .reg .pred %p_islast;
     .reg .pred %p_warp0;
     .reg .pred %p_lane_in;
+    .reg .pred %p_is_index;
     .reg .u32 %thr;
     .reg .u32 %bdim;
     .reg .u32 %bid;
@@ -20360,6 +20350,8 @@ done:
     .reg .u32 %btot;
     .reg .u32 %off32;
     .reg .u32 %tmp32;
+    .reg .u32 %row_u32;
+    .reg .u32 %store_val;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
@@ -20390,6 +20382,8 @@ done:
     ld.param.u32 %comparison, [comparison];
     ld.param.u64 %block_base, [block_base_ptr];
     ld.param.u64 %out_values, [out_values_ptr];
+    ld.param.u32 %tmp32, [out_is_index];
+    setp.ne.u32 %p_is_index, %tmp32, 0;
 
     add.u64 %base, %resident, %offset;
 
@@ -20443,11 +20437,17 @@ iter_loop:
     setp.le.s32 %p_lte, %r_value, %needle;
     setp.gt.s32 %p_gt, %r_value, %needle;
     setp.ge.s32 %p_gte, %r_value, %needle;
+    setp.eq.s32 %p_eq, %r_value, %needle;
+    setp.ne.s32 %p_ne, %r_value, %needle;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
     setp.eq.u32 %p_code_lt, %comparison, 1;
     setp.eq.u32 %p_code_lte, %comparison, 2;
     setp.eq.u32 %p_code_gt, %comparison, 3;
     setp.eq.u32 %p_code_gte, %comparison, 4;
+    setp.eq.u32 %p_code_ne, %comparison, 5;
     mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
     and.pred %p_lt, %p_lt, %p_code_lt;
     or.pred %p_match, %p_match, %p_lt;
     and.pred %p_lte, %p_lte, %p_code_lte;
@@ -20456,6 +20456,8 @@ iter_loop:
     or.pred %p_match, %p_match, %p_gt;
     and.pred %p_gte, %p_gte, %p_code_gte;
     or.pred %p_match, %p_match, %p_gte;
+    and.pred %p_ne, %p_ne, %p_code_ne;
+    or.pred %p_match, %p_match, %p_ne;
     selp.u32 %flag, 1, 0, %p_match;
 
 after_pred:
@@ -20546,7 +20548,13 @@ skip_combine:
     add.u64 %tmp64, %tmp64, %slot;
     mul.lo.u64 %output_addr, %tmp64, 4;
     add.u64 %output_addr, %out_values, %output_addr;
-    st.global.s32 [%output_addr], %r_value;
+    // In INDEX mode (out_is_index != 0) store the surviving ROW INDEX (the row u64 truncated to u32 -
+    // the 4-byte out slot holds an index; row < row_count which fits u32); in VALUE mode store the
+    // matching i32 value (unchanged). The ascending order is identical for both - the scatter slot is
+    // the same row's rank, only the payload written differs.
+    cvt.u32.u64 %row_u32, %row;
+    selp.b32 %store_val, %row_u32, %r_value, %p_is_index;
+    st.global.b32 [%output_addr], %store_val;
 
 after_scatter:
     // running += block total (uniform across the block); advance one stride window; fence the
@@ -20561,6 +20569,118 @@ iter_done:
     ret;
 }
 "#;
+
+/// VALUE-emit launch: returns the matching i32 VALUES in ASCENDING ROW ORDER (the ordered
+/// parallel-compaction backbone, `COMPARE_ORDERED_PTX`). A thin wrapper over the shared core with
+/// `out_is_index = 0`; behavior is unchanged from before the index-emit mode was added.
+fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
+    resident: &R,
+    byte_offset: u64,
+    row_count: u64,
+    needle: i32,
+    comparison: CudaI32Comparison,
+) -> Result<Vec<i32>, CudaRuntimeProbeError> {
+    launch_cuda_resident_i32_compare_ordered_core(
+        resident,
+        byte_offset,
+        row_count,
+        needle,
+        comparison.code(),
+        0,
+    )
+}
+
+/// INDEX-emit launch: returns the surviving ROW INDICES (`Vec<u32>`) in ASCENDING ORDER via the SAME
+/// ordered parallel compaction, with the scatter kernel storing each match's row index (u32) instead
+/// of its value (`out_is_index = 1`). The ascending-by-construction guarantee is identical to the
+/// value path — the scatter slot is the same row's rank either way, only the stored payload differs —
+/// so this replaces the atomic-append + host-`sort_unstable` index path with no host sort. Takes the
+/// raw comparison code (0=eq, 1=lt, 2=lte, 3=gt, 4=gte, 5=ne).
+fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
+    resident: &R,
+    byte_offset: u64,
+    row_count: u64,
+    needle: i32,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    let slots = launch_cuda_resident_i32_compare_ordered_core(
+        resident,
+        byte_offset,
+        row_count,
+        needle,
+        comparison,
+        1,
+    )?;
+    // The scatter kernel wrote each surviving row index as a u32 via `st.global.b32`; the host buffer
+    // is `Vec<i32>` 4-byte slots, so reinterpret each slot's bits back to u32 (bit-exact — a row index
+    // is `< row_count`, always non-negative, and fits u32 since row_count <= u32::MAX in every sized
+    // grid). The order is already ascending by construction (no host sort).
+    Ok(slots.into_iter().map(|slot| slot as u32).collect())
+}
+
+/// Shared core for the ordered i32 compare-compaction (`COMPARE_ORDERED_PTX`). `out_is_index` selects
+/// what each ascending output slot stores: the matching i32 VALUE (0) or the surviving ROW INDEX as a
+/// u32 (1, returned as `i32` bits the caller reinterprets). `comparison` is the raw kernel code
+/// (0=eq, 1=lt, 2=lte, 3=gt, 4=gte, 5=ne). All count/host-scan/scatter structure, chunk/grid sizing,
+/// and lease lifetimes are shared, so the value and index paths are byte-identical except the payload.
+fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
+    resident: &R,
+    byte_offset: u64,
+    row_count: u64,
+    needle: i32,
+    comparison: u32,
+    out_is_index: u32,
+) -> Result<Vec<i32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    // P2-M2 (compare-route parallel-kernel lever): the legacy kernel was a single-thread
+    // `<<<1,1,1>>>` ascending scan that ordered-appended every matching i32 VALUE, so its output
+    // is the matches in ASCENDING ROW ORDER. That serialized the whole 50k-row scan into one thread
+    // (~277 µs kernel; the route plateaued serial-kernel-bound). This route now runs an ORDERED
+    // PARALLEL COMPACTION over a CONTIGUOUS block partition — byte-identical ascending output, no
+    // atomic-append (which would yield non-deterministic atomic-SCHEDULE order, the hazard fixed in
+    // `row_indices`). The partition is the ordering backbone: block `b` owns the contiguous row
+    // range `[b*chunk, min(b*chunk+chunk, rows))`, so "block order" == "row order".
+    //
+    //   Pass A (`..._count_blocks`, parallel: G blocks x BLOCK threads): each block grid-strides
+    //   its own range and `red.global.add`s its local match count into `block_counts[b]`. This is
+    //   the parallel scan of all rows (analogous to `equal_count`'s parallel reduction).
+    //
+    //   Host (between passes): exclusive-scan `block_counts[0..G]` -> `block_base[b]` = number of
+    //   matches in all blocks `< b` (the base output slot for block `b`); the total match count is
+    //   `block_base[G-1] + block_counts[G-1]`. Tiny (G is the block count), so a host scan avoids a
+    //   third device scan kernel + a hand-authored shared-memory prefix sum.
+    //
+    //   Pass B (`..._scatter_blocks`, G blocks x BLOCK threads): block `b` compacts ITS range in
+    //   PARALLEL via an ORDERED intra-block prefix-sum — each thread tests its row(s) to a 0/1 flag,
+    //   an intra-block EXCLUSIVE scan (warp `shfl` scan + a tiny shared cross-warp combine) gives
+    //   each match its within-block rank, and the value is scattered at `block_base[b] + rank`
+    //   (+ a per-iteration running base when `chunk > blockDim`). The scan is monotonic in row index,
+    //   so the within-block order is ASCENDING BY CONSTRUCTION (no atomics in the ordering path), and
+    //   disjoint `block_base` ranges keep blocks independent — so the global output is exactly the
+    //   ascending per-row matches, byte-identical to the old serial kernel for ANY row_count and
+    //   match pattern. The serial span drops from one `chunk` (the prior one-thread-per-block scan)
+    //   to `ceil(chunk / blockDim)` ordered-scan steps.
+    //
+    // Both kernels loop over `[start, end)` (block grid-stride), so they are correct for any
+    // `chunk`/grid; the host sizes `chunk` so `G = ceil(rows/chunk) <= 65535` for every row_count
+    // (the CUDA grid-x max), rounding `chunk` up when rows would exceed `65535 * CHUNK_ROWS`.
+    const PTX: &[u8] = COMPARE_ORDERED_PTX;
 
     let bytes = row_count
         .checked_mul(std::mem::size_of::<i32>() as u64)
@@ -20687,10 +20807,13 @@ iter_done:
     let mut rows_arg = row_count;
     let mut chunk_arg = chunk;
     let mut needle_arg = needle;
-    let mut comparison_arg = comparison.code();
+    let mut comparison_arg = comparison;
     let mut block_counts_arg = block_counts_guard.ptr;
     let mut block_base_arg = block_base_guard.ptr;
     let mut values_arg = values_guard.ptr;
+    // out_is_index selects the scatter payload: 0 = matching i32 VALUE, 1 = surviving ROW INDEX (u32).
+    // Both produce the SAME ascending output slots; only the stored bytes differ.
+    let mut out_is_index_arg: u32 = out_is_index;
     let mut count_args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut offset_arg as *mut u64).cast::<c_void>(),
@@ -20709,6 +20832,7 @@ iter_done:
         (&mut comparison_arg as *mut u32).cast::<c_void>(),
         (&mut block_base_arg as *mut u64).cast::<c_void>(),
         (&mut values_arg as *mut u64).cast::<c_void>(),
+        (&mut out_is_index_arg as *mut u32).cast::<c_void>(),
     ];
 
     // Host exclusive scan of the per-block match counts into per-block base output slots; returns
@@ -29632,6 +29756,24 @@ mod tests {
         if let Some(pos) = PTX.iter().position(|&byte| !byte.is_ascii()) {
             let line = PTX[..pos].iter().filter(|&&byte| byte == b'\n').count() + 1;
             panic!("expr_proto.ptx has a non-ASCII byte at offset {pos} (line {line})");
+        }
+    }
+
+    #[test]
+    fn compare_ordered_ptx_is_pure_ascii() {
+        // Same runtime-JIT ASCII gate for the ordered compare-compaction module (`COMPARE_ORDERED_PTX`,
+        // shared by the value-emit and index-emit launches): a stray non-ASCII byte in a comment fails
+        // every GPU launch with INVALID_PTX (218) under the runtime ptxas. Keep it pure ASCII.
+        if let Some(pos) = COMPARE_ORDERED_PTX
+            .iter()
+            .position(|&byte| !byte.is_ascii())
+        {
+            let line = COMPARE_ORDERED_PTX[..pos]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count()
+                + 1;
+            panic!("COMPARE_ORDERED_PTX has a non-ASCII byte at offset {pos} (line {line})");
         }
     }
 

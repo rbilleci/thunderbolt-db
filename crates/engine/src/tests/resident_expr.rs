@@ -88,6 +88,96 @@ fn gpu_resident_expr_select_evaluates_arithmetic_predicate_and_materializes_rows
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_simple_int4_predicate_uses_ordered_index_route() {
+    // The `int4col <cmp> literal` peephole (`compare_indices_ordered_from_payload`): the simple single-
+    // column-vs-literal shape lowers to the ORDERED parallel compaction that emits surviving ROW INDICES
+    // ascending with NO host sort (replacing `run_expr_arith_filter`'s atomic-append + host-sort). This
+    // gate is the NON-VACUOUS proof that the new route is on the path AND ascending-correct: it uses a
+    // MULTI-BLOCK payload (1000 rows >> the 256-row chunk, so matches span many blocks and exercise the
+    // cross-block exclusive scan + intra-block prefix-sum scatter) with INTERLEAVED matches (a[i]=i%7),
+    // and asserts the EXACT ascending projected `id` vector. A broken cross-block scatter, an off-by-one
+    // in the index store, or a missing eq/ne fold would reorder or drop indices and fail this equality.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id INT, a INT)").unwrap();
+
+    const N: i32 = 1000;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        // a = i % 7 -> the rows matching `a = K` are {i : i % 7 == K}: interleaved across the WHOLE
+        // range and spread over many 256-row blocks (the cross-block ordering is load-bearing).
+        values.push_str(&format!("({i}, {})", i % 7));
+    }
+    e.execute_text(2, &format!("INSERT INTO t (id, a) VALUES {values}"))
+        .unwrap();
+
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
+        unreachable!()
+    };
+    let col_a = ResidentExpr::Column(1);
+    let lit = |k: i32| Box::new(ResidentExpr::Int4Literal(k));
+    let col = || Box::new(col_a.clone());
+
+    // (1) EQUALITY (code 0, the shape this lever targets): a = 3 -> ids {i : i%7 == 3}, ascending.
+    let eq = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Eq,
+        lhs: col(),
+        rhs: lit(3),
+    };
+    let got_eq = e
+        .execute_resident_expr_select(&select, &eq)
+        .expect("a = 3 simple int4 predicate on GPU");
+    let eq_expected: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|i| i % 7 == 3)
+        .map(|i| vec![SqlValue::Int4(i)])
+        .collect();
+    assert!(
+        eq_expected.len() > 32,
+        "must be multi-warp/multi-block to exercise cross-block ordering"
+    );
+    assert_eq!(got_eq.rows, eq_expected, "a = 3 -> ascending ids with i%7==3");
+    assert_eq!(got_eq.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(got_eq.fallback_reason, None);
+
+    // (2) RANGE (code 1): a < 3 -> ids {i : i%7 < 3}, ascending.
+    let lt = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Lt,
+        lhs: col(),
+        rhs: lit(3),
+    };
+    let got_lt = e
+        .execute_resident_expr_select(&select, &lt)
+        .expect("a < 3 simple int4 predicate on GPU");
+    let lt_expected: Vec<Vec<SqlValue>> = (0..N)
+        .filter(|i| i % 7 < 3)
+        .map(|i| vec![SqlValue::Int4(i)])
+        .collect();
+    assert_eq!(got_lt.rows, lt_expected, "a < 3 -> ascending ids with i%7<3");
+
+    // (3) FLIPPED operand order (literal <cmp> column): 3 > a == a < 3 (comparison flipped). Must equal
+    // the a < 3 result exactly (proves the flip path maps the code correctly).
+    let flipped = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Gt,
+        lhs: lit(3),
+        rhs: col(),
+    };
+    let got_flipped = e
+        .execute_resident_expr_select(&select, &flipped)
+        .expect("3 > a flipped simple int4 predicate on GPU");
+    assert_eq!(
+        got_flipped.rows, lt_expected,
+        "3 > a must equal a < 3 (flipped comparison code)"
+    );
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_where_excludes_null_operands_and_projection_carries_null() {
     // M3 (doc 21) Slice D + C: a WHERE comparison over a NULLABLE column evaluates to UNKNOWN for a NULL
     // operand ON THE GPU (the leaf mask is AND'd with the column's validity bitmap) -> the row is NOT
