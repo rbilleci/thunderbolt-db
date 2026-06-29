@@ -690,6 +690,20 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
     caught by a correctness test — the mechanical diff is the proof). **DEFAULT-OFF behind
     `dense_index_probe_enabled`; flip = strict win for the index route at >=b4096 (the production point-read
     regime), neutral at b256. The flip decision is the user's.**
+  - **DECISION: LPB OVER THE WAVE ENGINE (user 2026-06-29) -> DENSE FLIPPED ON + INDEX ROUTE ENABLED + WAVE
+    RETIRED.** The long-open wave-vs-lpb question is resolved: lpb (launch-per-batch — the dense unique index
+    probe + scan fallback) is the read path. (1) `dense_index_probe_enabled` default ON (the dense kernel is the
+    index route's kernel). (2) `wave_engine_enabled` (gates the R1 INDEX, not the persistent wave — mis-named,
+    rename pending) flipped default ON: production unique-key point reads take the O(1)/needle index instead of
+    the O(rows) scan (byte-identical, the index==scan differential). (3) The persistent `WaveReadEngine` read
+    path is RETIRED (`c45907d4`, ~-6180 LOC: `wave.rs` + the persistent route + the `Materialized` payload arm
+    [payload flattened to `DeferredProbe`] + the per-table engine cache + `wave_persistent_engine_enabled` +
+    `wave_route_hits` + the commit-eviction hook + the 9 wave probes + the wave-specific tests). KEPT: dense +
+    atomic index kernels, the scan fallback. Verified: full suite green (engine 439/0, facade 32/0, protocol
+    71/0, execution 23/0, server 3/0) + GPU differentials byte-identical (dense==atomic, index==scan, 4/0).
+    (A worktree agent over-reached on docs — deleted unrelated ADR-012 + a CHARTER over-VRAM line — caught +
+    reverted; only the code retirement was kept. The WaveReadEngine design narration in ARCHITECTURE/PLAN is
+    left as historical record.)
 
 ## ADR-007 — Full GPU-native, zero deferrals (scope = everything, incl. the oracle)
 - **Status:** Accepted (user, 2026-06-23)
