@@ -20467,6 +20467,14 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
 /// buffer is caller-sized and its lease must outlive both kernel launches), so it is checked only on
 /// the column path. `resident` still supplies the CUDA context (lib / primary / streams / leases)
 /// regardless of where the input is read.
+///
+/// SAFETY (load-bearing precondition for a leased-buffer `input_base`, audit P3): the buffer at
+/// `input_base` MUST cover `[byte_offset, byte_offset + row_count*4)` — BOTH the count and the scatter
+/// kernel read every `idx in [0, row_count)`. A too-small buffer is an out-of-bounds DEVICE read (CUDA
+/// 700). The current callers all satisfy this (the mask producers and the I32 arith filter lease exactly
+/// `row_count*4`; the I64/I128 mask buffers are larger), verified by the audit. NOTE (follow-up): make
+/// this runtime-checked by threading the input buffer's byte length down so the bound applies on the
+/// buffer path too, instead of by convention.
 fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
     resident: &R,
     input_base: u64,
