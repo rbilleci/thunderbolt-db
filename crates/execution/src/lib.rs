@@ -5871,13 +5871,23 @@ fn launch_cuda_resident_text_project(
 /// illegal DEVICE read in the kernel (CUDA 700, context-corrupting on a shared box). `n == 0` is a no-op.
 /// SAFETY: `out_host` must point to >= `row_indices.len() * elem_size` writable bytes and `kernel_name`
 /// must read/write `elem_size`-byte elements addressed `resident_ptr + byte_offset + idx*elem_size`.
-fn gather_resident_fixed_rows(
+/// Raw resident row-gather launch, shared by the fixed-width AND bool gathers: HtoD `row_indices` once,
+/// launch the 5-arg `kernel_name` (resident_ptr, `arg1`, indices, n, out), then ONE bulk D2H of `out_bytes`
+/// into the host buffer `out_host`. `arg1` is the kernel's second parameter -- a column `byte_offset` for
+/// the fixed-width gathers, a `bitmap_byte_offset` for the bool gather. `n == 0` is a no-op.
+///
+/// NO bounds check here -- the CALLER MUST validate every index in-bounds first (an OOB index is an illegal
+/// DEVICE read = CUDA 700, context-corrupting on a shared box). The kernel's writes to `out` are visible
+/// before the D2H: `launch_on_pooled_stream` blocking-syncs the stream before returning, then the legacy
+/// synchronous D2H reads `out`. SAFETY: `out_host` must point to >= `out_bytes` writable bytes matching the
+/// kernel's output element width.
+fn gather_resident_kernel(
     resident: &CudaResidentDeviceMemory,
-    byte_offset: u64,
+    arg1: u64,
     row_indices: &[u64],
-    elem_size: u64,
     kernel_name: &'static core::ffi::CStr,
     out_host: *mut c_void,
+    out_bytes: usize,
 ) -> Result<(), CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
@@ -5898,24 +5908,6 @@ fn gather_resident_fixed_rows(
     let n = row_indices.len();
     if n == 0 {
         return Ok(());
-    }
-    let out_bytes = n
-        .checked_mul(elem_size as usize)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
-
-    // Bounds safety: the kernel reads `resident_ptr + byte_offset + idx*elem_size` for `elem_size` bytes,
-    // so validate every index's element lies within the allocation FIRST. O(n) checked arithmetic, no
-    // transfers (the win was removing the per-row D2H, not this check).
-    let allocated = resident.metadata().allocated_bytes;
-    for &row_idx in row_indices {
-        let value_end = row_idx
-            .checked_mul(elem_size)
-            .and_then(|offset| byte_offset.checked_add(offset))
-            .and_then(|offset| offset.checked_add(elem_size))
-            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if value_end > allocated {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(value_end as usize));
-        }
     }
 
     let primary = resident.primary();
@@ -5938,15 +5930,15 @@ fn gather_resident_fixed_rows(
     ptx.push(0);
     let gather_fn = primary.cached_function(kernel_name, &ptx)?;
 
-    // HtoD the indices once (blocking; on-device on return), gather column[indices[i]] -> out[i] in ONE
-    // kernel, then ONE bulk D2H of the whole result buffer. Both leases are held alive past the D2H below.
+    // HtoD the indices once (blocking; on-device on return), run the gather in ONE kernel, then ONE bulk
+    // D2H of the whole result buffer. Both leases are held alive past the D2H below.
     let idx_buf = resident.upload_u64_device(row_indices)?;
     let out = primary.lease_device_buffer(out_bytes)?;
 
     const BLOCK: u32 = 256;
     let grid = (n as u64).div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
     let mut a0 = resident.device_ptr();
-    let mut a1 = byte_offset;
+    let mut a1 = arg1;
     let mut a2 = idx_buf.device_ptr();
     let mut a3 = n as u64;
     let mut a4 = out.ptr;
@@ -5980,6 +5972,44 @@ fn gather_resident_fixed_rows(
     Ok(())
 }
 
+/// Fixed-width row gather (i32/i64/i128): bounds-check every index, then [`gather_resident_kernel`] with
+/// `out_bytes = n * elem_size`. `out_host` must hold `row_indices.len() * elem_size` writable bytes, and
+/// `kernel_name` must read/write `elem_size`-byte elements addressed `resident_ptr + byte_offset +
+/// idx*elem_size`. `n == 0` is a no-op.
+fn gather_resident_fixed_rows(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_indices: &[u64],
+    elem_size: u64,
+    kernel_name: &'static core::ffi::CStr,
+    out_host: *mut c_void,
+) -> Result<(), CudaRuntimeProbeError> {
+    let n = row_indices.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let out_bytes = n
+        .checked_mul(elem_size as usize)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
+
+    // Bounds safety: the kernel reads `resident_ptr + byte_offset + idx*elem_size` for `elem_size` bytes,
+    // so validate every index's element lies within the allocation FIRST (an OOB index is CUDA 700). O(n)
+    // checked arithmetic, no transfers (the win was removing the per-row D2H, not this check).
+    let allocated = resident.metadata().allocated_bytes;
+    for &row_idx in row_indices {
+        let value_end = row_idx
+            .checked_mul(elem_size)
+            .and_then(|offset| byte_offset.checked_add(offset))
+            .and_then(|offset| offset.checked_add(elem_size))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if value_end > allocated {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(value_end as usize));
+        }
+    }
+
+    gather_resident_kernel(resident, byte_offset, row_indices, kernel_name, out_host, out_bytes)
+}
+
 /// Gather a resident int4 column at `row_indices` into host `i32` values: one
 /// `gpu_db_resident_i32_gather_rows` launch + one bulk D2H, via [`gather_resident_fixed_rows`].
 fn copy_cuda_resident_i32_rows(
@@ -6009,22 +6039,6 @@ fn copy_cuda_resident_bool_rows(
     bitmap_byte_offset: u64,
     row_indices: &[u64],
 ) -> Result<Vec<bool>, CudaRuntimeProbeError> {
-    type CuLaunchKernel = unsafe extern "C" fn(
-        *mut c_void,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        *mut c_void,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
-
     let n = row_indices.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -6043,63 +6057,16 @@ fn copy_cuda_resident_bool_rows(
         }
     }
 
-    let primary = resident.primary();
-    primary.set_current()?;
-    let cu_launch_kernel = unsafe {
-        resident
-            .lib()
-            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
-    let gather_fn = primary.cached_function(c"gpu_db_resident_bool_gather_rows", &ptx)?;
-
-    let idx_buf = resident.upload_u64_device(row_indices)?;
-    // One u8 per row (0/1); decoded to bool after the bulk D2H.
-    let out = primary.lease_device_buffer(n)?;
-
-    const BLOCK: u32 = 256;
-    let grid = (n as u64).div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
-    let mut a0 = resident.device_ptr();
-    let mut a1 = bitmap_byte_offset;
-    let mut a2 = idx_buf.device_ptr();
-    let mut a3 = n as u64;
-    let mut a4 = out.ptr;
-    let mut args = [
-        (&mut a0 as *mut u64).cast::<c_void>(),
-        (&mut a1 as *mut u64).cast::<c_void>(),
-        (&mut a2 as *mut u64).cast::<c_void>(),
-        (&mut a3 as *mut u64).cast::<c_void>(),
-        (&mut a4 as *mut u64).cast::<c_void>(),
-    ];
-    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
-        cu_launch_kernel(
-            gather_fn,
-            grid,
-            1,
-            1,
-            BLOCK,
-            1,
-            1,
-            0,
-            stream,
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    })?;
-
+    // One u8 per row: the kernel writes 0/1, gathered in bulk, then decoded to bool.
     let mut bytes = vec![0_u8; n];
-    check_cuda(unsafe { cu_memcpy_dtoh(bytes.as_mut_ptr().cast::<c_void>(), out.ptr, n) })?;
-    drop(idx_buf);
+    gather_resident_kernel(
+        resident,
+        bitmap_byte_offset,
+        row_indices,
+        c"gpu_db_resident_bool_gather_rows",
+        bytes.as_mut_ptr().cast::<c_void>(),
+        n,
+    )?;
     Ok(bytes.into_iter().map(|b| b != 0).collect())
 }
 
