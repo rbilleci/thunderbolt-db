@@ -6178,45 +6178,43 @@ impl Engine {
                 }
             })
             .collect::<Result<_, _>>()?;
-        let rows: Vec<Vec<SqlValue>> = (0..indices_u64.len())
-            .map(|row| {
-                projected_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(c, column)| {
-                        // A NULL row (validity bit 0) projects as SQL NULL regardless of its placeholder.
-                        if let Some(validity) = &projected_validity[c] {
-                            if !validity[row] {
-                                return SqlValue::Null;
-                            }
-                        }
-                        match column {
-                            ProjectedColumn::Int4(values) => SqlValue::Int4(values[row]),
-                            ProjectedColumn::Int8(values) => SqlValue::Int8(values[row]),
-                            ProjectedColumn::Numeric(values, scale) => {
-                                SqlValue::Numeric(Decimal128::new(values[row], *scale))
-                            }
-                            ProjectedColumn::Date(values) => SqlValue::Date(values[row]),
-                            ProjectedColumn::Timestamp(values) => SqlValue::Timestamp(values[row]),
-                            ProjectedColumn::Uuid(values) => {
-                                SqlValue::Uuid(values[row].to_le_bytes())
-                            }
-                            // The stored i32 is a widened i16, so the narrowing is exact.
-                            ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
-                            ProjectedColumn::Bool(values) => SqlValue::Bool(values[row]),
-                            // Device-gathered String; a NULL row was already handled by the validity
-                            // override above, so a bare value here is a real (possibly empty) string.
-                            ProjectedColumn::Text(values) => SqlValue::Text(values[row].clone()),
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
+        // Build the result rows FLAT, directly into the RowBlock (DECISIONS read-path lever): the dominant
+        // general-route cost was the per-row `Vec<SqlValue>` boxing PLUS the `rows.into()` RowBlock
+        // conversion (a 2nd O(n) pass) -- together ~75% of the per-row time (measured 38+39 of 102 ns/row).
+        // Emit ONE row-major `Vec<SqlValue>` (no inner Vec, no conversion). Byte-identical: same values in
+        // the same row-major order `RowBlock::from(Vec<Vec<_>>)` produced.
+        let ncols = projected_columns.len();
+        let mut flat: Vec<SqlValue> = Vec::with_capacity(indices_u64.len() * ncols);
+        for row in 0..indices_u64.len() {
+            for (c, column) in projected_columns.iter().enumerate() {
+                // A NULL row (validity bit 0) projects as SQL NULL regardless of its placeholder.
+                if projected_validity[c].as_ref().is_some_and(|validity| !validity[row]) {
+                    flat.push(SqlValue::Null);
+                    continue;
+                }
+                flat.push(match column {
+                    ProjectedColumn::Int4(values) => SqlValue::Int4(values[row]),
+                    ProjectedColumn::Int8(values) => SqlValue::Int8(values[row]),
+                    ProjectedColumn::Numeric(values, scale) => {
+                        SqlValue::Numeric(Decimal128::new(values[row], *scale))
+                    }
+                    ProjectedColumn::Date(values) => SqlValue::Date(values[row]),
+                    ProjectedColumn::Timestamp(values) => SqlValue::Timestamp(values[row]),
+                    ProjectedColumn::Uuid(values) => SqlValue::Uuid(values[row].to_le_bytes()),
+                    // The stored i32 is a widened i16, so the narrowing is exact.
+                    ProjectedColumn::Int2(values) => SqlValue::Int2(values[row] as i16),
+                    ProjectedColumn::Bool(values) => SqlValue::Bool(values[row]),
+                    // Device-gathered String; a NULL row was already handled by the validity override
+                    // above, so a bare value here is a real (possibly empty) string.
+                    ProjectedColumn::Text(values) => SqlValue::Text(values[row].clone()),
+                });
+            }
+        }
         // OFFSET/LIMIT was already applied as a control-plane window of `indices_u64` above (before the
-        // gather), so `rows` is the final windowed result -- no host drain/truncate on result data.
+        // gather), so `flat` is the final windowed result -- no host drain/truncate on result data.
         Ok(RelationalSelectResult {
             columns: Arc::new(bound.selected_columns),
-            rows: rows.into(),
+            rows: RowBlock::flat(flat, ncols),
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
