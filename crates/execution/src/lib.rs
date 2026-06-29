@@ -2249,6 +2249,7 @@ impl CudaResidentDeviceMemory {
         value_byte_offset: u64,
         row_count: u64,
         null_bitmap_offset: Option<u64>,
+        agg_mask: u32,
     ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_grouped_stats(
             self,
@@ -2258,7 +2259,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             null_bitmap_offset,
             None,
-            grouped_agg_mask::ALL,
+            agg_mask,
         )
         .map(|(rows, _)| rows)
     }
@@ -2322,6 +2323,7 @@ impl CudaResidentDeviceMemory {
         needle: i32,
         comparison: CudaI32Comparison,
         null_bitmap_offset: Option<u64>,
+        agg_mask: u32,
     ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_grouped_stats(
             self,
@@ -2331,7 +2333,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             null_bitmap_offset,
             None,
-            grouped_agg_mask::ALL,
+            agg_mask,
         )
         .map(|(rows, _)| rows)
     }

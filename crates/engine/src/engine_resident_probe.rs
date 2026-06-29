@@ -297,6 +297,21 @@ fn materialize_resident_scalar_stats(
     })
 }
 
+/// The aggregate-selection mask (`grouped_agg_mask`) for a scalar self-grouped reduction: request only
+/// the per-group field(s) the reduction actually reads, so the grouped kernel runs strictly fewer per-row
+/// update atomics (the masked-out fields stay at their init sentinels and are never read). SUM reads sum;
+/// AVG reads count+sum; MIN reads min; MAX reads max; COUNT reads count. Byte-identical to ALL for the
+/// consumed field(s); see [`reduce_nullable_grouped_stats`] and the unfiltered scalar arm.
+fn scalar_aggregate_mask(aggregate: &ResidentScalarAggregate) -> u32 {
+    match aggregate {
+        ResidentScalarAggregate::Sum { .. } => grouped_agg_mask::SUM,
+        ResidentScalarAggregate::Avg { .. } => grouped_agg_mask::COUNT | grouped_agg_mask::SUM,
+        ResidentScalarAggregate::Min { .. } => grouped_agg_mask::MIN,
+        ResidentScalarAggregate::Max { .. } => grouped_agg_mask::MAX,
+        ResidentScalarAggregate::Count => grouped_agg_mask::COUNT,
+    }
+}
+
 /// Reduce the NULL-aware self-grouped stats (M3 — doc 21) of a scalar SUM/AVG/MIN/MAX into one value.
 /// The groups cover only the surviving non-NULL (and, when filtered, matching) rows, so a zero-survivor
 /// result is SQL NULL for every aggregate (PG: an aggregate of no rows is NULL — never 0 or the
@@ -694,6 +709,7 @@ impl Engine {
                         byte_offset,
                         row_count,
                         agg_null_offset,
+                        scalar_aggregate_mask(&aggregate),
                     )
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
                 let elapsed = started.elapsed();
@@ -719,6 +735,7 @@ impl Engine {
                         *needle,
                         *comparison,
                         agg_null_offset,
+                        scalar_aggregate_mask(&aggregate),
                     )
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
                 let elapsed = started.elapsed();
