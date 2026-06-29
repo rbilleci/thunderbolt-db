@@ -15050,7 +15050,7 @@ fn compact_buffer_i32_compare_to_indices(
 /// primitives. Correctness-first: each step runs on a pooled stream that syncs, so an intermediate
 /// is valid before the next step reads it (pipelining/fusion is a later perf lever).
 /// Compare two int4 value buffers (absolute device ptrs) elementwise and return the matching row
-/// indices, host-sorted ascending. The col-vs-col / expr-vs-expr analogue of
+/// indices in ASCENDING order. The col-vs-col / expr-vs-expr analogue of
 /// `compact_buffer_i32_compare_to_indices`. `comparison`: 0=eq, 1=lt, 2=le, 3=gt, 4=ge.
 fn compact_buffers_i32_compare_to_indices(
     resident: &CudaResidentDeviceMemory,
@@ -15059,128 +15059,34 @@ fn compact_buffers_i32_compare_to_indices(
     n: u64,
     comparison: u32,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
-    type CuLaunchKernel = unsafe extern "C" fn(
-        *mut c_void,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        *mut c_void,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> i32;
-    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
-
-    // The buffer compact kernel switches on codes 0=eq..4=ge only; reject 5=ne (mask-path only).
+    // The buffer compact kernel switches on codes 0=eq..4=ge only; reject 5=ne (mask-path only) so a
+    // caller gets an error, not a silently-empty result. Preserved byte-identically across the re-route
+    // to the ordered two-input compaction (no production caller passes 5 here - `ne` lowers to a mask).
     if comparison > 4 {
         return Err(CudaRuntimeProbeError::UnsupportedComparison(comparison));
     }
     if n == 0 {
         return Ok(Vec::new());
     }
-    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
-    let byte_len = n_usize
-        .checked_mul(std::mem::size_of::<i32>())
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
-
-    let primary = resident.primary();
-    primary.set_current()?;
-    let cu_launch_kernel = unsafe {
-        resident
-            .lib()
-            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_htod = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
-    let compare_fn = primary.cached_function(c"gpu_db_buffer_i32_compare_buffers_to_indices", &ptx)?;
-
-    let indices_buf = primary.lease_device_buffer(byte_len)?;
-    let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
-    let zero = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_htod(
-            count_buf.ptr,
-            (&zero as *const u32).cast::<c_void>(),
-            std::mem::size_of::<u32>(),
-        )
-    })?;
-
-    const BLOCK: u32 = 256;
-    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
-    let mut a_arg = lhs_device_ptr;
-    let mut b_arg = rhs_device_ptr;
-    let mut n_arg = n;
-    let mut cmp_arg = comparison;
-    let mut count_arg = count_buf.ptr;
-    let mut idx_arg = indices_buf.ptr;
-    let mut args = [
-        (&mut a_arg as *mut u64).cast::<c_void>(),
-        (&mut b_arg as *mut u64).cast::<c_void>(),
-        (&mut n_arg as *mut u64).cast::<c_void>(),
-        (&mut cmp_arg as *mut u32).cast::<c_void>(),
-        (&mut count_arg as *mut u64).cast::<c_void>(),
-        (&mut idx_arg as *mut u64).cast::<c_void>(),
-    ];
-    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
-        cu_launch_kernel(
-            compare_fn,
-            grid,
-            1,
-            1,
-            BLOCK,
-            1,
-            1,
-            0,
-            stream,
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    })?;
-
-    let mut match_count = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut match_count as *mut u32).cast::<c_void>(),
-            count_buf.ptr,
-            std::mem::size_of::<u32>(),
-        )
-    })?;
-    let match_count = usize::try_from(match_count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?
-        .min(n_usize);
-    let mut indices = vec![0_u32; match_count];
-    if match_count > 0 {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                indices.as_mut_ptr().cast::<c_void>(),
-                indices_buf.ptr,
-                match_count * std::mem::size_of::<u32>(),
-            )
-        })?;
-    }
-    indices.sort_unstable();
-    Ok(indices)
+    // Re-route to the TWO-INPUT ORDERED parallel compaction (`COMPARE_ORDERED_PTX`,
+    // `gpu_db_buffers_i32_compare_*_blocks`): compare `lhs[i] <cmp> rhs[i]` over the two leased value
+    // buffers (`lhs_device_ptr`, `rhs_device_ptr`, each contiguous i32 at `base + idx*4` - the same
+    // layout the legacy `gpu_db_buffer_i32_compare_buffers_to_indices` atomic kernel read), so the
+    // surviving row indices are IDENTICAL (operand order lhs,rhs; codes 0..4) - but emitted ASCENDING
+    // BY CONSTRUCTION (contiguous block partition + ordered intra-block prefix sum), replacing the
+    // atomic-append + host `sort_unstable`.
+    //
+    // Lease lifetime: the ordered launch does count -> host-scan -> scatter (TWO launches, each reading
+    // BOTH buffers). The caller leases both value buffers and holds those leases across this whole call
+    // (borrowed for the duration), so both inputs outlive both reads - unchanged from the legacy
+    // single-launch path, which also read the same two buffers.
+    launch_cuda_resident_i32_compare_buffers_indices_ordered(
+        resident,
+        lhs_device_ptr,
+        rhs_device_ptr,
+        n,
+        comparison,
+    )
 }
 
 /// Execute an arithmetic bytecode `program` over a stack of leased device buffers and return the
@@ -20393,6 +20299,393 @@ after_scatter:
 iter_done:
     ret;
 }
+
+// ---- TWO-INPUT (col-vs-col) ordered compaction: compare lhs[i] <cmp> rhs[i], emit ASCENDING row
+// indices, no host sort. COPIED VERBATIM from the single-input `..._compare_count_blocks` /
+// `..._compare_scatter_blocks` above (the block partition, grid-stride, the entire two-level
+// warp-shuffle prefix-sum scan, the ordered scatter, all scaffolding); the ONLY change is the
+// match-test fold: replace the one `input[idx] <cmp> needle` load+setp with TWO loads
+// (`%a = lhs_base[idx]`, `%b = rhs_base[idx]`) and `%a <cmp> %b` (operand order lhs,rhs - identical
+// to the legacy atomic kernel `gpu_db_buffer_i32_compare_buffers_to_indices`). Codes 0..4 only
+// (eq/lt/lte/gt/gte); ne (5) is rejected at the wrapper, so the ne term is omitted. The scatter
+// ALWAYS stores the surviving ROW INDEX (col-vs-col is a predicate), so there is no `out_is_index`
+// param - the store is hardcoded to the row index (`cvt.u32.u64` of `%row`), exactly the single-input
+// index path. The match-test fold (the two loads + the setp/and/or composition) is byte-identical
+// between the two kernels below, so Pass A's per-block count equals Pass B's per-block scatter count
+// for every predicate (count <-> scatter symmetry).
+.visible .entry gpu_db_buffers_i32_compare_count_blocks(
+    .param .u64 lhs_base,
+    .param .u64 rhs_base,
+    .param .u64 row_count,
+    .param .u64 chunk_rows,
+    .param .u32 comparison,
+    .param .u64 out_block_counts_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %comparison;
+    .reg .u64 %lhs;
+    .reg .u64 %rhs;
+    .reg .u64 %rows;
+    .reg .u64 %chunk;
+    .reg .u64 %block_counts;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %idx;
+    .reg .u64 %tmp64;
+    .reg .u64 %lhs_addr;
+    .reg .u64 %rhs_addr;
+    .reg .u64 %off4;
+    .reg .u64 %matches;
+    .reg .u64 %count_addr;
+    .reg .s32 %a;
+    .reg .s32 %b;
+
+    ld.param.u64 %lhs, [lhs_base];
+    ld.param.u64 %rhs, [rhs_base];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %block_counts, [out_block_counts_ptr];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // idx = start + lane; stride = blockDim (grid-stride WITHIN this block's range)
+    cvt.u64.u32 %tmp64, %lane;
+    add.u64 %idx, %start, %tmp64;
+    cvt.u64.u32 %tmp64, %bdim;
+
+    mov.u64 %matches, 0;
+
+loop_buf:
+    setp.ge.u64 %p_done, %idx, %end;
+    @%p_done bra done_buf;
+    // value a = lhs[idx]; value b = rhs[idx]; flag iff a <cmp> b (operand order lhs,rhs).
+    mul.lo.u64 %off4, %idx, 4;
+    add.u64 %lhs_addr, %lhs, %off4;
+    ld.global.s32 %a, [%lhs_addr];
+    add.u64 %rhs_addr, %rhs, %off4;
+    ld.global.s32 %b, [%rhs_addr];
+    setp.lt.s32 %p_lt, %a, %b;
+    setp.le.s32 %p_lte, %a, %b;
+    setp.gt.s32 %p_gt, %a, %b;
+    setp.ge.s32 %p_gte, %a, %b;
+    setp.eq.s32 %p_eq, %a, %b;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    @!%p_match bra next_buf;
+    add.u64 %matches, %matches, 1;
+
+next_buf:
+    add.u64 %idx, %idx, %tmp64;
+    bra loop_buf;
+
+done_buf:
+    // Accumulate this thread's local matches into the block's slot (commutative add; the ordering is
+    // established by the contiguous partition + pass B, never by this reduction).
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %count_addr, %tmp64, 8;
+    add.u64 %count_addr, %block_counts, %count_addr;
+    red.global.add.u64 [%count_addr], %matches;
+    ret;
+}
+
+// Pass B for the two-input (col-vs-col) ordered compaction. Identical structure to the single-input
+// `gpu_db_resident_i32_compare_scatter_blocks` above (contiguous block partition + two-level
+// warp-shuffle ordered intra-block prefix sum -> ascending-by-construction scatter); the ONLY changes
+// vs that kernel are: (1) TWO input bases (lhs/rhs) read at `base + idx*4` and the `%a <cmp> %b`
+// match-test fold (codes 0..4, no ne) - byte-identical to the count kernel above; (2) the store is
+// hardcoded to the surviving ROW INDEX (`cvt.u32.u64` of %row) with no `out_is_index` param, since
+// col-vs-col is a predicate. Pass A and Pass B test the SAME predicate over the SAME range, so the
+// per-block scatter count equals Pass A's per-block count.
+.visible .entry gpu_db_buffers_i32_compare_scatter_blocks(
+    .param .u64 lhs_base,
+    .param .u64 rhs_base,
+    .param .u64 row_count,
+    .param .u64 chunk_rows,
+    .param .u32 comparison,
+    .param .u64 block_base_ptr,
+    .param .u64 out_indices_ptr
+)
+{
+    // shared scratch: [0..32) warp totals, [32..64) per-warp exclusive prefixes, [64] block total.
+    .shared .align 4 .b32 s_scan[65];
+
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_eq;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_code_eq;
+    .reg .pred %p_match;
+    .reg .pred %p_recv;
+    .reg .pred %p_inrange;
+    .reg .pred %p_islast;
+    .reg .pred %p_warp0;
+    .reg .pred %p_lane_in;
+    .reg .u32 %thr;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %lane;
+    .reg .u32 %warp;
+    .reg .u32 %nwarps;
+    .reg .u32 %comparison;
+    .reg .u32 %flag;
+    .reg .u32 %incl;
+    .reg .u32 %recv;
+    .reg .u32 %wexcl;
+    .reg .u32 %wtot;
+    .reg .u32 %prefix;
+    .reg .u32 %btot;
+    .reg .u32 %off32;
+    .reg .u32 %tmp32;
+    .reg .u32 %row_u32;
+    .reg .u64 %lhs;
+    .reg .u64 %rhs;
+    .reg .u64 %rows;
+    .reg .u64 %chunk;
+    .reg .u64 %block_base;
+    .reg .u64 %out_indices;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %row;
+    .reg .u64 %iter_base;
+    .reg .u64 %stride;
+    .reg .u64 %tmp64;
+    .reg .u64 %lhs_addr;
+    .reg .u64 %rhs_addr;
+    .reg .u64 %off4;
+    .reg .u64 %slot;
+    .reg .u64 %output_addr;
+    .reg .u64 %base_addr;
+    .reg .u64 %running;
+    .reg .u64 %sh_addr;
+    .reg .s32 %a;
+    .reg .s32 %b;
+
+    ld.param.u64 %lhs, [lhs_base];
+    ld.param.u64 %rhs, [rhs_base];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %block_base, [block_base_ptr];
+    ld.param.u64 %out_indices, [out_indices_ptr];
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // lane = thr & 31; warp = thr >> 5; nwarps = (bdim + 31) >> 5
+    and.b32 %lane, %thr, 31;
+    shr.u32 %warp, %thr, 5;
+    add.u32 %tmp32, %bdim, 31;
+    shr.u32 %nwarps, %tmp32, 5;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // slot = block_base[bid]  (this block's exclusive-prefix base output index)
+    mul.lo.u64 %base_addr, %tmp64, 8;
+    add.u64 %base_addr, %block_base, %base_addr;
+    ld.global.u64 %slot, [%base_addr];
+
+    cvt.u64.u32 %stride, %bdim;
+    // iter_base walks start, start+bdim, start+2*bdim, ...; row = iter_base + thr.
+    mov.u64 %iter_base, %start;
+    mov.u64 %running, 0;
+    setp.eq.u32 %p_warp0, %warp, 0;
+
+iter_loop_buf:
+    // Continue while the block still has rows to cover: iter_base < end (block-uniform trip count).
+    setp.ge.u64 %p_done, %iter_base, %end;
+    @%p_done bra iter_done_buf;
+
+    // row = iter_base + thr ; in-range = row < end
+    cvt.u64.u32 %tmp64, %thr;
+    add.u64 %row, %iter_base, %tmp64;
+    setp.lt.u64 %p_inrange, %row, %end;
+
+    mov.u32 %flag, 0;
+    @!%p_inrange bra after_pred_buf;
+
+    // a = lhs[row]; b = rhs[row]; flag = 1 iff a <cmp> b (operand order lhs,rhs).
+    mul.lo.u64 %off4, %row, 4;
+    add.u64 %lhs_addr, %lhs, %off4;
+    ld.global.s32 %a, [%lhs_addr];
+    add.u64 %rhs_addr, %rhs, %off4;
+    ld.global.s32 %b, [%rhs_addr];
+    setp.lt.s32 %p_lt, %a, %b;
+    setp.le.s32 %p_lte, %a, %b;
+    setp.gt.s32 %p_gt, %a, %b;
+    setp.ge.s32 %p_gte, %a, %b;
+    setp.eq.s32 %p_eq, %a, %b;
+    setp.eq.u32 %p_code_eq, %comparison, 0;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    mov.pred %p_match, 0;
+    and.pred %p_eq, %p_eq, %p_code_eq;
+    or.pred %p_match, %p_match, %p_eq;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    selp.u32 %flag, 1, 0, %p_match;
+
+after_pred_buf:
+    // ---- warp inclusive scan of %flag over 32 lanes (Hillis-Steele via shfl.sync.up.b32) ----
+    mov.u32 %incl, %flag;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    // warp-local exclusive = inclusive - own flag
+    sub.u32 %wexcl, %incl, %flag;
+
+    // lane 31 writes the warp total (= inclusive at the top lane) to s_scan[warp].
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_wtot_write_buf;
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    st.shared.u32 [%sh_addr], %incl;
+skip_wtot_write_buf:
+    bar.sync 0;
+
+    // ---- warp 0 exclusive-scans the warp totals s_scan[0..nwarps) ----
+    @!%p_warp0 bra skip_combine_buf;
+    setp.lt.u32 %p_lane_in, %lane, %nwarps;
+    mov.u32 %wtot, 0;
+    @!%p_lane_in bra have_wtot_buf;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    ld.shared.u32 %wtot, [%sh_addr];
+have_wtot_buf:
+    mov.u32 %prefix, %wtot;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    // exclusive per-warp prefix = inclusive - own total; write to s_scan[32 + lane] (byte 128 + 4*lane).
+    sub.u32 %tmp32, %prefix, %wtot;
+    @!%p_lane_in bra skip_excl_write_buf;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    st.shared.u32 [%sh_addr], %tmp32;
+skip_excl_write_buf:
+    // lane 31 holds the inclusive scan of ALL warp totals (lanes >= nwarps loaded 0) = block total;
+    // store it to s_scan[64] (byte 256).
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_combine_buf;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    st.shared.u32 [%sh_addr], %prefix;
+skip_combine_buf:
+    bar.sync 0;
+
+    // ---- scatter: out[slot + running + per-warp-prefix + warp-local-exclusive] = row index ----
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    ld.shared.u32 %prefix, [%sh_addr];
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    ld.shared.u32 %btot, [%sh_addr];
+
+    @!%p_inrange bra after_scatter_buf;
+    setp.eq.u32 %p_match, %flag, 1;
+    @!%p_match bra after_scatter_buf;
+    add.u32 %off32, %wexcl, %prefix;
+    cvt.u64.u32 %tmp64, %off32;
+    add.u64 %tmp64, %tmp64, %running;
+    add.u64 %tmp64, %tmp64, %slot;
+    mul.lo.u64 %output_addr, %tmp64, 4;
+    add.u64 %output_addr, %out_indices, %output_addr;
+    // Col-vs-col is a predicate -> store the surviving ROW INDEX (the row u64 truncated to u32; row <
+    // row_count which fits u32 - the wrapper asserts row_count <= u32::MAX). Hardcoded index store (no
+    // value mode), exactly the single-input index path.
+    cvt.u32.u64 %row_u32, %row;
+    st.global.b32 [%output_addr], %row_u32;
+
+after_scatter_buf:
+    // running += block total (uniform across the block); advance one stride window; fence the shared
+    // scratch before the next iteration's lane-31 writes overwrite it.
+    cvt.u64.u32 %tmp64, %btot;
+    add.u64 %running, %running, %tmp64;
+    add.u64 %iter_base, %iter_base, %stride;
+    bar.sync 0;
+    bra iter_loop_buf;
+
+iter_done_buf:
+    ret;
+}
 "#;
 
 /// VALUE-emit launch: returns the matching i32 VALUES in ASCENDING ROW ORDER (the ordered
@@ -20451,6 +20744,412 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
     // is `< row_count`, always non-negative, and fits u32 since row_count <= u32::MAX in every sized
     // grid). The order is already ascending by construction (no host sort).
     Ok(slots.into_iter().map(|slot| slot as u32).collect())
+}
+
+/// TWO-INPUT (col-vs-col / expr-vs-expr) ordered compare-compaction: compare `lhs[i] <cmp> rhs[i]`
+/// elementwise and return the surviving ROW INDICES (`Vec<u32>`) in ASCENDING ORDER, with NO host
+/// sort. Mirrors `launch_cuda_resident_i32_compare_indices_ordered` (and shares the orchestration of
+/// `launch_cuda_resident_i32_compare_ordered_core`: parallel per-block count -> tiny host
+/// exclusive-scan of the per-block counts -> parallel ordered-scatter, the same chunk/grid sizing,
+/// lease lifetimes, async-on-pooled-stream lever + blocking fallback, and the `output_count >
+/// row_count` guard), but drives the TWO-INPUT kernels `gpu_db_buffers_i32_compare_count_blocks` /
+/// `..._scatter_blocks` with two absolute device bases and NO needle/byte_offset. The scatter always
+/// stores the surviving row index (col-vs-col is a predicate). `comparison` is the raw code
+/// (0=eq,1=lt,2=lte,3=gt,4=gte; ne is rejected at the wrapper).
+///
+/// SAFETY (load-bearing precondition, audit P3): the buffers at `lhs_base` and `rhs_base` MUST each
+/// cover `[0, n*4)` - BOTH the count and the scatter kernel read every `idx in [0, n)` from BOTH
+/// bases. A too-small buffer is an out-of-bounds DEVICE read (CUDA 700). The caller leases each value
+/// buffer at exactly `n*4` and holds both leases across this whole call (borrowed for the duration),
+/// so both inputs outlive both reads - documented exactly as the single-input core's `input_base`.
+fn launch_cuda_resident_i32_compare_buffers_indices_ordered<R: CudaResidentReadSource>(
+    resident: &R,
+    lhs_base: u64,
+    rhs_base: u64,
+    n: u64,
+    comparison: u32,
+) -> Result<Vec<u32>, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = COMPARE_ORDERED_PTX;
+
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    // Load-bearing precondition (audit P3): the scatter kernel stores each surviving ROW INDEX as a u32
+    // (`cvt.u32.u64` then `st.global.b32`), so it would silently truncate past u32::MAX. The grid sizing
+    // grows `chunk` for arbitrarily large `n` and does NOT cap it, so assert here (~17 GB for one i32
+    // input = unreachable on a single GPU today, but make the invariant explicit, not a comment).
+    debug_assert!(
+        n <= u64::from(u32::MAX),
+        "ordered-index compaction stores row indices as u32; n {n} exceeds u32::MAX"
+    );
+
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset_d8 = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let values_bytes = usize::try_from(
+        n.checked_mul(std::mem::size_of::<i32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    // ---- ordered-compaction grid shape (identical to the single-input core) ----
+    const BLOCK: u32 = 256;
+    const CHUNK_ROWS: u64 = 256;
+    const MAX_GRID: u64 = 65_535;
+    let chunk = CHUNK_ROWS.max(n.div_ceil(MAX_GRID));
+    let grid_u64 = n.div_ceil(chunk);
+    debug_assert!((1..=MAX_GRID).contains(&grid_u64));
+    let grid = u32::try_from(grid_u64)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let block_counts_len = grid as usize;
+    let block_scratch_bytes = block_counts_len
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let async_ops = match (
+        resident.primary().cu_memcpy_dtoh_async,
+        resident.primary().cu_memcpy_htod_async,
+        resident.primary().cu_memset_d8_async,
+    ) {
+        (Some(dtoh), Some(htod), Some(memset)) => Some((dtoh, htod, memset)),
+        _ => None,
+    };
+
+    let values_guard = resident
+        .primary()
+        .lease_device_buffer(values_bytes.max(1))?;
+    let block_counts_guard = resident
+        .primary()
+        .lease_device_buffer(block_scratch_bytes)?;
+    let block_base_guard = resident
+        .primary()
+        .lease_device_buffer(block_scratch_bytes)?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let count_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_buffers_i32_compare_count_blocks", &ptx)?;
+    let scatter_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_buffers_i32_compare_scatter_blocks", &ptx)?;
+
+    // Shared kernel scalar args. The two-input kernels read lhs[idx] / rhs[idx] at `base + idx*4` (no
+    // needle / byte_offset). The scatter ALWAYS stores the row index (col-vs-col is a predicate).
+    let mut lhs_arg = lhs_base;
+    let mut rhs_arg = rhs_base;
+    let mut rows_arg = n;
+    let mut chunk_arg = chunk;
+    let mut comparison_arg = comparison;
+    let mut block_counts_arg = block_counts_guard.ptr;
+    let mut block_base_arg = block_base_guard.ptr;
+    let mut values_arg = values_guard.ptr;
+    let mut count_args = [
+        (&mut lhs_arg as *mut u64).cast::<c_void>(),
+        (&mut rhs_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut chunk_arg as *mut u64).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
+        (&mut block_counts_arg as *mut u64).cast::<c_void>(),
+    ];
+    let mut scatter_args = [
+        (&mut lhs_arg as *mut u64).cast::<c_void>(),
+        (&mut rhs_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut chunk_arg as *mut u64).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
+        (&mut block_base_arg as *mut u64).cast::<c_void>(),
+        (&mut values_arg as *mut u64).cast::<c_void>(),
+    ];
+
+    // Host exclusive scan of the per-block match counts into per-block base output slots; returns
+    // (block_base, total_matches). Identical to the single-input core.
+    fn exclusive_scan_blocks(counts: &[u64]) -> (Vec<u64>, u64) {
+        let mut base = Vec::with_capacity(counts.len());
+        let mut running = 0_u64;
+        for &c in counts {
+            base.push(running);
+            running = running.saturating_add(c);
+        }
+        (base, running)
+    }
+
+    if let Some((dtoh_async, htod_async, memset_async)) = async_ops {
+        // ---- async-on-pooled-stream path ----
+        resident.primary().set_current()?;
+        struct StreamLease<'a> {
+            primary: &'a GpuPrimaryContext,
+            pooled: Option<PooledStream>,
+        }
+        impl Drop for StreamLease<'_> {
+            fn drop(&mut self) {
+                if let Some(pooled) = self.pooled.take() {
+                    self.primary.release_pooled_stream(pooled);
+                }
+            }
+        }
+        let lease = StreamLease {
+            primary: resident.primary(),
+            pooled: Some(resident.primary().acquire_pooled_stream()?),
+        };
+        let pooled = lease.pooled.as_ref().expect("pooled stream just set");
+        let stream = pooled.stream;
+        let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+
+        // HARDENING (error-path stream drain): drain the private stream before yielding an error so
+        // enqueued ops cannot use leases freed by unwinding. Identical to the single-input core.
+        let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+            unsafe {
+                let _ = (resident.primary().cu_stream_synchronize)(stream);
+            }
+            err
+        };
+
+        if timed {
+            check_cuda(unsafe { (resident.primary().cu_event_record)(pooled.start_event, stream) })
+                .map_err(drain_err)?;
+        }
+        check_cuda(unsafe { memset_async(block_counts_guard.ptr, 0, block_scratch_bytes, stream) })
+            .map_err(drain_err)?;
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                count_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                count_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        let mut block_counts = vec![0_u64; block_counts_len];
+        let counts_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            block_counts_guard.ptr,
+            &mut block_counts,
+        )
+        .map_err(drain_err)?;
+        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+            .map_err(drain_err)?;
+        copy_pinned_into(&counts_pinned, &mut block_counts);
+        drop(counts_pinned);
+
+        let (block_base, output_count) = exclusive_scan_blocks(&block_counts);
+        if output_count > n {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(output_count).unwrap_or(usize::MAX),
+            ));
+        }
+
+        let base_pinned = resident
+            .primary()
+            .lease_pinned_host_buffer(block_scratch_bytes);
+        if let Some(pinned) = &base_pinned {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    block_base.as_ptr(),
+                    pinned.ptr.cast::<u64>(),
+                    block_base.len(),
+                );
+            }
+        }
+        let base_src: *const c_void = base_pinned
+            .as_ref()
+            .map(|p| p.ptr.cast_const())
+            .unwrap_or_else(|| block_base.as_ptr().cast::<c_void>());
+        check_cuda(unsafe {
+            htod_async(block_base_guard.ptr, base_src, block_scratch_bytes, stream)
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                scatter_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                scatter_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+        if timed {
+            check_cuda(unsafe { (resident.primary().cu_event_record)(pooled.stop_event, stream) })
+                .map_err(drain_err)?;
+        }
+
+        let mut output = vec![
+            0_i32;
+            usize::try_from(output_count).map_err(|_| {
+                CudaRuntimeProbeError::InvalidInputLength(usize::MAX)
+            })?
+        ];
+
+        let values_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            values_guard.ptr,
+            &mut output,
+        )
+        .map_err(drain_err)?;
+        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+            .map_err(drain_err)?;
+        drop(base_pinned);
+        copy_pinned_into(&values_pinned, &mut output);
+
+        if timed {
+            let mut elapsed_ms = 0.0_f32;
+            check_cuda(unsafe {
+                (resident.primary().cu_event_elapsed_time)(
+                    &mut elapsed_ms,
+                    pooled.start_event,
+                    pooled.stop_event,
+                )
+            })?;
+            resident.record_kernel_event_elapsed_us(Some(
+                (f64::from(elapsed_ms) * 1_000.0).ceil() as u64
+            ));
+        } else {
+            resident.record_kernel_event_elapsed_us(None);
+        }
+
+        drop(lease);
+        // The scatter wrote each surviving row index as a u32 via `st.global.b32`; the host buffer is
+        // `Vec<i32>` 4-byte slots, so reinterpret each slot's bits back to u32 (bit-exact - a row index
+        // is `< n`, non-negative, fits u32 since n <= u32::MAX). Already ascending by construction.
+        Ok(output.into_iter().map(|slot| slot as u32).collect())
+    } else {
+        // ---- legacy blocking fallback (old driver: no async/pinned symbols) ----
+        check_cuda(unsafe { cu_memset_d8(block_counts_guard.ptr, 0, block_scratch_bytes) })?;
+        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+            cu_launch_kernel(
+                count_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                count_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+
+        let mut block_counts = vec![0_u64; block_counts_len];
+        if !block_counts.is_empty() {
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(
+                    block_counts.as_mut_ptr().cast::<c_void>(),
+                    block_counts_guard.ptr,
+                    block_scratch_bytes,
+                )
+            })?;
+        }
+        let (block_base, output_count) = exclusive_scan_blocks(&block_counts);
+        if output_count > n {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(output_count).unwrap_or(usize::MAX),
+            ));
+        }
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                block_base_guard.ptr,
+                block_base.as_ptr().cast::<c_void>(),
+                block_scratch_bytes,
+            )
+        })?;
+        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+            cu_launch_kernel(
+                scatter_fn,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                scatter_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+
+        let mut output = vec![
+            0_i32;
+            usize::try_from(output_count).map_err(|_| {
+                CudaRuntimeProbeError::InvalidInputLength(usize::MAX)
+            })?
+        ];
+        if !output.is_empty() {
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(
+                    output.as_mut_ptr().cast::<c_void>(),
+                    values_guard.ptr,
+                    output.len() * std::mem::size_of::<i32>(),
+                )
+            })?;
+        }
+        Ok(output.into_iter().map(|slot| slot as u32).collect())
+    }
 }
 
 /// Shared core for the ordered i32 compare-compaction (`COMPARE_ORDERED_PTX`). `out_is_index` selects
