@@ -2623,11 +2623,13 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         .execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a >= 0")
         .expect("sum all on GPU");
     assert_eq!(s3.rows, vec![vec![SqlValue::Int8(sum_of(&|_| true))]], "SUM(a) WHERE a >= 0 => total");
-    // SUM over an EMPTY set is NULL (M3) -> hard error, NOT a wrong 0.
-    assert!(
+    // SUM over an EMPTY set is SQL NULL (PG) -- one row, NULL (was the M3 hard error).
+    assert_eq!(
         e.execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a > 1000")
-            .is_err(),
-        "SUM over empty => NULL/M3 hard error (not 0)"
+            .expect("SUM empty on GPU")
+            .rows,
+        vec![vec![SqlValue::Null]],
+        "SUM over empty => SQL NULL"
     );
 
     // MIN / MAX(int4) over a filtered set -- GPU reductions; PG preserves the type (int4 -> int4).
@@ -2649,13 +2651,20 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         .execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a >= 0")
         .expect("min all on GPU");
     assert_eq!(mn2.rows, vec![vec![SqlValue::Int4(0)]], "MIN(a) WHERE a >= 0 => 0");
-    // MIN/MAX over an EMPTY set is NULL (M3) -> hard error.
-    assert!(
+    // MIN/MAX over an EMPTY set is SQL NULL (PG).
+    assert_eq!(
         e.execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a > 1000")
-            .is_err()
-            && e.execute_resident_expr_select_sql("SELECT MAX(a) FROM t WHERE a > 1000")
-                .is_err(),
-        "MIN/MAX over empty => NULL/M3 hard error"
+            .expect("MIN empty on GPU")
+            .rows,
+        vec![vec![SqlValue::Null]],
+        "MIN over empty => SQL NULL"
+    );
+    assert_eq!(
+        e.execute_resident_expr_select_sql("SELECT MAX(a) FROM t WHERE a > 1000")
+            .expect("MAX empty on GPU")
+            .rows,
+        vec![vec![SqlValue::Null]],
+        "MAX over empty => SQL NULL"
     );
 
     // The remaining aggregates are follow-ons -> hard error (clear message, never a wrong/blank
@@ -2703,11 +2712,13 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
         .execute_resident_expr_select_sql("SELECT AVG(a) FROM t WHERE flag")
         .expect("avg where flag on GPU");
     assert_eq!(a3.rows, avg_expected(&|a| a % 3 == 0), "AVG(a) WHERE flag");
-    // AVG over an EMPTY set is NULL (M3) -> hard error.
-    assert!(
+    // AVG over an EMPTY set is SQL NULL (PG).
+    assert_eq!(
         e.execute_resident_expr_select_sql("SELECT AVG(a) FROM t WHERE a > 1000")
-            .is_err(),
-        "AVG over empty => NULL/M3 hard error"
+            .expect("AVG empty on GPU")
+            .rows,
+        vec![vec![SqlValue::Null]],
+        "AVG over empty => SQL NULL"
     );
 }
 
@@ -2830,13 +2841,17 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
         other => panic!("AVG must be numeric, got {other:?}"),
     }
 
-    // Empty SUM/MIN/AVG -> hard error (M3).
+    // Empty SUM/MIN/AVG -> SQL NULL (PG).
     for sql in [
         "SELECT MIN(b) FROM t WHERE label > 1000",
         "SELECT SUM(b) FROM t WHERE label > 1000",
         "SELECT AVG(b) FROM t WHERE label > 1000",
     ] {
-        assert!(e.execute_resident_expr_select_sql(sql).is_err(), "{sql} => empty NULL/M3 error");
+        assert_eq!(
+            e.execute_resident_expr_select_sql(sql).expect(sql).rows,
+            vec![vec![SqlValue::Null]],
+            "{sql} => SQL NULL"
+        );
     }
 }
 
@@ -2877,10 +2892,13 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_minmax() {
     let mx2 = e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label < 3").expect("max subset");
     assert_eq!(mx2.rows, vec![vec![num(10000)]], "MAX subset => 100.00");
 
-    // Empty -> hard error (M3).
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label > 1000").is_err(),
-        "MAX(numeric) over empty => NULL/M3 hard error"
+    // Empty -> SQL NULL (PG).
+    assert_eq!(
+        e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label > 1000")
+            .expect("MAX(numeric) empty on GPU")
+            .rows,
+        vec![vec![SqlValue::Null]],
+        "MAX(numeric) over empty => SQL NULL"
     );
 }
 
@@ -2931,12 +2949,16 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_sum_avg() {
         other => panic!("AVG numeric, got {other:?}"),
     }
 
-    // Empty SUM/AVG -> hard error (M3).
+    // Empty SUM/AVG -> SQL NULL (PG).
     for sql in [
         "SELECT SUM(p) FROM t WHERE label > 1000",
         "SELECT AVG(p) FROM t WHERE label > 1000",
     ] {
-        assert!(e.execute_resident_expr_select_sql(sql).is_err(), "{sql} => empty error");
+        assert_eq!(
+            e.execute_resident_expr_select_sql(sql).expect(sql).rows,
+            vec![vec![SqlValue::Null]],
+            "{sql} => SQL NULL"
+        );
     }
 }
 

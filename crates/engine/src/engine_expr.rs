@@ -5574,22 +5574,36 @@ impl Engine {
 
         // Scalar aggregate? Compute it from the filtered indices and return a single row.
         if is_aggregate {
+            // PG: an aggregate over ZERO surviving rows -- SUM/AVG/MIN/MAX are SQL NULL (COUNT(*) and
+            // COUNT(DISTINCT) are 0, handled in their arms below). NULL support is present now, so this
+            // resolves the former "the engine cannot represent NULL yet (M3)" hard-error. The result
+            // schema (bound.selected_columns) carries the aggregate's column type, so the NULL is typed.
+            if indices.is_empty()
+                && matches!(
+                    select.projection,
+                    SelectProjection::Sum { .. }
+                        | SelectProjection::Avg { .. }
+                        | SelectProjection::Min { .. }
+                        | SelectProjection::Max { .. }
+                )
+            {
+                return Ok(RelationalSelectResult {
+                    columns: Arc::new(bound.selected_columns),
+                    rows: (vec![vec![SqlValue::Null]]).into(),
+                    planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                    executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                    fallback_reason: None,
+                    access_path: Arc::new(access_path),
+                });
+            }
             let value = match &select.projection {
                 // COUNT(*): the surviving row count IS the result (PG returns bigint). The GPU filter
                 // + compaction already produced the count; no per-row materialization.
                 SelectProjection::CountAll => SqlValue::Int8(indices.len() as i64),
                 // SUM(int4): a GPU reduction over the filtered column (gather col[indices] + reduce);
-                // PG returns bigint. An EMPTY filtered set is SQL NULL, which the engine cannot
-                // represent until M3 -- so it hard-errors rather than returning a wrong 0.
+                // PG returns bigint. (An empty filtered set => SQL NULL is handled above the match.)
                 SelectProjection::Sum { column } => {
                     let col_idx = relational_column_index(table, column)?;
-                    if indices.is_empty() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "SUM over an empty set is NULL, which the engine cannot represent yet \
-                             (NULL support is M3)"
-                                .to_string(),
-                        )));
-                    }
                     let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                     };
@@ -5631,16 +5645,9 @@ impl Engine {
                     }
                 }
                 // MIN/MAX(int4): a GPU reduction; PG MIN/MAX preserve the column type (int4 -> int4).
-                // Empty set is NULL -> hard error (M3), like SUM.
+                // (An empty filtered set => SQL NULL is handled above the match.)
                 SelectProjection::Min { column } | SelectProjection::Max { column } => {
                     let col_idx = relational_column_index(table, column)?;
-                    if indices.is_empty() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "MIN / MAX over an empty set is NULL, which the engine cannot represent \
-                             yet (NULL support is M3)"
-                                .to_string(),
-                        )));
-                    }
                     let is_max = matches!(select.projection, SelectProjection::Max { .. });
                     let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
@@ -5700,16 +5707,9 @@ impl Engine {
                 }
                 // AVG(int4) = the GPU SUM / the count, as numeric (PG). The reduction is on the GPU;
                 // the final scalar divide reuses `average_sql_value` (scale-16, matching the enumerated
-                // path). Empty set is NULL -> hard error (M3), like the others.
+                // path). (An empty filtered set => SQL NULL is handled above the match.)
                 SelectProjection::Avg { column } => {
                     let col_idx = relational_column_index(table, column)?;
-                    if indices.is_empty() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "AVG over an empty set is NULL, which the engine cannot represent yet \
-                             (NULL support is M3)"
-                                .to_string(),
-                        )));
-                    }
                     let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                     };

@@ -1,9 +1,13 @@
 # Fix the M3 gap: general Expr path — empty scalar aggregate ⇒ SQL NULL (not a hard error)
 
-> **Status: Proposed.** The repo-wide empty-aggregate ⇒ NULL correction landed in `8870c301` / `7fd3eff1`
-> (resident `materialize_resident_scalar_stats`, the sharded COUNT-precheck placeholder, and the CPU/bind
-> path). This doc covers the **one remaining path**: the general on-device Expr executor still *hard-errors*
-> on an empty aggregate instead of returning NULL. Related: `sql-spec-over-cpu-parity` (PG spec wins).
+> **Status: DONE (implemented).** The general Expr path now returns a TYPED NULL for an empty
+> SUM/AVG/MIN/MAX (COUNT(*)/COUNT(DISTINCT) stay 0): a single `indices.is_empty()` guard above the
+> aggregate match returns `RelationalSelectResult { rows: [[SqlValue::Null]], columns: bound.selected_columns }`,
+> and the three per-arm hard-errors were removed. `resident_expr`/`resident_route` green (4 tests that pinned
+> the old hard-error updated to assert NULL). This completes the repo-wide empty-aggregate ⇒ NULL correction
+> begun in `8870c301` / `7fd3eff1` (resident `materialize_resident_scalar_stats`, the sharded COUNT-precheck
+> placeholder, the CPU/bind path). Related: `sql-spec-over-cpu-parity` (PG spec wins). The doc below records
+> the original gap + design for posterity.
 
 ## The gap
 
