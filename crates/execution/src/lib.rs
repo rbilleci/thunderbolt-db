@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 
+pub mod probe;
+pub use probe::Probe;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceTarget {
     Cpu,
@@ -15005,6 +15008,10 @@ fn compact_buffer_i32_compare_to_indices(
     if n == 0 {
         return Ok(Vec::new());
     }
+    // probe-timing (VM lever): the int4 simple-comparison compaction (`col <cmp> scalar` -> indices) -- the
+    // fused compare+atomic-append kernel + count/index D2H + the host sort_unstable of the surviving indices.
+    // vs predicate_total this localizes the match-count-dependent cost the prefix-sum/warp-agg lever targets.
+    let _compact_scope = Probe::scope("compact");
     let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     let byte_len = n_usize
         .checked_mul(std::mem::size_of::<i32>())
@@ -18177,6 +18184,9 @@ fn compact_mask_i32_to_indices(
     ptx.push(0);
     let compact_fn = primary.cached_function(c"gpu_db_mask_compact_to_indices", &ptx)?;
 
+    // probe-timing (VM lever): time the mask->indices compaction (atomic-counter compact + count/index D2H +
+    // host sort). Its share of the predicate decides the lever -- warp-aggregate the atomic vs the compare.
+    let _compact_scope = Probe::scope("compact");
     let indices_buf = primary.lease_device_buffer(byte_len)?;
     let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
     let zero = 0_u32;

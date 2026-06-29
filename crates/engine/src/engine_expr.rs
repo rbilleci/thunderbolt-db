@@ -3540,21 +3540,26 @@ impl Engine {
         // Evaluate the predicate on the GPU -> surviving row indices (ascending). With no WHERE clause
         // every row survives, so the indices are the full 0..row_count scan (the aggregate + projection
         // paths below are index-driven and need no other change).
-        let indices = match predicate {
-            Some(predicate) => self.lower_resident_predicate(
-                predicate,
-                table,
-                &snapshot,
-                &device_memory,
-                row_count,
-            )?,
-            None => {
-                let n = u32::try_from(row_count).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(
-                        "full-table scan row count exceeds the u32 row-index range".to_string(),
-                    ))
-                })?;
-                (0..n).collect()
+        let indices = {
+            // probe-timing (VM lever): the WHOLE predicate eval (compare kernel + compact). `compact`
+            // (timed separately in compact_mask_*) vs this total localizes where the predicate cost lives.
+            let _pred_scope = gpu_db_execution::Probe::scope("predicate_total");
+            match predicate {
+                Some(predicate) => self.lower_resident_predicate(
+                    predicate,
+                    table,
+                    &snapshot,
+                    &device_memory,
+                    row_count,
+                )?,
+                None => {
+                    let n = u32::try_from(row_count).map_err(|_| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "full-table scan row count exceeds the u32 row-index range".to_string(),
+                        ))
+                    })?;
+                    (0..n).collect()
+                }
             }
         };
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();

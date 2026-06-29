@@ -8,6 +8,12 @@ license.workspace = true
 serde.workspace = true
 libloading.workspace = true
 
+[features]
+# Analysis instrumentation (docs/proposals/feature-gated-instrumentation.md). OFF by default -> the gated
+# probe code is not compiled (zero perturbation; we measure in --release). Enable for benches/measurement:
+# `cargo run --features probe-timing ...`. Keep probes behind this rather than write-then-revert.
+probe-timing = []
+
 [dev-dependencies]
 # Reader/writer snapshot substrate, used by the P1-M3 step-1 real-GPU soundness
 # probe to publish a resident generation and prove epoch-safe reclamation of real

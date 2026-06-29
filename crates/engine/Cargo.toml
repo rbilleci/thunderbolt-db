@@ -25,6 +25,12 @@ gpu_db_snapshot = { path = "../snapshot" }
 # Heavy first build; isolated to this one crate (Charter rule 2, doc 18 §2.4).
 pg_query = "6"
 
+[features]
+# Passthrough for the analysis-instrumentation feature (docs/proposals/feature-gated-instrumentation.md):
+# enabling it here forwards to gpu_db_execution so the predicate/result-path probes in BOTH crates light up
+# with a single `cargo run --example ... --features probe-timing`. OFF by default (zero-cost).
+probe-timing = ["gpu_db_execution/probe-timing"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-postgres = "0.7"
