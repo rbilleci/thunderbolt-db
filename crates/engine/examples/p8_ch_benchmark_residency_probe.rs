@@ -1198,9 +1198,10 @@ fn expected_result_for_case(
         ),
         "order_line_max_amount_filter" => {
             let lower = (rows / 4).max(1) as i32;
+            // PG: MAX over an empty filtered set is SQL NULL (not the legacy empty-text sentinel).
             expected_amount_max_filter(rows, lower)
                 .map(|value| gpu_db_sql::SqlValue::Int4(value as i32))
-                .unwrap_or_else(|| gpu_db_sql::SqlValue::Text(String::new()))
+                .unwrap_or(gpu_db_sql::SqlValue::Null)
         }
         other => return Err(format!("no formula-backed expected result for {other}").into()),
     };
