@@ -304,7 +304,12 @@ fn materialize_resident_scalar_stats(
 /// consumed field(s); see [`reduce_nullable_grouped_stats`] and the unfiltered scalar arm.
 fn scalar_aggregate_mask(aggregate: &ResidentScalarAggregate) -> u32 {
     match aggregate {
-        ResidentScalarAggregate::Sum { .. } => grouped_agg_mask::SUM,
+        // SUM and AVG both need COUNT: `reduce_nullable_grouped_stats` uses total_count==0 as the
+        // zero-survivor => SQL NULL test (an aggregate of no non-NULL/matching rows is NULL, never 0).
+        // Masking COUNT out would leave count at its 0 sentinel => total_count 0 => wrongly NULL even
+        // when survivors exist. MIN/MAX instead detect "no survivors" via the empty group LIST, so they
+        // need only their own field.
+        ResidentScalarAggregate::Sum { .. } => grouped_agg_mask::COUNT | grouped_agg_mask::SUM,
         ResidentScalarAggregate::Avg { .. } => grouped_agg_mask::COUNT | grouped_agg_mask::SUM,
         ResidentScalarAggregate::Min { .. } => grouped_agg_mask::MIN,
         ResidentScalarAggregate::Max { .. } => grouped_agg_mask::MAX,
