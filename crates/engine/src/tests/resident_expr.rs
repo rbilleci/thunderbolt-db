@@ -176,6 +176,58 @@ fn gpu_resident_expr_where_excludes_null_operands_and_projection_carries_null() 
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_resident_expr_projection_carries_null_past_word_boundary() {
+    // Gather-fan-out audit P3 hardening: the per-column NULL-validity bitmap is materialized by the bool
+    // gather kernel (word = idx>>5, bit = idx&31, as a u8). A wrong intra-word shift (idx&7) would misread
+    // bits whose position is >= 8 within a 32-bit word, AND any index past the first word (>= 32). N=100
+    // with NULLs at i%7==0 scatters NULLs across validity words 0..3 at bit positions incl. 10/14/17/20/21/
+    // 24/27/28/31 (e.g. idx 42->word1 bit10, 70->word2 bit6, 91->word2 bit27) -> a DIRECT check that the
+    // projected nullable column carries SqlValue::Null at the right high indices through this gather.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
+    const N: i32 = 100;
+    let is_null = |i: i32| i % 7 == 0;
+    let mut values = String::new();
+    for i in 0..N {
+        if i > 0 {
+            values.push(',');
+        }
+        if is_null(i) {
+            values.push_str("(NULL, 100)");
+        } else {
+            values.push_str(&format!("({i}, 100)"));
+        }
+    }
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}")).unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let Command::Select(select) = parse_command("SELECT a FROM t").unwrap() else {
+        unreachable!()
+    };
+    // WHERE b >= 0: every row qualifies, so projecting `a` materializes ALL 100 rows in order and the
+    // validity gather alone decides NULL vs value at each index (incl. past word boundaries).
+    let b_ge_0 = ResidentExpr::Binary {
+        op: ResidentBinaryOp::Ge,
+        lhs: Box::new(ResidentExpr::Column(1)),
+        rhs: Box::new(ResidentExpr::Int4Literal(0)),
+    };
+    let r = e.execute_resident_expr_select(&select, &b_ge_0).unwrap();
+    let expected: Vec<Vec<SqlValue>> = (0..N)
+        .map(|i| vec![if is_null(i) { SqlValue::Null } else { SqlValue::Int4(i) }])
+        .collect();
+    assert_eq!(
+        r.rows, expected,
+        "nullable projection must carry SqlValue::Null at the right indices past validity word \
+         boundaries (the bool/validity gather's idx&31 shift)"
+    );
+    assert_eq!(r.fallback_reason, None);
+    assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_resident_expr_where_3vl_over_nullable_bigint() {
     // M3 (doc 21) Track A.3: a WHERE over a NULLABLE int8 (BIGINT) column evaluates to UNKNOWN for a NULL
     // operand ON THE GPU and excludes the row — routed to the i64 mask VM (elem I64), the same VM the
