@@ -2213,11 +2213,17 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Self-grouped/grouped i32 hash-aggregate. `agg_mask` (`grouped_agg_mask`: 1=count, 2=sum, 4=min,
+    /// 8=max; `ALL`=15) selects which per-group statistics are computed on-device: the kernel runs only
+    /// the selected fields' update atomics, leaving the rest at their init sentinels. Pass `ALL` for the
+    /// full count+sum+min+max (today's behavior); pass a reduced mask (e.g. `MAX`) when the caller reads
+    /// only that one field — strictly less per-row atomic work, and byte-identical for the read field(s).
     pub fn grouped_stats_i32_from_payload(
         &self,
         group_byte_offset: u64,
         value_byte_offset: u64,
         row_count: u64,
+        agg_mask: u32,
     ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_grouped_stats(
             self,
@@ -2227,6 +2233,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             None,
             None,
+            agg_mask,
         )
         .map(|(rows, _)| rows)
     }
@@ -2251,6 +2258,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             null_bitmap_offset,
             None,
+            grouped_agg_mask::ALL,
         )
         .map(|(rows, _)| rows)
     }
@@ -2276,6 +2284,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             None,
             Some(GroupedI64Post { order, having }),
+            grouped_agg_mask::ALL,
         )
     }
 
@@ -2296,6 +2305,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             None,
             None,
+            grouped_agg_mask::ALL,
         )
         .map(|(rows, _)| rows)
     }
@@ -2321,6 +2331,7 @@ impl CudaResidentDeviceMemory {
             row_count,
             null_bitmap_offset,
             None,
+            grouped_agg_mask::ALL,
         )
         .map(|(rows, _)| rows)
     }
@@ -2578,6 +2589,22 @@ pub type GroupedI64Having<'a> = (GroupedI64SortColumn, &'a [Vec<(u32, u32, i64)>
 pub struct GroupedI64Post<'a> {
     pub order: GroupedI64Order,
     pub having: Option<GroupedI64Having<'a>>,
+}
+
+/// Aggregate-selection mask for the self-grouped/grouped i32 hash-aggregate kernel
+/// (`gpu_db_resident_i32_grouped_hash_aggregate`). Each bit selects which per-row update atomic runs
+/// at the matched slot: a query needing only one aggregate (e.g. `SELECT MAX(id)`) passes only that
+/// bit and skips the other three atomics. Masked-out fields stay at their init sentinels (count/sum=0,
+/// min=`i32::MAX`, max=`i32::MIN`); the caller must read ONLY the field(s) whose bit it set. The CAS
+/// slot-claim + linear probe always run regardless (group identity is needed for every row), so the
+/// compacted group SET is unchanged — only the unrequested statistics are left at their sentinels.
+/// `ALL` reproduces today's full count+sum+min+max behavior byte-for-byte.
+pub mod grouped_agg_mask {
+    pub const COUNT: u32 = 1;
+    pub const SUM: u32 = 2;
+    pub const MIN: u32 = 4;
+    pub const MAX: u32 = 8;
+    pub const ALL: u32 = COUNT | SUM | MIN | MAX;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13081,6 +13108,10 @@ fn launch_cuda_resident_i32_grouped_stats(
     // hash-aggregate (they join no group and feed no statistic) — 3VL aggregate semantics.
     null_bitmap_offset: Option<u64>,
     post: Option<GroupedI64Post<'_>>,
+    // Aggregate-selection mask (`grouped_agg_mask`: 1=count, 2=sum, 4=min, 8=max; ALL=15). Only the
+    // selected fields' per-row update atomics run in the aggregate kernel; masked-out fields stay at
+    // their init sentinels (the host reads only what it requested). `ALL` = today's full behavior.
+    agg_mask: u32,
 ) -> Result<(Vec<CudaI32GroupedStats>, usize), CudaRuntimeProbeError> {
     // Returns (rows, group_count): `rows` is windowed/ordered when `order` is set, else all groups;
     // `group_count` is the FULL distinct-group count M (the D2H'd-bytes basis for the caller's
@@ -13186,10 +13217,12 @@ init_done:
     .param .u64 mins_ptr,
     .param .u64 maxs_ptr,
     .param .u32 table_mask,
-    .param .u64 value_null_bitmap_offset
+    .param .u64 value_null_bitmap_offset,
+    .param .u32 agg_mask
 )
 {
     .reg .pred %p_done;
+    .reg .pred %p_agg;
     .reg .pred %p_check;
     .reg .pred %p_match;
     .reg .pred %p_claimed;
@@ -13210,6 +13243,8 @@ init_done:
     .reg .u32 %tmp32;
     .reg .u32 %comparison;
     .reg .u32 %mask;
+    .reg .u32 %agg_mask;
+    .reg .u32 %agg_t;
     .reg .u32 %slot;
     .reg .u32 %hash;
     .reg .u32 %group_u;
@@ -13257,6 +13292,7 @@ init_done:
     ld.param.u64 %maxs, [maxs_ptr];
     ld.param.u32 %mask, [table_mask];
     ld.param.u64 %val_null_off, [value_null_bitmap_offset];
+    ld.param.u32 %agg_mask, [agg_mask];
 
     add.u64 %group_base, %resident, %group_base;
     add.u64 %value_base, %resident, %value_base;
@@ -13353,17 +13389,37 @@ probe:
     bra probe;
 
 at_slot:
+    // Aggregate-selection mask (1=count, 2=sum, 4=min, 8=max): each field's update atomic runs only
+    // when its bit is set. The CAS slot-claim + linear probe above ALWAYS run (group identity is
+    // needed regardless). Masked-out fields stay at their init sentinels; the host reads only what it
+    // requested, so a reduced mask is byte-identical for the field(s) it does request.
     mul.lo.u64 %off4, %slot64, 4;
+    and.b32 %agg_t, %agg_mask, 1;
+    setp.eq.u32 %p_agg, %agg_t, 0;
+    @%p_agg bra skip_count;
     add.u64 %addr, %counts, %off8;
     atom.global.add.u64 %ignore64, [%addr], %one;
+skip_count:
+    and.b32 %agg_t, %agg_mask, 2;
+    setp.eq.u32 %p_agg, %agg_t, 0;
+    @%p_agg bra skip_sum;
     cvt.s64.s32 %val64, %value;
     cvt.u64.s64 %valbits, %val64;
     add.u64 %addr, %sums, %off8;
     atom.global.add.u64 %ignore64, [%addr], %valbits;
+skip_sum:
+    and.b32 %agg_t, %agg_mask, 4;
+    setp.eq.u32 %p_agg, %agg_t, 0;
+    @%p_agg bra skip_min;
     add.u64 %addr, %mins, %off4;
     atom.global.min.s32 %ignore32, [%addr], %value;
+skip_min:
+    and.b32 %agg_t, %agg_mask, 8;
+    setp.eq.u32 %p_agg, %agg_t, 0;
+    @%p_agg bra skip_max;
     add.u64 %addr, %maxs, %off4;
     atom.global.max.s32 %ignore32, [%addr], %value;
+skip_max:
 
 next_row:
     add.u64 %idx, %idx, %stride;
@@ -13680,6 +13736,7 @@ compact_done:
     let mut mask_arg = table_mask;
     // u64::MAX sentinel when there is no validity bitmap; otherwise the bounds-checked byte offset.
     let mut value_null_off_arg = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
+    let mut agg_mask_arg = agg_mask;
     let mut agg_args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut group_offset_arg as *mut u64).cast::<c_void>(),
@@ -13695,6 +13752,7 @@ compact_done:
         (&mut maxs_arg as *mut u64).cast::<c_void>(),
         (&mut mask_arg as *mut u32).cast::<c_void>(),
         (&mut value_null_off_arg as *mut u64).cast::<c_void>(),
+        (&mut agg_mask_arg as *mut u32).cast::<c_void>(),
     ];
     check_cuda(launch(aggregate_fn, agg_grid, &mut agg_args)).map_err(drain_err)?;
 
@@ -28458,8 +28516,17 @@ mod tests {
                 .expect("serial nullable grouped"),
         );
         let parallel = sorted(
-            launch_cuda_resident_i32_grouped_stats(&resident, off, off, None, n, Some(null_off), None)
-                .expect("parallel nullable grouped")
+            launch_cuda_resident_i32_grouped_stats(
+                &resident,
+                off,
+                off,
+                None,
+                n,
+                Some(null_off),
+                None,
+                grouped_agg_mask::ALL,
+            )
+            .expect("parallel nullable grouped")
                 .0,
         );
         assert_eq!(serial, parallel, "serial == parallel (GPU oracle) with NULL skip");
@@ -28511,9 +28578,18 @@ mod tests {
             launch_cuda_resident_i32_grouped_stats_serial(&resident_an, off_an, off_an, None, m, Some(null_off_an))
                 .expect("serial all-null grouped");
         let parallel_an =
-            launch_cuda_resident_i32_grouped_stats(&resident_an, off_an, off_an, None, m, Some(null_off_an), None)
-                .expect("parallel all-null grouped")
-                .0;
+            launch_cuda_resident_i32_grouped_stats(
+                &resident_an,
+                off_an,
+                off_an,
+                None,
+                m,
+                Some(null_off_an),
+                None,
+                grouped_agg_mask::ALL,
+            )
+            .expect("parallel all-null grouped")
+            .0;
         assert!(serial_an.is_empty(), "all-NULL column must yield no serial groups");
         assert!(parallel_an.is_empty(), "all-NULL column must yield no parallel groups");
     }
@@ -29153,9 +29229,18 @@ mod tests {
                     .expect("serial grouped"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None, None)
-                    .expect("hash-agg grouped")
-                    .0,
+                launch_cuda_resident_i32_grouped_stats(
+                    &resident,
+                    go,
+                    vo,
+                    None,
+                    n,
+                    None,
+                    None,
+                    grouped_agg_mask::ALL,
+                )
+                .expect("hash-agg grouped")
+                .0,
             );
             assert_eq!(
                 hash, serial,
@@ -29168,9 +29253,18 @@ mod tests {
                     .expect("serial filtered grouped"),
             );
             let hash_f = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, n, None, None)
-                    .expect("hash-agg filtered grouped")
-                    .0,
+                launch_cuda_resident_i32_grouped_stats(
+                    &resident,
+                    go,
+                    vo,
+                    filt,
+                    n,
+                    None,
+                    None,
+                    grouped_agg_mask::ALL,
+                )
+                .expect("hash-agg filtered grouped")
+                .0,
             );
             assert_eq!(
                 hash_f, serial_f,
@@ -29190,8 +29284,17 @@ mod tests {
                     .expect("serial negatives"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, 2_000, None, None)
-                    .expect("hash-agg negatives")
+                launch_cuda_resident_i32_grouped_stats(
+                    &resident,
+                    go,
+                    vo,
+                    None,
+                    2_000,
+                    None,
+                    None,
+                    grouped_agg_mask::ALL,
+                )
+                .expect("hash-agg negatives")
                     .0,
             );
             assert_eq!(
@@ -29218,9 +29321,18 @@ mod tests {
                     .expect("serial fully-filtered"),
             );
             let hash = sorted(
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, filt, 2_000, None, None)
-                    .expect("hash-agg fully-filtered")
-                    .0,
+                launch_cuda_resident_i32_grouped_stats(
+                    &resident,
+                    go,
+                    vo,
+                    filt,
+                    2_000,
+                    None,
+                    None,
+                    grouped_agg_mask::ALL,
+                )
+                .expect("hash-agg fully-filtered")
+                .0,
             );
             assert_eq!(
                 hash, serial,
@@ -29249,7 +29361,17 @@ mod tests {
                 launch_cuda_resident_i32_grouped_stats_serial(&resident, go, vo, None, n, None).unwrap();
                 serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 let t = Instant::now();
-                launch_cuda_resident_i32_grouped_stats(&resident, go, vo, None, n, None, None).unwrap();
+                launch_cuda_resident_i32_grouped_stats(
+                    &resident,
+                    go,
+                    vo,
+                    None,
+                    n,
+                    None,
+                    None,
+                    grouped_agg_mask::ALL,
+                )
+                .unwrap();
                 hash_ms = hash_ms.min(t.elapsed().as_secs_f64() * 1e3);
             }
             let speedup = if hash_ms > 0.0 {

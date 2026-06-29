@@ -151,7 +151,7 @@ fn main() {
             }
         }));
     }
-    throughput("grouped_stats_i32 (~1M groups)", rows, Box::new(|| resident.grouped_stats_i32_from_payload(off_a, off_b, rows).unwrap().len()));
+    throughput("grouped_stats_i32 (~1M groups)", rows, Box::new(|| resident.grouped_stats_i32_from_payload(off_a, off_b, rows, gpu_db_execution::grouped_agg_mask::ALL).unwrap().len()));
 
     println!("\n# roofline = {roof:.0} GB/s (equal_any read). >=~80% on a 1-pass scan = saturated.");
 }

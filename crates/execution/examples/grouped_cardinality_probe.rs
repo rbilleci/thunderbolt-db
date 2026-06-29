@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use gpu_db_execution::{CudaDeviceMemoryChunk, CudaDriverRuntime};
+use gpu_db_execution::{grouped_agg_mask, CudaDeviceMemoryChunk, CudaDriverRuntime};
 
 fn p50(mut v: Vec<u128>) -> u128 {
     v.sort_unstable();
@@ -61,11 +61,32 @@ fn main() {
         .expect("retain resident device memory");
 
     println!("# grouped_stats_i32 cardinality sweep. rows={rows}, iters={iters}");
-    println!("  {:<14} {:>9}  {:>12}  {:>8}", "cardinality", "p50", "Melem/s", "groups");
+    println!(
+        "# aggregate-selection mask: ALL = count+sum+min+max (4 update atomics/row); MIN = 1 atomic;"
+    );
+    println!("# COUNT = 1 atomic. Reduced masks should be >= ALL at every cardinality (strictly less work).");
+    println!(
+        "  {:<14} {:>10}  {:>11} | {:>10}  {:>11}  {:>6} | {:>10}  {:>11}  {:>6} | {:>8}",
+        "cardinality",
+        "ALL us",
+        "ALL Melem/s",
+        "MIN us",
+        "MIN Melem/s",
+        "x ALL",
+        "CNT us",
+        "CNT Melem/s",
+        "x ALL",
+        "groups",
+    );
 
-    for (k, &c) in cards.iter().enumerate() {
-        let goff = group_off(k);
-        let mut run = || resident.grouped_stats_i32_from_payload(goff, off_value, rows).unwrap().len();
+    // p50 Melem/s for one (cardinality, mask) cell, averaged over `iters` after a warmup.
+    let bench = |goff: u64, mask: u32| -> (f64, f64, usize) {
+        let run = || {
+            resident
+                .grouped_stats_i32_from_payload(goff, off_value, rows, mask)
+                .unwrap()
+                .len()
+        };
         for _ in 0..3 {
             run();
         }
@@ -77,7 +98,19 @@ fn main() {
             s.push(t.elapsed().as_nanos());
         }
         let us = p50(s) as f64 / 1000.0;
-        println!("  {c:<14} {us:>9.0}us  {:>12.1}  {groups:>8}", rows as f64 / us);
+        (us, rows as f64 / us, groups)
+    };
+
+    for (k, &c) in cards.iter().enumerate() {
+        let goff = group_off(k);
+        let (all_us, all_mps, groups) = bench(goff, grouped_agg_mask::ALL);
+        let (min_us, min_mps, _) = bench(goff, grouped_agg_mask::MIN);
+        let (cnt_us, cnt_mps, _) = bench(goff, grouped_agg_mask::COUNT);
+        println!(
+            "  {c:<14} {all_us:>9.0}us  {all_mps:>11.1} | {min_us:>9.0}us  {min_mps:>11.1}  {:>5.2}x | {cnt_us:>9.0}us  {cnt_mps:>11.1}  {:>5.2}x | {groups:>8}",
+            min_mps / all_mps,
+            cnt_mps / all_mps,
+        );
     }
-    println!("\n# low-card pathological (contention) => shared-mem pre-agg is the win; flat curve => inherent.");
+    println!("\n# Reduced masks remove per-row atomics unconditionally => expect >= ALL at low AND high card.");
 }

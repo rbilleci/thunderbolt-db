@@ -609,9 +609,28 @@ impl Engine {
                 | ResidentScalarAggregate::Max { .. } => {
                     // Unfiltered AVG/MIN/MAX reduce the self-grouped stats kernel (group == value
                     // column), so the D2H scales with the distinct-value count it copies back.
+                    //
+                    // Aggregate-selection mask: this scalar reduction reads only the field(s) it needs,
+                    // so request only those on-device (the kernel runs strictly fewer per-row update
+                    // atomics; the masked-out fields stay at their init sentinels and are never read).
+                    // AVG reads total_count + total_sum (COUNT|SUM); MIN reads group.min (MIN); MAX reads
+                    // group.max (MAX). Byte-identical to ALL for the field(s) actually consumed below.
+                    let agg_mask = match aggregate {
+                        ResidentScalarAggregate::Avg { .. } => {
+                            grouped_agg_mask::COUNT | grouped_agg_mask::SUM
+                        }
+                        ResidentScalarAggregate::Min { .. } => grouped_agg_mask::MIN,
+                        ResidentScalarAggregate::Max { .. } => grouped_agg_mask::MAX,
+                        _ => unreachable!("matched AVG/MIN/MAX above"),
+                    };
                     let started = Instant::now();
                     let grouped_stats = device_memory
-                        .grouped_stats_i32_from_payload(byte_offset, byte_offset, row_count)
+                        .grouped_stats_i32_from_payload(
+                            byte_offset,
+                            byte_offset,
+                            row_count,
+                            agg_mask,
+                        )
                         .map_err(|err| {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                         })?;
