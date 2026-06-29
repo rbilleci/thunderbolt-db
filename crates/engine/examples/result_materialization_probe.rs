@@ -102,7 +102,44 @@ fn high_output(m: usize, k: usize) {
     println!("  current/flat: {:.1}x   (sink {sink})", per(current) / per(flat).max(0.01));
 }
 
+/// VM lever (atomic-vs-sort split): the predicate compaction does an atomic-append (unordered) then a HOST
+/// `sort_unstable` of the surviving row indices. This bounds the SORT's share of the ~3425us compact at
+/// cats=1 (n=262144). The atomic-append output is "locally shuffled, globally roughly-ascending" (grid-
+/// stride schedule order), so pdqsort is adaptive -- measure a few orders to bracket it.
+fn sort_cost(n: usize) {
+    let lcg = |mut x: u64| {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        x
+    };
+    let iters = 30usize;
+    let bench = |label: &str, build: &dyn Fn() -> Vec<u32>| {
+        let mut best = u128::MAX;
+        let mut sink = 0u64;
+        for _ in 0..iters {
+            let mut v = build();
+            let t = Instant::now();
+            v.sort_unstable();
+            best = best.min(t.elapsed().as_nanos());
+            sink += v[0] as u64 + v[n - 1] as u64;
+        }
+        println!("  sort {label:<22} {:>8.0}us  ({:>5.1} ns/elem)  sink={sink}", best as f64 / 1000.0, best as f64 / n as f64);
+    };
+    println!("\n# host sort_unstable of {n} u32 (the compaction's host sort -- the prefix-sum lever removes it):");
+    bench("already-ascending", &|| (0..n as u32).collect());
+    // grid-stride atomic-append order: matches in ~row order but warp-interleaved within small windows.
+    bench("roughly-ascending(±64)", &|| {
+        (0..n).map(|i| (i as i64 + (lcg(i as u64) % 128) as i64 - 64).clamp(0, n as i64 - 1) as u32).collect()
+    });
+    bench("fully-shuffled", &|| (0..n).map(|i| (lcg(i as u64) % n as u64) as u32).collect());
+}
+
 fn main() {
+    if let Ok(n) = std::env::var("SORT_N").map(|v| v.parse().unwrap_or(262144)) {
+        sort_cost(n);
+        return;
+    }
     let n: usize = std::env::var("N").ok().and_then(|v| v.parse().ok()).unwrap_or(65536);
     let ncols = 2usize;
     let iters = 50usize;
