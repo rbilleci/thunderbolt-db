@@ -167,10 +167,8 @@ impl Engine {
             auto_admit_on_commit: std::sync::atomic::AtomicBool::new(false),
             // DEFAULT ON (user 2026-06-29: lpb chosen over the wave engine): the R1 unique-key index probe is
             // the production read path (O(1)/needle vs the O(rows) scan it replaces; byte-identical). The
-            // persistent wave (`wave_persistent_engine_enabled`, nested under this) stays OFF and is being
-            // retired. (This flag gates the INDEX, not the wave — rename pending the wave retirement.)
+            // persistent wave has been RETIRED. (This flag gates the INDEX, not the wave — rename pending.)
             wave_engine_enabled: std::sync::atomic::AtomicBool::new(true),
-            wave_persistent_engine_enabled: std::sync::atomic::AtomicBool::new(false),
             // DEFAULT ON (user 2026-06-29): the dense kernel is the default for the lpb unique-index route — a
             // strict win at >=b4096, neutral at b256, byte-identical + audit SHIP. (Independent of whether the
             // index route itself is enabled via `wave_engine_enabled`, which stays gated.)

@@ -581,31 +581,6 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// ADR-009 R2.2b: enable/disable the PERSISTENT wave-kernel point-lookup route (default OFF). Only
-    /// takes effect when `wave_engine_enabled` is ALSO on — it selects the persistent `WaveReadEngine`
-    /// over the launch-per-batch R1 index probe for resident int4 unique-key equality batches, falling
-    /// back to lpb on any wave error / harvest timeout / oversize batch. This is the R2.2b-3 A/B lever
-    /// (wave vs lpb). `&self` (an interior-mutable flag the read path reads).
-    pub fn set_wave_persistent_engine_enabled(&self, on: bool) {
-        self.wave_persistent_engine_enabled
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn wave_persistent_engine_enabled(&self) -> bool {
-        self.wave_persistent_engine_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// ADR-009 R2.2b: total batches served by the persistent wave route (one per successful
-    /// `WaveReadEngine::submit`) vs falling through to lpb/scan. Wave-hit-vs-fallback telemetry for the
-    /// R2.2b-3 A/B; also the test hook proving the ROUTE (not just the engine) produced the rows.
-    pub fn wave_route_hits(&self) -> u64 {
-        self.read_state
-            .residency
-            .wave_route_hits
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe. The test signal
     /// that the dense route actually ran (dense and atomic are byte-identical, so output equality can't prove
     /// which kernel produced the rows).

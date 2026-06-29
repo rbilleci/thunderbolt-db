@@ -3928,127 +3928,11 @@ fn r1_wave_index_probe_matches_scan_differential() {
     );
 }
 
-// ADR-009 R2.2b Slice 1 (impedance plumbing): the `Materialized` payload arm of the int4
-// projection completion materializes its already-harvested `CudaI32BatchProjectionRow`s through the
-// SAME downstream path (stable sort by `row_index`, `SqlValue::Int4` mapping, per-needle grouping,
-// shared columns/access-path) that the `Deferred` (lpb/scan/R1-index) arm feeds — so routing the
-// persistent wave engine through `Materialized` (Slice 3) is byte-identical to the lpb route by
-// construction. This is a CPU-only unit test of that arm (no GPU): it asserts the grouping/sort/
-// mapping and that there is NO per-batch kernel-event timing on this arm (the persistent kernel is
-// not timed per wave -> `None`).
-#[test]
-fn r2_materialized_payload_arm_materializes_identically() {
-    let col = |name: &str| RelationalColumn {
-        id: 0,
-        table_oid: 0,
-        attnum: 1,
-        name: name.to_string(),
-        ty: SqlType::Int4,
-        domain: None,
-        default: None,
-        type_oid: 23,
-        type_size: 4,
-    };
-    let table = RelationalTable {
-        schema: "public".to_string(),
-        name: "t".to_string(),
-        oid: 1,
-        columns: vec![col("id"), col("v")],
-        indexes: Vec::new(),
-        check_constraints: Vec::new(),
-        foreign_keys: Vec::new(),
-        acl: std::collections::BTreeMap::new(),
-    };
-    let access = RelationalAccessPath::EqualityIndex {
-        table: "t".to_string(),
-        column: "id".to_string(),
-        matched_keys: 1,
-    };
-    // Two needles (needle_index 0, 1). The shared (needle-invariant) projected columns are [id, v] —
-    // the submission now stores the shared schema once + `needle_count` (no per-needle Vec).
-    let shared_cols = std::sync::Arc::new(vec![col("id"), col("v")]);
-    let shared_access = std::sync::Arc::new(access.clone());
-    // Rows arrive in `atom.add` SCHEDULE order (non-deterministic), so needle 0's two rows are
-    // delivered HIGH `row_index` first to prove the completion re-sorts ascending by `row_index`.
-    let rows = vec![
-        CudaI32BatchProjectionRow {
-            needle_index: 0,
-            row_index: 5,
-            values: vec![10, 105],
-        },
-        CudaI32BatchProjectionRow {
-            needle_index: 0,
-            row_index: 2,
-            values: vec![10, 102],
-        },
-        CudaI32BatchProjectionRow {
-            needle_index: 1,
-            row_index: 9,
-            values: vec![20, 209],
-        },
-    ];
-
-    let e = Engine::new_local();
-    let pending = RelationalRetainedInt4ProjectionSubmission {
-        table,
-        snapshot_gpu_id: 3,
-        selected_indexes: vec![0, 1],
-        needle_count: 2,
-        shared_columns: shared_cols,
-        shared_access_path: shared_access,
-        before_metrics: e.metrics.snapshot(),
-        batch_started: std::time::Instant::now(),
-        payload: RelationalRetainedInt4ProjectionPayload::Materialized(
-            CudaI32BatchProjectionColumns::from_rows(rows),
-        ),
-    };
-
-    let completion =
-        Engine::complete_relational_retained_int4_projection_submission_detached(pending).unwrap();
-
-    // No per-batch kernel event on the Materialized arm (the persistent kernel is not timed per wave).
-    assert!(
-        completion.kernel_event_elapsed_us.is_none(),
-        "Materialized arm has no per-batch kernel-event timing"
-    );
-    assert_eq!(completion.total_rows, 3);
-    assert_eq!(completion.int4_result_columns, 2);
-    assert_eq!(completion.table_name, "t");
-    assert_eq!(completion.results.len(), 2, "one result per needle/member");
-
-    // needle 0: BOTH its rows, re-sorted ASCENDING by row_index (2 before 5), values mapped to Int4.
-    assert_eq!(
-        completion.results[0].rows,
-        vec![
-            vec![SqlValue::Int4(10), SqlValue::Int4(102)],
-            vec![SqlValue::Int4(10), SqlValue::Int4(105)],
-        ],
-        "needle 0 rows sorted ascending by row_index"
-    );
-    // needle 1: its single row.
-    assert_eq!(
-        completion.results[1].rows,
-        vec![vec![SqlValue::Int4(20), SqlValue::Int4(209)]],
-        "needle 1 single row"
-    );
-    // The shared (needle-invariant) columns + access path are stamped onto every result, and the
-    // device target reflects the submission's `snapshot_gpu_id`.
-    for result in &completion.results {
-        assert_eq!(*result.columns, vec![col("id"), col("v")]);
-        assert_eq!(*result.access_path, access);
-        assert_eq!(result.planned_target, DeviceTarget::Gpu(3));
-        assert_eq!(result.executed_target, DeviceTarget::Gpu(3));
-        assert!(result.fallback_reason.is_none());
-    }
-}
-
-// ADR-009 R2.2b (lifecycle + routing): the PERSISTENT wave-kernel point-lookup route returns BYTE-IDENTICAL
-// rows to the launch-per-batch (lpb) R1 index probe and to the full scan, across NULL data, NULL-as-0 keys,
-// absent needles, non-unique fallback, and a generation rebuild + eviction. Mirrors
-// `r1_wave_index_probe_matches_scan_differential` but adds the third (wave) config and a DIRECT wave-engine
-// submit for non-vacuity: because all three routes are byte-identical BY DESIGN, output equality alone can't
-// prove the wave actually ran -- so we also (1) assert a wave engine is CACHED over the filter col after a
-// wave run, and (2) invoke the cached engine's `submit` directly and check the rows. GPU test (#[ignore]).
+// ADR-009 R1 (lifecycle + routing): the launch-per-batch (lpb) GPU hash-index probe returns BYTE-IDENTICAL
+// rows to the full scan, across NULL data, NULL-as-0 keys, absent needles, non-unique fallback, and a
+// generation rebuild. The `dense_index_probe_hits` counter is the non-vacuity signal that the index route
+// (not a silent scan) actually served the unique-key batches -- output equality alone can't tell them apart,
+// since they are byte-identical by design. GPU test (#[ignore]).
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_wave_engine_matches_lpb_differential() {
@@ -4058,7 +3942,7 @@ fn r2_wave_engine_matches_lpb_differential() {
         "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
     )
     .unwrap();
-    // Same shape as the R1 differential: `id` UNIQUE (wave/index fire), `bucket` NON-unique (scan fallback),
+    // Same shape as the R1 differential: `id` UNIQUE (index fires), `bucket` NON-unique (scan fallback),
     // NULL balance (id=20) is a NULL PROJECTED column, NULL id is a NULL-as-0 KEY (needle 0 matches it).
     e.execute_text(
         2,
@@ -4092,68 +3976,41 @@ fn r2_wave_engine_matches_lpb_differential() {
             .map(|result| result.rows.clone())
             .collect()
     };
-    // Three flag configs. `wave` is nested UNDER the index flag, so it needs BOTH on.
+    // Two flag configs: scan (index off) and lpb (index on). The dense kernel is the index route's default,
+    // so `dense_index_probe_hits` increments once per index-served batch -- the non-vacuity signal.
     let scan_cfg = |e: &Engine| {
         e.set_wave_engine_enabled(false);
-        e.set_wave_persistent_engine_enabled(false);
     };
     let lpb_cfg = |e: &Engine| {
         e.set_wave_engine_enabled(true);
-        e.set_wave_persistent_engine_enabled(false);
-    };
-    let wave_cfg = |e: &Engine| {
-        e.set_wave_engine_enabled(true);
-        e.set_wave_persistent_engine_enabled(true);
-    };
-    // Non-vacuity probe: which column (if any) a wave engine is cached over for `accounts`.
-    let cached_wave_col = |e: &Engine| -> Option<usize> {
-        let cache = e
-            .read_state
-            .residency
-            .wave_read_engine
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.get("accounts").map(|entry| entry.column_idx)
     };
 
     // (a) Unique-key differential WITH NULL: DISTINCT present needles (incl id=20 NULL balance), an absent
-    // needle (25), and needle 0 (NULL-as-0 key). wave == lpb == scan, byte-identical.
+    // needle (25), and needle 0 (NULL-as-0 key). lpb == scan, byte-identical.
     let unique_needles = vec![10, 20, 30, 40, 25, 0];
-    // `wave_route_hits` proves the ROUTE (not just the engine) served the rows: all three configs are
-    // byte-identical by design, so output equality alone can't tell a wave hit from a silent lpb fallback.
     scan_cfg(&e);
-    let hits = e.wave_route_hits();
+    let hits = e.dense_index_probe_hits();
     let scan_u = run(&e, &select_unique, &unique_needles);
-    assert_eq!(e.wave_route_hits(), hits, "scan config must NOT hit the wave route");
+    assert_eq!(
+        e.dense_index_probe_hits(),
+        hits,
+        "scan config must NOT hit the index route"
+    );
     lpb_cfg(&e);
-    let hits = e.wave_route_hits();
+    let hits = e.dense_index_probe_hits();
     let lpb_u = run(&e, &select_unique, &unique_needles);
     assert_eq!(
-        e.wave_route_hits(),
-        hits,
-        "lpb config must NOT hit the wave route"
-    );
-    wave_cfg(&e);
-    let hits = e.wave_route_hits();
-    let wave_u = run(&e, &select_unique, &unique_needles);
-    assert_eq!(
-        e.wave_route_hits(),
+        e.dense_index_probe_hits(),
         hits + 1,
-        "the wave run was SERVED by the wave route (not a silent lpb fallback)"
-    );
-    assert_eq!(lpb_u, scan_u, "lpb index probe == scan (R1 sanity)");
-    assert_eq!(
-        wave_u, scan_u,
-        "persistent wave == scan for a unique key (incl NULL projection + NULL-as-0 key)"
+        "the lpb run was SERVED by the index route (not a silent scan fallback)"
     );
     assert_eq!(
-        cached_wave_col(&e),
-        Some(0),
-        "the wave run BUILT + cached a persistent engine over the id filter col (col 0)"
+        lpb_u, scan_u,
+        "lpb index probe == scan for a unique key (incl NULL projection + NULL-as-0 key)"
     );
     // SCHEMA stamping (audit gap-closer): `run` compares only `result.rows`, so a wrong columns/access_path
     // from the template-submit path's Arc-SHARED schema would slip through. Assert the full result schema
-    // on the wave route once: projected columns = [id, balance], access_path = the equality-index route.
+    // on the index route once: projected columns = [id, balance], access_path = the equality-index route.
     {
         let template = e.prepare_relational_retained_read_template(&select_unique).unwrap();
         let results = e
@@ -4166,256 +4023,94 @@ fn r2_wave_engine_matches_lpb_differential() {
             assert_eq!(
                 result.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
                 vec!["id", "balance"],
-                "wave route stamps the shared projected schema [id, balance]"
+                "index route stamps the shared projected schema [id, balance]"
             );
             assert!(
                 matches!(
                     &*result.access_path,
                     RelationalAccessPath::EqualityIndex { column, .. } if column == "id"
                 ),
-                "wave route stamps the shared equality-index access path over id, got {:?}",
+                "index route stamps the shared equality-index access path over id, got {:?}",
                 result.access_path
             );
         }
     }
-    assert_eq!(wave_u[5].len(), 1, "needle 0 -> the NULL-id row via the wave");
+    assert_eq!(lpb_u[5].len(), 1, "needle 0 -> the NULL-id row via the index");
     assert_eq!(
-        wave_u[4],
+        lpb_u[4],
         Vec::<Vec<SqlValue>>::new(),
-        "needle 25 absent -> no rows via the wave"
+        "needle 25 absent -> no rows via the index"
     );
     assert_eq!(
-        wave_u[0],
+        lpb_u[0],
         vec![vec![SqlValue::Int4(10), SqlValue::Int4(100)]],
-        "needle 10 -> its row via the wave"
+        "needle 10 -> its row via the index"
     );
 
-    // (a') NON-VACUITY: invoke the cached wave engine's `submit` DIRECTLY and check the rows came from the
-    // GPU wave machinery (not silently via an lpb fallback). The engine projects (id, balance).
-    {
-        let engine = {
-            let cache = e
-                .read_state
-                .residency
-                .wave_read_engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Arc::clone(&cache.get("accounts").expect("wave engine cached").engine)
-        };
-        let mut guard = engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut rows = guard.submit(&[10, 30, 40]).expect("direct wave submit");
-        rows.sort_by_key(|row| (row.needle_index, row.row_index));
-        let got: Vec<Vec<i32>> = rows.iter().map(|row| row.values.clone()).collect();
-        assert_eq!(
-            got,
-            vec![vec![10, 100], vec![30, 300], vec![40, 400]],
-            "the cached wave engine itself gathers (id, balance) correctly for present needles"
-        );
-    }
-
-    // (a'') Projection-set identity: a DIFFERENT projection over the SAME unique col must REBUILD a distinct
-    // wave engine -- the proj-set is BAKED at launch and is part of the cache identity, so the (id, balance)
-    // engine must NOT be reused. Reversed projection (balance, id) -> values [balance, id]; a stale reuse
-    // would yield [id, balance] and the differential would catch it. (Proves the proj-key is load-bearing.)
+    // (a') Reversed projection (balance, id) over the same unique col still matches the scan: a per-needle
+    // gather with the projection offsets baked at submit, so a column-order bug would diverge here.
     let select_rev = select_cmd("SELECT balance, id FROM accounts WHERE id = 1");
     scan_cfg(&e);
     let scan_rev = run(&e, &select_rev, &unique_needles);
-    wave_cfg(&e);
-    let hits = e.wave_route_hits();
-    let wave_rev = run(&e, &select_rev, &unique_needles);
+    lpb_cfg(&e);
+    let lpb_rev = run(&e, &select_rev, &unique_needles);
     assert_eq!(
-        e.wave_route_hits(),
-        hits + 1,
-        "the proj-rebuild wave run was served by the wave route"
+        lpb_rev, scan_rev,
+        "index probe matches scan for a reversed projection set over the same unique col"
     );
     assert_eq!(
-        wave_rev, scan_rev,
-        "wave rebuilds for a new projection set over the same unique col and matches scan"
-    );
-    assert_eq!(
-        wave_rev[0],
+        lpb_rev[0],
         vec![vec![SqlValue::Int4(100), SqlValue::Int4(10)]],
-        "reversed projection (balance, id) -> [100, 10] -- a proj-specific rebuild, not stale (id,balance) reuse"
+        "reversed projection (balance, id) -> [100, 10]"
     );
 
-    // (c) Generation change + EVICTION. The cache is currently POPULATED (the (a'') proj-rebuild left an
-    // engine over col 0), so the post-INSERT `cached_wave_col == None` check genuinely exercises the SERIAL-
-    // commit eviction (engine_commit.rs) -- it would FAIL if eviction were broken. The INSERT commits ->
-    // serial invalidation evicts (tears the kernel down); re-admission + a wave read rebuilds over the new
-    // buffer; wave still == scan over the larger table.
+    // (c) Generation change. The INSERT commits -> serial invalidation tombstones residency; re-admission
+    // rebuilds the index over the new buffer; lpb still == scan over the larger table.
     e.execute_text(
         3,
         "INSERT INTO accounts (id, bucket, balance, note) VALUES (50, 3, 500, 'e')",
     )
     .unwrap();
-    assert_eq!(
-        cached_wave_col(&e),
-        None,
-        "the serial commit invalidation EVICTED the (populated) wave engine (kernel torn down)"
-    );
     e.populate_relational_residency_snapshot("accounts").unwrap();
     let gen_needles = vec![10, 50, 40, 999];
     scan_cfg(&e);
     let scan_g = run(&e, &select_unique, &gen_needles);
-    wave_cfg(&e);
-    let hits = e.wave_route_hits();
-    let wave_g = run(&e, &select_unique, &gen_needles);
+    lpb_cfg(&e);
+    let lpb_g = run(&e, &select_unique, &gen_needles);
     assert_eq!(
-        e.wave_route_hits(),
-        hits + 1,
-        "the rebuilt wave run was served by the wave route"
+        lpb_g, scan_g,
+        "after a generation change the REBUILT index still matches the scan"
     );
     assert_eq!(
-        wave_g, scan_g,
-        "after a generation change the REBUILT wave engine still matches the scan"
-    );
-    assert_eq!(
-        cached_wave_col(&e),
-        Some(0),
-        "the wave engine rebuilt over col 0 for the new generation"
-    );
-    assert_eq!(
-        wave_g[1],
+        lpb_g[1],
         vec![vec![SqlValue::Int4(50), SqlValue::Int4(500)]],
-        "the newly-inserted row 50 is found by the rebuilt wave engine"
+        "the newly-inserted row 50 is found by the rebuilt index"
     );
 
-    // (b) Non-unique fallback (LAST -- after (c), so it does not drain the cache before the eviction check
-    // above). `bucket` is duplicated, so the index/wave DECLINE and fall back to the scan: rows == scan AND
-    // the wave route is NOT hit (proves the fallback is taken, not a wrong-result wave).
+    // (b) Non-unique fallback. `bucket` is duplicated, so the index DECLINES and falls back to the scan:
+    // rows == scan AND the index route is NOT hit (proves the fallback is taken, not a wrong-result index).
     let dup_needles = vec![1, 2, 9];
     scan_cfg(&e);
     let scan_d = run(&e, &select_dup, &dup_needles);
-    wave_cfg(&e);
-    let hits = e.wave_route_hits();
-    let wave_d = run(&e, &select_dup, &dup_needles);
+    lpb_cfg(&e);
+    let hits = e.dense_index_probe_hits();
+    let lpb_d = run(&e, &select_dup, &dup_needles);
     assert_eq!(
-        e.wave_route_hits(),
+        e.dense_index_probe_hits(),
         hits,
-        "a non-unique key must NOT hit the wave route (it declines -> lpb/scan fallback)"
+        "a non-unique key must NOT hit the index route (it declines -> scan fallback)"
     );
     assert_eq!(
-        wave_d, scan_d,
-        "a non-unique key falls back (no wave engine buildable) and stays identical to the scan"
+        lpb_d, scan_d,
+        "a non-unique key falls back (no index buildable) and stays identical to the scan"
     );
-    assert_eq!(wave_d[0].len(), 2, "bucket = 1 matches two rows (id 10 and 20)");
-}
-
-// ADR-009 R2.2b: concurrent SAME-SHAPE point lookups (the R2.2b-3 A/B workload: many connections, one
-// shape) are SAFE and correct with the wave route on. Proves the build latch + double-checked lookup build
-// exactly ONE persistent engine (no two-kernel mutual-starvation hang) and the per-engine Mutex serializes
-// submits (single-flight) so every concurrent reader gets results byte-identical to the scan. The test
-// completing (no hang) is itself the liveness assertion. GPU test (#[ignore]).
-#[test]
-#[ignore = "requires a local NVIDIA driver and GPU"]
-fn r2_wave_engine_concurrent_same_shape_single_flight() {
-    let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-        .unwrap();
-    let mut values = String::new();
-    for i in 0..256i32 {
-        if i > 0 {
-            values.push_str(", ");
-        }
-        values.push_str(&format!("({}, {})", i * 2 + 1, i * 100));
-    }
-    e.execute_text(
-        2,
-        &format!("INSERT INTO accounts (id, balance) VALUES {values}"),
-    )
-    .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
-
-    let Command::Select(select) =
-        parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap()
-    else {
-        unreachable!()
-    };
-    if !e.plan_relational_resident_route(&select).accepted {
-        return; // no GPU -> skip
-    }
-    let needles: Vec<i32> = (0..16).map(|i| i * 2 + 1).collect(); // present unique keys
-
-    let run = |e: &Engine, needles: &[i32]| -> Vec<RowBlock> {
-        let template = e.prepare_relational_retained_read_template(&select).unwrap();
-        let submission = e
-            .submit_relational_retained_template_point_lookups(&template, needles)
-            .unwrap();
-        e.complete_relational_retained_read_submission(submission)
-            .unwrap()
-            .iter()
-            .map(|result| result.rows.clone())
-            .collect()
-    };
-    // Baseline (scan), then flip the wave route ON before sharing the engine across threads.
-    e.set_wave_engine_enabled(false);
-    e.set_wave_persistent_engine_enabled(false);
-    let baseline = run(&e, &needles);
-    e.set_wave_engine_enabled(true);
-    e.set_wave_persistent_engine_enabled(true);
-    let engine = Arc::new(e);
-    let hits_before = engine.wave_route_hits(); // 0 (baseline ran under scan config)
-
-    const READERS: usize = 8;
-    const READS_PER_THREAD: usize = 50;
-    let barrier = Arc::new(std::sync::Barrier::new(READERS));
-    let readers: Vec<_> = (0..READERS)
-        .map(|_| {
-            let engine = Arc::clone(&engine);
-            let barrier = Arc::clone(&barrier);
-            let baseline = baseline.clone();
-            let needles = needles.clone();
-            let select = select.clone();
-            std::thread::spawn(move || {
-                barrier.wait(); // maximize overlap so concurrent first-misses race the build latch
-                for _ in 0..READS_PER_THREAD {
-                    let template = engine
-                        .prepare_relational_retained_read_template(&select)
-                        .unwrap();
-                    let submission = engine
-                        .submit_relational_retained_template_point_lookups(&template, &needles)
-                        .unwrap();
-                    let rows: Vec<RowBlock> = engine
-                        .complete_relational_retained_read_submission(submission)
-                        .unwrap()
-                        .iter()
-                        .map(|result| result.rows.clone())
-                        .collect();
-                    assert_eq!(rows, baseline, "concurrent wave read diverged from the scan");
-                }
-            })
-        })
-        .collect();
-    for reader in readers {
-        reader.join().expect("reader thread panicked (hang/deadlock would time out)");
-    }
-    // Every one of the READERS*READS_PER_THREAD reads was SERVED by the wave route (not a silent lpb
-    // fallback): the per-engine Mutex serializes the submits (single-flight) and each succeeds.
-    assert_eq!(
-        engine.wave_route_hits(),
-        hits_before + (READERS * READS_PER_THREAD) as u64,
-        "all concurrent reads were served by the wave route"
-    );
-    // EXACTLY ONE persistent wave engine was built despite 8 racing first-readers (build latch +
-    // double-checked lookup), over the id filter col.
-    let cache = engine
-        .read_state
-        .residency
-        .wave_read_engine
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert_eq!(cache.len(), 1, "concurrent first-readers built exactly one wave engine");
-    assert_eq!(
-        cache.get("accounts").map(|entry| entry.column_idx),
-        Some(0),
-        "the single wave engine is over the id filter col"
-    );
+    assert_eq!(lpb_d[0].len(), 2, "bucket = 1 matches two rows (id 10 and 20)");
 }
 
 // ADR-009 Result-path: the BATCHED completion (one flat RelationalRetainedBatchResult + per-needle ranges)
 // must produce BYTE-IDENTICAL per-needle rows to the per-needle `complete_relational_retained_read_submission`
 // path (same ascending row_index order, same NULL-as-0 + absent handling). Two submits of the SAME needles
-// (the wave is deterministic) -> one completed per-needle, one batched -> compare slice-by-slice. GPU test.
+// (the index probe is deterministic) -> one completed per-needle, one batched -> compare slice-by-slice. GPU test.
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_batched_completion_matches_per_needle() {
@@ -4436,8 +4131,8 @@ fn r2_batched_completion_matches_per_needle() {
     if !e.plan_relational_resident_route(&select).accepted {
         return; // no GPU
     }
+    // lpb INDEX route (unique key `id`): wave_engine on.
     e.set_wave_engine_enabled(true);
-    e.set_wave_persistent_engine_enabled(true);
     let template = e.prepare_relational_retained_read_template(&select).unwrap();
     // distinct needles incl an ABSENT one (25) and NULL-as-0 (0, the NULL-id row).
     let needles = vec![10, 20, 30, 40, 25, 0];
@@ -4508,8 +4203,8 @@ fn r2_batched_completion_matches_per_needle_multirow() {
     if !e.plan_relational_resident_route(&select).accepted {
         return; // no GPU
     }
+    // Non-unique `bucket` -> the index declines and the SCAN serves; wave_engine on exercises that fallback.
     e.set_wave_engine_enabled(true);
-    e.set_wave_persistent_engine_enabled(true);
     let template = e.prepare_relational_retained_read_template(&select).unwrap();
     // bucket 1 -> 2 rows, bucket 2 -> 2 rows, bucket 3 -> 1 row, bucket 9 -> absent.
     let needles = vec![1, 2, 3, 9];

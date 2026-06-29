@@ -507,28 +507,6 @@ pub(crate) struct ResidencyReadState {
     /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the
     /// fast cache-hit path; staleness is handled by the per-entry `generation` tag, not by eviction.
     pub(crate) wave_index: Mutex<BTreeMap<String, WaveResidentIndex>>,
-    /// ADR-009 R2.2b: per-table PERSISTENT wave read engine cache for the persistent-kernel point-lookup
-    /// route (built lazily, behind the default-OFF `wave_persistent_engine_enabled` flag nested under
-    /// `wave_engine_enabled`). A plain `Mutex` like `wave_index`, BUT each entry owns a live GPU kernel +
-    /// watchdog petter, so unlike the passive index — which self-invalidates by ptr on the next read — an
-    /// entry MUST be dropped to reclaim its SM/buffers: the serialized-invalidation (catalog-latch) path
-    /// removes + drops it on DDL/drop/memory-pressure; a re-admission rebuild overwrites + drops the stale
-    /// entry. Staleness on the concurrent commit path is handled by the residency tombstone (which makes the
-    /// route unreachable) + ptr-keyed overwrite-on-next-read, NOT by eviction in the commit critical section
-    /// (Drop joins the petter ~watchdog window — too costly to hold there).
-    pub(crate) wave_read_engine: Mutex<BTreeMap<String, WaveResidentReadEngine>>,
-    /// ADR-009 R2.2b: serializes wave-engine BUILDS (not submits) so two concurrent cache misses cannot
-    /// both launch a persistent kernel. Critical for the AT-MOST-ONE-RESIDENT invariant: two full-occupancy
-    /// persistent spin-kernels in the shared context mutually starve (neither yields its SMs), so the second
-    /// launch + the first's later teardown (`cuStreamSynchronize`, infinite backstop) would DEADLOCK. Held
-    /// across the drain-existing + launch-new + publish sequence; cache HITS never take it (hot path).
-    pub(crate) wave_build_latch: Mutex<()>,
-    /// ADR-009 R2.2b: count of batches actually SERVED by the persistent wave route (one per successful
-    /// `WaveReadEngine::submit`), as opposed to falling through to the lpb index probe / scan. Real telemetry
-    /// for the R2.2b-3 A/B (wave-hit vs fallback rate) AND the test signal that proves the ROUTE (not just the
-    /// engine in isolation) produced the rows — output equality alone can't, since all routes are
-    /// byte-identical by design. `Relaxed` (a monotonic counter, no ordering dependency).
-    pub(crate) wave_route_hits: std::sync::atomic::AtomicU64,
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe (vs the atomic
     /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
     /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.

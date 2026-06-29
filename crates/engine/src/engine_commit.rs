@@ -294,27 +294,6 @@ impl Engine {
             .residency
             .shard_device_memory
             .invalidate_table(table);
-        // ADR-009 R2.2b: a cached persistent wave read engine owns a LIVE GPU kernel (+ watchdog petter)
-        // over this table's buffers. Unlike the passive R1 index — which self-invalidates by ptr on the next
-        // read (a re-admission's new buffer misses the cache) — the kernel must be EXPLICITLY torn down to
-        // reclaim its SM / device buffers / petter thread on DROP TABLE / DDL / memory-pressure. This is the
-        // SERIALIZED (catalog-latch) invalidation path, so the teardown latency (Drop joins the petter ~one
-        // heartbeat slice + syncs the stream) is acceptable here — it is NOT done on the concurrent commit
-        // path (`invalidate_relational_residency_tables_concurrent`), where the residency tombstone already
-        // makes the wave route unreachable and a re-admission's ptr-keyed rebuild reclaims the stale engine.
-        // Take the entry OUT under the cache lock, then drop it AFTER releasing the lock so the teardown
-        // never blocks a concurrent accessor on the cache mutex (and `WaveReadEngine::Drop` set_currents the
-        // context, so dropping on this catalog-latch thread is sound).
-        let evicted_wave_engine = {
-            let mut cache = self
-                .read_state
-                .residency
-                .wave_read_engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.remove(table)
-        };
-        drop(evicted_wave_engine);
     }
 
     /// Invalidate the GPU residency of the `tables` a CONCURRENT commit mutated, via `&self`

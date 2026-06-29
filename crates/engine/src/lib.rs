@@ -19,7 +19,6 @@ use gpu_db_execution::{
     ResidentElemType,
     MockGpuRuntime, Operator,
     PlannedOp, ProjectOperator, RouteDecision, ScanOperator, SortOperator,
-    WaveReadEngine,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -317,14 +316,6 @@ pub struct Engine {
     /// the per-batch device cost drops O(rows)→O(1). Default off; falls back to the scan whenever the
     /// column is non-unique or the index cannot be built. Interior-mutable (`&self`), read on the read path.
     wave_engine_enabled: AtomicBool,
-    /// ADR-009 R2.2b: when true (AND `wave_engine_enabled` is also on), a resident int4 unique-key equality
-    /// point lookup is served by a PERSISTENT wave kernel (`WaveReadEngine`, lazily built per
-    /// (filter_col, projection set)) instead of the launch-per-batch (lpb) R1 index probe — removing the
-    /// per-batch launch cost. Default off (nested UNDER `wave_engine_enabled`, which stays the lpb default),
-    /// so flipping just this flag is the R2.2b-3 A/B lever: wave vs lpb, both byte-identical to the scan.
-    /// Falls back to the lpb index probe on any wave error / harvest timeout / oversize batch. Interior-
-    /// mutable (`&self`), read on the read path.
-    wave_persistent_engine_enabled: AtomicBool,
     /// DECISIONS "lpb read levers" #1: when true, the lpb unique index probe uses the DENSE-emit kernel
     /// (thread `i` -> slot `i`, no atomic, no needle_indices/row_indices/count; host compacts sequentially)
     /// instead of the atomic-compaction kernel. Byte-identical; DEFAULT ON (user 2026-06-29: strict win

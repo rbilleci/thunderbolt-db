@@ -1,32 +1,25 @@
-//! R2.2b-3 wave-engine A/B — the SHIP-decision instrument (ADR-009 R2.2b).
+//! lpb-index A/B — the index-route vs full-scan instrument (ADR-009 R1).
 //!
-//! R2.2b-2 wired the PERSISTENT `WaveReadEngine` into the resident int4 unique-key point-lookup route
-//! behind the default-OFF `wave_persistent_engine_enabled` flag (NESTED under `wave_engine_enabled`,
-//! which stays the lpb default). This benchmark measures the SAME swap **through the engine** — the real
-//! retained-read template path the production batcher drives — across THREE byte-identical routes:
-//!   - `scan`      : both flags off                         -> full-scan equal_any  (O(rows)/batch)
-//!   - `lpb-index` : wave_engine_enabled only               -> launch-per-batch GPU hash-index (O(1)/needle)
-//!   - `wave`      : both flags                              -> persistent kernel    (no per-batch launch)
+//! This benchmark measures the resident int4 unique-key point-lookup route **through the engine** — the
+//! real retained-read template path the production batcher drives — across two byte-identical routes:
+//!   - `scan`      : index off (`wave_engine_enabled` off)  -> full-scan equal_any  (O(rows)/batch)
+//!   - `lpb-index` : `wave_engine_enabled` on               -> launch-per-batch GPU hash-index (O(1)/needle)
+//! It also sweeps the index route's atomic vs DENSE completion kernel on the batched path.
 //!
-//! WHAT THIS MEASURES (and what it does NOT). The wired wave route is SINGLE-FLIGHT: one `WaveReadEngine`
-//! per (table,proj), submits serialized by its `Arc<Mutex<_>>`. In production, point reads flow through
-//! the facade's SINGLE coalescer thread, so the production-relevant regime is ONE caller varying BATCH
-//! size (a higher offered rate coalesces into bigger batches). That is the PRIMARY sweep below. We ALSO
-//! run a concurrent section (N threads hammering the same shape through one shared `Engine`) — for the
-//! wave that contends the per-engine Mutex (the single-flight ceiling), for scan/lpb the GPU pipelines
-//! per-batch launches. The concurrent numbers expose the Mutex ceiling that motivates R2.2c (a
-//! multi-producer lock-free-ring replacement of the coalescer), and are NOT the production path.
+//! WHAT THIS MEASURES (and what it does NOT). In production, point reads flow through the facade's SINGLE
+//! coalescer thread, so the production-relevant regime is ONE caller varying BATCH size (a higher offered
+//! rate coalesces into bigger batches). That is the PRIMARY sweep below. We ALSO run a concurrent section
+//! (N threads hammering the same shape through one shared `Engine`) where the GPU pipelines per-batch
+//! launches — NOT the production single-coalescer path.
 //!
-//! NON-VACUITY (the R2.2 "loses 118x" retraction lesson — wrong regime + wrong baseline + crippled impl):
-//!   (1) every route is asserted BYTE-IDENTICAL before any timing (a silent wrong/empty result can't win);
-//!   (2) `Engine::wave_route_hits()` confirms the wave route ACTUALLY served every batch (not a silent
-//!       fallback to lpb) — the benchmark ABORTS if the wave didn't serve, so "wave" numbers are real.
+//! NON-VACUITY: every route is asserted BYTE-IDENTICAL before any timing (a silent wrong/empty result can't
+//! win).
 //!
-//! Env: GPU_DB_BENCH_ROWS (single table size, default 1048576 — wave-vs-lpb is ~table-size-independent,
-//! both O(1)/needle; R1's A/B already covered the O(rows) scan curve), GPU_DB_BENCH_BATCH (comma-separated
-//! batch sizes to sweep, default "1,8,32,256,4096"), GPU_DB_BENCH_BATCHES (measured batches/mode, default
-//! 2000), GPU_DB_BENCH_WARMUP (untimed warmup batches/mode, default 20 — the first wave batch builds the
-//! engine), GPU_DB_BENCH_THREADS (concurrent section thread counts, default "1,2,4,8"; "" disables it).
+//! Env: GPU_DB_BENCH_ROWS (single table size, default 1048576 — lpb-vs-scan; both index probes are
+//! O(1)/needle), GPU_DB_BENCH_BATCH (comma-separated batch sizes to sweep, default "1,8,32,256,4096"),
+//! GPU_DB_BENCH_BATCHES (measured batches/mode, default 2000), GPU_DB_BENCH_WARMUP (untimed warmup
+//! batches/mode, default 20 — lpb builds the index), GPU_DB_BENCH_THREADS (concurrent section thread
+//! counts, default "1,2,4,8"; "" disables it).
 //!
 //! Run (RTX box; never `--gpu-reset`, always under `timeout`):
 //!   timeout 900 cargo run --release --example r2_wave_engine_ab -p gpu_db_engine
@@ -59,7 +52,6 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 enum Mode {
     Scan,
     Lpb,
-    Wave,
 }
 
 impl Mode {
@@ -67,23 +59,16 @@ impl Mode {
         match self {
             Mode::Scan => "scan",
             Mode::Lpb => "lpb-index",
-            Mode::Wave => "wave",
         }
     }
-    /// Set the two nested flags for this route. `wave` needs BOTH; `lpb` needs the index flag only.
+    /// Set the index-route flag for this route: `lpb` needs it on, `scan` off.
     fn configure(self, e: &Engine) {
         match self {
             Mode::Scan => {
                 e.set_wave_engine_enabled(false);
-                e.set_wave_persistent_engine_enabled(false);
             }
             Mode::Lpb => {
                 e.set_wave_engine_enabled(true);
-                e.set_wave_persistent_engine_enabled(false);
-            }
-            Mode::Wave => {
-                e.set_wave_engine_enabled(true);
-                e.set_wave_persistent_engine_enabled(true);
             }
         }
     }
@@ -188,13 +173,12 @@ fn measure(
     rows: u64,
 ) -> Result<Lat, Box<dyn Error>> {
     mode.configure(e);
-    // Warmup: the first wave batch builds + caches the engine; lpb builds the index; also JIT/allocator.
+    // Warmup: lpb builds the index; also JIT/allocator.
     for b in 0..warmup {
         let needles = needles_for_batch(b, batch, step, rows);
         let sub = e.submit_relational_retained_template_point_lookups(template, &needles)?;
         let _ = e.complete_relational_retained_read_submission(sub)?;
     }
-    let hits_before = e.wave_route_hits();
     let mut batch_micros = Vec::with_capacity(batches);
     let t = Instant::now();
     for b in 0..batches {
@@ -205,22 +189,12 @@ fn measure(
         batch_micros.push(s0.elapsed().as_micros());
     }
     let wall = t.elapsed();
-    // NON-VACUITY: the wave route must have SERVED every timed batch (not silently fallen back to lpb);
-    // scan/lpb must NEVER hit the wave route. Abort loudly otherwise — a misleading number is worse than none.
-    let hits = e.wave_route_hits() - hits_before;
-    let expect = if mode == Mode::Wave { batches as u64 } else { 0 };
-    assert_eq!(
-        hits, expect,
-        "{} mode: wave_route_hits delta {hits} != expected {expect} (silent fallback / mis-route)",
-        mode.label()
-    );
     Ok(summarize(batch_micros, batches * batch, wall))
 }
 
 /// Like `measure` but completes via the BATCHED path (`complete_relational_retained_read_submission_batched`)
 /// — one flat result + per-needle ranges instead of N per-needle structs (DECISIONS "Result-path
 /// optimization"). Shows how close the per-needle-result-model change gets end-to-end to the GPU drain.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn measure_batched(
     e: &Engine,
@@ -286,8 +260,7 @@ fn rows_once(
 }
 
 /// Concurrent section: `threads` workers each run `per_thread` batches through ONE shared engine in `mode`.
-/// For `wave` this contends the per-engine Mutex (the single-flight ceiling); for scan/lpb the GPU
-/// pipelines the per-batch launches. Returns aggregate lookups/s. NOT the production coalescer path.
+/// The GPU pipelines the per-batch launches. Returns aggregate lookups/s. NOT the production coalescer path.
 fn measure_concurrent(
     engine: &Arc<Engine>,
     select: &Select,
@@ -376,10 +349,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         parse_csv_usize(&env::var("GPU_DB_BENCH_THREADS").unwrap_or_else(|_| "1,2,4,8".to_string()));
 
     println!(
-        "# R2.2b-3 wave-engine A/B  rows={rows}  batches={batch_sizes:?}  measured_batches={batches}  warmup={warmup}"
+        "# lpb-index A/B  rows={rows}  batches={batch_sizes:?}  measured_batches={batches}  warmup={warmup}"
     );
-    println!("# scan=both flags off | lpb-index=wave_engine_enabled | wave=both (persistent kernel)");
-    println!("# single-flight = the production single-coalescer path; concurrent = the per-engine-Mutex ceiling (R2.2c)\n");
+    println!("# scan=index off | lpb-index=wave_engine_enabled (GPU hash-index probe)");
+    println!("# single-flight = the production single-coalescer path; concurrent = the multi-producer ceiling\n");
 
     let rows_u = rows as u64;
     let mut step = 0x9E37_79B1u64 % rows_u.max(2);
@@ -400,79 +373,67 @@ fn main() -> Result<(), Box<dyn Error>> {
     let template = e.prepare_relational_retained_read_template(&select)?;
     println!("# executed_target={exec_target}\n");
 
-    // (batch, scan_ops, lpb_ops, wave_ops) for the closing summary.
-    let mut headline: Vec<(usize, f64, f64, f64)> = Vec::new();
+    // (batch, scan_ops, lpb_ops) for the closing summary.
+    let mut headline: Vec<(usize, f64, f64)> = Vec::new();
 
     println!("## SINGLE-FLIGHT (one caller, varying batch) — the production single-coalescer regime");
     for &b in &batch_sizes {
         let batch = b.min(rows as usize);
 
-        // Correctness gate: scan == lpb == wave, byte-identical, before any timing.
+        // Correctness gate: scan == lpb, byte-identical, before any timing.
         let probe = needles_for_batch(0, batch, step, rows_u);
         let scan_rows = rows_once(&e, &template, Mode::Scan, &probe)?;
         let lpb_rows = rows_once(&e, &template, Mode::Lpb, &probe)?;
-        let wave_rows = rows_once(&e, &template, Mode::Wave, &probe)?;
         assert_eq!(lpb_rows, scan_rows, "batch={batch}: lpb != scan");
-        assert_eq!(wave_rows, scan_rows, "batch={batch}: wave != scan");
 
         let scan = measure(&e, &template, Mode::Scan, batch, batches, warmup, step, rows_u)?;
         let lpb = measure(&e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u)?;
-        let wave = measure(&e, &template, Mode::Wave, batch, batches, warmup, step, rows_u)?;
-        let wave_b = measure_batched(&e, &template, Mode::Wave, batch, batches, warmup, step, rows_u)?;
         let lpb_b = measure_batched(&e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u)?;
         let lpb_dense_b = measure_batched_dense(
             &e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u, true,
         )?;
-        let sp_lpb = if lpb.ops_per_s > 0.0 {
-            wave.ops_per_s / lpb.ops_per_s
-        } else {
-            0.0
-        };
         let sp_scan = if scan.ops_per_s > 0.0 {
-            wave.ops_per_s / scan.ops_per_s
+            lpb.ops_per_s / scan.ops_per_s
         } else {
             0.0
         };
         println!("\n### batch={batch}");
         print_lat(Mode::Scan.label(), &scan);
         print_lat(Mode::Lpb.label(), &lpb);
-        print_lat(Mode::Wave.label(), &wave);
         print_lat("lpb-batched", &lpb_b);
         print_lat("lpb-DENSE-batched", &lpb_dense_b);
-        print_lat("wave-batched", &wave_b);
-        let sp_lpb_b = if lpb_b.ops_per_s > 0.0 {
-            wave_b.ops_per_s / lpb_b.ops_per_s
+        let sp_dense_b = if lpb_b.ops_per_s > 0.0 {
+            lpb_dense_b.ops_per_s / lpb_b.ops_per_s
         } else {
             0.0
         };
-        println!("  wave/lpb: {sp_lpb:.2}x lookups/s    wave/scan: {sp_scan:.2}x");
-        println!("  BATCHED wave/lpb: {sp_lpb_b:.2}x    (batched completion = one flat result, no per-needle structs)");
-        headline.push((batch, scan.ops_per_s, lpb.ops_per_s, wave.ops_per_s));
+        println!("  lpb/scan: {sp_scan:.2}x lookups/s");
+        println!("  BATCHED dense/atomic: {sp_dense_b:.2}x    (batched completion = one flat result, no per-needle structs)");
+        headline.push((batch, scan.ops_per_s, lpb.ops_per_s));
     }
 
     println!("\n## SINGLE-FLIGHT summary  (lookups/s by batch)");
     println!(
-        "  {:>8}  {:>13}  {:>13}  {:>13}  {:>10}  {:>10}",
-        "batch", "scan", "lpb-index", "wave", "wave/lpb", "wave/scan"
+        "  {:>8}  {:>13}  {:>13}  {:>10}",
+        "batch", "scan", "lpb-index", "lpb/scan"
     );
-    for (b, s, l, w) in &headline {
-        let spl = if *l > 0.0 { w / l } else { 0.0 };
-        let sps = if *s > 0.0 { w / s } else { 0.0 };
-        println!("  {b:>8}  {s:>13.0}  {l:>13.0}  {w:>13.0}  {spl:>9.2}x  {sps:>9.2}x");
+    for (b, s, l) in &headline {
+        let spl = if *s > 0.0 { l / s } else { 0.0 };
+        println!("  {b:>8}  {s:>13.0}  {l:>13.0}  {spl:>9.2}x");
     }
 
-    // Concurrent section — exposes the per-engine-Mutex single-flight ceiling for the wave (NOT production).
+    // Concurrent section — N producers hammering one shared Engine (NOT the production single-coalescer path).
     if !thread_counts.is_empty() {
-        let conc_batch = 32usize.min(rows as usize); // a small OLTP batch; the regime the wave is meant for
+        let conc_batch = 32usize.min(rows as usize); // a small OLTP batch
         let per_thread = (batches / thread_counts.iter().max().copied().unwrap_or(1)).max(50);
         let engine = Arc::new(e);
         println!(
             "\n## CONCURRENT (N threads, one shared Engine, batch={conc_batch}, {per_thread} batches/thread)"
         );
-        println!("# wave contends its per-engine Mutex (single-flight ceiling); scan/lpb pipeline launches. NOT the prod path.");
+        println!("# scan/lpb pipeline the per-batch launches across threads. NOT the prod single-coalescer path.");
         println!(
-            "  {:>8}  {:>13}  {:>13}  {:>13}  {:>10}",
-            "threads", "scan", "lpb-index", "wave", "wave/lpb"
+            "  {:>8}  {:>13}  {:>13}  {:>10}",
+            "threads", "scan", "lpb-index", "lpb/scan"
         );
         for &threads in &thread_counts {
             let s = measure_concurrent(
@@ -481,11 +442,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let l = measure_concurrent(
                 &engine, &select, Mode::Lpb, conc_batch, threads, per_thread, step, rows_u,
             )?;
-            let w = measure_concurrent(
-                &engine, &select, Mode::Wave, conc_batch, threads, per_thread, step, rows_u,
-            )?;
-            let spl = if l > 0.0 { w / l } else { 0.0 };
-            println!("  {threads:>8}  {s:>13.0}  {l:>13.0}  {w:>13.0}  {spl:>9.2}x");
+            let spl = if s > 0.0 { l / s } else { 0.0 };
+            println!("  {threads:>8}  {s:>13.0}  {l:>13.0}  {spl:>9.2}x");
         }
     }
 

@@ -1,16 +1,16 @@
-//! R2.2c host-machinery spike — localize lpb's per-batch cost (submit vs complete) on the REAL engine
-//! path, to decide whether host-machinery optimization can close the lpb->wave gap without the wave.
+//! lpb host-machinery spike — localize lpb's per-batch cost (submit vs complete) on the REAL engine path,
+//! to decide whether host-machinery optimization can shrink the lpb per-batch overhead.
 //!
-//! The R2.2b-3 A/B + the graphs spike showed: lpb's ~27us/batch is NOT raw launch (~7us) — it is per-batch
-//! ENGINE machinery. Reading `submit_cuda_resident_i32_index_probe` + `complete_detached`: the lpb COMPLETE
-//! does TWO sync round-trips (DtoH the match count to size result arrays -> sync, THEN DtoH the 3 result
-//! arrays -> sync), plus 5 per-batch device-buffer leases + event timing; the WAVE does ONE round-trip (its
-//! per-slot status ring is host-mapped, so no count DtoH, then one bulk DtoH). So the suspected lever is
-//! COLLAPSING lpb's two round-trips into one (buffers are ALREADY pooled, so pooling is not the lever).
+//! lpb's ~27us/batch is NOT raw launch (~7us) — it is per-batch ENGINE machinery. Reading
+//! `submit_cuda_resident_i32_index_probe` + `complete_detached`: the lpb COMPLETE does TWO sync round-trips
+//! (DtoH the match count to size result arrays -> sync, THEN DtoH the 3 result arrays -> sync), plus 5
+//! per-batch device-buffer leases + event timing. So the suspected lever is COLLAPSING lpb's two round-trips
+//! into one (buffers are ALREADY pooled, so pooling is not the lever). The DENSE kernel sidesteps the count
+//! round-trip (one slot per needle, host-compacted), so the lpb-vs-lpb-dense split localizes that cost.
 //!
 //! This probe TIMES, on the real retained-template path, the SUBMIT phase vs the COMPLETE phase separately,
-//! for lpb (wave_engine_enabled) and wave (both flags), so we see WHERE each spends its per-batch time. NO
-//! production change. (Faithful: same engine path the A/B drives; non-vacuity via wave_route_hits.)
+//! for lpb (atomic) and lpb-dense, so we see WHERE each spends its per-batch time. NO production change.
+//! (Faithful: same engine path; non-vacuity via dense_index_probe_hits.)
 //!
 //! Run (RTX box; never `--gpu-reset`, always under `timeout`):
 //!   timeout 240 cargo run --release --example lpb_phase_split_probe -p gpu_db_engine
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let template = e.prepare_relational_retained_read_template(&select)?;
 
-    println!("# TAIL-LOCALIZATION — lpb vs wave SUBMIT/COMPLETE distribution on the BATCHED path. rows={rows}");
+    println!("# TAIL-LOCALIZATION — lpb vs lpb-dense SUBMIT/COMPLETE distribution on the BATCHED path. rows={rows}");
     println!("# Goal: find WHERE the lpb p99 tail lives (submit vs complete). us = microseconds.\n");
     println!(
         "  {:>5} {:>6}  {:>26}  {:>26}",
@@ -135,21 +135,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     for &batch in &batch_sizes {
-        for (label, wave_engine, persistent, dense) in [
-            ("lpb", true, false, false),
-            ("lpb-dense", true, false, true),
-            ("wave", true, true, false),
+        for (label, wave_engine, dense) in [
+            ("lpb", true, false),
+            ("lpb-dense", true, true),
         ] {
             e.set_wave_engine_enabled(wave_engine);
-            e.set_wave_persistent_engine_enabled(persistent);
             e.set_dense_index_probe_enabled(dense);
-            // warmup (first wave batch builds the engine; lpb builds the index)
+            // warmup (lpb builds the index)
             for b in 0..30 {
                 let n = needles_for_batch(b, batch, step, rows_u);
                 let sub = e.submit_relational_retained_template_point_lookups(&template, &n)?;
                 let _ = e.complete_relational_retained_read_submission_batched(sub)?;
             }
-            let hits_before = e.wave_route_hits();
             let dense_before = e.dense_index_probe_hits();
             let mut submit_us = Vec::with_capacity(batches);
             let mut complete_us = Vec::with_capacity(batches);
@@ -164,11 +161,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 submit_us.push(s);
                 complete_us.push(c);
             }
-            let hits = e.wave_route_hits() - hits_before;
-            // non-vacuity: wave must have served every batch; lpb never hits the wave route; dense must have
-            // served every dense batch (the dense kernel actually ran, no silent fallback).
-            let expect = if persistent { batches as u64 } else { 0 };
-            assert_eq!(hits, expect, "{label}: wave_route_hits {hits} != {expect}");
+            // non-vacuity: dense must have served every dense batch (the dense kernel actually ran, no
+            // silent fallback).
             let dense_hits = e.dense_index_probe_hits() - dense_before;
             let dense_expect = if dense { batches as u64 } else { 0 };
             assert_eq!(
@@ -185,7 +179,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let _ = p50(Vec::new()); // (p50 retained for back-compat; dist() drives the tail report)
-    println!("\n# If the lpb COMPLETE max/p99.9 >> its p50 while wave stays flat, the tail is in lpb's");
-    println!("# blocking cuStreamSynchronize drain (shared-GPU contention) — localize drain-vs-sync next.");
+    println!("\n# If the lpb COMPLETE max/p99.9 >> its p50, the tail is in lpb's blocking cuStreamSynchronize");
+    println!("# drain (shared-GPU contention) — localize drain-vs-sync next.");
     Ok(())
 }

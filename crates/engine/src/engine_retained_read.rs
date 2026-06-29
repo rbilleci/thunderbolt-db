@@ -6,24 +6,6 @@
 
 use super::*;
 
-// ADR-009 R2.2b persistent wave-read-engine launch config (single-flight first; tunable for the R2.2b-3
-// A/B). The engine is built lazily per (filter_col, projection set) and owned for the residency generation.
-//
-/// Ring capacity bounds ONE wave; a needle batch larger than this falls back to the lpb index probe
-/// (blocker#1: total un-harvested needles <= ring_capacity, trivially satisfied single-flight). 65536
-/// covers the measured batch range; `WaveReadEngine::new` rounds up to a power of two.
-const WAVE_ENGINE_RING_CAPACITY: usize = 65536;
-/// Persistent grid; `WaveReadEngine::new` CLAMPS this to device occupancy (correctness gate C1), so an
-/// over-large value can never silently hang (un-resident blocks would never drain the ring). ~8k threads
-/// is where the device-result rewrite peaked (~31.8M lookups/s).
-const WAVE_ENGINE_THREADS: u32 = 8192;
-/// Near-infinite fixed backstop: the engine is long-lived, so crash-safety is the watchdog's job, not a
-/// fixed timeout that would kill a healthy idle engine mid-life.
-const WAVE_ENGINE_BACKSTOP_NS: u64 = u64::MAX;
-/// Crash-safe watchdog window: if the host dies/hangs (no heartbeat), thread 0 self-terminates the kernel
-/// ~2s after the heartbeat goes stale — vs zombie-ing until the backstop on the `--gpu-reset`-denied box.
-const WAVE_ENGINE_WATCHDOG_NS: u64 = 2_000_000_000;
-
 impl Engine {
     // Stage-0 (Thread-3 batched/async submission): this takes `&self`, not `&mut self`.
     // Its body only calls `plan_relational_resident_route`, `bind_relational_select_for_execution`,
@@ -513,7 +495,7 @@ impl Engine {
             u16,
             RuntimeMetricsSnapshot,
             Instant,
-            RelationalRetainedInt4ProjectionPayload,
+            DeferredProbe,
         )>,
         ExecuteError,
     > {
@@ -553,59 +535,20 @@ impl Engine {
         device_memory.clear_last_kernel_event_elapsed_us();
         let before_metrics = self.metrics.snapshot();
         let batch_started = Instant::now();
-        // ADR-009 R1/R2.2b: route this resident int4 unique-key batch among three byte-identical producers
-        // (each returns the SAME matched rows; only HOW/WHEN they're found differs):
-        //   (1) PERSISTENT wave kernel  — `wave_persistent_engine_enabled` ON (nested under
-        //       `wave_engine_enabled`): no per-batch launch; rows harvested SYNCHRONOUSLY -> Materialized.
-        //   (2) lpb GPU hash-index probe — `wave_engine_enabled` ON, column unique/buildable: O(1)/needle.
-        //   (3) full-scan kernel        — flag off, or column non-unique / un-buildable: O(rows).
-        // (2)+(3) are DEFERRED submissions drained at completion. The wave (1) is built over the SAME R1
-        // index as (2) (so NULL-as-0 + gather semantics match), and falls through to (2)/(3) on ANY wave
-        // error / harvest timeout / oversize batch — never a wrong result, only a slower path.
-        // CONTRACT: the index + wave routes require `needles` to be DISTINCT — the facade batcher's
-        // `dedup_needles` guarantees this. The thread-per-needle gather emits one match per found needle vs
-        // the scan's one per matched row; for a unique key + distinct needles these coincide (a bijection).
-        // Duplicate needles would over-count relative to the scan, so the distinct-needle invariant is
-        // debug-asserted INSIDE the index + wave arms only — the scan arm is reachable with duplicate needles
-        // from the jobs-batch caller (`submit_relational_retained_int4_projection_batch`) and must NOT be
-        // guarded.
-        let payload = 'route: {
-            // (1) Persistent wave route. blocker#1: a batch larger than the ring falls back to lpb (the
-            // wave can't hold it). blocker#2: `WaveReadEngine::submit`'s internal `DRAIN_TIMEOUT` bounds the
-            // single-flight harvest. Single-flight: lock the per-(col,proj) engine for this one wave.
-            if self.wave_engine_enabled()
-                && self.wave_persistent_engine_enabled()
-                && needles.len() <= WAVE_ENGINE_RING_CAPACITY
-            {
-                if let Some(engine) = self.wave_read_engine_for(
-                    &table.name,
-                    &device_memory,
-                    filter_offset,
-                    filter_idx,
-                    &projection_offsets,
-                    row_count,
-                ) {
-                    debug_assert!(
-                        {
-                            let mut seen = std::collections::HashSet::with_capacity(needles.len());
-                            needles.iter().all(|needle| seen.insert(*needle))
-                        },
-                        "wave route requires distinct needles (batcher dedup_needles contract)"
-                    );
-                    let mut guard = engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Ok(columns) = guard.submit_columnar(needles) {
-                        self.read_state
-                            .residency
-                            .wave_route_hits
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        break 'route RelationalRetainedInt4ProjectionPayload::Materialized(columns);
-                    }
-                    // else: wave error / harvest timeout -> fall through to the lpb route below (the engine
-                    // is left cached; a transient timeout does not invalidate it).
-                }
-            }
-            // (2)/(3) launch-per-batch: GPU index probe when buildable, else the full scan -> Deferred.
-            let deferred = match self
+        // ADR-009 R1: route this resident int4 unique-key batch among two byte-identical producers (each
+        // returns the SAME matched rows; only HOW they're found differs):
+        //   (1) lpb GPU hash-index probe — `wave_engine_enabled` ON, column unique/buildable: O(1)/needle.
+        //   (2) full-scan kernel        — flag off, or column non-unique / un-buildable: O(rows).
+        // Both are DEFERRED submissions drained at completion.
+        // CONTRACT: the index route requires `needles` to be DISTINCT — the facade batcher's `dedup_needles`
+        // guarantees this. The thread-per-needle gather emits one match per found needle vs the scan's one
+        // per matched row; for a unique key + distinct needles these coincide (a bijection). Duplicate
+        // needles would over-count relative to the scan, so the distinct-needle invariant is debug-asserted
+        // INSIDE the index arm only — the scan arm is reachable with duplicate needles from the jobs-batch
+        // caller (`submit_relational_retained_int4_projection_batch`) and must NOT be guarded.
+        // launch-per-batch: GPU index probe when buildable, else the full scan -> a DeferredProbe.
+        let payload = {
+            match self
                 .wave_engine_enabled()
                 .then(|| {
                     self.wave_resident_int4_index(
@@ -624,7 +567,7 @@ impl Engine {
                             let mut seen = std::collections::HashSet::with_capacity(needles.len());
                             needles.iter().all(|needle| seen.insert(*needle))
                         },
-                        "wave index route requires distinct needles (batcher dedup_needles contract)"
+                        "index route requires distinct needles (batcher dedup_needles contract)"
                     );
                     // The index route is unique (<=1 match/needle), so it can take the DENSE-emit kernel
                     // (DECISIONS "lpb read levers" #1) when the flag is on — byte-identical, no atomic/scatter.
@@ -677,8 +620,7 @@ impl Engine {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                         })?,
                 ),
-            };
-            RelationalRetainedInt4ProjectionPayload::Deferred(deferred)
+            }
         };
         Ok(Some((snapshot_gpu_id, before_metrics, batch_started, payload)))
     }
@@ -745,130 +687,6 @@ impl Engine {
             },
         );
         built
-    }
-
-    /// ADR-009 R2.2b: fetch (building + caching on demand) the PERSISTENT wave read engine for resident
-    /// int4 key column `filter_idx` projecting `projection_offsets` over resident buffer `device_memory`.
-    /// `Some(engine)` drives the persistent-kernel route (`WaveReadEngine::submit`); `None` means "use the
-    /// lpb index probe" — the column is non-unique / un-buildable (no R1 index) OR the kernel launch failed.
-    ///
-    /// Mirrors [`Engine::wave_resident_int4_index`]'s ptr-keyed cache discipline (the engine is built over +
-    /// gathers through the SAME device buffer, whose address the engine's own `Arc` pins), EXTENDED with the
-    /// projection set in the identity because the wave kernel BAKES the projection offsets at launch. The
-    /// engine is built over the SAME R1 index (reusing `wave_resident_int4_index`), so its NULL-as-0 key +
-    /// gather semantics are byte-identical to the lpb index probe by construction.
-    ///
-    /// AT-MOST-ONE-RESIDENT INVARIANT (load-bearing for liveness): two full-occupancy persistent spin-kernels
-    /// in the shared context MUTUALLY STARVE — neither yields its SMs, so a kernel whose blocks lost the SMs
-    /// never runs (can't observe the doorbell / watchdog), and tearing it down (`cuStreamSynchronize`, with an
-    /// infinite backstop) HANGS FOREVER. So on a miss this DRAINS every existing wave engine (each then the
-    /// sole persistent kernel -> clean doorbell teardown) BEFORE launching the new one, all under the
-    /// `wave_build_latch` so two concurrent misses can't both launch. [LIMITATION: this means ONE wave engine
-    /// TOTAL across all tables — alternating tables/projections rebuilds each time. Fine for R2.2b single-
-    /// flight + the one-shape A/B; lifting it (multi-engine coexistence) needs sub-occupancy sizing or a
-    /// shared multi-table kernel — deferred to R2.2c. KNOWN single-flight EDGE: a concurrent reader holding a
-    /// to-be-drained engine across a rebuild keeps it alive past the new launch (-> transient two-kernel
-    /// window); the supported model is single-flight (one submit at a time), so this is out of scope here and
-    /// is the central concern multi-producer R2.2b-3 must resolve.]
-    fn wave_read_engine_for(
-        &self,
-        table_name: &str,
-        device_memory: &Arc<CudaResidentDeviceMemory>,
-        filter_offset: u64,
-        filter_idx: usize,
-        projection_offsets: &[u64],
-        row_count: u64,
-    ) -> Option<Arc<Mutex<WaveReadEngine>>> {
-        let resident_device_ptr = device_memory.device_ptr();
-        // Cache lookup with the full (col, buffer, proj) identity check.
-        let lookup = || -> Option<Arc<Mutex<WaveReadEngine>>> {
-            let cache = self
-                .read_state
-                .residency
-                .wave_read_engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.get(table_name).and_then(|existing| {
-                (existing.column_idx == filter_idx
-                    && existing.resident_device_ptr == resident_device_ptr
-                    && existing.projection_offsets == projection_offsets)
-                    .then(|| Arc::clone(&existing.engine))
-            })
-        };
-        // Fast path: cache hit (no build latch -> no contention on the hot path).
-        if let Some(engine) = lookup() {
-            return Some(engine);
-        }
-        // Miss: serialize the BUILD so two concurrent misses can't both launch a persistent kernel.
-        let _build_guard = self
-            .read_state
-            .residency
-            .wave_build_latch
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Re-check under the build latch: another builder may have just published exactly what we need.
-        if let Some(engine) = lookup() {
-            return Some(engine);
-        }
-        // Drain EVERY existing wave engine BEFORE launching the new one (at-most-one-resident invariant).
-        // Take the whole map out under the cache lock, then drop OUTSIDE it: each drained engine is now the
-        // sole persistent kernel, so `WaveReadEngine::Drop` (doorbell + petter join + stream sync) completes
-        // cleanly. Dropping outside the cache lock keeps cache-hit readers unblocked; the build latch (held)
-        // is what serializes builders.
-        let stale = {
-            let mut cache = self
-                .read_state
-                .residency
-                .wave_read_engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *cache)
-        };
-        drop(stale);
-        // Get-or-build the R1 index over THIS buffer (so the wave gathers with the SAME NULL-as-0 semantics
-        // as the scan/index); `None` here -> caller uses lpb. Then launch the persistent kernel — no other
-        // persistent wave kernel is resident now. `WaveReadEngine::new` set_current's the shared primary
-        // context, clamps the grid to occupancy (C1), and runs until Drop / backstop / stale-heartbeat
-        // watchdog.
-        let (index, table_mask, hash_shift) = self.wave_resident_int4_index(
-            table_name,
-            device_memory,
-            filter_offset,
-            filter_idx,
-            row_count,
-        )?;
-        let engine = WaveReadEngine::new(
-            index,
-            Arc::clone(device_memory),
-            projection_offsets,
-            table_mask,
-            hash_shift,
-            WAVE_ENGINE_RING_CAPACITY,
-            WAVE_ENGINE_THREADS,
-            WAVE_ENGINE_BACKSTOP_NS,
-            WAVE_ENGINE_WATCHDOG_NS,
-        )
-        .ok()?;
-        let engine = Arc::new(Mutex::new(engine));
-        {
-            let mut cache = self
-                .read_state
-                .residency
-                .wave_read_engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // The map was drained above and builds are serialized by the latch, so this slot is absent.
-            cache.insert(
-                table_name.to_string(),
-                WaveResidentReadEngine {
-                    column_idx: filter_idx,
-                    resident_device_ptr,
-                    projection_offsets: projection_offsets.to_vec(),
-                    engine: Arc::clone(&engine),
-                },
-            );
-        }
-        Some(engine)
     }
 
     /// ADR-009 R1: build the open-addressing GPU hash index (`(key<<32)|(row+1)`, 0 = empty; Fibonacci
@@ -968,11 +786,8 @@ impl Engine {
             )
             .saturating_add(row_metadata_d2h_bytes);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        // R2.2b (Slice-1 audit note): `observe_kernel_exec_ms` is recorded for BOTH payload arms from the
-        // batch WALL time (`batch_micros`), intentionally — it models "a batch executed on the GPU" and keeps
-        // `kernel_exec_samples` comparable across the lpb and wave routes. The wave (Materialized) arm has no
-        // per-batch CUDA EVENT (the persistent kernel is not timed per wave), so only the separate
-        // `kernel_event_*` counter pair below is omitted (via the `None` elapsed), not this exec-ms sample.
+        // `observe_kernel_exec_ms` is recorded from the batch WALL time (`batch_micros`) — it models "a batch
+        // executed on the GPU" and keeps `kernel_exec_samples` comparable across the scan and index routes.
         self.metrics
             .observe_kernel_exec_ms(completion.batch_micros.div_ceil(1000).max(1));
         if let Some(elapsed_us) = completion.kernel_event_elapsed_us {
@@ -1017,28 +832,23 @@ impl Engine {
     pub(crate) fn complete_relational_retained_int4_projection_submission_detached(
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<RelationalRetainedInt4ProjectionCompletion, ExecuteError> {
-        // ADR-009 R2.2b: both payload arms yield the SAME `Vec<CudaI32BatchProjectionRow>` — the
-        // `Deferred` (lpb/scan/R1-index) arm drains its enqueued GPU submission here; the `Materialized`
-        // (persistent wave engine) arm already drained the wave synchronously in `submit`, so the rows are
-        // in hand and there is no per-batch kernel event (the persistent kernel is not timed per wave ->
-        // `None`). Everything downstream (stable sort by `row_index`, `SqlValue::Int4` mapping, metrics,
-        // results assembly) is shared and arm-agnostic, so the two routes are byte-identical by construction.
-        // This per-needle path is COLD (the hot batcher uses the batched completion); it bridges the columnar
-        // Materialized arm back to per-row via `into_rows` (DECISIONS "Tail latency").
+        // ADR-009 R1: the deferred (lpb/scan/R1-index) probe drains its enqueued GPU submission here, yielding
+        // a `Vec<CudaI32BatchProjectionRow>`. Everything downstream (stable sort by `row_index`,
+        // `SqlValue::Int4` mapping, metrics, results assembly) is shared, so atomic and dense are byte-
+        // identical by construction. This per-needle path is COLD (the hot batcher uses the batched
+        // completion); it bridges the columnar dense form back to per-row via `into_rows` (DECISIONS "Tail
+        // latency").
         let (projected_rows, kernel_event_elapsed_us) = match pending.payload {
-            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Atomic(submission)) => {
+            DeferredProbe::Atomic(submission) => {
                 submission
                     .complete_detached()
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
             }
-            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Dense(submission)) => {
+            DeferredProbe::Dense(submission) => {
                 let (columns, elapsed) = submission
                     .complete_detached_columnar()
                     .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
                 (columns.into_rows(), elapsed)
-            }
-            RelationalRetainedInt4ProjectionPayload::Materialized(columns) => {
-                (columns.into_rows(), None)
             }
         };
         let batch_micros = pending
@@ -1145,17 +955,12 @@ impl Engine {
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<RelationalRetainedBatchResult, ExecuteError> {
         let (projected, _kernel_event_elapsed_us) = match pending.payload {
-            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Atomic(submission)) => {
-                submission
-                    .complete_detached_columnar()
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
-            }
-            RelationalRetainedInt4ProjectionPayload::Deferred(DeferredProbe::Dense(submission)) => {
-                submission
-                    .complete_detached_columnar()
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
-            }
-            RelationalRetainedInt4ProjectionPayload::Materialized(columns) => (columns, None),
+            DeferredProbe::Atomic(submission) => submission
+                .complete_detached_columnar()
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
+            DeferredProbe::Dense(submission) => submission
+                .complete_detached_columnar()
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
         };
         let n = pending.needle_count;
         let ncols = pending.selected_indexes.len();
