@@ -260,6 +260,69 @@ done_ld:
     ret;
 }
 
+// out[i] = column[indices[i]] : GATHER a resident int4 column (at resident_ptr + byte_offset) at the
+// given row indices into a buffer. `indices_ptr` is an absolute device u64 array of `n` row indices;
+// `out_ptr` an absolute (leased) buffer of n*4 bytes. Grid-stride. Replaces the per-row D2H gather
+// (copy_cuda_resident_i32_rows): one kernel + one bulk D2H instead of n tiny synchronous D2H copies --
+// the shared materialization primitive for the general Expr routes (projection/ordered/distinct/grouped/
+// join). Caller bounds-checks the indices host-side (an OOB index here would be an illegal device read).
+.visible .entry gpu_db_resident_i32_gather_rows(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 indices_ptr,
+    .param .u64 n,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %t32;
+    .reg .s32 %v;
+    .reg .u64 %src;
+    .reg .u64 %idxbase;
+    .reg .u64 %n;
+    .reg .u64 %out;
+    .reg .u64 %i;
+    .reg .u64 %stride;
+    .reg .u64 %idx;
+    .reg .u64 %off;
+    .reg .u64 %addr;
+
+    ld.param.u64 %src, [resident_ptr];
+    ld.param.u64 %off, [byte_offset];
+    add.u64 %src, %src, %off;
+    ld.param.u64 %idxbase, [indices_ptr];
+    ld.param.u64 %n, [n];
+    ld.param.u64 %out, [out_ptr];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %t32, %bid, %bdim, %lane;
+    cvt.u64.u32 %i, %t32;
+    mul.lo.u32 %t32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %t32;
+loop_g:
+    setp.ge.u64 %p, %i, %n;
+    @%p bra done_g;
+    mul.lo.u64 %off, %i, 8;
+    add.u64 %addr, %idxbase, %off;
+    ld.global.u64 %idx, [%addr];
+    mul.lo.u64 %off, %idx, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.s32 %v, [%addr];
+    mul.lo.u64 %off, %i, 4;
+    add.u64 %addr, %out, %off;
+    st.global.s32 [%addr], %v;
+    add.u64 %i, %i, %stride;
+    bra loop_g;
+done_g:
+    ret;
+}
+
 // out[i] = a[i] <op> b[i] : elementwise binary over two intermediate buffers (absolute ptrs).
 // CHECKED int4 arithmetic: each op is evaluated in 64-bit and range-checked; an int4-overflowing
 // result ORs 1 into out_overflow_ptr[0] (Postgres `integer out of range`). Stored i32 is wrapped.

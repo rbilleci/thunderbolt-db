@@ -5868,18 +5868,36 @@ fn copy_cuda_resident_i32_rows(
     byte_offset: u64,
     row_indices: &[u64],
 ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
 
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
+    let n = row_indices.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let out_bytes = n
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n))?;
 
-    let mut values = Vec::with_capacity(row_indices.len());
-    for row_idx in row_indices {
+    // Bounds safety (the prior per-row gather checked this per row, then D2H'd it): an OOB index would be
+    // an illegal DEVICE read in the gather kernel (CUDA 700, context-corrupting on a shared box), so
+    // validate every index host-side FIRST. O(n) checked arithmetic, no transfers -- the win was removing
+    // the per-row D2H (us/row), which this preserves; the check is unchanged from the prior code.
+    let allocated = resident.metadata().allocated_bytes;
+    for &row_idx in row_indices {
         let value_offset = row_idx
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|offset| byte_offset.checked_add(offset))
@@ -5887,21 +5905,72 @@ fn copy_cuda_resident_i32_rows(
         let value_end = value_offset
             .checked_add(std::mem::size_of::<i32>() as u64)
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if value_end > resident.metadata().allocated_bytes {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(
-                value_end as usize,
-            ));
+        if value_end > allocated {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(value_end as usize));
         }
-        let mut value = 0_i32;
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                (&mut value as *mut i32).cast::<c_void>(),
-                resident.device_ptr() + value_offset,
-                std::mem::size_of::<i32>(),
-            )
-        })?;
-        values.push(value);
     }
+
+    let primary = resident.primary();
+    primary.set_current()?;
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let gather_fn = primary.cached_function(c"gpu_db_resident_i32_gather_rows", &ptx)?;
+
+    // HtoD the indices once (blocking; on-device on return), gather column[indices[i]] -> out[i] in ONE
+    // kernel, then ONE bulk D2H of the whole result buffer. Both leases are held alive past the D2H below.
+    let idx_buf = resident.upload_u64_device(row_indices)?;
+    let out = primary.lease_device_buffer(out_bytes)?;
+
+    const BLOCK: u32 = 256;
+    let grid = (n as u64).div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+    let mut a0 = resident.device_ptr();
+    let mut a1 = byte_offset;
+    let mut a2 = idx_buf.device_ptr();
+    let mut a3 = n as u64;
+    let mut a4 = out.ptr;
+    let mut args = [
+        (&mut a0 as *mut u64).cast::<c_void>(),
+        (&mut a1 as *mut u64).cast::<c_void>(),
+        (&mut a2 as *mut u64).cast::<c_void>(),
+        (&mut a3 as *mut u64).cast::<c_void>(),
+        (&mut a4 as *mut u64).cast::<c_void>(),
+    ];
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+        cu_launch_kernel(
+            gather_fn,
+            grid,
+            1,
+            1,
+            BLOCK,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    // Legacy synchronous D2H serializes with the pooled-stream gather, so the kernel's writes are visible.
+    let mut values = vec![0_i32; n];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(values.as_mut_ptr().cast::<c_void>(), out.ptr, out_bytes)
+    })?;
+    drop(idx_buf);
     Ok(values)
 }
 
