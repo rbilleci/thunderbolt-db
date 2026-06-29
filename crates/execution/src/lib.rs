@@ -15002,133 +15002,44 @@ fn compact_buffer_i32_compare_to_indices(
     needle: i32,
     comparison: u32,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
-    type CuLaunchKernel = unsafe extern "C" fn(
-        *mut c_void,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        *mut c_void,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> i32;
-    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
-
-    // The scalar compact kernel switches on codes 0=eq..4=ge only; reject 5=ne (mask-path only) so a
-    // caller gets an error, not a silently-empty result.
+    // The scalar compact kernel switched on codes 0=eq..4=ge only; reject 5=ne (mask-path only) so a
+    // caller gets an error, not a silently-empty result. Preserved byte-identically across the
+    // re-route to the ordered compaction (no production caller passes 5 here — `ne` lowers to a mask).
     if comparison > 4 {
         return Err(CudaRuntimeProbeError::UnsupportedComparison(comparison));
     }
     if n == 0 {
         return Ok(Vec::new());
     }
-    // probe-timing (VM lever): the int4 simple-comparison compaction (`col <cmp> scalar` -> indices) -- the
-    // fused compare+atomic-append kernel + count/index D2H + the host sort_unstable of the surviving indices.
-    // vs predicate_total this localizes the match-count-dependent cost the prefix-sum/warp-agg lever targets.
+    // probe-timing (VM lever): the int4 simple-comparison compaction (`col <cmp> scalar` -> indices). The
+    // legacy path was a fused compare+atomic-append kernel + count/index D2H + a host `sort_unstable` of
+    // the surviving indices; the ~93%-of-cost host sort is what the ordered compaction eliminates.
     let _compact_scope = Probe::scope("compact");
-    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
-    let byte_len = n_usize
-        .checked_mul(std::mem::size_of::<i32>())
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
 
-    let primary = resident.primary();
-    primary.set_current()?;
-    let cu_launch_kernel = unsafe {
-        resident
-            .lib()
-            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_htod = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
-    let compare_fn = primary.cached_function(c"gpu_db_buffer_i32_compare_to_indices", &ptx)?;
-
-    let indices_buf = primary.lease_device_buffer(byte_len)?;
-    let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
-    let zero = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_htod(
-            count_buf.ptr,
-            (&zero as *const u32).cast::<c_void>(),
-            std::mem::size_of::<u32>(),
-        )
-    })?;
-
-    const BLOCK: u32 = 256;
-    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
-    let mut in_arg = value_device_ptr;
-    let mut n_arg = n;
-    let mut needle_arg = needle;
-    let mut cmp_arg = comparison;
-    let mut count_arg = count_buf.ptr;
-    let mut idx_arg = indices_buf.ptr;
-    let mut args = [
-        (&mut in_arg as *mut u64).cast::<c_void>(),
-        (&mut n_arg as *mut u64).cast::<c_void>(),
-        (&mut needle_arg as *mut i32).cast::<c_void>(),
-        (&mut cmp_arg as *mut u32).cast::<c_void>(),
-        (&mut count_arg as *mut u64).cast::<c_void>(),
-        (&mut idx_arg as *mut u64).cast::<c_void>(),
-    ];
-    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
-        cu_launch_kernel(
-            compare_fn,
-            grid,
-            1,
-            1,
-            BLOCK,
-            1,
-            1,
-            0,
-            stream,
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    })?;
-
-    let mut match_count = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut match_count as *mut u32).cast::<c_void>(),
-            count_buf.ptr,
-            std::mem::size_of::<u32>(),
-        )
-    })?;
-    let match_count = usize::try_from(match_count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?
-        .min(n_usize);
-    let mut indices = vec![0_u32; match_count];
-    if match_count > 0 {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                indices.as_mut_ptr().cast::<c_void>(),
-                indices_buf.ptr,
-                match_count * std::mem::size_of::<u32>(),
-            )
-        })?;
-    }
-    indices.sort_unstable();
-    Ok(indices)
+    // Re-route to the ORDERED parallel compaction (`COMPARE_ORDERED_PTX`) in INDEX-emit mode: read the
+    // leased VALUE buffer as the contiguous i32 input (`input_base = value_device_ptr`, `byte_offset =
+    // 0`). The kernels read one i32 per row at `value_device_ptr + idx*4` (the same layout the legacy
+    // compact kernel read), so the surviving row indices are identical — but emitted ASCENDING BY
+    // CONSTRUCTION (contiguous block partition + ordered intra-block prefix sum), replacing the host
+    // `sort_unstable`. Call the shared core directly (not the column-only index wrapper, which always
+    // reads `resident.device_ptr()`) so the input base is the value buffer; reinterpret each u32 row
+    // index from its i32 slot bits (always `< n`, non-negative — bit-exact) exactly as that wrapper
+    // does.
+    //
+    // Lease lifetime: the ordered core does count -> host-scan -> scatter (TWO launches reading
+    // `value_device_ptr`). The caller leases the value buffer and holds that lease across this whole
+    // call (it is borrowed for the duration), so the input outlives both reads — unchanged from the
+    // legacy single-launch path, which also read the same buffer.
+    let slots = launch_cuda_resident_i32_compare_ordered_core(
+        resident,
+        value_device_ptr,
+        0,
+        n,
+        needle,
+        comparison,
+        1,
+    )?;
+    Ok(slots.into_iter().map(|slot| slot as u32).collect())
 }
 
 /// PROTOTYPE — the resident arithmetic bytecode VM (docs/architecture/17 section 2.3). Runs a postfix
@@ -18151,123 +18062,37 @@ fn compact_mask_i32_to_indices(
     mask_device_ptr: u64,
     n: u64,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
-    type CuLaunchKernel = unsafe extern "C" fn(
-        *mut c_void,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        *mut c_void,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> i32;
-    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    const PTX: &[u8] = include_bytes!("expr_proto.ptx");
-
     if n == 0 {
         return Ok(Vec::new());
     }
-    let n_usize = usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
-    let byte_len = n_usize
-        .checked_mul(std::mem::size_of::<i32>())
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
-
-    let primary = resident.primary();
-    primary.set_current()?;
-    let cu_launch_kernel = unsafe {
-        resident
-            .lib()
-            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_htod = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let mut ptx = Vec::with_capacity(PTX.len() + 1);
-    ptx.extend_from_slice(PTX);
-    ptx.push(0);
-    let compact_fn = primary.cached_function(c"gpu_db_mask_compact_to_indices", &ptx)?;
-
-    // probe-timing (VM lever): time the mask->indices compaction (atomic-counter compact + count/index D2H +
-    // host sort). Its share of the predicate decides the lever -- warp-aggregate the atomic vs the compare.
+    // probe-timing (VM lever): time the mask->indices compaction. The legacy path was an atomic-counter
+    // compact + count/index D2H + a host `sort_unstable`; the ~93%-of-cost host sort is what the ordered
+    // compaction eliminates (the share of the predicate that decided this lever).
     let _compact_scope = Probe::scope("compact");
-    let indices_buf = primary.lease_device_buffer(byte_len)?;
-    let count_buf = primary.lease_device_buffer(std::mem::size_of::<u32>())?;
-    let zero = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_htod(
-            count_buf.ptr,
-            (&zero as *const u32).cast::<c_void>(),
-            std::mem::size_of::<u32>(),
-        )
-    })?;
 
-    const BLOCK: u32 = 256;
-    let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
-    let mut mask_arg = mask_device_ptr;
-    let mut n_arg = n;
-    let mut count_arg = count_buf.ptr;
-    let mut idx_arg = indices_buf.ptr;
-    let mut args = [
-        (&mut mask_arg as *mut u64).cast::<c_void>(),
-        (&mut n_arg as *mut u64).cast::<c_void>(),
-        (&mut count_arg as *mut u64).cast::<c_void>(),
-        (&mut idx_arg as *mut u64).cast::<c_void>(),
-    ];
-    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
-        cu_launch_kernel(
-            compact_fn,
-            grid,
-            1,
-            1,
-            BLOCK,
-            1,
-            1,
-            0,
-            stream,
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    })?;
-
-    let mut match_count = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut match_count as *mut u32).cast::<c_void>(),
-            count_buf.ptr,
-            std::mem::size_of::<u32>(),
-        )
-    })?;
-    let match_count = usize::try_from(match_count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?
-        .min(n_usize);
-    let mut indices = vec![0_u32; match_count];
-    if match_count > 0 {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                indices.as_mut_ptr().cast::<c_void>(),
-                indices_buf.ptr,
-                match_count * std::mem::size_of::<u32>(),
-            )
-        })?;
-    }
-    indices.sort_unstable();
-    Ok(indices)
+    // Re-route to the ORDERED parallel compaction (`COMPARE_ORDERED_PTX`) in INDEX-emit mode. The mask
+    // is a 0/1 i32 PER ROW (the compare-to-mask / mask-binary kernels write `selp.b32 %mask,1,0` then
+    // `st.global.b32 [out + idx*4]` — one i32 per row, NOT bit-packed), so "row is set" == "mask i32 !=
+    // 0". Read the leased MASK buffer as the contiguous i32 input (`input_base = mask_device_ptr`,
+    // `byte_offset = 0`) and select set rows with `needle = 0`, `comparison = 5 (ne)`: the ordered
+    // count/scatter kernels both test `mask[idx] != 0` and emit the surviving ROW INDICES ascending by
+    // construction (contiguous block partition + ordered intra-block prefix sum) — identical indices to
+    // the legacy atomic-append, but with no host `sort_unstable`.
+    //
+    // Lease lifetime: the ordered core does count -> host-scan -> scatter (TWO launches reading
+    // `mask_device_ptr`). The caller leases the mask buffer and holds that lease across this whole call
+    // (it is borrowed for the duration), so the input outlives both reads — unchanged from the legacy
+    // single-launch path, which also read the same mask buffer.
+    let slots = launch_cuda_resident_i32_compare_ordered_core(
+        resident,
+        mask_device_ptr,
+        0,
+        n,
+        0,
+        5,
+        1,
+    )?;
+    Ok(slots.into_iter().map(|slot| slot as u32).collect())
 }
 
 /// Evaluate a boolean predicate `program` (comparisons -> masks, combined by `MaskBinary`) to one
@@ -20582,6 +20407,7 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
 ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
     launch_cuda_resident_i32_compare_ordered_core(
         resident,
+        resident.device_ptr(),
         byte_offset,
         row_count,
         needle,
@@ -20613,6 +20439,7 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
     );
     let slots = launch_cuda_resident_i32_compare_ordered_core(
         resident,
+        resident.device_ptr(),
         byte_offset,
         row_count,
         needle,
@@ -20631,8 +20458,18 @@ fn launch_cuda_resident_i32_compare_indices_ordered<R: CudaResidentReadSource>(
 /// u32 (1, returned as `i32` bits the caller reinterprets). `comparison` is the raw kernel code
 /// (0=eq, 1=lt, 2=lte, 3=gt, 4=gte, 5=ne). All count/host-scan/scatter structure, chunk/grid sizing,
 /// and lease lifetimes are shared, so the value and index paths are byte-identical except the payload.
+///
+/// `input_base` is the device base the kernels read `row_count` contiguous i32s from, at
+/// `input_base + byte_offset + idx*4`. The column path passes `resident.device_ptr()` (input IS the
+/// resident column, so the `byte_offset + row_count*4 <= allocated_bytes` bound is checked against the
+/// column allocation). A generalized caller passes a leased device buffer's ptr instead (its OWN i32
+/// input — e.g. a 0/1 mask or an arithmetic result); the column-allocation bound does NOT apply (the
+/// buffer is caller-sized and its lease must outlive both kernel launches), so it is checked only on
+/// the column path. `resident` still supplies the CUDA context (lib / primary / streams / leases)
+/// regardless of where the input is read.
 fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
     resident: &R,
+    input_base: u64,
     byte_offset: u64,
     row_count: u64,
     needle: i32,
@@ -20694,12 +20531,27 @@ fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata().allocated_bytes {
+    // The `[byte_offset, byte_offset + row_count*4)` read window must fit the INPUT allocation. When the
+    // input IS the resident column (`input_base == resident.device_ptr()`) that allocation is the
+    // column's `allocated_bytes`, so check it (byte-identical to the pre-generalization column path).
+    // A generalized caller reads its OWN leased buffer (a different base), which is sized to exactly
+    // `row_count*4` with `byte_offset == 0` and owned by the caller, so the column bound does not apply.
+    if input_base == resident.device_ptr() && bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
     if row_count == 0 {
         return Ok(Vec::new());
     }
+    // Load-bearing precondition (audit P3) for INDEX-emit mode: the scatter kernel stores each surviving
+    // ROW INDEX as a u32 (`cvt.u32.u64` then `st.global.b32`), so it would silently truncate past
+    // u32::MAX. The grid sizing grows `chunk` for arbitrarily large `row_count` and does NOT cap it, so
+    // assert here (~17 GB for one i32 input = unreachable on a single GPU today, but make the invariant
+    // explicit). Lives in the core so EVERY index-emit caller is covered (the column wrapper and the
+    // generalized mask / arithmetic-result compactions alike), not just the original column wrapper.
+    debug_assert!(
+        out_is_index == 0 || row_count <= u64::from(u32::MAX),
+        "ordered-index compaction stores row indices as u32; row_count {row_count} exceeds u32::MAX"
+    );
 
     let cu_memcpy_dtoh = unsafe {
         resident
@@ -20809,8 +20661,10 @@ fn launch_cuda_resident_i32_compare_ordered_core<R: CudaResidentReadSource>(
         .cached_function(c"gpu_db_resident_i32_compare_scatter_blocks", &ptx)?;
 
     // Shared kernel scalar args (pointers/needle/comparison/chunk are identical across both passes;
-    // each pass binds its own output pointer).
-    let mut resident_arg = resident.device_ptr();
+    // each pass binds its own output pointer). The kernels read the input at `input_base + byte_offset
+    // + idx*4`; `input_base` is the resident column ptr for the column path and a leased buffer ptr for
+    // a generalized caller (mask / arithmetic-result compaction).
+    let mut resident_arg = input_base;
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
     let mut chunk_arg = chunk;
