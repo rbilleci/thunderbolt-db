@@ -1109,6 +1109,42 @@ fn gpu_s10a_text_prefix_like_count_nullable_text_pg_correct_on_device() {
 }
 
 #[test]
+fn gpu_resident_empty_nonnullable_scalar_aggregate_min_max_avg_is_null() {
+    // AUDIT (commit 75aeb493): the direct scalar-stats path maps `count == 0` (empty input) to
+    // SqlValue::Null. SQL spec: an aggregate over ZERO rows is NULL (matching the NULLABLE path's
+    // all-NULL behavior and `reduce_nullable_grouped_stats`'s "PG: an aggregate of no rows is NULL").
+    // This corner (an EMPTY, NON-nullable, UNFILTERED resident table) was UNTESTED; this pins it so a
+    // future regression to the old empty sentinels (MIN/MAX -> Text("") / AVG -> Numeric(0)) is caught.
+    let mut e = Engine::new_local();
+    // Plain `INT` (no inserted NULLs) routes the NON-nullable arm (`agg_null_offset.is_none()`), the
+    // same arm the populated `gpu_resident_device_memory_scalar_aggregate_probe_*` test exercises.
+    e.execute_text(1, "CREATE TABLE events (amount INT)").unwrap();
+    // No rows inserted: an empty non-nullable column.
+    let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+
+    for sql in [
+        "SELECT MIN(amount) FROM events",
+        "SELECT MAX(amount) FROM events",
+        "SELECT AVG(amount) FROM events",
+    ] {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let resident = e.execute_resident_plan(&select).unwrap();
+        assert_eq!(
+            resident.rows,
+            vec![vec![SqlValue::Null]],
+            "{sql} over an EMPTY non-nullable table must be SQL NULL (aggregate of no rows)"
+        );
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(resident.fallback_reason, None, "{sql}");
+    }
+}
+
+#[test]
 fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results() {
     let mut e = Engine::new_local();
     e.execute_text(

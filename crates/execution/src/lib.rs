@@ -29453,6 +29453,157 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_i32_scalar_stats_byte_identical_to_host_and_self_grouped_oracle() {
+        // ADVERSARIAL AUDIT (commit 75aeb493 -- direct (count,sum,min,max) scalar-stats reduction
+        // replacing the self-grouped hash path for unfiltered non-nullable MIN/MAX/AVG).
+        //
+        // The load-bearing CLAIM is BYTE-IDENTITY: the new direct kernel's (count, sum, min, max) must
+        // equal (a) an independent HOST oracle AND (b) the OLD self-grouped path's reduced totals --
+        // `grouped_stats_i32_from_payload(off, off, rows, ALL)` with group==value, reduced exactly the
+        // way the old engine arm reduced it (sum of group.count, sum of group.sum, min of group.min,
+        // max of group.max). The NEW min/max logic is what this commit introduces, so the focus is
+        // sentinel-valued (i32::MIN/MAX as REAL data, not init sentinels), all-negative (a leaked
+        // INT_MAX init would surface), all-positive (a leaked INT_MIN init would surface), single row,
+        // partial last block, ODD counts, and grid-stride wrap. count must == rows (non-nullable
+        // unfiltered), and i64 sum must == the linear host `wrapping_add` oracle.
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Independent HOST oracle (linear order; the kernel groups/orders adds via a per-thread
+        // grid-stride scan then a per-block halving tree then one atomic/block -- equality is exactly
+        // the associativity/commutativity claim for u64 sum and the assoc/comm claim for min/max.s32).
+        let host_oracle = |values: &[i32]| -> (u64, i64, i32, i32) {
+            let count = values.len() as u64;
+            let sum = values.iter().fold(0_i64, |acc, &v| acc.wrapping_add(i64::from(v)));
+            let min = values.iter().copied().min().unwrap_or(i32::MAX);
+            let max = values.iter().copied().max().unwrap_or(i32::MIN);
+            (count, sum, min, max)
+        };
+
+        let run = |values: &[i32]| -> ((u64, i64, i32, i32), (u64, i64, i32, i32)) {
+            let n = values.len() as u64;
+            // SAFETY: `i32` is POD; native (little-endian) bytes match the resident column layout, and
+            // `values` outlives the synchronous retain copy.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let allocated = std::mem::size_of::<u64>() as u64 + column_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated.max(std::mem::size_of::<u64>() as u64),
+                    &[
+                        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: std::mem::size_of::<u64>() as u64,
+                            bytes: column_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident column");
+            let off = std::mem::size_of::<u64>() as u64;
+
+            // NEW direct path.
+            let direct = resident
+                .scalar_stats_i32_from_payload(off, n)
+                .expect("direct scalar stats");
+
+            // OLD self-grouped path, reduced EXACTLY as the pre-75aeb493 engine arm did
+            // (group == value column == the SAME column, ALL mask). For the empty case the grouped
+            // path returns zero groups; the OLD engine mapped that to Text("")/Numeric(0). The NEW
+            // engine maps count==0 to NULL (SQL-spec correction), which is asserted at the ENGINE level
+            // elsewhere; here we A/B only the kernel TOTALS, defining the empty self-grouped totals the
+            // way the host oracle does (count 0, sum 0, min INT_MAX, max INT_MIN sentinels).
+            let grouped = resident
+                .grouped_stats_i32_from_payload(off, off, n, grouped_agg_mask::ALL)
+                .expect("self-grouped stats");
+            let g_count: u64 = grouped.iter().map(|g| g.count).sum();
+            let g_sum: i64 = grouped.iter().map(|g| g.sum).sum();
+            let g_min = grouped.iter().map(|g| g.min).min().unwrap_or(i32::MAX);
+            let g_max = grouped.iter().map(|g| g.max).max().unwrap_or(i32::MIN);
+            (direct, (g_count, g_sum, g_min, g_max))
+        };
+
+        let check = |values: &[i32], label: &str| {
+            let oracle = host_oracle(values);
+            let (direct, self_grouped) = run(values);
+            assert_eq!(
+                direct, oracle,
+                "DIRECT scalar_stats != host oracle for '{label}' (n={})",
+                values.len()
+            );
+            // For non-empty input the self-grouped totals must ALSO match (the A/B vs the OLD path).
+            if !values.is_empty() {
+                assert_eq!(
+                    direct, self_grouped,
+                    "DIRECT scalar_stats != reduced self-grouped (OLD path) for '{label}' (n={})",
+                    values.len()
+                );
+            }
+            // count must == rows on this unfiltered non-nullable path.
+            assert_eq!(direct.0, values.len() as u64, "count != rows for '{label}'");
+        };
+
+        // --- min/max NEW logic: sentinel-valued REAL data (must return i32::MIN/MAX, NOT confuse with
+        // the INT_MAX/INT_MIN init sentinels). ---
+        check(&[i32::MIN], "single i32::MIN as REAL min");
+        check(&[i32::MAX], "single i32::MAX as REAL max");
+        check(&[i32::MIN, i32::MAX], "both extremes");
+        check(&[i32::MAX, i32::MIN, 0, -1, 1], "extremes + small mixed");
+
+        // --- all-negative: a leaked INT_MAX min-sentinel or mis-init min=0 would surface (max must be
+        // negative; min must be the most-negative real value). ---
+        check(&[-1, -5, -100, -7, -3], "all-negative small");
+        check(&(1..=1000_i32).map(|i| -i).collect::<Vec<_>>(), "all-negative 1000 (-1..-1000)");
+        check(&[-42; 257], "all-equal negative, 257 (partial block, odd)");
+
+        // --- all-positive: a leaked INT_MIN max-sentinel or mis-init min=0 (would wrongly win the min
+        // of an all-positive column) would surface. ---
+        check(&[1, 5, 100, 7, 3], "all-positive small");
+        check(&(1..=1000_i32).collect::<Vec<_>>(), "all-positive 1000 (1..1000)");
+        check(&[42; 257], "all-equal positive, 257 (partial block, odd)");
+
+        // --- mixed-sign, duplicates, monotonic, single, all-equal. ---
+        check(&[7], "single positive");
+        check(&[-7], "single negative");
+        check(&[3, 3, 3, 3, 3], "all-equal");
+        check(&(-500..=500_i32).collect::<Vec<_>>(), "monotonic -500..500 (1001, odd)");
+        check(&(0..1024_i32).rev().collect::<Vec<_>>(), "monotonic decreasing 1023..0");
+        check(
+            &(0..777_u32).map(|i| i.wrapping_mul(2_654_435_761) as i32).collect::<Vec<_>>(),
+            "scrambled 777 (random-ish, odd, partial block)",
+        );
+
+        // --- sizes: < one block, exactly one block, partial last block, ODD, rows >> grid*block. ---
+        check(&(0..255_i32).collect::<Vec<_>>(), "255 (< one block)");
+        check(&(0..256_i32).collect::<Vec<_>>(), "256 (exactly one block)");
+        check(&(0..257_i32).collect::<Vec<_>>(), "257 (one over a block, partial)");
+        check(&(0..513_i32).collect::<Vec<_>>(), "513 (odd, two-block tail)");
+
+        // --- i64 SUM wrap: large negative partials forcing u64 wrap in the tree/atomics across
+        // hundreds of thousands of threads; == linear host wrapping_add oracle. Also exercises
+        // grid-stride wrap (> 1024*256 = 262144 threads). The min here is i32::MIN (a REAL extreme) and
+        // max is i32::MIN too (all equal), so a sentinel leak would surface alongside the wrap. ---
+        let neg_n = 2_000_003_usize; // > grid width, odd, partial tail
+        check(&vec![i32::MIN; neg_n], "2_000_003x i32::MIN (i64-wrap + grid-stride + sentinel min/max)");
+
+        // --- grid-stride wrap with large-magnitude alternating extremes (partial tail, odd). min must
+        // be i32::MIN and max i32::MAX -- both REAL extremes, scattered across many grid-stride iters. ---
+        let big: Vec<i32> = (0..4_000_001_u64)
+            .map(|i| if i % 2 == 0 { i32::MAX - (i % 17) as i32 } else { i32::MIN + (i % 13) as i32 })
+            .collect();
+        check(&big, "4_000_001 alternating near-extremes (grid-stride wrap, partial tail)");
+
+        // --- mixed positive grid-stride-wrap control (no high bit) with a single embedded extreme so
+        // min/max are determined by ONE row reached deep in a grid-stride iteration. ---
+        let mut spread: Vec<i32> = (0..3_000_007_u64).map(|i| (i % 100) as i32).collect();
+        spread[2_500_000] = i32::MAX; // a single real max buried mid-stream
+        spread[1_999_999] = i32::MIN; // a single real min buried mid-stream
+        check(&spread, "3M spread with single buried i32::MIN/MAX (grid-stride, partial tail)");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn gpu_pooled_i32_between_stats_matches_expected() {
         // P2-M2 — between-stats pooled launch-migration correctness gate (GPU-native oracle).
         // The kernel is unchanged (parallel grid-stride count/sum/min/max for the [lo,hi] predicate,
