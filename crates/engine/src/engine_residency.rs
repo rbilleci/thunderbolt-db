@@ -69,6 +69,14 @@ pub(crate) fn build_relational_device_payload_with_capacity(
             "resident payload capacity {capacity} is below the row count {row_count}"
         ))));
     }
+    // Defensive bound: `capacity` is engine-chosen (an open-shard size), never user input, but guard an
+    // absurd value that would pad/allocate a multi-GB payload (an allocation panic) rather than return a
+    // clean error — the read-offset helpers already use checked arithmetic.
+    if capacity > (1_usize << 31) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "resident payload capacity {capacity} is implausibly large"
+        ))));
+    }
     if capacity > row_count && column_types.iter().any(|ty| matches!(ty, SqlType::Text)) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "open-shard (capacity-padded) resident payload does not support variable-length text columns"
@@ -297,17 +305,70 @@ mod capacity_payload_tests {
             .collect()
     }
 
-    /// `capacity == row_count` must reproduce the dense builder BYTE-FOR-BYTE — that is what keeps the
-    /// unified-buffer / sealed-shard read path untouched while the capacity param exists.
+    /// NON-VACUOUS layout check across ALL section types (opus audit finding): the prior test compared
+    /// the delegating wrapper to `..._with_capacity(.., row_count)` — the SAME call — so it could never
+    /// fail, and it only used int4. This asserts the EXACT dense layout of a multi-type schema at 32 rows
+    /// (a 32-word bitmap boundary), so a wrong section size — e.g. a bitmap `div_ceil` regression — shifts
+    /// the total length / section offsets and is caught. (Text is omitted: it is data-dependent and
+    /// self-describing, and is covered by the null/text suites.)
     #[test]
-    fn capacity_equal_rowcount_is_byte_identical() {
-        let (names, types) = int4_cols();
-        let rows = int4_rows(5);
-        let dense = build_relational_device_payload(&names, &types, &rows).unwrap().0;
-        let capped = build_relational_device_payload_with_capacity(&names, &types, &rows, 5)
+    fn dense_multitype_payload_layout_is_exact() {
+        // Catalog order: id i32, maybe i32 (nullable), big i64, amt numeric (16B), flag bool.
+        let names: Vec<String> = ["id", "maybe", "big", "amt", "flag"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let types = vec![
+            SqlType::Int4,
+            SqlType::Int4,
+            SqlType::Int8,
+            SqlType::Numeric {
+                precision: 18,
+                scale: 0,
+            },
+            SqlType::Bool,
+        ];
+        let n = 32_usize; // capacity == row_count (dense / production path); crosses a 32-word boundary
+        let rows: Vec<Vec<SqlValue>> = (0..n as i64)
+            .map(|i| {
+                vec![
+                    SqlValue::Int4(i as i32),
+                    if i % 4 == 0 {
+                        SqlValue::Null
+                    } else {
+                        SqlValue::Int4(i as i32 * 2)
+                    },
+                    SqlValue::Int8(i * 1000),
+                    SqlValue::Numeric(gpu_db_sql::Decimal128::new(i as i128, 0)),
+                    SqlValue::Bool(i % 2 == 0),
+                ]
+            })
+            .collect();
+        let p = build_relational_device_payload_with_capacity(&names, &types, &rows, n)
             .unwrap()
             .0;
-        assert_eq!(dense, capped, "capacity==row_count must equal the dense build");
+        // Exact layout: header 8 | i32 x2 (n*4 each) | i64 (n*8) | 16B (n*16) | bool 1 word | null 1 word.
+        let words = n.div_ceil(32); // 1 at n=32; a div_ceil regression makes this 2 -> length changes
+        let i64_off = 8 + 2 * n * 4;
+        let b128_off = i64_off + n * 8;
+        let bool_off = b128_off + n * 16;
+        let null_off = bool_off + words * 4;
+        let expected_len = null_off + words * 4;
+        assert_eq!(p.len(), expected_len, "exact dense multi-type payload length");
+        assert_eq!(
+            u64::from_le_bytes(p[0..8].try_into().unwrap()),
+            n as u64,
+            "header = live row count"
+        );
+        // i64 section spot-check: row 5 = 5000.
+        let off = i64_off + 5 * 8;
+        assert_eq!(i64::from_le_bytes(p[off..off + 8].try_into().unwrap()), 5000);
+        // bool bitmap: row0 flag=true -> bit0 set; row1 flag=false -> bit1 clear.
+        let bool_word = u32::from_le_bytes(p[bool_off..bool_off + 4].try_into().unwrap());
+        assert_eq!(bool_word & 0b11, 0b01, "flag bits: row0 set, row1 clear");
+        // NULL validity bitmap (1 = present): row0=NULL -> bit0 clear; row1=present -> bit1 set.
+        let null_word = u32::from_le_bytes(p[null_off..null_off + 4].try_into().unwrap());
+        assert_eq!(null_word & 0b11, 0b10, "validity bits: row0 NULL, row1 present");
     }
 
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);

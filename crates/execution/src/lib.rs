@@ -1024,6 +1024,13 @@ impl CudaResidentDeviceMemory {
     /// shared primary context is made current on this thread first (mirrors `read_resident_i32_column`
     /// and `launch_cuda_resident_device_memory_owned_chunks`). No cached sync HtoD pointer exists
     /// (only the async one), so the sync entry point is resolved from the context's library.
+    ///
+    /// PARTIAL-FAILURE CONTRACT (no rollback): chunks are written in order; if a `cuMemcpyHtoD` fails
+    /// mid-list, the chunks already written STAY written and `Err` is returned with the allocation left
+    /// PARTIALLY MUTATED. A caller appending multiple column sections must therefore treat any non-`Ok`
+    /// return as "this shard is poisoned -- do NOT publish it; rebuild/drop it", and must not advance the
+    /// live row count (the header) until all column writes have landed (so a partial append can never
+    /// advertise rows whose column bytes are missing).
     pub fn append_owned_chunks<I>(&self, chunks: I) -> Result<u64, CudaRuntimeProbeError>
     where
         I: IntoIterator<Item = CudaOwnedDeviceMemoryChunk>,
@@ -1050,13 +1057,14 @@ impl CudaResidentDeviceMemory {
             if end > self.metadata.allocated_bytes {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(len));
             }
-            check_cuda(unsafe {
-                cu_memcpy_htod(
-                    self.device_ptr + chunk.byte_offset,
-                    chunk.bytes.as_ptr().cast::<c_void>(),
-                    len,
-                )
-            })?;
+            // checked_add on the destination address too (mirrors the launcher) — for an honestly-built
+            // allocation `byte_offset < allocated_bytes` so this cannot wrap, but guard against a
+            // debug-build panic / release-build silent wrap to a wrong device address.
+            let dst = self
+                .device_ptr
+                .checked_add(chunk.byte_offset)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            check_cuda(unsafe { cu_memcpy_htod(dst, chunk.bytes.as_ptr().cast::<c_void>(), len) })?;
             appended_bytes = appended_bytes
                 .checked_add(len as u64)
                 .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
