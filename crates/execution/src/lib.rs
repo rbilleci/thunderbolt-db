@@ -23566,6 +23566,72 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn open_shard_append_two_int4_columns_equals_full_build() {
+        // Slice 1a END-TO-END: build a 2-column i32 OPEN shard (capacity C, seeded with R rows in the
+        // capacity-padded layout: header + col0[C] + col1[C]), append K rows into the HEADROOM of both
+        // sections + bump the header, then read each column back at its capacity-based offset — the
+        // result must equal a fresh build of all R+K rows (incremental append == full rebuild).
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        let capacity = 8_usize;
+        let r = 3_usize; // seeded rows
+        let k = 2_usize; // appended rows
+        let header = 8_usize;
+        let col = capacity * 4; // bytes per capacity-padded i32 section
+        let allocated = (header + 2 * col) as u64;
+        // Padded initial buffer: header = R; col0 = ids 0..R then zero headroom; col1 = 0,10,20 then pad.
+        let mut init = vec![0_u8; header + 2 * col];
+        init[0..8].copy_from_slice(&(r as u64).to_le_bytes());
+        for row in 0..r {
+            init[header + row * 4..header + row * 4 + 4].copy_from_slice(&(row as i32).to_le_bytes());
+            init[header + col + row * 4..header + col + row * 4 + 4]
+                .copy_from_slice(&((row as i32) * 10).to_le_bytes());
+        }
+        let mem = runtime
+            .retain_device_memory_owned_chunks(
+                0,
+                allocated,
+                std::iter::once(CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: init,
+                }),
+            )
+            .expect("retain padded open shard");
+        // Append K rows (ids R..R+K, balances *10) into both section tails + bump the live-row header.
+        let new_ids: Vec<u8> = (r..r + k).flat_map(|row| (row as i32).to_le_bytes()).collect();
+        let new_bals: Vec<u8> = (r..r + k).flat_map(|row| ((row as i32) * 10).to_le_bytes()).collect();
+        mem.append_owned_chunks(vec![
+            CudaOwnedDeviceMemoryChunk {
+                byte_offset: 0,
+                bytes: ((r + k) as u64).to_le_bytes().to_vec(),
+            },
+            CudaOwnedDeviceMemoryChunk {
+                byte_offset: (header + r * 4) as u64,
+                bytes: new_ids,
+            },
+            CudaOwnedDeviceMemoryChunk {
+                byte_offset: (header + col + r * 4) as u64,
+                bytes: new_bals,
+            },
+        ])
+        .expect("append rows into open shard");
+        // Read each column back at its capacity-based offset — must equal a fresh full build of R+K rows.
+        let col0 = mem.read_resident_i32_column(header as u64, r + k).expect("read col0");
+        let col1 = mem
+            .read_resident_i32_column((header + col) as u64, r + k)
+            .expect("read col1");
+        assert_eq!(col0, (0..(r + k) as i32).collect::<Vec<i32>>(), "id column");
+        assert_eq!(
+            col1,
+            (0..(r + k) as i32).map(|i| i * 10).collect::<Vec<i32>>(),
+            "balance column"
+        );
+        // The 8-byte header now records R+K live rows.
+        let header_i32 = mem.read_resident_i32_column(0, 2).expect("read header");
+        assert_eq!(header_i32[0], (r + k) as i32, "header tracks the live row count");
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_index_probe_matches_equal_any_scan() {
         // R1a: the GPU index-probe point lookup must return EXACTLY the equal_any scan's rows.
         let runtime = CudaDriverRuntime::probe().expect("probe");
