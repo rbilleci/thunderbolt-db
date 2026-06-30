@@ -289,6 +289,77 @@ pub(crate) fn build_relational_device_payload_with_capacity(
     ))
 }
 
+/// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
+/// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
+/// slots. Each chunk lands EXACTLY where the capacity-aware read offsets expect it (column `c` at
+/// `8 + c*capacity*4`, row `r` at `+ r*4`), so feeding these to `append_owned_chunks` makes the open
+/// shard byte-identical to a full rebuild. The header (live row count) chunk is emitted LAST so a
+/// partial append (a mid-list CUDA failure) can never advertise rows whose column bytes are missing
+/// (the `append_owned_chunks` partial-failure contract).
+///
+/// Returns `Err` — the caller must fall back to a full re-admit — when the table is not all
+/// int4/date/int2 (this slice's open-shard append is fixed-width-i32 only; text/int8/numeric ride the
+/// re-admit path until later slices), and when `row_start + new_rows.len() > capacity` (the headroom is
+/// exhausted — the caller must seal this shard and roll a fresh open one).
+// Interim WIP (charter): a tested building block; the production caller is the commit/admit append
+// path wired in Slice 1b-ii-b (which removes this allow).
+#[allow(dead_code)]
+pub(crate) fn compute_open_shard_int4_append_chunks(
+    column_types: &[SqlType],
+    capacity: usize,
+    row_start: usize,
+    new_rows: &[Vec<SqlValue>],
+) -> Result<Vec<CudaOwnedDeviceMemoryChunk>, ExecuteError> {
+    let appended = new_rows.len();
+    let end = row_start.checked_add(appended).ok_or_else(|| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "open-shard append row index overflowed".to_string(),
+        ))
+    })?;
+    if end > capacity {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "open-shard append of {appended} rows at {row_start} exceeds capacity {capacity}"
+        ))));
+    }
+    if !column_types
+        .iter()
+        .all(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
+    {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "open-shard append supports int4/date/int2 columns only (this slice)".to_string(),
+        )));
+    }
+    let header_bytes = std::mem::size_of::<u64>();
+    let width = std::mem::size_of::<i32>();
+    // Column chunks FIRST, header LAST (the partial-failure contract: never advertise un-written rows).
+    let mut chunks = Vec::with_capacity(column_types.len() + 1);
+    for (col_idx, _ty) in column_types.iter().enumerate() {
+        let section_start = header_bytes + col_idx * capacity * width;
+        let byte_offset = (section_start + row_start * width) as u64;
+        let mut bytes = Vec::with_capacity(appended * width);
+        for row in new_rows {
+            let value: i32 = match row[col_idx] {
+                SqlValue::Int4(value) | SqlValue::Date(value) => value,
+                SqlValue::Int2(value) => i32::from(value),
+                // A NULL int4 materializes as 0 (the validity bitmap, a later slice, marks the row).
+                SqlValue::Null => 0,
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "open-shard int4 append encountered a non-i32 value".to_string(),
+                    )))
+                }
+            };
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
+    }
+    chunks.push(CudaOwnedDeviceMemoryChunk {
+        byte_offset: 0,
+        bytes: (end as u64).to_le_bytes().to_vec(),
+    });
+    Ok(chunks)
+}
+
 #[cfg(test)]
 mod capacity_payload_tests {
     use super::*;
@@ -422,6 +493,42 @@ mod capacity_payload_tests {
         // row_count, drives the stride (a row_count stride would give 32 for BOTH cases).
         let s3 = snapshot(3);
         assert_eq!(resident_device_int8_column_offset(&s3, &table, 2).unwrap(), 8 + 2 * 3 * 4);
+    }
+
+    /// 1b-ii: int4 open-shard append chunks land at the capacity-aware read offsets (column c at
+    /// `8 + c*capacity*4`, row r at `+ r*4`), header LAST (partial-failure contract), with eligibility
+    /// + capacity-overflow rejection (the full-rebuild fallback).
+    #[test]
+    fn open_shard_int4_append_chunks_match_capacity_layout() {
+        let types = vec![SqlType::Int4, SqlType::Int4]; // id, balance
+        let capacity = 8;
+        let row_start = 3;
+        let new_rows = vec![
+            vec![SqlValue::Int4(3), SqlValue::Int4(30)],
+            vec![SqlValue::Int4(4), SqlValue::Int4(40)],
+        ];
+        let chunks =
+            compute_open_shard_int4_append_chunks(&types, capacity, row_start, &new_rows).unwrap();
+        assert_eq!(chunks.len(), 3, "2 column chunks + 1 header chunk");
+        let le = |vals: &[i32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        // col0 (id): section 8 + 0*8*4 = 8; row 3 -> 8 + 3*4 = 20; bytes [3,4].
+        assert_eq!(chunks[0].byte_offset, 8 + 3 * 4);
+        assert_eq!(chunks[0].bytes, le(&[3, 4]));
+        // col1 (balance): section 8 + 1*8*4 = 40; row 3 -> 52; bytes [30,40].
+        assert_eq!(chunks[1].byte_offset, 8 + 8 * 4 + 3 * 4);
+        assert_eq!(chunks[1].bytes, le(&[30, 40]));
+        // header LAST: offset 0, live row count = row_start + 2 = 5.
+        assert_eq!(chunks[2].byte_offset, 0);
+        assert_eq!(chunks[2].bytes, 5_u64.to_le_bytes().to_vec());
+
+        // ineligible (text) -> Err (caller falls back to re-admit).
+        assert!(
+            compute_open_shard_int4_append_chunks(&[SqlType::Int4, SqlType::Text], capacity, 0, &[])
+                .is_err()
+        );
+        // capacity overflow -> Err (caller seals + rolls a new shard).
+        let two = vec![vec![SqlValue::Int4(0)], vec![SqlValue::Int4(1)]];
+        assert!(compute_open_shard_int4_append_chunks(&[SqlType::Int4], 4, 3, &two).is_err());
     }
 
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
