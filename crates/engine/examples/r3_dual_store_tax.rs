@@ -66,8 +66,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     println!();
-    println!("Reading: per-insert cost grows ~linearly with base_rows -> each single-row commit");
-    println!("re-uploads the whole table. This is the dual-store tax GPU-native incremental writes remove.");
+    println!("Reading: with the open-shard append (Slices 1b-ii-c/d) the per-insert COMMIT cost is now flat");
+    println!("in table size (~the control + a small segment term). The whole-table re-upload is gone.");
+    println!();
+
+    // The THIRD dual-store term (review-2 #1): with the GPU index probe ON, each commit INVALIDATES the
+    // wave index, so the NEXT read rebuilds it host-side (DtoH key column -> CPU hash -> HtoD) = O(table).
+    // The write-only tax above cannot see this; measure it explicitly (read-after-write).
+    println!("## read-after-write (index probe ON — each commit invalidates the GPU index; next read rebuilds it)");
+    println!("| base_rows | read_after_write_mean_us | read_after_write_max_us |");
+    println!("|---|---|---|");
+    for &base in &bases {
+        let (r_mean, r_max) = measure_read_after_write(base, timed)?;
+        println!("| {base} | {r_mean:.1} | {r_max:.1} |");
+    }
+    println!();
+    println!("Reading (MEASURED 16k/64k/256k ~= 114/122/133us, NEARLY FLAT): the index rebuild is O(table)");
+    println!("in principle but BANDWIDTH-BOUND + small (~tens of us even at 256k), masked by the ~100us fixed");
+    println!("point-read overhead -- NOT the O(table) blow-up review-2 #1 (term b) feared. So an INSERT");
+    println!("index-append (which needs an on-device insert kernel for true O(rows) -- the HtoD of a");
+    println!("hash-scattered table is itself O(table)) is a modest ~tens-of-us win = LOW priority; the index");
+    println!("probe is default-OFF anyway, and read-after-write here is not an extra scan cost. Measure-first");
+    println!("(this probe) avoided a premature on-device-kernel optimization.");
     Ok(())
 }
 
@@ -114,6 +134,66 @@ fn measure_resident(base: i64, timed: usize) -> Result<(f64, f64, f64), Box<dyn 
     let mean = samples_us.iter().sum::<f64>() / samples_us.len().max(1) as f64;
     let max = samples_us.iter().cloned().fold(0.0_f64, f64::max);
     Ok((admit_ms, mean, max))
+}
+
+/// With the GPU index probe ON, time a point-lookup READ after each single-row INSERT. Each INSERT commit
+/// invalidates the wave index (Finding A), so the next read rebuilds it host-side (DtoH key column -> CPU
+/// hash -> HtoD) = O(table). Surfaces the read-after-write index term (review-2 #1) the write-only tax
+/// cannot. Returns (read_mean_us, read_max_us).
+fn measure_read_after_write(base: i64, timed: usize) -> Result<(f64, f64), Box<dyn Error>> {
+    let mut engine = Engine::new_local();
+    engine.set_auto_admit_on_commit(false);
+    engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
+    let mut txn = 2u64;
+    let mut id = 0i64;
+    while id < base {
+        let mut vals = String::new();
+        for _ in 0..INSERT_CHUNK {
+            if id >= base {
+                break;
+            }
+            if !vals.is_empty() {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
+            id += 1;
+        }
+        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        txn += 1;
+    }
+    engine.populate_relational_residency_snapshot("accounts")?;
+    engine.set_auto_admit_on_commit(true);
+    engine.set_index_probe_enabled(true);
+
+    // Warm the CUDA index-buffer alloc path (the first index build is a cold-start outlier otherwise).
+    {
+        let warm = base + 1_000_000;
+        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES ({warm}, {warm})"))?;
+        txn += 1;
+        let _ = engine.execute_relational_select_text(&format!(
+            "SELECT id, balance FROM accounts WHERE id = {}",
+            base / 2
+        ))?;
+    }
+
+    let mut samples_us = Vec::with_capacity(timed);
+    for i in 0..timed {
+        let id = base + i as i64;
+        // Commit (invalidates the index) ...
+        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES ({id}, {id})"))?;
+        txn += 1;
+        // ... then a point lookup of an EXISTING unique key -> index rebuild (O(table)) + probe.
+        let needle = id / 2;
+        let start = Instant::now();
+        let _ = engine
+            .execute_relational_select_text(&format!(
+                "SELECT id, balance FROM accounts WHERE id = {needle}"
+            ))?;
+        samples_us.push(start.elapsed().as_secs_f64() * 1e6);
+    }
+    let mean = samples_us.iter().sum::<f64>() / samples_us.len().max(1) as f64;
+    let max = samples_us.iter().cloned().fold(0.0_f64, f64::max);
+    Ok((mean, max))
 }
 
 /// `timed` single-row INSERTs with no residency and auto-admit OFF (the O(1) control). Mean us/insert.
