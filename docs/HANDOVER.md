@@ -17,8 +17,9 @@ edge is no longer hidden — the kernel decision is on strong numbers.** **LAST 
 instrumentation found the engine overhead was NOT lpb's round-trips but the assembly's O(n log n) sort (~80% of it);
 replaced with an O(n) counting-sort scatter -> lpb-batched 11M->14.6M (+32%), and wave/lpb dropped 1.76x->1.33x@b65536
 /1.21x@b4096 = CONVERGING ON THE TRUE RAW GPU RATIO (1.26x): BOTH ROUTES NOW AT THEIR DRAINS, the read-path ratio is
-HONEST. Audit SHIP; a CPU unit test now proves the within-needle sort necessary (P3). (Caveat: lpb b65536 p99 ~30ms
-tail, lpb-path only, not the wave; marginal levers left = members ~360us + flatten ~240us, don't change the ratio.) THE
+HONEST. Audit SHIP; a CPU unit test now proves the within-needle sort necessary (P3). (The lpb b65536 p99 ~30ms tail
+flagged here was SUBSEQUENTLY FIXED by the columnar batched result `10c724e6` + slim-submission `ec4b1a8c` + dense
+default; MEASURED 2026-06-30: lpb-DENSE-batched b65536 p50=411us p99=476us max=510us, 121.6M lookups/s, 4.17x scan.) THE
 READ PATH IS NOW SETTLED END-TO-END.** R2.2b-3's A/B still stands: **the wave is a STRICT WIN
 (throughput + latency) for the single-coalescer point-read regime — 2.45x lpb @batch=1 down to 1.02x @batch=4096 — but
 the DEFAULT FLIP is GATED on two R2.2c architectural unlocks.** Keep R1 lpb the default until they clear. The fork:

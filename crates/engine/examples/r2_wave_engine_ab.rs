@@ -16,7 +16,7 @@
 //! win).
 //!
 //! Env: GPU_DB_BENCH_ROWS (single table size, default 1048576 — lpb-vs-scan; both index probes are
-//! O(1)/needle), GPU_DB_BENCH_BATCH (comma-separated batch sizes to sweep, default "1,8,32,256,4096"),
+//! O(1)/needle), GPU_DB_BENCH_BATCH (comma-separated batch sizes to sweep, default "1,8,32,256,4096,16384,65536"),
 //! GPU_DB_BENCH_BATCHES (measured batches/mode, default 2000), GPU_DB_BENCH_WARMUP (untimed warmup
 //! batches/mode, default 20 — lpb builds the index), GPU_DB_BENCH_THREADS (concurrent section thread
 //! counts, default "1,2,4,8"; "" disables it).
@@ -346,7 +346,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(1_048_576);
     let batch_sizes = {
         let v = parse_csv_usize(
-            &env::var("GPU_DB_BENCH_BATCH").unwrap_or_else(|_| "1,8,32,256,4096".to_string()),
+            &env::var("GPU_DB_BENCH_BATCH").unwrap_or_else(|_| "1,8,32,256,4096,16384,65536".to_string()),
         );
         if v.is_empty() {
             vec![256]
