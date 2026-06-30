@@ -1,4 +1,4 @@
-# Proposal: GPU-native writes (delta/undo MVCC, incremental, on-device)
+# Proposal: GPU-native writes — storage + durability half of R3 (delta/undo MVCC, incremental, on-device)
 
 > **Status: PROPOSAL (not accepted) — drafted 2026-06-30, revised 2026-06-30 to a DELTA/UNDO
 > version-storage model** (latest version in place + out-of-line version deltas). An append-only
@@ -9,6 +9,39 @@
 > on `main` (`87c326bb`) + an independent MVCC/residency audit (file:line inline); the comparative
 > version-storage claims about other databases are sourced from a deep-research pass (citations inline:
 > CMU/Peloton survey PVLDB 10(7) 2017; HyPer SIGMOD 2015; PostgreSQL/MySQL/Oracle docs; Hekaton PVLDB 2012).
+>
+> **Revised 2026-06-30 (round-2) per the round-1 design review (`gpu-native-writes-review-1.md`):**
+> UPDATE changed from in-place patch to copy-on-write (review Finding 3 — torn-row hazard, the substantive
+> fix); read-after-write index-rebuild cost + the host-mirror tax folded into the slice gates (Finding 4);
+> scope clarified below (Findings 1/2); single-row latency floor + int4-only scope + epoch handling stated
+> (Finding 5 + minor notes).
+
+## SCOPE (what this proposal is, and is NOT)
+
+This is the **write data-plane: storage + durability** half of R3. It eliminates the dual-store tax
+(O(table) re-upload per commit) and makes the GPU the durable-reconstructible source of write state.
+
+**NOT in scope here (sibling proposal, R3's other half — concurrency control + write throughput):** the
+deterministic CC spine (ADR-009 Calvin-style determinism + MV-dependency-graph execution, DECISIONS ADR)
+and the **100k sustained / 400k peak TPS SLO** (DECISIONS) that R3 was chartered to hit. The serial
+`commit_seq`-under-commit-lock model is *assumed* here (it is today's path); whether that lock is a
+concurrent-commit throughput ceiling — the single-coalescer trap the read path hit — is **not answered by
+this doc**. Storage-first is the correct order: concurrent write throughput cannot be achieved *or even
+meaningfully benchmarked* while every commit is O(table). Once the data plane is flat (Slice 1b+), a
+**concurrent-commit throughput benchmark** (write-side analog of `r2_wave_engine_ab`) and the CC design
+become the next, separate work — tracked as a gate in the Slice plan, not as a Slice-1 gate.
+
+**Type/shape scope.** Incremental writes apply only to **resident-supported fixed-width types** (int4 /
+date / int2 today; text in progress). Tables with bigint / uuid / numeric (see
+`non-int4-point-lookup-index.md`), and any row carrying a NULL into a bitmap-free shard, stay on the host
+write path (full re-admit) until residency + the validity-bitmap-on-append cover them. So "retire the host
+store" means "for resident-supported tables."
+
+**Latency vs throughput (the read-path lesson, review Finding 5).** "O(rows-touched)" is asymptotic; a
+*single-row* commit's constant is the GPU round-trip + on-device apply (~tens of us — the same GPU
+round-trip floor reads pay), so single-row-commit *latency* will not beat a CPU row store. The win, exactly
+as for reads, is **batched / group-commit THROUGHPUT**. Pair every write benchmark line with both latency
+and throughput; do not expect sub-us single-row commits.
 
 ## Starting context (read FIRST)
 
@@ -107,9 +140,10 @@ rejected.
 
 ## The optimal target (define this BEFORE any slice)
 
-**A GPU-resident, latest-version-in-place columnar hot store + an out-of-line version-delta (undo) store,
-mutated incrementally on commit, with on-device visibility only on the rare old-snapshot path. Host =
-control plane only.** Concretely:
+**A GPU-resident, latest-version columnar hot store (the latest version is dense + resident — placed by
+append / copy-on-write, NOT patched in its old slot) + an out-of-line version-delta (undo) store, mutated
+incrementally on commit, with on-device visibility only on the rare old-snapshot path. Host = control plane
+only.** Concretely:
 
 1. **Hot store = a SEGMENTED columnar layout: a sequence of immutable *sealed* shards + one bounded *open*
    (active) shard** — NOT a unified buffer (ADR-012 retires that). Within a shard, columns are dense and
@@ -131,18 +165,33 @@ control plane only.** Concretely:
    per-row visibility predicate** → the settled read path is unchanged. **Reads at an older `read_txn_id`**
    reconstruct only the rows whose `created_by > read_txn_id` by walking their undo reference; unchanged
    rows are read directly.
-4. **Incremental writes on commit** (answers "are UPDATE/DELETE incremental, and how"):
-   - **INSERT** → append a hot slot `{values, created_by = commit_seq}`. O(rows inserted).
-   - **DELETE** → capture the before-image to undo + tombstone the hot slot (deleting `commit_seq`).
-     O(rows deleted).
-   - **UPDATE** → capture the before-image (changed columns) to undo + **patch the hot slot in place** to
-     the new values, advancing `created_by`. O(rows updated).
+4. **Incremental writes on commit** (answers "are UPDATE/DELETE incremental, and how").
+   **All three are copy-on-write with respect to existing slots** — they only *append* into open-shard
+   headroom or flip out-of-line tombstone metadata; they **never patch the bytes of a slot a reader may be
+   reading.** This is forced by the read model: latest reads are lock-free and **predicate-free** (raw byte
+   reads — the 121.6M-lookups/s win) and run concurrently with commits, so an in-place multi-column patch is
+   N separate device stores a concurrent reader can observe half-applied = a **torn row** (review Finding 3).
+   The shipped INSERT-append is safe for exactly this reason: it writes only unread headroom slots and bumps
+   the live row count last. (HyPer patches latest-in-place because CPU readers latch; the GPU's latch-free
+   predicate-free reader cannot — so the GPU adaptation of delta/undo is COW *placement* of the new version,
+   not an in-place patch.)
+   - **INSERT** → append a hot slot `{values, created_by = commit_seq}` into open-shard headroom. O(rows).
+   - **DELETE** → capture the before-image to undo + set the row's **out-of-line tombstone** (a per-shard
+     deleted-bitmap / `deleted_by` side-structure, NOT a write into the column bytes). O(rows deleted).
+   - **UPDATE** → **append the new version to the open shard** (`created_by = commit_seq`), set the old
+     row's out-of-line tombstone, capture its before-image to undo, and repoint the index to the new slot.
+     Copy-on-write: the old slot stays byte-intact for older-snapshot readers (it *is* the undo
+     before-image) and no live slot is mutated, so there is no torn-row window. O(rows updated).
    None are O(table); the full re-admit is deleted from the commit path. Writes target the **open shard**;
-   a sealed shard is immutable except by vacuum/merge, so an UPDATE/DELETE to a sealed-shard row stamps its
-   `deleted_by` in place and (for UPDATE) appends the new version to the open shard. **Write delivery** uses
-   the wave engine's host-pinned lock-free ring (ADR-009): the host enqueues mutation intents in
-   `commit_seq` order and a persistent kernel drains the ring and applies them to the open shard on-device —
-   segmented shards are the *storage*, the wave ring is the *delivery*.
+   **sealed shards are TRULY immutable** — their column bytes are never written after sealing. An
+   UPDATE/DELETE to a sealed-shard row records its tombstone in that shard's out-of-line deleted-structure
+   (and, for UPDATE, appends the new version to the open shard); the sealed column data is untouched, so the
+   immutability invariant the read path + zone maps rely on holds. Vacuum/merge (Slice 5) reclaims
+   tombstoned space by *rebuilding* a shard, never by in-place edits. **Write delivery** may use the wave
+   engine's host-pinned lock-free ring (ADR-009) — host enqueues mutation intents in `commit_seq` order, a
+   persistent kernel drains + applies on-device — OR a direct synchronous append in the commit path (what
+   Slice 1b ships today); the storage model (segmented shards + out-of-line tombstones) is independent of
+   the delivery mechanism.
 5. **Device-side vacuum/GC** = prune undo entries + reclaim tombstoned slots below the oldest active reader
    snapshot (GPU analog of `prune_versions_deleted_at_or_before`, guarded as `checkpoint_vacuum_mvcc_versions`,
    `engine_introspection.rs:119`). Off the hot path.
@@ -167,8 +216,13 @@ hot row, **bounded** — no dead versions) vs append-only +16 B **and growing**.
 InnoDB's delta/undo inline cost is **13 B** (`DB_TRX_ID` 6 + `DB_ROLL_PTR` 7); PostgreSQL's append-only
 cost is a **23–24 B header per version** + dead-version accumulation. Our target can sit *below* InnoDB's
 13 B because the resident slot position can serve as the undo reference (no explicit roll pointer needed).
-(Rebasing = stamps as a delta from a per-shard checkpoint base, à la PostgreSQL's 32-bit `xmin`/`xmax`;
-exact sizing decided by measurement, ADR-009.)
+(Rebasing = stamps as a 32-bit delta from a per-shard checkpoint base, à la PostgreSQL's 32-bit
+`xmin`/`xmax`; exact sizing decided by measurement, ADR-009. **Wraparound (review minor note):** a bounded
+open shard commits far fewer than 2^32 versions before it seals, and sealing snapshots a fresh per-shard
+base, so the 32-bit delta cannot wrap within a live shard. A per-shard **epoch** = the base's absolute
+`commit_seq`; the full cross-shard / cross-checkpoint ordering is the pair **(epoch, delta)**, never the
+bare 32-bit value. This sidesteps PostgreSQL's global-XID-wraparound-vacuum problem entirely — there is no
+global 32-bit counter to exhaust.)
 
 ## Durability & recovery (production-grade)
 
@@ -182,7 +236,8 @@ NVMe**. This is unchanged from today and is the backbone; the GPU-native target 
 1. assign `commit_seq` (the deterministic log order, ADR-009);
 2. append the mutation intent to the WAL + **fsync (group commit)** — `wal.flush_all()` (`:170`). **This is
    the durability point:** the commit is durable once fsync returns, independent of the GPU.
-3. apply to the GPU data plane (append / patch / capture-undo);
+3. apply to the GPU data plane (append new version / set out-of-line tombstone / capture-undo —
+   copy-on-write, no in-place slot patch);
 4. **publish `committed_seq`** (`:222`) — the visibility point.
 
 fsync precedes visibility (**WAL-before-visibility** — a reader never observes an un-durable write). A crash
@@ -241,17 +296,32 @@ them. Each slice is a strict step toward the optimal target.
     a target size; reads go through the existing push-down-to-shard + combine path. Introduce the inline
     `created_by` stamp. Gate: byte-identical to the unified-buffer reads + **no read regression** on
     `r2_wave_engine_ab`.
-  - **1b — Route INSERT-only commits to append.** On an INSERT-only commit to a fixed-width table, append to
-    the open shard (O(rows)) instead of full re-admit; UPDATE/DELETE/text fall back to re-admit. Index:
-    invalidate → lazy rebuild (incremental index = Slice 5). Gate: incremental == full-rebuild; the
-    dual-store-tax benchmark goes flat for INSERT.
+  - **1b — Route INSERT-only commits to append.** On an INSERT-only commit to a fixed-width int4 table,
+    append to the open shard (O(rows)) instead of full re-admit; UPDATE/DELETE/text/**NULL-row** fall back
+    to re-admit. Index: invalidate → lazy rebuild (incremental index = Slice 5). Gate: incremental ==
+    full-rebuild, **read through the DEVICE route** (a host-store differential is vacuous — both sides read
+    the same store); dual-store-tax benchmark flat for the DEVICE write. **The gate must also account for the
+    two remaining O(table)-per-commit sources or the "flat" claim is incomplete:** (i) **read-after-write** —
+    the index invalidate → lazy rebuild is O(table) on the next read when the index probe is enabled (review
+    Finding 4); measure it, or state read-after-write stays O(table) until Slice 5; (ii) **host mirror** —
+    `host_rows` is still cloned O(table) per commit (`Arc::make_mut` extend; proven — skipping it makes the
+    tax flat ~40us, keeping it gives 723us@16k), so per-commit cost is host-bound until a structural-shared /
+    sealed+open host-row representation (host analog of the open-shard append) or Slice 7 (retire the host
+    store).
+    *[STATUS 2026-06-30: 1a + 1b-i (capacity-aware reads) + 1b-ii-a (append-chunk computation) + 1b-ii-c
+    (append wired into the SERIALIZED commit path) SHIPPED to main — device re-upload eliminated, tax
+    5774→723us@16k; the host_rows residual is the next slice.]*
   - **1c — Old-snapshot visibility.** Latest reads still pay nothing; old-snapshot reads skip rows with
     `created_by > read_txn_id` (per-shard, cheap). Gate: old-snapshot read == host MVCC.
 - **Slice 2 — Version-delta (undo) store + old-snapshot reconstruction.** The out-of-line before-image
   structure + the reconstruction read path. Foundation for UPDATE/DELETE.
 - **Slice 3 — Incremental DELETE.** Capture before-image to undo + tombstone the hot slot.
-- **Slice 4 — Incremental UPDATE.** Capture before-image (changed columns) to undo + patch the hot slot
-  in place.
+- **Slice 4 — Incremental UPDATE (copy-on-write).** Append the new version to the open shard
+  (`created_by = commit_seq`) + set the old slot's out-of-line tombstone + capture its before-image to undo
+  + repoint the index to the new slot. **NO in-place patch of a live slot** (review Finding 3: a multi-column
+  in-place patch is a torn-row hazard against the lock-free, predicate-free latest-reader). Gate adds: a
+  HAZARD test with a concurrent latest-reader during a multi-column UPDATE must observe only whole rows
+  (never col-A-new/col-B-old).
 - **Slice 5 — Device vacuum/GC + incremental index maintenance.** Prune undo + reclaim tombstones below
   the oldest active snapshot; keep the index current without an O(table) rebuild.
 - **Slice 6 — GPU-state checkpoint (GDS) + WAL-replay-into-GPU recovery.** Add the GPU-state checkpoint
@@ -261,7 +331,10 @@ them. Each slice is a strict step toward the optimal target.
   RTO budget. Nothing about retiring the host store may proceed until this is green.
 - **Slice 7 — Retire the host MVCC store for resident tables.** Now safe (GPU-side durability proven
   equivalent to today's host-store recovery). The host keeps WAL + checkpoint orchestration + catalog; the
-  in-memory row mirror is deleted. Closes "host out of the data path" (S10d/S-F) for the write side.
+  in-memory row mirror is deleted. Closes "host out of the data path" (S10d/S-F) for the write side, and
+  finally removes the host-mirror O(table) clone (the Slice 1b residual). **Point of no return — gated on an
+  independent adversarial DESIGN review (not just the per-slice code/residency audit) before it proceeds
+  (review-1 minor note); round-1 is not a substitute.**
 
 Mixed/unsupported commits fall back to the full re-admit, with a non-vacuity counter so a silent
 always-fallback can't pass the gates (the wave faked-throughput lesson).
@@ -274,9 +347,13 @@ always-fallback can't pass the gates (the wave faked-throughput lesson).
   would instead tax *every* read — the deliberate trade.)
 - **Undo store placement + GC.** Device region vs host-cold (ADR-012); GC cadence below the oldest active
   snapshot; device memory pressure from undo accumulation against the STRATA byte budget.
-- **In-place patch + publish ordering.** The hot-slot patch + before-image capture must be atomic w.r.t.
-  the `committed_seq` publish so a reader never sees a torn slot or a missing undo entry. The creator stamp
-  keeps a not-yet-published row invisible to older snapshots.
+- **COW publish ordering (was: in-place patch).** UPDATE is now copy-on-write (append-new-version +
+  out-of-line tombstone, NOT an in-place patch — review Finding 3), so the torn-slot hazard is **designed
+  out**: no live slot is ever mutated. What remains is publish ordering — the new version's append, the old
+  row's tombstone, and the undo capture must become visible atomically at the `committed_seq` publish (new
+  version invisible / tombstone not yet applied until publish), exactly like the shipped INSERT-append
+  (write headroom, bump the live count last). A single-column UPDATE *could* be an atomic 4 B in-place
+  store, but the design uses COW uniformly to keep a single safe path.
 - **Old-snapshot index probe contract.** key → latest slot is trivial for latest reads; an old-snapshot
   point lookup on a since-updated row must reconstruct via undo — define this probe contract.
 - **Recovery (RTO)** must hit CHARTER's < 5 min full GPU recovery; checkpoints (ADR-009, GDS) bound replay.
@@ -286,14 +363,22 @@ always-fallback can't pass the gates (the wave faked-throughput lesson).
 
 ## Validation
 
-Byte-identical differentials per the project standard: (a) **latest-snapshot resident read == hot image ==
-host MVCC** at `committed_seq`; (b) **old-snapshot resident read (via undo reconstruction) == host MVCC**
-at that `read_txn_id`; (c) **incremental hot+undo state == full-rebuild snapshot** — across insert /
-update / delete / multi-row / multi-version / NULL / NULL-as-0 / vacuum, plus facade + protocol
-byte-identity, plus a non-vacuity route-hit assertion. HAZARD (3× sequential + 2× concurrent, zero CUDA
-700/716/717). The dual-store-tax benchmark must show per-write cost **flat regardless of table size**, AND
-the read-path benchmark must show **no latest-snapshot regression**. Independent adversarial audit per
-slice (never self-audit; prove non-vacuity by sabotage).
+Byte-identical differentials per the project standard, **read through the DEVICE route** (a host-store
+differential is vacuous — both sides read the same store; the read must hit the resident buffer + index):
+(a) **latest-snapshot resident read == hot image == host MVCC** at `committed_seq`; (b) **old-snapshot
+resident read (via undo reconstruction) == host MVCC** at that `read_txn_id`; (c) **incremental hot+undo
+state == full-rebuild snapshot** — across insert / update / delete / multi-row / multi-version / NULL /
+NULL-as-0 / vacuum, plus facade + protocol byte-identity, plus a **non-vacuity route-hit counter** (proves
+the append/COW actually fired, not a silent always-fallback — the wave faked-throughput lesson). HAZARD
+(3× sequential + 2× concurrent, zero CUDA 700/716/717), **including a concurrent latest-reader during a
+multi-column UPDATE — it must observe only whole rows, never col-A-new/col-B-old (the COW torn-row gate,
+Finding 3).** The dual-store-tax benchmark must show per-write cost **flat regardless of table size —
+counting ALL O(table) sources (the device write AND the read-after-write index rebuild AND the host-mirror
+clone), not the device write in isolation** — AND the read-path benchmark must show **no latest-snapshot
+regression**. **Concurrent-commit throughput (R3's other half) is a SEPARATE, later gate** — a write-side
+analog of `r2_wave_engine_ab` measuring sustained/peak commit TPS against the SLO — added once the data
+plane is flat; it is explicitly NOT a Slice-1 gate. Independent adversarial audit per slice (never
+self-audit; prove non-vacuity by sabotage).
 
 ## Bottom line
 
@@ -301,7 +386,7 @@ The dual-store tax (260× at 16k rows, O(table) per commit) is the write-side of
 path." The optimal target is the **delta/undo** model — latest version dense in place + out-of-line
 version deltas — **not** append-only inline-stamps: it keeps the hot columns dense, the settled
 latest-read path predicate-free, and the index single-version, while making INSERT=append,
-DELETE=tombstone+undo, UPDATE=patch+undo all O(rows touched). It is what the most sophisticated
+DELETE=tombstone+undo, UPDATE=append-new-version+tombstone+undo (copy-on-write) all O(rows touched). It is what the most sophisticated
 main-memory column stores (HyPer/Umbra) and classic engines (Oracle/InnoDB) do. The first slice
 (incremental INSERT) introduces only the inline creator stamp the full target needs — no throwaway — and
 adds zero cost to latest-snapshot reads. This converts a GPU-resident table from un-writable-row-by-row to
