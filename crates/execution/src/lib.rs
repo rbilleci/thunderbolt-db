@@ -1014,6 +1014,56 @@ impl CudaResidentDeviceMemory {
         Ok(out)
     }
 
+    /// Slice 1a (GPU-native writes): append `chunks` IN PLACE into this allocation's headroom — one
+    /// `cuMemcpyHtoD` to `device_ptr + byte_offset` per chunk, with NO reallocation and NO
+    /// device-to-device recompaction, so an OPEN shard grows without re-uploading the rows it already
+    /// holds (the whole point — the dual-store tax was a full re-upload per commit). Each chunk must
+    /// fit within `allocated_bytes` (the headroom reserved at admission); a chunk that would overrun
+    /// the allocation is rejected (the caller must roll over to a fresh shard instead). Returns the
+    /// total bytes written (the caller advances the shard's `resident_bytes` / `row_count`). The
+    /// shared primary context is made current on this thread first (mirrors `read_resident_i32_column`
+    /// and `launch_cuda_resident_device_memory_owned_chunks`). No cached sync HtoD pointer exists
+    /// (only the async one), so the sync entry point is resolved from the context's library.
+    pub fn append_owned_chunks<I>(&self, chunks: I) -> Result<u64, CudaRuntimeProbeError>
+    where
+        I: IntoIterator<Item = CudaOwnedDeviceMemoryChunk>,
+    {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        self.primary.set_current()?;
+        let cu_memcpy_htod = unsafe {
+            *self
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| self.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let mut appended_bytes = 0_u64;
+        for chunk in chunks {
+            if chunk.bytes.is_empty() {
+                continue;
+            }
+            let len = chunk.bytes.len();
+            let end = chunk
+                .byte_offset
+                .checked_add(len as u64)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if end > self.metadata.allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(len));
+            }
+            check_cuda(unsafe {
+                cu_memcpy_htod(
+                    self.device_ptr + chunk.byte_offset,
+                    chunk.bytes.as_ptr().cast::<c_void>(),
+                    len,
+                )
+            })?;
+            appended_bytes = appended_bytes
+                .checked_add(len as u64)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        }
+        Ok(appended_bytes)
+    }
+
     pub fn context(&self) -> *mut c_void {
         self.primary.context()
     }
@@ -23469,6 +23519,49 @@ mod tests {
         let runtime = CudaDriverRuntime::probe().unwrap();
 
         assert_eq!(runtime.launch_smoke_add_one(41).unwrap(), 42);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn append_owned_chunks_into_headroom_equals_a_fresh_upload() {
+        // Slice 1a: appending rows IN PLACE into an open shard's headroom must produce byte-identical
+        // device contents to a single fresh upload of the whole column — that equality is what lets us
+        // replace the full re-admit (the dual-store tax) with an O(rows-appended) write.
+        let runtime = CudaDriverRuntime::probe().expect("probe");
+        // Allocate with HEADROOM: room for 16 i32 (64 bytes); seed the first 8.
+        let allocated_bytes = 64_u64;
+        let seed: Vec<i32> = (0..8).collect();
+        let seed_bytes: Vec<u8> = seed.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mem = runtime
+            .retain_device_memory_owned_chunks(
+                0,
+                allocated_bytes,
+                std::iter::once(CudaOwnedDeviceMemoryChunk {
+                    byte_offset: 0,
+                    bytes: seed_bytes,
+                }),
+            )
+            .expect("retain with headroom");
+        // Append the next 4 i32 in place at the tail (offset 8*4 = 32) — no realloc.
+        let tail: Vec<i32> = (8..12).collect();
+        let tail_bytes: Vec<u8> = tail.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let appended = mem
+            .append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+                byte_offset: 32,
+                bytes: tail_bytes.clone(),
+            }))
+            .expect("append into headroom");
+        assert_eq!(appended, tail_bytes.len() as u64);
+        // The 12 i32 read back must equal a fresh full upload of 0..12 (non-vacuous: seed=0..8,
+        // appended=8..12, so a wrong offset/contents would corrupt the join).
+        let read = mem.read_resident_i32_column(0, 12).expect("read back");
+        assert_eq!(read, (0..12).collect::<Vec<i32>>(), "append must equal a fresh upload");
+        // A chunk that would overrun the allocation is REJECTED (caller must roll over to a new shard).
+        let overrun = mem.append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
+            byte_offset: 60,
+            bytes: vec![0_u8; 8],
+        }));
+        assert!(overrun.is_err(), "a chunk overrunning allocated_bytes must be rejected");
     }
 
     #[test]
