@@ -395,12 +395,44 @@ pub struct RelationalResidencySnapshot {
 /// (every invalidation / DDL) -- bumps a refcount instead of deep-copying the rows. The GPU executor
 /// reads only `descriptor`; the CPU / enumerated paths read `host_rows`. Keeping the host copy (the
 /// charter's "CPU materialization = debt") off the device read path AND independently shareable is the
-/// architectural point: `relational_residency_snapshot_ref` returns the descriptor;
-/// `relational_residency_host_rows` returns the rows.
+/// architectural point. Fetch the published pair via `relational_residency_entry`; read the rows via
+/// [`RelationalResidencyEntry::host_rows_iter`] / [`RelationalResidencyEntry::host_row_count`] (the host
+/// rows are SEGMENTED — Slice 1b-ii-d — so callers must not assume one contiguous vec).
+/// A host-row materialization SEGMENT — an immutable, `Arc`-shared batch of rows. The entry holds a
+/// *sequence* of these (Slice 1b-ii-d) so an INSERT commit can APPEND a new segment — O(rows appended)
+/// plus a tiny num-segments pointer clone — instead of deep-cloning the whole row vec (O(table), which was
+/// the dual-store tax's host-side residual). Re-admit folds back to a single segment.
+pub type HostRowSegment = std::sync::Arc<Vec<Vec<SqlValue>>>;
+
 #[derive(Debug, Clone)]
 pub struct RelationalResidencyEntry {
     pub descriptor: std::sync::Arc<RelationalResidencySnapshot>,
-    pub host_rows: std::sync::Arc<Vec<Vec<SqlValue>>>,
+    /// Host rows as a sequence of immutable Arc'd segments (append-friendly; see [`HostRowSegment`]).
+    /// Read via [`Self::host_rows_iter`] / [`Self::host_row_count`] — callers should not assume one segment.
+    pub host_rows: std::sync::Arc<Vec<HostRowSegment>>,
+}
+
+impl RelationalResidencyEntry {
+    /// Build the dense single-segment entry (the admit / transient case) from a flat row vec.
+    pub fn from_dense_host_rows(
+        descriptor: std::sync::Arc<RelationalResidencySnapshot>,
+        host_rows: Vec<Vec<SqlValue>>,
+    ) -> Self {
+        Self {
+            descriptor,
+            host_rows: std::sync::Arc::new(vec![std::sync::Arc::new(host_rows)]),
+        }
+    }
+
+    /// Total host row count (sum over segments) — what the CPU / enumerated paths see.
+    pub fn host_row_count(&self) -> usize {
+        self.host_rows.iter().map(|seg| seg.len()).sum()
+    }
+
+    /// Iterate host rows in stored (append / TupleId-ascending) order across all segments.
+    pub fn host_rows_iter(&self) -> impl Iterator<Item = &Vec<SqlValue>> {
+        self.host_rows.iter().flat_map(|seg| seg.iter())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

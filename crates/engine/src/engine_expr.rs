@@ -2433,10 +2433,10 @@ impl Engine {
             Some(rows) => {
                 let (snapshot, memory) = self.build_transient_relation_residency(table, &rows)?;
                 let row_count = rows.len();
-                let entry = RelationalResidencyEntry {
-                    descriptor: std::sync::Arc::new(snapshot),
-                    host_rows: std::sync::Arc::new(rows),
-                };
+                let entry = RelationalResidencyEntry::from_dense_host_rows(
+                    std::sync::Arc::new(snapshot),
+                    rows,
+                );
                 Ok((entry, JoinDeviceMemory::Transient(memory), row_count))
             }
         }
@@ -2748,7 +2748,7 @@ impl Engine {
         debug_assert!(
             sides
                 .iter()
-                .all(|s| s.0.host_rows.len() < JOIN_NULL_ROW as usize),
+                .all(|s| s.0.host_row_count() < JOIN_NULL_ROW as usize),
             "a join relation has too many rows to distinguish the LEFT-join NULL-pad sentinel"
         );
         let gpu_id = sides[0].0.descriptor.gpu_id;

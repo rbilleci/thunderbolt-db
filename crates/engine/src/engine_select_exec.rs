@@ -353,8 +353,7 @@ impl Engine {
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
             rows: entry
-                .host_rows
-                .iter()
+                .host_rows_iter()
                 .map(|row| MvccReadRow {
                     source_key: None,
                     key: None,

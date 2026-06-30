@@ -709,11 +709,9 @@ impl RelationalResidentCache {
             residency.device_memory.invalidate(&table);
         }
         // Co-publish the lightweight descriptor + the heavy host rows as one Arc-shared entry, so
-        // the COW map clone (every reader + every invalidation) bumps refcounts, not row data.
-        let entry = RelationalResidencyEntry {
-            descriptor: Arc::new(descriptor),
-            host_rows: Arc::new(host_rows),
-        };
+        // the COW map clone (every reader + every invalidation) bumps refcounts, not row data. Admit lays
+        // the rows down as ONE segment; an INSERT commit appends further segments (Slice 1b-ii-d).
+        let entry = RelationalResidencyEntry::from_dense_host_rows(Arc::new(descriptor), host_rows);
         residency.with_snapshots_mut(|snapshots| snapshots.insert(table, entry));
     }
 

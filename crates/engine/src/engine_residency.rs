@@ -721,6 +721,83 @@ mod capacity_payload_tests {
         );
     }
 
+    /// Slice 1b-ii-d: committed INSERTs append host rows as immutable SEGMENTS (so the commit is O(rows
+    /// appended), not the O(table) `host_rows` deep-clone — the dual-store tax's last residual; benchmark
+    /// shows the tax now flat ~40us at every base size). This gate proves the segmented `host_rows` reads
+    /// back CORRECTLY through the HOST-MATERIALIZATION path
+    /// (`execute_relational_select_with_resident_snapshot_probe`, which iterates `host_rows` segments via
+    /// `host_rows_iter`): after many appends produce MULTIPLE segments (non-vacuity assert), a scan +
+    /// point lookup over them must match the non-resident store baseline — same rows, same order. A
+    /// cross-segment ordering bug (or a dropped segment) in `host_rows_iter` fails the scan equality.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn host_rows_segmented_append_reads_match_baseline() {
+        use gpu_db_sql::{parse_command, Command};
+        let load = |e: &Engine| {
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+                .unwrap();
+            for i in 0..200_i64 {
+                e.execute_text(
+                    (i as u64) + 2,
+                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                )
+                .unwrap();
+            }
+        };
+
+        // Resident path: auto-admit -> the open-shard append fires repeatedly, accumulating host_rows
+        // SEGMENTS between headroom-overflow re-admits.
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        load(&e);
+        // NON-VACUITY: the appends produced MULTIPLE host_rows segments — else cross-segment iteration
+        // order is untested (a single dense segment reads correctly trivially).
+        let entry = e.relational_residency_entry("accounts").unwrap();
+        assert!(
+            entry.host_rows.len() > 1,
+            "appends must produce multiple host_rows segments (got {}) or this gate is vacuous",
+            entry.host_rows.len()
+        );
+        assert_eq!(entry.host_row_count(), 200, "all 200 rows across segments");
+        drop(entry);
+
+        // Non-resident store baseline (single canonical materialization).
+        let base = Engine::new_local();
+        load(&base);
+
+        let resident = |sql: &str| match parse_command(sql).unwrap() {
+            Command::Select(s) => e
+                .execute_relational_select_with_resident_snapshot_probe(&s) // iterates host_rows segments
+                .unwrap()
+                .rows,
+            _ => panic!("not a SELECT"),
+        };
+        let baseline = |sql: &str| match parse_command(sql).unwrap() {
+            Command::Select(s) => base
+                .execute_relational_select_with_cuda_driver_probe(&s)
+                .unwrap()
+                .rows,
+            _ => panic!("not a SELECT"),
+        };
+        // No ORDER BY: the result order IS the host_rows_iter (segment) order, so this differential is
+        // sensitive to cross-segment ordering (a re-sort would mask a wrong-order bug). Both paths yield
+        // insertion / TupleId order, so they must match iff the segments iterate in append order.
+        let scan = "SELECT id, balance FROM accounts";
+        let point = "SELECT id, balance FROM accounts WHERE id = 137";
+        let r_scan = resident(scan);
+        assert_eq!(
+            r_scan,
+            baseline(scan),
+            "segmented host_rows scan must match the baseline (cross-segment ORDER + content)"
+        );
+        assert_eq!(
+            resident(point),
+            baseline(point),
+            "segmented host_rows point lookup must match the baseline"
+        );
+        assert_eq!(r_scan.len(), 200, "all 200 rows present via the segmented host path");
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -1231,14 +1308,13 @@ impl Engine {
                 desc.resident_bytes = desc.resident_bytes.saturating_add(appended_bytes);
                 // Keep host_rows (the CPU-path materialization) consistent: new INSERTs get monotonic
                 // tuple_ids, so they sort to the END of the seq-scan order — the same place the device
-                // append wrote them.
-                // NOTE (Slice 1b-ii-d, flagged): this make_mut clones the whole shared host-row vec —
-                // the SOLE remaining O(table)-per-commit cost (the device append above is O(rows)).
-                // Proven by measurement: skipping it makes the dual-store tax flat (~40us at every base
-                // size). The fix (structural-shared / sealed+open host rows) is its own slice; correctness
-                // requires it here today (the host-materialization read path reads host_rows).
-                let host = std::sync::Arc::make_mut(&mut entry.host_rows);
-                host.extend_from_slice(new_rows);
+                // append wrote them. Slice 1b-ii-d: APPEND a new immutable segment (the appended rows)
+                // instead of deep-cloning the whole row vec. make_mut here clones only the small
+                // Vec<HostRowSegment> pointer list (one element per append since the last re-admit folds it
+                // back to one), so the host side is O(rows appended) + O(num_segments) — no longer the
+                // O(table) dual-store residual. Prior segments' row data is shared (refcounted), not copied.
+                std::sync::Arc::make_mut(&mut entry.host_rows)
+                    .push(std::sync::Arc::new(new_rows.to_vec()));
             }
         });
         // Slice 1b-ii (audit Finding A): the wave/lpb GPU index cache (engine_retained_read.rs) validates a
