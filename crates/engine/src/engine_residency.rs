@@ -321,12 +321,26 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
             "open-shard append of {appended} rows at {row_start} exceeds capacity {capacity}"
         ))));
     }
+    // Mirror the builder's defensive capacity bound so the unchecked offset multiplies below cannot
+    // overflow usize (the read helpers + append_owned_chunks are likewise checked/guarded).
+    if capacity > (1_usize << 31) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "open-shard append capacity {capacity} is implausibly large"
+        ))));
+    }
     if !column_types
         .iter()
         .all(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
     {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "open-shard append supports int4/date/int2 columns only (this slice)".to_string(),
+        )));
+    }
+    // Row-arity guard: a malformed (short/long) row must return the fallback Err, never panic on the
+    // unchecked `row[col_idx]` indexing below.
+    if new_rows.iter().any(|row| row.len() != column_types.len()) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "open-shard append row has the wrong column count".to_string(),
         )));
     }
     let header_bytes = std::mem::size_of::<u64>();
@@ -529,6 +543,37 @@ mod capacity_payload_tests {
         // capacity overflow -> Err (caller seals + rolls a new shard).
         let two = vec![vec![SqlValue::Int4(0)], vec![SqlValue::Int4(1)]];
         assert!(compute_open_shard_int4_append_chunks(&[SqlType::Int4], 4, 3, &two).is_err());
+
+        // value-encoding arms (opus coverage note): Int2 widens, Date passes, NULL -> 0.
+        let mixed = compute_open_shard_int4_append_chunks(
+            &[SqlType::Int2, SqlType::Date],
+            4,
+            0,
+            &[
+                vec![SqlValue::Int2(7), SqlValue::Date(100)],
+                vec![SqlValue::Null, SqlValue::Null],
+            ],
+        )
+        .unwrap();
+        assert_eq!(mixed[0].bytes, le(&[7, 0]), "int2 widened + null->0");
+        assert_eq!(mixed[1].byte_offset, 8 + 4 * 4, "date section after the int2 section");
+        assert_eq!(mixed[1].bytes, le(&[100, 0]), "date pass-through + null->0");
+        // a wrong-typed value in an eligible column -> Err (clean, no panic).
+        assert!(compute_open_shard_int4_append_chunks(
+            &[SqlType::Int4],
+            4,
+            0,
+            &[vec![SqlValue::Int8(1)]]
+        )
+        .is_err());
+        // a malformed (short) row -> Err, never a panic (the row-arity guard).
+        assert!(compute_open_shard_int4_append_chunks(
+            &[SqlType::Int4, SqlType::Int4],
+            4,
+            0,
+            &[vec![SqlValue::Int4(1)]]
+        )
+        .is_err());
     }
 
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
