@@ -798,6 +798,127 @@ mod capacity_payload_tests {
         assert_eq!(r_scan.len(), 200, "all 200 rows present via the segmented host path");
     }
 
+    /// Billions-of-rows S-d1: admitting a table as a (single dense) SEGMENTED shard — `shard_residency`
+    /// flag ON, routed through the sharded resident read path — must produce byte-identical reads to the
+    /// single capacity-padded unified buffer (flag OFF). NON-VACUITY: with the flag ON the table lands in
+    /// `residency.shards` (the sharded route), and NOT with the flag OFF (the single-buffer route).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_residency_admit_reads_match_single_buffer() {
+        let run = |shard: bool| -> (RowBlock, RowBlock, RowBlock, bool) {
+            let mut e = Engine::new_local();
+            e.set_shard_residency_enabled(shard);
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+                .unwrap();
+            let mut txn = 2u64;
+            let mut id = 0i64;
+            while id < 1000 {
+                let mut vals = String::new();
+                for _ in 0..200 {
+                    if id >= 1000 {
+                        break;
+                    }
+                    if !vals.is_empty() {
+                        vals.push(',');
+                    }
+                    vals.push_str(&format!("({id}, {})", id * 10));
+                    id += 1;
+                }
+                e.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))
+                    .unwrap();
+                txn += 1;
+            }
+            e.populate_relational_residency_snapshot("accounts").unwrap();
+            let in_shards = e
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get("accounts")
+                .is_some_and(|s| !s.is_empty());
+            let sel = |sql: &str| -> RowBlock {
+                e.execute_relational_select_text(sql).unwrap().rows
+            };
+            (
+                sel("SELECT id, balance FROM accounts WHERE id = 137"),
+                sel("SELECT id, balance FROM accounts ORDER BY id"),
+                sel("SELECT COUNT(*) FROM accounts"),
+                in_shards,
+            )
+        };
+        let (on_pt, on_scan, on_cnt, on_in_shards) = run(true);
+        let (off_pt, off_scan, off_cnt, off_in_shards) = run(false);
+        // NON-VACUITY: flag ON took the sharded route; flag OFF took the single buffer.
+        assert!(
+            on_in_shards,
+            "flag ON must admit the table as a shard (the sharded read route)"
+        );
+        assert!(
+            !off_in_shards,
+            "flag OFF must use the single buffer (no shard)"
+        );
+        // point-lookup + COUNT(*) ARE served by the sharded route (the non-vacuous sharded gates); the
+        // ORDER BY scan on a shard table takes the CPU fallback (a shard has no `snapshots` entry, so the
+        // gpu-sortable gate declines) — kept as a correctness check (CPU shard path == GPU single buffer).
+        assert_eq!(on_pt, off_pt, "sharded point lookup == single-buffer baseline");
+        assert_eq!(on_scan, off_scan, "scan (CPU fallback) == single-buffer baseline");
+        assert_eq!(on_cnt, off_cnt, "sharded COUNT(*) == single-buffer baseline");
+        assert_eq!(on_scan.len(), 1000, "all 1000 rows present");
+    }
+
+    /// Audit (S-d1) fix: a runtime `shard_residency` flag FLIP + re-admit must clear the OPPOSITE residency
+    /// representation, so a stale shard can't shadow a fresh snapshot (the read route checks shards FIRST →
+    /// it would serve wrong rows) and a stale snapshot can't shadow fresh shards. Verifies the map state
+    /// after each flip — WITHOUT the clears the stale cell persists, so the `!in_*` asserts fail.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_residency_flag_flip_clears_opposite_representation() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200), (3, 300)",
+        )
+        .unwrap();
+        let in_shards = |e: &Engine| {
+            e.read_state
+                .residency
+                .shards
+                .load()
+                .get("accounts")
+                .is_some_and(|s| !s.is_empty())
+        };
+        let in_snaps =
+            |e: &Engine| e.read_state.residency.snapshots.load().get("accounts").is_some();
+
+        // OFF -> single buffer.
+        e.set_shard_residency_enabled(false);
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        assert!(in_snaps(&e) && !in_shards(&e), "OFF admits the single buffer");
+        // Flip ON -> shard; the stale snapshot must be cleared.
+        e.set_shard_residency_enabled(true);
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        assert!(
+            in_shards(&e) && !in_snaps(&e),
+            "OFF->ON re-admit must clear the stale snapshot"
+        );
+        // Flip OFF -> single buffer; the stale shard must be cleared (the wrong-rows footgun).
+        e.set_shard_residency_enabled(false);
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        assert!(
+            in_snaps(&e) && !in_shards(&e),
+            "ON->OFF re-admit must clear the stale shard (else it shadows the fresh snapshot)"
+        );
+        // Reads are correct after the flips.
+        let r = e
+            .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 2")
+            .unwrap()
+            .rows;
+        assert_eq!(r.len(), 1, "id=2 present");
+        assert_eq!(r.row(0), &[SqlValue::Int4(2), SqlValue::Int4(200)]);
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -941,7 +1062,10 @@ impl Engine {
             && column_types
                 .iter()
                 .all(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2));
-        let capacity = if purely_int4 {
+        // S-d1: the sharded read addresses a shard with a DENSE stride (`resident_snapshot_for_shard` sets
+        // capacity == shard.row_count), so a table admitted as a shard must be laid down DENSE — no
+        // capacity headroom. (Open-shard headroom + a capacity-aware sharded read is S-d2.)
+        let capacity = if purely_int4 && !self.shard_residency_enabled() {
             row_count.saturating_mul(2).next_power_of_two()
         } else {
             row_count
@@ -1021,6 +1145,57 @@ impl Engine {
             device_memory_proof,
         };
         let read_state = Arc::clone(&self.read_state);
+        // Billions-of-rows segmented layout (S-d1, default-OFF `shard_residency_enabled`): admit as a
+        // SEGMENTED shard list — ONE dense shard for now; seal/rollover into many shards is S-d2 — routed
+        // through the sharded resident read path, instead of the single capacity-padded unified buffer
+        // (which caps at ~536M rows and re-admits O(table)). The single dense shard reuses the SAME columnar
+        // payload + layout the single buffer uses (header at offset 0, dense columns), so the (already
+        // tested) sharded read path reads it identically. Requires GPU device memory; without it (no GPU)
+        // we fall through to the single-buffer/host path. Append/seal/per-shard-index land in S-d2/S-d3.
+        if self.shard_residency_enabled() && device_memory.is_some() {
+            // Audit (S-d1) fix: this re-admit makes the SHARD representation authoritative — clear any prior
+            // single-buffer cell for the table so a runtime flag flip (OFF->ON) cannot leave a stale
+            // snapshot/device_memory shadowing the shards. Idempotent (a no-op when none exists).
+            read_state.residency.with_snapshots_mut(|snapshots| {
+                snapshots.remove(table);
+            });
+            read_state.residency.device_memory.remove(table);
+            let dm = device_memory.expect("device_memory.is_some() checked");
+            let shard = RelationalResidentShard {
+                shard_id: 0,
+                row_start: 0,
+                row_count,
+                resident_bytes,
+                allocated_bytes: device_payload.len() as u64,
+                count_header_byte_offset: 0,
+                resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
+                resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
+                gpu_id,
+                schema: snapshot.schema.clone(),
+                table: snapshot.table.clone(),
+                device_memory_proof: snapshot.device_memory_proof.clone(),
+                invalidated_by_txn_id: None,
+                invalidated_at_index: None,
+                invalidated_by_memory_pressure: memory_pressure_active,
+                memory_pressure_active,
+            };
+            let mut shard_memory = BTreeMap::new();
+            shard_memory.insert(0_u32, dm);
+            cat.relational_resident_cache.install_shards(
+                catalog_table.name,
+                vec![shard],
+                shard_memory,
+                &read_state.residency,
+            );
+            return Ok(snapshot);
+        }
+        // Audit (S-d1) fix: the single-buffer path is authoritative here — clear any prior SHARD cell for
+        // the table so a flag flip (ON->OFF) cannot leave a stale shard shadowing the fresh snapshot (the
+        // read route checks shards FIRST, so a still-valid stale shard would serve wrong rows). Idempotent.
+        read_state.residency.with_shards_mut(|shards| {
+            shards.remove(table);
+        });
+        read_state.residency.shard_device_memory.remove_table(table);
         cat
             .relational_resident_cache
             .install_snapshot(
@@ -1207,6 +1382,19 @@ impl Engine {
 
     pub(crate) fn dense_index_probe_enabled(&self) -> bool {
         self.dense_index_probe_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Billions-of-rows segmented layout (S-d1): enable/disable admitting a table as a SEGMENTED shard list
+    /// (routed through the sharded resident read path) instead of one capacity-padded unified buffer.
+    /// DEFAULT OFF — the A/B lever to validate the shard path before flipping the default. Interior-mutable.
+    pub fn set_shard_residency_enabled(&self, on: bool) {
+        self.shard_residency_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn shard_residency_enabled(&self) -> bool {
+        self.shard_residency_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

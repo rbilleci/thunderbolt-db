@@ -324,6 +324,12 @@ pub struct Engine {
     /// >=b4096, audit SHIP) — set false to A/B against the atomic kernel. Only the unique index route honors
     /// it — the non-unique scan always keeps the atomic kernel. Interior-mutable.
     dense_index_probe_enabled: AtomicBool,
+    /// Billions-of-rows scaling (segmented layout, S-d1): when true, a table is admitted as a SEGMENTED
+    /// shard list (sealed shards + one bounded open shard) routed through the sharded resident read path,
+    /// instead of one capacity-padded unified buffer that caps at ~536M rows and re-admits O(table). DEFAULT
+    /// OFF — production stays on the single buffer until seal/rollover (S-d2) + per-shard bloom index (S-d3)
+    /// make the shard path strictly better at scale; this flag is the A/B lever to validate it. Interior-mutable.
+    shard_residency_enabled: AtomicBool,
 }
 
 /// The DDL-only catalog working state, serialized behind the engine's **catalog latch**

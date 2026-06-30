@@ -174,6 +174,8 @@ impl Engine {
             // strict win at >=b4096, neutral at b256, byte-identical + audit SHIP. (The index route itself is
             // `index_probe_enabled`, also default ON.)
             dense_index_probe_enabled: std::sync::atomic::AtomicBool::new(true),
+            // Billions-of-rows segmented layout (S-d1): default OFF — production stays on the single buffer.
+            shard_residency_enabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
