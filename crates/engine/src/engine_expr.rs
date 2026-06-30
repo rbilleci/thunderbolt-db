@@ -2121,7 +2121,7 @@ impl Engine {
         // (`8 + c*p.row_count*4`, len `p.row_count*4`) into the unified slot
         // (`8 + c*total_row_count*4 + rows_before_p*4`). Empty shards contribute a zero-length segment
         // (skipped by the primitive). The host never touches the column bytes.
-        let mut shard_ptrs: Vec<(u64, usize)> = Vec::with_capacity(shards.len());
+        let mut shard_ptrs: Vec<(u64, usize, usize)> = Vec::with_capacity(shards.len());
         let mut total_row_count = 0_usize;
         for shard in &shards {
             let src = source_for(shard)?;
@@ -2134,7 +2134,7 @@ impl Engine {
                     shard.shard_id, shard.resident_device_int4_columns, int4_columns
                 ))));
             }
-            shard_ptrs.push((src.device_memory.device_ptr(), shard.row_count));
+            shard_ptrs.push((src.device_memory.device_ptr(), shard.row_count, shard.capacity));
             total_row_count = total_row_count.saturating_add(shard.row_count);
         }
 
@@ -2142,12 +2142,16 @@ impl Engine {
             Vec::with_capacity(num_int4_cols * shards.len());
         for ordinal in 0..num_int4_cols {
             let mut rows_before = 0_u64;
-            for (device_ptr, row_count) in &shard_ptrs {
+            for (device_ptr, row_count, capacity) in &shard_ptrs {
                 let row_count = *row_count as u64;
+                let capacity = *capacity as u64;
                 let byte_len = row_count.saturating_mul(4);
                 segments.push(gpu_db_execution::RecompactSegment {
                     src_device_ptr: *device_ptr,
-                    src_byte_offset: 8 + (ordinal as u64) * row_count * 4,
+                    // S-d2: a column's live rows sit at its CAPACITY-strided start in the (possibly padded)
+                    // shard (`8 + ordinal*capacity*4`); copy only the `row_count` live rows into the dense
+                    // unified buffer. capacity == row_count for a dense/sealed shard (unchanged there).
+                    src_byte_offset: 8 + (ordinal as u64) * capacity * 4,
                     dst_byte_offset: 8
                         + (ordinal as u64) * (total_row_count as u64) * 4
                         + rows_before * 4,

@@ -640,6 +640,11 @@ pub(crate) struct RelationalResidentShard {
     pub(crate) shard_id: u32,
     pub(crate) row_start: usize,
     pub(crate) row_count: usize,
+    /// Capacity-padded column stride (S-d2): the OPEN shard carries headroom (`capacity > row_count`) for
+    /// in-place appends; sealed/benchmark shards are dense (`capacity == row_count`). The sharded read's
+    /// recompaction gather reads each column slice at this stride (a column's live rows sit at its
+    /// capacity-strided start), mirroring the single buffer's `capacity` field (Slice 1b-i).
+    pub(crate) capacity: usize,
     pub(crate) resident_bytes: u64,
     pub(crate) allocated_bytes: u64,
     pub(crate) count_header_byte_offset: u64,

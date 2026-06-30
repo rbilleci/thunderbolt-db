@@ -864,6 +864,27 @@ mod capacity_payload_tests {
         assert_eq!(on_scan, off_scan, "scan (CPU fallback) == single-buffer baseline");
         assert_eq!(on_cnt, off_cnt, "sharded COUNT(*) == single-buffer baseline");
         assert_eq!(on_scan.len(), 1000, "all 1000 rows present");
+
+        // S-d2a non-vacuity: the OPEN shard carries capacity HEADROOM (capacity > row_count), and the
+        // capacity-aware sharded recompaction above addressed it correctly (the reads matched the
+        // baseline — a dense-stride recompaction would have copied the wrong column slice and diverged).
+        {
+            let mut e = Engine::new_local();
+            e.set_shard_residency_enabled(true);
+            e.execute_text(1, "CREATE TABLE t (id INT, balance INT)").unwrap();
+            e.execute_text(2, "INSERT INTO t (id, balance) VALUES (1,10),(2,20),(3,30)")
+                .unwrap();
+            e.populate_relational_residency_snapshot("t").unwrap();
+            let shards = e.read_state.residency.shards.load();
+            let shard = &shards.get("t").expect("table admitted as a shard")[0];
+            assert_eq!(shard.row_count, 3, "live row count");
+            assert!(
+                shard.capacity > shard.row_count,
+                "open shard must carry headroom: capacity {} > row_count {}",
+                shard.capacity,
+                shard.row_count
+            );
+        }
     }
 
     /// Audit (S-d1) fix: a runtime `shard_residency` flag FLIP + re-admit must clear the OPPOSITE residency
@@ -1062,10 +1083,11 @@ impl Engine {
             && column_types
                 .iter()
                 .all(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2));
-        // S-d1: the sharded read addresses a shard with a DENSE stride (`resident_snapshot_for_shard` sets
-        // capacity == shard.row_count), so a table admitted as a shard must be laid down DENSE — no
-        // capacity headroom. (Open-shard headroom + a capacity-aware sharded read is S-d2.)
-        let capacity = if purely_int4 && !self.shard_residency_enabled() {
+        // A PURELY-int4 table is laid down with capacity HEADROOM (~2x rows, power-of-two) so committed
+        // INSERTs append in place (1b-ii). S-d2: the sharded read is now capacity-aware (the recompaction
+        // gather + `resident_snapshot_for_shard` stride by `shard.capacity`), so the OPEN shard gets the
+        // same headroom as the single buffer. Other shapes (and huge/empty tables) stay dense.
+        let capacity = if purely_int4 {
             row_count.saturating_mul(2).next_power_of_two()
         } else {
             row_count
@@ -1165,6 +1187,9 @@ impl Engine {
                 shard_id: 0,
                 row_start: 0,
                 row_count,
+                // S-d2: the OPEN shard carries headroom (capacity > row_count for int4); the recompaction
+                // gather + offset helpers stride by this capacity. (Dead MVCC tail omitted when padded.)
+                capacity,
                 resident_bytes,
                 allocated_bytes: device_payload.len() as u64,
                 count_header_byte_offset: 0,
@@ -2028,6 +2053,8 @@ impl Engine {
                 shard_id: shard.shard_id,
                 row_start: shard.row_start,
                 row_count: shard.row_count,
+                // Benchmark shards are read DENSE (explicit chunk layouts sized by row_count).
+                capacity: shard.row_count,
                 resident_bytes: shard.resident_bytes,
                 allocated_bytes: shard.allocated_bytes,
                 count_header_byte_offset: 0,
@@ -2078,9 +2105,11 @@ impl Engine {
             table: shard.table.clone(),
             generation: 0,
             // CRITICAL: the shard's own row count sizes the SoA the single-store offset helpers
-            // read, so they address THIS shard's buffer (not the whole table).
+            // read, so they address THIS shard's buffer (not the whole table). S-d2: an OPEN shard is
+            // capacity-padded (headroom for appends), so the column STRIDE is `shard.capacity` while the
+            // live row count is `shard.row_count` — exactly the single buffer's capacity/row_count split.
             row_count: shard.row_count,
-            capacity: shard.row_count,
+            capacity: shard.capacity,
             column_count: table.columns.len(),
             resident_bytes: shard.resident_bytes,
             resident_device_int4_columns: shard.resident_device_int4_columns.clone(),
