@@ -7929,6 +7929,30 @@ fn launch_cuda_group_by_i32_count_sum(
         None
     };
 
+    // GPU stream-compaction (result-path O(groups), not O(row_count)). After the aggregate kernel a
+    // single-block kernel scans the alloc_slots slot table, applies the SAME occupancy predicate the
+    // host compact loop used, and (ascending-slot order, two-level prefix sum -> byte-identical order)
+    // scatters every occupied group's fields into DENSE arrays + writes out_count. We then D2H ONLY the
+    // out_count dense rows, not the full ~2*row_count slot table. Dense arrays are worst-case sized to
+    // alloc_slots (every slot occupied) and leased like the slot buffers; the D2H slices to out_count.
+    let compact_fn = primary.cached_function(c"gpu_db_group_by_slot_compact", &ptx)?;
+    let out_key = primary.lease_device_buffer(slot_bytes)?;
+    let out_count_arr = primary.lease_device_buffer(slot_bytes)?;
+    let out_sum = primary.lease_device_buffer(slot_bytes)?;
+    let out_sum_hi = primary.lease_device_buffer(slot_bytes)?;
+    let out_min = primary.lease_device_buffer(slot_bytes)?;
+    let out_max = primary.lease_device_buffer(slot_bytes)?;
+    let out_min_hi = primary.lease_device_buffer(slot_bytes)?;
+    let out_max_hi = primary.lease_device_buffer(slot_bytes)?;
+    let out_min_uuid = primary.lease_device_buffer(uuid_slot_bytes)?;
+    let out_max_uuid = primary.lease_device_buffer(uuid_slot_bytes)?;
+    let out_keyi128 = primary.lease_device_buffer(uuid_slot_bytes)?;
+    let out_isnull_bytes = alloc_slots
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(alloc_slots))?;
+    let out_isnull = primary.lease_device_buffer(out_isnull_bytes)?;
+    let out_count_dev = primary.lease_device_buffer(std::mem::size_of::<u64>())?;
+
     const BLOCK: u32 = 256;
     // Fills cover alloc_slots (nslots + the dedicated i64::MIN slot) so that slot is initialized too.
     let fill_grid = alloc_slots_u64.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
@@ -8122,6 +8146,69 @@ fn launch_cuda_group_by_i32_count_sum(
         (&mut q8 as *mut u64).cast::<c_void>(),
         (&mut q9 as *mut u64).cast::<c_void>(),
     ];
+    // Compaction-kernel args. `use_i128` mirrors the host hash-range occupancy condition (i128/text/
+    // composite keys live in slot_keys_i128); `key_is_i128_strict` mirrors the dedicated i64::MIN slot's
+    // `key_i128: if key_is_i128 { i128::MIN }` (ONLY the plain-i128-key path, not text/composite).
+    let use_i128_occ: u64 = u64::from(key_is_i128 || key_is_text || comp_w > 0 || n_text > 0);
+    let key_is_i128_strict: u64 = u64::from(key_is_i128);
+    let mut c0 = slot_keys.ptr;
+    let mut c1 = slot_count.ptr;
+    let mut c2 = slot_sum.ptr;
+    let mut c3 = slot_sum_hi.ptr;
+    let mut c4 = slot_min.ptr;
+    let mut c5 = slot_max.ptr;
+    let mut c6 = slot_min_hi.ptr;
+    let mut c7 = slot_max_hi.ptr;
+    let mut c8 = slot_min_uuid.ptr;
+    let mut c9 = slot_max_uuid.ptr;
+    let mut c10 = slot_keys_i128.ptr;
+    let mut c11 = nslots as u64;
+    let mut c12 = alloc_slots_u64;
+    let mut c13 = use_i128_occ;
+    let mut c14 = key_is_i128_strict;
+    let mut c15 = out_key.ptr;
+    let mut c16 = out_count_arr.ptr;
+    let mut c17 = out_sum.ptr;
+    let mut c18 = out_sum_hi.ptr;
+    let mut c19 = out_min.ptr;
+    let mut c20 = out_max.ptr;
+    let mut c21 = out_min_hi.ptr;
+    let mut c22 = out_max_hi.ptr;
+    let mut c23 = out_min_uuid.ptr;
+    let mut c24 = out_max_uuid.ptr;
+    let mut c25 = out_keyi128.ptr;
+    let mut c26 = out_isnull.ptr;
+    let mut c27 = out_count_dev.ptr;
+    let mut compact_args = [
+        (&mut c0 as *mut u64).cast::<c_void>(),
+        (&mut c1 as *mut u64).cast::<c_void>(),
+        (&mut c2 as *mut u64).cast::<c_void>(),
+        (&mut c3 as *mut u64).cast::<c_void>(),
+        (&mut c4 as *mut u64).cast::<c_void>(),
+        (&mut c5 as *mut u64).cast::<c_void>(),
+        (&mut c6 as *mut u64).cast::<c_void>(),
+        (&mut c7 as *mut u64).cast::<c_void>(),
+        (&mut c8 as *mut u64).cast::<c_void>(),
+        (&mut c9 as *mut u64).cast::<c_void>(),
+        (&mut c10 as *mut u64).cast::<c_void>(),
+        (&mut c11 as *mut u64).cast::<c_void>(),
+        (&mut c12 as *mut u64).cast::<c_void>(),
+        (&mut c13 as *mut u64).cast::<c_void>(),
+        (&mut c14 as *mut u64).cast::<c_void>(),
+        (&mut c15 as *mut u64).cast::<c_void>(),
+        (&mut c16 as *mut u64).cast::<c_void>(),
+        (&mut c17 as *mut u64).cast::<c_void>(),
+        (&mut c18 as *mut u64).cast::<c_void>(),
+        (&mut c19 as *mut u64).cast::<c_void>(),
+        (&mut c20 as *mut u64).cast::<c_void>(),
+        (&mut c21 as *mut u64).cast::<c_void>(),
+        (&mut c22 as *mut u64).cast::<c_void>(),
+        (&mut c23 as *mut u64).cast::<c_void>(),
+        (&mut c24 as *mut u64).cast::<c_void>(),
+        (&mut c25 as *mut u64).cast::<c_void>(),
+        (&mut c26 as *mut u64).cast::<c_void>(),
+        (&mut c27 as *mut u64).cast::<c_void>(),
+    ];
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         let rc = unsafe {
             htod_async(
@@ -8249,107 +8336,124 @@ fn launch_cuda_group_by_i32_count_sum(
         }
         // Pass 2 (numeric MIN/MAX): resolve the i128 low limb lock-free, on the same stream.
         if let Some(f) = pass2_fn {
-            return unsafe {
+            let rc = unsafe {
                 cu_launch_kernel(
                     f, group_grid, 1, 1, BLOCK, 1, 1, 0, stream,
                     pass2_args.as_mut_ptr(), std::ptr::null_mut(),
                 )
             };
+            if rc != 0 {
+                return rc;
+            }
         }
-        rc
+        // GPU stream-compaction: single block (the two-level prefix-sum scatter is block-local; one
+        // block grid-strides the whole slot table with a running offset, like the HAVING compactor). On
+        // the same stream, after every aggregate pass has finalized the slots.
+        unsafe {
+            cu_launch_kernel(
+                compact_fn, 1, 1, 1, BLOCK, 1, 1, 0, stream,
+                compact_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        }
     })?;
 
-    // Sized alloc_slots (= nslots + the dedicated i64::MIN slot) -- the D2H copies slot_bytes bytes.
-    let mut keys = vec![0i64; alloc_slots];
-    let mut counts = vec![0u64; alloc_slots];
-    let mut sums = vec![0i64; alloc_slots];
-    let mut sum_his = vec![0i64; alloc_slots];
-    let mut mins = vec![0i64; alloc_slots];
-    let mut maxs = vec![0i64; alloc_slots];
-    let mut min_his = vec![0i64; alloc_slots];
-    let mut max_his = vec![0i64; alloc_slots];
+    // RESULT PATH (O(groups), not O(row_count)): the compaction kernel above already scanned the slot
+    // table and wrote the occupied groups DENSELY in ascending-slot order + the group count. D2H only
+    // `out_count` (one u64) and then the dense arrays SLICED to out_count entries -- not the full
+    // ~2*row_count slot table. The dense arrays carry EXACTLY the fields the old host `for i in 0..nslots`
+    // loop produced (key/count/sum/sum_hi/min/max/min_hi/max_hi + the raw b128 uuid + b128 key_i128 +
+    // the key_is_null flag), in the SAME order, so the built groups are byte-identical.
+    let mut out_count: u64 = 0;
     check_cuda(unsafe {
-        cu_memcpy_dtoh(keys.as_mut_ptr().cast::<c_void>(), slot_keys.ptr, slot_bytes)
+        cu_memcpy_dtoh(
+            (&mut out_count as *mut u64).cast::<c_void>(),
+            out_count_dev.ptr,
+            std::mem::size_of::<u64>(),
+        )
     })?;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(counts.as_mut_ptr().cast::<c_void>(), slot_count.ptr, slot_bytes)
-    })?;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(sums.as_mut_ptr().cast::<c_void>(), slot_sum.ptr, slot_bytes)
-    })?;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(sum_his.as_mut_ptr().cast::<c_void>(), slot_sum_hi.ptr, slot_bytes)
-    })?;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(mins.as_mut_ptr().cast::<c_void>(), slot_min.ptr, slot_bytes)
-    })?;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(maxs.as_mut_ptr().cast::<c_void>(), slot_max.ptr, slot_bytes)
-    })?;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(min_his.as_mut_ptr().cast::<c_void>(), slot_min_hi.ptr, slot_bytes)
-    })?;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(max_his.as_mut_ptr().cast::<c_void>(), slot_max_hi.ptr, slot_bytes)
-    })?;
-    // UUID MIN/MAX: copy the b128 result slots back only on the uuid path (empty vecs otherwise, so the
-    // accessor returns [0; 16] and adds no D2H to the common path).
-    let (mins_uuid, maxs_uuid) = if value_is_uuid {
-        let mut mn = vec![0u8; uuid_slot_bytes];
-        let mut mx = vec![0u8; uuid_slot_bytes];
+    // out_count <= alloc_slots (every slot occupied is the worst case) -- a larger value means the kernel
+    // miscounted (corrupt) and would over-read the dense buffers; treat as a hard error.
+    let groups_len = usize::try_from(out_count)
+        .ok()
+        .filter(|&n| n <= alloc_slots)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut groups = Vec::with_capacity(groups_len);
+    if groups_len > 0 {
+        let dense_i64_bytes = groups_len
+            .checked_mul(std::mem::size_of::<i64>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(groups_len))?;
+        let dense_b128_bytes = groups_len
+            .checked_mul(16)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(groups_len))?;
+        let dense_u32_bytes = groups_len
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(groups_len))?;
+        let mut keys = vec![0i64; groups_len];
+        let mut counts = vec![0u64; groups_len];
+        let mut sums = vec![0i64; groups_len];
+        let mut sum_his = vec![0i64; groups_len];
+        let mut mins = vec![0i64; groups_len];
+        let mut maxs = vec![0i64; groups_len];
+        let mut min_his = vec![0i64; groups_len];
+        let mut max_his = vec![0i64; groups_len];
+        let mut min_uuid_bytes = vec![0u8; dense_b128_bytes];
+        let mut max_uuid_bytes = vec![0u8; dense_b128_bytes];
+        let mut key_i128s = vec![0i128; groups_len];
+        let mut is_nulls = vec![0u32; groups_len];
         check_cuda(unsafe {
-            cu_memcpy_dtoh(mn.as_mut_ptr().cast::<c_void>(), slot_min_uuid.ptr, uuid_slot_bytes)
+            cu_memcpy_dtoh(keys.as_mut_ptr().cast::<c_void>(), out_key.ptr, dense_i64_bytes)
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(mx.as_mut_ptr().cast::<c_void>(), slot_max_uuid.ptr, uuid_slot_bytes)
+            cu_memcpy_dtoh(counts.as_mut_ptr().cast::<c_void>(), out_count_arr.ptr, dense_i64_bytes)
         })?;
-        (mn, mx)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    // i128 / text GROUP BY keys: copy the b128 key slots back. Each slot's 16 LE bytes are the i128 key
-    // (numeric mantissa or uuid bytes), or for a text key the b128 (hi=text hash, lo=representative row
-    // index), claimed via atom.cas.b128.
-    let keys_i128: Vec<i128> = if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
-        let mut k = vec![0i128; alloc_slots];
         check_cuda(unsafe {
-            cu_memcpy_dtoh(k.as_mut_ptr().cast::<c_void>(), slot_keys_i128.ptr, uuid_slot_bytes)
+            cu_memcpy_dtoh(sums.as_mut_ptr().cast::<c_void>(), out_sum.ptr, dense_i64_bytes)
         })?;
-        k
-    } else {
-        Vec::new()
-    };
-    // Rebuild a canonical-order uuid from a slot's 16 device bytes. The kernel stored the b128 as
-    // `(uhi << 64) | ulo` with uhi = uuid bytes 0-7 big-endian and ulo = bytes 8-15 big-endian; in LE
-    // device memory that is the uuid fully byte-reversed. from_le_bytes recovers ulo/uhi and to_be_bytes
-    // restores the canonical (memcmp / textual) order. Returns [0; 16] when not a uuid aggregate.
-    let uuid_at = |buf: &[u8], slot: usize| -> [u8; 16] {
-        if buf.is_empty() {
-            return [0u8; 16];
-        }
-        let b = &buf[slot * 16..slot * 16 + 16];
-        let ulo = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        let uhi = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        let mut out = [0u8; 16];
-        out[0..8].copy_from_slice(&uhi.to_be_bytes());
-        out[8..16].copy_from_slice(&ulo.to_be_bytes());
-        out
-    };
-    // Host-compact the occupied slots (slot_keys != EMPTY). A GPU stream-compaction is a follow-on.
-    // min/max are the per-group values from the single-level kernel; for the two-level kernel (COUNT/
-    // SUM/AVG only) they stay at the i64::MAX/MIN identity and the engine ignores them. sum_hi is the
-    // i128 high limb for int8 sums (0 for int4).
-    let mut groups = Vec::new();
-    for i in 0..nslots {
-        // Occupancy: i128 + text keys live in slot_keys_i128 (EMPTY128 = i128::MIN); i64 keys in
-        // slot_keys (EMPTY = i64::MIN). The i128/text path never writes the i64 slot_keys, so it must
-        // test its own. (A text key never aliases i128::MIN -- the kernel remaps hash i64::MIN->0.)
-        let occupied = if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
-            keys_i128[i] != i128::MIN
-        } else {
-            keys[i] != EMPTY
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(sum_his.as_mut_ptr().cast::<c_void>(), out_sum_hi.ptr, dense_i64_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(mins.as_mut_ptr().cast::<c_void>(), out_min.ptr, dense_i64_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(maxs.as_mut_ptr().cast::<c_void>(), out_max.ptr, dense_i64_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(min_his.as_mut_ptr().cast::<c_void>(), out_min_hi.ptr, dense_i64_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(max_his.as_mut_ptr().cast::<c_void>(), out_max_hi.ptr, dense_i64_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(min_uuid_bytes.as_mut_ptr().cast::<c_void>(), out_min_uuid.ptr, dense_b128_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(max_uuid_bytes.as_mut_ptr().cast::<c_void>(), out_max_uuid.ptr, dense_b128_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(key_i128s.as_mut_ptr().cast::<c_void>(), out_keyi128.ptr, dense_b128_bytes)
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(is_nulls.as_mut_ptr().cast::<c_void>(), out_isnull.ptr, dense_u32_bytes)
+        })?;
+        // Rebuild a canonical-order uuid from a dense row's 16 device bytes -- the SAME byte-reversal the
+        // old host loop applied (the kernel stored the b128 as `(uhi << 64) | ulo` with uhi = uuid bytes
+        // 0-7 big-endian and ulo = bytes 8-15 big-endian; in LE device memory that is the uuid fully
+        // byte-reversed). Only run for a uuid value aggregate; [0; 16] otherwise (matches the old path,
+        // which left the b128 slots at their identity / unread for non-uuid and emitted [0; 16]).
+        let uuid_at = |buf: &[u8], row: usize| -> [u8; 16] {
+            if !value_is_uuid {
+                return [0u8; 16];
+            }
+            let b = &buf[row * 16..row * 16 + 16];
+            let ulo = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let uhi = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            let mut out = [0u8; 16];
+            out[0..8].copy_from_slice(&uhi.to_be_bytes());
+            out[8..16].copy_from_slice(&ulo.to_be_bytes());
+            out
         };
-        if occupied {
+        for i in 0..groups_len {
             groups.push(GroupByI32Row {
                 key: keys[i],
                 count: counts[i],
@@ -8359,61 +8463,12 @@ fn launch_cuda_group_by_i32_count_sum(
                 max: maxs[i],
                 min_hi: min_his[i],
                 max_hi: max_his[i],
-                min_uuid: uuid_at(&mins_uuid, i),
-                max_uuid: uuid_at(&maxs_uuid, i),
-                key_i128: if key_is_i128 || key_is_text || comp_w > 0 || n_text > 0 {
-                    keys_i128[i]
-                } else {
-                    0
-                },
-                key_is_null: false,
+                min_uuid: uuid_at(&min_uuid_bytes, i),
+                max_uuid: uuid_at(&max_uuid_bytes, i),
+                key_i128: key_i128s[i],
+                key_is_null: is_nulls[i] != 0,
             });
         }
-    }
-    // The dedicated slot (index nslots) holds the i64::MIN key (== EMPTY, so it can't be detected by
-    // the sentinel test above); it is occupied iff its count > 0. Empty for int4 keys.
-    // Occupied iff the kernel routed a key here and marked it USED (slot_keys = 0, != EMPTY). NOT
-    // `counts > 0`: the slot is never CAS-claimed, so a count-0 reserved group (all-NULL aggregate
-    // values) must still be emitted — consistently across EVERY pass — or the by-index merge mis-aligns.
-    if keys[nslots] != EMPTY {
-        groups.push(GroupByI32Row {
-            key: i64::MIN,
-            count: counts[nslots],
-            sum: sums[nslots],
-            sum_hi: sum_his[nslots],
-            min: mins[nslots],
-            max: maxs[nslots],
-            min_hi: min_his[nslots],
-            max_hi: max_his[nslots],
-            min_uuid: uuid_at(&mins_uuid, nslots),
-            max_uuid: uuid_at(&maxs_uuid, nslots),
-            // The dedicated slot's i128 key (when key_is_i128) is EMPTY128 itself = i128::MIN (the
-            // kernel routes that key here without writing slot_keys_i128). 0 for the i64-key paths.
-            key_i128: if key_is_i128 { i128::MIN } else { 0 },
-            key_is_null: false,
-        });
-    }
-    // M3 (doc 21): the SECOND dedicated slot (index nslots+1) is the NULL-KEY group — the kernel routes
-    // every row whose GROUP BY key is NULL here (via `key_null_off`), forming ONE group. Occupied iff the
-    // kernel marked it USED (slot_keys = 0, != EMPTY) — NOT count > 0, so an all-NULL-value null group is
-    // still emitted consistently across passes. `key`/`key_i128` are a placeholder; the engine renders the
-    // key as SqlValue::Null via `key_is_null`.
-    let null_slot = nslots + 1;
-    if keys[null_slot] != EMPTY {
-        groups.push(GroupByI32Row {
-            key: 0,
-            count: counts[null_slot],
-            sum: sums[null_slot],
-            sum_hi: sum_his[null_slot],
-            min: mins[null_slot],
-            max: maxs[null_slot],
-            min_hi: min_his[null_slot],
-            max_hi: max_his[null_slot],
-            min_uuid: uuid_at(&mins_uuid, null_slot),
-            max_uuid: uuid_at(&maxs_uuid, null_slot),
-            key_i128: 0,
-            key_is_null: true,
-        });
     }
     // A numeric SUM that overflowed i128 in any group/thread set this flag on-device -> PG numeric
     // field overflow (never silently wrapped). Checked after the kernel like the scalar numeric SUM.
