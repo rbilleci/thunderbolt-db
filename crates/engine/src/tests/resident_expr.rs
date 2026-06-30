@@ -4071,6 +4071,50 @@ fn gpu_group_by_composite_int8_member_bare() {
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_group_by_single_bigint_key_i64_min_dedicated_slot() {
+    // The slot table's EMPTY sentinel is i64::MIN, so a GROUP BY key == i64::MIN cannot live in the
+    // hash table -- the kernel routes it to the DEDICATED slot (idx = nslots). The result-path GPU
+    // stream-compaction must emit that dedicated slot (presence + correct stats). This is the BARE
+    // single-BIGINT i64 path, NOT the composite/i128 path that `*_two_int8_min_edge` exercises.
+    // (Audit follow-up to the stream-compaction commit -- closes the i64::MIN-bare-key coverage gap.)
+    use std::collections::BTreeMap;
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        &format!(
+            "INSERT INTO t (a,v) VALUES ({min},10),({min},20),(100,1),(200,2),(200,3)",
+            min = i64::MIN
+        ),
+    )
+    .unwrap();
+    let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
+    if snapshot.device_memory_proof.is_none() {
+        return;
+    }
+    let g = e
+        .execute_resident_expr_select_sql("SELECT a, COUNT(*), SUM(v) FROM t GROUP BY a")
+        .expect("single bigint GROUP BY incl the i64::MIN dedicated slot");
+    assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
+    let got: BTreeMap<i64, (i64, i64)> = g
+        .rows
+        .iter()
+        .map(|r| {
+            let (SqlValue::Int8(k), SqlValue::Int8(c), SqlValue::Int8(s)) = (&r[0], &r[1], &r[2])
+            else {
+                panic!("expected (Int8 key, Int8 count, Int8 sum), got {r:?}");
+            };
+            (*k, (*c, *s))
+        })
+        .collect();
+    assert_eq!(got.len(), 3, "exactly 3 groups (incl the i64::MIN dedicated slot)");
+    assert_eq!(got.get(&i64::MIN), Some(&(2, 30)), "i64::MIN key (dedicated slot) => count 2, sum 30");
+    assert_eq!(got.get(&100), Some(&(1, 1)), "100 => count 1, sum 1");
+    assert_eq!(got.get(&200), Some(&(2, 5)), "200 => count 2, sum 5");
+}
+
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_group_by_composite_int8_and_int4_ordered() {
     // Composite GROUP BY a, b (a BIGINT, b INT) with a NEGATIVE wide member + a duplicate group +
     // SUM(c); ORDER BY a, b gives the true (a,b) order over the unpacked columns.
