@@ -111,9 +111,19 @@ rejected.
 mutated incrementally on commit, with on-device visibility only on the rare old-snapshot path. Host =
 control plane only.** Concretely:
 
-1. **Hot columnar image = latest committed version per row, dense (≈ today's layout).** Each row carries a
-   minimal inline **creator stamp** `created_by` (= `commit_seq`) and an **undo reference** into the
-   version-delta store (NONE if the row was never superseded).
+1. **Hot store = a SEGMENTED columnar layout: a sequence of immutable *sealed* shards + one bounded *open*
+   (active) shard** — NOT a unified buffer (ADR-012 retires that). Within a shard, columns are dense and
+   contiguous (PAX) for coalesced reads, plus per-shard **zone maps** (min/max — already a per-table stat,
+   `ResidentDeviceInt4ColumnStats`) and a **VersionedPositions synopsis** (which row ranges hold recent
+   versions, so a latest-snapshot scan skips the visibility check on un-versioned shards — HyPer). Each row
+   carries a minimal inline **creator stamp** `created_by` (= `commit_seq`) + an **undo reference** into the
+   version-delta store (NONE if never superseded). This is the engine's committed residency unit (ADR-010
+   shards, `residency.shards: Vec<RelationalResidentShard>`) and read model (push-down-to-shard + cross-shard
+   combine, ADR-012); it composes with STRATA admission / eviction / streaming (the over-VRAM requirement)
+   and per-shard vacuum. The open shard ≈ a write-optimized "delta"; sealed shards ≈ read-optimized "main"
+   (HANA / Kudu / Umbra merge-on-read), with a periodic **merge** folding churn into the main shards.
+   (Capacity-padded growth is fine *inside* the bounded open shard — worst case O(shard), never O(table) —
+   but the table-level structure is segmented, never one padded buffer.)
 2. **Version-delta (undo) store** = before-images of superseded rows, **changed columns only**,
    newest-to-oldest, keyed for reconstruction. Lives in a compact device region (or host-cold per ADR-012),
    consulted only by reads older than the latest commit.
@@ -127,12 +137,19 @@ control plane only.** Concretely:
      O(rows deleted).
    - **UPDATE** → capture the before-image (changed columns) to undo + **patch the hot slot in place** to
      the new values, advancing `created_by`. O(rows updated).
-   None are O(table); the full re-admit is deleted from the commit path.
+   None are O(table); the full re-admit is deleted from the commit path. Writes target the **open shard**;
+   a sealed shard is immutable except by vacuum/merge, so an UPDATE/DELETE to a sealed-shard row stamps its
+   `deleted_by` in place and (for UPDATE) appends the new version to the open shard. **Write delivery** uses
+   the wave engine's host-pinned lock-free ring (ADR-009): the host enqueues mutation intents in
+   `commit_seq` order and a persistent kernel drains the ring and applies them to the open shard on-device —
+   segmented shards are the *storage*, the wave ring is the *delivery*.
 5. **Device-side vacuum/GC** = prune undo entries + reclaim tombstoned slots below the oldest active reader
    snapshot (GPU analog of `prune_versions_deleted_at_or_before`, guarded as `checkpoint_vacuum_mvcc_versions`,
    `engine_introspection.rs:119`). Off the hot path.
-6. **Index** = key → hot slot (single-version, slot = latest). lpb/wave probe unchanged for latest reads;
-   an old-snapshot point lookup on a since-updated row reconstructs via undo.
+6. **Index** = key → (shard, slot) for the latest version (single-version per key). Per-shard indexes
+   probed in parallel + merged, or one global index over shards (decided by measurement); the lpb/wave probe
+   is unchanged per shard for latest reads. An old-snapshot point lookup on a since-updated row reconstructs
+   via undo.
 7. **Host = control plane only** (answers "how is MVCC handled"): the host assigns `commit_seq` (the
    deterministic log order, ADR-009/ADR-001), writes + fsyncs the WAL, holds the catalog, and orchestrates
    checkpoint/recovery — then routes the *mutation intent* to the GPU. **MVCC lives on the GPU**: the
@@ -217,11 +234,19 @@ them. Each slice is a strict step toward the optimal target.
 
 ## Slice plan
 
-- **Slice 1 — Incremental INSERT.** On an INSERT-only commit, append the stamped hot slot(s) instead of
-  re-admitting; delete the full re-admit from that path. Introduces the inline `created_by` creator stamp.
-  Latest-snapshot reads unchanged; old-snapshot reads skip rows with `created_by > read_txn_id` (cheap,
-  rare path; no undo needed). Gates: incremental == full-rebuild; old-snapshot read == host MVCC; the
-  dual-store-tax benchmark goes flat for INSERT; the read-path benchmark shows no latest-read regression.
+- **Slice 1 — Incremental INSERT via shard-append (phased; built on the existing shard infra, NOT a padded
+  unified buffer):**
+  - **1a — Open-shard append layout.** Route resident tables through the sharded layout (sealed shards + one
+    bounded open shard) and add an append path that writes rows into the open shard and seals + rolls over at
+    a target size; reads go through the existing push-down-to-shard + combine path. Introduce the inline
+    `created_by` stamp. Gate: byte-identical to the unified-buffer reads + **no read regression** on
+    `r2_wave_engine_ab`.
+  - **1b — Route INSERT-only commits to append.** On an INSERT-only commit to a fixed-width table, append to
+    the open shard (O(rows)) instead of full re-admit; UPDATE/DELETE/text fall back to re-admit. Index:
+    invalidate → lazy rebuild (incremental index = Slice 5). Gate: incremental == full-rebuild; the
+    dual-store-tax benchmark goes flat for INSERT.
+  - **1c — Old-snapshot visibility.** Latest reads still pay nothing; old-snapshot reads skip rows with
+    `created_by > read_txn_id` (per-shard, cheap). Gate: old-snapshot read == host MVCC.
 - **Slice 2 — Version-delta (undo) store + old-snapshot reconstruction.** The out-of-line before-image
   structure + the reconstruction read path. Foundation for UPDATE/DELETE.
 - **Slice 3 — Incremental DELETE.** Capture before-image to undo + tombstone the hot slot.
