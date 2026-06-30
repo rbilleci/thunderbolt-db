@@ -410,10 +410,15 @@ impl Engine {
 
         let count: i64 = match *predicate {
             ResidentPredicate::All => {
-                // Unfiltered COUNT(*): a device header-count kernel proves residency (recorded as a
-                // route device lookup), validated against the snapshot's expected row count.
+                // Unfiltered COUNT(*): the device header-count kernel proves residency (recorded as a
+                // route device lookup). The COUNT itself is the reader's MVCC-snapshot view
+                // (snapshot.row_count), NOT the raw device header: an in-place open-shard append
+                // (Slice 1b-ii) bumps the device header for a LATER commit, so a concurrent reader's
+                // header read can legitimately EXCEED snapshot.row_count — that is not corruption, and a
+                // strict `==` here would spuriously fail the COUNT. Only a header BELOW the snapshot's
+                // count is genuine corruption (the device has fewer rows than the snapshot advertises).
                 let lookup_started = Instant::now();
-                let row_count = device_memory.count_rows_from_header().map_err(|err| {
+                let device_header = device_memory.count_rows_from_header().map_err(|err| {
                     ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                 })?;
                 let lookup_micros = lookup_started
@@ -421,16 +426,16 @@ impl Engine {
                     .as_micros()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                if row_count != snapshot.row_count as u64 {
+                let snapshot_count = resident_snapshot_row_count(snapshot)?;
+                if device_header < snapshot_count {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "resident device-memory row-count proof returned {row_count}, expected {}",
-                        snapshot.row_count
+                        "resident device-memory row-count proof returned {device_header}, below the snapshot's {snapshot_count}"
                     ))));
                 }
                 self.read_state
                     .route_telemetry
                     .record_route_device_lookup_micros(&table.name, lookup_micros, 1);
-                resident_count_to_i64(row_count)?
+                resident_count_to_i64(snapshot_count)?
             }
             ResidentPredicate::Int4Equal { col, needle } => {
                 let byte_offset = resident_device_int4_column_offset(snapshot, table, col)?;

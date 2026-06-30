@@ -12,7 +12,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         insert: Insert,
         txn_id: TxnId,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
         self.apply_insert_with_profile(cat, insert, txn_id, None)
     }
 

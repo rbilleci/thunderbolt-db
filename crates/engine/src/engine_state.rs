@@ -511,6 +511,11 @@ pub(crate) struct ResidencyReadState {
     /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
     /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.
     pub(crate) dense_index_probe_hits: std::sync::atomic::AtomicU64,
+    /// Slice 1b-ii-c: count of commits served by the IN-PLACE open-shard APPEND (vs a whole-table
+    /// re-admit). The test signal that the append actually fired — output equality can't prove it
+    /// (append and re-admit are byte-identical), and device-ptr stability can't either (a same-size
+    /// re-admit reuses the just-freed address). `Relaxed` monotonic counter.
+    pub(crate) open_shard_append_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

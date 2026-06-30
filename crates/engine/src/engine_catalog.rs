@@ -93,12 +93,17 @@ impl Engine {
                     // Stamp with the commit sequence (commit `Index`), NOT the façade txn_id, so the
                     // live COPY apply produces the same `created_by` a WAL replay would (Stage 0). The
                     // held catalog latch (`cat`) carries any working-map mutation (sequence advance).
-                    let result = engine.apply_insert_with_profile(
-                        cat,
-                        insert.clone(),
-                        commit_seq,
-                        Some(&mut apply_profile),
-                    );
+                    // The COPY current-apply path re-admits residency (it does not use the open-shard
+                    // append), so discard the applied-rows surfaced for the append path — keep this
+                    // closure's type `Result<(), _>` (the generic `apply_current` bound is unchanged).
+                    let result = engine
+                        .apply_insert_with_profile(
+                            cat,
+                            insert.clone(),
+                            commit_seq,
+                            Some(&mut apply_profile),
+                        )
+                        .map(|_applied| ());
                     current_apply_total_micros += apply_started.elapsed().as_micros();
                     result
                 },

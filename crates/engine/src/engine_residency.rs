@@ -301,9 +301,6 @@ pub(crate) fn build_relational_device_payload_with_capacity(
 /// int4/date/int2 (this slice's open-shard append is fixed-width-i32 only; text/int8/numeric ride the
 /// re-admit path until later slices), and when `row_start + new_rows.len() > capacity` (the headroom is
 /// exhausted — the caller must seal this shard and roll a fresh open one).
-// Interim WIP (charter): a tested building block; the production caller is the commit/admit append
-// path wired in Slice 1b-ii-b (which removes this allow).
-#[allow(dead_code)]
 pub(crate) fn compute_open_shard_int4_append_chunks(
     column_types: &[SqlType],
     capacity: usize,
@@ -576,6 +573,154 @@ mod capacity_payload_tests {
         .is_err());
     }
 
+    /// Slice 1b-ii-c END-TO-END: committed INSERTs on a GPU-resident int4 table APPEND in place to the
+    /// open shard via the SERIALIZED commit path (`commit_mutation_at`, the path `execute_text` — hence
+    /// the façade — actually uses) instead of re-uploading the whole table. All gates read through the
+    /// DEVICE resident route (the retained-template point-lookup path + the wave index), NOT the MVCC
+    /// store, so they actually exercise the appended device bytes + the index (an earlier version read
+    /// the store and was vacuous — append==re-admit there by construction). Gates:
+    ///  1. NON-VACUITY — the append FIRED: across 50 in-headroom inserts the open_shard_append_hits
+    ///     counter advances by EXACTLY 50 (sabotage the commit hook → 0 → fail). Output equality / device
+    ///     ptr-stability cannot prove it (append==re-admit byte-identical; a same-size re-admit reuses
+    ///     the freed address).
+    ///  2. DEVICE CORRECTNESS + Finding A — the GPU index probe over the appended shard equals the scan,
+    ///     resolves an APPENDED key to its bytes, and misses an absent key. A generation-blind stale
+    ///     index (cache keyed on the unchanged device ptr) would miss the appended key.
+    ///  3. NULL GUARD (audit DO-NOT-SHIP fix) — a committed INSERT carrying a NULL must NOT append in
+    ///     place (no validity bitmap on the open shard → an appended NULL reads as a phantom 0 on the
+    ///     device aggregate/DISTINCT routes); it must re-admit, so the counter does NOT advance.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn open_shard_append_fires_in_place_and_matches_device_route() {
+        use gpu_db_sql::{parse_command, Command, Select};
+        let select_cmd = |sql: &str| -> Select {
+            match parse_command(sql).unwrap() {
+                Command::Select(s) => s,
+                other => panic!("expected SELECT, got {other:?}"),
+            }
+        };
+        // DEVICE route, per needle: the resident retained-template point-lookup path (wave index when
+        // enabled, else the device scan) — reads the resident buffer, NOT the MVCC store.
+        let run = |e: &Engine, select: &Select, needles: &[i32]| -> Vec<RowBlock> {
+            let template = e.prepare_relational_retained_read_template(select).unwrap();
+            let submission = e
+                .submit_relational_retained_template_point_lookups(&template, needles)
+                .unwrap();
+            e.complete_relational_retained_read_submission(submission)
+                .unwrap()
+                .iter()
+                .map(|r| r.rows.clone())
+                .collect()
+        };
+
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        // Settle at 300 rows: the open shard's last headroom-overflow re-admit (at row 129) set capacity
+        // 512, so rows 130..512 — incl. the next 50 appends — fit without a further re-admit.
+        for i in 0..300_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let select_unique = select_cmd("SELECT id, balance FROM accounts WHERE id = 1");
+        if !e.plan_relational_resident_route(&select_unique).accepted {
+            return; // resident device route unavailable (no GPU / not accepted) -> nothing to exercise
+        }
+
+        // (1) NON-VACUITY: all 50 in-headroom commits take the IN-PLACE append.
+        let hits_before = e.open_shard_append_hits();
+        for i in 300..350_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            e.open_shard_append_hits() - hits_before,
+            50,
+            "all 50 in-headroom commits must take the IN-PLACE open-shard append (sabotaging the commit \
+             hook drops this to 0); output equality alone cannot prove the append fired"
+        );
+
+        // (2) DEVICE CORRECTNESS + Finding A: index-probe vs scan over needles incl. APPENDED keys
+        // (342, 349) and an absent key (999).
+        let needles = vec![5_i32, 200, 342, 349, 999];
+        e.set_index_probe_enabled(false);
+        let scan = run(&e, &select_unique, &needles);
+        e.set_index_probe_enabled(true);
+        let index = run(&e, &select_unique, &needles);
+        assert_eq!(
+            index, scan,
+            "GPU index-probe rows over the appended shard must equal the device scan rows (guards \
+             Finding A: an in-place append keeps the device ptr, so a generation-blind cached index \
+             would be stale and miss appended keys)"
+        );
+        // Non-vacuous: the flag-on run BUILT a real GPU index over the `id` filter column (col 0).
+        {
+            let cache = e
+                .read_state
+                .residency
+                .wave_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = cache
+                .get("accounts")
+                .expect("wave index cached after a flag-on run");
+            assert!(
+                entry.index_memory.is_some() && entry.column_idx == 0,
+                "the index-probe run must have built a real GPU index over the id column"
+            );
+        }
+        // ABSOLUTE: the in-place-appended key 342 resolves to its appended bytes; 999 is absent.
+        let at = |n: i32| index[needles.iter().position(|&x| x == n).unwrap()].clone();
+        let row342 = at(342);
+        assert_eq!(row342.len(), 1, "appended key 342 present via the device route");
+        assert_eq!(
+            row342.row(0),
+            &[SqlValue::Int4(342), SqlValue::Int4(3420)],
+            "the device route returns the in-place-appended row's bytes"
+        );
+        assert!(at(999).is_empty(), "absent key 999 returns no row");
+
+        // (2b) Finding A SPECIFICALLY: the flag-on run above BUILT + cached the GPU index. Now append a
+        // new key IN PLACE (same device ptr — capacity 512 holds row 351) and look it up via the index.
+        // The append must have INVALIDATED the cached index so the rebuild sees the new key; a stale,
+        // generation-blind HIT (cache keyed only on the unchanged ptr) would miss it. Remove the
+        // wave_index invalidation in try_append -> this lookup returns empty -> fail.
+        e.execute_text(20_000, "INSERT INTO accounts (id, balance) VALUES (360, 3600)")
+            .unwrap();
+        let after = run(&e, &select_unique, &[360]);
+        assert_eq!(
+            after[0].len(),
+            1,
+            "a key appended in place AFTER the index was built must be found — try_append must \
+             invalidate the cached GPU index (audit Finding A); a generation-blind stale HIT misses it"
+        );
+        assert_eq!(
+            after[0].row(0),
+            &[SqlValue::Int4(360), SqlValue::Int4(3600)],
+            "the post-build in-place-appended row resolves to its bytes via the rebuilt index"
+        );
+
+        // (3) NULL-GUARD NON-VACUITY (audit DO-NOT-SHIP fix): a committed INSERT carrying a NULL must
+        // fall back to re-admit (build the validity bitmap), NOT append in place. Remove the NULL guard
+        // in try_append -> this insert appends -> the counter advances -> this assertion fails.
+        let hits_pre_null = e.open_shard_append_hits();
+        e.execute_text(10_000, "INSERT INTO accounts (id, balance) VALUES (5000, NULL)")
+            .unwrap();
+        assert_eq!(
+            e.open_shard_append_hits(),
+            hits_pre_null,
+            "an appended NULL must force re-admit (which builds the validity bitmap), NOT an in-place \
+             append — an appended NULL has no bitmap and would read as a phantom 0 on the device"
+        );
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -710,6 +855,20 @@ impl Engine {
             .collect();
         let column_types: Vec<SqlType> =
             catalog_table.columns.iter().map(|column| column.ty).collect();
+        // Slice 1b-ii: a PURELY-int4 table is laid down as an OPEN shard with capacity headroom (~2x
+        // rows, power-of-two) so committed INSERTs append in place (amortized O(1)/row) instead of
+        // re-uploading the whole table every commit. Other shapes (and huge / empty tables) stay dense.
+        let purely_int4 = row_count > 0
+            && row_count < (1usize << 29)
+            && !column_types.is_empty()
+            && column_types
+                .iter()
+                .all(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2));
+        let capacity = if purely_int4 {
+            row_count.saturating_mul(2).next_power_of_two()
+        } else {
+            row_count
+        };
         let (
             mut device_payload,
             resident_device_text_columns,
@@ -717,9 +876,17 @@ impl Engine {
             resident_device_int4_column_stats,
             _resident_device_b128_columns,
             resident_device_null_columns,
-        ) = build_relational_device_payload(&column_names, &column_types, &resident_rows)?;
-        // The MVCC tuple bytes (key + value per row) ride after the columnar sections (unchanged).
-        device_payload.extend_from_slice(&raw_device_tail);
+        ) = build_relational_device_payload_with_capacity(
+            &column_names,
+            &column_types,
+            &resident_rows,
+            capacity,
+        )?;
+        // The dead MVCC tail rides only the dense (sealed) payload; an OPEN shard (capacity > row_count)
+        // omits it (no kernel reads it) so the section headroom an append writes into stays clean.
+        if capacity == row_count {
+            device_payload.extend_from_slice(&raw_device_tail);
+        }
 
         let memory_pressure_active = self
             .router
@@ -740,7 +907,8 @@ impl Engine {
             table: catalog_table.name.clone(),
             generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_deref()),
             row_count,
-            capacity: row_count,
+            // headroom for an open shard (== row_count for the dense/sealed path); Slice 1b-ii.
+            capacity,
             column_count: catalog_table.columns.len(),
             resident_bytes,
             resident_device_int4_columns,
@@ -973,6 +1141,125 @@ impl Engine {
             .residency
             .dense_index_probe_hits
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Slice 1b-ii-c: count of commits served by the IN-PLACE open-shard append (vs a whole-table
+    /// re-admit). The test/telemetry signal that the append actually fired — output equality and even
+    /// device-ptr stability can't prove it (a same-size re-admit reuses the freed address).
+    pub fn open_shard_append_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .open_shard_append_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Slice 1b-ii: append an INSERT's APPLIED rows IN PLACE into the table's resident OPEN shard's
+    /// capacity headroom, instead of a full re-admit. `new_rows` MUST be the post-coercion/post-default
+    /// applied images (the WriteDelta's `PreparedMutation::Insert.inserted_rows`), in catalog order, so
+    /// the appended bytes match what a full rebuild would store. Returns `true` iff it appended +
+    /// republished; `false` (the caller MUST fall back to invalidate + re-admit) when the table is not
+    /// purely-int4-resident, is invalidated, lacks headroom, or the device append fails. MUST run BEFORE
+    /// `committed_seq` is published, so a reader at the new commit observes the advanced `row_count`
+    /// (visibility ordering — same placement as the invalidation it replaces).
+    pub(crate) fn try_append_resident_int4_open_shard(
+        &self,
+        table: &str,
+        new_rows: &[Vec<SqlValue>],
+    ) -> bool {
+        if new_rows.is_empty() {
+            return false;
+        }
+        // Audit DO-NOT-SHIP fix: a NULL in an appended row would need a validity bitmap, but the open
+        // shard this path appends into is bitmap-free by construction (the eligibility check below
+        // requires `resident_device_null_columns.is_empty()`) and this append writes a NULL int4 as a
+        // placeholder 0 WITHOUT creating/maintaining a bitmap. The device aggregate / DISTINCT / GROUP BY
+        // routes derive NULL-ness solely from the bitmap, so an appended NULL would read as a phantom 0
+        // (wrong results vs the re-admit baseline). Decline -> the caller re-admits, which BUILDS the
+        // correct bitmap; thereafter the table has a null column so this path always declines it. (Bitmap
+        // maintenance on append is a later slice.)
+        if new_rows
+            .iter()
+            .any(|row| row.iter().any(|v| matches!(v, SqlValue::Null)))
+        {
+            return false;
+        }
+        let (capacity, row_start, column_count) = {
+            let snapshots = self.read_state.residency.snapshots.load();
+            let Some(entry) = snapshots.get(table) else {
+                return false;
+            };
+            let s = &entry.descriptor;
+            // Purely int4-resident: every column rides the i32 section (no other typed sections), so the
+            // int4 append op covers the whole row. (Date/Int2 ride i32 too — handled by the op.)
+            let purely_int4 = s.resident_device_int8_columns.is_empty()
+                && s.resident_device_numeric_columns.is_empty()
+                && s.resident_device_bool_columns.is_empty()
+                && s.resident_device_text_columns.is_empty()
+                && s.resident_device_null_columns.is_empty()
+                && s.column_count == s.resident_device_int4_columns.len();
+            if !s.is_valid() || !purely_int4 {
+                return false;
+            }
+            match s.row_count.checked_add(new_rows.len()) {
+                Some(end) if end <= s.capacity => (s.capacity, s.row_count, s.column_count),
+                _ => return false, // no headroom (or overflow) -> caller re-admits (with fresh headroom)
+            }
+        };
+        let Some(device_memory) = self.read_state.residency.device_memory.get(table) else {
+            return false;
+        };
+        // The append op reads each value's SqlValue variant (Int4/Date/Int2) for encoding; the column
+        // TYPES only gate eligibility + count, and a purely-int4 table is all-i32-section by definition.
+        let column_types = vec![SqlType::Int4; column_count];
+        let chunks =
+            match compute_open_shard_int4_append_chunks(&column_types, capacity, row_start, new_rows) {
+                Ok(chunks) => chunks,
+                Err(_) => return false,
+            };
+        if device_memory.append_owned_chunks(chunks).is_err() {
+            // A partial/failed append leaves bytes only in the (still-invisible) headroom beyond
+            // row_count; returning false makes the caller invalidate + re-admit, discarding them.
+            return false;
+        }
+        let k = new_rows.len();
+        let appended_bytes = (k * column_count * std::mem::size_of::<i32>()) as u64;
+        self.read_state.residency.with_snapshots_mut(|snapshots| {
+            if let Some(entry) = snapshots.get_mut(table) {
+                let desc = std::sync::Arc::make_mut(&mut entry.descriptor);
+                desc.generation = desc.generation.saturating_add(1);
+                desc.row_count += k;
+                desc.resident_bytes = desc.resident_bytes.saturating_add(appended_bytes);
+                // Keep host_rows (the CPU-path materialization) consistent: new INSERTs get monotonic
+                // tuple_ids, so they sort to the END of the seq-scan order — the same place the device
+                // append wrote them.
+                // NOTE (Slice 1b-ii-d, flagged): this make_mut clones the whole shared host-row vec —
+                // the SOLE remaining O(table)-per-commit cost (the device append above is O(rows)).
+                // Proven by measurement: skipping it makes the dual-store tax flat (~40us at every base
+                // size). The fix (structural-shared / sealed+open host rows) is its own slice; correctness
+                // requires it here today (the host-materialization read path reads host_rows).
+                let host = std::sync::Arc::make_mut(&mut entry.host_rows);
+                host.extend_from_slice(new_rows);
+            }
+        });
+        // Slice 1b-ii (audit Finding A): the wave/lpb GPU index cache (engine_retained_read.rs) validates a
+        // cached entry by (column, resident_device_ptr) ONLY — it is BLIND to generation/row_count. An
+        // in-place append keeps the SAME device_ptr, so a cached index built over [0, old_row_count) would
+        // be a stale HIT that reports the just-appended keys as not-found (a lost-from-reads committed
+        // INSERT). Drop the table's entry so the next probe rebuilds over the new row_count. This runs
+        // before the caller's publish_committed_seq, so a reader that observes the new committed_seq can
+        // never bind the stale index. (In-flight probes pinned the prior index's own Arc; removing the
+        // map entry only prevents NEW binds — the buffer frees once no submission holds it.)
+        self.read_state
+            .residency
+            .wave_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(table);
+        self.read_state
+            .residency
+            .open_shard_append_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit

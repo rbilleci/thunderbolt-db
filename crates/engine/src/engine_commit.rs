@@ -96,12 +96,15 @@ impl Engine {
         // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
         // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
         // order is fixed: commit_mutex (held in `commit`) FIRST, then this latch.
-        {
+        let appended = {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
+            let mut applied_insert: Option<(String, Vec<Vec<SqlValue>>)> = None;
             for e in &to_apply {
                 commit.sm.apply(e)?;
-                self.apply_mvcc_entry(e, cat)?;
+                if let Some(rows) = self.apply_mvcc_entry(e, cat)? {
+                    applied_insert = Some(rows);
+                }
                 commit.repl.mark_applied(e.index);
             }
 
@@ -115,14 +118,32 @@ impl Engine {
             // guaranteed to find this generation — the catalog is visible no later than `committed_seq`.
             // That, with the per-boundary self-consistency of the data (MVCC versions stamp old/new
             // part-counts at the DDL's commit_seq), rules out a reader straddling a shape-changing DDL.
-            self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
+            // Slice 1b-ii-c: an INSERT-only commit of EXACTLY ONE applied log entry APPENDS its rows in
+            // place to the resident open shard (O(rows)) instead of invalidating + re-admitting the whole
+            // table (the O(table) dual-store tax). The single-entry guard keeps the residency scope ==
+            // {that one table} — a multi-entry batch / DDL / update / delete falls back to the
+            // conservative invalidate below. Runs BEFORE publish_committed_seq, so a reader that observes
+            // the new committed_seq sees the appended rows; try_append also drops the table's stale GPU
+            // index (audit Finding A). On failure (not-int4-resident / no headroom / device err) it
+            // returns false and we invalidate + re-admit (which rebuilds with fresh headroom).
+            let appended = self.auto_admit_on_commit_enabled()
+                && to_apply.len() == 1
+                && match applied_insert.as_ref() {
+                    Some((table, rows)) => self.try_append_resident_int4_open_shard(table, rows),
+                    None => false,
+                };
+            if !appended {
+                self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
+            }
             let prune_below = self.catalog_prune_boundary(token.index);
             self.publish_catalog_snapshot(cat, token.index, prune_below);
-        }
+            appended
+        };
         self.publish_committed_seq(token.index);
         // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
         // after the publish so it snapshots the new generation; never fails the already-durable commit).
-        if self.auto_admit_on_commit_enabled() {
+        // Skipped when we appended in place above — that table is already resident + current.
+        if self.auto_admit_on_commit_enabled() && !appended {
             if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
                 self.auto_admit_resident_tables(&tables);
             }
@@ -449,12 +470,15 @@ impl Engine {
         &self,
         entry: &LogEntry,
         cat: &mut DdlCatalogState,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
+        // Returns the APPLIED insert rows `(table, rows)` for a single INSERT entry (Slice 1b-ii-c:
+        // the caller may append them in place to the resident open shard); `None` for every other
+        // command (and for a non-UTF-8 / unparseable payload — a defensive no-op as before).
         let Ok(text) = std::str::from_utf8(&entry.payload) else {
-            return Ok(());
+            return Ok(None);
         };
         let Ok(cmd) = parse_command(text) else {
-            return Ok(());
+            return Ok(None);
         };
 
         // Stage 0 (write-half MVCC): the version stamp is the commit sequence, which is the
@@ -469,6 +493,7 @@ impl Engine {
             read_txn_id: commit_seq,
         };
 
+        let mut applied_insert: Option<(String, Vec<Vec<SqlValue>>)> = None;
         match cmd {
             Command::SetKv { key, value } => {
                 // KV lives in its own shard. Read the current version under the loaded
@@ -645,13 +670,15 @@ impl Engine {
                 .apply_revoke_default_table_privileges(cat, &revoke.grantee, &revoke.privileges)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(cat, alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(cat, comment)?,
-            Command::Insert(insert) => self.apply_insert(cat, insert, commit_seq)?,
+            Command::Insert(insert) => {
+                applied_insert = self.apply_insert(cat, insert, commit_seq)?;
+            }
             Command::Delete(delete) => self.apply_delete(cat, delete, commit_seq)?,
             Command::Update(update) => self.apply_update(cat, update, commit_seq)?,
             _ => {}
         }
 
-        Ok(())
+        Ok(applied_insert)
     }
 }
 

@@ -148,7 +148,7 @@ impl Engine {
         insert: Insert,
         txn_id: TxnId,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
         // Stage 2 split: PURE prepare (preflight + encode + write-set) then a `&mut self` install,
         // both under the existing commit lock so the result is byte-identical to the old direct
         // apply. `txn_id` is the commit-seq (== `entry.index`), used as BOTH the read boundary and
@@ -156,7 +156,27 @@ impl Engine {
         // `next_row_id` and the read visibility match what the in-line apply used.
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_insert(&insert, snapshot, profile.as_deref_mut())?;
-        self.apply_delta_serialized(cat, delta, txn_id, profile)
+        // Slice 1b-ii-c: surface the APPLIED rows (post-coercion / post-default, catalog order — the
+        // actual stored images) for the commit path's in-place open-shard append. Captured BEFORE
+        // apply_delta_serialized consumes the delta; byte-identical to what a re-admit rebuild would
+        // store (same encode path). `(table, rows)`; `None` is impossible here (delta is an Insert) but
+        // keeps the type uniform with apply_mvcc_entry's other (non-insert) commands.
+        let applied = match &delta.mutation {
+            PreparedMutation::Insert {
+                table,
+                inserted_rows,
+                ..
+            } => Some((
+                table.clone(),
+                inserted_rows
+                    .iter()
+                    .map(|(_key, values)| values.clone())
+                    .collect(),
+            )),
+            _ => None,
+        };
+        self.apply_delta_serialized(cat, delta, txn_id, profile)?;
+        Ok(applied)
     }
 
     pub(crate) fn apply_delete(

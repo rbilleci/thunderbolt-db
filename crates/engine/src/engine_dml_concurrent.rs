@@ -280,6 +280,24 @@ impl Engine {
         // service rather than serve state inconsistent with the durable WAL (a restart replays the
         // WAL, the source of truth). Mark the entry applied so the replicator's applied_index tracks
         // the directly-applied commit (no later re-drain / re-apply).
+        //
+        // Slice 1b-ii: capture the APPLIED insert rows (post-coercion / post-default, the actual stored
+        // images) BEFORE apply_delta consumes the delta, so an INSERT-only commit can append them in
+        // place to the resident open shard instead of a full re-admit (residency step below).
+        let insert_append: Option<(String, Vec<Vec<SqlValue>>)> = match &delta.mutation {
+            crate::write_path::PreparedMutation::Insert {
+                table,
+                inserted_rows,
+                ..
+            } => Some((
+                table.clone(),
+                inserted_rows
+                    .iter()
+                    .map(|(_key, values)| values.clone())
+                    .collect(),
+            )),
+            _ => None,
+        };
         self.apply_delta(delta, commit_seq, None).unwrap_or_else(|err| {
             panic!(
                 "commit-path invariant violation: apply at commit_seq {commit_seq} failed after the \
@@ -300,21 +318,30 @@ impl Engine {
             .unwrap_or(commit_seq);
         commit.ledger.prune_below(prune_boundary);
 
-        // Residency invalidation for the mutated tables, INSIDE the critical section so it is atomic
-        // with the data publish (residency↔data consistency, design Risk #3): a reader that observes
-        // the new committed_seq also sees the table's GPU residency invalidated.
-        self.invalidate_relational_residency_tables_concurrent(
-            &residency_tables,
-            txn_id,
-            commit_seq,
-        );
+        // Residency, INSIDE the critical section + BEFORE publish (residency↔data consistency, design
+        // Risk #3). Slice 1b-ii: for an INSERT-only commit, try to APPEND the applied rows in place to
+        // the resident OPEN shard (advancing row_count) — O(rows), not a whole-table re-upload. On
+        // success skip the invalidation it replaces; otherwise invalidate (and the re-admit below
+        // rebuilds, with fresh headroom).
+        let appended = self.auto_admit_on_commit_enabled()
+            && insert_append
+                .as_ref()
+                .is_some_and(|(table, rows)| self.try_append_resident_int4_open_shard(table, rows));
+        if !appended {
+            self.invalidate_relational_residency_tables_concurrent(
+                &residency_tables,
+                txn_id,
+                commit_seq,
+            );
+        }
 
         // (3f) Publish point: bump committed_seq LAST (release-store). Strictly after the WAL fsync
         // and the data/value-index publish, so an acquire-load by a reader observes a fully durable,
         // fully published commit.
         self.publish_committed_seq(commit_seq);
-        // STRATA S-B: best-effort GPU-residency admission for the mutated tables (flag-gated).
-        if self.auto_admit_on_commit_enabled() {
+        // STRATA S-B: best-effort GPU-residency admission for the mutated tables (flag-gated). Skipped
+        // when we appended in place above — that table is already resident + current (Slice 1b-ii).
+        if self.auto_admit_on_commit_enabled() && !appended {
             self.auto_admit_resident_tables(&residency_tables);
         }
         self.metrics.inc_commit();
