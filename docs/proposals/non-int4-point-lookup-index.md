@@ -1,9 +1,66 @@
 # Proposal: non-int4 point-lookup indexes (bigint, text, uuid, numeric)
 
-> **Status: PROPOSAL (not accepted).** Forward-looking design for review. Evidence below is grounded in the
-> current kernel set on `main` (enumerated from `cached_function(c"...")` names in
-> `crates/execution/src/lib.rs`) and the resident routing in `crates/engine/src/engine_retained_read.rs` /
-> `engine_resident_probe.rs`. No code is changed by this doc.
+> **Status: PROPOSAL (not accepted) — refreshed 2026-06-30 with a cold-start onboarding section.** Forward-looking
+> design for review. Evidence below is grounded in the current kernel set on `main` (enumerated from
+> `cached_function(c"...")` names in `crates/execution/src/lib.rs`) and the resident routing in
+> `crates/engine/src/engine_retained_read.rs` / `engine_resident_probe.rs`. No code is changed by this doc.
+> **If you are an agent picking this up cold, read "Starting context" first — it has the current state, the exact
+> entry-point files/functions, how to measure + validate, and the charter discipline.**
+
+## Starting context (for the implementing agent — read this FIRST)
+
+**Where this sits (as of 2026-06-30).** The READ path is settled end-to-end *for i32 keys*: the lpb point-read
+route (GPU hash-index probe + columnar batched result) does **121.6M lookups/s @ batch 65536, p50 411us / p99
+476us** on a 1M-row in-L2 table (`accounts(id INT, balance INT)`), 4.17x over the full-scan path; the old p99
+~30ms tail is fixed. This proposal is the next READ-path **breadth** item — *key-type coverage* — and is
+independent of **R3 (writes)**, the other open phase (the SQL-INSERT load is ~111K rows/s; see memory
+`r3-write-path`). Work happens on branch `phase0-m1-engine-facade`, merged to `main` via `git merge --ff-only`
+per verified increment. There is no accepted sequencing yet — the user sets it; do not assume this runs before R3.
+
+**Entry points (start reading here).**
+- Route + gate: `crates/engine/src/engine_retained_read.rs:487 submit_resident_int4_equal_any_payload` (the
+  int4-only route) and `:701 build_wave_resident_int4_index` (the inline-packed index build — note it packs
+  `slot = (key << 32) | (row + 1)`, so the **row id must fit u32**; this packing is *why* the index can't simply
+  widen — see "Why the int4 index doesn't simply widen" below).
+- Route flags + non-vacuity telemetry: `crates/engine/src/engine_residency.rs:562 set_index_probe_enabled`,
+  `:574 set_dense_index_probe_enabled`, `:587 dense_index_probe_hits` (assert hits>0 in tests so a silent
+  scan-fallback can't pass — the lesson from the wave faked-throughput audit).
+- i32 probe kernels (the templates): `crates/execution/src/lib.rs:9813 submit_cuda_resident_i32_index_probe`
+  (PTX `gpu_db_resident_i32_index_probe`, open-addressing, power-of-2 table via `hash_shift`) and
+  `:10198 ..._dense` (single-pass dense compaction: for a unique key, thread *i* writes `result[needle_i]` — no
+  `atom.global.add`, no host scatter; this is type-AGNOSTIC, reuse it for every type).
+- Reusable hashing already in tree (the hard part is done): `hash_join_inner_i64` (`lib.rs:1350`), the text
+  hash-join probe `gpu_db_hash_join_probe_text` (`:15492`), and the composite wide-key builders
+  `pack_two_int4_cols_device` (`:1259`), `pack_two_cols_i128_device` (`:1274`), `build_wide_key_device` (`:1303`).
+- Differential test to model new ones on: `cuda_index_probe_matches_equal_any_scan` (`lib.rs:23476`).
+
+**How to measure + validate.**
+- Benchmark: `GPU_DB_BENCH_ROWS=1048576 cargo run --release --example r2_wave_engine_ab -p gpu_db_engine`
+  (the lpb-vs-scan A/B; the default batch sweep now includes 16384,65536 — the headline regime). The full
+  standard report card (raw kernels + lpb/wave, in-L2 + out-of-L2, latency+throughput) is
+  `scripts/benchmark_report_card.sh`. **Always report latency WITH throughput** (memory `benchmark-report-latency`).
+- Correctness: each new per-type probe must hold a **byte-identical `<type>_index_probe == <type>_scan`**
+  differential (model on the i32 test) across NULL / NULL-as-0 / absent / duplicate-needle / multi-row cases,
+  plus facade + protocol byte-identity, plus the route-hit (non-vacuity) assertion.
+
+**Charter discipline (load-bearing — non-negotiable).** GPU tests are `#[ignore]`, run under
+`timeout 290 cargo test ... -- --ignored --test-threads=1`, **NEVER `--gpu-reset`** (shared box), wait ~10s after
+any timeout-kill and never launch a GPU test right after a timeout-killed one. PTX is **ASCII-only**, validated
+with `ptxas --gpu-name sm_XX` before launch. Every new kernel gets an **independent adversarial audit** (never
+self-audit). The engine crate is fmt-dirty — never run crate-wide `cargo fmt`. Commit footer
+`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`; merge = checkout main ->
+`git merge --ff-only phase0-m1-engine-facade` -> push -> back to branch.
+
+**The unifying frame (recommended).** Every key type reduces to a `(hash64, verify-bytes)` pair: fixed-width
+(i32/i64/i128) — the key *is* the verify bytes; text — hash the content, verify by byte-compare; composite —
+pack or hash-combine components, verify component-wise. Build ONE general hash-bucket index + ONE probe kernel
+parameterized by an *encoder* + a *comparator*, and **leave the i32 inline-packed fast path untouched**. That
+collapses "N bespoke index kernels" into "one kernel + N small encoders," most of which already exist (the table
+in "Evidence" below). The per-type design in "Proposed design" is the concrete realization of this frame.
+
+**Read next:** `docs/HANDOVER.md` (the project start-here), `docs/DECISIONS.md` (the lpb/read-path ADRs + the
+result-path arc `11M->14.6M->44.1M->78.5M->121.6M`), and the memory index (the read-path arc, the charter, the
+`r3-write-path` and `benchmark-report-card` notes).
 
 ## Problem
 The fast, O(1) GPU **point-lookup index** path is **int4 only**. The only index-probe kernels that exist are:
