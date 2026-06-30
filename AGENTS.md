@@ -107,3 +107,29 @@ are now block-reduced and near roof in this baseline (`count_i32_compare` ~0.85;
 ~0.44 since it calls count twice). (The i64/i128 FILTERS earlier looked "slow" only as a
 100%-selectivity output artifact; at ~1% sel they are fine.) Treat a ratio FALLING below the
 baseline as the regression signal.
+
+### Standard benchmark report card (BOTH layers x BOTH cache regimes)
+
+The roofline above is Layer 1 only. The canonical, recurring artifact is the **report card**, which
+ALWAYS reports BOTH layers x BOTH cache regimes, p50 latency + throughput on every line:
+
+```
+scripts/benchmark_report_card.sh        # ~17-20 min; self-manages timeouts + GPU cool-downs
+```
+
+- **Layer 1 -- RAW READ KERNELS** (`read_kernel_roofline`, crates/execution): emits IN-L2 (32MB/col,
+  8M rows) AND OUT-OF-L2 (256MB/col, 64M rows) in ONE invocation.
+- **Layer 2 -- lpb/wave POINT-READ PATH** (`r2_wave_engine_ab`, crates/engine): batched equal-any
+  point reads = the production default route, run IN-L2 (Section B, 1M rows) and OUT-OF-L2 (Section C).
+
+**This card's L2 = 128 MB** (cudaDevAttrL2CacheSize, RTX PRO 6000 Blackwell Max-Q). OUT-OF-L2 needs the
+gathered i32 column (4B/row) to exceed 128MB => > 32M rows. Section C uses **48M rows = 192MB/col
+(1.5x L2)** by default.
+
+**BUILD-TIME NOTE (why Section C has its own timeout):** `r2_wave_engine_ab` builds its table via a SQL
+INSERT loop at ~11 us/row (CPU-bound SQL parse + txn/MVCC apply; in-memory WAL, no fsync). So 48M rows
+take ~9 min to build, which cannot fit a 280s box. Section C therefore gets `SECTION_C_TIMEOUT=700`
+(Sections A/B keep 280). The INSERT-chunk size was measured non-helpful (250/1000/10000 all ~11 us/row --
+the cost is the engine's per-row apply, not per-statement overhead), so the lever is the timeout, not the
+chunk. Tunables (env): `OUT_OF_L2_ROWS`, `OUT_OF_L2_BATCHES` (default 300; p50 stable there),
+`SECTION_{A,B,C}_TIMEOUT`, `GPU_GAP`. Never `--gpu-reset`.

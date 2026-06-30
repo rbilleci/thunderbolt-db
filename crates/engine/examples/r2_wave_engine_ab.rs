@@ -121,14 +121,24 @@ fn print_lat(label: &str, l: &Lat) {
 }
 
 /// Load `rows` accounts (id 0..rows-1, balance derived) and make the table GPU-resident.
+/// Prints the build (INSERT-loop + residency) wall time -- at large row counts the SQL build is the
+/// dominant cost, so the report card's out-of-L2 sizing is driven by this number.
 fn build_resident_engine(rows: i64) -> Result<Engine, Box<dyn Error>> {
+    let t_build = Instant::now();
+    // Rows per INSERT statement. At large row counts the SQL build dominates wall time; a bigger chunk
+    // amortizes per-statement parse/txn overhead so the out-of-L2 table can be built inside the timeout.
+    let chunk: i64 = env::var("GPU_DB_BENCH_INSERT_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(1000);
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
     let mut txn = 2u64;
     let mut id = 0i64;
     while id < rows {
         let mut vals = String::new();
-        for _ in 0..1000 {
+        for _ in 0..chunk {
             if id >= rows {
                 break;
             }
@@ -144,7 +154,14 @@ fn build_resident_engine(rows: i64) -> Result<Engine, Box<dyn Error>> {
         )?;
         txn += 1;
     }
+    let t_insert = t_build.elapsed();
     e.populate_relational_residency_snapshot("accounts")?;
+    println!(
+        "# build: {rows} rows loaded + made resident in {:.1}s (insert {:.1}s + residency {:.1}s)",
+        t_build.elapsed().as_secs_f64(),
+        t_insert.as_secs_f64(),
+        (t_build.elapsed() - t_insert).as_secs_f64(),
+    );
     Ok(e)
 }
 
