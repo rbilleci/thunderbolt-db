@@ -252,11 +252,13 @@ writes; GDS reserved for checkpoints, not the WAL).
 
 **Checkpoints bound recovery time (RTO).** Today `persist_durable_wal_checkpoint` (`engine_wal_archive.rs:54`)
 persists a durable WAL prefix + control file — recovery replays it, so RTO scales with WAL length
-(unbounded). The target ADDS a **GPU-state checkpoint via GDS (GPUDirect Storage)**: the GPU streams its
-resident columnar bytes directly to NVMe (DtoStorage, bypassing host RAM — exactly what ADR-009 reserves GDS
-for). Recovery = load the latest checkpoint image into the GPU (StorageToD) + replay only the WAL tail
-(`commit_seq >` checkpoint). Cadence is sized so (checkpoint-load + tail-replay) < CHARTER's 5-min full GPU
-recovery.
+(unbounded). The target ADDS a **GPU-state checkpoint**: the baseline path is GDS-independent (DtoH copy →
+host write the resident columnar bytes); **GDS / GPUDirect Storage (DtoStorage, bypassing host RAM — what
+ADR-009 reserves GDS for) is an OPTIMIZATION over that baseline, never a hard dependency** (review-2 #4), so
+recovery-equivalence never blocks on GDS availability. Recovery = load the latest checkpoint image into the
+GPU (StorageToD, or HtoD on the baseline path) + replay only the WAL tail (`commit_seq >` checkpoint).
+Cadence is sized against the **measured** apply/replay rate so (checkpoint-load + tail-replay) < CHARTER's
+5-min full GPU recovery.
 
 **Consistent checkpoints reuse the MVCC machinery — no write stall.** A checkpoint captures the data plane
 at a `commit_seq C`. Under delta/undo, "read the table at snapshot C" is already a consistent MVCC read, so
@@ -303,7 +305,12 @@ them. Each slice is a strict step toward the optimal target.
     the same store); dual-store-tax benchmark flat for the DEVICE write. **The gate must also account for the
     two remaining O(table)-per-commit sources or the "flat" claim is incomplete:** (i) **read-after-write** —
     the index invalidate → lazy rebuild is O(table) on the next read when the index probe is enabled (review
-    Finding 4); measure it, or state read-after-write stays O(table) until Slice 5; (ii) **host mirror** —
+    Finding 4 / review-2 #1); measure it with a read-after-write probe in the benchmark (else "flat" is a
+    commit-only claim and this term is silently O(table)). This term can be closed EARLY for INSERT by
+    **appending the new keys to the GPU hash index** (O(rows) amortized — INSERT is pure additions; the index
+    buffer needs its own headroom + periodic resize/rehash, like the data open shard) instead of
+    invalidate+rebuild; the hard part (index tombstone/compaction under UPDATE/DELETE) genuinely stays Slice
+    5. Until then, read-after-write is O(table); (ii) **host mirror** —
     `host_rows` is still cloned O(table) per commit (`Arc::make_mut` extend; proven — skipping it makes the
     tax flat ~40us, keeping it gives 723us@16k), so per-commit cost is host-bound until a structural-shared /
     sealed+open host-row representation (host analog of the open-shard append) or Slice 7 (retire the host
@@ -322,13 +329,20 @@ them. Each slice is a strict step toward the optimal target.
   in-place patch is a torn-row hazard against the lock-free, predicate-free latest-reader). Gate adds: a
   HAZARD test with a concurrent latest-reader during a multi-column UPDATE must observe only whole rows
   (never col-A-new/col-B-old).
-- **Slice 5 — Device vacuum/GC + incremental index maintenance.** Prune undo + reclaim tombstones below
-  the oldest active snapshot; keep the index current without an O(table) rebuild.
-- **Slice 6 — GPU-state checkpoint (GDS) + WAL-replay-into-GPU recovery.** Add the GPU-state checkpoint
-  (DtoStorage) and a recovery path that loads the latest checkpoint into the GPU and replays the WAL tail.
+- **Slice 5 — Device vacuum/GC + incremental index maintenance under UPDATE/DELETE.** Prune undo + reclaim
+  tombstones below the oldest active snapshot; keep the index current without an O(table) rebuild under
+  churn (tombstone + compaction). The easy INSERT-only case — *appending* new keys, O(rows) amortized — can
+  land earlier alongside the data append (review-2 #1); this slice is the hard part: index entries that must
+  be invalidated/compacted when UPDATE/DELETE supersede or remove rows.
+- **Slice 6 — GPU-state checkpoint + WAL-replay-into-GPU recovery.** Add a GPU-state checkpoint and a
+  recovery path that loads the latest checkpoint into the GPU and replays the WAL tail. **The baseline
+  checkpoint is GDS-INDEPENDENT (DtoH copy → host write); GPUDirect Storage (DtoStorage, bypassing host RAM)
+  is an OPTIMIZATION, not the gate (review-2 #4)** — RPO-0 / recovery-equivalence (hence retiring the host
+  store) must not block on GDS hardware/driver availability. Checkpoint cadence is sized against the
+  **measured** WAL-tail apply/replay rate (review-2 #6) so (checkpoint-load + tail-replay) < the RTO budget.
   **Production durability gate:** crash-recovery tests (kill the process across the fsync / GPU-apply /
-  publish boundary) must prove RPO 0 and a byte-identical recovered state, with recovery time inside the
-  RTO budget. Nothing about retiring the host store may proceed until this is green.
+  publish boundary) must prove RPO 0 and a byte-identical recovered state, recovery time inside RTO. Nothing
+  about retiring the host store may proceed until this is green.
 - **Slice 7 — Retire the host MVCC store for resident tables.** Now safe (GPU-side durability proven
   equivalent to today's host-store recovery). The host keeps WAL + checkpoint orchestration + catalog; the
   in-memory row mirror is deleted. Closes "host out of the data path" (S10d/S-F) for the write side, and
@@ -356,6 +370,12 @@ always-fallback can't pass the gates (the wave faked-throughput lesson).
   store, but the design uses COW uniformly to keep a single safe path.
 - **Old-snapshot index probe contract.** key → latest slot is trivial for latest reads; an old-snapshot
   point lookup on a since-updated row must reconstruct via undo — define this probe contract.
+- **Index↔shard encoding contract (before multi-shard rollover, review-2 #2).** Today the append writes into
+  one capacity-padded buffer's headroom, so rows stay flat-addressed and the R1 index's `(key<<32)|(row+1)`
+  encoding still holds — this is not live yet. When the segmented sealed+open multi-shard target lands, "row"
+  becomes `(shard, slot)`: the index value (and the cross-shard combine) must carry the shard dimension
+  (per-shard indexes probed in parallel + merged, or a global index whose value encodes shard+slot). Define
+  this contract BEFORE the first multi-shard rollover, not after.
 - **Recovery (RTO)** must hit CHARTER's < 5 min full GPU recovery; checkpoints (ADR-009, GDS) bound replay.
 - **Concurrent commits.** `commit_dml_concurrent` assigns `commit_seq` under the commit lock; the GPU
   mutation must apply consistently with that order (the creator stamp makes apply-order irrelevant to
