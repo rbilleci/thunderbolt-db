@@ -344,6 +344,11 @@ pub struct RelationalResidencySnapshot {
     pub table: String,
     pub generation: u64,
     pub row_count: usize,
+    /// Number of row SLOTS the fixed-width device sections are sized for (`>= row_count`). Dense /
+    /// sealed payloads have `capacity == row_count`; an OPEN shard (Slice 1b) exceeds it by the reserved
+    /// headroom. Section OFFSETS derive from `capacity` (the `resident_device_*_column_offset` helpers
+    /// read it); `row_count` bounds the live rows. `capacity == row_count` reproduces the dense layout.
+    pub capacity: usize,
     pub column_count: usize,
     pub resident_bytes: u64,
     // NOTE: the heavy host-side row materialization (`resident_rows`) is NOT here -- it lives in the
@@ -851,13 +856,15 @@ pub(crate) fn resident_device_int4_column_offset(
             column.name
         ))));
     }
-    let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+    // Section offsets use the fixed-width CAPACITY the sections were sized for (== row_count for a dense
+    // payload; > row_count for an open shard with reserved headroom), so a padded shard addresses right.
+    let capacity = u64::try_from(snapshot.capacity).map_err(|_| {
         ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident snapshot row count exceeds retained device-memory proof range".to_string(),
+            "resident snapshot capacity exceeds retained device-memory proof range".to_string(),
         ))
     })?;
     let int4_width = std::mem::size_of::<i32>() as u64;
-    let offset = row_count
+    let offset = capacity
         .checked_mul(int4_width)
         .and_then(|column_bytes| {
             (int4_ordinal as u64)
@@ -968,9 +975,10 @@ pub(crate) fn resident_device_int8_column_offset(
             column.name
         ))));
     }
-    let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+    // Section offsets use the fixed-width CAPACITY (== row_count dense; > row_count for an open shard).
+    let capacity = u64::try_from(snapshot.capacity).map_err(|_| {
         ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident snapshot row count exceeds retained device-memory proof range".to_string(),
+            "resident snapshot capacity exceeds retained device-memory proof range".to_string(),
         ))
     })?;
     let payload_offset_overflow = || {
@@ -978,13 +986,13 @@ pub(crate) fn resident_device_int8_column_offset(
             "resident snapshot int8 payload offset overflowed".to_string(),
         ))
     };
-    let int4_section_bytes = row_count
+    let int4_section_bytes = capacity
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|int4_col_bytes| {
             (snapshot.resident_device_int4_columns.len() as u64).checked_mul(int4_col_bytes)
         })
         .ok_or_else(payload_offset_overflow)?;
-    let int8_prefix_bytes = row_count
+    let int8_prefix_bytes = capacity
         .checked_mul(std::mem::size_of::<i64>() as u64)
         .and_then(|int8_col_bytes| (int8_ordinal as u64).checked_mul(int8_col_bytes))
         .ok_or_else(payload_offset_overflow)?;
@@ -1031,9 +1039,10 @@ pub(crate) fn resident_device_numeric_column_offset(
             column.name
         ))));
     }
-    let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+    // Section offsets use the fixed-width CAPACITY (== row_count dense; > row_count for an open shard).
+    let capacity = u64::try_from(snapshot.capacity).map_err(|_| {
         ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident snapshot row count exceeds retained device-memory proof range".to_string(),
+            "resident snapshot capacity exceeds retained device-memory proof range".to_string(),
         ))
     })?;
     let payload_offset_overflow = || {
@@ -1041,19 +1050,19 @@ pub(crate) fn resident_device_numeric_column_offset(
             "resident snapshot numeric payload offset overflowed".to_string(),
         ))
     };
-    let int4_section_bytes = row_count
+    let int4_section_bytes = capacity
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|int4_col_bytes| {
             (snapshot.resident_device_int4_columns.len() as u64).checked_mul(int4_col_bytes)
         })
         .ok_or_else(payload_offset_overflow)?;
-    let int8_section_bytes = row_count
+    let int8_section_bytes = capacity
         .checked_mul(std::mem::size_of::<i64>() as u64)
         .and_then(|int8_col_bytes| {
             (snapshot.resident_device_int8_columns.len() as u64).checked_mul(int8_col_bytes)
         })
         .ok_or_else(payload_offset_overflow)?;
-    let numeric_prefix_bytes = row_count
+    let numeric_prefix_bytes = capacity
         .checked_mul(std::mem::size_of::<i128>() as u64)
         .and_then(|numeric_col_bytes| (numeric_ordinal as u64).checked_mul(numeric_col_bytes))
         .ok_or_else(payload_offset_overflow)?;
