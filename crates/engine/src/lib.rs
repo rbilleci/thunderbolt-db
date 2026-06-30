@@ -375,6 +375,13 @@ struct CommitState {
     /// PITR-by-timestamp lookups. Keyed by the façade txn_id (the durable identity), distinct from
     /// the MVCC `commit_seq`.
     wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
+    /// O(1) running max of every value ever put into `wal_commit_timestamps_micros`. Commit
+    /// timestamps are assigned monotonically (`next_commit_timestamp_micros`), so this is exactly
+    /// `wal_commit_timestamps_micros.values().max()` — tracked incrementally to keep the per-commit
+    /// timestamp assignment O(1) instead of an O(n) scan of the never-pruned map. Maintained ONLY
+    /// via `record_commit_timestamp` so the two can never drift (the invariant the differential
+    /// test asserts). `0` means "no commit yet".
+    max_commit_timestamp_micros: u64,
     /// The recent-commits conflict ledger (SI write-write, first-committer-wins).
     ledger: RecentCommitsLedger,
     /// The KV replay/state machine (the `SET`/`DELETE`/`GET` key namespace's applied-record log +
@@ -386,6 +393,18 @@ struct CommitState {
     /// control runs on the serialized path; the active-count / oldest-txn watermark reads take a brief
     /// `commit_state()` shim.
     txn_manager: TxnManager,
+}
+
+impl CommitState {
+    /// Record a commit's wall-clock timestamp in the PITR map AND advance the O(1) running max
+    /// (`max_commit_timestamp_micros`) in lock-step. EVERY writer of `wal_commit_timestamps_micros`
+    /// must go through here so the max can never lag the map — that is the invariant
+    /// `next_commit_timestamp_micros` relies on to skip the old O(n) `.values().max()` scan.
+    fn record_commit_timestamp(&mut self, txn_id: TxnId, timestamp_micros: u64) {
+        self.wal_commit_timestamps_micros
+            .insert(txn_id, timestamp_micros);
+        self.max_commit_timestamp_micros = self.max_commit_timestamp_micros.max(timestamp_micros);
+    }
 }
 
 /// The whole-engine value-index key `(table, column, value)`. With the value-index now folded

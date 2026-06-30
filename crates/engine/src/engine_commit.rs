@@ -32,13 +32,13 @@ impl Engine {
 
     pub(crate) fn next_commit_timestamp_micros(&self) -> u64 {
         let wall_clock = current_timestamp_micros();
-        self.commit_state()
-            .wal_commit_timestamps_micros
-            .values()
-            .copied()
-            .max()
-            .map(|last| wall_clock.max(last.saturating_add(1)))
-            .unwrap_or(wall_clock)
+        // O(1): read the running max instead of scanning the never-pruned timestamp map. Identical
+        // to the old `wal_commit_timestamps_micros.values().max().map(|last| wall.max(last+1))`:
+        // before any commit the max is 0, so `wall.max(0+1) == wall` reproduces the empty-map arm
+        // (wall-clock micros dwarf 1); after commits it is `wall.max(prior_max + 1)`, guaranteeing a
+        // strictly-monotonic timestamp >= wall clock.
+        let prior_max = self.commit_state().max_commit_timestamp_micros;
+        wall_clock.max(prior_max.saturating_add(1))
     }
 
     pub fn commit_mutation_at(
@@ -83,9 +83,7 @@ impl Engine {
             // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in
             // the WAL record and keyed here for PITR lookups. Intentionally DECOUPLED from the MVCC
             // version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
-            commit
-                .wal_commit_timestamps_micros
-                .insert(txn_id, timestamp_micros);
+            commit.record_commit_timestamp(txn_id, timestamp_micros);
             token
         };
 
@@ -178,9 +176,7 @@ impl Engine {
                 .repl
                 .wait_committed(token, Duration::from_millis(0))?;
             // `txn_id` is the durable transaction identity (decoupled from the MVCC `commit_seq`).
-            commit
-                .wal_commit_timestamps_micros
-                .insert(txn_id, timestamp_micros);
+            commit.record_commit_timestamp(txn_id, timestamp_micros);
             token
         };
 
@@ -656,5 +652,86 @@ impl Engine {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod commit_timestamp_tests {
+    use crate::Engine;
+
+    fn engine_with_commits(n: u64) -> Engine {
+        let engine = Engine::new_local();
+        engine
+            .execute_text(1, "CREATE TABLE t (id INT)")
+            .expect("create table");
+        for i in 0..n {
+            engine
+                .execute_text(i + 2, &format!("INSERT INTO t (id) VALUES ({i})"))
+                .expect("insert");
+        }
+        engine
+    }
+
+    /// NON-VACUOUS DIFFERENTIAL: the O(1) `max_commit_timestamp_micros` must equal the O(n)
+    /// `wal_commit_timestamps_micros.values().max()` it replaced, after a real commit sequence.
+    /// This is byte-identity by construction — if `record_commit_timestamp` ever fails to bump the
+    /// running max, the two diverge and this fails. The length assert proves commits actually ran
+    /// (so the equality is not vacuously over an empty map).
+    #[test]
+    fn running_max_equals_full_scan_of_map() {
+        let engine = engine_with_commits(64);
+        let commit = engine.commit_state();
+        let scan_max = commit
+            .wal_commit_timestamps_micros
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert!(
+            commit.wal_commit_timestamps_micros.len() >= 64,
+            "expected the commit-timestamp map to be populated (got {})",
+            commit.wal_commit_timestamps_micros.len()
+        );
+        assert_ne!(scan_max, 0, "non-vacuity: the scanned max must be a real timestamp");
+        assert_eq!(
+            commit.max_commit_timestamp_micros, scan_max,
+            "O(1) running max diverged from the O(n) scan it replaced"
+        );
+    }
+
+    /// The assignment property the O(n) scan guaranteed is preserved: commit timestamps are strictly
+    /// increasing. (txn_ids are assigned monotonically here, so `values()` is in commit order.)
+    #[test]
+    fn assigned_timestamps_are_strictly_monotonic() {
+        let engine = engine_with_commits(32);
+        let commit = engine.commit_state();
+        let stamps: Vec<u64> = commit
+            .wal_commit_timestamps_micros
+            .values()
+            .copied()
+            .collect();
+        assert!(stamps.len() >= 32, "expected commits to be recorded");
+        for pair in stamps.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "commit timestamps must be strictly increasing: {} !> {}",
+                pair[1],
+                pair[0]
+            );
+        }
+    }
+
+    /// Fresh engine (empty map): the running max is 0 and `next_commit_timestamp_micros` returns the
+    /// wall clock — reproducing the old `unwrap_or(wall_clock)` arm (wall micros >> 1).
+    #[test]
+    fn fresh_engine_next_timestamp_is_wall_clock() {
+        let engine = Engine::new_local();
+        {
+            let commit = engine.commit_state();
+            assert_eq!(commit.max_commit_timestamp_micros, 0);
+            assert!(commit.wal_commit_timestamps_micros.is_empty());
+        }
+        let ts = engine.next_commit_timestamp_micros();
+        assert!(ts > 1, "fresh-engine timestamp should be the wall clock, got {ts}");
     }
 }

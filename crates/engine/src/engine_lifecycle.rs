@@ -132,6 +132,7 @@ impl Engine {
                 repl: LocalReplicator::leader(),
                 wal: WalBuffer::default(),
                 wal_commit_timestamps_micros: BTreeMap::new(),
+                max_commit_timestamp_micros: 0,
                 ledger: RecentCommitsLedger::default(),
                 sm: KvStateMachine::default(),
                 txn_manager: TxnManager::default(),

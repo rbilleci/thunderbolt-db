@@ -266,9 +266,7 @@ impl Engine {
         commit
             .repl
             .wait_committed(token, Duration::from_millis(0))?;
-        commit
-            .wal_commit_timestamps_micros
-            .insert(txn_id, timestamp_micros);
+        commit.record_commit_timestamp(txn_id, timestamp_micros);
 
         // (3d) Install the already-validated delta + publish the table generation. The delta was
         // re-resolved at exactly this `commit_seq` above, so this is a PURE install (reserve fresh
