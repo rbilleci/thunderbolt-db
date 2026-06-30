@@ -34,7 +34,47 @@ pub(crate) fn build_relational_device_payload(
     ),
     ExecuteError,
 > {
+    // The unified-buffer / sealed-shard path is exactly `capacity == row_count` — every padding loop
+    // in the capacity-aware builder is then zero-iteration, so the bytes are identical to before.
+    build_relational_device_payload_with_capacity(column_names, column_types, rows, rows.len())
+}
+
+/// Slice 1a (GPU-native writes): build the columnar payload with each FIXED-WIDTH section sized for
+/// `capacity >= row_count` rows (headroom = `capacity - row_count` zero-padded slots), so an OPEN shard
+/// can have new rows appended into the headroom in place (via `append_owned_chunks`) instead of being
+/// rebuilt + re-uploaded. The 8-byte header still records `row_count` (the live row count); section
+/// OFFSETS derive from `capacity` (callers/read-helpers pass it). `capacity == row_count` reproduces the
+/// dense build byte-for-byte. Headroom is only definable for fixed-width sections, so an open
+/// (`capacity > row_count`) payload rejects variable-length text columns; the open-shard route declines
+/// text tables to the full re-admit.
+pub(crate) fn build_relational_device_payload_with_capacity(
+    column_names: &[String],
+    column_types: &[SqlType],
+    rows: &[Vec<SqlValue>],
+    capacity: usize,
+) -> Result<
+    (
+        Vec<u8>,
+        Vec<ResidentDeviceTextColumnLayout>,
+        Vec<ResidentDeviceBoolColumnLayout>,
+        Vec<ResidentDeviceInt4ColumnStats>,
+        Vec<(String, u64)>,
+        Vec<ResidentDeviceNullBitmapLayout>,
+    ),
+    ExecuteError,
+> {
     let row_count = rows.len();
+    if capacity < row_count {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "resident payload capacity {capacity} is below the row count {row_count}"
+        ))));
+    }
+    if capacity > row_count && column_types.iter().any(|ty| matches!(ty, SqlType::Text)) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "open-shard (capacity-padded) resident payload does not support variable-length text columns"
+                .to_string(),
+        )));
+    }
     let mut device_payload = vec![0u8; std::mem::size_of::<u64>()];
     let mut resident_device_text_columns = Vec::new();
     let mut resident_device_bool_columns = Vec::new();
@@ -72,6 +112,9 @@ pub(crate) fn build_relational_device_payload(
             }
             device_payload.extend_from_slice(&value.to_le_bytes());
         }
+        for _ in row_count..capacity {
+            device_payload.extend_from_slice(&0_i32.to_le_bytes());
+        }
         resident_device_int4_column_stats.push(ResidentDeviceInt4ColumnStats {
             name: column_names[col_idx].clone(),
             min,
@@ -99,6 +142,9 @@ pub(crate) fn build_relational_device_payload(
             };
             device_payload.extend_from_slice(&value.to_le_bytes());
         }
+        for _ in row_count..capacity {
+            device_payload.extend_from_slice(&0_i64.to_le_bytes());
+        }
     }
     // numeric / uuid share the 16-byte section (numeric = i128 mantissa LE; uuid = raw 16 bytes).
     for col_idx in column_types
@@ -124,6 +170,9 @@ pub(crate) fn build_relational_device_payload(
                 }
             }
         }
+        for _ in row_count..capacity {
+            device_payload.extend_from_slice(&[0u8; 16]);
+        }
         resident_device_b128_columns.push((column_names[col_idx].clone(), section_byte_offset));
     }
     // bool -> a 1-bit-per-row bitmap (ceil(row_count/32) LE u32 words, bit i = row i, LSB-first).
@@ -134,7 +183,7 @@ pub(crate) fn build_relational_device_payload(
         .map(|(i, _)| i)
     {
         let bitmap_byte_offset = device_payload.len() as u64;
-        let mut words = vec![0u32; row_count.div_ceil(32)];
+        let mut words = vec![0u32; capacity.div_ceil(32)];
         for (i, row) in rows.iter().enumerate() {
             match row[col_idx] {
                 // NULL leaves the value bit 0 (don't-care; the validity bitmap marks the row).
@@ -167,7 +216,7 @@ pub(crate) fn build_relational_device_payload(
             continue;
         }
         let bitmap_byte_offset = device_payload.len() as u64;
-        let mut words = vec![0u32; row_count.div_ceil(32)];
+        let mut words = vec![0u32; capacity.div_ceil(32)];
         for (i, row) in rows.iter().enumerate() {
             if !matches!(row[col_idx], SqlValue::Null) {
                 words[i / 32] |= 1u32 << (i % 32); // 1 = valid/present
@@ -230,6 +279,74 @@ pub(crate) fn build_relational_device_payload(
         resident_device_b128_columns,
         resident_device_null_columns,
     ))
+}
+
+#[cfg(test)]
+mod capacity_payload_tests {
+    use super::*;
+
+    fn int4_cols() -> (Vec<String>, Vec<SqlType>) {
+        (
+            vec!["id".to_string(), "balance".to_string()],
+            vec![SqlType::Int4, SqlType::Int4],
+        )
+    }
+    fn int4_rows(n: i32) -> Vec<Vec<SqlValue>> {
+        (0..n)
+            .map(|i| vec![SqlValue::Int4(i), SqlValue::Int4(i * 10)])
+            .collect()
+    }
+
+    /// `capacity == row_count` must reproduce the dense builder BYTE-FOR-BYTE — that is what keeps the
+    /// unified-buffer / sealed-shard read path untouched while the capacity param exists.
+    #[test]
+    fn capacity_equal_rowcount_is_byte_identical() {
+        let (names, types) = int4_cols();
+        let rows = int4_rows(5);
+        let dense = build_relational_device_payload(&names, &types, &rows).unwrap().0;
+        let capped = build_relational_device_payload_with_capacity(&names, &types, &rows, 5)
+            .unwrap()
+            .0;
+        assert_eq!(dense, capped, "capacity==row_count must equal the dense build");
+    }
+
+    /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
+    /// the header still records `row_count`; section offsets derive from `capacity`.
+    #[test]
+    fn capacity_padding_reserves_headroom_with_capacity_offsets() {
+        let (names, types) = int4_cols();
+        let rows = int4_rows(3);
+        let capacity = 8;
+        let payload = build_relational_device_payload_with_capacity(&names, &types, &rows, capacity)
+            .unwrap()
+            .0;
+        // Layout: 8-byte header, int4 col0 (capacity*4), int4 col1 (capacity*4).
+        assert_eq!(payload.len(), 8 + 2 * capacity * 4);
+        let header = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        assert_eq!(header, 3, "header records the live row count, not capacity");
+        let at = |sec: usize, row: usize| -> i32 {
+            let off = 8 + sec * capacity * 4 + row * 4;
+            i32::from_le_bytes(payload[off..off + 4].try_into().unwrap())
+        };
+        // col0 (id): 0,1,2 then zero headroom.
+        assert_eq!((at(0, 0), at(0, 2), at(0, 3), at(0, 7)), (0, 2, 0, 0));
+        // col1 (balance): 0,10,20 then zero headroom.
+        assert_eq!((at(1, 0), at(1, 2), at(1, 3)), (0, 20, 0));
+    }
+
+    /// An OPEN (capacity > row_count) payload rejects variable-length text; `capacity == row_count`
+    /// (dense) still accepts it. And `capacity < row_count` is always rejected.
+    #[test]
+    fn open_payload_rejects_text_and_undersize() {
+        let names = vec!["id".to_string(), "name".to_string()];
+        let types = vec![SqlType::Int4, SqlType::Text];
+        let rows = vec![vec![SqlValue::Int4(1), SqlValue::Text("a".to_string())]];
+        assert!(build_relational_device_payload_with_capacity(&names, &types, &rows, 1).is_ok());
+        assert!(build_relational_device_payload_with_capacity(&names, &types, &rows, 4).is_err());
+        let (names, types) = int4_cols();
+        let rows = int4_rows(5);
+        assert!(build_relational_device_payload_with_capacity(&names, &types, &rows, 3).is_err());
+    }
 }
 
 impl Engine {
