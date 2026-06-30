@@ -645,6 +645,11 @@ pub(crate) struct RelationalResidentShard {
     /// recompaction gather reads each column slice at this stride (a column's live rows sit at its
     /// capacity-strided start), mirroring the single buffer's `capacity` field (Slice 1b-i).
     pub(crate) capacity: usize,
+    /// S-d2b: true iff this shard is an int4-only open shard with NO null bitmap / text / non-int4 sections
+    /// — i.e. a committed INSERT's applied rows can be appended in place into its headroom (the same
+    /// eligibility the single-buffer append checks). Set at admission from the shard's column layout; the
+    /// append is declined (re-admit) when false. Benchmark/sealed shards are not append targets (false).
+    pub(crate) int4_appendable: bool,
     pub(crate) resident_bytes: u64,
     pub(crate) allocated_bytes: u64,
     pub(crate) count_header_byte_offset: u64,

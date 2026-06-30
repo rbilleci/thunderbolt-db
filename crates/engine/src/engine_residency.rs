@@ -940,6 +940,69 @@ mod capacity_payload_tests {
         assert_eq!(r.row(0), &[SqlValue::Int4(2), SqlValue::Int4(200)]);
     }
 
+    /// S-d2b: with the shard flag ON, a committed INSERT appends IN PLACE into the resident OPEN shard's
+    /// headroom (no whole-table re-admit) — the shard-path analog of 1b-ii-c/d. Across 50 in-headroom
+    /// commits the open_shard_append_hits counter advances by exactly 50, the table stays ONE shard (in
+    /// place, not rollover/re-admit), the open shard's row_count grows, and a point lookup + COUNT over the
+    /// sharded route return the appended rows. (Counter +50 vs 0 distinguishes append from re-admit.)
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_open_append_in_place_reads_correct() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        // Grow to 300 rows: the first commit admits as a shard (headroom); subsequent commits append in
+        // place, with headroom-overflow re-admits at power-of-two boundaries (last at row 129 -> capacity
+        // 512), so by row 300 the open shard has ample headroom for the next 50 appends.
+        for i in 0..300_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let shard_state = |e: &Engine| -> (usize, usize) {
+            let shards = e.read_state.residency.shards.load();
+            let s = shards.get("accounts").expect("shard-resident");
+            (s.len(), s.last().unwrap().row_count)
+        };
+        let count_before = shard_state(&e).0;
+        let hits_before = e.open_shard_append_hits();
+        for i in 300..350_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let (count_after, open_row_count) = shard_state(&e);
+        // NON-VACUITY: the 50 in-headroom commits appended IN PLACE to the open shard (counter +50, vs 0
+        // for a re-admit), the shard count is unchanged (no rollover/re-admit), and row_count grew.
+        assert_eq!(
+            e.open_shard_append_hits() - hits_before,
+            50,
+            "all 50 in-headroom commits must append in place to the open shard (re-admit would give 0)"
+        );
+        assert_eq!(count_after, count_before, "no rollover/re-admit -> shard count unchanged");
+        assert_eq!(
+            open_row_count, 350,
+            "the open shard's row_count grew to 350 via in-place append"
+        );
+
+        // Reads over the sharded route include the in-place-appended rows.
+        let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
+        let pt = sel("SELECT id, balance FROM accounts WHERE id = 342");
+        assert_eq!(pt.len(), 1, "appended key 342 present via the sharded route");
+        assert_eq!(pt.row(0), &[SqlValue::Int4(342), SqlValue::Int4(3420)]);
+        assert_eq!(
+            sel("SELECT COUNT(*) FROM accounts").row(0),
+            &[SqlValue::Int8(350)],
+            "COUNT(*) sees the appended rows"
+        );
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -1190,6 +1253,15 @@ impl Engine {
                 // S-d2: the OPEN shard carries headroom (capacity > row_count for int4); the recompaction
                 // gather + offset helpers stride by this capacity. (Dead MVCC tail omitted when padded.)
                 capacity,
+                // S-d2b: append-eligible iff purely int4 (no text / int8 / numeric / bool / NULL sections)
+                // AND it has headroom — the SAME eligibility the single-buffer append checks.
+                int4_appendable: snapshot.resident_device_int8_columns.is_empty()
+                    && snapshot.resident_device_numeric_columns.is_empty()
+                    && snapshot.resident_device_bool_columns.is_empty()
+                    && snapshot.resident_device_text_columns.is_empty()
+                    && snapshot.resident_device_null_columns.is_empty()
+                    && snapshot.column_count == snapshot.resident_device_int4_columns.len()
+                    && capacity > row_count,
                 resident_bytes,
                 allocated_bytes: device_payload.len() as u64,
                 count_header_byte_offset: 0,
@@ -1473,6 +1545,19 @@ impl Engine {
         {
             return false;
         }
+        // S-d2b: a SHARD-resident table (the segmented layout, default-OFF flag) appends to its OPEN shard's
+        // headroom instead of the single buffer. (Admission publishes a table to shards XOR snapshots, so
+        // the two paths never overlap for one table.)
+        if self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(table)
+            .is_some_and(|shards| !shards.is_empty())
+        {
+            return self.try_append_to_resident_open_shard(table, new_rows);
+        }
         let (capacity, row_start, column_count) = {
             let snapshots = self.read_state.residency.snapshots.load();
             let Some(entry) = snapshots.get(table) else {
@@ -1544,6 +1629,76 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(table);
+        self.read_state
+            .residency
+            .open_shard_append_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// S-d2b: append a committed INSERT's applied rows IN PLACE into the resident table's OPEN shard's
+    /// headroom (the last shard in `residency.shards`) — the shard-path analog of the single-buffer append.
+    /// Empty + NULL-bearing rows are already rejected by the caller. Returns false (caller invalidates +
+    /// re-admits) when the open shard isn't int4-appendable, is invalid, or has no headroom (seal + a fresh
+    /// open shard on overflow is S-d2c), or the device append fails. No host_rows (shard tables read via the
+    /// device recompaction, not the host-materialization path) and no wave_index (the shard read recompacts
+    /// a fresh unified buffer per query, so there is no ptr-keyed cached index to invalidate).
+    fn try_append_to_resident_open_shard(&self, table: &str, new_rows: &[Vec<SqlValue>]) -> bool {
+        let pressured_gpus = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .clone();
+        let (shard_id, capacity, row_start, column_count) = {
+            let shards = self.read_state.residency.shards.load();
+            let Some(table_shards) = shards.get(table) else {
+                return false;
+            };
+            let Some(open) = table_shards.last() else {
+                return false;
+            };
+            if !open.int4_appendable || !open.is_valid(pressured_gpus.contains(&open.gpu_id)) {
+                return false;
+            }
+            let column_count = open.resident_device_int4_columns.len();
+            match open.row_count.checked_add(new_rows.len()) {
+                Some(end) if end <= open.capacity => {
+                    (open.shard_id, open.capacity, open.row_count, column_count)
+                }
+                // no headroom (or overflow) -> caller re-admits; seal + a fresh open shard is S-d2c.
+                _ => return false,
+            }
+        };
+        let Some(shard_device_memory) = self
+            .read_state
+            .residency
+            .shard_device_memory
+            .get(&(table.to_string(), shard_id))
+        else {
+            return false;
+        };
+        let column_types = vec![SqlType::Int4; column_count];
+        let chunks =
+            match compute_open_shard_int4_append_chunks(&column_types, capacity, row_start, new_rows) {
+                Ok(chunks) => chunks,
+                Err(_) => return false,
+            };
+        if shard_device_memory.append_owned_chunks(chunks).is_err() {
+            // Partial/failed append leaves bytes only in the (invisible) headroom beyond row_count;
+            // returning false makes the caller invalidate + re-admit, discarding them.
+            return false;
+        }
+        let k = new_rows.len();
+        let appended_bytes = (k * column_count * std::mem::size_of::<i32>()) as u64;
+        self.read_state.residency.with_shards_mut(|shards| {
+            if let Some(table_shards) = shards.get_mut(table) {
+                if let Some(open) = table_shards.last_mut() {
+                    open.row_count += k;
+                    open.resident_bytes = open.resident_bytes.saturating_add(appended_bytes);
+                }
+            }
+        });
         self.read_state
             .residency
             .open_shard_append_hits
@@ -2053,8 +2208,10 @@ impl Engine {
                 shard_id: shard.shard_id,
                 row_start: shard.row_start,
                 row_count: shard.row_count,
-                // Benchmark shards are read DENSE (explicit chunk layouts sized by row_count).
+                // Benchmark shards are read DENSE (explicit chunk layouts sized by row_count) and are not
+                // append targets.
                 capacity: shard.row_count,
+                int4_appendable: false,
                 resident_bytes: shard.resident_bytes,
                 allocated_bytes: shard.allocated_bytes,
                 count_header_byte_offset: 0,
