@@ -1159,10 +1159,35 @@ impl LocalReplicator {
         self.next_index
     }
 
+    /// O(1) lookup of the retained log entry at `index`. The log is contiguous in `index` (prefix-
+    /// compacted by `install_snapshot`, suffix-trimmed by `rollback_unapplied_from`), so the position
+    /// is `index - entries[0].index`. `None` if `index` was prefix-compacted away or is past the tail.
+    fn entry_at(&self, index: Index) -> Option<&LogEntry> {
+        let first = self.entries.first()?.index;
+        let pos = index.checked_sub(first)? as usize;
+        let entry = self.entries.get(pos)?;
+        debug_assert_eq!(
+            entry.index, index,
+            "LocalReplicator log must stay contiguous in index"
+        );
+        Some(entry)
+    }
+
+    /// Committed entries with index in `(start_exclusive, commit_index]`, in order. O(k) in the
+    /// number yielded, NOT O(entries): the contiguous log lets the window map directly to a slice
+    /// range, so the commit hot path no longer scans the unbounded entries vec. Yields exactly the
+    /// same set as the former `entries.iter().filter(index > start && index <= commit_index)`.
     pub fn drain_committed_from(&self, start_exclusive: Index) -> impl Iterator<Item = &LogEntry> {
-        self.entries
-            .iter()
-            .filter(move |e| e.index > start_exclusive && e.index <= self.commit_index)
+        let (start_pos, end_pos) = match self.entries.first().map(|e| e.index) {
+            Some(first) if self.commit_index >= first => {
+                let lo = start_exclusive.saturating_add(1).max(first);
+                let start = (lo - first) as usize;
+                let end = ((self.commit_index - first) as usize + 1).min(self.entries.len());
+                (start.min(end), end)
+            }
+            _ => (0, 0),
+        };
+        self.entries[start_pos..end_pos].iter()
     }
 
     pub fn retained_entry_count(&self) -> usize {
@@ -1184,8 +1209,9 @@ impl LocalReplicator {
         }
 
         self.applied_index = bounded;
-        if let Some(entry) = self.entries.iter().find(|entry| entry.index == bounded) {
-            self.applied_term = entry.term;
+        // O(1) via the contiguous-log index->position map (was an O(n) `entries.iter().find`).
+        if let Some(term) = self.entry_at(bounded).map(|entry| entry.term) {
+            self.applied_term = term;
         }
     }
 
@@ -2558,6 +2584,53 @@ mod tests {
         assert_eq!(r.current_term(), 5);
         assert_eq!(meta.last_included_index, t1.index);
         assert_eq!(meta.last_included_term, 1);
+    }
+
+    /// Locks the contiguity assumption the O(1) `drain_committed_from`/`entry_at` rewrite relies on
+    /// (audit follow-up): after prefix compaction via `install_snapshot`, `entries[0].index != 1`, so
+    /// the relative position math `index - entries[0].index` is the ONLY thing that keeps drain/apply
+    /// selecting the right WAL entries. A future mutator that broke contiguity would silently corrupt
+    /// the applied set; this test would catch it.
+    #[test]
+    fn local_drain_and_entry_at_after_prefix_compaction() {
+        let mut r = LocalReplicator::leader();
+        for i in 1..=8u64 {
+            assert_eq!(r.propose(vec![i as u8]).unwrap().index, i);
+        }
+        // Compact the prefix: apply through 5, snapshot, install -> retained entries become 6,7,8.
+        r.mark_applied(5);
+        let meta = r.export_snapshot_meta();
+        assert_eq!(meta.last_included_index, 5);
+        r.install_snapshot(meta);
+        // Append more committed entries (indices 9, 10) on top of the compacted log.
+        for i in 9..=10u64 {
+            assert_eq!(r.propose(vec![i as u8]).unwrap().index, i);
+        }
+        // entries[0].index is now 6 (not 1). drain over EVERY start must equal the predicate it
+        // replaced: `index > start && index <= commit_index`, over the retained set [6, commit_index].
+        let commit_index = r.commit_index();
+        assert_eq!(commit_index, 10);
+        let retained_first = 6u64;
+        for start in 0..=12u64 {
+            let got: Vec<u64> = r.drain_committed_from(start).map(|e| e.index).collect();
+            let expected: Vec<u64> = (retained_first..=commit_index)
+                .filter(|&idx| idx > start && idx <= commit_index)
+                .collect();
+            assert_eq!(
+                got, expected,
+                "drain_committed_from({start}) diverged after prefix compaction"
+            );
+        }
+        // entry_at maps via the relative position; compacted/out-of-range -> None (never a panic or
+        // a wrong-position hit).
+        assert_eq!(r.entry_at(6).map(|e| e.index), Some(6));
+        assert_eq!(r.entry_at(10).map(|e| e.index), Some(10));
+        assert_eq!(r.entry_at(5), None, "index 5 was prefix-compacted away");
+        assert_eq!(r.entry_at(11), None, "index 11 is past the tail");
+        assert_eq!(r.entry_at(0), None);
+        // mark_applied past the compaction boundary reads the correct entry's term (no panic).
+        r.mark_applied(9);
+        assert_eq!(r.applied_index(), 9);
     }
 
     #[test]
