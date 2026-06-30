@@ -371,6 +371,59 @@ mod capacity_payload_tests {
         assert_eq!(null_word & 0b11, 0b10, "validity bits: row0 NULL, row1 present");
     }
 
+    /// Proves the offset helpers are CAPACITY-aware (opus audit #5: the only thing that actually
+    /// exercises the capacity stride through the helpers — the regression only covers capacity ==
+    /// row_count). With capacity > row_count the int8 section must start AFTER the capacity-padded int4
+    /// sections, not the row_count-sized ones.
+    #[test]
+    fn offset_helpers_use_capacity_not_row_count() {
+        let engine = Engine::new_local();
+        engine
+            .execute_text(1, "CREATE TABLE t (a INT, b INT, c BIGINT)")
+            .expect("create");
+        let table = engine.relational_catalog_table("t").expect("table");
+
+        let snapshot = |capacity: usize| RelationalResidencySnapshot {
+            gpu_id: 0,
+            schema: "public".to_string(),
+            table: "t".to_string(),
+            generation: 0,
+            row_count: 3,
+            capacity,
+            column_count: 3,
+            resident_bytes: 0,
+            resident_device_int4_columns: vec!["a".to_string(), "b".to_string()],
+            resident_device_int4_column_stats: vec![],
+            resident_device_int8_columns: vec!["c".to_string()],
+            resident_device_numeric_columns: vec![],
+            resident_device_bool_columns: vec![],
+            resident_device_text_columns: vec![],
+            resident_device_null_columns: vec![],
+            valid_through_index: 0,
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: false,
+            memory_pressure_active: false,
+            last_refresh_cost: None,
+            admission_budget_bytes: None,
+            resident_bytes_after_admission: 0,
+            evicted_tables_on_admission: vec![],
+            device_memory_proof: None,
+        };
+
+        // capacity = 8 > row_count = 3: each int4 section is capacity*4 = 32 bytes.
+        let s8 = snapshot(8);
+        assert_eq!(resident_device_int4_column_offset(&s8, &table, 0).unwrap(), 8);
+        assert_eq!(resident_device_int4_column_offset(&s8, &table, 1).unwrap(), 8 + 8 * 4);
+        // int8 col `c` starts AFTER both capacity-padded int4 sections: 8 + 2*(8*4) = 72.
+        assert_eq!(resident_device_int8_column_offset(&s8, &table, 2).unwrap(), 8 + 2 * 8 * 4);
+
+        // Dense (capacity == row_count == 3): int8 col `c` at 8 + 2*(3*4) = 32 — proving capacity, not
+        // row_count, drives the stride (a row_count stride would give 32 for BOTH cases).
+        let s3 = snapshot(3);
+        assert_eq!(resident_device_int8_column_offset(&s3, &table, 2).unwrap(), 8 + 2 * 3 * 4);
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]

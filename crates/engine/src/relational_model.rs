@@ -558,7 +558,7 @@ pub struct ResidentDeviceTextColumnLayout {
 }
 
 /// A `bool` column retained in the device payload as a 1-bit-per-row BITMAP (the type matrix, doc 19):
-/// `ceil(row_count / 32)` little-endian u32 words, bit `i` (LSB-first within its word) = row `i`'s
+/// `ceil(capacity / 32)` little-endian u32 words, bit `i` (LSB-first within its word) = row `i`'s
 /// value. 1 bit/row -- 32x denser than the i32 sections, and a near-ready predicate mask. NULLs are a
 /// separate VALIDITY bitmap ([`ResidentDeviceNullBitmapLayout`], M3 — doc 21), so this stores only the
 /// value bit. The section is self-describing (like text): the bitmap's byte offset is recorded at build
@@ -570,7 +570,7 @@ pub struct ResidentDeviceBoolColumnLayout {
 }
 
 /// A column's per-row NULL VALIDITY bitmap in the device payload (M3 — doc 21):
-/// `ceil(row_count / 32)` little-endian u32 words, bit `i` (LSB-first) = row `i`, where **1 = valid
+/// `ceil(capacity / 32)` little-endian u32 words, bit `i` (LSB-first) = row `i`, where **1 = valid
 /// (present), 0 = NULL** (Arrow / PostgreSQL convention). One layout is emitted ONLY for a column that
 /// actually contains a NULL; a column with no NULLs has NO bitmap (absence ⇒ all-valid), so non-nullable
 /// columns and pre-M3 payloads stay byte-identical. The kernels read it on-device to honor three-valued
@@ -936,8 +936,8 @@ pub(crate) fn resident_device_null_column_offset(
 }
 
 /// Byte offset of int8 column `column_idx` within the retained device payload (the type matrix, doc
-/// 19). Layout: header (u64) + the WHOLE int4 section (`int4_columns * row_count * 4`) + the int8
-/// columns before this one (`int8_ordinal * row_count * 8`). Validates the column is int8 and present
+/// 19). Layout: header (u64) + the WHOLE int4 section (`int4_columns * capacity * 4`) + the int8
+/// columns before this one (`int8_ordinal * capacity * 8`). Validates the column is int8 and present
 /// in `snapshot.resident_device_int8_columns`. Mirrors [`resident_device_int4_column_offset`].
 // ALIGNMENT INVARIANT: this offset is 4-mod-8 (NOT 8-aligned) exactly when `(#int4 columns ×
 // row_count)` is odd, because the int8 section follows the int4 section. Any device kernel that reads
@@ -1004,7 +1004,7 @@ pub(crate) fn resident_device_int8_column_offset(
 
 /// Byte offset of numeric column `column_idx` within the retained device payload (the type matrix,
 /// doc 19). Layout: header (u64) + the WHOLE int4 section + the WHOLE int8 section + the numeric
-/// columns before this one (`numeric_ordinal * row_count * 16`). Validates the column is numeric and
+/// columns before this one (`numeric_ordinal * capacity * 16`). Validates the column is numeric and
 /// present in `snapshot.resident_device_numeric_columns`. A numeric mantissa is a fixed 16-byte i128;
 /// the decimal scale is the column's catalog scale (values are rescaled on insert), not stored here.
 pub(crate) fn resident_device_numeric_column_offset(
