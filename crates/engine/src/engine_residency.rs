@@ -1223,93 +1223,6 @@ mod capacity_payload_tests {
         out
     }
 
-    fn read_shard_created_by(e: &Engine, table: &str) -> Vec<u64> {
-        read_shard_u64_section(e, table, |s| s.created_by_offset)
-    }
-
-    /// Slice 1c (MVCC visibility, Axis 1): a resident SHARD carries a per-row `created_by` = the commit
-    /// `Index` that created each row version. Admission captures it from the host version (`tuple.created_by`);
-    /// an in-place open-shard append stamps THIS commit's sequence. The gate reads the `created_by` SoA
-    /// section back from device and asserts it equals the exact commit sequences.
-    ///
-    /// NON-VACUITY / anti-sabotage: two separate INSERT commits produce two DISTINCT, NONZERO stamps in the
-    /// right per-row positions — a broken capture would leave all-zero padding; a broken append-stamp would
-    /// give the appended rows the wrong (or zero) sequence; a swapped admission/append order would misplace them.
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn shard_created_by_stamps_match_commit_sequences() {
-        let e = Engine::new_local();
-        e.set_shard_residency_enabled(true);
-        e.set_auto_admit_on_commit(true);
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-            .unwrap();
-        // Commit 1: admitted as a shard (its 3 rows' created_by captured from the host version).
-        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)")
-            .unwrap();
-        let c1 = e.committed_seq();
-        // Commit 2: a single-entry INSERT -> appended IN PLACE into the open shard's headroom (created_by
-        // stamped = this commit's seq). Fits (default 4M target -> capacity 8), so it stays ONE shard.
-        e.execute_text(3, "INSERT INTO accounts (id, balance) VALUES (4,40),(5,50)")
-            .unwrap();
-        let c2 = e.committed_seq();
-        assert!(
-            c1 > 0 && c2 > c1,
-            "two distinct nonzero commit sequences (c1={c1}, c2={c2})"
-        );
-        assert_eq!(
-            e.read_state.residency.shards.load().get("accounts").unwrap().len(),
-            1,
-            "the append fits headroom -> still one shard (created_by section is contiguous)"
-        );
-
-        let stamps = read_shard_created_by(&e, "accounts");
-        assert_eq!(
-            stamps,
-            vec![c1, c1, c1, c2, c2],
-            "device creator stamps == the exact per-commit sequences (admission x3 @c1, append x2 @c2)"
-        );
-    }
-
-    /// Slice 1c (audit follow-up): the creator stamp is correct across ROLLOVER — every row, whether it
-    /// was admitted, appended in place, or landed in a rolled-over shard, carries the `created_by` of the
-    /// exact commit that inserted it. Ordered single-row INSERTs into a small-target table lay rows down in
-    /// insertion order across several shards, so the device stamp for row i must equal the commit sequence
-    /// of INSERT i. NON-VACUITY: the table really is multiple shards (rollover happened) and the stamps are
-    /// the distinct, increasing per-commit sequences (a broken rollover stamp would mis-stamp rolled rows).
-    #[test]
-    #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn shard_rollover_created_by_stamps_match_per_commit() {
-        let e = Engine::new_local();
-        e.set_shard_residency_enabled(true);
-        e.set_auto_admit_on_commit(true);
-        e.set_shard_size_target(64); // small -> roll over into several shards
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
-            .unwrap();
-        let mut seqs = Vec::new();
-        for i in 0..200_i64 {
-            e.execute_text(
-                (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
-            )
-            .unwrap();
-            // row i (id=i) was created by THIS commit; its created_by == committed_seq after it.
-            seqs.push(e.committed_seq());
-        }
-        let shard_count = e.read_state.residency.shards.load().get("accounts").unwrap().len();
-        assert!(
-            shard_count >= 3,
-            "need rollover into multiple shards to exercise rolled-shard stamping (got {shard_count})"
-        );
-        // Physical shard-then-row order == insertion order (ordered appends), so the flattened stamps are
-        // exactly the per-commit sequences in order.
-        let stamps = read_shard_created_by(&e, "accounts");
-        assert_eq!(
-            stamps, seqs,
-            "every row's device creator stamp == the commit sequence of the INSERT that created it, across \
-             admission + in-place append + rollover"
-        );
-    }
-
     /// Slice A1 (MVCC visibility): a resident SHARD carries a per-row `deleted_by` section born ALL-LIVE
     /// (sentinel `u64::MAX`). Every row — admitted, appended in place (into headroom pre-filled with the
     /// sentinel, so no extra write), or landed in a rolled-over shard — reads as live until a DELETE stamps
@@ -1489,11 +1402,6 @@ impl Engine {
         let mut row_count = 0usize;
         let mut resident_bytes = 0u64;
         let mut resident_rows = Vec::new();
-        // Slice 1c (MVCC visibility): capture each admitted version's `created_by` (the commit `Index` that
-        // created it) parallel to `resident_rows`, so the resident buffer can carry a per-row creator stamp
-        // for the old-snapshot visibility mask. `seq_scan_open(visibility)` yields the versions visible at
-        // `committed_seq`, so these are the live creators (a never-updated INSERT's created_by = its commit).
-        let mut created_by_stamps: Vec<u64> = Vec::new();
         let mut raw_device_tail = Vec::new();
         {
             let table_rows = self.read_state.mvcc.table_rows(table);
@@ -1515,7 +1423,6 @@ impl Engine {
                             .sum::<u64>(),
                     );
                 resident_rows.push(decoded);
-                created_by_stamps.push(tuple.created_by);
             }
         }
         // int4 AND date columns share the i32 section: a `date` is physically an i32 (days since
@@ -1596,19 +1503,18 @@ impl Engine {
         if capacity == row_count {
             device_payload.extend_from_slice(&raw_device_tail);
         }
-        // Slice 1c: on the shard (segmented write-model) path, append the per-row `created_by` section so the
-        // shard carries a creator stamp for the old-snapshot visibility mask. Placed AFTER the SQL columns +
-        // dense tail (offset recorded explicitly), so no existing column/tail offset shifts. The default
-        // single-buffer path (being retired, ADR-012) skips it — no per-row MVCC overhead on the hot path.
-        let (created_by_offset, deleted_by_offset) = if self.shard_residency_enabled() {
-            let cb = append_u64_section(&mut device_payload, &created_by_stamps, capacity, 0);
+        // SV1 (sparse-versioning): `created_by` is NO LONGER stored per-row — latest reads never check it and
+        // under SI it returns as a per-shard zone map + boundary (docs/proposals/sparse-mvcc-version-metadata.md
+        // §4.2), never a per-row array. Only `deleted_by` rides the shard payload for now (SV2 makes it
+        // on-demand). Placed AFTER the SQL columns + dense tail (offset recorded explicitly), so no existing
+        // column/tail offset shifts; the default single-buffer path skips it.
+        let deleted_by_offset = if self.shard_residency_enabled() {
             // deleted_by: every admitted row is LIVE -> fill the WHOLE capacity (rows + headroom) with the
             // live sentinel, so an in-place append is born live with no extra write and a DELETE stamps one
             // slot in place later.
-            let db = append_u64_section(&mut device_payload, &[], capacity, DELETED_BY_LIVE);
-            (Some(cb), Some(db))
+            Some(append_u64_section(&mut device_payload, &[], capacity, DELETED_BY_LIVE))
         } else {
-            (None, None)
+            None
         };
 
         let memory_pressure_active = self
@@ -1703,9 +1609,7 @@ impl Engine {
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
                     .clone(),
-                // Slice 1c/A1: the per-row creator + tombstone stamp sections appended above (Some on the
-                // shard path); deleted_by init all-live.
-                created_by_offset,
+                // A1: the deleted_by tombstone section appended above (Some on the shard path, born all-live).
                 deleted_by_offset,
                 resident_bytes,
                 allocated_bytes: device_payload.len() as u64,
@@ -2005,9 +1909,6 @@ impl Engine {
         &self,
         table: &str,
         new_rows: &[Vec<SqlValue>],
-        // Slice 1c: the commit `Index` that created these rows — stamped as their `created_by` in the open
-        // shard's creator-stamp section (the single-buffer path ignores it; it carries no version stamps).
-        created_by: Index,
     ) -> bool {
         if new_rows.is_empty() {
             return false;
@@ -2037,7 +1938,7 @@ impl Engine {
             .get(table)
             .is_some_and(|shards| !shards.is_empty())
         {
-            return self.try_append_to_resident_open_shard(table, new_rows, created_by);
+            return self.try_append_to_resident_open_shard(table, new_rows);
         }
         let (capacity, row_start, column_count) = {
             let snapshots = self.read_state.residency.snapshots.load();
@@ -2124,12 +2025,7 @@ impl Engine {
     /// open shard on overflow is S-d2c), or the device append fails. No host_rows (shard tables read via the
     /// device recompaction, not the host-materialization path) and no wave_index (the shard read recompacts
     /// a fresh unified buffer per query, so there is no ptr-keyed cached index to invalidate).
-    fn try_append_to_resident_open_shard(
-        &self,
-        table: &str,
-        new_rows: &[Vec<SqlValue>],
-        created_by: Index,
-    ) -> bool {
+    fn try_append_to_resident_open_shard(&self, table: &str, new_rows: &[Vec<SqlValue>]) -> bool {
         let pressured_gpus = self
             .router
             .runtime()
@@ -2138,7 +2034,7 @@ impl Engine {
             .clone();
         let k = new_rows.len();
         // Read the OPEN (last) shard's state once.
-        let (shard_id, capacity, row_count, row_start, column_count, column_names, gpu_id, schema, max_shard_id, created_by_offset) = {
+        let (shard_id, capacity, row_count, row_start, column_count, column_names, gpu_id, schema, max_shard_id) = {
             let shards = self.read_state.residency.shards.load();
             let Some(table_shards) = shards.get(table) else {
                 return false;
@@ -2159,7 +2055,6 @@ impl Engine {
                 open.gpu_id,
                 open.schema.clone(),
                 table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
-                open.created_by_offset,
             )
         };
         let column_types = vec![SqlType::Int4; column_count];
@@ -2176,29 +2071,14 @@ impl Engine {
             };
             // The append position within THIS shard's buffer is its LOCAL row_count (rows [0, row_count)
             // are live; the new rows go at [row_count, row_count+k)), NOT the shard's global `row_start`.
-            let mut chunks =
+            let chunks =
                 match compute_open_shard_int4_append_chunks(&column_types, capacity, row_count, new_rows) {
                     Ok(chunks) => chunks,
                     Err(_) => return false,
                 };
-            // Slice 1c: stamp the k new rows' `created_by` into the shard's creator-stamp section headroom
-            // (at its LOCAL row_count offset), BEFORE the header chunk (which `compute_...` emits last) so a
-            // partial-failure append never advertises a row whose creator stamp is unwritten — the same
-            // contract the value-column chunks follow. Skipped when the shard carries no stamps (offset None).
-            if let Some(cb_off) = created_by_offset {
-                let mut bytes = Vec::with_capacity(k * std::mem::size_of::<u64>());
-                for _ in 0..k {
-                    bytes.extend_from_slice(&created_by.to_le_bytes());
-                }
-                let header_pos = chunks.len().saturating_sub(1);
-                chunks.insert(
-                    header_pos,
-                    CudaOwnedDeviceMemoryChunk {
-                        byte_offset: cb_off + (row_count * std::mem::size_of::<u64>()) as u64,
-                        bytes,
-                    },
-                );
-            }
+            // SV1: no `created_by` stamp on append (per-row created_by is gone). `deleted_by` needs no write
+            // either — the headroom was pre-filled with the live sentinel at admission, so appended rows are
+            // born live. Only the value-column + header chunks are written.
             if shard_device_memory.append_owned_chunks(chunks).is_err() {
                 // Partial/failed append leaves bytes only in invisible headroom beyond row_count;
                 // returning false makes the caller invalidate + re-admit, discarding them.
@@ -2255,11 +2135,8 @@ impl Engine {
             Ok((payload, _text, _bool, stats, _b128, _null)) => (payload, stats),
             Err(_) => return false,
         };
-        // Slice 1c/A1: the freshly-rolled shard's k rows were all created by THIS commit -> stamp them into
-        // a creator-stamp section (capacity-padded), plus a deleted_by section born all-live, so a
-        // rolled-over shard carries visibility metadata identical to an admitted one.
-        let rolled_created_by_offset =
-            Some(append_u64_section(&mut device_payload, &vec![created_by; k], new_capacity, 0));
+        // SV1/A1: the rolled shard carries a deleted_by section born all-live (no per-row created_by; that is
+        // now a per-shard zone map + boundary, not stored here).
         let rolled_deleted_by_offset =
             Some(append_u64_section(&mut device_payload, &[], new_capacity, DELETED_BY_LIVE));
         let Some(new_device_memory) = self.relational_residency_device_memory(gpu_id, &device_payload)
@@ -2275,7 +2152,6 @@ impl Engine {
             capacity: new_capacity,
             int4_appendable: true,
             resident_device_int4_column_stats: int4_stats,
-            created_by_offset: rolled_created_by_offset,
             deleted_by_offset: rolled_deleted_by_offset,
             resident_bytes: (8 + k * column_count * std::mem::size_of::<i32>()) as u64,
             allocated_bytes: device_payload.len() as u64,
@@ -2879,9 +2755,8 @@ impl Engine {
                 int4_appendable: false,
                 // S-d3: benchmark shards carry no zone map -> never pruned (always gathered).
                 resident_device_int4_column_stats: Vec::new(),
-                // Slice 1c/A1: benchmark shards carry no version stamps -> the visibility mask is skipped
+                // A1: benchmark shards carry no version metadata -> the visibility mask is skipped
                 // (they read as all-live, correct for the latest-snapshot benchmark reads).
-                created_by_offset: None,
                 deleted_by_offset: None,
                 resident_bytes: shard.resident_bytes,
                 allocated_bytes: shard.allocated_bytes,

@@ -324,10 +324,9 @@ impl Engine {
         // success skip the invalidation it replaces; otherwise invalidate (and the re-admit below
         // rebuilds, with fresh headroom).
         let appended = self.auto_admit_on_commit_enabled()
-            && insert_append.as_ref().is_some_and(|(table, rows)| {
-                // Slice 1c: stamp the appended rows' `created_by` with this commit's sequence.
-                self.try_append_resident_int4_open_shard(table, rows, commit_seq)
-            });
+            && insert_append
+                .as_ref()
+                .is_some_and(|(table, rows)| self.try_append_resident_int4_open_shard(table, rows));
         if !appended {
             self.invalidate_relational_residency_tables_concurrent(
                 &residency_tables,

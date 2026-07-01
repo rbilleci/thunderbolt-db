@@ -670,13 +670,6 @@ pub(crate) struct RelationalResidentShard {
     /// recompacts ~1 shard instead of all of them (O(1), not O(num_shards)). Maintained on append (merge the
     /// new rows' min/max). Empty = not pruned (always gathered) — e.g. benchmark shards.
     pub(crate) resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
-    /// Slice 1c (MVCC visibility, Axis 1): byte offset of the per-row `created_by` (u64 = the commit `Index`
-    /// that created each row version) SoA section in this shard's device payload, laid out AFTER the SQL
-    /// columns + any dense tail, capacity-strided like the value columns (so an open-shard append stamps new
-    /// rows into its headroom). `None` = no version stamps (e.g. a benchmark shard) → the old-snapshot
-    /// visibility mask is skipped and the shard reads as all-live. The COLD stamp: the hot (latest) read
-    /// never touches it; only an old-snapshot read's `created_by ≤ read_txn_id` mask does (Slice 1c-ii).
-    pub(crate) created_by_offset: Option<u64>,
     /// Slice A1 (MVCC visibility): byte offset of the per-row `deleted_by` (u64 = the commit `Index` that
     /// deleted each row, sentinel `u64::MAX` = LIVE) SoA section, laid out after `created_by`, capacity-
     /// strided. Every slot (rows + headroom) is born `u64::MAX` so an appended row is live with no extra

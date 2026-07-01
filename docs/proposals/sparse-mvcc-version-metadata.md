@@ -247,11 +247,17 @@ change. So most of A1/A2's tested machinery survives.
 
 ## 6. Revised slice plan
 
-- **SV0 — SPIKE: does the mask VM accept a second device pointer outside the main payload? (review #5 —
-  do FIRST).** This gates all of SV3. The `deleted_by` side buffer (and the zone map / boundary) live in a
-  *separate* per-shard allocation, not the main columnar payload; confirm `compile_predicate_program` /
-  `execute_resident_expr_select_with_binding` can point a `LoadColumn`/mask step at a second device pointer,
-  or scope the plumbing to add it. Cheap, decisive, removes the biggest schedule risk before SV3 effort.
+- **SV0 — SPIKE (DONE by inspection, 2026-07-01): no second device pointer needed for the sharded read.**
+  The sharded read **recompacts** all pruned shards into ONE unified buffer + a unified descriptor
+  (`resident_snapshot_for_unified`, `engine_residency.rs:2973`) before running the executor. So `deleted_by`
+  is gathered into the **unified buffer** as an extra section: a per-shard `RecompactSegment`
+  (`engine_expr.rs:2247`) takes an **arbitrary `src_device_ptr`**, so the per-shard out-of-line **metadata
+  region is a valid recompaction SOURCE** (device-to-device copy into the unified `deleted_by` section). The
+  mask then reads it from that single payload via the **existing** `LoadColumn` + `CompareScalarI64`
+  (`elem=I64`) path — the same one int8/timestamp columns already use (`engine_expr.rs:6713`). **No mask-VM
+  second-pointer plumbing.** The "second pointer" only matters for the future per-shard **index probe**
+  (structural review #1), which is a separate slice — so SV3's scan filter is de-risked and uses existing
+  kernels.
 - **SV1 — Remove `created_by` outright.** Revert the 1c-i device section (+ admission capture). Reads stay
   byte-identical (it was never read). `created_by` returns only as a per-shard **zone map + boundary** with SI
   (§4.2), never a per-row array. Gate: shard reads unchanged; SV5 footprint shows `created_by` gone. Small,

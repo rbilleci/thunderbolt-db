@@ -129,10 +129,7 @@ impl Engine {
             let appended = self.auto_admit_on_commit_enabled()
                 && to_apply.len() == 1
                 && match applied_insert.as_ref() {
-                    // Slice 1c: stamp the appended rows' `created_by` with this commit's `Index`.
-                    Some((table, rows)) => {
-                        self.try_append_resident_int4_open_shard(table, rows, token.index)
-                    }
+                    Some((table, rows)) => self.try_append_resident_int4_open_shard(table, rows),
                     None => false,
                 };
             if !appended {
