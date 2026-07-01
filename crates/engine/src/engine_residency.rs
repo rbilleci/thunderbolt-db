@@ -1813,6 +1813,78 @@ mod capacity_payload_tests {
         assert_eq!(count(&c), 200, "control: COUNT 200 == the flag-ON result (byte-identical semantics)");
     }
 
+    /// CROSS-SHARD PK INDEX sub-slice 1: the per-shard hash-index locate returns the IDENTICAL physical
+    /// (shard, LOCAL slot) the scan-based locate finds -- present keys across shards, absent keys (empty),
+    /// NULL-as-0 (id 0), and it DECLINES (None -> scan fallback) on a duplicate key. ORACLE = the proven SV4a
+    /// scan-based `locate_resident_delete_slots` (an INDEPENDENT mechanism: hash-probe vs scan-predicate, so
+    /// agreement is strong). NON-VACUITY: a wrong slot / missed shard / wrong decline diverges from the oracle;
+    /// a cross-check confirms exactly one hit per unique key. Multi-shard (size 64) exercises per-shard build.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cross_shard_pk_index_locate_matches_scan_locate() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        // Oracle: SV4a scan-based locate for `id = k`, flattened + sorted to (shard, slot).
+        let scan_locate = |k: i32| -> Vec<(u32, u32)> {
+            let pred = crate::engine_expr::ResidentExpr::Binary {
+                op: crate::engine_expr::ResidentBinaryOp::Eq,
+                lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
+                rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(k)),
+            };
+            let mut v: Vec<(u32, u32)> = e
+                .locate_resident_delete_slots(&table, &pred)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(shard, slots)| slots.into_iter().map(move |s| (shard, s)))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        // Present keys across multiple shards: index locate == scan locate, exactly one hit each.
+        for k in [0_i32, 5, 63, 64, 130, 199] {
+            let mut idx = e
+                .locate_resident_pk_via_shard_index(&table, id_col, k)
+                .expect("resident + unique -> Some");
+            idx.sort_unstable();
+            assert_eq!(idx, scan_locate(k), "index locate == scan locate for id={k}");
+            assert_eq!(idx.len(), 1, "unique key id={k} -> exactly one (shard,slot) hit");
+        }
+        // Absent key: both empty.
+        let mut absent = e
+            .locate_resident_pk_via_shard_index(&table, id_col, 999)
+            .expect("resident -> Some(empty)");
+        absent.sort_unstable();
+        assert_eq!(absent, scan_locate(999));
+        assert!(absent.is_empty(), "absent key -> no hit");
+
+        // DUP-DECLINE: a table with a duplicate int4 key -> the hash build declines -> None (scan fallback),
+        // because a hash holds one row/key but the scan returns EVERY match.
+        let d = Engine::new_local();
+        d.set_shard_residency_enabled(true);
+        d.set_auto_admit_on_commit(true);
+        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)").unwrap();
+        d.execute_text(2, "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)")
+            .unwrap();
+        let dtable = d.relational_catalog_table("dup").unwrap();
+        let did = crate::rel_exec_helpers::relational_column_index(&dtable, "id").unwrap();
+        assert!(
+            d.locate_resident_pk_via_shard_index(&dtable, did, 1).is_none(),
+            "duplicate key -> hash declines -> None (caller falls back to the scan)"
+        );
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]

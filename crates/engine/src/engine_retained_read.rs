@@ -715,38 +715,7 @@ impl Engine {
         if keys.len() != row_count_usize {
             return None;
         }
-        // Bound the table so a pathological row count can't allocate an absurd host vector (scan instead).
-        let table_size = row_count
-            .checked_mul(2)
-            .and_then(|doubled| doubled.checked_next_power_of_two())?;
-        if table_size > (1_u64 << 30) {
-            return None;
-        }
-        let table_mask = (table_size - 1) as u32;
-        let hash_shift = 32 - table_size.trailing_zeros();
-        let mut index = vec![0_u64; table_size as usize];
-        for (row, &key) in keys.iter().enumerate() {
-            let key_bits = key as u32;
-            let mut slot = (key_bits.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
-            // Mirror the kernel's hard 256-probe cap: a key the kernel could not reach within the cap must
-            // NOT be silently placed here (it would read as a false not-found at probe time) — decline.
-            let mut probes = 0_u32;
-            loop {
-                let occupant = index[slot as usize];
-                if occupant == 0 {
-                    index[slot as usize] = ((key_bits as u64) << 32) | (row as u64 + 1);
-                    break;
-                }
-                if (occupant >> 32) as u32 == key_bits {
-                    return None;
-                }
-                slot = (slot + 1) & table_mask;
-                probes += 1;
-                if probes >= 256 {
-                    return None;
-                }
-            }
-        }
+        let (index, table_mask, hash_shift) = build_int4_pk_hash_table_host(&keys, row_count)?;
         let index_bytes: Vec<u8> = index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
         let runtime = self.cuda_driver_probe_runtime();
         let gpu_id = device_memory.metadata().gpu_id;
@@ -754,6 +723,76 @@ impl Engine {
             .retain_device_memory_copy(gpu_id, &index_bytes)
             .ok()?;
         Some((Arc::new(memory), table_mask, hash_shift))
+    }
+
+    /// CROSS-SHARD PK INDEX (sub-slice 1): resolve `filter_idx = key` to the resident `(shard_id, LOCAL row)`
+    /// positions via a PER-SHARD host-built PK hash index (`build_int4_pk_hash_table_host` +
+    /// `probe_int4_pk_hash_table`) instead of a per-shard scan. This is the O(1)-probe replacement for the
+    /// scan-based `locate_resident_delete_slots`; it returns the IDENTICAL physical `(shard, slot)` a scan
+    /// finds (the differential gate). Returns `None` to fall back to the scan when ANY shard's key column
+    /// has a DUPLICATE / a 256-probe overflow / an oversize table (the hash declines), or the table is not
+    /// shard-resident / a shard is missing its offset or device memory. PHYSICAL positions -- NO visibility
+    /// gate here (the caller applies the SV3b `deleted_by[slot]` gate), exactly like the scan locate.
+    /// UNWIRED (`#[allow(dead_code)]`) until sub-slice 3 routes point lookups through it; per-lookup host
+    /// build for now (sub-slice 3 caches the device index + probes on-device). Filter column must be int4.
+    #[allow(dead_code)]
+    pub(crate) fn locate_resident_pk_via_shard_index(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        key: i32,
+    ) -> Option<Vec<(u32, u32)>> {
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for shard in table_shards.iter() {
+            // Identity/validity prechecks (mirror `locate_resident_delete_slots` / the scan's `source_for`):
+            // an invalidated / memory-pressured / catalog-mismatched shard forces None so the caller scans,
+            // rather than reading a stale generation's device bytes (audit P3).
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
+                return None;
+            }
+            // An empty shard contributes no keys (the scan matches 0 rows there): SKIP it -- both to match the
+            // scan (which continues to other shards) and to avoid the 0-row hash-build decline that would
+            // otherwise drop hits from OTHER shards (audit P2).
+            if shard.row_count == 0 {
+                continue;
+            }
+            // The filter column's BYTE offset within this shard's own (capacity-strided) buffer -- the SAME
+            // offset the scan reads, so the row indices line up 1:1 with the scan + the deleted_by gather.
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let filter_offset =
+                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
+            let device_memory = self
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&(table.name.clone(), shard.shard_id))?;
+            let keys = device_memory
+                .read_resident_i32_column(filter_offset, shard.row_count)
+                .ok()?;
+            if keys.len() != shard.row_count {
+                return None;
+            }
+            // Build the per-shard hash table over THIS shard's live rows; a duplicate key in ANY shard
+            // declines the whole locate (the scan returns every match; a hash holds one row/key).
+            let (host_table, mask, shift) =
+                build_int4_pk_hash_table_host(&keys, shard.row_count as u64)?;
+            if let Some(row) = probe_int4_pk_hash_table(&host_table, mask, shift, key) {
+                out.push((shard.shard_id, row));
+            }
+        }
+        Some(out)
     }
 
     fn complete_relational_retained_int4_projection_submission(
@@ -1131,5 +1170,119 @@ impl Engine {
             ncols,
             needle_ranges,
         }
+    }
+}
+
+/// Cross-shard PK index (sub-slice 1): the PURE host build of the open-addressing int4 hash table
+/// `(key<<32)|(row+1)` (0 = empty), Fibonacci hash `(key*0x9E37_79B1)>>hash_shift` + linear probe with the
+/// kernel's hard 256-probe cap. Extracted verbatim from `build_wave_resident_int4_index` so the per-shard
+/// index uses the IDENTICAL layout + dup/overflow rules as the R1 single-buffer index. Returns
+/// `(table, table_mask, hash_shift)` or `None` when: the table would exceed 2^30 entries; or the column has
+/// DUPLICATE int4 keys / a key exceeds the 256-probe cap (a hash index holds one row per key but the scan
+/// returns every match, so a duplicate MUST decline → caller scans). `row + 1` packs into the low 32 bits.
+pub(crate) fn build_int4_pk_hash_table_host(
+    keys: &[i32],
+    row_count: u64,
+) -> Option<(Vec<u64>, u32, u32)> {
+    // A 0-row shard makes `table_size = 1` -> `hash_shift = 32`, and `key >> 32` is a u32 shift-overflow
+    // (panics in debug/test, silently masks in release). Decline (the scan handles 0 rows as an empty match);
+    // R1's caller `build_wave_resident_int4_index` already returns None for 0 rows BEFORE delegating, so this
+    // is byte-identical for R1 and also protects the per-shard locate caller (audit P2).
+    if row_count == 0 {
+        return None;
+    }
+    let table_size = row_count
+        .checked_mul(2)
+        .and_then(|doubled| doubled.checked_next_power_of_two())?;
+    if table_size > (1_u64 << 30) {
+        return None;
+    }
+    let table_mask = (table_size - 1) as u32;
+    let hash_shift = 32 - table_size.trailing_zeros();
+    let mut index = vec![0_u64; table_size as usize];
+    for (row, &key) in keys.iter().enumerate() {
+        let key_bits = key as u32;
+        let mut slot = (key_bits.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+        let mut probes = 0_u32;
+        loop {
+            let occupant = index[slot as usize];
+            if occupant == 0 {
+                index[slot as usize] = ((key_bits as u64) << 32) | (row as u64 + 1);
+                break;
+            }
+            if (occupant >> 32) as u32 == key_bits {
+                return None;
+            }
+            slot = (slot + 1) & table_mask;
+            probes += 1;
+            if probes >= 256 {
+                return None;
+            }
+        }
+    }
+    Some((index, table_mask, hash_shift))
+}
+
+/// Cross-shard PK index (sub-slice 1): probe the host hash table built by `build_int4_pk_hash_table_host`
+/// for `key`, returning the LOCAL row index (0-based) or `None` (absent). Mirrors the device probe kernel:
+/// Fibonacci hash → linear probe up to the 256 cap, matching the high 32 bits (the key) and unpacking
+/// `row = (entry & 0xFFFF_FFFF) - 1`. An empty slot (0) terminates the probe = not found. A NULL int4 is
+/// materialized as `0`, so `key = 0` probes exactly as the build indexed it (agrees with the scan).
+pub(crate) fn probe_int4_pk_hash_table(
+    table: &[u64],
+    table_mask: u32,
+    hash_shift: u32,
+    key: i32,
+) -> Option<u32> {
+    let key_bits = key as u32;
+    let mut slot = (key_bits.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+    for _ in 0..256 {
+        let occupant = table[slot as usize];
+        if occupant == 0 {
+            return None;
+        }
+        if (occupant >> 32) as u32 == key_bits {
+            return Some(((occupant & 0xFFFF_FFFF) as u32) - 1);
+        }
+        slot = (slot + 1) & table_mask;
+    }
+    None
+}
+
+#[cfg(test)]
+mod cross_shard_pk_index_tests {
+    use super::{build_int4_pk_hash_table_host, probe_int4_pk_hash_table};
+
+    /// The pure per-shard PK hash index (sub-slice 1) round-trips: every built key probes back to its own
+    /// row; an absent key returns None; NULL-as-0 is indexed + found; a DUPLICATE key declines the build
+    /// (so the caller scans). Non-vacuous: a wrong row/absent would mismatch the enumerate() oracle.
+    #[test]
+    fn pk_hash_table_build_probe_roundtrips_and_declines_dups() {
+        let keys: Vec<i32> = vec![0, 5, 130, -7, 42, 1_000_000];
+        let (table, mask, shift) =
+            build_int4_pk_hash_table_host(&keys, keys.len() as u64).expect("unique keys build");
+        for (row, &key) in keys.iter().enumerate() {
+            assert_eq!(
+                probe_int4_pk_hash_table(&table, mask, shift, key),
+                Some(row as u32),
+                "key {key} must probe back to its own row {row}"
+            );
+        }
+        // Absent keys (not in the set) return None.
+        for absent in [7, 131, -1, 999] {
+            assert_eq!(probe_int4_pk_hash_table(&table, mask, shift, absent), None);
+        }
+        // A duplicate key declines the build (a hash index holds one row/key; the scan returns all).
+        assert!(
+            build_int4_pk_hash_table_host(&[5, 5], 2).is_none(),
+            "duplicate keys must decline (fall back to scan)"
+        );
+        // NULL-as-0: key 0 is indexed at its row and probes found (agrees with WHERE col = 0).
+        assert_eq!(probe_int4_pk_hash_table(&table, mask, shift, 0), Some(0));
+        // Audit P2: a 0-row shard declines WITHOUT a shift-by-32 overflow (would panic in debug otherwise).
+        assert!(
+            build_int4_pk_hash_table_host(&[], 0).is_none(),
+            "0-row build declines (no shift-by-32 panic)"
+        );
     }
 }
