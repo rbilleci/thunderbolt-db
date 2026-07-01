@@ -784,6 +784,16 @@ impl Engine {
             if keys.len() != shard.row_count {
                 return None;
             }
+            // Sub-slice 2: BLOOM membership prune -- skip this shard if its bloom PROVES `key` absent. No
+            // false negatives (every key sets all k of its bits), so a shard that HOLDS the key is NEVER
+            // skipped -> RESULT-INVARIANT (locate-with-bloom == locate-without == scan); a false positive
+            // just falls through to the hash probe below (which returns not-found). Host-built per lookup
+            // here; sub-slice 3 caches the bloom at seal so this skips WITHOUT reading the shard's keys.
+            if let Some((bloom_words, bloom_bits, bloom_k)) = build_int4_pk_bloom_host(&keys) {
+                if !bloom_maybe_contains(&bloom_words, bloom_bits, bloom_k, key) {
+                    continue;
+                }
+            }
             // Build the per-shard hash table over THIS shard's live rows; a duplicate key in ANY shard
             // declines the whole locate (the scan returns every match; a hash holds one row/key).
             let (host_table, mask, shift) =
@@ -1249,9 +1259,85 @@ pub(crate) fn probe_int4_pk_hash_table(
     None
 }
 
+/// Cross-shard PK index (sub-slice 2): two well-distributed 64-bit hashes of an int4 key for the bloom's
+/// double hashing (Kirsch-Mitzenmacher `bit_i = h1 + i*h2`). Each key is run through a splitmix64-style
+/// finalizer -- a PLAIN multiplicative hash leaves poorly-distributed LOW bits, so we mix and the bit index
+/// is taken from the HIGH bits (see `bloom_bit`). Key is zero-extended (NULL-as-0 hashes as key 0,
+/// consistent with the hash index + the scan's `WHERE col = 0`).
+fn bloom_hashes(key: i32) -> (u64, u64) {
+    let mix = |mut z: u64| -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let k = key as u32 as u64;
+    let h1 = mix(k.wrapping_add(0x9E37_79B9_7F4A_7C15));
+    // h2 forced ODD so the k probes land on distinct bit slots.
+    let h2 = mix(k.wrapping_add(0x1234_5678_9ABC_DEF0)) | 1;
+    (h1, h2)
+}
+
+/// The i-th bloom bit index for a key with double-hash `(h1, h2)` over `num_bits = 2^b`: take the HIGH `b`
+/// bits of the 64-bit `h1 + i*h2` (`>> (64 - b)`), where the entropy of the mixed hash lives.
+fn bloom_bit(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
+    let shift = 64 - num_bits.trailing_zeros();
+    h1.wrapping_add((i as u64).wrapping_mul(h2)) >> shift
+}
+
+/// Cross-shard PK index (sub-slice 2): build a per-shard membership BLOOM over the int4 key column. `m` =
+/// 10 bits/key rounded up to a power of two (mask-friendly, >= 64), `k` = 7 double-hashed probes. A false
+/// POSITIVE (all k bits set by OTHER keys) only costs one extra hash-index probe of a shard; there is NEVER
+/// a false NEGATIVE -- every inserted key sets ALL k of its bits, so `bloom_maybe_contains` returns true for
+/// it. That no-false-negative property is the LOAD-BEARING correctness invariant: the bloom may only SKIP a
+/// shard it PROVES cannot hold the key. Sizing (10 bits/key, k=7 → ~1% FP) is a tunable perf/memory knob,
+/// NOT a correctness parameter. `None` on 0 rows / oversize (>2^34 bits). Returns `(words, num_bits, k)`.
+pub(crate) fn build_int4_pk_bloom_host(keys: &[i32]) -> Option<(Vec<u64>, u64, u32)> {
+    let n = keys.len() as u64;
+    if n == 0 {
+        return None;
+    }
+    const BITS_PER_KEY: u64 = 10;
+    const NUM_HASHES: u32 = 7;
+    let num_bits = n
+        .saturating_mul(BITS_PER_KEY)
+        .checked_next_power_of_two()?
+        .max(64);
+    if num_bits > (1_u64 << 34) {
+        return None;
+    }
+    let mut words = vec![0_u64; (num_bits / 64) as usize];
+    for &key in keys {
+        let (h1, h2) = bloom_hashes(key);
+        for i in 0..NUM_HASHES {
+            let bit = bloom_bit(h1, h2, i, num_bits);
+            words[(bit / 64) as usize] |= 1_u64 << (bit % 64);
+        }
+    }
+    Some((words, num_bits, NUM_HASHES))
+}
+
+/// Cross-shard PK index (sub-slice 2): `true` = key MAYBE present (probe the shard's hash), `false` =
+/// DEFINITELY absent (skip the shard). No false negatives by construction (see `build_int4_pk_bloom_host`).
+pub(crate) fn bloom_maybe_contains(words: &[u64], num_bits: u64, num_hashes: u32, key: i32) -> bool {
+    if num_bits == 0 {
+        return true; // no bloom -> can't prune -> conservatively "maybe" (never skip)
+    }
+    let (h1, h2) = bloom_hashes(key);
+    for i in 0..num_hashes {
+        let bit = bloom_bit(h1, h2, i, num_bits);
+        if words[(bit / 64) as usize] & (1_u64 << (bit % 64)) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod cross_shard_pk_index_tests {
-    use super::{build_int4_pk_hash_table_host, probe_int4_pk_hash_table};
+    use super::{
+        bloom_maybe_contains, build_int4_pk_bloom_host, build_int4_pk_hash_table_host,
+        probe_int4_pk_hash_table,
+    };
 
     /// The pure per-shard PK hash index (sub-slice 1) round-trips: every built key probes back to its own
     /// row; an absent key returns None; NULL-as-0 is indexed + found; a DUPLICATE key declines the build
@@ -1284,5 +1370,36 @@ mod cross_shard_pk_index_tests {
             build_int4_pk_hash_table_host(&[], 0).is_none(),
             "0-row build declines (no shift-by-32 panic)"
         );
+    }
+
+    /// The per-shard bloom (sub-slice 2) has NO FALSE NEGATIVES (every built key -> maybe_contains true --
+    /// the load-bearing membership-prune invariant, so a present key's shard is NEVER skipped) and a sane
+    /// false-positive rate (most absent keys -> false = skippable). Includes 0, negatives, and a large set.
+    #[test]
+    fn pk_bloom_no_false_negatives_and_sane_fp() {
+        let keys: Vec<i32> = (0..1000_i32).map(|i| i * 3 - 500).collect(); // -500..2497, incl 0-adjacent + neg
+        let (words, num_bits, k) = build_int4_pk_bloom_host(&keys).expect("build");
+        // NO FALSE NEGATIVES: every inserted key MUST test present. A single miss = a dropped hit = WRONG.
+        for &key in &keys {
+            assert!(
+                bloom_maybe_contains(&words, num_bits, k, key),
+                "bloom false negative for a BUILT key {key} -- would drop a real hit"
+            );
+        }
+        // False-positive sanity: 10k absent candidates far from the built range -> mostly "definitely absent".
+        let (mut fp, mut total) = (0_usize, 0_usize);
+        for cand in 1_000_000..1_010_000_i32 {
+            total += 1;
+            if bloom_maybe_contains(&words, num_bits, k, cand) {
+                fp += 1;
+            }
+        }
+        let fp_rate = fp as f64 / total as f64;
+        assert!(fp_rate < 0.05, "bloom FP rate {fp_rate:.4} must be well under 5% at 10 bits/key, k=7");
+        // Empty -> None (no bloom to prune with).
+        assert!(build_int4_pk_bloom_host(&[]).is_none());
+        // A single-key bloom still contains its key (>= 64-bit min size, no sub-word issue).
+        let (w1, b1, k1) = build_int4_pk_bloom_host(&[42]).unwrap();
+        assert!(bloom_maybe_contains(&w1, b1, k1, 42));
     }
 }
