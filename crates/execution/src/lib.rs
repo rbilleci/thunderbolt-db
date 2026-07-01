@@ -13827,6 +13827,17 @@ fn launch_cuda_resident_expr_two_col_filter(
 pub enum ExprStep {
     /// Push the resident int4 column at `byte_offset` (loaded into a fresh buffer).
     LoadColumn { byte_offset: u64 },
+    /// SV3b (mixed-width VM): push an i64 (u64) column at `byte_offset` into an 8-byte-per-elem buffer via
+    /// the i64 load kernel — REGARDLESS of the program's run `elem`. This is what lets a mixed program
+    /// combine an i32 value predicate with an i64 `deleted_by > read_txn_id` visibility compare
+    /// (`CompareScalarI64`) in ONE program: masks are width-agnostic, only the value buffers differ. An
+    /// all-i32 / all-i64 program never emits this step, so those programs are byte-identical.
+    ///
+    /// **CALLER CONTRACT (audit follow-up):** in a NON-I64 run, a `CompareScalarI64` MUST consume a buffer
+    /// produced by a preceding `LoadColumnI64` (its 8-byte operand) — the i64 compare kernel reads 8 bytes
+    /// per element, so pairing it with a 4-byte `LoadColumn` buffer is an out-of-bounds DEVICE read. The
+    /// program builder is responsible for this pairing (the VM does not structurally enforce it).
+    LoadColumnI64 { byte_offset: u64 },
     /// Pop b, pop a, push `a <op> b` (buffer x buffer).
     BufferBinary { op: u32 },
     /// Pop a, push `a <op> scalar` (or `scalar <op> a` if `scalar_on_left`) — folds an immediate
@@ -14135,6 +14146,25 @@ fn run_resident_arith_program<'r>(
     } else {
         None
     };
+    // SV3b (mixed-width VM): the i64 load + i64 compare-scalar kernels, loaded lazily only when the program
+    // contains a `LoadColumnI64` step — i.e. a MIXED program running at `elem = I32` that also needs an i64
+    // `deleted_by` compare. They let those i64 steps run at full 8-byte width inside an otherwise-i32 program;
+    // the value buffers differ (8 vs 4 bytes) but the resulting masks are width-agnostic and AND together.
+    // An all-i64 program keeps using `elem`'s `load_fn`/`compare_scalar_mask_fn` (already the i64 kernels).
+    let has_i64_step = program
+        .iter()
+        .any(|s| matches!(s, ExprStep::LoadColumnI64 { .. }));
+    let i64_byte_len = n_usize
+        .checked_mul(ResidentElemType::I64.elem_size())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(n_usize))?;
+    let (i64_load_fn, i64_compare_scalar_mask_fn) = if has_i64_step {
+        (
+            Some(primary.cached_function(c"gpu_db_resident_i64_load_column", &ptx)?),
+            Some(primary.cached_function(c"gpu_db_buffer_i64_compare_scalar_to_mask", &ptx)?),
+        )
+    } else {
+        (None, None)
+    };
     // numeric (i128) multiply is a SEPARATE kernel — the signed 128x128->256 product is too large to
     // inline into the add/sub binary kernel — loaded only for I128. int4/int8 multiply lives in their
     // binary kernel (mul.hi), so this stays None there.
@@ -14205,6 +14235,24 @@ fn run_resident_arith_program<'r>(
                     (&mut a3 as *mut u64).cast::<c_void>(),
                 ];
                 launch(load_fn, &mut args)?;
+                stack.push(out);
+            }
+            ExprStep::LoadColumnI64 { byte_offset } => {
+                // SV3b: load an i64 column at full 8-byte width even in a mixed (elem=I32) program.
+                let i64_load_fn =
+                    i64_load_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+                let out = primary.lease_device_buffer(i64_byte_len)?;
+                let mut a0 = resident_base;
+                let mut a1 = byte_offset;
+                let mut a2 = n;
+                let mut a3 = out.ptr;
+                let mut args = [
+                    (&mut a0 as *mut u64).cast::<c_void>(),
+                    (&mut a1 as *mut u64).cast::<c_void>(),
+                    (&mut a2 as *mut u64).cast::<c_void>(),
+                    (&mut a3 as *mut u64).cast::<c_void>(),
+                ];
+                launch(i64_load_fn, &mut args)?;
                 stack.push(out);
             }
             ExprStep::BufferBinary { op } => {
@@ -14371,12 +14419,18 @@ fn run_resident_arith_program<'r>(
                 scalar,
                 scalar_on_left,
             } => {
-                // A full-width i64 scalar (timestamp micros / large int8 literal). The i64
-                // compare-scalar-to-mask kernel reads an s64 scalar, so this is valid ONLY for an I64
-                // program; reject any other elem (an i32/i128 kernel would mis-read the 8-byte arg).
-                if elem != ResidentElemType::I64 {
-                    return Err(CudaRuntimeProbeError::InvalidInputLength(0));
-                }
+                // A full-width i64 scalar (timestamp micros / large int8 literal / `deleted_by` commit seq).
+                // The i64 compare-scalar-to-mask kernel reads an s64 scalar + an 8-byte operand, so it is
+                // valid EITHER in an all-I64 program (the run's `compare_scalar_mask_fn` is the i64 kernel)
+                // OR in a MIXED program where a `LoadColumnI64` supplied the 8-byte operand and the lazy i64
+                // kernel was loaded (SV3b). Reject otherwise (an i32/i128 run kernel would mis-read the arg).
+                // The mask OUTPUT is width-agnostic (i32), so `byte_len` fits it in either run.
+                let compare_fn = if elem == ResidentElemType::I64 {
+                    compare_scalar_mask_fn
+                } else {
+                    i64_compare_scalar_mask_fn
+                        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?
+                };
                 let value = stack
                     .pop()
                     .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
@@ -14395,7 +14449,7 @@ fn run_resident_arith_program<'r>(
                     (&mut a4 as *mut u64).cast::<c_void>(),
                     (&mut a5 as *mut u64).cast::<c_void>(),
                 ];
-                launch(compare_scalar_mask_fn, &mut args)?;
+                launch(compare_fn, &mut args)?;
                 stack.push(out);
             }
             ExprStep::CompareScalarI128 {
@@ -25614,6 +25668,90 @@ mod tests {
         let mut ne_expected: Vec<u32> = (0..300).collect();
         ne_expected.extend(301..N as u32);
         assert_eq!(got_ne, ne_expected, "a != 300 <=> all rows but index 300");
+    }
+
+    /// SV3b (mixed-width VM): ONE predicate program run at `elem = I32` that combines an i32 value predicate
+    /// (`id == 5`) with an i64 `deleted_by > read_txn_id` visibility compare, via `LoadColumnI64` +
+    /// `CompareScalarI64` — the capability that unblocks point-lookup visibility. Hand-built columns are the
+    /// GPU-native oracle. NON-VACUITY: the i32-only WHERE keeps the deleted row; the i64 visibility compare
+    /// is what removes it — so a broken mixed-width path (i64 step no-op or mis-read) fails.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_expr_mixed_width_i32_where_and_i64_visibility() {
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        const N: u64 = 4;
+        let header = N.to_le_bytes().to_vec();
+        let id_off = std::mem::size_of::<u64>() as u64; // i32 id column after the 8-byte header
+        let db_off = id_off + N * std::mem::size_of::<i32>() as u64; // i64 deleted_by after the i32 column
+        let ids: [i32; 4] = [5, 5, 7, 5];
+        // row1 deleted @10, row3 deleted @3; rows 0,2 LIVE. The live sentinel is 0x7F7F... — a LARGE POSITIVE
+        // signed i64 (the compare kernel is signed s64), NOT u64::MAX (which is -1 as signed and would fail
+        // `> read_txn_id`). This mirrors the engine's `DELETED_BY_LIVE`.
+        const LIVE: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+        let deleted_by: [u64; 4] = [LIVE, 10, LIVE, 3];
+        let mut id_bytes = Vec::new();
+        for v in ids {
+            id_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut db_bytes = Vec::new();
+        for v in deleted_by {
+            db_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                db_off + db_bytes.len() as u64,
+                &[
+                    CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+                    CudaDeviceMemoryChunk { byte_offset: id_off, bytes: &id_bytes },
+                    CudaDeviceMemoryChunk { byte_offset: db_off, bytes: &db_bytes },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // MIXED program at elem=I32: `id == 5` (i32) AND `deleted_by > 6` (i64).
+        let mixed = [
+            ExprStep::LoadColumn { byte_offset: id_off },
+            ExprStep::CompareScalar { cmp: 0, scalar: 5, scalar_on_left: false }, // 0 = `=`
+            ExprStep::LoadColumnI64 { byte_offset: db_off },
+            ExprStep::CompareScalarI64 { cmp: 3, scalar: 6, scalar_on_left: false }, // 3 = `>`
+            ExprStep::MaskBinary { op: 0 },                                          // 0 = AND
+        ];
+        // row0 (id5, MAX>6) yes; row1 (id5, 10>6) yes; row2 (id7) no; row3 (id5, 3>6) no.
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&mixed, N, ResidentElemType::I32)
+                .expect("mixed i32 WHERE + i64 visibility"),
+            vec![0, 1],
+            "id==5 AND deleted_by>6"
+        );
+
+        // NON-VACUITY: id==5 ALONE (no visibility) keeps the deleted row3 -> [0,1,3]; the i64 visibility
+        // compare is what removes it. A no-op mixed-width path would leave row3 in.
+        let where_only = [
+            ExprStep::LoadColumn { byte_offset: id_off },
+            ExprStep::CompareScalar { cmp: 0, scalar: 5, scalar_on_left: false },
+        ];
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&where_only, N, ResidentElemType::I32)
+                .unwrap(),
+            vec![0, 1, 3],
+            "id==5 alone keeps the deleted row"
+        );
+
+        // The i64 visibility compare ALONE (the no-WHERE scan/COUNT case) at elem=I64: deleted_by>6 -> [0,1,2].
+        let vis_only = [
+            ExprStep::LoadColumnI64 { byte_offset: db_off },
+            ExprStep::CompareScalarI64 { cmp: 3, scalar: 6, scalar_on_left: false },
+        ];
+        assert_eq!(
+            resident
+                .run_expr_predicate_filter(&vis_only, N, ResidentElemType::I64)
+                .unwrap(),
+            vec![0, 1, 2],
+            "deleted_by>6 alone (scan visibility) hides rows deleted at <= the snapshot"
+        );
     }
 
     #[test]

@@ -300,6 +300,13 @@ pub(crate) fn sql_value_as_int4(value: &SqlValue) -> i32 {
     }
 }
 
+/// The uniform memset byte whose repetition is the `deleted_by` LIVE sentinel `0x7F7F_7F7F_7F7F_7F7F` — a
+/// large POSITIVE signed i64 (the device visibility compare `deleted_by > read_txn_id` is a signed s64
+/// kernel; `u64::MAX` would be -1 signed and a live row would wrongly fail the compare) that exceeds every
+/// real commit `Index`, and is memset-friendly (uniform byte) for both the on-demand region and the SV3a
+/// recompaction fill.
+pub(crate) const DELETED_BY_LIVE_FILL_BYTE: u8 = 0x7F;
+
 /// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
 /// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
 /// slots. Each chunk lands EXACTLY where the capacity-aware read offsets expect it (column `c` at
@@ -1268,8 +1275,8 @@ mod capacity_payload_tests {
             .expect("region is allocated on the first delete");
         assert_eq!(
             db,
-            vec![u64::MAX, 777, u64::MAX, 777, u64::MAX],
-            "only the targeted slots are stamped; other rows stay the live sentinel"
+            vec![0x7F7F_7F7F_7F7F_7F7F, 777, 0x7F7F_7F7F_7F7F_7F7F, 777, 0x7F7F_7F7F_7F7F_7F7F],
+            "only the targeted slots are stamped; other rows stay the live sentinel (0x7F7F.. = signed-safe)"
         );
 
         // Out-of-line: column bytes untouched -> (visibility unwired at SV2) a full scan still returns 5 rows.
@@ -1291,7 +1298,7 @@ mod capacity_payload_tests {
         assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[0], 888));
         assert_eq!(
             read_shard_deleted_by_region(&e, "accounts", shard_id, 5).unwrap(),
-            vec![888, 777, u64::MAX, 777, u64::MAX],
+            vec![888, 777, 0x7F7F_7F7F_7F7F_7F7F, 777, 0x7F7F_7F7F_7F7F_7F7F],
             "the second delete reuses the region + preserves the earlier stamps"
         );
 
@@ -2208,8 +2215,12 @@ impl Engine {
         {
             Some(region) => region,
             None => {
-                // Born all-live: every u64 = `DELETED_BY_LIVE` (all 0xFF bytes).
-                let live_payload = vec![0xFF_u8; capacity * std::mem::size_of::<u64>()];
+                // Born all-live: every u64 = the LIVE sentinel `0x7F7F_7F7F_7F7F_7F7F` (memset byte 0x7F).
+                // It must be a LARGE POSITIVE SIGNED i64 (the read visibility compare `deleted_by >
+                // read_txn_id` uses the SIGNED s64 kernel) — `u64::MAX` would be -1 as signed and a live row
+                // would wrongly FAIL `> read_txn_id`. 0x7F7F... ≈ 9.1e18 > every real commit `Index`; byte
+                // 0x7F is also uniform so the same value is producible by the SV3a recompaction memset-fill.
+                let live_payload = vec![DELETED_BY_LIVE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
                 let Some(region) = self.relational_residency_device_memory(gpu_id, &live_payload) else {
                     return false;
                 };
