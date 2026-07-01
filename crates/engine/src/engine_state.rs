@@ -550,6 +550,17 @@ pub(crate) struct ResidencyReadState {
 }
 
 impl ResidencyReadState {
+    /// Sub-slice 3b (cache lifecycle cleanup): drop every cached per-shard PK index for `table` -- mirrors
+    /// `shard_deleted_by_memory` cleanup at the evict / invalidate / drop / re-admit lifecycle sites so a
+    /// wired index route does not LEAK the pinned shard buffers (`_resident_guard`) of a table whose
+    /// residency changed. Cheap `retain` over the small cache; INERT for a delete/index-free table (empty).
+    pub(crate) fn purge_shard_pk_index_for_table(&self, table: &str) {
+        self.shard_pk_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(cached_table, _, _), _| cached_table != table);
+    }
+
     /// COW-mutate the resident snapshot map under the serialized catalog latch: clone the published
     /// map, apply `mutate`, then atomically store it. In-flight readers keep the generation they
     /// loaded. One publisher (the catalog-latch path), so the load→clone→store is race-free.

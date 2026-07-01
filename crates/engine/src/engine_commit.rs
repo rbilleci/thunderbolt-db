@@ -338,6 +338,10 @@ impl Engine {
             .residency
             .shard_deleted_by_memory
             .invalidate_table(table);
+        // Sub-slice 3b: drop the table's cached per-shard PK indexes (they pin stale buffers).
+        self.read_state
+            .residency
+            .purge_shard_pk_index_for_table(table);
     }
 
     /// Invalidate the GPU residency of the `tables` a CONCURRENT commit mutated, via `&self`
@@ -370,6 +374,10 @@ impl Engine {
                 .residency
                 .shard_deleted_by_memory
                 .invalidate_table(table);
+            // Sub-slice 3b: drop the table's cached per-shard PK indexes.
+            self.read_state
+                .residency
+                .purge_shard_pk_index_for_table(table);
         }
         // ADR-009 R2.2b: deliberately does NOT evict the persistent wave read engine here. Dropping it tears
         // a live kernel down (petter join ~watchdog window + stream sync) — far too costly to do inside the
@@ -494,6 +502,10 @@ impl Engine {
                 .residency
                 .shard_deleted_by_memory
                 .invalidate_table(table);
+            // Sub-slice 3b: drop the pressured table's cached per-shard PK indexes.
+            self.read_state
+                .residency
+                .purge_shard_pk_index_for_table(table);
         }
     }
 

@@ -2003,6 +2003,59 @@ mod capacity_payload_tests {
         assert_eq!(appended.len(), 1, "appended id=250 is located");
     }
 
+    /// CROSS-SHARD PK INDEX sub-slice 3b (cache LIFECYCLE CLEANUP): the shard_pk_index cache is PURGED for a
+    /// table on the residency-change lifecycle events (an invalidating commit's re-admit, and DROP), so a
+    /// wired index route can't leak the pinned shard buffers of a no-longer-resident table. Sabotage: make
+    /// `purge_shard_pk_index_for_table` a no-op and the post-DELETE / post-DROP "cache empty" asserts FAIL.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cross_shard_pk_index_cache_purged_on_lifecycle() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let id_col = {
+            let table = e.relational_catalog_table("accounts").unwrap();
+            crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap()
+        };
+        let entries = |t: &str| {
+            e.read_state
+                .residency
+                .shard_pk_index
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(cached, _, _)| cached == t)
+                .count()
+        };
+        let locate = |k: i32| {
+            let table = e.relational_catalog_table("accounts").unwrap();
+            e.locate_resident_pk_via_shard_index(&table, id_col, k).unwrap()
+        };
+
+        // Populate the cache.
+        assert_eq!(locate(130).len(), 1);
+        assert!(entries("accounts") > 0, "cache populated after a locate");
+
+        // An invalidating commit (DELETE -> invalidate + re-admit) purges the table's cache.
+        e.execute_text(202, "DELETE FROM accounts WHERE id = 5").unwrap();
+        assert_eq!(entries("accounts"), 0, "invalidate/re-admit purged the cache (no leaked pinned buffers)");
+
+        // Re-populate, then DROP TABLE purges via apply_drop_table.
+        assert_eq!(locate(130).len(), 1);
+        assert!(entries("accounts") > 0, "cache re-populated");
+        e.execute_text(203, "DROP TABLE accounts").unwrap();
+        assert_eq!(entries("accounts"), 0, "DROP TABLE purged the cache");
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -2264,6 +2317,8 @@ impl Engine {
             // shard_id) or the fresh shard would inherit them (SV4 wrong-results). Symmetric to the
             // single-buffer path below. INERT until SV4 (no region exists today).
             read_state.residency.shard_deleted_by_memory.remove_table(table);
+            // Sub-slice 3b: this sharded re-admit replaces the table's shards -> purge stale cached indexes.
+            read_state.residency.purge_shard_pk_index_for_table(table);
             let dm = device_memory.expect("device_memory.is_some() checked");
             let shard = RelationalResidentShard {
                 shard_id: 0,
@@ -2320,6 +2375,8 @@ impl Engine {
         // `deleted_by` regions -- a flag flip / re-admit must not leave a tombstone region shadowing the fresh
         // all-live buffer (wrong-results guard). INERT until SV4 (no region exists today).
         read_state.residency.shard_deleted_by_memory.remove_table(table);
+        // Sub-slice 3b: the single-buffer path replaces the table's shards -> purge stale cached indexes.
+        read_state.residency.purge_shard_pk_index_for_table(table);
         cat
             .relational_resident_cache
             .install_snapshot(
@@ -2734,8 +2791,9 @@ impl Engine {
     /// Empty + NULL-bearing rows are already rejected by the caller. Returns false (caller invalidates +
     /// re-admits) when the open shard isn't int4-appendable, is invalid, or has no headroom (seal + a fresh
     /// open shard on overflow is S-d2c), or the device append fails. No host_rows (shard tables read via the
-    /// device recompaction, not the host-materialization path) and no wave_index (the shard read recompacts
-    /// a fresh unified buffer per query, so there is no ptr-keyed cached index to invalidate).
+    /// device recompaction, not the host-materialization path) and no single-buffer `wave_index` to drop.
+    /// (The sub-slice-3a `shard_pk_index` per-shard cache IS ptr-keyed but ALSO row_count-validated, so an
+    /// in-place append grows row_count -> next probe misses -> rebuild; no explicit invalidation needed here.)
     fn try_append_to_resident_open_shard(&self, table: &str, new_rows: &[Vec<SqlValue>]) -> bool {
         let pressured_gpus = self
             .router
