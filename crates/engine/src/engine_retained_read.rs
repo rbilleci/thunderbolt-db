@@ -778,31 +778,101 @@ impl Engine {
                 .residency
                 .shard_device_memory
                 .get(&(table.name.clone(), shard.shard_id))?;
-            let keys = device_memory
-                .read_resident_i32_column(filter_offset, shard.row_count)
-                .ok()?;
-            if keys.len() != shard.row_count {
-                return None;
-            }
-            // Sub-slice 2: BLOOM membership prune -- skip this shard if its bloom PROVES `key` absent. No
-            // false negatives (every key sets all k of its bits), so a shard that HOLDS the key is NEVER
-            // skipped -> RESULT-INVARIANT (locate-with-bloom == locate-without == scan); a false positive
-            // just falls through to the hash probe below (which returns not-found). Host-built per lookup
-            // here; sub-slice 3 caches the bloom at seal so this skips WITHOUT reading the shard's keys.
-            if let Some((bloom_words, bloom_bits, bloom_k)) = build_int4_pk_bloom_host(&keys) {
-                if !bloom_maybe_contains(&bloom_words, bloom_bits, bloom_k, key) {
-                    continue;
-                }
-            }
-            // Build the per-shard hash table over THIS shard's live rows; a duplicate key in ANY shard
-            // declines the whole locate (the scan returns every match; a hash holds one row/key).
-            let (host_table, mask, shift) =
-                build_int4_pk_hash_table_host(&keys, shard.row_count as u64)?;
-            if let Some(row) = probe_int4_pk_hash_table(&host_table, mask, shift, key) {
-                out.push((shard.shard_id, row));
+            // Sub-slice 3: probe the CACHED per-shard hash+bloom index (built once per shard generation,
+            // ptr-validated) instead of a per-lookup DtoH + rebuild. Bloom-prunes then hash-probes.
+            match self.probe_shard_pk_index_cached(
+                &table.name,
+                shard.shard_id,
+                filter_idx,
+                &device_memory,
+                filter_offset,
+                shard.row_count,
+                key,
+            ) {
+                ShardPkProbe::Hit(row) => out.push((shard.shard_id, row)),
+                ShardPkProbe::Miss => {}
+                // A duplicate key in ANY shard declines the whole locate (the scan returns every match; a
+                // hash holds one row/key) -> the caller scans.
+                ShardPkProbe::Declined => return None,
             }
         }
         Some(out)
+    }
+
+    /// Sub-slice 3: probe the CACHED per-shard host PK index (hash + bloom) for `key`. Builds + caches the
+    /// index ONCE per shard generation -- keyed `(table, shard_id, col_idx)`, VALIDATED by
+    /// `resident_device_ptr` so a re-admit / rollover (new device buffer -> new ptr) misses and rebuilds
+    /// against the live bytes (the R1 `wave_index` staleness discipline, per shard). Reuse makes a point
+    /// lookup an O(1) host probe instead of a per-lookup DtoH + rebuild. Build happens OUTSIDE the cache lock
+    /// (a concurrent rebuild of the same entry merely overwrites -- harmless, rare). A DECLINED shard
+    /// (duplicate / oversize key column) is CACHED as `index: None` so it is not rebuilt every lookup.
+    fn probe_shard_pk_index_cached(
+        &self,
+        table_name: &str,
+        shard_id: u32,
+        col_idx: usize,
+        device_memory: &Arc<CudaResidentDeviceMemory>,
+        filter_offset: u64,
+        row_count: usize,
+        key: i32,
+    ) -> ShardPkProbe {
+        let device_ptr = device_memory.device_ptr();
+        let cache_key = (table_name.to_string(), shard_id, col_idx);
+        // Fast path: a cached entry whose ptr still matches the live buffer -> probe under the lock.
+        {
+            let cache = self
+                .read_state
+                .residency
+                .shard_pk_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cache.get(&cache_key) {
+                // Validate (ptr, row_count): a re-admit/rollover changes the ptr; an in-place open-shard
+                // APPEND grows row_count with the SAME ptr -> either mismatch rebuilds against the live shard.
+                if entry.resident_device_ptr == device_ptr && entry.row_count == row_count {
+                    return probe_cached_shard_pk(entry, key);
+                }
+            }
+        }
+        // Miss / stale ptr: build OUTSIDE the lock (DtoH the key column + host hash + bloom), then publish.
+        let Ok(keys) = device_memory.read_resident_i32_column(filter_offset, row_count) else {
+            return ShardPkProbe::Declined; // a read failure forces the conservative scan (not cached)
+        };
+        if keys.len() != row_count {
+            return ShardPkProbe::Declined;
+        }
+        let index = match build_int4_pk_hash_table_host(&keys, row_count as u64) {
+            Some((hash_table, table_mask, hash_shift)) => {
+                // build_int4_pk_bloom_host only declines on 0 rows (excluded above) -> Some; the fallback
+                // (0,0) makes `bloom_maybe_contains` conservatively "maybe" (never wrongly skips).
+                let (bloom_words, bloom_num_bits, bloom_num_hashes) =
+                    build_int4_pk_bloom_host(&keys).unwrap_or((Vec::new(), 0, 0));
+                Some(CachedShardPkIndexData {
+                    hash_table,
+                    table_mask,
+                    hash_shift,
+                    bloom_words,
+                    bloom_num_bits,
+                    bloom_num_hashes,
+                })
+            }
+            None => None, // duplicate / oversize key column -> declined (cached so we don't rebuild)
+        };
+        let entry = CachedShardPkIndex {
+            resident_device_ptr: device_ptr,
+            row_count,
+            // Pin the buffer so its address can't be reused while cached (ABA guard; see the struct doc).
+            _resident_guard: Arc::clone(device_memory),
+            index,
+        };
+        let result = probe_cached_shard_pk(&entry, key);
+        self.read_state
+            .residency
+            .shard_pk_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(cache_key, entry);
+        result
     }
 
     fn complete_relational_retained_int4_projection_submission(
@@ -1330,6 +1400,34 @@ pub(crate) fn bloom_maybe_contains(words: &[u64], num_bits: u64, num_hashes: u32
         }
     }
     true
+}
+
+/// Sub-slice 3: the result of probing a shard's cached PK index for a key.
+enum ShardPkProbe {
+    /// Local row index of the (unique) matching row in the shard.
+    Hit(u32),
+    /// Absent in this shard (bloom-pruned, or the hash found no match).
+    Miss,
+    /// The shard's key column has duplicates / oversize -> the caller must fall back to the scan.
+    Declined,
+}
+
+/// Probe a cached shard PK index entry for `key`: bloom-prune, then hash-probe. `index = None` = the shard
+/// declined at build (dup/oversize) -> `Declined`. No false negative (see the bloom/hash builds), so a
+/// present key is never wrongly Missed.
+fn probe_cached_shard_pk(entry: &CachedShardPkIndex, key: i32) -> ShardPkProbe {
+    match &entry.index {
+        None => ShardPkProbe::Declined,
+        Some(data) => {
+            if !bloom_maybe_contains(&data.bloom_words, data.bloom_num_bits, data.bloom_num_hashes, key) {
+                return ShardPkProbe::Miss;
+            }
+            match probe_int4_pk_hash_table(&data.hash_table, data.table_mask, data.hash_shift, key) {
+                Some(row) => ShardPkProbe::Hit(row),
+                None => ShardPkProbe::Miss,
+            }
+        }
+    }
 }
 
 #[cfg(test)]

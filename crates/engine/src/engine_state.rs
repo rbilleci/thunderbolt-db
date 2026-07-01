@@ -515,6 +515,19 @@ pub(crate) struct ResidencyReadState {
     /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the
     /// fast cache-hit path; staleness is handled by the per-entry `generation` tag, not by eviction.
     pub(crate) wave_index: Mutex<BTreeMap<String, WaveResidentIndex>>,
+    /// Cross-shard PK index (sub-slice 3): per-`(table, shard_id, column_idx)` host hash+bloom index reuse
+    /// cache, built lazily + validated by `resident_device_ptr` (a re-admit/rollover's new ptr -> rebuild).
+    /// A plain `Mutex` like `wave_index`; the index-probe point-lookup route is opt-in behind
+    /// `shard_index_probe_enabled` (wired in sub-slice 3b). Staleness handled by the per-entry `(ptr,
+    /// row_count)` tag + the entry's buffer-pinning ABA guard.
+    ///
+    /// **3b PREREQUISITE (audit P2, INERT until wired):** this cache is NOT cleaned on shard evict /
+    /// invalidate / drop / re-admit, so once the route is wired a dropped/evicted shard leaks its buffer
+    /// (the `_resident_guard` pins it). Before 3b wires the route, add `shard_pk_index` cleanup at the SAME
+    /// lifecycle sites as `shard_deleted_by_memory` (SV4-prereq-#1: `invalidate_relational_residency_*`,
+    /// `apply_drop_table`, the re-admit clears) to bound memory. Leak-only (never wrong-results: the pinned
+    /// guard makes ptr-reuse impossible while an entry lives).
+    pub(crate) shard_pk_index: Mutex<BTreeMap<(String, u32, usize), CachedShardPkIndex>>,
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe (vs the atomic
     /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
     /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.

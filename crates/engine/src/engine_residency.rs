@@ -1885,6 +1885,124 @@ mod capacity_payload_tests {
         );
     }
 
+    /// CROSS-SHARD PK INDEX sub-slice 3 (CACHE): the per-shard index cache is populated on first locate, and
+    /// on a GENERATION CHANGE (a DELETE re-admits the table -> new device ptrs + SHIFTED row slots) the stale
+    /// cached index is NOT served -- ptr-validation rebuilds, so locate still == the scan on the NEW buffer.
+    /// This is the load-bearing cache-correctness gate: deleting id=50 moves id=51 from slot 51 to slot 50 in
+    /// shard 0, so a stale index would return the WRONG slot. Sabotage: drop the ptr check (serve stale) and
+    /// the post-re-admit locate diverges from the scan.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cross_shard_pk_index_cache_rebuilds_on_generation_change() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        let scan_locate = |t: &crate::relational_model::RelationalTable, k: i32| -> Vec<(u32, u32)> {
+            let pred = crate::engine_expr::ResidentExpr::Binary {
+                op: crate::engine_expr::ResidentBinaryOp::Eq,
+                lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
+                rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(k)),
+            };
+            let mut v: Vec<(u32, u32)> = e
+                .locate_resident_delete_slots(t, &pred)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(s, slots)| slots.into_iter().map(move |x| (s, x)))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        // Populate the cache (first locate builds + caches the per-shard indexes).
+        assert_eq!(e.locate_resident_pk_via_shard_index(&table, id_col, 51).unwrap().len(), 1);
+        assert!(
+            !e.read_state.residency.shard_pk_index.lock().unwrap().is_empty(),
+            "the per-shard PK index cache is populated after a locate"
+        );
+
+        // GENERATION CHANGE: a DELETE (delete-tombstone flag OFF) invalidates + re-admits -> new device ptrs
+        // AND shifts shard-0 rows (id=50 removed -> id=51 moves from slot 51 to slot 50).
+        e.execute_text(202, "DELETE FROM accounts WHERE id = 50").unwrap();
+        let table2 = e.relational_catalog_table("accounts").unwrap();
+
+        // The stale cached index (old ptr) must NOT be served: ptr-validation rebuilds against the new buffer.
+        let mut after = e.locate_resident_pk_via_shard_index(&table2, id_col, 51).unwrap();
+        after.sort_unstable();
+        assert_eq!(
+            after,
+            scan_locate(&table2, 51),
+            "cache rebuilt on generation change -> locate == scan on the NEW buffer (no stale slot)"
+        );
+        assert_eq!(after.len(), 1, "id=51 still present (only id=50 deleted)");
+        assert!(
+            e.locate_resident_pk_via_shard_index(&table2, id_col, 50).unwrap().is_empty(),
+            "id=50 is deleted -> not located"
+        );
+    }
+
+    /// CROSS-SHARD PK INDEX sub-slice 3 (CACHE, in-place APPEND): an in-place open-shard INSERT grows the
+    /// shard's row_count with the SAME device ptr, so ptr-ONLY validation would serve a stale index MISSING
+    /// the appended key. The `(ptr, row_count)` validation rebuilds -> the appended key is located == scan.
+    /// Sabotage: drop the row_count check -> the stale ptr-hit misses the appended key. Fresh table (no
+    /// re-admit) so the INSERT is a genuine in-place append (same ptr), isolating the row_count check.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cross_shard_pk_index_cache_rebuilds_on_in_place_append() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64); // 200 rows -> shards 64/64/64/8; the last (open) shard is appendable
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        let scan_slots = |t: &crate::relational_model::RelationalTable, k: i32| -> Vec<(u32, u32)> {
+            let pred = crate::engine_expr::ResidentExpr::Binary {
+                op: crate::engine_expr::ResidentBinaryOp::Eq,
+                lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
+                rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(k)),
+            };
+            let mut v: Vec<(u32, u32)> = e
+                .locate_resident_delete_slots(t, &pred)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(s, slots)| slots.into_iter().map(move |x| (s, x)))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        // Populate the OPEN shard's cache entry (id=195 lives in the last/open shard).
+        assert_eq!(e.locate_resident_pk_via_shard_index(&table, id_col, 195).unwrap().len(), 1);
+        // In-place append (id=250 -> the open shard grows by one row, SAME ptr, +row_count).
+        e.execute_text(202, "INSERT INTO accounts (id, balance) VALUES (250, 2500)").unwrap();
+        let table2 = e.relational_catalog_table("accounts").unwrap();
+        let mut appended = e.locate_resident_pk_via_shard_index(&table2, id_col, 250).unwrap();
+        appended.sort_unstable();
+        assert_eq!(
+            appended,
+            scan_slots(&table2, 250),
+            "appended key located == scan -> cache rebuilt on the row_count change (not a stale ptr-hit miss)"
+        );
+        assert_eq!(appended.len(), 1, "appended id=250 is located");
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
