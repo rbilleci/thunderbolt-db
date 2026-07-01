@@ -361,6 +361,25 @@ them. Each slice is a strict step toward the optimal target.
     5774→723us@16k; the host_rows residual is the next slice.]*
   - **1c — Old-snapshot visibility.** Latest reads still pay nothing; old-snapshot reads skip rows with
     `created_by > read_txn_id` (per-shard, cheap). Gate: old-snapshot read == host MVCC.
+    - **1c-i DONE (`33383327`):** per-row `created_by` stamp on the resident shard (admission-captured +
+      append/rollover-stamped), byte-identical reads, DtoH gate. See [[r3-write-path]].
+    - **1c-ii (the read filter) — MECHANISM (found by investigation 2026-07-01, decided with the user):**
+      the resident read determines its row set through SEVERAL paths (predicate-VM, typed peephole kernels,
+      no-WHERE full scan, COUNT-via-header, join pre-filter), so visibility is NOT a single VM step — and it
+      must be **ON-DEVICE with NO round trips during the filter** (user constraint: no host-side survivor
+      post-filter that would DtoH `created_by`/`deleted_by`). There is no on-device stream-compaction
+      primitive (`retain_device_memory_recompacted` is a plain DtoD memcpy). **CHOSEN mechanism = ROUTE
+      VERSIONED READS THROUGH THE MASK VM** exactly as the NULL-bitmap path already gates: a read over a
+      shard-set that carries version stamps / tombstones lowers through `compile_predicate_program` with a
+      `deleted_by > read_txn_id` (and, for old snapshots, `created_by <= read_txn_id`) mask ANDed in
+      (`LoadColumn` → `CompareScalarI64` → `MaskBinary` AND — reuses existing kernels, `read_txn_id` a scalar
+      arg); a delete-free / un-versioned shard keeps the peephole fast path byte-identically (HyPer
+      VersionedPositions). The no-WHERE scan + COUNT paths, when versioned, also route through the VM. On
+      device, no round trip. **REORDERED (user pick "A"):** wire this filter to **`deleted_by` + incremental
+      DELETE first** (observable at the LATEST snapshot — a DELETE a SELECT immediately stops seeing), since
+      `created_by`/old-snapshot has no SQL consumer yet (every read pins `committed_seq`); old-snapshot
+      `created_by` reuses the SAME filter later. **lpb BEFORE/AFTER is a MUST on the read-filter slice**
+      (prove delete-free reads pay ~nothing; see [[benchmark-report-card]]).
 - **Slice 2 — Version-delta (undo) store + old-snapshot reconstruction.** The out-of-line before-image
   structure + the reconstruction read path. Foundation for UPDATE/DELETE.
 - **Slice 3 — Incremental DELETE.** Capture before-image to undo + tombstone the hot slot.
