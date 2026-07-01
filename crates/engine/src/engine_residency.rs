@@ -1347,6 +1347,71 @@ mod capacity_payload_tests {
         );
     }
 
+    /// Slice A2 (incremental DELETE write): the device tombstone primitive stamps `deleted_by[slot] =
+    /// commit_seq` IN PLACE for the given slots, leaving other rows LIVE and — crucially — the row COLUMN
+    /// bytes untouched (out-of-line tombstone: no torn-row hazard). The read visibility filter is A3, so at
+    /// A2 a tombstoned row STILL reads (its columns are intact); this test asserts exactly that separation.
+    ///
+    /// NON-VACUITY: only the targeted slots flip to `commit_seq`, every other slot stays the sentinel, and a
+    /// full scan still returns all 5 rows with correct values — a wrong write offset would corrupt another
+    /// slot or a column (failing the positional deleted_by check or the value scan).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_tombstone_stamps_slots_out_of_line() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        // One batch commit -> admitted as ONE shard, 5 rows, all born live.
+        e.execute_text(
+            2,
+            "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30),(4,40),(5,50)",
+        )
+        .unwrap();
+        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+
+        // Tombstone slots 1 and 3 with commit sequence 777.
+        assert!(
+            e.tombstone_resident_shard_slots("accounts", shard_id, &[1, 3], 777),
+            "tombstone write must succeed on a live shard slot"
+        );
+
+        // deleted_by: exactly slots 1 and 3 flipped to 777; the rest stay the live sentinel.
+        let db = read_shard_u64_section(&e, "accounts", |s| s.deleted_by_offset);
+        assert_eq!(
+            db,
+            vec![u64::MAX, 777, u64::MAX, 777, u64::MAX],
+            "only the targeted slots are stamped; other rows stay live"
+        );
+
+        // Out-of-line: the column bytes are untouched, so (with visibility unwired at A2) a full scan still
+        // returns all 5 rows with correct values — the tombstone corrupted no column.
+        let rows = e
+            .execute_relational_select_text("SELECT id, balance FROM accounts")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 5, "columns intact: all rows still read (visibility is A3)");
+        let mut seen: Vec<(i32, i32)> = (0..rows.len())
+            .map(|i| match (&rows.row(i)[0], &rows.row(i)[1]) {
+                (SqlValue::Int4(id), SqlValue::Int4(bal)) => (*id, *bal),
+                other => panic!("unexpected row shape {other:?}"),
+            })
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
+            "every row's columns are byte-intact after the out-of-line tombstone"
+        );
+
+        // Bounds: an out-of-range slot is rejected (never writes into headroom / past the section).
+        assert!(
+            !e.tombstone_resident_shard_slots("accounts", shard_id, &[5], 777),
+            "slot == row_count (headroom) must be rejected"
+        );
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -2242,6 +2307,68 @@ impl Engine {
             .open_shard_append_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Slice A2 (incremental DELETE): stamp `deleted_by[slot] = commit_seq` for each of `slots` in a
+    /// resident shard's tombstone section, via ONE targeted device write (`append_owned_chunks`, which
+    /// bounds-checks each chunk against the allocation). This is an OUT-OF-LINE tombstone: it writes only
+    /// the `deleted_by` metadata word, NEVER the row's column bytes — so a lock-free, predicate-free reader
+    /// can never observe a torn row (review Finding 3), and the change is a single aligned u64 store.
+    ///
+    /// Returns `false` (caller must fall back to invalidate + re-admit) if the shard is missing / carries no
+    /// tombstone section (`deleted_by_offset` None) / any slot is out of `[0, row_count)` / the device write
+    /// fails. `slots` are LOCAL indices within the shard.
+    // Wired into the DELETE-only commit path in the next A2 slice (slot-finding via the pruned-shard
+    // predicate); shipped now as the tested device-write primitive (the 1a append_owned_chunks discipline).
+    #[allow(dead_code)]
+    pub(crate) fn tombstone_resident_shard_slots(
+        &self,
+        table: &str,
+        shard_id: u32,
+        slots: &[u32],
+        commit_seq: Index,
+    ) -> bool {
+        if slots.is_empty() {
+            return true;
+        }
+        // The two loads below (shards metadata, then device memory) are made atomic by the COMMIT LOCK when
+        // this is wired into the serialized commit path. Even without it, a torn (gen-N offset/row_count +
+        // gen-N+1 buffer) read can NEVER write out of bounds — `append_owned_chunks` re-checks every chunk
+        // against the buffer's `allocated_bytes`; the worst case is a rejected write -> `false` -> re-admit.
+        let (deleted_by_offset, row_count) = {
+            let shards = self.read_state.residency.shards.load();
+            let Some(table_shards) = shards.get(table) else {
+                return false;
+            };
+            let Some(shard) = table_shards.iter().find(|s| s.shard_id == shard_id) else {
+                return false;
+            };
+            match shard.deleted_by_offset {
+                Some(off) => (off, shard.row_count),
+                None => return false,
+            }
+        };
+        // Bounds: every slot must be a live row of THIS shard (never headroom / out of range).
+        if slots.iter().any(|&slot| (slot as usize) >= row_count) {
+            return false;
+        }
+        let Some(shard_device_memory) = self
+            .read_state
+            .residency
+            .shard_device_memory
+            .get(&(table.to_string(), shard_id))
+        else {
+            return false;
+        };
+        let width = std::mem::size_of::<u64>() as u64;
+        let chunks: Vec<CudaOwnedDeviceMemoryChunk> = slots
+            .iter()
+            .map(|&slot| CudaOwnedDeviceMemoryChunk {
+                byte_offset: deleted_by_offset + u64::from(slot) * width,
+                bytes: commit_seq.to_le_bytes().to_vec(),
+            })
+            .collect();
+        shard_device_memory.append_owned_chunks(chunks).is_ok()
     }
 
     /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit
