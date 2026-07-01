@@ -311,6 +311,15 @@ impl Engine {
             .residency
             .shard_device_memory
             .invalidate_table(table);
+        // SV4 prereq #1 (lifecycle): release the shard's on-demand `deleted_by` region alongside the
+        // resident buffer it annotates. The re-admit that follows an invalidating commit rebuilds the
+        // shard ALL-LIVE from the host store, so a surviving tombstone region would wrongly hide rows
+        // (and leak device memory). Mirrors `shard_device_memory` exactly. INERT until SV4 (no region
+        // exists in production today), so this leaves the OFF path byte-identical.
+        self.read_state
+            .residency
+            .shard_deleted_by_memory
+            .invalidate_table(table);
     }
 
     /// Invalidate the GPU residency of the `tables` a CONCURRENT commit mutated, via `&self`
@@ -337,6 +346,11 @@ impl Engine {
             self.read_state
                 .residency
                 .shard_device_memory
+                .invalidate_table(table);
+            // SV4 prereq #1: mirror the deleted_by cleanup on the concurrent commit path (INERT today).
+            self.read_state
+                .residency
+                .shard_deleted_by_memory
                 .invalidate_table(table);
         }
         // ADR-009 R2.2b: deliberately does NOT evict the persistent wave read engine here. Dropping it tears
@@ -456,6 +470,11 @@ impl Engine {
             self.read_state
                 .residency
                 .shard_device_memory
+                .invalidate_table(table);
+            // SV4 prereq #1: a pressured shard's deleted_by region is released with its buffer (INERT today).
+            self.read_state
+                .residency
+                .shard_deleted_by_memory
                 .invalidate_table(table);
         }
     }

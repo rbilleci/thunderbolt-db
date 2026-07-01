@@ -724,6 +724,14 @@ impl RelationalResidentCache {
         residency.device_memory.remove(table);
         residency.with_shards_mut(|shards| shards.remove(table));
         residency.shard_device_memory.remove_table(table);
+        // SV4 prereq #1 (lifecycle): this is the BUDGET-EVICTION cleanup (a table evicted to make room while a
+        // DIFFERENT table is admitted) -- there is NO preceding `invalidate_*` for the evictee, so release its
+        // on-demand `deleted_by` regions HERE, or a later re-admit of the same shard_id inherits a stale
+        // tombstone region (SV4 wrong-results) and the device buffers leak. DEFENSIVE today: the eviction loop
+        // draws candidates only from the single-buffer `snapshots` map, so a region-bearing (shard-resident)
+        // table is not yet an eviction candidate -- this is a no-op until shard-eviction is wired, but it keeps
+        // this method's cleanup COMPLETE (mirrors the `shard_device_memory.remove_table` on the line above).
+        residency.shard_deleted_by_memory.remove_table(table);
         telemetry.remove_table(table);
     }
 

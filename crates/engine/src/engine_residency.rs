@@ -1193,6 +1193,33 @@ mod capacity_payload_tests {
         Some(out)
     }
 
+    /// Test helper: does ANY shard of `table` currently hold a LIVE `deleted_by` region (cell present AND
+    /// `Some`)? False after either `invalidate_table` (publishes `None`, device buffer freed, cell kept) or
+    /// `remove_table` (cell dropped). Use to prove a region was RELEASED. Reads the published cell map
+    /// directly (in-crate).
+    fn table_has_any_deleted_by_cell(e: &Engine, table: &str) -> bool {
+        e.read_state
+            .residency
+            .shard_deleted_by_memory
+            .cells
+            .load()
+            .iter()
+            .any(|((cell_table, _), cell)| cell_table == table && cell.load().get().is_some())
+    }
+
+    /// Test helper: does ANY cell KEY for `table` still exist (regardless of `Some`/`None`)? Distinguishes
+    /// `invalidate_table` (key KEPT as a `None` tombstone) from `remove_table` (key ERASED). Use to prove
+    /// DROP fully removes the entry -- invalidate alone would leak a dangling `None` key per dropped table.
+    fn table_has_any_deleted_by_key(e: &Engine, table: &str) -> bool {
+        e.read_state
+            .residency
+            .shard_deleted_by_memory
+            .cells
+            .load()
+            .keys()
+            .any(|(cell_table, _)| cell_table == table)
+    }
+
     /// SV2 (sparse-versioning): a shard is born DELETE-FREE and carries NO `deleted_by` region — the HyPer
     /// "un-versioned rows pay nothing" property. Across admission + in-place append + rollover, NO shard has a
     /// tombstone region until a DELETE touches it (SV4). NON-VACUITY: the table is really multiple shards
@@ -1306,6 +1333,176 @@ mod capacity_payload_tests {
         assert!(
             !e.tombstone_resident_shard_slots("accounts", shard_id, &[5], 777),
             "slot == row_count (headroom) must be rejected"
+        );
+    }
+
+    /// SV4 prerequisite #1 (lifecycle/leak, audit-flagged): the on-demand `deleted_by` region a tombstone
+    /// allocates MUST be released whenever the resident buffer it annotates is invalidated (an invalidating
+    /// commit -> O(table) re-admit) or dropped -- otherwise a re-admit rebuilds the shard ALL-LIVE from the
+    /// host store yet inherits a STALE tombstone region (wrong-results: rows wrongly hidden), and DROP TABLE
+    /// leaks the tombstone device buffers. NON-VACUITY: the region is proven PRESENT first, then proven GONE
+    /// after each lifecycle event, with an end-to-end read confirming the buffer really is fresh + all-live.
+    /// Path B (DROP) is specific to the `apply_drop_table` `remove_table` erase (KEY absence). NOTE: Path A's
+    /// DELETE fires BOTH the commit invalidate mirror AND the auto-admit re-admit `remove_table`, so the
+    /// re-admit MASKS the invalidate mirror here -- `shard_deleted_by_region_released_by_invalidate_alone`
+    /// (auto-admit OFF) isolates the serialized invalidate mirror; the sharded re-admit + eviction-cleanup
+    /// mirrors have their own isolated gates.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_deleted_by_region_released_on_invalidate_and_drop() {
+        // --- Path A: an invalidating commit (SQL DELETE -> invalidate + re-admit) releases the region ---
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
+        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        // The SV2 primitive allocates the region on this first tombstone.
+        assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "precondition: the tombstone allocated a live deleted_by region"
+        );
+        // A DELETE goes through invalidate + the O(table) re-admit today (the path SV4 will replace).
+        e.execute_text(3, "DELETE FROM accounts WHERE id = 2").unwrap();
+        assert!(
+            !table_has_any_deleted_by_cell(&e, "accounts"),
+            "invalidate/re-admit must release the stale deleted_by region (leak + wrong-results guard)"
+        );
+        // End-to-end: the DELETE really removed id=2, and the rebuilt buffer reads ALL-LIVE (no stale hide
+        // from the released tombstone region) -- id=1 was tombstoned resident-only, so it must reappear.
+        let rows = e
+            .execute_relational_select_text("SELECT id FROM accounts")
+            .unwrap()
+            .rows;
+        let mut ids: Vec<i32> = (0..rows.len())
+            .map(|i| match &rows.row(i)[0] {
+                SqlValue::Int4(id) => *id,
+                other => panic!("unexpected row shape {other:?}"),
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3], "id=2 deleted; id=1 all-live again (stale tombstone released)");
+
+        // --- Path B: DROP TABLE releases the region ---
+        e.execute_text(4, "INSERT INTO accounts (id, balance) VALUES (7,70)")
+            .unwrap();
+        let shard_id2 = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        assert!(e.tombstone_resident_shard_slots("accounts", shard_id2, &[0], 888));
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "precondition: the region is re-allocated on the post-re-admit shard"
+        );
+        e.execute_text(5, "DROP TABLE accounts").unwrap();
+        // DROP fully ERASES the cell entries (invalidate alone would leave a dangling `None` key per dropped
+        // table). Asserting KEY absence (not just Some absence) makes this specific to `remove_table`.
+        assert!(
+            !table_has_any_deleted_by_key(&e, "accounts"),
+            "DROP TABLE must erase the deleted_by cell entries (no leaked per-table keys / device memory)"
+        );
+    }
+
+    /// SV4 prereq #1 (round-2 audit P3 hardening): ISOLATE the serialized-commit `invalidate_table` mirror.
+    /// With AUTO-ADMIT OFF, a DELETE invalidates residency but triggers NO re-admit, so the region is released
+    /// SOLELY by the commit-path `invalidate_relational_residency_table` deleted_by mirror -- nothing masks it
+    /// (unlike `..._on_invalidate_and_drop`, where the re-admit's `remove_table` would hide a deleted mirror).
+    /// Sabotage: delete ONLY the serialized `shard_deleted_by_memory.invalidate_table` (engine_commit.rs) and
+    /// this FAILS. This is the exact production DELETE path SV4 will build on.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_deleted_by_region_released_by_invalidate_alone() {
+        let mut e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(false); // NO re-admit after the DELETE -> isolates the invalidate mirror
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
+        // Explicit shard-resident admit (auto-admit is off).
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "precondition: the tombstone allocated a live deleted_by region"
+        );
+        // DELETE invalidates residency; with auto-admit OFF nothing re-admits -> the serialized-commit
+        // invalidate mirror is the ONLY thing that can release the region.
+        e.execute_text(3, "DELETE FROM accounts WHERE id = 2").unwrap();
+        assert!(
+            !table_has_any_deleted_by_cell(&e, "accounts"),
+            "the serialized-commit invalidate mirror must release the region even with no re-admit"
+        );
+    }
+
+    /// SV4 prereq #1 (audit Finding 2): a WARMUP/REFRESH re-admit (`populate_relational_residency_snapshot`)
+    /// reaches the SHARDED re-admit branch with NO preceding invalidate, so it must itself erase stale
+    /// `deleted_by` regions -- else the fresh all-live shard 0 (reused shard_id) inherits the tombstone region
+    /// and wrongly hides rows at SV4. NON-VACUITY: region proven present, then KEY-absent after the refresh.
+    /// Sabotage: remove the sharded-branch `shard_deleted_by_memory.remove_table` and this FAILS.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_deleted_by_region_released_on_warmup_readmit() {
+        let mut e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "precondition: the tombstone allocated a live deleted_by region"
+        );
+        // Warmup/refresh re-admit -- NO commit, so NO invalidate precedes it (the path Finding 2 patched).
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        assert!(
+            !table_has_any_deleted_by_key(&e, "accounts"),
+            "warmup re-admit (no preceding invalidate) must erase the stale deleted_by region"
+        );
+    }
+
+    /// SV4 prereq #1 (audit Finding 1): `RelationalResidentCache::remove_table` (the BUDGET-EVICTION cleanup)
+    /// must release the table's `deleted_by` regions. This is DEFENSIVE today: the eviction loop draws its
+    /// candidates ONLY from the single-buffer `snapshots` map (engine_residency.rs, the `candidates` filter),
+    /// and a region-bearing table is by construction SHARD-resident (removed from `snapshots`), so `remove_table`
+    /// is currently only ever called on region-free tables. But it is the exact call a future shard-eviction
+    /// will make, so we test the METHOD CONTRACT directly: a shard-resident, tombstoned table passed to
+    /// `remove_table` has its region ERASED. NON-VACUITY: region present, then KEY-absent. Sabotage: remove the
+    /// `shard_deleted_by_memory.remove_table` in `RelationalResidentCache::remove_table` and this FAILS.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn resident_cache_remove_table_releases_deleted_by_region() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20)")
+            .unwrap();
+        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[0], 5));
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "precondition: the tombstone allocated a live deleted_by region"
+        );
+        // Invoke the cache eviction-cleanup method DIRECTLY -- the exact call the budget-eviction loop makes
+        // (`cat.relational_resident_cache.remove_table(map_key, &residency, &route_telemetry)`).
+        {
+            let guard = e.ddl_catalog();
+            guard.relational_resident_cache.remove_table(
+                "accounts",
+                &e.read_state.residency,
+                &e.read_state.route_telemetry,
+            );
+        }
+        assert!(
+            !table_has_any_deleted_by_key(&e, "accounts"),
+            "RelationalResidentCache::remove_table must erase the table's deleted_by regions (eviction cleanup)"
         );
     }
 
@@ -1629,6 +1826,12 @@ impl Engine {
                 snapshots.remove(table);
             });
             read_state.residency.device_memory.remove(table);
+            // SV4 prereq #1 (lifecycle): this SHARDED re-admit installs a FRESH all-live shard 0, but a
+            // warmup/refresh (`populate_relational_residency_snapshot_on_gpu`) reaches here with NO preceding
+            // invalidate -- so erase any stale `deleted_by` regions for the table (keyed by the reused
+            // shard_id) or the fresh shard would inherit them (SV4 wrong-results). Symmetric to the
+            // single-buffer path below. INERT until SV4 (no region exists today).
+            read_state.residency.shard_deleted_by_memory.remove_table(table);
             let dm = device_memory.expect("device_memory.is_some() checked");
             let shard = RelationalResidentShard {
                 shard_id: 0,
@@ -1681,6 +1884,10 @@ impl Engine {
             shards.remove(table);
         });
         read_state.residency.shard_device_memory.remove_table(table);
+        // SV4 prereq #1 (lifecycle): the single-buffer path replaces the table's shards, so clear any stale
+        // `deleted_by` regions -- a flag flip / re-admit must not leave a tombstone region shadowing the fresh
+        // all-live buffer (wrong-results guard). INERT until SV4 (no region exists today).
+        read_state.residency.shard_deleted_by_memory.remove_table(table);
         cat
             .relational_resident_cache
             .install_snapshot(
@@ -2232,10 +2439,22 @@ impl Engine {
     ///
     /// UNWIRED (`#[allow(dead_code)]`) — wired into the DELETE-only commit path in SV4 (slot-finding via the
     /// pruned-shard predicate). **SV4 PREREQUISITES (audit-flagged, out of scope until wired — the primitive
-    /// creates NO region in production today, so both are inert now):**
-    ///  1. **Lifecycle/leak:** `shard_deleted_by_memory` is NOT cleaned up on shard evict / invalidate / drop /
-    ///     re-admit (those paths clear `shard_device_memory` + `shards` but not this map). Wire the cleanup
-    ///     before SV4, else a re-admit (new shard_ids) or a dropped table leaks its regions.
+    /// creates NO region in production today, so they are inert now):**
+    ///  1. **Lifecycle/leak — DONE (SV4 prereq #1):** `shard_deleted_by_memory` cleanup is now wired at every
+    ///     site the resident buffer it annotates is retired. Two categories, distinguished by whether an
+    ///     invalidate precedes the retire:
+    ///       - `invalidate_table` (device buffer freed, cell kept) on the three invalidate paths (serialized
+    ///         `invalidate_relational_residency_table` + concurrent-commit + memory-pressure variants).
+    ///       - full `remove_table` (keys erased) on the paths that retire a buffer WITHOUT a preceding
+    ///         invalidate: the single-buffer AND sharded re-admit branches in `populate_..._snapshot_inner`
+    ///         (a warmup/refresh has no invalidate), the BUDGET-EVICTION path (`RelationalResidentCache::
+    ///         remove_table`, evicting a different table during admission), and `apply_drop_table` (a DROPped
+    ///         table is gone for good — stronger than `shard_device_memory`, which leaves `None` cells on DROP).
+    ///     Gates (all sabotage-verified non-vacuous): `shard_deleted_by_region_released_on_invalidate_and_drop`
+    ///     (invalidate + DROP), `shard_deleted_by_region_released_on_warmup_readmit` (sharded re-admit with no
+    ///     preceding invalidate), and `resident_cache_remove_table_releases_deleted_by_region` (the eviction-
+    ///     cleanup method contract, currently defensive). This keeps a re-admit (rebuilt all-live from the host
+    ///     store) from inheriting a stale tombstone region and stops evicted/dropped tables leaking regions.
     ///  2. **Concurrency:** hold the COMMIT LOCK across the get-or-allocate below, else two concurrent
     ///     first-deletes to the same shard both allocate + the losing region's `Arc` leaks (writes still land
     ///     safely; only the buffer leaks). SV4 runs this under the serialized commit lock, which is the fix.

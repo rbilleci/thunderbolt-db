@@ -1167,6 +1167,14 @@ impl Engine {
                 .residency
                 .with_snapshots_mut(|snapshots| snapshots.remove(name));
             self.read_state.residency.device_memory.remove(name);
+            // SV4 prereq #1 (lifecycle): ERASE the dropped table's on-demand `deleted_by` region cells
+            // (the commit's `invalidate_table` only publishes `None`, freeing the device buffer but leaving
+            // a dangling per-shard key). A DROPped table is gone for good, so fully remove its keys to avoid
+            // an unbounded host-cell leak across distinct dropped tables. INERT until SV4 (no region today).
+            self.read_state
+                .residency
+                .shard_deleted_by_memory
+                .remove_table(name);
         }
         Ok(())
     }
