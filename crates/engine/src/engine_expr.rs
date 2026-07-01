@@ -2031,6 +2031,111 @@ impl Engine {
         )
     }
 
+    /// SV4 (GPU-native DELETE -- LOCATE phase): find the resident `(shard_id, LOCAL slot)` positions of
+    /// every row matching `predicate` (an int4-equality point-lookup shape), via zone-map-pruned per-shard
+    /// `lower_resident_predicate`. PER-SHARD (NOT the recompacted unified buffer of the read path), so the
+    /// returned slots are LOCAL to each shard's own device buffer -- exactly what the per-shard,
+    /// local-slot-indexed `deleted_by` region needs. Returns `None` if the table is not shard-resident / a
+    /// shard is invalid or missing device memory / the predicate cannot lower on a shard (caller falls back to
+    /// the O(table) invalidate + re-admit). Visibility = `None`: locate addresses PHYSICAL positions (a DELETE
+    /// stamps a row by WHERE IT SITS, independent of read-time visibility; the raw buffer's rows are present),
+    /// and only reads that already-committed shard buffer. UNWIRED (`#[allow(dead_code)]`) until the DELETE
+    /// commit path routes through it (SV4b).
+    #[allow(dead_code)]
+    pub(crate) fn locate_resident_delete_slots(
+        &self,
+        table: &RelationalTable,
+        predicate: &ResidentExpr,
+    ) -> Option<Vec<(u32, Vec<u32>)>> {
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        // Zone-map prune inputs: the mandatory (top-level-AND) int4 equalities the predicate requires.
+        let mut constraints: Vec<(usize, i32)> = Vec::new();
+        mandatory_int4_equalities(predicate, &mut constraints);
+        let column_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let mut out: Vec<(u32, Vec<u32>)> = Vec::new();
+        for shard in table_shards.iter() {
+            // S-d3 zone-map prune: skip a shard whose min/max provably excludes every mandatory needle (it
+            // cannot hold a matching row). Same soundness as the sharded read: prune ONLY on a stat-carrying
+            // shard that provably excludes; a no-stat shard is always kept.
+            if !constraints.is_empty()
+                && constraints.iter().any(|(col, needle)| {
+                    shard_zone_map_excludes(
+                        &column_names,
+                        &shard.resident_device_int4_column_stats,
+                        *col,
+                        *needle,
+                    )
+                })
+            {
+                continue;
+            }
+            // Per-shard identity/validity precheck (mirror `execute_resident_sharded_via_general::source_for`).
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
+                return None;
+            }
+            let device_memory = self
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&(table.name.clone(), shard.shard_id))?;
+            // The per-shard descriptor is capacity-strided + row_count-sized to THIS shard's buffer
+            // (`resident_snapshot_for_shard`), so the predicate reads the shard's int4 columns at the right
+            // offsets and returns slots LOCAL to `[0, row_count)`.
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let slots = self
+                .lower_resident_predicate(
+                    predicate,
+                    table,
+                    &descriptor,
+                    &device_memory,
+                    shard.row_count as u64,
+                    None,
+                )
+                .ok()?;
+            if !slots.is_empty() {
+                out.push((shard.shard_id, slots));
+            }
+        }
+        Some(out)
+    }
+
+    /// SV4 (GPU-native DELETE): LOCATE the resident slots matching `predicate` + stamp `deleted_by =
+    /// commit_seq` on them IN PLACE (O(rows touched)), instead of the O(table) invalidate + re-admit. Returns
+    /// `Some(n)` = n slots tombstoned (n may be 0: the predicate matched no resident row -- still a success,
+    /// nothing to re-admit); `None` = the caller must fall back to invalidate + re-admit (not shard-resident /
+    /// locate could not run / a tombstone write failed). A PARTIAL stamp before a `None` is harmless: the
+    /// fallback re-admit rebuilds every shard all-live from the host store (which already applied the DELETE)
+    /// AND SV4-prereq-#1 releases any partial `deleted_by` region. MUST run under the commit lock so the
+    /// per-shard `deleted_by` get-or-allocate is atomic (SV2 prereq #2). UNWIRED until SV4b.
+    #[allow(dead_code)]
+    pub(crate) fn try_tombstone_resident_delete(
+        &self,
+        table: &RelationalTable,
+        predicate: &ResidentExpr,
+        commit_seq: Index,
+    ) -> Option<usize> {
+        let located = self.locate_resident_delete_slots(table, predicate)?;
+        let mut total = 0usize;
+        for (shard_id, slots) in &located {
+            if !self.tombstone_resident_shard_slots(&table.name, *shard_id, slots, commit_seq) {
+                return None;
+            }
+            total = total.saturating_add(slots.len());
+        }
+        Some(total)
+    }
+
     /// S10c slice 2a: `&Select`->general BRIDGE for the MULTI-PARTITION resident shapes (single-GPU,
     /// int4-only). Supersedes the slice-1 per-shard host-combine: instead of running the executor once
     /// per shard and folding the results on the HOST, it RECOMPACTS the table's shard buffers into

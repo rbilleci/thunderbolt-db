@@ -1571,6 +1571,60 @@ mod capacity_payload_tests {
         assert_eq!(far.row(0), &[SqlValue::Int4(137), SqlValue::Int4(1370)]);
     }
 
+    /// SV4 (GPU-native DELETE, locate+tombstone data-plane primitive): `try_tombstone_resident_delete`
+    /// LOCATES a row by an int4-equality predicate (zone-map-pruned, per-shard) and stamps its `deleted_by`
+    /// -- so the SV3b read HIDES exactly that row, with NO O(table) re-admit. This is the mechanism SV4b wires
+    /// into the DELETE commit. NON-VACUITY / correctness of LOCATE: a wrong slot would hide the WRONG row, so
+    /// the neighbor-still-visible + COUNT-drops-by-exactly-one + other-shard-untouched asserts fail unless
+    /// locate returns the EXACT slot. Multi-shard (size 64) exercises zone-map pruning + cross-shard locate.
+    /// Delete-free byte-identical is proven by the pre-delete COUNT + the untouched rows post-delete.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn resident_delete_locate_and_tombstone_hides_exactly_the_matched_row() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8; id=k in shard k/64 at slot k%64
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
+        // Pre-delete: delete-free reads are byte-identical (all 200 rows live, none hidden).
+        assert_eq!(sel("SELECT COUNT(*) FROM accounts").row(0), &[SqlValue::Int8(200)]);
+        assert_eq!(sel("SELECT id FROM accounts WHERE id = 130").len(), 1, "id=130 present pre-delete");
+
+        // Build the point predicate `id = 130` (id is catalog column 0) and DELETE it via the GPU primitive.
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        let pred = crate::engine_expr::ResidentExpr::Binary {
+            op: crate::engine_expr::ResidentBinaryOp::Eq,
+            lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
+            rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(130)),
+        };
+        // commit_seq 5 (well below the read snapshot) -> `deleted_by(=5) > read_txn_id` is FALSE -> hidden.
+        let n = e
+            .try_tombstone_resident_delete(&table, &pred, 5)
+            .expect("resident, prunable point delete succeeds");
+        assert_eq!(n, 1, "exactly one resident row matched id=130");
+
+        // The matched row is now hidden; its neighbors + other shards are UNTOUCHED (proves the RIGHT slot).
+        assert_eq!(sel("SELECT id FROM accounts WHERE id = 130").len(), 0, "id=130 tombstoned -> hidden");
+        assert_eq!(sel("SELECT id FROM accounts WHERE id = 129").len(), 1, "same-shard neighbor 129 still visible");
+        assert_eq!(sel("SELECT id FROM accounts WHERE id = 131").len(), 1, "same-shard neighbor 131 still visible");
+        assert_eq!(sel("SELECT id FROM accounts WHERE id = 5").len(), 1, "a row in a DIFFERENT shard untouched");
+        assert_eq!(
+            sel("SELECT COUNT(*) FROM accounts").row(0),
+            &[SqlValue::Int8(199)],
+            "COUNT drops by exactly the one tombstoned row"
+        );
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
