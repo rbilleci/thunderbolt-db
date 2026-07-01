@@ -502,6 +502,14 @@ pub(crate) struct CatalogSnapshot {
 pub(crate) struct ResidencyReadState {
     pub(crate) device_memory: ResidentDeviceMemoryMap,
     pub(crate) shard_device_memory: ShardResidentDeviceMemoryMap,
+    /// SV2 (sparse-versioning): the per-shard on-demand `deleted_by` tombstone region, keyed `(table,
+    /// shard_id)`, PARALLEL to `shard_device_memory`. A delete-free shard has NO entry here (the HyPer
+    /// "un-versioned rows pay nothing" property); a shard's region — a `capacity`-sized u64 buffer born
+    /// all-live (`u64::MAX`) — is allocated on its FIRST DELETE (`tombstone_resident_shard_slots`). Presence
+    /// in this map IS the shard's "has tombstones" flag; a DELETE stamps `deleted_by[slot] = commit_seq` here
+    /// (out-of-line — the immutable column payload is never touched). The read filter (SV3) gathers it into
+    /// the recompaction's unified buffer for the `deleted_by > read_txn_id` mask.
+    pub(crate) shard_deleted_by_memory: ShardResidentDeviceMemoryMap,
     /// ADR-009 R1: per-table GPU hash-index reuse cache for the index-probe point-lookup route (built
     /// lazily, behind the default-OFF `index_probe_enabled` flag). A plain `Mutex` (not the lock-free
     /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the

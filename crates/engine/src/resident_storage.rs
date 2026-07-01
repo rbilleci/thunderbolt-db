@@ -670,13 +670,10 @@ pub(crate) struct RelationalResidentShard {
     /// recompacts ~1 shard instead of all of them (O(1), not O(num_shards)). Maintained on append (merge the
     /// new rows' min/max). Empty = not pruned (always gathered) — e.g. benchmark shards.
     pub(crate) resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
-    /// Slice A1 (MVCC visibility): byte offset of the per-row `deleted_by` (u64 = the commit `Index` that
-    /// deleted each row, sentinel `u64::MAX` = LIVE) SoA section, laid out after `created_by`, capacity-
-    /// strided. Every slot (rows + headroom) is born `u64::MAX` so an appended row is live with no extra
-    /// write; a committed DELETE stamps ONE slot in place (out-of-line tombstone — never patches column
-    /// bytes, so no torn-row hazard). The read visibility filter keeps rows with `deleted_by > read_txn_id`.
-    /// `None` = no tombstone metadata (benchmark shard) → reads as all-live.
-    pub(crate) deleted_by_offset: Option<u64>,
+    // SV2 (sparse-versioning): the per-row `deleted_by` tombstone is NOT stored in the shard payload. It is an
+    // ON-DEMAND per-shard region in `ResidencyReadState.shard_deleted_by_memory` (keyed `(table, shard_id)`),
+    // allocated on the shard's first DELETE — a delete-free shard carries zero tombstone metadata. Presence in
+    // that map is the "has tombstones" flag; there is no per-shard offset field.
     pub(crate) resident_bytes: u64,
     pub(crate) allocated_bytes: u64,
     pub(crate) count_header_byte_offset: u64,

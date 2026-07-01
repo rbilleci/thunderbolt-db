@@ -300,37 +300,6 @@ pub(crate) fn sql_value_as_int4(value: &SqlValue) -> i32 {
     }
 }
 
-/// Slice 1c (MVCC visibility): append a per-row u64 SoA metadata section (`values`, one per live row, then
-/// `capacity - values.len()` slots of `pad_fill`) to a resident payload, returning its byte offset. Laid
-/// out AFTER the SQL columns + any dense tail so existing column offsets are untouched and the hot (latest)
-/// read never reads it; only the visibility mask does. Two uses:
-///  - `created_by` = per-row commit `Index` that created the row; live rows carry their stamp, headroom
-///    pads `0` (unused; a real stamp is never 0 since commit Index starts at 1).
-///  - `deleted_by` = per-row commit `Index` that deleted the row, sentinel `u64::MAX` = LIVE; ALL slots
-///    (live rows + headroom) init to `u64::MAX` so an appended row is born LIVE with no extra write, and a
-///    DELETE later stamps one slot in place.
-/// `values.len()` must be `<= capacity` (the caller guarantees it).
-pub(crate) fn append_u64_section(
-    payload: &mut Vec<u8>,
-    values: &[u64],
-    capacity: usize,
-    pad_fill: u64,
-) -> u64 {
-    debug_assert!(capacity >= values.len(), "u64 section capacity below value count");
-    let offset = payload.len() as u64;
-    for value in values {
-        payload.extend_from_slice(&value.to_le_bytes());
-    }
-    for _ in values.len()..capacity {
-        payload.extend_from_slice(&pad_fill.to_le_bytes());
-    }
-    offset
-}
-
-/// The `deleted_by` sentinel meaning "this row is LIVE (never deleted)". A read is visible when
-/// `deleted_by > read_txn_id`; `u64::MAX` exceeds every real commit `Index`, so a live row always passes.
-pub(crate) const DELETED_BY_LIVE: u64 = u64::MAX;
-
 /// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
 /// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
 /// slots. Each chunk lands EXACTLY where the capacity-aware read offsets expect it (column `c` at
@@ -1192,48 +1161,39 @@ mod capacity_payload_tests {
         assert_eq!(g, 1, "an out-of-range needle prunes to the single keep-one fallback shard");
     }
 
-    /// Read a per-row u64 SoA section (selected by `offset_of`) back from every resident shard (DtoH), in
-    /// shard-then-row order. `read_resident_i32_column` returns i32s, so each u64 is reconstructed from its
-    /// little-endian (lo, hi) i32 pair.
-    fn read_shard_u64_section(
+    /// Read a shard's ON-DEMAND `deleted_by` region back from device (DtoH), first `count` slots. Returns
+    /// `None` when the shard has NO region (delete-free). u64 reconstructed from i32 LE (lo, hi) pairs.
+    fn read_shard_deleted_by_region(
         e: &Engine,
         table: &str,
-        offset_of: impl Fn(&crate::resident_storage::RelationalResidentShard) -> Option<u64>,
-    ) -> Vec<u64> {
-        let shards = e.read_state.residency.shards.load();
-        let table_shards = shards.get(table).expect("shard-resident");
-        let mut out = Vec::new();
-        for shard in table_shards {
-            let off = offset_of(shard).expect("a shard-path shard carries this u64 section");
-            let dm = e
-                .read_state
-                .residency
-                .shard_device_memory
-                .get(&(table.to_string(), shard.shard_id))
-                .expect("shard device memory");
-            let halves = dm
-                .read_resident_i32_column(off, shard.row_count * 2)
-                .expect("read u64 section");
-            for i in 0..shard.row_count {
-                let lo = halves[2 * i] as u32 as u64;
-                let hi = halves[2 * i + 1] as u32 as u64;
-                out.push((hi << 32) | lo);
-            }
+        shard_id: u32,
+        count: usize,
+    ) -> Option<Vec<u64>> {
+        let region = e
+            .read_state
+            .residency
+            .shard_deleted_by_memory
+            .get(&(table.to_string(), shard_id))?;
+        let halves = region
+            .read_resident_i32_column(0, count * 2)
+            .expect("read deleted_by region");
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let lo = halves[2 * i] as u32 as u64;
+            let hi = halves[2 * i + 1] as u32 as u64;
+            out.push((hi << 32) | lo);
         }
-        out
+        Some(out)
     }
 
-    /// Slice A1 (MVCC visibility): a resident SHARD carries a per-row `deleted_by` section born ALL-LIVE
-    /// (sentinel `u64::MAX`). Every row — admitted, appended in place (into headroom pre-filled with the
-    /// sentinel, so no extra write), or landed in a rolled-over shard — reads as live until a DELETE stamps
-    /// its slot (Slice A2). The gate reads the `deleted_by` section back from device across several shards.
-    ///
-    /// NON-VACUITY: the table is really multiple shards (rollover), and EVERY one of the 200 rows reads the
-    /// exact sentinel — a wrong section offset would read garbage (not all-MAX), a wrong init would read 0,
-    /// and a corrupted append headroom would leave an appended row non-sentinel.
+    /// SV2 (sparse-versioning): a shard is born DELETE-FREE and carries NO `deleted_by` region — the HyPer
+    /// "un-versioned rows pay nothing" property. Across admission + in-place append + rollover, NO shard has a
+    /// tombstone region until a DELETE touches it (SV4). NON-VACUITY: the table is really multiple shards
+    /// (rollover) and EVERY one has no region (a regression that eagerly allocated would fail this), while the
+    /// reads are still correct (all 200 rows live).
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn shard_deleted_by_born_all_live() {
+    fn shard_born_delete_free_carries_no_region() {
         let e = Engine::new_local();
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
@@ -1247,36 +1207,45 @@ mod capacity_payload_tests {
             )
             .unwrap();
         }
-        let shard_count = e.read_state.residency.shards.load().get("accounts").unwrap().len();
-        assert!(
-            shard_count >= 3,
-            "need rollover into multiple shards to exercise all layout paths (got {shard_count})"
-        );
-        let deleted_by = read_shard_u64_section(&e, "accounts", |s| s.deleted_by_offset);
-        assert_eq!(deleted_by.len(), 200, "one deleted_by slot per live row");
-        assert!(
-            deleted_by.iter().all(|&d| d == u64::MAX),
-            "every row is born LIVE (deleted_by == u64::MAX sentinel) across admission + append + rollover"
+        let shard_ids: Vec<(u32, usize)> = {
+            let shards = e.read_state.residency.shards.load();
+            let table_shards = shards.get("accounts").unwrap();
+            assert!(
+                table_shards.len() >= 3,
+                "need rollover into multiple shards (got {})",
+                table_shards.len()
+            );
+            table_shards.iter().map(|s| (s.shard_id, s.row_count)).collect()
+        };
+        for (shard_id, row_count) in shard_ids {
+            assert!(
+                read_shard_deleted_by_region(&e, "accounts", shard_id, row_count).is_none(),
+                "a delete-free shard {shard_id} must carry NO deleted_by region (zero version overhead)"
+            );
+        }
+        assert_eq!(
+            e.execute_relational_select_text("SELECT COUNT(*) FROM accounts")
+                .unwrap()
+                .rows
+                .row(0),
+            &[SqlValue::Int8(200)],
+            "all rows live (no tombstones)"
         );
     }
 
-    /// Slice A2 (incremental DELETE write): the device tombstone primitive stamps `deleted_by[slot] =
-    /// commit_seq` IN PLACE for the given slots, leaving other rows LIVE and — crucially — the row COLUMN
-    /// bytes untouched (out-of-line tombstone: no torn-row hazard). The read visibility filter is A3, so at
-    /// A2 a tombstoned row STILL reads (its columns are intact); this test asserts exactly that separation.
-    ///
-    /// NON-VACUITY: only the targeted slots flip to `commit_seq`, every other slot stays the sentinel, and a
-    /// full scan still returns all 5 rows with correct values — a wrong write offset would corrupt another
-    /// slot or a column (failing the positional deleted_by check or the value scan).
+    /// SV2 (incremental DELETE write): the tombstone primitive ALLOCATES the shard's `deleted_by` region on
+    /// its FIRST delete (delete-free shards pay zero) + stamps `deleted_by[slot] = commit_seq` there,
+    /// OUT-OF-LINE (row column bytes untouched — the read visibility filter is SV3, so at SV2 a tombstoned row
+    /// STILL reads). NON-VACUITY: no region before the first delete; only the targeted slots flip; the region
+    /// is REUSED (not re-allocated) on a second delete; a full scan still returns all 5 rows byte-intact.
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn shard_tombstone_stamps_slots_out_of_line() {
+    fn shard_tombstone_allocates_region_and_stamps_out_of_line() {
         let e = Engine::new_local();
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
-        // One batch commit -> admitted as ONE shard, 5 rows, all born live.
         e.execute_text(
             2,
             "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30),(4,40),(5,50)",
@@ -1284,27 +1253,31 @@ mod capacity_payload_tests {
         .unwrap();
         let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
 
-        // Tombstone slots 1 and 3 with commit sequence 777.
+        // Before any delete: NO region (the zero-cost property).
         assert!(
-            e.tombstone_resident_shard_slots("accounts", shard_id, &[1, 3], 777),
-            "tombstone write must succeed on a live shard slot"
+            read_shard_deleted_by_region(&e, "accounts", shard_id, 5).is_none(),
+            "a delete-free shard has no deleted_by region"
         );
 
-        // deleted_by: exactly slots 1 and 3 flipped to 777; the rest stay the live sentinel.
-        let db = read_shard_u64_section(&e, "accounts", |s| s.deleted_by_offset);
+        // First delete: allocates the region + stamps slots 1 and 3 with seq 777.
+        assert!(
+            e.tombstone_resident_shard_slots("accounts", shard_id, &[1, 3], 777),
+            "first tombstone allocates the region + stamps"
+        );
+        let db = read_shard_deleted_by_region(&e, "accounts", shard_id, 5)
+            .expect("region is allocated on the first delete");
         assert_eq!(
             db,
             vec![u64::MAX, 777, u64::MAX, 777, u64::MAX],
-            "only the targeted slots are stamped; other rows stay live"
+            "only the targeted slots are stamped; other rows stay the live sentinel"
         );
 
-        // Out-of-line: the column bytes are untouched, so (with visibility unwired at A2) a full scan still
-        // returns all 5 rows with correct values — the tombstone corrupted no column.
+        // Out-of-line: column bytes untouched -> (visibility unwired at SV2) a full scan still returns 5 rows.
         let rows = e
             .execute_relational_select_text("SELECT id, balance FROM accounts")
             .unwrap()
             .rows;
-        assert_eq!(rows.len(), 5, "columns intact: all rows still read (visibility is A3)");
+        assert_eq!(rows.len(), 5, "columns intact: all rows still read (visibility is SV3)");
         let mut seen: Vec<(i32, i32)> = (0..rows.len())
             .map(|i| match (&rows.row(i)[0], &rows.row(i)[1]) {
                 (SqlValue::Int4(id), SqlValue::Int4(bal)) => (*id, *bal),
@@ -1312,13 +1285,17 @@ mod capacity_payload_tests {
             })
             .collect();
         seen.sort_unstable();
+        assert_eq!(seen, vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]);
+
+        // Second delete on the SAME shard REUSES the region (no re-alloc) and stamps another slot.
+        assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[0], 888));
         assert_eq!(
-            seen,
-            vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
-            "every row's columns are byte-intact after the out-of-line tombstone"
+            read_shard_deleted_by_region(&e, "accounts", shard_id, 5).unwrap(),
+            vec![888, 777, u64::MAX, 777, u64::MAX],
+            "the second delete reuses the region + preserves the earlier stamps"
         );
 
-        // Bounds: an out-of-range slot is rejected (never writes into headroom / past the section).
+        // Bounds: an out-of-range slot is rejected.
         assert!(
             !e.tombstone_resident_shard_slots("accounts", shard_id, &[5], 777),
             "slot == row_count (headroom) must be rejected"
@@ -1503,19 +1480,11 @@ impl Engine {
         if capacity == row_count {
             device_payload.extend_from_slice(&raw_device_tail);
         }
-        // SV1 (sparse-versioning): `created_by` is NO LONGER stored per-row — latest reads never check it and
-        // under SI it returns as a per-shard zone map + boundary (docs/proposals/sparse-mvcc-version-metadata.md
-        // §4.2), never a per-row array. Only `deleted_by` rides the shard payload for now (SV2 makes it
-        // on-demand). Placed AFTER the SQL columns + dense tail (offset recorded explicitly), so no existing
-        // column/tail offset shifts; the default single-buffer path skips it.
-        let deleted_by_offset = if self.shard_residency_enabled() {
-            // deleted_by: every admitted row is LIVE -> fill the WHOLE capacity (rows + headroom) with the
-            // live sentinel, so an in-place append is born live with no extra write and a DELETE stamps one
-            // slot in place later.
-            Some(append_u64_section(&mut device_payload, &[], capacity, DELETED_BY_LIVE))
-        } else {
-            None
-        };
+        // SV1/SV2 (sparse-versioning): NO version metadata rides the shard payload. `created_by` is gone
+        // (SV1 — returns as a zone map + boundary under SI), and `deleted_by` is now ON-DEMAND: a shard is
+        // born delete-free with NO tombstone region; its `deleted_by` region (a separate device buffer in
+        // `shard_deleted_by_memory`) is allocated on the shard's FIRST delete. So a delete-free / cold shard
+        // pays ZERO version overhead (the HyPer property). See docs/proposals/sparse-mvcc-version-metadata.md.
 
         let memory_pressure_active = self
             .router
@@ -1609,8 +1578,6 @@ impl Engine {
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
                     .clone(),
-                // A1: the deleted_by tombstone section appended above (Some on the shard path, born all-live).
-                deleted_by_offset,
                 resident_bytes,
                 allocated_bytes: device_payload.len() as u64,
                 count_header_byte_offset: 0,
@@ -2124,7 +2091,7 @@ impl Engine {
         let new_capacity = self
             .shard_size_target()
             .max(k.saturating_mul(2).next_power_of_two());
-        let (mut device_payload, int4_stats) = match build_relational_device_payload_with_capacity(
+        let (device_payload, int4_stats) = match build_relational_device_payload_with_capacity(
             &column_names,
             &column_types,
             new_rows,
@@ -2135,10 +2102,8 @@ impl Engine {
             Ok((payload, _text, _bool, stats, _b128, _null)) => (payload, stats),
             Err(_) => return false,
         };
-        // SV1/A1: the rolled shard carries a deleted_by section born all-live (no per-row created_by; that is
-        // now a per-shard zone map + boundary, not stored here).
-        let rolled_deleted_by_offset =
-            Some(append_u64_section(&mut device_payload, &[], new_capacity, DELETED_BY_LIVE));
+        // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
+        // `deleted_by` is on-demand (allocated in `shard_deleted_by_memory` on the shard's first delete).
         let Some(new_device_memory) = self.relational_residency_device_memory(gpu_id, &device_payload)
         else {
             return false;
@@ -2152,7 +2117,6 @@ impl Engine {
             capacity: new_capacity,
             int4_appendable: true,
             resident_device_int4_column_stats: int4_stats,
-            deleted_by_offset: rolled_deleted_by_offset,
             resident_bytes: (8 + k * column_count * std::mem::size_of::<i32>()) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
@@ -2191,11 +2155,18 @@ impl Engine {
     /// the `deleted_by` metadata word, NEVER the row's column bytes — so a lock-free, predicate-free reader
     /// can never observe a torn row (review Finding 3), and the change is a single aligned u64 store.
     ///
-    /// Returns `false` (caller must fall back to invalidate + re-admit) if the shard is missing / carries no
-    /// tombstone section (`deleted_by_offset` None) / any slot is out of `[0, row_count)` / the device write
-    /// fails. `slots` are LOCAL indices within the shard.
-    // Wired into the DELETE-only commit path in the next A2 slice (slot-finding via the pruned-shard
-    // predicate); shipped now as the tested device-write primitive (the 1a append_owned_chunks discipline).
+    /// Returns `false` (caller must fall back to invalidate + re-admit) if the shard is missing / any slot is
+    /// out of `[0, row_count)` / the region allocation or device write fails. `slots` are LOCAL indices.
+    ///
+    /// UNWIRED (`#[allow(dead_code)]`) — wired into the DELETE-only commit path in SV4 (slot-finding via the
+    /// pruned-shard predicate). **SV4 PREREQUISITES (audit-flagged, out of scope until wired — the primitive
+    /// creates NO region in production today, so both are inert now):**
+    ///  1. **Lifecycle/leak:** `shard_deleted_by_memory` is NOT cleaned up on shard evict / invalidate / drop /
+    ///     re-admit (those paths clear `shard_device_memory` + `shards` but not this map). Wire the cleanup
+    ///     before SV4, else a re-admit (new shard_ids) or a dropped table leaks its regions.
+    ///  2. **Concurrency:** hold the COMMIT LOCK across the get-or-allocate below, else two concurrent
+    ///     first-deletes to the same shard both allocate + the losing region's `Arc` leaks (writes still land
+    ///     safely; only the buffer leaks). SV4 runs this under the serialized commit lock, which is the fix.
     #[allow(dead_code)]
     pub(crate) fn tombstone_resident_shard_slots(
         &self,
@@ -2207,11 +2178,10 @@ impl Engine {
         if slots.is_empty() {
             return true;
         }
-        // The two loads below (shards metadata, then device memory) are made atomic by the COMMIT LOCK when
-        // this is wired into the serialized commit path. Even without it, a torn (gen-N offset/row_count +
-        // gen-N+1 buffer) read can NEVER write out of bounds — `append_owned_chunks` re-checks every chunk
-        // against the buffer's `allocated_bytes`; the worst case is a rejected write -> `false` -> re-admit.
-        let (deleted_by_offset, row_count) = {
+        // Read the shard's shape once. The commit lock (when wired) makes this + the region allocation atomic;
+        // even without it, `append_owned_chunks` re-bounds-checks every chunk vs the region's allocated_bytes,
+        // so a torn read can only produce a rejected write (-> `false` -> re-admit), never an OOB.
+        let (capacity, row_count, gpu_id) = {
             let shards = self.read_state.residency.shards.load();
             let Some(table_shards) = shards.get(table) else {
                 return false;
@@ -2219,32 +2189,55 @@ impl Engine {
             let Some(shard) = table_shards.iter().find(|s| s.shard_id == shard_id) else {
                 return false;
             };
-            match shard.deleted_by_offset {
-                Some(off) => (off, shard.row_count),
-                None => return false,
-            }
+            (shard.capacity, shard.row_count, shard.gpu_id)
         };
         // Bounds: every slot must be a live row of THIS shard (never headroom / out of range).
         if slots.iter().any(|&slot| (slot as usize) >= row_count) {
             return false;
         }
-        let Some(shard_device_memory) = self
+        // SV2: get-or-allocate the shard's ON-DEMAND `deleted_by` region (a separate `capacity`-sized u64
+        // device buffer born all-live). A delete-free shard has NO entry -> the FIRST delete allocates it, so
+        // the un-versioned majority pays zero. The region is `capacity` (not `row_count`) u64s so later
+        // in-place appends into the open shard's headroom are already live without extending it.
+        let width = std::mem::size_of::<u64>() as u64;
+        let region = match self
             .read_state
             .residency
-            .shard_device_memory
+            .shard_deleted_by_memory
             .get(&(table.to_string(), shard_id))
-        else {
-            return false;
+        {
+            Some(region) => region,
+            None => {
+                // Born all-live: every u64 = `DELETED_BY_LIVE` (all 0xFF bytes).
+                let live_payload = vec![0xFF_u8; capacity * std::mem::size_of::<u64>()];
+                let Some(region) = self.relational_residency_device_memory(gpu_id, &live_payload) else {
+                    return false;
+                };
+                self.read_state.residency.shard_deleted_by_memory.insert_shard(
+                    table,
+                    shard_id,
+                    region,
+                );
+                match self
+                    .read_state
+                    .residency
+                    .shard_deleted_by_memory
+                    .get(&(table.to_string(), shard_id))
+                {
+                    Some(region) => region,
+                    None => return false,
+                }
+            }
         };
-        let width = std::mem::size_of::<u64>() as u64;
         let chunks: Vec<CudaOwnedDeviceMemoryChunk> = slots
             .iter()
             .map(|&slot| CudaOwnedDeviceMemoryChunk {
-                byte_offset: deleted_by_offset + u64::from(slot) * width,
+                // The region is JUST deleted_by (0-based): slot `s`'s stamp is at byte `s * 8`.
+                byte_offset: u64::from(slot) * width,
                 bytes: commit_seq.to_le_bytes().to_vec(),
             })
             .collect();
-        shard_device_memory.append_owned_chunks(chunks).is_ok()
+        region.append_owned_chunks(chunks).is_ok()
     }
 
     /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit
@@ -2755,9 +2748,8 @@ impl Engine {
                 int4_appendable: false,
                 // S-d3: benchmark shards carry no zone map -> never pruned (always gathered).
                 resident_device_int4_column_stats: Vec::new(),
-                // A1: benchmark shards carry no version metadata -> the visibility mask is skipped
-                // (they read as all-live, correct for the latest-snapshot benchmark reads).
-                deleted_by_offset: None,
+                // A1/SV2: benchmark shards carry no version metadata (no on-demand deleted_by region) -> the
+                // visibility mask is skipped (they read as all-live, correct for latest-snapshot benchmarks).
                 resident_bytes: shard.resident_bytes,
                 allocated_bytes: shard.allocated_bytes,
                 count_header_byte_offset: 0,
