@@ -378,8 +378,11 @@ them. Each slice is a strict step toward the optimal target.
       device, no round trip. **REORDERED (user pick "A"):** wire this filter to **`deleted_by` + incremental
       DELETE first** (observable at the LATEST snapshot — a DELETE a SELECT immediately stops seeing), since
       `created_by`/old-snapshot has no SQL consumer yet (every read pins `committed_seq`); old-snapshot
-      `created_by` reuses the SAME filter later. **lpb BEFORE/AFTER is a MUST on the read-filter slice**
-      (prove delete-free reads pay ~nothing; see [[benchmark-report-card]]).
+      `created_by` reuses the SAME filter later. **ORDER (review #4): the read filter (A3) lands BEFORE the
+      tombstone-instead-of-re-admit wiring (A2-wiring)** — A3 is a safe no-op on delete-free data, tested via
+      the shipped A2 tombstone primitive; flipping re-admit→tombstone before A3 leaks deleted rows. **lpb
+      BEFORE/AFTER MUST run on the SHARD path (flag ON), has-deletes vs delete-free (review #3)** — at defaults
+      it's vacuous (shards OFF). See "Review-adopted structural constraints" below + [[benchmark-report-card]].
 - **Slice 2 — Version-delta (undo) store + old-snapshot reconstruction.** The out-of-line before-image
   structure + the reconstruction read path. Foundation for UPDATE/DELETE.
 - **Slice 3 — Incremental DELETE.** Capture before-image to undo + tombstone the hot slot.
@@ -412,6 +415,71 @@ them. Each slice is a strict step toward the optimal target.
 
 Mixed/unsupported commits fall back to the full re-admit, with a non-vacuity counter so a silent
 always-fallback can't pass the gates (the wave faked-throughput lesson).
+
+### Review-adopted constraints (MVCC-visibility reviews, 2026-07-01)
+
+TWO independent reviews landed at `docs/reviews/gpu-native-writes-mvcc-visibility-review.md` (a structural
+read-path/index review + a GPU-scaling adversarial review — different, complementary findings; the canonical
+file on `main` is the GPU-scaling one). Both were checked against code; no point was invalid. Adopting both.
+
+**A. Structural — MVCC lives on the shard SCAN path, the 121.6M perf lives on the single-buffer INDEX-PROBE
+path** (verified: `execute_resident_sharded_via_general` has ZERO index-probe / visibility references;
+`r2_wave_engine_ab` runs shards OFF):
+
+- **[#4 — REORDER, correctness] The read filter (A3) lands BEFORE the tombstone-instead-of-re-admit wiring
+  (A2-wiring), not after.** The shard read trusts the buffer is all-live (deletes are removed at admit-time
+  re-admit); replacing re-admit with a tombstone BEFORE the filter exists would leave deleted rows VISIBLE
+  (wrong SQL results) in the interim. A3 lands first as a SAFE NO-OP (delete-free ⇒ `deleted_by > read_txn_id`
+  passes every row ⇒ byte-identical), tested via the already-shipped A2 tombstone primitive (tombstone a slot
+  device-direct → the read/COUNT must hide it, == host MVCC). Only then does A2-wiring flip re-admit→tombstone.
+  No gate between them may assert SQL-delete-correctness before A3.
+- **[#3 — the lpb before/after must point at the SHARD path]** `r2_wave_engine_ab` at defaults runs shards OFF
+  (single-buffer index probe), which A3 does not touch ⇒ before==after is VACUOUS. The A3 read-filter gate must
+  run `shard_residency_enabled` **ON**, a has-deletes table vs a delete-free one (measures the filter's marginal
+  cost on the scan path), AND separately report a **shard-scan point-lookup vs single-buffer index-probe**
+  comparison (the path-change cost of shards-as-default). See [[benchmark-report-card]].
+- **[#1/#2/#5 — PIN, not deferrable] The cross-shard index and the index-probe visibility contract are
+  load-bearing companions to flipping shards-to-default, not later Axis-2 polish.** (1) The mask-VM filter (A3)
+  covers the SCAN family only; a per-shard bloom/hash index returns a SLOT, so it must carry its OWN per-hit
+  `deleted_by[slot] > read_txn_id` gate — design that contract with the index, never ship a shard index probe
+  without it (else it silently returns deleted rows). (2) When the segmented path becomes default, point lookups
+  become zone-map-pruned SCANS + mask (a PATH CHANGE from the 121.6M index probe); the per-shard index is what
+  restores point-lookup performance — sequence it as a HARD companion to the default flip. (5) DELETE-locate
+  (run the predicate over pruned shards, O(shard)/delete — fine now, bounded) + point-lookup + index-maintenance
+  ALL converge on the same missing piece: the cross-shard index. (See [[billions-rows-scale]] Axis-2 matrix,
+  `non-int4-point-lookup-index.md`.)
+
+**B. GPU-scaling — the host-MVCC literature doesn't force these; VRAM does** (all verified against the layout):
+
+- **[VERSION-METADATA VRAM TAX — measure now, prioritize rebasing] `created_by` (8 B) + `deleted_by` (8 B) =
+  16 B/row of version metadata.** On `accounts(id,balance)` (8 B of data) that is **+200% hot-row footprint**,
+  cutting effective residency capacity to ~1/3 in scarce VRAM. (The review flagged `created_by`'s 8 B; the
+  shipped layout ALSO carries `deleted_by` 8 B — the tax is bigger than stated.) The "~4 B rebased" (per-shard
+  32-bit `(epoch, delta)`) is **capacity-critical, not a nice-to-have**: prioritize it, and add a
+  residency-capacity-hit measurement now. Future reclaim: drop `created_by` on sealed shards whose whole range
+  is below the oldest active snapshot (all-definitely-visible), and reclaim `deleted_by` for delete-free sealed
+  shards.
+- **[COUNT-under-MVCC — a silent-wrong-count risk; own differential] `COUNT(*)` via the row-count header is
+  O(1) but header-count ≠ visible-count once tombstones/old versions exist.** A3 must make COUNT a FILTERED
+  reduction, and header-count is valid ONLY when the synopsis says no versions/tombstones affect this snapshot.
+  This is the read path most likely to silently return a wrong count — it needs its OWN correctness differential
+  (a committed DELETE drops `COUNT(*)` by exactly the deleted rows), gated in A3 alongside the row filter.
+- **[lpb before/after on an UPDATE-HEAVY table — a fresh table overstates "untouched"] The VersionedPositions
+  "latest reads pay nothing" erodes under update-scatter** (CoW scatters new versions into the open shard,
+  tombstones scatter across sealed shards → fewer un-versioned ranges to skip) — the Axis-1 analog of the
+  zone-map clustering-degradation ([[zone-map-clustering-limit]]). So run the mandatory lpb before/after on a
+  has-deletes/update-HEAVY table, not a fresh one, plus an explicit OLD-SNAPSHOT-visibility-cost measurement.
+- **[VACUUM/GC + VRAM-OOM backstop — needed BEFORE UPDATE/DELETE at SCALE, not just Slice 5] On the GPU,
+  undo+tombstone accumulation is VRAM (not RAM) pressure, and a single long-lived/stuck snapshot pins them and
+  can OOM the device.** So device vacuum + a memory-pressure backstop (spill undo per ADR-012, or bound/abort
+  long-lived snapshots) must exist before update-heavy production scale — pull the Slice-5 GC forward for the
+  scale gate (the first DELETE slice at small scale is fine without it).
+- **[OLD-SNAPSHOT BACK-LINK — write at CoW time, Slice 4, not reconstruct in Slice 2] An old-snapshot point
+  lookup lands on the latest version (`created_by > read_txn_id`) and must walk back to the visible one; with
+  CoW the prior version is in a different shard/slot,** so the new version should carry a prev-version/undo
+  back-link WRITTEN when the CoW append happens (UPDATE slice), rather than Slice 2 rebuilding the linkage.
+- **[CONFIRMED GOOD] `deleted_by` is a DENSE-by-row-position u64 SoA section (coalesced gather), not sparse/hash**
+  — correct for the per-candidate-row old-snapshot read; keep it dense.
 
 ## Risks / open questions
 
