@@ -734,6 +734,12 @@ pub(crate) struct RelationalResidentShard {
     pub(crate) count_header_byte_offset: u64,
     pub(crate) resident_device_int4_columns: Vec<String>,
     pub(crate) resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    /// M3-for-shards: per-column NULL validity bitmaps carried in THIS shard's device payload (1 = valid,
+    /// 0 = NULL), in catalog order, one entry per column that contains a NULL. The sharded scan's unified
+    /// recompaction copies these into the unified buffer + labels the unified descriptor so the executor
+    /// materializes `SqlValue::Null` instead of the raw-0 placeholder. Empty for the NULL-free majority
+    /// (the rollover/append + benchmark paths reject NULLs by construction), so those payloads are unchanged.
+    pub(crate) resident_device_null_columns: Vec<ResidentDeviceNullBitmapLayout>,
     pub(crate) gpu_id: u16,
     pub(crate) schema: String,
     pub(crate) table: String,

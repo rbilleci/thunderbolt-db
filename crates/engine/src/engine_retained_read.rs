@@ -1108,6 +1108,25 @@ impl Engine {
                 return None;
             }
         }
+        // M3-for-shards: the batched gather (GPU dense-emit + host paths) both emit RAW i32 with NO validity
+        // channel, so they would read a NULL-stored-0 as 0 while the sharded SCAN is now NULL-aware. DECLINE a
+        // null-bearing table so the caller (facade -> per-query scan) serves it NULL-correctly. null-bearing is
+        // single-shard by construction, so this never costs the many-shard batched win. The
+        // `sharded_point_batch_*` null differentials are the tripwire that this decline holds.
+        if self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(&table.name)
+            .is_some_and(|shards| {
+                shards
+                    .iter()
+                    .any(|s| !s.resident_device_null_columns.is_empty())
+            })
+        {
+            return None;
+        }
         // Sub-slice 8: PREFER the fully-GPU dense-emit path (device-resident per-shard index + the
         // `gpu_db_resident_i32_index_probe_dense` kernel probes+gathers+emits on the GPU — no host per-needle
         // probe, one bulk DtoH per shard). Returns None -> fall through to the host-probe path below when a

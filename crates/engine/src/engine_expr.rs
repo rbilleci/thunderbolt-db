@@ -2348,11 +2348,20 @@ impl Engine {
         // soundness guard it returns None and we fall through to the scan (byte-identical). Placed before the
         // zone-map prune so it also wins when zone maps DEGRADE under UPDATE key-scatter (membership pruning,
         // scalability-ledger #4/#8) — locate finds the exact shard even when [min,max] can't exclude any.
-        if let Some((filter_idx, needle)) = point_lookup_eq {
-            if let Some(result) =
-                self.try_shard_index_point_route(select, &table, &bound, filter_idx, needle, copin_s)
-            {
-                return Ok(result);
+        // M3-for-shards: the point-index route gathers RAW i32 slots (no validity bitmap), so it would read a
+        // NULL-stored-0 as 0 while the scan below is now NULL-aware -> SKIP it for a null-bearing table so the
+        // NULL-aware scan serves it (null-bearing => single-shard, so this never costs the many-shard win).
+        // The `..._null_blind_matches_scan` differential is the tripwire that this decline keeps route == scan.
+        let any_shard_has_nulls = shards
+            .iter()
+            .any(|s| !s.resident_device_null_columns.is_empty());
+        if !any_shard_has_nulls {
+            if let Some((filter_idx, needle)) = point_lookup_eq {
+                if let Some(result) = self
+                    .try_shard_index_point_route(select, &table, &bound, filter_idx, needle, copin_s)
+                {
+                    return Ok(result);
+                }
             }
         }
         // S-d3 zone-map pruning: for a point-lookup shape (`col = needle`, ANDed at top level) drop every
@@ -2593,6 +2602,81 @@ impl Engine {
         } else {
             int4_bytes
         };
+
+        // M3-for-shards: recompact each column's NULL VALIDITY BITMAP into the unified buffer (mirrors the
+        // deleted_by region: FILL all-valid, then DtoD-copy each null-bearing shard's bitmap). A column gets a
+        // unified bitmap iff SOME surviving shard carries one; the region is 1 bit/row (u32 words, LSB-first,
+        // 1 = valid / 0 = NULL), placed 4-aligned after the int4 (+ deleted_by) sections. The executor reads it
+        // by ABSOLUTE offset (`resident_device_null_column_offset`) and materializes `SqlValue::Null` for a
+        // 0 bit, so the sharded scan stops reading a NULL-stored-0 placeholder as `0`. A null-bearing shard's
+        // live-row prefix MUST start on a 32-row (word) boundary to byte-copy; multi-shard tables are NULL-FREE
+        // by construction (the rollover admit rejects NULLs -> a null-bearing table is a SINGLE shard with
+        // rows_before == 0), so this always holds -- a misaligned null-bearing shard errors rather than
+        // mis-copy bits (never a wrong result). No null-bearing shard -> zero extra bytes, byte-identical read.
+        let mut allocated_bytes = allocated_bytes;
+        let mut unified_null_columns: Vec<crate::relational_model::ResidentDeviceNullBitmapLayout> =
+            Vec::new();
+        {
+            // Union of null-bearing column names across surviving shards, in catalog order (deterministic).
+            let null_col_names: Vec<String> = table
+                .columns
+                .iter()
+                .filter(|column| {
+                    shards.iter().any(|s| {
+                        s.resident_device_null_columns
+                            .iter()
+                            .any(|n| n.name == column.name)
+                    })
+                })
+                .map(|column| column.name.clone())
+                .collect();
+            let words_per_col = (total_row_count as u64).div_ceil(32);
+            let col_region_bytes = words_per_col * 4;
+            for name in &null_col_names {
+                let col_offset = allocated_bytes;
+                // Born all-valid (0xFF): a row/shard without a bitmap for this column is non-NULL.
+                fills.push(gpu_db_execution::RecompactFill {
+                    byte_offset: col_offset,
+                    len: col_region_bytes,
+                    fill_byte: 0xFF,
+                });
+                let mut rows_before = 0_u64;
+                for (shard, (device_ptr, row_count, _capacity)) in
+                    shards.iter().zip(shard_ptrs.iter())
+                {
+                    let row_count = *row_count as u64;
+                    if let Some(layout) = shard
+                        .resident_device_null_columns
+                        .iter()
+                        .find(|n| &n.name == name)
+                    {
+                        if !rows_before.is_multiple_of(32) {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "sharded NULL recompaction: shard live prefix ({rows_before} rows) is not \
+                                 32-row aligned for column \"{name}\" (unreachable: multi-shard is NULL-free)"
+                            ))));
+                        }
+                        // The shard bitmap is capacity-strided; its first ceil(row_count/32) words hold the
+                        // live bits (trailing bits map to rows past the table end -> don't-care).
+                        let shard_words = row_count.div_ceil(32);
+                        segments.push(gpu_db_execution::RecompactSegment {
+                            src_device_ptr: *device_ptr,
+                            src_byte_offset: layout.bitmap_byte_offset,
+                            dst_byte_offset: col_offset + (rows_before / 32) * 4,
+                            byte_len: shard_words * 4,
+                        });
+                    }
+                    rows_before = rows_before.saturating_add(row_count);
+                }
+                unified_null_columns.push(
+                    crate::relational_model::ResidentDeviceNullBitmapLayout {
+                        name: name.clone(),
+                        bitmap_byte_offset: col_offset,
+                    },
+                );
+                allocated_bytes = allocated_bytes.saturating_add(col_region_bytes);
+            }
+        }
         let header = (total_row_count as u64).to_le_bytes();
 
         // Recompact ON-DEVICE into one unified buffer, then build the whole-table descriptor + injected
@@ -2613,6 +2697,7 @@ impl Engine {
             allocated_bytes,
             proof,
             int4_columns,
+            unified_null_columns,
         );
         let unified_src = ResidentExecSource {
             descriptor: Arc::new(snapshot),
@@ -2709,13 +2794,14 @@ impl Engine {
     /// scan applies its multi-row + ordering); or the located shard is gone / invalid / raced (`slot >=
     /// row_count`).
     ///
-    /// NULLs: the sharded read path is uniformly NULL-BLIND (NULL stored as 0; the int4-only recompaction
-    /// carries no validity bitmap, and both the shard descriptor and the scan's unified descriptor report no
-    /// null columns), so the raw-i32 slot gather here is BYTE-IDENTICAL to the scan on NULLs by construction
-    /// (both read `col = 0` as matching a NULL-stored-0 row) — no NULL guard is needed or possible. The
+    /// NULLs (M3-for-shards): the sharded SCAN is now NULL-AWARE (its recompaction rebuilds each column's
+    /// validity bitmap into the unified buffer + labels the unified descriptor), but this route gathers RAW i32
+    /// slots with no validity channel. So the CALLER SKIPS this route entirely for a null-bearing table (any
+    /// surviving shard with a non-empty `resident_device_null_columns`) -> the NULL-aware scan serves it. null-
+    /// bearing is single-shard by construction, so the skip never costs the many-shard route. The
     /// `deleted_by[slot] > read_txn_id` visibility gate mirrors the scan's SV3b filter — a tombstoned row
-    /// materializes ZERO rows. (When M3 recompacts validity bitmaps through the sharded path, the scan turns
-    /// NULL-aware and this route must read the bitmap too; the nullable differential is the tripwire.)
+    /// materializes ZERO rows. (`cross_shard_pk_index_route_declines_on_null_bearing` is the tripwire that this
+    /// decline keeps route == the NULL-aware scan.)
     fn try_shard_index_point_route(
         &self,
         select: &Select,

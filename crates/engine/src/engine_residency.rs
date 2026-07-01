@@ -2190,17 +2190,17 @@ mod capacity_payload_tests {
         assert_eq!(got_live.len(), 1, "live neighbor id=131 visible");
     }
 
-    /// SUB-SLICE 3b ROUTE — NULL-BLINDNESS byte-identicality (the tripwire, per the route's doc). The sharded
-    /// read path is uniformly NULL-BLIND: NULL is stored as 0, the int4-only recompaction carries no validity
-    /// bitmap, and BOTH descriptors (`resident_snapshot_for_shard` and the scan's `resident_snapshot_for_unified`)
-    /// report no null columns, so the scan reads the raw i32 (a NULL reads as 0; `col = 0` MATCHES a NULL-stored-0
-    /// row). The raw-i32 index route reads the SAME bytes, so it must be BYTE-IDENTICAL to the scan even with
-    /// NULLs present — including the adversarial NULL-KEY case (`id = 0` matching a NULL-stored-0 row) — AND the
-    /// route must actually FIRE (no silent fallback). If M3 ever makes the scan NULL-aware without teaching this
-    /// route to read the bitmap, this differential FAILS (route != scan) — the intended tripwire.
+    /// SUB-SLICE 3b ROUTE — after M3-for-shards, the point-index route DECLINES on a NULL-BEARING table (the
+    /// resolved tripwire). The sharded SCAN is now NULL-aware (its recompaction rebuilds the validity bitmap +
+    /// labels the unified descriptor), but the raw-i32 slot route has NO validity channel -> it would read a
+    /// NULL-stored-0 as 0 and DIVERGE. So `execute_resident_sharded_via_general` SKIPS the route whenever any
+    /// surviving shard carries a null bitmap, falling to the NULL-aware scan. This test proves the decline
+    /// holds: route-ON == route-OFF (both the scan) AND the route does NOT fire on a null-bearing table, while
+    /// the scan is genuinely NULL-aware (case (a) projects SQL NULL). null-bearing => single-shard, so the
+    /// decline never costs the many-shard route on NULL-free tables.
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn cross_shard_pk_index_route_null_blind_matches_scan() {
+    fn cross_shard_pk_index_route_declines_on_null_bearing() {
         let sel = |e: &Engine, on: bool, sql: &str| -> (Vec<Vec<SqlValue>>, u64) {
             e.set_shard_index_probe_enabled(on);
             let hb = e.shard_index_route_hits();
@@ -2208,7 +2208,8 @@ mod capacity_payload_tests {
             (r, e.shard_index_route_hits() - hb)
         };
 
-        // (a) a nullable PROJECTED column: route == scan (both NULL-blind -> NULL reads as 0), route FIRES.
+        // (a) a nullable-column table: the route DECLINES (fired 0) -> the NULL-aware scan serves it, and
+        // route-ON == route-OFF (both the scan). The scan projects the NULL as SQL NULL (not raw 0).
         let n = Engine::new_local();
         n.set_shard_residency_enabled(true);
         n.set_auto_admit_on_commit(true);
@@ -2216,17 +2217,19 @@ mod capacity_payload_tests {
         n.execute_text(2, "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30)").unwrap();
         let (want_bal, _) = sel(&n, false, "SELECT id, balance FROM nn WHERE id = 2");
         let (got_bal, fired_bal) = sel(&n, true, "SELECT id, balance FROM nn WHERE id = 2");
-        assert_eq!(got_bal, want_bal, "nullable projected column: route == scan (both NULL-blind)");
-        assert_eq!(fired_bal, 1, "route FIRED on the nullable-projection point lookup (no silent fallback)");
+        assert_eq!(got_bal, want_bal, "null-bearing: route declined -> route-ON == route-OFF (scan)");
+        assert_eq!(fired_bal, 0, "route DECLINED on the null-bearing table (M3 scan serves it)");
+        assert_eq!(
+            got_bal,
+            vec![vec![SqlValue::Int4(2), SqlValue::Null]],
+            "the NULL-aware scan projects SQL NULL (proves the decline is not vacuous)"
+        );
         let (want_id, _) = sel(&n, false, "SELECT id FROM nn WHERE id = 2");
         let (got_id, fired_id) = sel(&n, true, "SELECT id FROM nn WHERE id = 2");
-        assert_eq!(got_id, want_id, "non-null projection: route == scan");
-        assert_eq!(fired_id, 1, "route fired");
+        assert_eq!(got_id, want_id, "route declined -> == scan");
+        assert_eq!(fired_id, 0, "route DECLINED (the table carries a null bitmap)");
 
-        // (b) the adversarial NULL-KEY case: a NULL id stored as 0, NO real id=0. Both the scan (NULL-blind
-        // predicate) and the route (hash key 0 -> Hit) MATCH the NULL-stored-0 row identically -> route ==
-        // scan, and the route FIRES. (SQL-incorrect NULL=0 matching is a PRE-EXISTING sharded-path
-        // NULL-blindness limitation, ledgered — not introduced by this route.)
+        // (b) the NULL-KEY table (a NULL id stored as 0): the route DECLINES here too -> route-ON == route-OFF.
         let k = Engine::new_local();
         k.set_shard_residency_enabled(true);
         k.set_auto_admit_on_commit(true);
@@ -2235,8 +2238,47 @@ mod capacity_payload_tests {
         k.execute_text(3, "INSERT INTO kn (id, balance) VALUES (NULL, 99)").unwrap();
         let (want0, _) = sel(&k, false, "SELECT id, balance FROM kn WHERE id = 0");
         let (got0, fired0) = sel(&k, true, "SELECT id, balance FROM kn WHERE id = 0");
-        assert_eq!(got0, want0, "NULL-key case: route == scan (both NULL-blind, byte-identical)");
-        assert_eq!(fired0, 1, "route FIRED on the NULL-key point lookup (byte-identical to the scan)");
+        assert_eq!(got0, want0, "NULL-key table: route declined -> route-ON == route-OFF (scan)");
+        assert_eq!(fired0, 0, "route DECLINED on the null-bearing (NULL-id) table");
+    }
+
+    /// M3-for-shards: the sharded read path's PROJECTION is now NULL-AWARE — a NULL materializes as
+    /// `SqlValue::Null`, not the raw-0 placeholder the ledger flagged as SQL-WRONG. The sharded scan's
+    /// recompaction rebuilds each column's validity bitmap into the unified buffer + labels the unified
+    /// descriptor, so the general executor emits NULLs. Asserts the SQL-SPEC-CORRECT result directly (the
+    /// authoritative reference — [[sql-spec-over-cpu-parity]]) for a NULL in the PROJECTED column AND a NULL in
+    /// the KEY column. Sabotage: passing an empty `unified_null_columns` (or dropping the null-region
+    /// fills/segments) reverts to raw-0 -> the NULL cells read back as Int4(0), failing the assertions below.
+    /// (IS NULL / IS NOT NULL predicates are a separate sharded-router-eligibility concern, out of scope here.)
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_null_read_projects_sql_null() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
+        e.execute_text(2, "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30),(4,40)")
+            .unwrap();
+        let run = |sql: &str| -> Vec<Vec<SqlValue>> {
+            e.execute_relational_select_text(sql).unwrap().rows.into_boxed()
+        };
+        // NULL in the PROJECTED column materializes as SQL NULL (the documented bug was Int4(0)).
+        assert_eq!(
+            run("SELECT id, balance FROM nn WHERE id = 2"),
+            vec![vec![SqlValue::Int4(2), SqlValue::Null]],
+            "NULL balance projects as NULL"
+        );
+        // Non-null control: unchanged (byte-identical to the pre-M3 read).
+        assert_eq!(
+            run("SELECT id, balance FROM nn WHERE id = 3"),
+            vec![vec![SqlValue::Int4(3), SqlValue::Int4(30)]],
+            "non-null row unchanged"
+        );
+        assert_eq!(
+            run("SELECT balance FROM nn WHERE id = 4"),
+            vec![vec![SqlValue::Int4(40)]],
+            "non-null single projection unchanged"
+        );
     }
 
     /// STEP 1 (lpb-for-shards) — the BATCHED cross-shard point-lookup gather returns, per needle, rows
@@ -2373,87 +2415,52 @@ mod capacity_payload_tests {
             .rows
             .len();
         assert_eq!(xrows, 2, "cross-shard dup id=5 -> 2 rows (row 5 + row 105) via the scan");
-
-        // NULL-BLIND: batched == single-flight on a table with NULLs (both read raw i32, NULL as 0).
-        let n = Engine::new_local();
-        n.set_shard_residency_enabled(true);
-        n.set_auto_admit_on_commit(true);
-        n.set_shard_index_probe_enabled(true);
-        n.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
-        n.execute_text(2, "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30)").unwrap();
-        let nt = n.relational_catalog_table("nn").unwrap();
-        let nid = crate::rel_exec_helpers::relational_column_index(&nt, "id").unwrap();
-        let nbal = crate::rel_exec_helpers::relational_column_index(&nt, "balance").unwrap();
-        let np = n
-            .gather_sharded_int4_point_lookups_batched(&nt, nid, &[nid, nbal], &[2])
-            .expect("batched served");
-        let want_n = n
-            .execute_relational_select_text("SELECT id, balance FROM nn WHERE id = 2")
-            .unwrap()
-            .rows
-            .into_boxed();
-        let want_n_i32: Vec<i32> = want_n[0]
-            .iter()
-            .map(|v| match v {
-                SqlValue::Int4(x) => *x,
-                other => panic!("expected int4, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(np.needle_ranges[0].1, 1, "id=2 present");
-        assert_eq!(&np.values[0..2], &want_n_i32[..], "batched NULL-blind == single-flight (NULL as 0)");
+        // (NULL-bearing tables are covered by `sharded_point_batch_declines_on_null_bearing` — the batched
+        // gather declines them post-M3, so this NULL-free differential no longer exercises a NULL sub-case.)
     }
 
-    /// SUB-SLICE 8 v3 (zone-map pruning) — the KEEP-SHARD-0 fallback (load-bearing for byte-identicality with
-    /// the scan's zone prune, which keeps shard 0 when a needle is out of EVERY shard's range so its NULL-blind
-    /// predicate can still match). A NULL id (stored 0) sits OUTSIDE the zone map [5,7] (NULLs are excluded from
-    /// min/max), so `WHERE id = 0` PRUNES the shard on-device -> the kernel MUST keep-shard-0 (probe shard 0
-    /// unconditionally) to find the NULL-stored-as-0 row, exactly as the scan does. Sabotage: disabling the
-    /// keep-shard-0 re-entry (`bra SHARD` -> `bra WRITEABSENT`) makes id=0 return 0 rows (diverges from the scan).
+    /// M3-for-shards: the BATCHED gather DECLINES on a NULL-BEARING table. The batched path emits RAW i32 with
+    /// no validity channel, so (like the 3b route) it would read a NULL-stored-0 as 0 while the sharded SCAN is
+    /// now NULL-aware -> `gather_sharded_int4_point_lookups_batched` returns None for a table whose shard carries
+    /// a null bitmap, and the facade's per-query fallback serves it via the NULL-aware scan. A NULL-free control
+    /// still SERVES (the decline is null-specific, not always-None). (Before M3 this exercised the kernel's
+    /// keep-shard-0 NULL-as-0 find; that corner is now correctly unreachable via the batched gather. The
+    /// kernel's keep-shard-0 stays exercised for the out-of-range ABSENT case by the `matches` differential.)
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
-    fn sharded_point_batch_keep_shard_0_null_as_zero() {
+    fn sharded_point_batch_declines_on_null_bearing() {
+        // NULL-FREE control: the batched gather SERVES it (Some) -> the decline below is null-specific.
+        let f = Engine::new_local();
+        f.set_shard_residency_enabled(true);
+        f.set_auto_admit_on_commit(true);
+        f.set_shard_index_probe_enabled(true);
+        f.execute_text(1, "CREATE TABLE nf (id INT, balance INT)").unwrap();
+        f.execute_text(2, "INSERT INTO nf (id, balance) VALUES (5,50),(7,70)").unwrap();
+        let tf = f.relational_catalog_table("nf").unwrap();
+        let idf = crate::rel_exec_helpers::relational_column_index(&tf, "id").unwrap();
+        let balf = crate::rel_exec_helpers::relational_column_index(&tf, "balance").unwrap();
+        assert!(
+            f.gather_sharded_int4_point_lookups_batched(&tf, idf, &[idf, balf], &[5])
+                .is_some(),
+            "NULL-free table: batched gather SERVES (the decline is null-specific, not always-None)"
+        );
+
+        // NULL-BEARING (a NULL id -> a null bitmap on the filter column): the batched gather DECLINES (None).
         let k = Engine::new_local();
         k.set_shard_residency_enabled(true);
         k.set_auto_admit_on_commit(true);
         k.set_shard_index_probe_enabled(true);
         k.execute_text(1, "CREATE TABLE knz (id INT, balance INT)").unwrap();
-        // id 5,7 + one NULL (stored 0). Zone map for id = [5,7] (NULL EXCLUDED). No within-shard dup on id.
         k.execute_text(2, "INSERT INTO knz (id, balance) VALUES (5,50),(7,70)").unwrap();
         k.execute_text(3, "INSERT INTO knz (id, balance) VALUES (NULL, 99)").unwrap();
         let t = k.relational_catalog_table("knz").unwrap();
         let id = crate::rel_exec_helpers::relational_column_index(&t, "id").unwrap();
         let bal = crate::rel_exec_helpers::relational_column_index(&t, "balance").unwrap();
-        let gpu_hb = k.sharded_point_gpu_probe_hits();
-        // id=0 is OUT of the zone map [5,7] -> pruned on-device -> the kernel must KEEP-SHARD-0 to find the
-        // NULL-stored-as-0 row (the index holds key 0 for the NULL row).
-        let proj = k
-            .gather_sharded_int4_point_lookups_batched(&t, id, &[id, bal], &[0])
-            .expect("batched served (delete-free)");
-        assert!(k.sharded_point_gpu_probe_hits() > gpu_hb, "the GPU zone-prune path fired");
-        let want = k
-            .execute_relational_select_text("SELECT id, balance FROM knz WHERE id = 0")
-            .unwrap()
-            .rows
-            .into_boxed();
-        let got: Vec<Vec<i32>> = (0..proj.needle_ranges[0].1 as usize)
-            .map(|r| {
-                let base = (proj.needle_ranges[0].0 as usize + r) * proj.ncols;
-                proj.values[base..base + proj.ncols].to_vec()
-            })
-            .collect();
-        let want_i32: Vec<Vec<i32>> = want
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|v| match v {
-                        SqlValue::Int4(x) => *x,
-                        o => panic!("expected int4, got {o:?}"),
-                    })
-                    .collect()
-            })
-            .collect();
-        assert_eq!(got, want_i32, "keep-shard-0 finds the NULL-as-0 row for id=0 == scan");
-        assert_eq!(got.len(), 1, "id=0 matches the NULL-stored-as-0 row (NULL-blind, via keep-shard-0)");
+        assert!(
+            k.gather_sharded_int4_point_lookups_batched(&t, id, &[id, bal], &[5])
+                .is_none(),
+            "null-bearing table: batched gather DECLINES (-> the facade per-query fallback runs the NULL-aware scan)"
+        );
     }
 
     /// SUB-SLICE 8 v3 (O(1) routing) — the BINARY-SEARCH route at DEPTH across many ascending-disjoint shards.
@@ -2463,7 +2470,8 @@ mod capacity_payload_tests {
     /// binary BKEEP0 fallback -> absent). Byte-identical to the scan proves the binary search lands on the RIGHT
     /// shard at every depth. NOTE: multi-shard tables are NULL-FREE by construction (the incremental-rollover
     /// admit rejects NULLs -> a NULL forces a single shard = LINEAR mode), so binary BKEEP0 only ever resolves
-    /// to absent here; the NULL-as-0 keep-shard-0 corner is a LINEAR-mode concern (see the knz test).
+    /// to absent here; a null-bearing table declines the whole batched gather (see
+    /// `sharded_point_batch_declines_on_null_bearing`) so its NULL-as-0 read is served by the NULL-aware scan.
     /// Sabotage: a wrong binary candidate (or a broken bound) makes a present needle materialize the wrong row.
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
@@ -2881,6 +2889,10 @@ impl Engine {
                 count_header_byte_offset: 0,
                 resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
                 resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
+                // M3-for-shards: carry the payload's per-column NULL validity bitmaps so the sharded scan's
+                // recompaction can rebuild them into the unified buffer (this re-admit path is the ONLY
+                // shard builder that can see NULLs; rollover/benchmark are NULL-free).
+                resident_device_null_columns: snapshot.resident_device_null_columns.clone(),
                 gpu_id,
                 schema: snapshot.schema.clone(),
                 table: snapshot.table.clone(),
@@ -3529,6 +3541,8 @@ impl Engine {
             count_header_byte_offset: 0,
             resident_device_int4_columns: column_names,
             resident_device_text_columns: Vec::new(),
+            // Rollover shards are int4-only + NULL-free by precondition (the caller rejects NULLs).
+            resident_device_null_columns: Vec::new(),
             gpu_id,
             schema,
             table: table.to_string(),
@@ -4178,6 +4192,8 @@ impl Engine {
                 count_header_byte_offset: 0,
                 resident_device_int4_columns: shard.resident_device_int4_columns,
                 resident_device_text_columns: shard.resident_device_text_columns,
+                // Benchmark installs carry no NULL metadata (dense, read-only, NULL-free chunks).
+                resident_device_null_columns: Vec::new(),
                 gpu_id: install.gpu_id,
                 schema: catalog_table.schema.clone(),
                 table: catalog_table.name.clone(),
@@ -4236,7 +4252,9 @@ impl Engine {
             resident_device_numeric_columns: Vec::new(),
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: shard.resident_device_text_columns.clone(),
-            resident_device_null_columns: Vec::new(),
+            // M3-for-shards: carry the shard's own per-column NULL bitmaps (offsets are relative to the
+            // shard's buffer, which this descriptor addresses). Empty for the NULL-free majority.
+            resident_device_null_columns: shard.resident_device_null_columns.clone(),
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: shard.invalidated_by_txn_id,
             invalidated_at_index: shard.invalidated_at_index,
@@ -4268,6 +4286,9 @@ impl Engine {
         resident_bytes: u64,
         proof: CudaDeviceMemoryProof,
         int4_columns: Vec<String>,
+        // M3-for-shards: the per-column NULL bitmaps recompacted into the unified buffer (offsets ABSOLUTE
+        // in that buffer). Empty when no surviving shard carries a NULL — byte-identical to the pre-M3 read.
+        null_columns: Vec<ResidentDeviceNullBitmapLayout>,
     ) -> RelationalResidencySnapshot {
         let resident_device_int4_columns = int4_columns;
         RelationalResidencySnapshot {
@@ -4285,7 +4306,7 @@ impl Engine {
             resident_device_numeric_columns: Vec::new(),
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: Vec::new(),
-            resident_device_null_columns: Vec::new(),
+            resident_device_null_columns: null_columns,
             valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
