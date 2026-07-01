@@ -677,6 +677,13 @@ pub(crate) struct RelationalResidentShard {
     /// visibility mask is skipped and the shard reads as all-live. The COLD stamp: the hot (latest) read
     /// never touches it; only an old-snapshot read's `created_by ≤ read_txn_id` mask does (Slice 1c-ii).
     pub(crate) created_by_offset: Option<u64>,
+    /// Slice A1 (MVCC visibility): byte offset of the per-row `deleted_by` (u64 = the commit `Index` that
+    /// deleted each row, sentinel `u64::MAX` = LIVE) SoA section, laid out after `created_by`, capacity-
+    /// strided. Every slot (rows + headroom) is born `u64::MAX` so an appended row is live with no extra
+    /// write; a committed DELETE stamps ONE slot in place (out-of-line tombstone — never patches column
+    /// bytes, so no torn-row hazard). The read visibility filter keeps rows with `deleted_by > read_txn_id`.
+    /// `None` = no tombstone metadata (benchmark shard) → reads as all-live.
+    pub(crate) deleted_by_offset: Option<u64>,
     pub(crate) resident_bytes: u64,
     pub(crate) allocated_bytes: u64,
     pub(crate) count_header_byte_offset: u64,

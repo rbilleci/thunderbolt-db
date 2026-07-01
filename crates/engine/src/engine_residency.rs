@@ -300,23 +300,36 @@ pub(crate) fn sql_value_as_int4(value: &SqlValue) -> i32 {
     }
 }
 
-/// Slice 1c (MVCC visibility): append a per-row `created_by` u64 SoA section (one stamp per live row, then
-/// zero padding out to `capacity`) to a resident payload, returning its byte offset. Laid out AFTER the SQL
-/// columns + any dense tail so existing column offsets are untouched and the hot (latest) read never reads
-/// it; only the old-snapshot visibility mask does. `stamps.len()` must equal the live row count; the
-/// `capacity - stamps.len()` headroom slots mirror the value columns so an open-shard append stamps new
-/// creators in place. Panics only on the impossible `capacity < stamps.len()` (the caller guarantees it).
-pub(crate) fn append_created_by_section(payload: &mut Vec<u8>, stamps: &[u64], capacity: usize) -> u64 {
-    debug_assert!(capacity >= stamps.len(), "created_by capacity below row count");
+/// Slice 1c (MVCC visibility): append a per-row u64 SoA metadata section (`values`, one per live row, then
+/// `capacity - values.len()` slots of `pad_fill`) to a resident payload, returning its byte offset. Laid
+/// out AFTER the SQL columns + any dense tail so existing column offsets are untouched and the hot (latest)
+/// read never reads it; only the visibility mask does. Two uses:
+///  - `created_by` = per-row commit `Index` that created the row; live rows carry their stamp, headroom
+///    pads `0` (unused; a real stamp is never 0 since commit Index starts at 1).
+///  - `deleted_by` = per-row commit `Index` that deleted the row, sentinel `u64::MAX` = LIVE; ALL slots
+///    (live rows + headroom) init to `u64::MAX` so an appended row is born LIVE with no extra write, and a
+///    DELETE later stamps one slot in place.
+/// `values.len()` must be `<= capacity` (the caller guarantees it).
+pub(crate) fn append_u64_section(
+    payload: &mut Vec<u8>,
+    values: &[u64],
+    capacity: usize,
+    pad_fill: u64,
+) -> u64 {
+    debug_assert!(capacity >= values.len(), "u64 section capacity below value count");
     let offset = payload.len() as u64;
-    for stamp in stamps {
-        payload.extend_from_slice(&stamp.to_le_bytes());
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
     }
-    for _ in stamps.len()..capacity {
-        payload.extend_from_slice(&0u64.to_le_bytes());
+    for _ in values.len()..capacity {
+        payload.extend_from_slice(&pad_fill.to_le_bytes());
     }
     offset
 }
+
+/// The `deleted_by` sentinel meaning "this row is LIVE (never deleted)". A read is visible when
+/// `deleted_by > read_txn_id`; `u64::MAX` exceeds every real commit `Index`, so a live row always passes.
+pub(crate) const DELETED_BY_LIVE: u64 = u64::MAX;
 
 /// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
 /// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
@@ -1179,17 +1192,19 @@ mod capacity_payload_tests {
         assert_eq!(g, 1, "an out-of-range needle prunes to the single keep-one fallback shard");
     }
 
-    /// Read a table's resident-shard `created_by` sections back from device (DtoH), in shard-then-row order.
-    /// `created_by` is a u64 SoA section; `read_resident_i32_column` returns i32s, so each stamp is
-    /// reconstructed from its little-endian (lo, hi) i32 pair.
-    fn read_shard_created_by(e: &Engine, table: &str) -> Vec<u64> {
+    /// Read a per-row u64 SoA section (selected by `offset_of`) back from every resident shard (DtoH), in
+    /// shard-then-row order. `read_resident_i32_column` returns i32s, so each u64 is reconstructed from its
+    /// little-endian (lo, hi) i32 pair.
+    fn read_shard_u64_section(
+        e: &Engine,
+        table: &str,
+        offset_of: impl Fn(&crate::resident_storage::RelationalResidentShard) -> Option<u64>,
+    ) -> Vec<u64> {
         let shards = e.read_state.residency.shards.load();
         let table_shards = shards.get(table).expect("shard-resident");
         let mut out = Vec::new();
         for shard in table_shards {
-            let off = shard
-                .created_by_offset
-                .expect("a shard-path shard carries a created_by section");
+            let off = offset_of(shard).expect("a shard-path shard carries this u64 section");
             let dm = e
                 .read_state
                 .residency
@@ -1198,7 +1213,7 @@ mod capacity_payload_tests {
                 .expect("shard device memory");
             let halves = dm
                 .read_resident_i32_column(off, shard.row_count * 2)
-                .expect("read created_by section");
+                .expect("read u64 section");
             for i in 0..shard.row_count {
                 let lo = halves[2 * i] as u32 as u64;
                 let hi = halves[2 * i + 1] as u32 as u64;
@@ -1206,6 +1221,10 @@ mod capacity_payload_tests {
             }
         }
         out
+    }
+
+    fn read_shard_created_by(e: &Engine, table: &str) -> Vec<u64> {
+        read_shard_u64_section(e, table, |s| s.created_by_offset)
     }
 
     /// Slice 1c (MVCC visibility, Axis 1): a resident SHARD carries a per-row `created_by` = the commit
@@ -1288,6 +1307,43 @@ mod capacity_payload_tests {
             stamps, seqs,
             "every row's device creator stamp == the commit sequence of the INSERT that created it, across \
              admission + in-place append + rollover"
+        );
+    }
+
+    /// Slice A1 (MVCC visibility): a resident SHARD carries a per-row `deleted_by` section born ALL-LIVE
+    /// (sentinel `u64::MAX`). Every row — admitted, appended in place (into headroom pre-filled with the
+    /// sentinel, so no extra write), or landed in a rolled-over shard — reads as live until a DELETE stamps
+    /// its slot (Slice A2). The gate reads the `deleted_by` section back from device across several shards.
+    ///
+    /// NON-VACUITY: the table is really multiple shards (rollover), and EVERY one of the 200 rows reads the
+    /// exact sentinel — a wrong section offset would read garbage (not all-MAX), a wrong init would read 0,
+    /// and a corrupted append headroom would leave an appended row non-sentinel.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_deleted_by_born_all_live() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64); // small -> admission + in-place append + rollover all exercised
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let shard_count = e.read_state.residency.shards.load().get("accounts").unwrap().len();
+        assert!(
+            shard_count >= 3,
+            "need rollover into multiple shards to exercise all layout paths (got {shard_count})"
+        );
+        let deleted_by = read_shard_u64_section(&e, "accounts", |s| s.deleted_by_offset);
+        assert_eq!(deleted_by.len(), 200, "one deleted_by slot per live row");
+        assert!(
+            deleted_by.iter().all(|&d| d == u64::MAX),
+            "every row is born LIVE (deleted_by == u64::MAX sentinel) across admission + append + rollover"
         );
     }
 
@@ -1479,14 +1535,15 @@ impl Engine {
         // shard carries a creator stamp for the old-snapshot visibility mask. Placed AFTER the SQL columns +
         // dense tail (offset recorded explicitly), so no existing column/tail offset shifts. The default
         // single-buffer path (being retired, ADR-012) skips it — no per-row MVCC overhead on the hot path.
-        let created_by_offset = if self.shard_residency_enabled() {
-            Some(append_created_by_section(
-                &mut device_payload,
-                &created_by_stamps,
-                capacity,
-            ))
+        let (created_by_offset, deleted_by_offset) = if self.shard_residency_enabled() {
+            let cb = append_u64_section(&mut device_payload, &created_by_stamps, capacity, 0);
+            // deleted_by: every admitted row is LIVE -> fill the WHOLE capacity (rows + headroom) with the
+            // live sentinel, so an in-place append is born live with no extra write and a DELETE stamps one
+            // slot in place later.
+            let db = append_u64_section(&mut device_payload, &[], capacity, DELETED_BY_LIVE);
+            (Some(cb), Some(db))
         } else {
-            None
+            (None, None)
         };
 
         let memory_pressure_active = self
@@ -1581,8 +1638,10 @@ impl Engine {
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
                     .clone(),
-                // Slice 1c: the per-row creator-stamp section appended above (Some on the shard path).
+                // Slice 1c/A1: the per-row creator + tombstone stamp sections appended above (Some on the
+                // shard path); deleted_by init all-live.
                 created_by_offset,
+                deleted_by_offset,
                 resident_bytes,
                 allocated_bytes: device_payload.len() as u64,
                 count_header_byte_offset: 0,
@@ -2131,14 +2190,13 @@ impl Engine {
             Ok((payload, _text, _bool, stats, _b128, _null)) => (payload, stats),
             Err(_) => return false,
         };
-        // Slice 1c: the freshly-rolled shard's k rows were all created by THIS commit -> stamp them into a
-        // creator-stamp section (capacity-padded like the value columns), so a rolled-over shard carries
-        // visibility metadata identical to an admitted one.
-        let rolled_created_by_offset = Some(append_created_by_section(
-            &mut device_payload,
-            &vec![created_by; k],
-            new_capacity,
-        ));
+        // Slice 1c/A1: the freshly-rolled shard's k rows were all created by THIS commit -> stamp them into
+        // a creator-stamp section (capacity-padded), plus a deleted_by section born all-live, so a
+        // rolled-over shard carries visibility metadata identical to an admitted one.
+        let rolled_created_by_offset =
+            Some(append_u64_section(&mut device_payload, &vec![created_by; k], new_capacity, 0));
+        let rolled_deleted_by_offset =
+            Some(append_u64_section(&mut device_payload, &[], new_capacity, DELETED_BY_LIVE));
         let Some(new_device_memory) = self.relational_residency_device_memory(gpu_id, &device_payload)
         else {
             return false;
@@ -2153,6 +2211,7 @@ impl Engine {
             int4_appendable: true,
             resident_device_int4_column_stats: int4_stats,
             created_by_offset: rolled_created_by_offset,
+            deleted_by_offset: rolled_deleted_by_offset,
             resident_bytes: (8 + k * column_count * std::mem::size_of::<i32>()) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
@@ -2693,9 +2752,10 @@ impl Engine {
                 int4_appendable: false,
                 // S-d3: benchmark shards carry no zone map -> never pruned (always gathered).
                 resident_device_int4_column_stats: Vec::new(),
-                // Slice 1c: benchmark shards carry no creator stamps -> the visibility mask is skipped
+                // Slice 1c/A1: benchmark shards carry no version stamps -> the visibility mask is skipped
                 // (they read as all-live, correct for the latest-snapshot benchmark reads).
                 created_by_offset: None,
+                deleted_by_offset: None,
                 resident_bytes: shard.resident_bytes,
                 allocated_bytes: shard.allocated_bytes,
                 count_header_byte_offset: 0,
