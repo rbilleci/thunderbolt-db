@@ -224,6 +224,47 @@ base, so the 32-bit delta cannot wrap within a live shard. A per-shard **epoch**
 bare 32-bit value. This sidesteps PostgreSQL's global-XID-wraparound-vacuum problem entirely — there is no
 global 32-bit counter to exhaust.)
 
+### Access-path / index picture (two ORTHOGONAL axes)
+
+A recurring confusion is worth pinning explicitly, because it decides what this write-side work does and does
+NOT cover. There are two independent axes:
+
+- **Axis 1 — VISIBILITY (which *version* of a row is live for me).** This is the MVCC model above: per-row
+  `created_by` + out-of-line `deleted_by`, tested as `created_by ≤ read_txn_id && (deleted_by > read_txn_id ||
+  unset)`. It is **per-row, column-agnostic, and universal** — it rides on top of *whatever* access path found
+  the candidate rows (point lookup or range, PK or any column, index or scan). It is **not an index** and says
+  nothing about *where* a row is. The old/new versions of an updated row get adjacent, disjoint visibility
+  windows (`deleted_by[old] = created_by[new]`), so the check **self-dedups** — exactly one version passes at
+  any snapshot, with no key-grouped merge. Latest-snapshot reads (the OLTP common case) skip the check entirely
+  (VersionedPositions synopsis / index→latest slot), so the settled read path is untouched. **This proposal is
+  Axis 1.**
+
+- **Axis 2 — ACCESS PATH / INDEXING (which *rows/shards* to touch for a predicate).** Column- and
+  access-pattern-specific. You can physically **cluster** a table on only ONE key; everything else is a matrix:
+
+  | Column role | Point (`= x`) | Range (`BETWEEN` / `<` / `>`) |
+  |---|---|---|
+  | **Clustering key** (e.g. ordered PK) | zone map (min/max) — free w/ layout ✓ **S-d3 shipped** | zone map — free ✓ |
+  | **Secondary column** (email, UUID, …) | **bloom** or per-shard **hash index** | **per-shard sorted secondary index** (or a global secondary index) |
+
+  Load-bearing facts: zone maps do point **and** range but **only for the clustering key** (they prune only on
+  physically-ordered data); blooms do point on **any** column but **never** ranges (set membership can't answer
+  `> x`); so a **range on a non-clustering column** is served by **neither** — it needs a genuine **secondary
+  index** (sorted structure over that column). In a *sharded* store a secondary range must probe **every**
+  shard's secondary index and merge, because the shards aren't ordered on that column so they can't be pruned by
+  it — O(num_shards × log shard), the inherent cost of a non-clustered range in a partitioned/LSM store (a
+  global secondary index trades that for worse write-scaling). Time-ordered keys (UUIDv7) are the one case where
+  a "UUID range" is cheap — the timestamp prefix clusters, so it's a clustering-key range. See
+  [`non-int4-point-lookup-index.md`](non-int4-point-lookup-index.md) for the secondary point-lookup mechanism.
+
+**The two axes compose and are sequenced independently:** Axis 1 (this proposal) unblocks incremental
+UPDATE/DELETE regardless of indexing; Axis 2 mechanisms land as separate per-access-pattern slices sized by the
+workload (clustering zone maps ✓ → secondary-point bloom/hash → secondary-range sorted index → re-clustering
+compaction). Zone maps degrade under update-scatter (a COW-appended new version lands in the open shard, so its
+key is no longer clustered) — so **membership pruning (bloom/hash) is the primary point-lookup tool once a table
+takes updates**, and **re-clustering compaction (not just GC-vacuum)** is what keeps range pruning alive; the
+"churn-then-static" table is the best case (re-cluster + rebuild indexes once, then freeze).
+
 ## Durability & recovery (production-grade)
 
 **Durability does NOT live on the GPU.** GPU memory is volatile — a crash, power loss, process exit, or
