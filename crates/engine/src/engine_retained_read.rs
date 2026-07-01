@@ -726,15 +726,12 @@ impl Engine {
     }
 
     /// CROSS-SHARD PK INDEX (sub-slice 1): resolve `filter_idx = key` to the resident `(shard_id, LOCAL row)`
-    /// positions via a PER-SHARD host-built PK hash index (`build_int4_pk_hash_table_host` +
-    /// `probe_int4_pk_hash_table`) instead of a per-shard scan. This is the O(1)-probe replacement for the
-    /// scan-based `locate_resident_delete_slots`; it returns the IDENTICAL physical `(shard, slot)` a scan
-    /// finds (the differential gate). Returns `None` to fall back to the scan when ANY shard's key column
-    /// has a DUPLICATE / a 256-probe overflow / an oversize table (the hash declines), or the table is not
-    /// shard-resident / a shard is missing its offset or device memory. PHYSICAL positions -- NO visibility
-    /// gate here (the caller applies the SV3b `deleted_by[slot]` gate), exactly like the scan locate.
-    /// UNWIRED (`#[allow(dead_code)]`) until sub-slice 3 routes point lookups through it; per-lookup host
-    /// build for now (sub-slice 3 caches the device index + probes on-device). Filter column must be int4.
+    /// positions via a PER-SHARD host-built PK hash index. Thin projection of
+    /// [`Self::locate_resident_pk_via_shard_index_detailed`] to just `(shard_id, slot)` -- the shape the
+    /// scan-locate differential + the (future) DELETE/UPDATE resolution compare against. See the detailed
+    /// method for the semantics (returns the IDENTICAL physical `(shard, slot)` a scan finds; `None` to fall
+    /// back on any decline / invalid shard / missing offset). Used by the scan-locate differential tests +
+    /// the (future) DELETE/UPDATE resolution; the 3b read route calls the `_detailed` variant directly.
     #[allow(dead_code)]
     pub(crate) fn locate_resident_pk_via_shard_index(
         &self,
@@ -742,13 +739,35 @@ impl Engine {
         filter_idx: usize,
         key: i32,
     ) -> Option<Vec<(u32, u32)>> {
+        self.locate_resident_pk_via_shard_index_detailed(table, filter_idx, key)
+            .map(|hits| hits.into_iter().map(|h| (h.shard_id, h.slot)).collect())
+    }
+
+    /// CROSS-SHARD PK INDEX: the GENERATION-CONSISTENT locate. Resolves `filter_idx = key` per shard via the
+    /// cached hash+bloom index and, for each HIT, CAPTURES the exact `(descriptor, device_memory,
+    /// deleted_by)` the slot was resolved against -- all from the SAME `shards.load()` snapshot, with the
+    /// device buffer PINNED by the returned `Arc`. A caller (the 3b point-lookup route) that materializes the
+    /// row from these captured handles reads the slot from the buffer it was computed for, closing the
+    /// concurrent TOCTOU: reads are lock-free and straddle commits, so a concurrent DELETE re-admit can
+    /// republish a shard_id's buffer with COMPACTED/reordered slots; resolving the slot against one
+    /// generation and then re-`get`-ing the buffer (a second, independent `ArcSwap` load) could read the slot
+    /// out of a DIFFERENT generation -> a wrong row. Returning the pinned buffer (not just `(shard,slot)`)
+    /// makes slot + capacity-stride + buffer + deleted_by generation-consistent by construction. `None` to
+    /// fall back to the scan when ANY shard declines (duplicate / 256-probe overflow / oversize) or is
+    /// invalid / missing its offset or device memory. Filter column must be int4.
+    pub(crate) fn locate_resident_pk_via_shard_index_detailed(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        key: i32,
+    ) -> Option<Vec<ShardPkHit>> {
         let shards = self.read_state.residency.shards.load();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
             return None;
         }
         let runtime_snapshot = self.router.runtime().snapshot();
-        let mut out: Vec<(u32, u32)> = Vec::new();
+        let mut out: Vec<ShardPkHit> = Vec::new();
         for shard in table_shards.iter() {
             // Identity/validity prechecks (mirror `locate_resident_delete_slots` / the scan's `source_for`):
             // an invalidated / memory-pressured / catalog-mismatched shard forces None so the caller scans,
@@ -789,7 +808,22 @@ impl Engine {
                 shard.row_count,
                 key,
             ) {
-                ShardPkProbe::Hit(row) => out.push((shard.shard_id, row)),
+                ShardPkProbe::Hit(row) => {
+                    // Capture the deleted_by region (if versioned) from the SAME snapshot -> the visibility
+                    // gate reads a `deleted_by[slot]` aligned to the SAME generation as the slot + buffer.
+                    let deleted_by = self
+                        .read_state
+                        .residency
+                        .shard_deleted_by_memory
+                        .get(&(table.name.clone(), shard.shard_id));
+                    out.push(ShardPkHit {
+                        shard_id: shard.shard_id,
+                        slot: row,
+                        descriptor,
+                        device_memory,
+                        deleted_by,
+                    });
+                }
                 ShardPkProbe::Miss => {}
                 // A duplicate key in ANY shard declines the whole locate (the scan returns every match; a
                 // hash holds one row/key) -> the caller scans.
@@ -1400,6 +1434,21 @@ pub(crate) fn bloom_maybe_contains(words: &[u64], num_bits: u64, num_hashes: u32
         }
     }
     true
+}
+
+/// Sub-slice 3b: a GENERATION-CONSISTENT cross-shard PK-index hit. Carries the resolved `(shard_id, slot)`
+/// TOGETHER WITH the exact device handles the slot was resolved against -- all captured inside ONE
+/// `shards.load()` snapshot in `locate_resident_pk_via_shard_index_detailed`. The point-lookup route
+/// materializes the row from these captured handles (NOT a fresh `shard_device_memory.get`), so the slot,
+/// the capacity-stride (via `descriptor.capacity`), the int4 buffer, and the `deleted_by` region are all the
+/// SAME generation. The `Arc<CudaResidentDeviceMemory>` PINS the buffer live for the read, so a concurrent
+/// re-admit that compacts/reorders the shard cannot free it or make the slot point at a different row.
+pub(crate) struct ShardPkHit {
+    pub(crate) shard_id: u32,
+    pub(crate) slot: u32,
+    pub(crate) descriptor: RelationalResidencySnapshot,
+    pub(crate) device_memory: Arc<CudaResidentDeviceMemory>,
+    pub(crate) deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
 }
 
 /// Sub-slice 3: the result of probing a shard's cached PK index for a key.

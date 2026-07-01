@@ -372,6 +372,41 @@ fn mandatory_int4_equalities(expr: &ResidentExpr, out: &mut Vec<(usize, i32)>) {
     }
 }
 
+/// Sub-slice 3b: detect the CROSS-SHARD PK-index route's precondition — a lone top-level int4 equality
+/// `col = needle` — from a (still-populated) bound select, returning `Some((filter_idx, needle))` or `None`.
+/// Mirrors the retained-read (lpb) route's shape gate (`build_relational_retained_read_job`): EXACTLY one
+/// equality group of one predicate, operator `Eq`, an int4 filter column, and an int4 needle. Any other
+/// shape (multiple predicates, a range, a non-int4 column/value, no filter) returns `None` so the caller
+/// runs the scan path unchanged. Must be called BEFORE the caller clears `bound`'s filters.
+fn shard_point_lookup_int4_eq(
+    bound: &BoundRelationalSelect,
+    table: &RelationalTable,
+) -> Option<(usize, i32)> {
+    let filter_groups = if !bound.filter_groups.is_empty() {
+        bound.filter_groups.clone()
+    } else if !bound.filters.is_empty() {
+        vec![bound.filters.clone()]
+    } else if let Some(filter) = bound.filter.clone() {
+        vec![vec![filter]]
+    } else {
+        return None;
+    };
+    if filter_groups.len() != 1 || filter_groups[0].len() != 1 {
+        return None;
+    }
+    let (filter_idx, op, value) = filter_groups[0][0].clone();
+    if op != SelectFilterOp::Eq {
+        return None;
+    }
+    let SqlValue::Int4(needle) = value else {
+        return None;
+    };
+    if table.columns.get(filter_idx).map(|c| c.ty) != Some(SqlType::Int4) {
+        return None;
+    }
+    Some((filter_idx, needle))
+}
+
 /// S-d3 zone-map pruning core: does `shard_stats` (a shard's per-int4-column zone map) provably EXCLUDE
 /// `needle` for the FULL-CATALOG column index `col` into `column_names`? Returns `false` (⇒ keep the
 /// shard) unless the column resolves to a zone-map stat BY NAME whose `[min, max]` rules the needle out.
@@ -2275,6 +2310,11 @@ impl Engine {
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, mut bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        // Sub-slice 3b: detect a single top-level int4 `Eq` POINT-lookup shape from the (still-populated)
+        // bound BEFORE the filters are cleared below — the precondition for the cross-shard PK-index route.
+        // Mirrors the retained-read (lpb) route's shape gate: exactly one equality group of one, `Eq`, an
+        // int4 filter column + an int4 needle. `None` = not a point lookup -> the scan path runs unchanged.
+        let point_lookup_eq: Option<(usize, i32)> = shard_point_lookup_int4_eq(&bound, &table);
         // Rebuild the WHERE predicate from the bound filters, then clear them so the executor filters
         // SOLELY via the predicate (the SQL->Expr contract), exactly as the grouped bridge does.
         let predicate = resident_predicate_from_bound_filters(&bound)?;
@@ -2301,6 +2341,19 @@ impl Engine {
                 "relation \"{}\" has no resident shards",
                 table.name
             ))));
+        }
+        // Sub-slice 3b: try the CROSS-SHARD PK-INDEX point-lookup route (flag-gated, DEFAULT OFF). On a hit
+        // it uses the cached hash+bloom `locate` to jump straight to the (shard, slot) and gather ONLY that
+        // row (a few tiny DtoH reads), skipping the zone-map scan + recompaction below; on ANY shape or
+        // soundness guard it returns None and we fall through to the scan (byte-identical). Placed before the
+        // zone-map prune so it also wins when zone maps DEGRADE under UPDATE key-scatter (membership pruning,
+        // scalability-ledger #4/#8) — locate finds the exact shard even when [min,max] can't exclude any.
+        if let Some((filter_idx, needle)) = point_lookup_eq {
+            if let Some(result) =
+                self.try_shard_index_point_route(select, &table, &bound, filter_idx, needle, copin_s)
+            {
+                return Ok(result);
+            }
         }
         // S-d3 zone-map pruning: for a point-lookup shape (`col = needle`, ANDed at top level) drop every
         // shard whose min/max zone map for that column excludes the needle — it cannot hold a matching row,
@@ -2638,6 +2691,162 @@ impl Engine {
         // Run the executor ONCE over the unified buffer with the real projection — it handles
         // COUNT / SUM / MIN / MAX / AVG / projection on-device — and return its result directly.
         run(select, bound.clone(), &unified_src, visibility)
+    }
+
+    /// Sub-slice 3b: the CROSS-SHARD PK-INDEX point-lookup route for the sharded read path. For a
+    /// shard-resident int4 UNIQUE-key equality POINT lookup with a PLAIN int4-column projection, use the
+    /// cached hash+bloom `locate` to jump straight to the located `(shard, slot)` and gather ONLY that row
+    /// (a few tiny DtoH reads) instead of scanning + recompacting the whole (zone-map-pruned) shard — the
+    /// per-shard scan is ~half of a point-lookup's latency at the 4M production shard size (MEASURED: point
+    /// p50 131k=343us -> 4M=709us at avg-gathered 1.00, so the rise is the one gathered shard's scan).
+    ///
+    /// Returns `Some(result)` — BYTE-IDENTICAL to the scan (`columns` / `access_path` / target computed the
+    /// SAME way as the scan's `finalize`) — when it served the read, or `None` to FALL BACK to the existing
+    /// scan + recompaction (the caller runs it unchanged) on ANY shape or soundness guard: never a wrong
+    /// result. Guards (each -> None -> scan): the flag is OFF; the projection is not a plain `All`/`Columns`
+    /// of int4-only columns, or carries DISTINCT / GROUP BY / ORDER BY / LIMIT / OFFSET / HAVING; `locate`
+    /// declines (duplicate / oversize / invalid shard); more than one hit (a cross-shard duplicate -> the
+    /// scan applies its multi-row + ordering); or the located shard is gone / invalid / raced (`slot >=
+    /// row_count`).
+    ///
+    /// NULLs: the sharded read path is uniformly NULL-BLIND (NULL stored as 0; the int4-only recompaction
+    /// carries no validity bitmap, and both the shard descriptor and the scan's unified descriptor report no
+    /// null columns), so the raw-i32 slot gather here is BYTE-IDENTICAL to the scan on NULLs by construction
+    /// (both read `col = 0` as matching a NULL-stored-0 row) — no NULL guard is needed or possible. The
+    /// `deleted_by[slot] > read_txn_id` visibility gate mirrors the scan's SV3b filter — a tombstoned row
+    /// materializes ZERO rows. (When M3 recompacts validity bitmaps through the sharded path, the scan turns
+    /// NULL-aware and this route must read the bitmap too; the nullable differential is the tripwire.)
+    fn try_shard_index_point_route(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        bound: &BoundRelationalSelect,
+        filter_idx: usize,
+        needle: i32,
+        copin_s: Index,
+    ) -> Option<RelationalSelectResult> {
+        if !self.shard_index_probe_enabled() {
+            return None;
+        }
+        // Plain int4-column projection ONLY: `All`/`Columns` (both resolve to `selected_indexes`), no
+        // aggregate / DISTINCT / GROUP BY / ORDER BY / LIMIT / OFFSET / HAVING — anything else is the scan's.
+        if !matches!(
+            select.projection,
+            SelectProjection::All | SelectProjection::Columns(_)
+        ) || select.distinct
+            || select.group_by.is_some()
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || !select.having_groups.is_empty()
+        {
+            return None;
+        }
+        if bound.selected_indexes.is_empty() {
+            return None;
+        }
+        for &idx in &bound.selected_indexes {
+            if table.columns.get(idx).map(|c| c.ty) != Some(SqlType::Int4) {
+                return None;
+            }
+        }
+        // Locate the (shard_id, slot) via the cached hash+bloom index. `None` = the index declined (a
+        // duplicate / oversize / invalidated shard) -> scan. `Some(hits)`: 0 hits = key absent everywhere
+        // (0 rows), 1 hit = the row, >1 = a cross-shard duplicate -> scan (the scan returns every match).
+        let hits = self.locate_resident_pk_via_shard_index_detailed(table, filter_idx, needle)?;
+        if hits.len() > 1 {
+            return None;
+        }
+        // gpu_id is a result LABEL (shape metadata, not shard data), so a lightweight lock-free load is fine
+        // — the DATA read below uses the generation-consistent handles captured inside the hit, which is what
+        // closes the concurrent TOCTOU (a stale gpu_id label on the same single GPU is harmless).
+        let gpu_id = self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(&table.name)?
+            .first()?
+            .gpu_id;
+        // `access_path` + `columns` are shape/table-level metadata (independent of the shard data), computed
+        // EXACTLY as the scan's `finalize` does (from the filter-cleared `bound`) so the result is
+        // byte-identical to the scan's. The transient read pin is dropped immediately (RAII).
+        let (_query, access_path) = self
+            .relational_select_mvcc_query_pinned(select, table, bound, copin_s)
+            .ok()?;
+
+        let rows: Vec<Vec<SqlValue>> = if let Some(hit) = hits.first() {
+            // GENERATION-CONSISTENT materialization (audit fix). The slot, the capacity-stride
+            // (`hit.descriptor`), the int4 buffer (`hit.device_memory`, PINNED by the Arc), and the
+            // `deleted_by` region were ALL captured in the SAME `shards.load()` snapshot inside
+            // `locate...detailed`. Reading the slot out of `hit`'s pinned buffer (NOT a fresh
+            // `shard_device_memory.get`) closes the concurrent TOCTOU: reads are lock-free and straddle
+            // commits, so a concurrent DELETE re-admit can republish a shard_id's buffer with COMPACTED /
+            // reordered slots; resolving the slot against one generation and re-`get`-ing the buffer (a
+            // second independent `ArcSwap` load) could read the slot out of a DIFFERENT generation -> a wrong
+            // row. Holding the exact buffer the slot indexes into makes that impossible. (locate already ran
+            // the identity / is_valid / memory-pressure prechecks before capturing the hit.)
+            let slot = hit.slot as u64;
+            if hit.slot as usize >= hit.descriptor.row_count {
+                return None; // defensive: slot past the captured live region
+            }
+            // NULL handling: the sharded read path is uniformly NULL-BLIND (NULL stored as 0). Its
+            // recompaction is int4-only with NO validity-bitmap segment, and BOTH descriptors it builds --
+            // `resident_snapshot_for_shard` AND the scan's `resident_snapshot_for_unified` -- carry
+            // `resident_device_null_columns: Vec::new()`, so the scan reads the raw i32 (a NULL reads back as
+            // 0, and `col = 0` MATCHES a NULL-stored-0 row). This raw-i32 slot gather is therefore
+            // BYTE-IDENTICAL to the scan on NULLs BY CONSTRUCTION (the `..._null_blind_matches_scan`
+            // differential proves it; it is the tripwire when M3 recompacts bitmaps through the sharded path).
+            //
+            // SV3b visibility gate: a VERSIONED shard's `deleted_by[slot]` (dense i64 at byte `slot*8`, NO
+            // header, little-endian) HIDES the row when `deleted_by <= read_txn_id`; an un-versioned shard (no
+            // region) is all-live. `copin_s as i64` is the read snapshot, exactly the scan's `vis`. The region
+            // is the SAME-generation handle captured in the hit.
+            let visible = match &hit.deleted_by {
+                Some(region) => {
+                    let halves = region.read_resident_i32_column(slot * 8, 2).ok()?;
+                    let deleted_by =
+                        ((*halves.first()? as u32 as u64) | ((*halves.get(1)? as u32 as u64) << 32))
+                            as i64;
+                    deleted_by > copin_s as i64
+                }
+                None => true,
+            };
+            if visible {
+                // Materialize the projected row: one tiny DtoH per projected int4 column at its
+                // capacity-strided slot byte (`col_base + slot*4`) in the PINNED buffer. Column order =
+                // `selected_indexes` = the scan's projection order, so the row is byte-identical to the scan's.
+                let mut row = Vec::with_capacity(bound.selected_indexes.len());
+                for &idx in &bound.selected_indexes {
+                    let col_base =
+                        resident_device_int4_column_offset(&hit.descriptor, table, idx).ok()?;
+                    let v = hit
+                        .device_memory
+                        .read_resident_i32_column(col_base + slot * 4, 1)
+                        .ok()?;
+                    row.push(SqlValue::Int4(*v.first()?));
+                }
+                vec![row]
+            } else {
+                Vec::new()
+            }
+        } else {
+            // All shards Miss -> the key is absent -> zero rows (the scan returns the same empty set).
+            Vec::new()
+        };
+
+        self.read_state
+            .residency
+            .shard_index_route_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(RelationalSelectResult {
+            columns: Arc::new(bound.selected_columns.clone()),
+            rows: rows.into(),
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path: Arc::new(access_path),
+        })
     }
 
     /// S10b: `&Select`->general BRIDGE for a single-column `SELECT DISTINCT` (the int4_[filtered_]distinct

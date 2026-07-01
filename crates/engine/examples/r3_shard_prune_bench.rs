@@ -69,9 +69,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     println!(
         "| shards | rows | point p50 us | point p99 us | point lookups/s | avg shards gathered | \
-         COUNT(*) recompact-all p50 us |"
+         index-routed | COUNT(*) recompact-all p50 us |"
     );
-    println!("|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|");
 
     for &n_shards in &shard_counts {
         let total_rows = (n_shards * shard_size) as i64;
@@ -79,6 +79,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         engine.set_shard_residency_enabled(true);
         engine.set_auto_admit_on_commit(true);
         engine.set_shard_size_target(shard_size);
+        // Sub-slice 3b: GPU_DB_BENCH_SHARD_INDEX=1 flips the cross-shard PK-index point-lookup route ON (the
+        // O(1) hash+bloom locate + slot gather) so a point lookup SKIPS the per-shard scan + recompaction.
+        // Default OFF = the scan baseline. The "point p50 stays flat vs shard_size ON but rises OFF" delta is
+        // the scan cost the index removes.
+        let use_index = env::var("GPU_DB_BENCH_SHARD_INDEX").ok().as_deref() == Some("1");
+        engine.set_shard_index_probe_enabled(use_index);
         engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
 
         // Load ordered rows (batched, untimed). Ordered keys -> disjoint zone maps -> prunable.
@@ -113,6 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Timed point lookups on random PRESENT keys.
         let mut rng = 0x9E3779B97F4A7C15u64 ^ (n_shards as u64).wrapping_mul(0x1000_0001B3);
         let gathered_before = engine.sharded_shards_gathered();
+        let route_before = engine.shard_index_route_hits();
         let mut lat_us: Vec<f64> = Vec::with_capacity(lookups);
         for _ in 0..lookups {
             let k = (next_rand(&mut rng) % total_rows as u64) as i64;
@@ -125,6 +132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let gathered_after = engine.sharded_shards_gathered();
         let avg_gathered = (gathered_after - gathered_before) as f64 / lookups as f64;
+        let routed = engine.shard_index_route_hits() - route_before;
 
         lat_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p50 = percentile(&lat_us, 0.50);
@@ -146,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         println!(
             "| {actual_shards} | {total_rows} | {p50:.1} | {p99:.1} | {per_s:.0} | {avg_gathered:.2} | \
-             {count_p50:.1} |"
+             {routed} | {count_p50:.1} |"
         );
     }
 

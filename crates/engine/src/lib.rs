@@ -338,6 +338,13 @@ pub struct Engine {
     /// SV5: route a single-entry UPDATE commit through the GPU-native tombstone-old + append-new (O(rows))
     /// instead of the O(table) invalidate + re-admit. DEFAULT OFF, nested under the shard path. Interior-mutable.
     resident_update_tombstone_enabled: AtomicBool,
+    /// Sub-slice 3b: route a shard-resident int4 UNIQUE-key equality POINT lookup through the CROSS-SHARD PK
+    /// INDEX (cached hash+bloom `locate`) so the sharded read gathers ONLY the located shard(s) instead of
+    /// every zone-map-non-excluded shard. DEFAULT OFF, nested under `shard_residency_enabled` (the sharded read
+    /// falls back to the existing zone-map scan + recompaction until this flips — byte-identical). The A/B lever
+    /// for the membership-pruning win that lets the shard path stay O(1) even when zone-maps degrade under
+    /// UPDATE key-scatter (scalability-ledger #4/#8). Interior-mutable (the read path reads it).
+    shard_index_probe_enabled: AtomicBool,
     /// S-d2c: target row count per shard. When the open shard reaches it, an append SEALS the open shard
     /// (immutable) and ROLLS OVER to a fresh open shard (O(rows), never the O(table) re-admit), so a table
     /// grows as bounded shards to billions of rows. Caps the admit headroom + sizes a rollover shard.

@@ -541,6 +541,12 @@ pub(crate) struct ResidencyReadState {
     /// The non-vacuity signal that pruning fired — output equality can't prove a shard was skipped
     /// (a pruned shard holds no matching rows, so the result is identical either way). `Relaxed` monotonic.
     pub(crate) sharded_shards_gathered: std::sync::atomic::AtomicU64,
+    /// Sub-slice 3b: count of sharded point-lookup reads served by the CROSS-SHARD PK INDEX route (the
+    /// cached hash+bloom `locate` restricted the gathered shard set to the located shard(s), instead of
+    /// gathering every zone-map-non-excluded shard). The non-vacuity signal that the index route actually
+    /// fired — output equality can't prove it (the index route and the full scan return byte-identical
+    /// rows by construction; only the SET of shards gathered differs). `Relaxed` monotonic counter.
+    pub(crate) shard_index_route_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

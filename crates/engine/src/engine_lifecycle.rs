@@ -180,6 +180,8 @@ impl Engine {
             resident_delete_tombstone_enabled: std::sync::atomic::AtomicBool::new(false),
             // SV5: GPU-native incremental UPDATE (tombstone old + append new) default OFF (nested A/B lever).
             resident_update_tombstone_enabled: std::sync::atomic::AtomicBool::new(false),
+            // Sub-slice 3b: cross-shard PK-index point-lookup route default OFF (nested under shard residency).
+            shard_index_probe_enabled: std::sync::atomic::AtomicBool::new(false),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }
