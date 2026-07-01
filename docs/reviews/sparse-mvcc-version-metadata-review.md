@@ -71,3 +71,39 @@ The proposal already delivers the big win (24 → 8 B/row common case). To do be
 path; **(2)** add a truly-sparse deleted-slot structure for the point-lookup path; **(3)** reconcile the
 `created_by` deferral with SI/SSI + WAL-reconstruction so the footprint win doesn't open a correctness gap when
 transaction-level snapshots land. #1 and #3 before wiring.
+
+---
+
+## Addendum — second reviewer (read-path / index agent)
+
+Independent pass; I reached #1/#2/#4 separately and concur with them (and with #3/#5). Three things to add — one
+sharpens #1, one is a gap neither of us weighed, one is a correctness dependency under #4.4.
+
+### A. Monotonicity retires per-row `created_by` even on the straddling shard (extends #1)
+#1 keeps per-row `created_by` "only on shards that straddle an active-snapshot boundary." It is sparser still:
+`created_by` is **monotonic non-decreasing by slot within a shard** — appends stamp `commit_seq` in commit
+order, rollover seals a contiguous range, and a CoW UPDATE appends the new version to the *open* shard (never
+rewriting a sealed shard's stamps). Preserve that at admission (admit in `created_by` order) and it holds
+globally by `(shard, slot)`. So even the one straddling shard needs no per-row array: **binary-search the
+boundary slot `b`** (or keep a per-shard `commit_seq → first_slot` breakpoint list — O(#commits), which group
+commit keeps small and which reclaims below the oldest snapshot), and the read is a scan **range restriction
+`[0, b]`, not a mask-VM column** — cheaper than the `deleted_by` mask (no per-row read at all; an extension of
+the existing `row_count` read-bound). Net with monotonic admission: per-row `created_by` never exists — the zone
+map (#1) prunes whole shards and a boundary handles the straddler.
+
+### B. Weigh stamp-in-place (Model A) vs keyed tombstone (Model B) on the *locate* cost
+The proposal commits to stamping the sealed shard's `deleted_by`, which forces **locating** each deleted row's
+`(shard, slot)` per DELETE — a pruned-shard predicate scan or (later) an index probe. A log-structured
+alternative appends a **PK-keyed tombstone record to the open shard** and merges on read: the DELETE becomes a
+pure append (the locate — the biggest per-DELETE cost — is dodged entirely), at the price of read-side merge +
+a key index for the merge. For a store where DELETE-by-PK dominates and locate wants the still-missing
+cross-shard index, that trade deserves an explicit comparison, not an implicit Model-A choice. It also
+interacts with #2/Option-C: Model B needs a **key -> tombstone** structure, not a per-slot array.
+
+### C. §4.4's timestamp is necessary but not sufficient — the pre-publish stamping order is what makes it correct
+§4.4 is right that a bare bit is wrong, but the reason a concurrent reader at `S < c` still sees the row is that
+the tombstone is stamped **before `publish_committed_seq`** (A2-wiring): the stamp is the *new* `commit_seq c`,
+and `c > S` for the older reader, so `deleted_by > read_txn_id` keeps it visible. Pin that dependency in §4.4 —
+correctness rests on the stamp value being the post-publish `commit_seq` written pre-publish, not merely on
+"using a timestamp." A future path that ever stamped a provisional or lower value would break it even with a
+full u64.
