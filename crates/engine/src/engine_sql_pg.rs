@@ -187,6 +187,7 @@ impl Engine {
             bound,
             copin_s,
             predicate.as_ref(),
+            None, // SV3b visibility: the whole-table single-store PG path carries no deleted_by column
             &order_by_exprs,
             &order_by_nulls_first,
             group_key_expr.as_ref(),

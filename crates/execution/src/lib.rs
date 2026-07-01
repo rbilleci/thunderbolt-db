@@ -808,9 +808,12 @@ pub struct RecompactSegment {
 /// SV3 (MVCC visibility): fill `len` bytes of the freshly-allocated unified buffer at `byte_offset` with
 /// `fill_byte` (a `cuMemsetD8`) BEFORE the segment copies run. The recompaction buffer is `cuMemAlloc`'d
 /// (uninitialized), so a section not fully covered by segments would read garbage; a fill initializes it.
-/// Use `0xFF` to make a gathered `deleted_by` section born all-live (`u64::MAX`), so delete-free shards'
-/// rows (which contribute no `deleted_by` segment) read as live, and versioned shards' segments overwrite
-/// only their deleted slots. `len == 0` is a no-op.
+/// Use `0x7F` to make a gathered `deleted_by` section born all-live (each u64 = `0x7F7F_7F7F_7F7F_7F7F`
+/// ≈ 9.1e18, a LARGE POSITIVE i64 greater than every real commit `Index`), so delete-free shards' rows
+/// (which contribute no `deleted_by` segment) read as live and versioned shards' segments overwrite only
+/// their deleted slots. Do NOT use `0xFF`/`u64::MAX`: the read visibility compare `deleted_by > read_txn_id`
+/// is SIGNED (s64), so `u64::MAX` = -1 and a live row would wrongly FAIL the compare (hidden). `len == 0`
+/// is a no-op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecompactFill {
     pub byte_offset: u64,

@@ -1948,6 +1948,7 @@ impl Engine {
             bound,
             copin_s,
             Some(predicate),
+            None, // SV3b visibility: single-buffer path is never a versioned shard
             &[],
             &[],
             None,
@@ -2022,6 +2023,7 @@ impl Engine {
             bound,
             copin_s,
             predicate.as_ref(),
+            None, // SV3b visibility: this bridge does not carry a co-resident deleted_by column
             &order_by_exprs,
             &order_by_nulls_first,
             None,
@@ -2166,10 +2168,15 @@ impl Engine {
             })
         };
 
-        // Run one (already-bound) select against an injected source via the general executor.
+        // Run one (already-bound) select against an injected source via the general executor. `vis` is the
+        // SV3b MVCC visibility descriptor for the unified buffer (`Some((deleted_by_offset, read_txn_id))`
+        // when any surviving shard is versioned, else `None`) -- forwarded so the on-device predicate ANDs
+        // `deleted_by > read_txn_id` and hides tombstoned rows. BOTH the COUNT precheck and the real run pass
+        // the SAME `vis` so the count and the projection agree on which rows are visible.
         let run = |select_ref: &Select,
                    bound_for_select: BoundRelationalSelect,
-                   src: &ResidentExecSource|
+                   src: &ResidentExecSource,
+                   vis: Option<(u64, i64)>|
          -> Result<RelationalSelectResult, ExecuteError> {
             self.execute_resident_expr_select_with_binding(
                 select_ref,
@@ -2178,6 +2185,7 @@ impl Engine {
                 bound_for_select,
                 copin_s,
                 predicate.as_ref(),
+                vis,
                 &[],
                 &[],
                 None,
@@ -2258,14 +2266,69 @@ impl Engine {
                 rows_before = rows_before.saturating_add(row_count);
             }
         }
-        let allocated_bytes = 8 + (total_row_count as u64) * 4 * (num_int4_cols as u64);
+        let int4_bytes = 8 + (total_row_count as u64) * 4 * (num_int4_cols as u64);
+
+        // SV3b MVCC visibility gather: if ANY surviving shard is VERSIONED (carries an on-demand `deleted_by`
+        // region), append a co-resident DENSE i64 `deleted_by` column to the unified buffer right after the
+        // int4 columns. The predicate then ANDs `deleted_by > read_txn_id` to hide tombstoned rows. Only the
+        // versioned shards contribute bytes, so the whole region is first MEMSET to the all-live sentinel
+        // (SV3a fill, byte 0x7F = a large positive i64 > every commit Index) and each versioned shard's live
+        // prefix is DtoD-copied over its rows. The int4 descriptor/offsets are untouched (the executor reads
+        // deleted_by by ABSOLUTE byte offset via LoadColumnI64). The un-versioned majority allocates zero
+        // extra bytes and takes the `None` visibility path -- byte-identical to the pre-SV3b read.
+        let mut fills: Vec<gpu_db_execution::RecompactFill> = Vec::new();
+        let mut visibility: Option<(u64, i64)> = None;
+        let has_versioned = shards.iter().any(|shard| {
+            self.read_state
+                .residency
+                .shard_deleted_by_memory
+                .get(&(table.name.clone(), shard.shard_id))
+                .is_some()
+        });
+        let allocated_bytes = if has_versioned {
+            let deleted_by_offset = int4_bytes;
+            let deleted_by_bytes = (total_row_count as u64) * 8;
+            // Fill the WHOLE deleted_by region live first (covers un-versioned shards' rows + any tail);
+            // versioned segments below overwrite only their own live rows.
+            fills.push(gpu_db_execution::RecompactFill {
+                byte_offset: deleted_by_offset,
+                len: deleted_by_bytes,
+                fill_byte: crate::engine_residency::DELETED_BY_LIVE_FILL_BYTE,
+            });
+            // One DtoD segment per versioned shard: its `row_count` live deleted_by slots (dense at the
+            // region front, byte 0..row_count*8, NO header) -> the unified dense slot at `rows_before*8`.
+            // `rows_before` walks shards in the SAME published order the int4 gather used, so deleted_by
+            // rows line up 1:1 with the int4 rows.
+            let mut rows_before = 0_u64;
+            for shard in &shards {
+                let row_count = shard.row_count as u64;
+                if let Some(region) = self
+                    .read_state
+                    .residency
+                    .shard_deleted_by_memory
+                    .get(&(table.name.clone(), shard.shard_id))
+                {
+                    segments.push(gpu_db_execution::RecompactSegment {
+                        src_device_ptr: region.device_ptr(),
+                        src_byte_offset: 0,
+                        dst_byte_offset: deleted_by_offset + rows_before * 8,
+                        byte_len: row_count * 8,
+                    });
+                }
+                rows_before = rows_before.saturating_add(row_count);
+            }
+            visibility = Some((deleted_by_offset, copin_s as i64));
+            int4_bytes + deleted_by_bytes
+        } else {
+            int4_bytes
+        };
         let header = (total_row_count as u64).to_le_bytes();
 
         // Recompact ON-DEVICE into one unified buffer, then build the whole-table descriptor + injected
         // source the executor runs over ONCE.
         let runtime = self.cuda_driver_probe_runtime();
         let unified_mem = runtime
-            .retain_device_memory_recompacted(gpu_id, allocated_bytes, &header, &[], &segments)
+            .retain_device_memory_recompacted(gpu_id, allocated_bytes, &header, &fills, &segments)
             .map_err(|err| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "sharded resident recompaction into a unified device buffer failed: {err}"
@@ -2293,6 +2356,20 @@ impl Engine {
         // them). Order matters: DISTINCT carries no `group_by` but synthesizes one internally, so it must be
         // checked first; a grouped select may ALSO carry ORDER BY and must take the grouped path. The plain
         // scalar/projection shapes fall through to the COUNT-precheck + single run below (unchanged).
+        //
+        // SV3b scope: these sub-bridges re-bind internally and do NOT yet thread the visibility filter, so a
+        // versioned shard reaching them would leak tombstoned rows. Reject with a clean error rather than
+        // return wrong rows. (Inert in production until DELETE tombstoning is wired -- SV4; the gate tests
+        // exercise the plain projection + scalar-aggregate path below, which IS visibility-correct.)
+        if visibility.is_some()
+            && (select.distinct || select.group_by.is_some() || !select.order_by.is_empty())
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident visibility filter (SV3b) is not yet wired through the DISTINCT / GROUP BY / \
+                 ORDER BY sharded sub-bridges"
+                    .to_string(),
+            )));
+        }
         if select.distinct {
             return self.execute_resident_distinct_via_general(select, Some(&unified_src));
         }
@@ -2313,7 +2390,7 @@ impl Engine {
         };
         let count_bound = bind_relational_select(&table, &count_select)?;
         let matched = {
-            let result = run(&count_select, count_bound, &unified_src)?;
+            let result = run(&count_select, count_bound, &unified_src, visibility)?;
             match result.rows.iter().next().and_then(|row| row.first()) {
                 Some(SqlValue::Int8(n)) => *n,
                 other => {
@@ -2342,7 +2419,7 @@ impl Engine {
 
         // Run the executor ONCE over the unified buffer with the real projection — it handles
         // COUNT / SUM / MIN / MAX / AVG / projection on-device — and return its result directly.
-        run(select, bound.clone(), &unified_src)
+        run(select, bound.clone(), &unified_src, visibility)
     }
 
     /// S10b: `&Select`->general BRIDGE for a single-column `SELECT DISTINCT` (the int4_[filtered_]distinct
@@ -2560,7 +2637,7 @@ impl Engine {
     ) -> Result<bool, ExecuteError> {
         let null_row = vec![vec![SqlValue::Null; table.columns.len()]];
         let (snapshot, memory) = self.build_transient_relation_residency(table, &null_row)?;
-        let survivors = self.lower_resident_predicate(predicate, table, &snapshot, &memory, 1)?;
+        let survivors = self.lower_resident_predicate(predicate, table, &snapshot, &memory, 1, None)?;
         Ok(!survivors.is_empty())
     }
 
@@ -2876,6 +2953,7 @@ impl Engine {
                     &entry.descriptor,
                     dm.mem(),
                     *n as u64,
+                    None,
                 )?,
                 _ => (0..*n as u32).collect(),
             };
@@ -3493,6 +3571,11 @@ impl Engine {
         copin_s: Index,
         // `None` = no WHERE clause: a full-table scan (every row survives).
         predicate: Option<&ResidentExpr>,
+        // SV3b (MVCC visibility): `Some((deleted_by_offset, read_txn_id))` = this (unified) buffer carries a
+        // co-resident i64 `deleted_by` column at `deleted_by_offset`; AND `deleted_by > read_txn_id` onto the
+        // survivors so tombstoned rows are hidden. `None` = a delete-free/unversioned buffer (the common case)
+        // -> no visibility mask, byte-identical to the pre-SV3b path. Only the sharded read passes `Some`.
+        visibility: Option<(u64, i64)>,
         // Parallel to `select.order_by`: `Some(expr)` = a SORT EXPRESSION key (`ORDER BY a+b`),
         // evaluated on-device into an i64 key column; `None` = a plain column key. Empty = no ORDER BY.
         order_by_exprs: &[Option<ResidentExpr>],
@@ -3662,15 +3745,44 @@ impl Engine {
                     &snapshot,
                     &device_memory,
                     row_count,
+                    visibility,
                 )?,
-                None => {
-                    let n = u32::try_from(row_count).map_err(|_| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(
-                            "full-table scan row count exceeds the u32 row-index range".to_string(),
-                        ))
-                    })?;
-                    (0..n).collect()
-                }
+                None => match visibility {
+                    // SV3b: no WHERE but a versioned buffer -> the survivors are exactly the VISIBLE rows.
+                    // Run a visibility-only VM program (`deleted_by > read_txn_id`) at elem=I64 -- the same
+                    // mixed-width interpreter, with no i32 WHERE mask to AND against.
+                    Some((deleted_by_offset, read_txn_id)) => {
+                        let program = vec![
+                            gpu_db_execution::ExprStep::LoadColumnI64 {
+                                byte_offset: deleted_by_offset,
+                            },
+                            gpu_db_execution::ExprStep::CompareScalarI64 {
+                                cmp: 3,
+                                scalar: read_txn_id,
+                                scalar_on_left: false,
+                            },
+                        ];
+                        device_memory
+                            .run_expr_predicate_filter_with_text(
+                                &program,
+                                &[],
+                                row_count,
+                                gpu_db_execution::ResidentElemType::I64,
+                            )
+                            .map_err(|err| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                            })?
+                    }
+                    None => {
+                        let n = u32::try_from(row_count).map_err(|_| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "full-table scan row count exceeds the u32 row-index range"
+                                    .to_string(),
+                            ))
+                        })?;
+                        (0..n).collect()
+                    }
+                },
             }
         };
         let indices_u64: Vec<u64> = indices.iter().map(|&i| u64::from(i)).collect();
@@ -5593,6 +5705,7 @@ impl Engine {
                         &h_snapshot,
                         &h_memory,
                         having_rows.len() as u64,
+                        None,
                     )?;
                     let kept: Vec<Vec<SqlValue>> =
                         survivors.iter().map(|&i| rows[i as usize].clone()).collect();
@@ -7450,7 +7563,43 @@ impl Engine {
         snapshot: &RelationalResidencySnapshot,
         device_memory: &CudaResidentDeviceMemory,
         row_count: u64,
+        // SV3b (MVCC visibility): `Some((deleted_by_offset, read_txn_id))` on a VERSIONED shard — AND the
+        // on-device `deleted_by > read_txn_id` mask onto the WHERE survivors. `None` (delete-free/cold shard,
+        // the majority) keeps the peephole fast paths below byte-identically.
+        visibility: Option<(u64, i64)>,
     ) -> Result<Vec<u32>, ExecuteError> {
+        // SV3b: a versioned shard forces the mask VM (bypassing the typed peephole kernels) so the WHERE is a
+        // program we can AND the i64 visibility mask onto — via the mixed-width VM (int4 WHERE at elem=I32 +
+        // an i64 `deleted_by` compare). Only versioned shards reach here, so the peephole fast paths below
+        // stay the common-case default.
+        if let Some((deleted_by_offset, read_txn_id)) = visibility {
+            // A predicate the VM can't lower at one elem width (mixed non-int8 widths / an unsupported shape)
+            // can't compose the i64 visibility conjunct, so this HARD-ERRORS rather than risk leaking
+            // tombstoned rows. NB: this is NOT the CPU fallback (that fires only on residency invalidation);
+            // it surfaces as a query error. Inert until DELETE tombstoning is wired (SV4) -- at which point
+            // extending visibility to these shapes (or routing them to the CPU-pinned path) is the follow-up.
+            let elem = predicate_vm_elem_type(predicate, table).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident visibility filter: this WHERE predicate is not VM-lowerable (mixed width / \
+                     unsupported shape) so the MVCC visibility conjunct cannot be composed"
+                        .to_string(),
+                ))
+            })?;
+            let mut program: Vec<gpu_db_execution::ExprStep> = Vec::new();
+            let mut needles: Vec<Vec<u8>> = Vec::new();
+            compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
+            // AND the visibility: `deleted_by > read_txn_id` (cmp 3 = Gt), then MaskBinary op 0 = AND.
+            program.push(gpu_db_execution::ExprStep::LoadColumnI64 { byte_offset: deleted_by_offset });
+            program.push(gpu_db_execution::ExprStep::CompareScalarI64 {
+                cmp: 3,
+                scalar: read_txn_id,
+                scalar_on_left: false,
+            });
+            program.push(gpu_db_execution::ExprStep::MaskBinary { op: 0 });
+            return device_memory
+                .run_expr_predicate_filter_with_text(&program, &needles, row_count, elem)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
+        }
         // bool-predicate (type matrix, doc 19): a bare `WHERE flag` is a bool COLUMN used directly as
         // a predicate -- a bool column is a 1-bit-per-row bitmap, so it expands straight to the row
         // mask (true rows). A bare NON-bool column is invalid SQL (PG: "argument of WHERE must be type

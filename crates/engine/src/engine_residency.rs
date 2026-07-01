@@ -1309,6 +1309,71 @@ mod capacity_payload_tests {
         );
     }
 
+    /// SV3b (MVCC read visibility): once a shard is tombstoned (the SV2 primitive), the SHARDED read path
+    /// HIDES the tombstoned rows -- the on-device predicate ANDs `deleted_by > read_txn_id` over a co-resident
+    /// i64 `deleted_by` column gathered into the unified buffer (memset to the all-live sentinel, then the
+    /// versioned shard's live prefix DtoD-copied over). Gate: a point lookup for a tombstoned key returns
+    /// EMPTY; COUNT(*) drops by exactly the tombstone count; a LIVE neighbor in the SAME now-versioned shard
+    /// still reads (the live sentinel passes the SIGNED compare -- guards the fill-vs-stamp boundary); a point
+    /// lookup pruned to a DIFFERENT, un-tombstoned shard is byte-identical (no deleted_by region -> the `None`
+    /// visibility path). This is the host-MVCC visibility semantics enforced ENTIRELY on the GPU.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_visibility_filter_hides_tombstoned_rows() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8; id=k sits in shard (k/64) at slot (k%64)
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
+
+        // Baseline (delete-free): every shard is un-versioned -> the read takes the `None` visibility path.
+        assert_eq!(sel("SELECT id FROM accounts WHERE id = 0").len(), 1, "id=0 present pre-delete");
+        assert_eq!(sel("SELECT COUNT(*) FROM accounts").row(0), &[SqlValue::Int8(200)]);
+
+        // Tombstone id=0 (shard 0, slot 0) at a commit seq well below the read snapshot so
+        // `deleted_by(=5) > read_txn_id` is FALSE and the row is hidden.
+        let shard0 = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        assert!(
+            e.tombstone_resident_shard_slots("accounts", shard0, &[0], 5),
+            "tombstone id=0 at slot 0"
+        );
+
+        // (1) the tombstoned key is now INVISIBLE to a point lookup (gathers the versioned shard 0).
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 0").len(),
+            0,
+            "tombstoned id=0 hidden by the on-device visibility filter"
+        );
+
+        // (2) COUNT(*) over ALL shards drops by exactly one (deleted_by built for the whole unified buffer;
+        //     the un-versioned shards' rows are the all-live memset fill).
+        assert_eq!(
+            sel("SELECT COUNT(*) FROM accounts").row(0),
+            &[SqlValue::Int8(199)],
+            "COUNT reflects the single tombstone"
+        );
+
+        // (3) a LIVE neighbor in the SAME now-versioned shard still reads -- the live sentinel passes the
+        //     visibility compare (guards the fill-vs-tombstone boundary + the signed-safe sentinel).
+        let n1 = sel("SELECT id, balance FROM accounts WHERE id = 1");
+        assert_eq!(n1.len(), 1, "live neighbor id=1 in the versioned shard still visible");
+        assert_eq!(n1.row(0), &[SqlValue::Int4(1), SqlValue::Int4(10)]);
+
+        // (4) a point lookup pruned to a DIFFERENT, un-tombstoned shard is unaffected (no region -> `None`).
+        let far = sel("SELECT id, balance FROM accounts WHERE id = 137");
+        assert_eq!(far.len(), 1, "un-tombstoned shard unaffected");
+        assert_eq!(far.row(0), &[SqlValue::Int4(137), SqlValue::Int4(1370)]);
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
