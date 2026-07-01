@@ -1706,6 +1706,18 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The number of resident shards a table currently holds (0 if not shard-resident). Read-only
+    /// telemetry for benchmarks/tests that assert a table really grew into N bounded shards (else a
+    /// "flat latency vs shard count" claim could be vacuously true on a silently single-shard table).
+    pub fn resident_shard_count(&self, table: &str) -> usize {
+        self.read_state
+            .residency
+            .shards
+            .load()
+            .get(table)
+            .map_or(0, |shards| shards.len())
+    }
+
     /// Slice 1b-ii: append an INSERT's APPLIED rows IN PLACE into the table's resident OPEN shard's
     /// capacity headroom, instead of a full re-admit. `new_rows` MUST be the post-coercion/post-default
     /// applied images (the WriteDelta's `PreparedMutation::Insert.inserted_rows`), in catalog order, so
