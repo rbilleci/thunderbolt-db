@@ -8,6 +8,16 @@
 > tax" finding this addresses at the root). **Supersedes** the *layout* of Slices 1c-i / A1 / A2 as
 > shipped (all UNWIRED, behind the default-OFF `shard_residency_enabled` flag — see §5 for why the cost of
 > correcting now is low).
+>
+> **v2 (2026-07-01) — integrated `sparse-mvcc-version-metadata-review.md` (two reviewers, all points
+> validated):** (#1) the `is_versioned` bool is now a per-shard `created_by`/`deleted_by` **zone map**
+> reusing S-d3 (§4.1); (A) monotonic `created_by` collapses to a per-shard **boundary + range restriction**
+> so **no per-row `created_by` array exists at all** (§4.2); (#3) the `created_by` deferral is reconciled
+> with **SI/SSI** (it becomes correctness, not time-travel) + **WAL reconstruction** after host-store
+> retirement (§4.2); (#2) added **Option C** (sparse `slot→deleted_by` for the point-lookup/index path,
+> §4.3); (C) §4.4 now pins the **pre-publish stamping-order** dependency; (B) added the **stamp-in-place vs
+> log-structured keyed-tombstone** fork (§4.6); (#4/#5) resolved open Qs — **one per-shard metadata region**
+> (§4.7) + a **front-loaded mask-VM spike (SV0)** (§6).
 
 ## 1. TL;DR
 
@@ -21,15 +31,15 @@ concern from the MVCC-visibility review.
 **Target:** restore the HyPer property — *un-versioned rows pay nothing* — adapted to the immutable-sealed-
 shard layout, by making version metadata **sparse across shards (per-shard optional)**:
 
-1. **`created_by`: DEFER it.** Latest-snapshot reads (the only reads that exist today) *never* check
-   `created_by`; its sole consumer is old-snapshot reads, which have no SQL path yet. Remove the eager
-   per-row section now; reintroduce it **dense-within-the-active-snapshot-window-only** when old-snapshot
-   reads are actually built.
-2. **`deleted_by`: make it ON-DEMAND per shard.** A delete-free shard carries **no** tombstone data at all.
-   A shard's `deleted_by` is allocated (as a separate out-of-line device buffer) the first time a DELETE
-   touches it.
-3. **Read fast path: a per-shard `is_versioned` flag** (VersionedPositions at shard granularity) gates the
-   mask; un-versioned shards keep the byte-identical peephole path.
+1. **`created_by`: REMOVE the per-row array outright.** Latest-snapshot reads (the only reads today) *never*
+   check `created_by`; under SI it becomes correctness, but even then it is a per-shard **zone map + boundary**
+   (monotonic `created_by`, §4.2), **never a per-row array**.
+2. **`deleted_by`: make it ON-DEMAND per shard, in one metadata region.** A delete-free shard carries **no**
+   version metadata at all; a shard's metadata region (holding `deleted_by` + the version zone map) is
+   allocated the first time a DELETE touches it (§4.7).
+3. **Read fast path: a per-shard version ZONE MAP** (reuse S-d3, §4.1) — the honest VersionedPositions — gates
+   the mask far more precisely than a coarse `is_versioned` bool; zone-map-cleared shards keep the
+   byte-identical peephole path.
 
 **Common-case footprint (`accounts(id INT, balance INT)`, 8 B of data): 24 B/row → 8 B/row** (data only)
 for the delete-free / cold-shard majority. Reworks the UNWIRED A1/A2 slices before A3 wires them.
@@ -75,27 +85,58 @@ Two independent wastes:
 
 ## 4. Target design
 
-### 4.1 Principle — VersionedPositions at *shard granularity*
+### 4.1 Principle — VersionedPositions as per-shard ZONE MAPS (reuse S-d3), not an `is_versioned` bool
 
-Version metadata is **sparse across shards**: a shard carries version metadata **only if it holds versions
-or tombstones**. A per-shard `is_versioned` flag gates the read:
+Version metadata is **sparse across shards** and gated by a per-shard **version zone map** — ~4 numbers per
+shard, the honest VersionedPositions coarsened to the immutability unit, reusing the S-d3 zone-map machinery
+already shipped (`ResidentDeviceInt4ColumnStats`). A per-shard boolean would flip the *whole* shard onto the
+mask path for one delete; the zone map prunes far more precisely (review #1):
 
-- `is_versioned == false` → the read uses the existing peephole / recompaction path **unchanged**
-  (byte-identical, zero version cost). This is the delete-free / cold-shard majority.
-- `is_versioned == true` → the read routes through the mask VM with the visibility AND (per
-  `gpu-native-writes.md` §"Review-adopted constraints"). Dense-*within*-that-shard for GPU coalescing.
+- **`deleted_by [min_del, max_del]`** over a shard's deleted rows (a delete-free shard has none → skip). A
+  reader at snapshot `S`: if `S < min_del`, **no delete in this shard affects `S`** → skip the delete check
+  entirely. (At the *latest* snapshot a shard with any delete still pays, correctly; the zone map buys the
+  skip for concurrent/older readers.)
+- **`created_by [min_cr, max_cr]`** per shard: `max_cr ≤ S` ⇒ **all rows created-visible** → skip the
+  `created_by` check; `min_cr > S` ⇒ **whole shard invisible** → prune it. A `created_by` check is needed
+  only on a shard that **straddles** `S` (`min_cr ≤ S < max_cr`) — and even then it is a boundary, not a
+  per-row array (§4.2 / review-addendum A).
 
-This is HyPer's VersionedPositions, coarsened to the shard (our natural residency + immutability unit).
+A shard whose zone map lets both checks be skipped uses the existing peephole / recompaction path
+**unchanged** (byte-identical, zero version cost) — the delete-free / cold-shard majority. Only a shard the
+zone map cannot rule out routes through the mask VM, dense-*within*-that-shard for GPU coalescing.
 
-### 4.2 `created_by` — DEFER, then dense-within-window
+### 4.2 `created_by` — no per-row array, ever: a per-shard zone map + a boundary
 
-- **Now:** remove the eager per-row `created_by` device section (§5). No consumer exists.
-- **When old-snapshot reads are built** (a snapshot-isolation / time-travel feature, post-DELETE): reintroduce
-  `created_by` **only on shards within the active-snapshot window** `[oldest_active_snapshot, latest]`. A
-  shard whose entire `created_by` range is below `oldest_active_snapshot` is *all-definitely-visible* to every
-  live reader and needs no stamps — **drop/reclaim the section** as snapshots advance. `created_by` must be
-  dense *within* a window shard (old-snapshot visibility checks it for **every** candidate row, not just
-  modified ones), but the set of window shards is small and bounded by snapshot lifetime.
+**Correctness framing (review #3): the deferral is safe only for READ-COMMITTED, and SI makes `created_by`
+correctness, not time-travel.** Today every read pins `S = committed_seq` (statement-level, READ COMMITTED),
+so `created_by ≤ S` is trivially true for all rows and the check is a no-op — deferral is free. But the
+stated MVCC target (PLAN: SI → SSI) uses **transaction-held snapshots**: a transaction reads at
+`read_txn_id = its start seq < committed_seq`, so its reads **are** old-snapshot reads and must exclude rows
+with `created_by > read_txn_id`. So `created_by` is **core correctness the moment SI lands**, not a far-off
+feature. The plan is therefore *not* "drop it and forget it" — it is "**stop paying 8 B/row for it, and
+reintroduce it as a per-shard zone map + boundary, never a per-row array.**"
+
+**Design — `created_by` needs NO per-row storage (review-addendum A):** `created_by` is **monotonic
+non-decreasing by `(shard, slot)`** if we preserve the natural order — appends stamp `commit_seq` in commit
+order, rollover seals a contiguous range, and a CoW UPDATE appends the new version to the *open* shard
+(sealed-shard stamps are immutable) — **provided admission admits rows in `created_by` order** (a stated
+invariant to establish + verify; results are set-semantics so the reorder is benign). Given monotonicity:
+
+- The per-shard `created_by [min_cr, max_cr]` **zone map** (§4.1) prunes whole shards (`max_cr ≤ S` all-visible;
+  `min_cr > S` all-invisible).
+- The single **straddling** shard needs only a **boundary slot `b`** = the first slot with `created_by > S`
+  (a binary search over the monotone stamps, or a per-shard `commit_seq → first_slot` breakpoint list —
+  O(#commits), kept small by group commit, reclaimed below the oldest snapshot). The read is then a **scan
+  range restriction `[0, b]`** — an extension of the existing `row_count` read-bound, **no per-row column read
+  at all** (cheaper than even the `deleted_by` mask).
+
+So **the eager per-row `created_by` section (1c-i) is removed outright** and never returns as a per-row array;
+it returns (with SI) as a per-shard zone map + boundary.
+
+**Host-store retirement (review #3):** "re-derive `created_by` at admit" holds only while the host
+`InMemoryTupleStore` lives. After S10d retires it, `created_by` (and the boundary breakpoints) must be
+reconstructible from **WAL replay** — the commit order in the log *is* `created_by`. State this so the
+deferral does not collide with host-store retirement (Slice 7).
 
 ### 4.3 `deleted_by` — ON-DEMAND, out-of-line, per shard
 
@@ -104,21 +145,29 @@ This is HyPer's VersionedPositions, coarsened to the shard (our natural residenc
   **separate out-of-line device buffer** (NOT appended to the immutable column payload — sealed shards must
   stay byte-immutable; the open shard *could* inline it, but a uniform separate allocation is simpler and
   keeps the sealed/open paths identical).
-- Structure — two options, staged:
-  - **Option A (recommended first): dense-within-shard `u64` array**, allocated on first delete, every slot
-    init `DELETED_BY_LIVE = u64::MAX`, the deleted slot stamped `commit_seq`. Simple; **coalesced** read;
+- Structure — three options, access-pattern-dependent (review #2), picked by measurement:
+  - **Option A: dense-within-shard `u64` array**, allocated on first delete, every slot init
+    `DELETED_BY_LIVE = u64::MAX`, the deleted slot stamped `commit_seq`. Simple; **coalesced** SCAN read;
     reuses today's `tombstone_resident_shard_slots` write and the `deleted_by > read_txn_id` GPU predicate
-    (`execution/lib.rs:22459`). Cost: 8 B/row **only on shards that have ≥1 delete**.
-  - **Option B (within-shard optimization, deferred until measured): delete-bitmap + sparse timestamp map** —
-    a 1-bit/row "has-a-`deleted_by`" bitmap (`row_count/8` bytes, reuses the NULL-validity `bool_to_mask`
-    kernel) plus a sparse `slot → deleted_by` map (`8 B × #deletes`). The mask kernel reads the bit (coalesced);
-    for the few set bits it looks up the timestamp and compares to `read_txn_id`; clear bits are live with no
-    lookup. Cost on a deleted shard: `row_count/8 + 8·#deletes` instead of `8·row_count` — ~64× smaller when
-    deletes are sparse *within* a shard.
-- **Recommendation:** ship **Option A** first — it already recovers the *across-shard* sparsity (the main win:
-  delete-free shards pay **zero**), reuses the shipped primitive + predicate, and is coalesced. Move to
-  **Option B** only if measurement shows deletes spread thinly across *many* shards (which would re-inflate
-  Option A back toward dense). Decide by measurement, not up front.
+    (`execution/lib.rs:22459`). Cost: 8 B/row **only on shards that have ≥1 delete** — and since shards are
+    **bounded (~4–16M rows**, per [[billions-rows-scale]]), that is ~**32–128 MB per *deleted* shard**, not the
+    review's "8 GB for a billion-row shard" (there are no billion-row shards). Still wasteful if deletes spread
+    thinly across *many* shards.
+  - **Option B: delete-bitmap + sparse timestamp map** — a 1-bit/row "has-a-`deleted_by`" bitmap (`row_count/8`
+    bytes, reuses the NULL-validity `bool_to_mask` kernel) + a sparse `slot → deleted_by` map (`8 B × #deletes`).
+    Mask kernel reads the bit (coalesced); set bits look up the timestamp vs `read_txn_id`; clear bits are live,
+    no lookup. Cost: `row_count/8 + 8·#deletes` — still O(row_count) in the bitmap.
+  - **Option C (review #2 — for the POINT-LOOKUP / INDEX path): a sparse `slot → deleted_by` device
+    hash/sorted structure, O(#deletes)** — kilobytes for a lightly-deleted shard, no per-row term at all. It
+    satisfies §4.4 (exact timestamp) AND is the right shape for the **index probe's per-hit gate** (structural
+    review #1: an index hit is a *membership probe* — "is this slot tombstoned, and if so at what `commit_seq`"
+    — which a device hash-set answers in O(1), where a dense array would waste a full-shard allocation).
+- **Recommendation:** the structure is **access-pattern-dependent**, so it is not one choice: **A (or B) for
+  the SCAN path** (coalesced mask over row-position), **C for the POINT-LOOKUP / INDEX path** (O(1) membership,
+  O(#deletes) memory). Ship **A first** for the scan-path DELETE work (reuses the shipped primitive + predicate,
+  recovers the across-shard sparsity — the main win), and add **C when the cross-shard index lands** (it needs
+  a keyed/slotted membership probe anyway). Pick A-vs-B for the scan path by measurement (spread-of-deletes);
+  do not treat B as the only sparse option.
 
 ### 4.4 Correctness — why a per-row `deleted_by` *timestamp* is required (not a 1-bit "is-deleted")
 
@@ -131,11 +180,53 @@ tombstone). Therefore the visibility test must be `deleted_by[slot] > read_txn_i
 `S` — the timestamp is load-bearing, and Option B's bitmap is only a *gate* (which rows to look up), never the
 answer. `DELETED_BY_LIVE = u64::MAX` passes for every real `S` (commit `Index` starts at 1).
 
+**The timestamp is necessary but not sufficient — the STAMPING ORDER is what makes it correct (review-addendum
+C).** The reason a concurrent reader at `S < c` still sees the row is that the tombstone is stamped with the
+*real* commit sequence `c` **before `publish_committed_seq`** (the A2-wiring / SV4 visibility ordering, same
+placement as the append it replaces): a reader that has *not* observed `committed_seq = c` has `S < c`, so
+`deleted_by = c > S` keeps the row visible; a reader that observes `committed_seq ≥ c` also observes the stamp
+(it was written first) and correctly hides it. **Correctness rests on the stamp value being the post-publish
+`commit_seq`, written pre-publish** — not merely on "using a u64 timestamp." A future path that stamped a
+*provisional* or *lower-than-`c`* value (e.g. a pre-commit txn id) would break visibility even with a full u64.
+Pin this: the tombstone stamp is `c = the commit's published Index`, written before that Index is published.
+
 ### 4.5 Out-of-line invariant (unchanged, keep)
 
 The tombstone write touches only the `deleted_by` structure, **never the row's column bytes** — so a
 lock-free, predicate-free latest-reader can never see a torn row. This is preserved (A2 already does it); the
 only change is *where* `deleted_by` lives (on-demand side buffer vs eager inline section).
+
+### 4.6 OPEN FORK — stamp-in-place (Model A) vs log-structured keyed tombstone (Model B) (review-addendum B)
+
+This proposal so far assumes **Model A: stamp the target shard's `deleted_by[slot]`** — which forces
+**locating** each deleted row's `(shard, slot)` per DELETE (a pruned-shard predicate scan now, an index probe
+later). The **locate is the biggest per-DELETE cost**, and it wants the still-missing cross-shard index. A
+log-structured alternative deserves an explicit comparison rather than an implicit choice:
+
+- **Model A — stamp-in-place.** DELETE = locate `(shard, slot)` → stamp `deleted_by[slot] = c`. Read = a
+  per-position mask (§4.3 A/B). Locate cost per delete: O(shard) scan (or O(1) with the index). No read-side
+  merge. Fits the SCAN read model directly.
+- **Model B — log-structured keyed tombstone.** DELETE = **append a `(PK, deleted_at = c)` tombstone record
+  to the open shard** (a pure append — the locate is *dodged entirely*). Read = **merge-on-read**: a candidate
+  row is invisible if a tombstone for its PK has `deleted_at ≤ S`. Cost: read-side merge + a **key → tombstone**
+  structure (§4.3 Option C, keyed by PK not slot); tombstones accumulate in the open shard until compaction.
+
+**Trade:** Model B eliminates the per-DELETE locate (attractive when **DELETE-by-PK dominates**, the OLTP
+common case) at the price of read-side merge + a PK index — but the merge's PK index is the *same* cross-shard
+index Model A's locate wants, so **both converge on the cross-shard index**. Model A is simpler to land on the
+current scan path (it reuses the shipped tombstone primitive); Model B is the more scalable write path if
+DELETE/UPDATE-by-PK is the workload. **Decision: measurement + workload-driven; do not lock Model A
+implicitly.** SV2/SV4 below assume Model A (least new machinery, reuses A1/A2) but must be written so the read
+filter (SV3) is agnostic to which model produced the tombstone (both yield "this row has `deleted_by = c`").
+
+### 4.7 One per-shard METADATA REGION, not three side buffers (resolves open Q#3; review #4)
+
+Allocate the on-demand version metadata **once**, as a single optional per-shard **metadata region** (one
+descriptor pointer, one allocation site, allocated on a shard's first version/delete), holding: `deleted_by`
+(§4.3), the version **zone map** (§4.1), the `created_by` **boundary breakpoints** (§4.2), and — later — undo
+**back-links** (review-5 / `gpu-native-writes.md` Slice 4). Three separate side buffers is churn to regret;
+design the region's layout up front so each consumer reads its sub-block by offset. A shard with no
+versions/deletes has **no metadata region at all** (the zero-cost majority).
 
 ## 5. What changes vs shipped (revert / rework)
 
@@ -144,11 +235,11 @@ churn on metadata slices, not a behavior change.
 
 | Shipped | Change | Rationale |
 |---|---|---|
-| **1c-i** `created_by` dense device section (admission + append + rollover) | **REVERT the device section**; keep nothing on the hot buffer. (Admission-time `tuple.created_by` capture can go too — re-derivable at admit when the window feature lands.) | No consumer; 8 B/row of never-read VRAM. Reintroduce dense-within-window with old-snapshot reads. |
-| **A1** `deleted_by` dense per-row section, eager on every shard | **REWORK to on-demand per-shard side allocation** (`deleted_by: Option<Arc<CudaResidentDeviceMemory>>` or an offset into a per-shard side buffer), born absent | Delete-free shards must pay zero (the HyPer property). |
-| **A2 primitive** `tombstone_resident_shard_slots` (writes into the inline section) | **Adjust:** if the shard has no `deleted_by` buffer, **allocate + init-all-live** on first tombstone, then stamp; write targets the side buffer | Same out-of-line write, new home. |
-| **A3** (planned) mask reads the inline `deleted_by` | **Read the per-shard side buffer when `is_versioned`; else skip.** `is_versioned = deleted_by.is_some()` (+ `created_by`-window later) | This *is* VersionedPositions gating. |
-| `RelationalResidentShard.created_by_offset` / `deleted_by_offset: Option<u64>` | `created_by_offset` → removed (deferred). `deleted_by` → `Option<side-buffer handle>` | Reflects the layout change. |
+| **1c-i** `created_by` dense device section (admission + append + rollover) | **REMOVE outright**; keep nothing per-row. Returns only as a per-shard zone map + boundary with SI (§4.2), never a per-row array. | No consumer at READ COMMITTED; 8 B/row of never-read VRAM. |
+| **A1** `deleted_by` dense per-row section, eager on every shard | **REWORK to on-demand, inside a per-shard METADATA REGION** (§4.7; born absent, allocated on first delete) — Model A structure (§4.3 Option A) first | Delete-free shards must pay zero (the HyPer property). |
+| **A2 primitive** `tombstone_resident_shard_slots` (writes into the inline section) | **Adjust:** allocate + init-all-live the metadata region on first tombstone, then stamp; write targets the region's `deleted_by` sub-block + updates its zone map | Same out-of-line write, new home. |
+| **A3** (planned) mask reads the inline `deleted_by` | **Zone-map-gated** (§4.1): a shard the version zone map can't rule out reads the metadata region via SV0's second pointer; else the peephole/byte-identical path | This *is* VersionedPositions (S-d3-reused), not a coarse bool. |
+| `RelationalResidentShard.created_by_offset` / `deleted_by_offset: Option<u64>` | both **removed**; replaced by `metadata_region: Option<…>` (§4.7) holding `deleted_by` + zone map + (later) `created_by` boundary + undo back-links | One optional region, one descriptor pointer. |
 
 The `append_u64_section` helper, `DELETED_BY_LIVE`, and the `tombstone_resident_shard_slots` write mechanism
 are **retained**; only the *allocation site* (eager-inline → on-demand-side) and `created_by` (deferred)
@@ -156,29 +247,41 @@ change. So most of A1/A2's tested machinery survives.
 
 ## 6. Revised slice plan
 
-- **SV1 — Defer `created_by`.** Revert the 1c-i device section (+ its admission capture). Reads stay
-  byte-identical (the section was never read). Gate: shard reads unchanged; footprint measurement (SV5)
-  shows `created_by` gone. Small, low-risk (removal).
-- **SV2 — `deleted_by` on-demand, out-of-line.** Rework A1: shards born with `deleted_by = None`; a per-shard
-  side buffer allocated + init-all-live on first tombstone; rework the A2 primitive to allocate-then-stamp.
-  Gate: a delete-free shard has **no** `deleted_by` allocation (assert None + no device bytes); after a
-  tombstone, the shard has a side buffer reading `[…, commit_seq, …]` (device-direct, the A2 gate re-pointed).
-  Sabotage-verified.
-- **SV3 — Read filter (the old A3), VersionedPositions-gated.** `is_versioned` shards route through the mask
-  VM with `deleted_by > read_txn_id`; un-versioned shards keep the peephole/byte-identical path. Includes the
-  **COUNT-as-filtered-reduction** fix (review). Tested via the SV2 primitive (tombstone device-direct → the
-  read/COUNT hides it, == host MVCC). **lpb BEFORE/AFTER on the SHARD path, update-heavy table** (review #3) +
-  old-snapshot-cost note. This is the safe no-op on delete-free data.
-- **SV4 — DELETE commit wiring (the old A2-wiring).** DELETE-only commit → locate slots via the pruned-shard
-  predicate → tombstone (allocate side buffer on first) → skip the O(table) re-admit. Correct because SV3
-  filters. Gate: SQL DELETE stops being visible + no re-admit + O(table)→O(shard) tax.
-- **SV5 — Footprint measurement (do alongside SV1/SV2, not last).** Residency bytes/row before vs after, and
-  effective residency-capacity (rows/GB) for a delete-free table and an update-heavy one. Confirms 24→8 B/row
-  common-case and quantifies the deleted-shard cost (Option A) to decide Option B.
-- **Later — `created_by` window reintroduction** with old-snapshot reads (dense-within-window, reclaim below
-  oldest snapshot). **Later — Option B** (bitmap + sparse timestamp) if SV5 shows spread deletes. **Later —
-  32-bit `(epoch, delta)` rebasing** of whatever stamps remain (the review's other footprint lever; halves
-  the per-stamp cost on the shards that *do* carry stamps).
+- **SV0 — SPIKE: does the mask VM accept a second device pointer outside the main payload? (review #5 —
+  do FIRST).** This gates all of SV3. The `deleted_by` side buffer (and the zone map / boundary) live in a
+  *separate* per-shard allocation, not the main columnar payload; confirm `compile_predicate_program` /
+  `execute_resident_expr_select_with_binding` can point a `LoadColumn`/mask step at a second device pointer,
+  or scope the plumbing to add it. Cheap, decisive, removes the biggest schedule risk before SV3 effort.
+- **SV1 — Remove `created_by` outright.** Revert the 1c-i device section (+ admission capture). Reads stay
+  byte-identical (it was never read). `created_by` returns only as a per-shard **zone map + boundary** with SI
+  (§4.2), never a per-row array. Gate: shard reads unchanged; SV5 footprint shows `created_by` gone. Small,
+  low-risk (removal).
+- **SV2 — `deleted_by` on-demand, in the per-shard METADATA REGION (§4.7).** Rework A1: shards born with **no
+  metadata region**; the region (holding `deleted_by` + the version zone map §4.1) is allocated on a shard's
+  first tombstone; rework the A2 primitive to allocate-then-stamp. **Model A** structure first (§4.3 Option A;
+  §4.6 fork noted). Gate: a delete-free shard has **no** metadata region (assert None + zero device bytes);
+  after a tombstone the region reads `[…, commit_seq, …]` at the stamped slots + the `deleted_by` zone map
+  updates. Sabotage-verified.
+- **SV3 — Read filter, ZONE-MAP-gated (the old A3; needs SV0).** A shard the version zone map (§4.1) cannot
+  rule out routes through the mask VM with `deleted_by > read_txn_id` (reading the metadata region via SV0's
+  second pointer); zone-map-cleared shards keep the peephole/byte-identical path. Includes the
+  **COUNT-as-filtered-reduction** fix (parent review) with its own differential (a DELETE drops `COUNT(*)` by
+  exactly the deleted count). Read filter is **agnostic to the tombstone model** (§4.6). Tested via the SV2
+  primitive (tombstone device-direct → the read/COUNT hides it, == host MVCC; a reader at `S < c` still sees it,
+  validating §4.4). **lpb BEFORE/AFTER on the SHARD path, update-heavy table** (review #3) + an
+  old-snapshot-visibility-cost measurement. Safe no-op on zone-map-clear (delete-free) data.
+- **SV4 — DELETE commit wiring (the old A2-wiring; Model A).** DELETE-only commit → locate slots via the
+  pruned-shard predicate → allocate the metadata region on first → tombstone → skip the O(table) re-admit,
+  stamped **pre-`publish_committed_seq`** (§4.4). Correct because SV3 filters. Gate: SQL DELETE stops being
+  visible + no re-admit + O(table)→O(shard) tax. (If measurement later favours **Model B**, §4.6, the locate is
+  dropped for an open-shard tombstone append — SV3 is already model-agnostic.)
+- **SV5 — Footprint measurement (alongside SV1/SV2, not last).** Residency bytes/row + effective capacity
+  (rows/GB) for a delete-free table and an update-heavy one. Confirms 24→8 B/row common-case; quantifies the
+  deleted-shard cost (Option A) to decide Options B/C.
+- **Later — `created_by` zone-map + boundary with SI** (§4.2, correctness under transaction snapshots) +
+  **WAL reconstruction** after host-store retirement. **Option C** (sparse membership) with the cross-shard
+  index. **Option B** if SV5 shows spread deletes. **32-bit `(epoch, delta)` rebasing** of any stamps that
+  remain (the deleted-shard `deleted_by`), the review's secondary footprint lever.
 
 ## 7. The two "version data" — do NOT conflate (scope boundary)
 
@@ -249,31 +352,45 @@ i.e. **3× the effective residency capacity** vs the shipped layout.
 - **GPU-scaling review, "vacuum/OOM before scale":** sparse metadata reduces steady-state VRAM pressure but
   does **not** remove dead *column values* (§7) — compaction/vacuum is still required before update-heavy
   scale. Unchanged; complementary.
-- **Structural review (MVCC on scan path vs index path):** orthogonal to this doc — the scan/index divergence
-  and the cross-shard index remain as in `gpu-native-writes.md`. The `is_versioned` gate here is the *scan*
-  path's fast path; an index probe still needs its own per-hit `deleted_by[slot]` gate (structural review #1),
-  which now reads the *side buffer* — note the contract for whoever builds the shard index.
+- **Structural review (MVCC on scan path vs index path):** the scan/index divergence and the cross-shard index
+  remain as in `gpu-native-writes.md`. The version **zone map** here is the *scan* path's fast path; an index
+  probe still needs its own per-hit gate (structural review #1) — and this doc now gives it the right shape:
+  **Option C** (§4.3), a sparse `slot/PK → deleted_by` **membership probe** in the metadata region, O(1) per
+  hit, O(#deletes) memory (a dense array would waste a full-shard allocation for the index path). Contract for
+  whoever builds the shard index: the per-hit gate reads the metadata region's Option-C structure.
 
 ## 12. Open questions
 
-1. **Option A vs B timing:** ship A (simple, coalesced, across-shard sparse) and let SV5 decide B — or is
-   within-shard sparsity important enough to build B first? (Leaning A-first.)
-2. **`created_by` removal vs keep-optional:** fully revert 1c-i, or keep `created_by` as a per-shard `Option`
-   populated only for window shards now? (Leaning full revert — simplest, no consumer; re-add with the
-   feature.)
-3. **Descriptor shape:** `deleted_by` as a separate `Arc<CudaResidentDeviceMemory>` per shard vs a second
-   region in a per-shard "metadata" allocation that could later also hold `created_by`-window + undo
-   back-links (review-5). Designing the metadata allocation once may avoid three separate side buffers.
-4. **Does the mask VM already accept a second device pointer** for a column outside the main payload, or does
-   that plumbing need adding? (Affects SV3 effort.)
-5. **Compaction trigger** for dead column values (§7) — out of scope here, but the sparse-metadata design
-   should not preclude the compaction design (it doesn't, but flag for the vacuum slice).
+*Resolved by the v2 review integration:* ~~Q3 (descriptor shape)~~ → **one per-shard metadata region** (§4.7,
+review #4). ~~Q4 (mask-VM second pointer)~~ → **SV0 spike, done first** (§6, review #5). ~~created_by removal
+vs keep-optional~~ → **remove outright; return as a zone map + boundary with SI, never a per-row array**
+(§4.2, review #3 + addendum A).
+
+Remaining / new:
+
+1. **Tombstone model — stamp-in-place (A) vs log-structured keyed tombstone (B)** (§4.6, review-addendum B):
+   decide by workload/measurement. SV2/SV4 land Model A (least new machinery); SV3's filter is model-agnostic.
+   Does DELETE-by-PK dominance justify Model B's append-only DELETE (locate dodged) despite the read-side merge
+   + PK index? Revisit when the cross-shard index is designed (both models converge on it).
+2. **`deleted_by` structure per access path** (§4.3): A/B for scan, **C (sparse membership)** for the index
+   probe — do we need C *before* the cross-shard index, or does it co-land with the index?
+3. **Monotonic-admission invariant** (§4.2 / addendum A): admitting in `created_by` order is required for the
+   boundary trick. Verify it composes with re-admit (mixed `created_by` after churn) and with the zone-map/
+   S-d3 clustering assumptions; confirm the reorder is truly result-set-benign.
+4. **Metadata-region layout** (§4.7): fix the sub-block offsets (deleted_by | zone map | created_by boundary |
+   undo back-links) up front so consumers read by offset; size/grow policy for the sparse structures.
+5. **Compaction trigger** for dead column values (§7) — out of scope here, but the sparse-metadata design must
+   not preclude the compaction/vacuum design (it doesn't; flag for the vacuum slice + review-1 "vacuum before
+   scale").
 
 ## 13. Bottom line
 
 We accidentally built the Hekaton dense-inline stamp model that HyPer was designed to beat, and paid for it in
 the scarcest resource (VRAM). The fix restores HyPer's core property — *un-versioned rows pay nothing* — at
-shard granularity, adapted to immutable-sealed-shards: **defer `created_by` (no consumer), make `deleted_by`
-on-demand per shard (delete-free shards pay zero), gate reads by a per-shard `is_versioned` flag.** Common-case
-footprint 24 → 8 B/row. The correction is cheap now (A1/A2 are unwired metadata behind a default-OFF flag) and
-expensive later (once A3 wires it and shards flip default). Do SV1/SV2 before SV3.
+shard granularity, adapted to immutable-sealed-shards: **remove per-row `created_by` outright (it returns as a
+per-shard zone map + boundary with SI, never a per-row array); make `deleted_by` on-demand in a single
+per-shard metadata region (delete-free shards pay zero); gate reads by a per-shard version ZONE MAP** (reusing
+S-d3), not a coarse `is_versioned` bool. Common-case footprint 24 → 8 B/row. The correction is cheap now (A1/A2
+are unwired metadata behind a default-OFF flag) and expensive later (once the read filter wires it and shards
+flip default). Sequence: **SV0 spike → SV1 remove `created_by` → SV2 on-demand `deleted_by` → SV3 read filter**
+(SV1/SV2 before SV3).
