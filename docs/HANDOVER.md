@@ -1,235 +1,166 @@
 # HANDOVER — Resume Baton
 
-> **This is a SINGLE ROLLING file. Overwrite it each session — never date it, never accrete.** Keep it short:
-> where we are, the one next action, and the open decisions. Everything else lives in the other five docs.
+> **This is a SINGLE ROLLING file. Overwrite it each session — never date it, never accrete.** Where we are,
+> the open decision, and the rules. The **why** is in DECISIONS.md; the **how** in ARCHITECTURE.md; the
+> **mandate** in CHARTER.md; the **plan** in PLAN.md.
 
-**Updated:** 2026-06-28.
+**Updated:** 2026-07-02.
 
-## >>> THE ONE NEXT ACTION: pick the fork — R2.2c (unlock the wave default) OR R3 (writes) <<<
-R2.2b COMPLETE + MERGED (wave wired/routed behind default-OFF `wave_persistent_engine_enabled`). **SINCE THEN the
-RESULT-PATH was optimized end-to-end + MERGED (DECISIONS "Result-path optimization", `c4b0bddb`+`d49aed6f`+`98f677c8`+
-`68b8e455`): the wave's 30M GPU drain had been MASKED by host result materialization (~3M cap). Three audited-SHIP
-slices — Arc-share schema (3M->7.8M), flat `RowBlock` (7.8M->10.8M), and the PER-NEEDLE RESULT MODEL -> BATCHED
-(`RelationalRetainedBatchResult` = shared schema once + one flat RowBlock over all needles + per-needle ranges; batcher
-slices per-needle; 10.8M->19.5M wave-batched, +78%, approaching the drain). Byte-identical throughout. NET: wave/lpb is
-now CLEARLY 1.62-1.76x end-to-end (was ~1.0x fully-masked); read-path absolute ~6.5x the session-start 3M. The wave's
-edge is no longer hidden — the kernel decision is on strong numbers.** **LAST READ LEVER DONE (`3f719e3a`+`b81774ee`):
-instrumentation found the engine overhead was NOT lpb's round-trips but the assembly's O(n log n) sort (~80% of it);
-replaced with an O(n) counting-sort scatter -> lpb-batched 11M->14.6M (+32%), and wave/lpb dropped 1.76x->1.33x@b65536
-/1.21x@b4096 = CONVERGING ON THE TRUE RAW GPU RATIO (1.26x): BOTH ROUTES NOW AT THEIR DRAINS, the read-path ratio is
-HONEST. Audit SHIP; a CPU unit test now proves the within-needle sort necessary (P3). (The lpb b65536 p99 ~30ms tail
-flagged here was SUBSEQUENTLY FIXED by the columnar batched result `10c724e6` + slim-submission `ec4b1a8c` + dense
-default; MEASURED 2026-06-30: lpb-DENSE-batched b65536 p50=411us p99=476us max=510us, 121.6M lookups/s, 4.17x scan.) THE
-READ PATH IS NOW SETTLED END-TO-END.** R2.2b-3's A/B still stands: **the wave is a STRICT WIN
-(throughput + latency) for the single-coalescer point-read regime — 2.45x lpb @batch=1 down to 1.02x @batch=4096 — but
-the DEFAULT FLIP is GATED on two R2.2c architectural unlocks.** Keep R1 lpb the default until they clear. The fork:
+---
 
-**(A) R2.2c — unlock the wave as the point-read fast-path default. TWO PROBES THIS SESSION SHOWED THE READ-SIDE POLISH
-IS MARGINAL** (DECISIONS "R2.2c gate-1 PROBE" + "R2.2c graphs spike"):
-  1. **Multi-shape coexistence = a REDESIGN, not a quick fix.** Probe (`wave_multikernel_probe`): two persistent wave
-     kernels RUN concurrently fine, but tearing one down HANGS to backstop (+ corrupts the survivor) — the doorbell exit
-     fails whenever a 2nd wave kernel is resident — even for MINIMAL 1-SM kernels. So it is NOT SM starvation / not a
-     grid-size change; the at-most-one invariant is vindicated. Lifting it needs a coexistence-teardown fix OR a single
-     shared multi-shape kernel (big), OR a small "one-sticky-shape, lpb-the-rest, no-rebuild" policy (captures the
-     dominant-shape win without coexistence).
-  2. **CUDA graphs do NOT help; the cheaper lead is host-machinery pooling.** Probe (`lpb_cudagraph_probe`): graph replay
-     == direct == ~7us (0 speedup) — the floor is the GPU ROUND-TRIP, not launch submission. lpb's A/B 27us vs the raw
-     7us => ~20us is per-batch ENGINE HOST MACHINERY (per-batch `cuMemAlloc` + pooled-stream lease + event timing +
-     deferred-complete). So the genuine cheaper alternative to the wave (single-coalescer regime) is POOLING/optimizing
-     lpb's per-batch machinery — no persistent kernel, no coexistence, no SM tax. The wave's only unique edge left is the
-     multi-PRODUCER concurrent regime (the per-engine `Mutex` plateaus ~1.4M, crosses under lpb at ~4 direct threads).
-  Before ANY wave default-flip: measure the wave's SM-coexistence TAX on a mixed workload (~60% loss at 8 reserved SMs) —
-  size down / spin up only under point-read load, don't flip blind. NET: R2.2c's read-side win is marginal vs its cost.
+## ⛳ THE CHARTER IS THE CONSTRAINT — READ THIS FIRST
 
-**(B) R3 — the write path (independent, the larger unmeasured frontier).** Concurrent lock-free index maintenance is
-PROVEN fast (write-probe-1, tens of billions inserts/s); the open problems are GPU-native commit/durability (WAL fsync +
-group commit) and deterministic CC (ADR-009 MV-dependency-graph). The write path is entirely unmeasured — likely the
-bigger bet for the OLTP SLO, and the gate for deleting the CPU engine (deletion plan: PLAN §4b / ADR-006).
+**The GPU is the execution substrate for the ENTIRE relational data path. The host is CONTROL PLANE ONLY.**
+The end goal is to **REMOVE the CPU relational engine** — it exists today only as a parity oracle + a GPU-fault
+safety net, both **interim debt to be deleted**, never product direction (ADR-006).
 
-Recommendation (STRENGTHENED by the probes): **(B) R3 writes.** The read half is settled (read-ceiling SETTLED + wave
-validated behind the flag); R2.2c's remaining read wins are marginal (coexistence redesign with little payoff; graphs
-ruled out; host-machinery pooling is a minor polish of an already-fast path). The write half is the unknown that the
-100k-TPS SLO and the CPU-engine deletion both hinge on. (Optional cheap detour first: a host-machinery-pooling spike on
-the lpb path — the real version of the graphs idea — if a near-term read default-flip is wanted.)
-DISCIPLINE (charter, non-negotiable): GPU tests under `timeout`, NEVER `--gpu-reset`; ASCII-only PTX (ptxas -arch=sm_70
-check before launch); independent adversarial audit on kernel/protocol changes (never self-audit); commit/push/merge each
-verified increment; do NOT run a GPU test right after a `timeout`-killed one (its kernel zombies ~watchdog/backstop).
+- **Host MAY:** wire I/O; SQL parse + plan; kernel orchestration/launch; txn coordination + sequencing;
+  WAL/durability I/O; the staging upload (build + upload the next device generation); the single final
+  device→wire result readback.
+- **Host MUST NOT:** scans, filters, joins, aggregates, sorts, grouping, DISTINCT, HAVING, LIMIT/OFFSET,
+  expression eval, NULL/3VL — and MUST NOT materialize results from `host_rows`.
 
-## Where we are
-- Docs are **6 canonical files**: [CHARTER](CHARTER.md), [ARCHITECTURE](ARCHITECTURE.md), [DECISIONS](DECISIONS.md),
-  [PLAN](PLAN.md), [STATUS](STATUS.md), this. `main` == branch == origin (`ac7cbfc8`). Workspace builds; execution
-  non-ignored tests green; the wave GPU tests are `#[ignore]`d (need a local GPU; run with `-- --ignored`).
-- **Workload = high-throughput OLTP** (ADR-008). **Success bar (clarified): same ballpark on TODAY's hardware + a
-  GPU-architectural gap that CLOSES with hardware — NOT beat-the-CPU-today** (host-serial gaps are fixes, not losses).
-- GPU-native **resident read path complete for int4** (S1–S10c). **STRATA S-A + S-B landed** (auto-admission producer,
-  default-OFF). Execution = waves (ADR-009); residency = STRATA (ADR-010).
-- **OLTP benchmark v1 built** (PLAN §1, `engine/examples/oltp_auto_admit_ab` + `facade/examples/oltp_batched_read_scaling`).
-  Findings (DECISIONS ADR-008 "First measurement"): a GPU point read is a fixed ~72µs (launch overhead); even *batched*
-  it was 11× under the CPU — the gap was **host-serial**, not GPU. → **STRATA S-F (flip auto-admit ON) decided OFF**
-  (net-negative today; resident point reads lose).
-- **Batcher Tier-1 landed** (per-shape resident-read template): batched point reads **68k → 156k ops/s (2.3×)**, CPU
-  gap **11× → ~4.5×**. Residual bottleneck = the **single-coalescer host-serial cap (~167k)**, which does NOT scale
-  with GPU hardware. (Audit caught + fixed a pre-existing mixed-int4+text CUDA-201 bug → mixed routes to per-query.)
-- **Wave engine (ADR-009) 1a + 1b + 1c PROVEN** (isolated standalone probes `crates/execution/examples/wave_*_probe.rs`;
-  each independently audited):
-  - **1a** = persistent kernel clean **~3.5µs doorbell exit** + `%globaltimer` backstop (the `--gpu-reset`-box risk is
-    de-risked).
-  - **1b** = parallel data plane (lock-free claim, on-GPU scan+gather, packed atomic result) = host-serial cap broken;
-    full-scan O(rows) → 1M-row table = 485k req/s.
-  - **1c** = a GPU hash index removes the scan → **~10.5M point lookups/s FLAT across 1M/4M/16M-row tables (O(1)),
-    ~13.6× the CPU's 770k, table-size-independent. THE OLTP POINT-READ BET VALIDATED at the data-plane level** — the GPU
-    does millions of lookups/s at realistic scale; the residual bottleneck (host-mapped atomics) is GPU-architectural
-    (scales with hardware). NOT integrated into the engine; the batcher remains the production default.
+**THE LOAD-BEARING DIRECTIVE (user, verbatim):** *"We need to stay GPU native with the solution. Follow the
+charter."* When you MEASURE a host-side cost in a data-plane hot path, the fix is to **MOVE THE WORK ONTO THE
+GPU**, not to optimize the host. Host-side is acceptable ONLY for control-plane / amortized-once work (e.g. an
+index BUILD once per generation), NEVER the per-query / per-row hot path. A "310× by scattering on the host"
+answer was REJECTED for exactly this reason; the correct answer was a device-native kernel. Memory:
+`stay-gpu-native-charter`.
 
-- **Wave 1d-i + 1d-ii** (push the read ceiling) ✅ DONE: claim/`completed` atomics → **device memory** (1d-i, ~30M),
-  then **batched claiming** K=8 (1d-ii) = read ceiling **10.5M → ~45–53M req/s (~5×, ~60–69× the CPU)**, 3× stable.
-  slot→wire mapping quantified MINOR (~200M–1.1B rows/s, ≪ GPU drain). **Read half of the bet is SETTLED** — further
-  read gains are diminishing/tuning-sensitive. (`wave_devatomic_probe.rs`, `wave_batchclaim_probe.rs`.)
+**Success bar (trajectory bet):** same ORDER OF MAGNITUDE as a tuned CPU engine on today's hardware, with the
+residual gap being GPU-ARCHITECTURAL (launch amortization, bandwidth/coherence) so it closes as hardware
+advances. A gap that is host-side serial overhead is IN SCOPE TO FIX. SLO: >100k TPS sustained, ≥400k burst,
+p50/p99/p99.9 < 0.5/1/5 ms.
 
-- **Write probe 1** (concurrent lock-free index INSERT) ✅ DONE: many threads `atom.cas.b64`-insert into a shared
-  open-addressing table at **~tens of BILLIONS of inserts/s** (all verified) → **GPU index maintenance is NOT a
-  bottleneck**; the remaining write constraints (durability/WAL fsync, deterministic CC) are host-I/O + coordination
-  problems CPU engines face too. (`wave_index_insert_probe.rs`; caveats: low contention, raw insert only.)
+---
 
-## R1 ✅ DONE + MERGED (index in the engine read path, default-OFF flag) — SHIP; next = measure, then R2
-**R1a (`53b5fc97`) + R1b (`3f7e5b08`) + audit-adoption (`ffeccfc4`) + re-audit fix (`5b84bb9e`)** are merged to main.
-Two independent adversarial audit cycles; **re-audit verdict = SHIP the flag-on path** (both P1 divergences + all P2s
-closed at the root). The GPU hash-index probe serves resident int4 unique-key point lookups when `wave_engine_enabled`
-is on, returning **byte-identical** results to the scan; default OFF leaves the scan path untouched.
-- **Key design (audit-driven):** the index is built from the **same device bytes the scan reads** — `CudaResidentDeviceMemory::
-  read_resident_i32_column` DtoH-reads the key column, `build_wave_resident_int4_index` hashes it (NO host_rows). This makes
-  NULL-as-0 keys match the scan AND makes the index inherently consistent with the buffer it gathers from (cache keyed by
-  `(column_idx, resident_device_ptr)`, buffer pinned so the ptr can't be reused). Index buffer pinned in the submission.
-- **Swap:** `submit_resident_int4_equal_any_payload` (`engine_retained_read.rs`), flag-gated index-vs-scan, same submission
-  type → byte-identical completion. Falls back to scan on: non-unique keys (dup detect), >256-probe, un-buildable. Distinct
-  needles required (batcher `dedup_needles`, debug-asserted).
-- **Gate:** `r1_wave_index_probe_matches_scan_differential` (flag OFF vs ON) — NULL projection + NULL-as-0 key (needle 0) +
-  absent + dup-fallback + generation rebuild, non-vacuous. Suites green: engine 437 + 295 GPU, execution 84, facade 34.
-  Independent adversarial audit done (2 P1 + 2 P2 all adopted via `ffeccfc4`); **re-audit of the fix in flight.**
-- **NEXT:** (1) ✅ DONE + VERIFIED — end-to-end O(rows)→O(1) win MEASURED (`engine/examples/r1_wave_index_ab`, DECISIONS
-  ADR-008 "R1 end-to-end measurement"): flag ON vs OFF on the production template path, ON==OFF byte-identical each size.
-  Verified re-run: scan falls ≈O(rows) (1M→4M→16M = 1.68M→731k→247k lookups/s), index is **FLAT ~2.3M across all sizes
-  (true O(1))** → **16M rows = 9.34×**. **Crossover ≈1M rows**; below it the fixed ~110µs host+launch floor dominates
-  (~1.0× at ≤256k) → batcher stays default; any flip is size-aware or lands with R2. (2) **R2** — persistent kernel + ring
-  (breaks the host-serial coalescer cap = the ~110µs floor this measurement is now bound by → proven 10–30M).
-  **SM-coexistence gate ✅ MEASURED (`execution/examples/wave_coexist_probe`, DECISIONS ADR-008 "R2 SM-coexistence
-  gate"): VIABLE** — a persistent kernel + concurrent engine scans on ONE shared context never deadlock/starve and exit
-  cleanly (188 SMs), BUT the cost is steeply non-linear: 1 reserved SM ~2%, **8 SMs ~60%, 32 SMs ~87%** of concurrent
-  scan throughput (≈ same busy-spin vs gentle ⇒ SM co-residency, not poll traffic). **Design rule: the wave kernel must
-  be ~1-SM minimal as a sidecar, or REPLACE the per-batch path (ADR-009 intent) — never a fat always-resident
-  co-resident.** **`all_done` ordering audit ✅ DONE** (two independent auditors, DECISIONS ADR-008 "R2 `all_done`
-  ordering audit"): they split (cumulativity GAP vs SOUND) but CONVERGED — `all_done` alone is NOT a robust gate; the
-  sound completion gate is the host **acquiring the `completed` counter** (DtoH `==requests` before reading slots = the
-  proven 1b pattern; `all_done` is only a wake hint). **Engine-lift rule: gate on the counter-acquire, never on
-  `all_done`-only** (ideally `.release.sys`/`.acquire.sys` under sm_70). `cuMemHostGetDevicePointer` already in the FFI
-  (probes). **R2.1 BUILD ✅ DONE** (`crates/execution/src/wave.rs`, new child module): `WaveReadEngine` lifts the proven
-  1d data-plane into the crate, running the persistent kernel on the engine's **shared primary context** (not a throwaway
-  one). Multi-wave `submit(needles)->Vec<Option<i32>>` over a circular lock-free ring; completion GATED ON the DtoH
-  `completed` counter-acquire (audit rule), `all_done` = wake hint; doorbell + `%globaltimer` backstop + clean Drop.
-  Kernel = the audited probe kernel with ONE change: `atom.cas` claim (bounded, no overshoot) instead of `atom.add`, so
-  cumulative `head` works across waves (the result/completion ordering path is unchanged → audit still holds). GPU test
-  `wave_engine_point_lookups_match_oracle_on_shared_context` (#[ignore]) passes: 2 waves, results == CPU oracle, clean
-  exit; ASCII-PTX guard + exec suite 24/0/62-ignored green. **R2.2a ✅ DONE** — multi-column projection (R1's 4-way
-  gather) over the ring, `submit` returns `CudaI32BatchProjectionRow`s **byte-identical to the R1 index probe** (GPU
-  oracle test green); `atom.cas` bounded claim makes cumulative multi-wave work. **BUT a CRITICAL BLOCKER for R2.2
-  wiring surfaced (DECISIONS ADR-008 "R2.2a ... INTERLEAVED-LAUNCH FREEZE"):** launching the GPU index-probe oracle
-  BETWEEN waves FREEZES the idle persistent kernel (claim frozen, no error/fault/backstop); reordering so all submits
-  precede any launch passes. The SM-coexistence probe only tested NON-blocking concurrent launches (fine); the
-  index-probe uses a flag-0 (blocking) pooled stream + NULL-stream memcpy — the legacy-default-stream path is the prime
-  suspect. **ROOT CAUSE PINNED (`execution/examples/wave_freeze_probe`, DECISIONS ADR-008 "R2.2 freeze ROOT CAUSE"): it
-  is `cuMemAlloc`/`cuMemFree`, NOT the stream type.** The probe shows every interleave op (non-blocking/blocking launch,
-  NULL-stream HtoD/DtoH, events, the combo) keeps the kernel ALIVE in µs; only `cuMemAlloc+cuMemFree` FREEZES it, and
-  that op blocks ~the backstop (4.96s of a 5s backstop) — i.e. `cuMemAlloc/Free` **device-synchronize**, blocking until
-  the never-ending wave kernel hits its backstop and dies. (Explains the original 50s test: ~30s cold `cuMemAlloc` to
-  the 30s backstop + 20s wave-2 timeout.) **R2.2 path:** the engine's device-buffer pool amortizes `cuMemAlloc` (steady
-  state reuses pooled buffers; syncs only on cold growth / overflow free), and the wave path is itself alloc-free
-  (pre-allocated device-mapped ring) — so **pre-warm the pool + suppress pool shrink while a wave kernel is resident**
-  (pragmatic), or migrate engine device alloc to `cuMemAllocAsync` (robust). **R2.2 PROPER PORT — verdict FLIPS: the
-  wave WINS at small (OLTP) batches (`5e6b2302`+`bcc12af5`, DECISIONS ADR-008 "R2.2 PROPER PORT"; an independent review
-  `docs/reviews/r2.2-wave-benchmark-review.md` drove this).** The first "wave loses 118x, PARK" was a NAIVE per-needle
-  port measured in the wrong regime (synchronous single-flight) vs the wrong baseline (raw 1-thread index probe, not the
-  156k batcher) — RETRACTED. Proper port: optimized drain (clamped-batched CAS claim + amortized membar, 520k->2.27M/s)
-  + async `submit_async`/`harvest` + host-mapped `completed` mirror on its own cacheline (fixed a false-sharing
-  per-wave-latency pathology); all byte-identical to R1. **Single-flight, 1M rows, wave vs lpb: batch1 124k/39k=3.20x,
-  batch8 448k/309k=1.45x, batch32 1.21M/1.19M=1.02x, batch256 0.30x, batch65536 0.10x.** The persistent kernel WINS at
-  small batches (no per-batch launch: 8us/submit vs lpb's ~25us) — exactly the OLTP point-lookup regime; lpb wins only at
-  large batches (GPU-bound 23M vs the wave's ~2.27M drain ceiling = CAS contention on the single `claim` counter, sharded
-  counters the lever). At batch 8-32 the wave is already 3-8x the 156k batcher.
-  **R2.2 DEVICE-RESULT REWRITE — the wave now EXCEEDS lpb at EVERY batch size (`7dd041e2`, `e1b2072f`, `aeaee74d`;
-  DECISIONS ADR-008 "R2.2 DEVICE-RESULT REWRITE").** An independent audit caught a REAL harvest-gate underflow
-  (`completed.wrapping_sub(base)` wraps when the kernel lags -> returned UNWRITTEN slots; had FAKED a 348M no-op);
-  fixed + timed loop now verifies every wave. Then: grid-stride claim (no claim CAS) + thread-0 device-mirror
-  coordinator (workers stop polling host-mapped ctrl over PCIe) + **records to a DEVICE ring + bulk DtoH** (the ~7.5M
-  plateau was the per-needle host-mapped record WRITE; device lifted it 4.2x). **VERIFIED byte-identical (T=8192, stress
-  gate K=1/max-threads, reused slots): batch1 1.72x, batch8 1.69x, batch32 1.81x, batch256 1.72x, batch65536
-  31.6M/23.4M = 1.35x (peak ~31.8M).** Two audits: number REAL (not a no-op); cross-stream DtoH ordering sound
-  (empirically validated). Caveats: completion gate is single-flight/in-order ONLY (depth-K pipelining needs per-slot
-  status); thread-0 co-residency assumed (backstop catches eviction). **The read-ceiling bet is now in-crate on the
-  shared context, not just standalone probes — lpb is matched/beaten everywhere.**
-  **R2.2 FOLLOW-UP REVIEW correctness gates C1/C2/C3 DONE (`6b28832e`; `docs/reviews/r2.2-wave-port-followup-review.md`;
-  two independent audits = SHIP/SOUND):** C1 = `new()` clamps `threads` to occupancy (`cuOccupancyMaxActiveBlocksPerMultiprocessor
-  * SM_count`) so a too-large grid can't silently hang (un-resident blocks never drain) — but occupancy is SOLO-device,
-  so the shared-context coexistence trap stays the open R2 question; C2 = u64 cumulative counters (u32 wrapped at ~2^32
-  lookups ~=135s -> permanent gate hang); C3 = `debug_assert!(status!=0)`. `WaveReadEngine` is now WIREABLE.
-  **P1 needles-to-device = TRIED + REJECTED (negative result, reverted; DECISIONS "R2.2 P1 ... REJECTED"):** the needle
-  read is NOT the cap — device `req_dev` + bulk HtoD left large batch UNCHANGED (30.7M vs 31.3M) and REGRESSED small/mid
-  batches (HtoD+sync latency: batch1 1.72x->1.46x). device-records already saturated the per-needle path; the residual
-  ~31M is the GATHER/RECORD work, and the bare-probe 45M is a simpler kernel (no multi-col rows) -> ~31.8M is at/near the
-  realistic in-crate ceiling for this workload.
-  **R2.2 P2 DONE — per-slot status gate + depth-K pipelining; CONCURRENT premise VALIDATED (`65c2b3de`,`494e3c9d`,
-  `38e0f874`; two audits = no new runtime bug; DECISIONS "R2.2 P2"):** replaced the single-flight cumulative gate with a
-  PER-SLOT status ring (kernel `.target sm_70`, `st.release.sys` per slot; harvest = all-slots-set, any order; submit
-  clears slots). BONUS: cut single-flight small-batch latency (batch1 1.72x->2.51x lpb). P2b depth-K test = byte-identical
-  out-of-order across 64 reused-slot rounds. P2c (premise gate): pipelining lifts throughput **1.4-2.1x over single-flight**
-  (saturates ~depth-4); pipelined wave = **2.6-4.6x lpb, 9-32x the 156k batcher**. Open (deferred to R2.2b): enforce the
-  in-flight ring bound + per-ticket-harvest + a depth-K harvest deadline (currently caller contracts). Cross-engine body
-  visibility = the device-result design's property, empirically validated.
-  **R2.2b STARTED (`3207f457`,`7210d484`; DECISIONS "R2.2b STARTED"):** mapped the wiring (flag lib.rs:316; swap point
-  `submit_resident_int4_equal_any_payload` engine_retained_read.rs; lifecycle in engine_residency/engine_commit; state in
-  engine_state.rs `ResidencyReadState`). Decisions: export `WaveReadEngine` `pub`; build it LAZILY per (filter_col,proj
-  set) like the R1 index (the kernel bakes projection offsets at launch); own it as `Arc<Mutex<WaveReadEngine>>`
-  (single-flight first). **Blocker#3 crash-safe watchdog DONE** (host petter + heartbeat; thread 0 self-terminates the
-  kernel ~watchdog_ns after the host dies, not ~30s; independent audit=SHIP, fixed a latent unfenced-petter bug + a
-  startup race -> arm-on-first-pet). **R2.2b-1 FOUNDATION DONE (`44289772`):** exported `WaveReadEngine`/`WaveTicket`
-  `pub` + `unsafe impl Send`.
-  **R2.2b-2 DONE + MERGED (`8feb4131`,`04f20bfc`,`b0ff7bb3`,`50bfdec5`,`f6fd436e`; DECISIONS "R2.2b-2 DONE"):** the wave
-  engine is WIRED + ROUTED into `submit_resident_int4_equal_any_payload` behind the default-OFF
-  `wave_persistent_engine_enabled` flag (nested under `wave_engine_enabled`). (1) IMPEDANCE resolved with a payload enum
-  `RelationalRetainedInt4ProjectionPayload::{Deferred(submission)|Materialized(rows)}` — both arms converge on the same
-  `Vec<CudaI32BatchProjectionRow>` the completion materializes (byte-identical by construction). (2) Lifecycle: per-table
-  `Arc<Mutex<WaveReadEngine>>` cache keyed `(col, resident_ptr, proj-set)`, lazy accessor over the R1 index
-  (`wave_read_engine_for`), serial-path eviction; cross-thread `Drop` made sound (`shutdown`/`read_records` set_current —
-  `WaveReadEngine` is `Send`). (3) Route is single-flight, falls back to lpb on any wave Err/timeout/oversize.
-  **CRITICAL: an at-most-one-persistent-wave-kernel invariant is LOAD-BEARING for liveness** — two full-occupancy
-  persistent spin-kernels in one context mutually starve (neither yields its SMs) -> teardown `cuStreamSynchronize`
-  (infinite backstop) HANGS; the accessor DRAINS existing engines before launching a new one, under a `wave_build_latch`.
-  (A non-vacuity test caught this as a real hang.) Two independent adversarial audits: Slice 1 = SHIP; combined =
-  SHIP-WITH-FIXES, all adopted (added `wave_route_hits` telemetry/test-signal + closed two vacuous assertions). GPU
-  differential `r2_wave_engine_matches_lpb_differential` (wave==lpb==scan byte-identical incl NULL/NULL-as-0/absent/dup-
-  fallback/generation-rebuild/eviction/proj-rebuild) + concurrent same-shape `r2_wave_engine_concurrent_same_shape_single_flight`
-  + HAZARD (3x seq + 2x concurrent, zero CUDA 700/716/717). **R1 lpb stays the default; the A/B (R2.2b-3, above) is the
-  ship decision.**
-  (3) **R3** — writes (concurrent index maintenance proven fast) + deterministic CC.
-- **Discovered pre-existing bug (out of R1 scope, follow-up):** the jobs-batch path
-  (`submit_relational_retained_int4_projection_batch`) does NOT dedup needles; the scan kernel emits a matched row under
-  only the FIRST matching needle_index, so a duplicate job (`WHERE id=1` twice) gets an empty result for the 2nd. The
-  facade-template path is unaffected (`dedup_needles`). Fix = dedup in the jobs-batch path (or map results by value).
-*Parked (verify before starting):* open-loop offered-rate + tuned-Postgres baseline (the real end-to-end OLTP-fitness
-instrument, incl. the WRITE path which is still unmeasured); batched-mixed int4+text; STRATA S-C/S-D/S-E.
+## >>> THE ONE NEXT ACTION: pick the next correctness/SLO slice (4 options) <<<
 
-## Top open decisions (unresolved)
-- **Data-size envelope:** OLTP working set vs aggregate VRAM, and the over-VRAM spill/tiering model (cross-shard
-  combine doesn't exist; STRATA placement, not hardware paging, owns the tail).
-- **Coherent-memory dependency:** the strongest latency wins assume GH200/GB200 (untestable on the dev box) — the
-  PCIe baseline must be competitive or the bet is confined to premium hardware.
-- **Wave-engine integration shape (1c+):** coexistence is now MEASURED (above) — viable but a fat co-resident wave
-  kernel is too costly, so the shape is **either ~1-SM sidecar or full replacement of the per-batch path**, not a wide
-  always-resident data-plane beside launch-per-batch. Still open: the slow-class (dependent-read, data-dependent-
-  predicate) path; and the deterministic spine + MV-dependency-graph CC the writes will need (ADR-009).
-- **S-B v1 tradeoffs (now lower priority — S-F is OFF):** admission holds the catalog latch during the upload + re-admits
-  the whole table per commit. Only matters if auto-admit is ever turned on for an analytical/read-heavy resident case.
+The **READ path is SETTLED** at its architectural ceiling (GPU-native, O(log)-routed, ~parity single-buffer,
+scale-ready). The **WRITE CRUD data plane is GPU-native** (INSERT/DELETE/UPDATE all incremental, behind
+default-OFF flags). What remains is **CORRECTNESS + SLO** — the path to flipping the GPU data plane ON by
+default and DELETING the CPU relational engine. Pick one (the user sets the sequence):
 
-## Discipline reminders
-GPU-native-or-it-doesn't-land; differential WITH NULL data; HAZARD on device-touching slices; **independent
-adversarial audit, never self-audit**; engine crate is fmt-dirty (never crate-wide `cargo fmt`); `--gpu-reset`
-DENIED, run GPU tests under `timeout`. Full list: CHARTER "Operational gotchas".
+### (A) `created_by` SI flip-gate — the SECOND shards-default correctness gate  ★ recommended next
+The incremental UPDATE (SV5, `try_update_resident_commit`) appends the new row version with **no `created_by`
+lower-bound gate**, so a concurrent reader at `committed_seq = C-1` can see the key **TWICE** (old + new). This
+is the P2 flip-gate blocking `resident_update_tombstone_enabled`. **Do:** add a `created_by`-style
+consistent-snapshot boundary on the appended version — mirror the SV3b `deleted_by > read_txn` visibility gate
+ON THE GPU with a `created_by <= read_txn` lower bound (the mixed-width predicate VM already does i32 WHERE +
+i64 deleted_by; add created_by the same way) — plus a CONCURRENT-READER differential that reproduces the
+double-read and proves it gone. With the NULL fix (done), this clears the shards-default correctness gates.
+**Charter:** the boundary is a device-side predicate AND, not a host filter.
+
+### (B) Finish sharded NULL correctness — predicate three-valued logic on shards
+Projection NULL is DONE (M3-for-shards, `3958e847`). TWO follow-ups: (1) `WHERE col IS NULL` / `IS NOT NULL` on
+a sharded-ONLY table currently **ERRORS** ("relation has no resident snapshot" — the IS NULL shape isn't
+sharded-router-eligible, so it falls to a single-buffer path with no snapshot); route it to the sharded scan
+(the unified descriptor now carries the null bitmaps and the executor already reads them). (2) `col = x`
+NULL-EXCLUSION (SQL 3VL: `NULL = 0` is UNKNOWN → excluded) is UNTESTED on the sharded path — verify the
+executor's equality predicate ANDs the validity bitmap on the sharded scan == single-buffer. **Charter:** all on
+the device predicate VM.
+
+### (C) VACUUM/GC (#5) + host-store retirement (#2) — attack the O(table) residuals directly
+The biggest cut toward DELETING the CPU engine. (1) Tombstone/undo GC (ledger #5): reclaim `deleted_by`
+tombstones + dead versions without an O(table) rewrite — a RE-CLUSTERING compaction (also needed for zone-map
+pruning under key-scatter, memory `zone-map-clustering-limit`). (2) Host-store retirement (ledger #2): the
+MEASURED write residual is the **host-side `prepare_delete`/`prepare_update` seq_scan** (resolve tuple_ids),
+O(table) ON THE HOST = a charter violation in the hot path. Drive DELETE/UPDATE resolution from the RESIDENT
+INDEX (cross-shard PK index sub-slice [7]) OR retire the host tuple store, so writes become O(rows-touched).
+**Charter:** this IS the charter work — moving the last O(table) control-plane scan off the CPU.
+
+### (D) Deterministic CC (#6) + WAL group commit (#7) + SLO benchmark
+The OLTP write SLO, unmeasured end-to-end. Deterministic CC for the fast-path deterministic waves (ADR-009) +
+WAL group commit (batch fsync; today size-1, ledger #7) + a CONCURRENT-COMMIT SLO benchmark vs the >100k TPS /
+p99<1ms targets. **Charter:** sequencing + WAL I/O are legitimately host (control plane); the SLO proves the
+write half of the trajectory bet.
+
+**Guidance:** A and B directly gate the **shards-default flip** (turns the GPU data plane ON). C is the deepest
+charter cut. D proves the SLO. Recommend **A** next (pairs with the shipped NULL fix to clear both flip-gates),
+then B, then C, then D.
+
+---
+
+## Where we are (DONE + on origin/main; HEAD `3958e847`)
+
+**READ PATH — SETTLED (architectural ceiling; banked; GPU-native). Do not re-litigate the perf.**
+- Arc: single-flight 44k/s → 3b index route 22µs → Step-1 batched 13.7M/s → wired → v2 multi-shard kernel
+  146M/s → **v3 O(1) binary routing** (`f15687fe`, opus SHIP): each needle binary-searches to its ONE shard
+  (O(log shards)) when the host proves the shards ascending-disjoint (self-validating `windows(2).all(max<min)`).
+  **HONEST: binary beats linear at many shards (462 vs 487µs @b65536, 67 shards) but does NOT beat single-buffer
+  at 1M — the cap is MULTI-BUFFER LOCALITY, not the loop. More shards = slower. SHARDING IS A SCALE PLAY**
+  (billions of rows, where single-buffer's ~536M residency cap can't run at all); no routing cleverness beats
+  single-buffer's contiguous layout when it fits.
+- **M3-for-shards NULL (`3958e847`, opus SHIP):** the sharded read PROJECTION is NULL-AWARE (emits
+  `SqlValue::Null`, was a raw `Int4(0)` — the ledgered SQL-correctness bug). The scan's recompaction rebuilds
+  each column's validity bitmap into the unified buffer (deleted_by-style fill+segment) + labels the unified
+  descriptor. The default-OFF raw-i32 routes (3b + batched gather) DECLINE on null-bearing tables → the
+  NULL-aware scan serves them. (See option B for the remaining predicate 3VL.)
+
+**WRITE CRUD — GPU-native data plane, ALL behind default-OFF flags (INERT in prod).**
+- MVCC: SV1/SV2 sparse HyPer-faithful versioning (24→8 B/row for the delete-free majority) + SV3a/SV3b
+  (recompaction fill + GPU read-visibility filter) + mixed-width predicate VM.
+- SV4b (`cb382ea5`): GPU-native incremental DELETE (locate+tombstone) behind `resident_delete_tombstone_
+  enabled`. SV5 (`dc2de15f`): GPU-native incremental UPDATE (tombstone-old + append-new) behind
+  `resident_update_tombstone_enabled` — **its created_by flip-gate is option A.**
+- MEASURED: DELETE/UPDATE tombstone = 2.2× re-admit (device re-admit gone) but STILL O(table) — the residual is
+  the HOST seq_scan (option C).
+
+**CROSS-SHARD PK INDEX — per-shard immutable (billions-rows), hash + bloom.** Sub-slices 1/2/3a/3b + Step-1
+batched gather (`6710b8ce`) + facade wiring (`98d5e7e0`) + v2/v3 device multi-shard kernel — DONE + audited.
+REMAINING: [4] sorted-run point+range, [5] cross-shard merge, [6] incremental maintenance, [7] wire DELETE/UPDATE
+resolution (removes the host seq_scan — overlaps C), [8] GPU-native build.
+
+**LOAD-BEARING INVARIANT (audit-verified):** **multi-shard tables are NULL-FREE by construction** — the
+incremental rollover rejects NULL rows (→ single-shard re-admit) and a null-bearing table's `int4_appendable`
+is false. So any shard with a null bitmap is the sole shard (row_start 0). Binary-mode keep-shard-0 and the M3
+recompaction alignment both depend on this.
+
+Default-OFF flags (byte-identical until flipped): `shard_residency_enabled`, `shard_index_probe_enabled`,
+`shard_batched_point_read_enabled`, `resident_delete_tombstone_enabled`, `resident_update_tombstone_enabled`,
+`wave_engine_enabled` / `wave_persistent_engine_enabled`.
+
+---
+
+## The per-iteration protocol (NON-NEGOTIABLE)
+
+1. **MEASURE first** — reproduce/confirm before changing code; the slow SQL-honest load is the signal.
+2. **Smallest correct slice behind a default-OFF flag** — byte-identical to HEAD until the flip.
+3. **GPU-native solution (the charter)** — data-plane hot path on the device, not the host.
+4. **Differentials**: GPU == CPU == the SQL SPEC (not CPU-engine parity — memory `sql-spec-over-cpu-parity`).
+   Prove the new path FIRED (a route-hits counter), not a silent fallback.
+5. **NON-VACUOUS sabotage-verified asserts** — break the mechanism, watch the test FAIL, revert. A test that
+   still passes under sabotage is vacuous (this session caught vacuous asserts + a faked benchmark that way).
+6. **INDEPENDENT ADVERSARIAL OPUS AUDIT before EVERY push** — `Agent` `model:"opus"`, register-by-register for
+   PTX, hunt for wrong-results. **NEVER self-audit. NEVER push unaudited.** Adopt findings → re-verify → (re-audit
+   if fixes) → push to origin/main. Memory `audit-with-opus-subagents`.
+7. **Pair LATENCY (p50/p99) with THROUGHPUT** on every benchmark line (OLTP). Report card = BOTH the raw read
+   kernels AND the lpb/wave point-read path, in-L2 + out-of-L2 (memory `benchmark-report-card`).
+8. **Update memory** after each slice (`~/.claude/projects/-data-projects-gpu-database-engine/memory/`).
+
+**GPU discipline (hard rules):** GPU tests under `timeout`; **NEVER `--gpu-reset`**; **run GPU test SWEEPS with
+`--test-threads=1`** (the parallel runner oversubscribes the device → SPURIOUS failures; re-run failures in
+isolation before believing them — memory `gpu-test-threads-serial`); never a GPU test right after a
+timeout-killed one; **ASCII-only PTX**. Commit/push only per standing authorization to origin/main. User pref:
+**BIGGER SLICES, FEWER CHECK-INS**; surface only genuine architectural forks; the USER sets the sequence at
+track boundaries (memory `working-agreement-sequencing`).
+
+---
+
+## Pointers
+
+- **Memory (read first):** `MEMORY.md` index. Key files: `r3-write-path` (the active phase — full slice
+  history), `scalability-ledger` (every unscalable O(table)/global-lock cost → the slice that removes it;
+  RE-READ each iteration, no new slice may add an unscalable hot path without a row), `stay-gpu-native-charter`,
+  `billions-rows-scale`, `zone-map-clustering-limit`, `strata-design`, `working-agreement-sequencing`,
+  `gpu-test-threads-serial`, `benchmark-report-card`, `benchmark-report-latency`.
+- **Code:** sharded read + recompaction = `engine_expr.rs::execute_resident_sharded_via_general`; shard builders
+  + descriptors = `engine_residency.rs` (`resident_snapshot_for_shard/_unified`,
+  `build_relational_device_payload_with_capacity`, the 3 `RelationalResidentShard` construction sites); batched
+  gather + device index = `engine_retained_read.rs`; hand-written PTX kernels = `crates/execution/src/lib.rs`;
+  MVCC apply + write commit = `engine_commit.rs` / `engine_dml_prepare.rs`.
+- **Benchmarks:** `crates/engine/examples/r3_shard_index_route_ab.rs` (sharded point read; `GPU_DB_BENCH_SHARDS`
+  for the many-shard binary route), `r2_wave_engine_ab` (single-buffer lpb/wave), `r3_dual_store_tax.rs`,
+  `r3_insert_profile.rs`.
+- **Green baselines to preserve:** engine CPU 452/0; facade CPU 32/0; the sharded/null/route GPU differentials
+  (run `--test-threads=1`).
