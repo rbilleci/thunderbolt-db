@@ -176,6 +176,8 @@ impl Engine {
             dense_index_probe_enabled: std::sync::atomic::AtomicBool::new(true),
             // Billions-of-rows segmented layout (S-d1): default OFF — production stays on the single buffer.
             shard_residency_enabled: std::sync::atomic::AtomicBool::new(false),
+            // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
+            shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }
     }
 

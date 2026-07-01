@@ -330,6 +330,12 @@ pub struct Engine {
     /// OFF — production stays on the single buffer until seal/rollover (S-d2) + per-shard bloom index (S-d3)
     /// make the shard path strictly better at scale; this flag is the A/B lever to validate it. Interior-mutable.
     shard_residency_enabled: AtomicBool,
+    /// S-d2c: target row count per shard. When the open shard reaches it, an append SEALS the open shard
+    /// (immutable) and ROLLS OVER to a fresh open shard (O(rows), never the O(table) re-admit), so a table
+    /// grows as bounded shards to billions of rows. Caps the admit headroom + sizes a rollover shard.
+    /// Default 4M (seals in ~3ms, ~250 shards/1B per the admit-scaling measurement); settable small in
+    /// tests. Interior-mutable.
+    shard_size_target: std::sync::atomic::AtomicUsize,
 }
 
 /// The DDL-only catalog working state, serialized behind the engine's **catalog latch**

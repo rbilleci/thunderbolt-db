@@ -953,16 +953,15 @@ mod capacity_payload_tests {
         e.set_auto_admit_on_commit(true);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
-        // Grow to 300 rows: the first commit admits as a shard (headroom); subsequent commits append in
-        // place, with headroom-overflow re-admits at power-of-two boundaries (last at row 129 -> capacity
-        // 512), so by row 300 the open shard has ample headroom for the next 50 appends.
-        for i in 0..300_i64 {
-            e.execute_text(
-                (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
-            )
-            .unwrap();
-        }
+        // Batch-admit 300 rows as ONE shard with headroom (default 4M target -> the admit builds a
+        // capacity-1024 open shard holding 300 rows), so the next 50 single-row commits append IN PLACE
+        // without a rollover (rollover is exercised by shard_open_append_rolls_over_and_reads_correct).
+        let base: Vec<String> = (0..300_i64).map(|i| format!("({i}, {})", i * 10)).collect();
+        e.execute_text(
+            2,
+            &format!("INSERT INTO accounts (id, balance) VALUES {}", base.join(",")),
+        )
+        .unwrap();
         let shard_state = |e: &Engine| -> (usize, usize) {
             let shards = e.read_state.residency.shards.load();
             let s = shards.get("accounts").expect("shard-resident");
@@ -1000,6 +999,64 @@ mod capacity_payload_tests {
             sel("SELECT COUNT(*) FROM accounts").row(0),
             &[SqlValue::Int8(350)],
             "COUNT(*) sees the appended rows"
+        );
+    }
+
+    /// S-d2c: with the shard flag ON and a small shard-size target, a table built via committed INSERTs
+    /// SEALS the full open shard and ROLLS OVER into a fresh one — growing as MULTIPLE bounded shards
+    /// instead of ever re-admitting the whole table (this is what removes the ~536M single-buffer cap). The
+    /// recompaction reads correctly across the sealed + open shards. NON-VACUITY: rollover produced multiple
+    /// shards (a broken rollover -> re-admit -> ONE dense shard -> the assert fails); the per-shard row_counts
+    /// sum to the table total; point lookups across different shards + COUNT(*) are correct.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_open_append_rolls_over_and_reads_correct() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64); // small -> roll over every ~64 rows
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let (shard_count, total_rows) = {
+            let shards = e.read_state.residency.shards.load();
+            let s = shards.get("accounts").expect("shard-resident");
+            (s.len(), s.iter().map(|sh| sh.row_count).sum::<usize>())
+        };
+        // NON-VACUITY: rollover produced MULTIPLE bounded shards (200 rows / 64 target -> >= 3); a broken
+        // rollover would re-admit into ONE dense shard.
+        assert!(
+            shard_count >= 3,
+            "rollover must grow the table as multiple shards (got {shard_count})"
+        );
+        assert_eq!(total_rows, 200, "per-shard row_counts sum to the table total");
+
+        // Reads recompact across all shards: point lookups landing in different shards + COUNT(*).
+        let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
+        for id in [5_i64, 70, 137, 199] {
+            let r = sel(&format!("SELECT id, balance FROM accounts WHERE id = {id}"));
+            assert_eq!(r.len(), 1, "id={id} present across shards");
+            assert_eq!(
+                r.row(0),
+                &[SqlValue::Int4(id as i32), SqlValue::Int4((id * 10) as i32)],
+                "id={id} value correct across shards"
+            );
+        }
+        assert_eq!(
+            sel("SELECT COUNT(*) FROM accounts").row(0),
+            &[SqlValue::Int8(200)],
+            "COUNT(*) across all shards"
+        );
+        assert_eq!(
+            sel("SELECT id, balance FROM accounts").len(),
+            200,
+            "scan recompacts all shards"
         );
     }
 
@@ -1151,7 +1208,15 @@ impl Engine {
         // gather + `resident_snapshot_for_shard` stride by `shard.capacity`), so the OPEN shard gets the
         // same headroom as the single buffer. Other shapes (and huge/empty tables) stay dense.
         let capacity = if purely_int4 {
-            row_count.saturating_mul(2).next_power_of_two()
+            let doubled = row_count.saturating_mul(2).next_power_of_two();
+            // S-d2c: on the shard path, CAP the open shard at the target size (`row_count` if it already
+            // exceeds it — a large admit is one dense shard) so it seals + rolls over at the target rather
+            // than growing unbounded. The single buffer is uncapped (its cap is the 536M guard above).
+            if self.shard_residency_enabled() {
+                doubled.min(self.shard_size_target()).max(row_count)
+            } else {
+                doubled
+            }
         } else {
             row_count
         };
@@ -1495,6 +1560,17 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// S-d2c: set the target row count per shard (the rollover/seal threshold). Settable small in tests.
+    pub fn set_shard_size_target(&self, rows: usize) {
+        self.shard_size_target
+            .store(rows.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn shard_size_target(&self) -> usize {
+        self.shard_size_target
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe. The test signal
     /// that the dense route actually ran (dense and atomic are byte-identical, so output equality can't prove
     /// which kernel produced the rows).
@@ -1650,7 +1726,9 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .clone();
-        let (shard_id, capacity, row_start, column_count) = {
+        let k = new_rows.len();
+        // Read the OPEN (last) shard's state once.
+        let (shard_id, capacity, row_count, row_start, column_count, column_names, gpu_id, schema, max_shard_id) = {
             let shards = self.read_state.residency.shards.load();
             let Some(table_shards) = shards.get(table) else {
                 return false;
@@ -1661,42 +1739,110 @@ impl Engine {
             if !open.int4_appendable || !open.is_valid(pressured_gpus.contains(&open.gpu_id)) {
                 return false;
             }
-            let column_count = open.resident_device_int4_columns.len();
-            match open.row_count.checked_add(new_rows.len()) {
-                Some(end) if end <= open.capacity => {
-                    (open.shard_id, open.capacity, open.row_count, column_count)
-                }
-                // no headroom (or overflow) -> caller re-admits; seal + a fresh open shard is S-d2c.
-                _ => return false,
-            }
+            (
+                open.shard_id,
+                open.capacity,
+                open.row_count,
+                open.row_start,
+                open.resident_device_int4_columns.len(),
+                open.resident_device_int4_columns.clone(),
+                open.gpu_id,
+                open.schema.clone(),
+                table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
+            )
         };
-        let Some(shard_device_memory) = self
-            .read_state
-            .residency
-            .shard_device_memory
-            .get(&(table.to_string(), shard_id))
+        let column_types = vec![SqlType::Int4; column_count];
+
+        // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path).
+        if row_count.checked_add(k).is_some_and(|end| end <= capacity) {
+            let Some(shard_device_memory) = self
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&(table.to_string(), shard_id))
+            else {
+                return false;
+            };
+            // The append position within THIS shard's buffer is its LOCAL row_count (rows [0, row_count)
+            // are live; the new rows go at [row_count, row_count+k)), NOT the shard's global `row_start`.
+            let chunks =
+                match compute_open_shard_int4_append_chunks(&column_types, capacity, row_count, new_rows) {
+                    Ok(chunks) => chunks,
+                    Err(_) => return false,
+                };
+            if shard_device_memory.append_owned_chunks(chunks).is_err() {
+                // Partial/failed append leaves bytes only in invisible headroom beyond row_count;
+                // returning false makes the caller invalidate + re-admit, discarding them.
+                return false;
+            }
+            let appended_bytes = (k * column_count * std::mem::size_of::<i32>()) as u64;
+            self.read_state.residency.with_shards_mut(|shards| {
+                if let Some(table_shards) = shards.get_mut(table) {
+                    if let Some(open) = table_shards.last_mut() {
+                        open.row_count += k;
+                        open.resident_bytes = open.resident_bytes.saturating_add(appended_bytes);
+                    }
+                }
+            });
+            self.read_state
+                .residency
+                .open_shard_append_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+
+        // S-d2c ROLLOVER: the open shard is full -> SEAL it (leave it in place, immutable) and build + install
+        // a NEW open shard holding the k rows (capacity = the target, so it grows to the target before the
+        // next rollover). O(rows appended), NOT the O(table) re-admit -> this is what removes the 536M cap.
+        let new_capacity = self
+            .shard_size_target()
+            .max(k.saturating_mul(2).next_power_of_two());
+        let device_payload = match build_relational_device_payload_with_capacity(
+            &column_names,
+            &column_types,
+            new_rows,
+            new_capacity,
+        ) {
+            // Pure int4 + NULL-free (the caller rejects NULLs) -> the text/bool/stats/b128/null outputs are
+            // empty; only the columnar payload matters.
+            Ok((payload, _text, _bool, _stats, _b128, _null)) => payload,
+            Err(_) => return false,
+        };
+        let Some(new_device_memory) = self.relational_residency_device_memory(gpu_id, &device_payload)
         else {
             return false;
         };
-        let column_types = vec![SqlType::Int4; column_count];
-        let chunks =
-            match compute_open_shard_int4_append_chunks(&column_types, capacity, row_start, new_rows) {
-                Ok(chunks) => chunks,
-                Err(_) => return false,
-            };
-        if shard_device_memory.append_owned_chunks(chunks).is_err() {
-            // Partial/failed append leaves bytes only in the (invisible) headroom beyond row_count;
-            // returning false makes the caller invalidate + re-admit, discarding them.
-            return false;
-        }
-        let k = new_rows.len();
-        let appended_bytes = (k * column_count * std::mem::size_of::<i32>()) as u64;
+        let new_shard_id = max_shard_id.saturating_add(1);
+        let pressured = pressured_gpus.contains(&gpu_id);
+        let new_shard = RelationalResidentShard {
+            shard_id: new_shard_id,
+            row_start: row_start.saturating_add(row_count),
+            row_count: k,
+            capacity: new_capacity,
+            int4_appendable: true,
+            resident_bytes: (8 + k * column_count * std::mem::size_of::<i32>()) as u64,
+            allocated_bytes: device_payload.len() as u64,
+            count_header_byte_offset: 0,
+            resident_device_int4_columns: column_names,
+            resident_device_text_columns: Vec::new(),
+            gpu_id,
+            schema,
+            table: table.to_string(),
+            device_memory_proof: Some(new_device_memory.metadata().clone()),
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: pressured,
+            memory_pressure_active: pressured,
+        };
+        // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard
+        // in the shards list always finds its device memory (the recompaction loads the list then the memory).
+        self.read_state
+            .residency
+            .shard_device_memory
+            .insert_shard(table, new_shard_id, new_device_memory);
         self.read_state.residency.with_shards_mut(|shards| {
             if let Some(table_shards) = shards.get_mut(table) {
-                if let Some(open) = table_shards.last_mut() {
-                    open.row_count += k;
-                    open.resident_bytes = open.resident_bytes.saturating_add(appended_bytes);
-                }
+                table_shards.push(new_shard);
             }
         });
         self.read_state
