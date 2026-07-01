@@ -2265,7 +2265,7 @@ impl Engine {
         // source the executor runs over ONCE.
         let runtime = self.cuda_driver_probe_runtime();
         let unified_mem = runtime
-            .retain_device_memory_recompacted(gpu_id, allocated_bytes, &header, &segments)
+            .retain_device_memory_recompacted(gpu_id, allocated_bytes, &header, &[], &segments)
             .map_err(|err| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "sharded resident recompaction into a unified device buffer failed: {err}"

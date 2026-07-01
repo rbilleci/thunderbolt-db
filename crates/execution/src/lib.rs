@@ -805,6 +805,19 @@ pub struct RecompactSegment {
     pub byte_len: u64,
 }
 
+/// SV3 (MVCC visibility): fill `len` bytes of the freshly-allocated unified buffer at `byte_offset` with
+/// `fill_byte` (a `cuMemsetD8`) BEFORE the segment copies run. The recompaction buffer is `cuMemAlloc`'d
+/// (uninitialized), so a section not fully covered by segments would read garbage; a fill initializes it.
+/// Use `0xFF` to make a gathered `deleted_by` section born all-live (`u64::MAX`), so delete-free shards'
+/// rows (which contribute no `deleted_by` segment) read as live, and versioned shards' segments overwrite
+/// only their deleted slots. `len == 0` is a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecompactFill {
+    pub byte_offset: u64,
+    pub len: u64,
+    pub fill_byte: u8,
+}
+
 impl fmt::Debug for CudaResidentDeviceMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CudaResidentDeviceMemory")
@@ -3519,6 +3532,7 @@ impl CudaDriverRuntime {
         gpu_id: u16,
         allocated_bytes: u64,
         header: &[u8],
+        fills: &[RecompactFill],
         segments: &[RecompactSegment],
     ) -> Result<CudaResidentDeviceMemory, CudaRuntimeProbeError> {
         if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
@@ -3541,6 +3555,7 @@ impl CudaDriverRuntime {
             gpu_id,
             allocated_len,
             header,
+            fills,
             segments,
         )?;
         Ok(CudaResidentDeviceMemory {
@@ -3746,12 +3761,14 @@ fn launch_cuda_resident_device_memory_recompacted(
     gpu_id: u16,
     allocated_len: usize,
     header: &[u8],
+    fills: &[RecompactFill],
     segments: &[RecompactSegment],
 ) -> Result<RawCudaResidentDeviceMemory, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuMemcpyDtoD = unsafe extern "C" fn(u64, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
 
     // §9.3: allocate into the shared primary context for this GPU (created + cached on
     // first use), not a fresh per-allocation context. Make it current on this thread so
@@ -3787,6 +3804,17 @@ fn launch_cuda_resident_device_memory_recompacted(
             .or_else(|_| primary.lib().get::<CuMemcpyDtoD>(b"cuMemcpyDtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    let cu_memset_d8 = if fills.is_empty() {
+        None
+    } else {
+        Some(unsafe {
+            *primary
+                .lib()
+                .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        })
+    };
 
     let allocated_bytes = allocated_len as u64;
     let mut device_ptr = 0_u64;
@@ -3811,6 +3839,33 @@ fn launch_cuda_resident_device_memory_recompacted(
                 header.len(),
             )
         })?;
+    }
+
+    // SV3: fills run BEFORE the segment copies — they initialize a section (e.g. a gathered `deleted_by`
+    // born all-live) that segments then partially overwrite. `cuMemAlloc` leaves the buffer uninitialized,
+    // so a fill is the only way an un-segment-covered section reads a defined value.
+    if let Some(cu_memset_d8) = cu_memset_d8 {
+        for fill in fills {
+            if fill.len == 0 {
+                continue;
+            }
+            let end = fill
+                .byte_offset
+                .checked_add(fill.len)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if end > allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    usize::try_from(end).unwrap_or(usize::MAX),
+                ));
+            }
+            let destination = allocation_guard
+                .ptr
+                .checked_add(fill.byte_offset)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            let len = usize::try_from(fill.len)
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            check_cuda(unsafe { cu_memset_d8(destination, fill.fill_byte, len) })?;
+        }
     }
 
     // Each segment is a device→device copy from a source resident allocation into the unified
