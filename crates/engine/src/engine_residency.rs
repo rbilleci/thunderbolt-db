@@ -2271,10 +2271,17 @@ mod capacity_payload_tests {
         let needles: Vec<i32> =
             vec![0, 1, 5, 63, 64, 65, 128, 130, 191, 199, 200, 999, -1, 50, 51, 50, 130];
         let hb = e.sharded_point_batch_hits();
+        let gpu_hb = e.sharded_point_gpu_probe_hits();
         let proj = e
             .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
             .expect("batched path served this shape");
         assert!(e.sharded_point_batch_hits() > hb, "batched path FIRED (non-vacuity)");
+        // Sub-slice 8: this delete-free table takes the FULLY-GPU dense-emit path (not the host-probe
+        // fallback) — prove it fired, so the byte-identical comparison below is validating the GPU path.
+        assert!(
+            e.sharded_point_gpu_probe_hits() > gpu_hb,
+            "the GPU-native dense-emit probe path FIRED (delete-free -> not the host fallback)"
+        );
         assert_eq!(proj.ncols, 2, "id, balance");
         // Per-needle rows from the flat batched projection.
         let batched: Vec<Vec<Vec<i32>>> = (0..needles.len())
@@ -2325,6 +2332,38 @@ mod capacity_payload_tests {
             d.gather_sharded_int4_point_lookups_batched(&dt, did, &[did, dbal], &[1, 2]).is_none(),
             "duplicate key -> batched path declines -> None (caller falls back to the scan)"
         );
+
+        // CROSS-SHARD DUP (multi-shard kernel v2 correctness): the SAME key in TWO shards (each once, NO
+        // within-shard dup so both per-shard indexes build) -> the multi-shard kernel must NOT return only the
+        // first shard's row (the scan returns BOTH). It detects the 2nd shard hit -> the whole batch DECLINES
+        // (None) -> the caller falls back to the scan. A kernel that breaks on the first hit returns Some(1).
+        let x = Engine::new_local();
+        x.set_shard_residency_enabled(true);
+        x.set_auto_admit_on_commit(true);
+        x.set_shard_index_probe_enabled(true);
+        x.set_shard_size_target(64);
+        x.execute_text(1, "CREATE TABLE xdup (id INT, balance INT)").unwrap();
+        for i in 0..200i64 {
+            // id = i%100 -> id 5 at row 5 (shard 0) AND row 105 (shard 1): a CROSS-shard dup, unique per shard.
+            x.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO xdup (id, balance) VALUES ({}, {})", i % 100, i * 10),
+            )
+            .unwrap();
+        }
+        let xt = x.relational_catalog_table("xdup").unwrap();
+        let xid = crate::rel_exec_helpers::relational_column_index(&xt, "id").unwrap();
+        let xbal = crate::rel_exec_helpers::relational_column_index(&xt, "balance").unwrap();
+        assert!(
+            x.gather_sharded_int4_point_lookups_batched(&xt, xid, &[xid, xbal], &[5]).is_none(),
+            "cross-shard duplicate key -> batched declines -> None (scan returns BOTH rows)"
+        );
+        let xrows = x
+            .execute_relational_select_text("SELECT id, balance FROM xdup WHERE id = 5")
+            .unwrap()
+            .rows
+            .len();
+        assert_eq!(xrows, 2, "cross-shard dup id=5 -> 2 rows (row 5 + row 105) via the scan");
 
         // NULL-BLIND: batched == single-flight on a table with NULLs (both read raw i32, NULL as 0).
         let n = Engine::new_local();
@@ -2382,9 +2421,18 @@ mod capacity_payload_tests {
         let bal_col = crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
 
         let needles: Vec<i32> = vec![129, 130, 131];
+        let gpu_hb = t.sharded_point_gpu_probe_hits();
         let proj = t
             .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
             .expect("batched served");
+        // Sub-slice 8: the shard is VERSIONED (has a deleted_by region), so the un-gated GPU dense-emit path
+        // must DECLINE -> the host-probe path (which applies the SV3b gate) serves it. Prove the GPU path did
+        // NOT fire (else it would leak the tombstoned row).
+        assert_eq!(
+            t.sharded_point_gpu_probe_hits(),
+            gpu_hb,
+            "versioned shard -> GPU dense path declined -> host-gated fallback served it"
+        );
         let count = |i: usize| proj.needle_ranges[i].1;
         assert_eq!(count(0), 1, "id=129 live -> 1 row");
         assert_eq!(count(1), 0, "id=130 tombstoned -> hidden by the batched deleted_by gate");
@@ -3006,6 +3054,16 @@ impl Engine {
         self.read_state
             .residency
             .sharded_point_batch_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sub-slice 8 (GPU-native probe): count of batches served by the FULLY-GPU dense-emit path
+    /// (`gather_sharded_int4_point_lookups_batched_gpu`). Non-vacuity signal that the GPU-native probe (vs the
+    /// host-probe fallback) served the batch — output equality can't prove which path ran.
+    pub fn sharded_point_gpu_probe_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .sharded_point_gpu_probe_hits
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

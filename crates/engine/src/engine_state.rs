@@ -528,6 +528,12 @@ pub(crate) struct ResidencyReadState {
     /// `apply_drop_table`, the re-admit clears) to bound memory. Leak-only (never wrong-results: the pinned
     /// guard makes ptr-reuse impossible while an entry lives).
     pub(crate) shard_pk_index: Mutex<BTreeMap<(String, u32, usize), CachedShardPkIndex>>,
+    /// Sub-slice 8 (GPU-native probe): per-shard PK hash index resident ON THE DEVICE (uploaded once per
+    /// generation), so the batched point lookup probes+gathers+emits on the GPU. Keyed `(table, shard_id,
+    /// col_idx)`, validated by `(ptr, row_count)` + ABA `_resident_guard`, PURGED at the same lifecycle sites
+    /// as `shard_pk_index` (via `purge_shard_pk_index_for_table`). Parallel to the host `shard_pk_index`.
+    pub(crate) shard_pk_device_index:
+        Mutex<BTreeMap<(String, u32, usize), CachedShardPkDeviceIndex>>,
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe (vs the atomic
     /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
     /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.
@@ -552,6 +558,11 @@ pub(crate) struct ResidencyReadState {
     /// (shard, projected column) instead of a launch per needle). The non-vacuity signal that the batched
     /// path fired (vs a per-needle fallback). `Relaxed` monotonic counter.
     pub(crate) sharded_point_batch_hits: std::sync::atomic::AtomicU64,
+    /// Sub-slice 8 (GPU-native probe): count of batches served by the fully-GPU dense-emit path
+    /// (`gather_sharded_int4_point_lookups_batched_gpu` — device-resident per-shard index + the
+    /// `gpu_db_resident_i32_index_probe_dense` kernel probes+gathers+emits on the GPU, no host per-needle
+    /// probe). The non-vacuity signal that the GPU-native path (vs the host-probe fallback) served the batch.
+    pub(crate) sharded_point_gpu_probe_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
@@ -567,6 +578,12 @@ impl ResidencyReadState {
     /// residency changed. Cheap `retain` over the small cache; INERT for a delete/index-free table (empty).
     pub(crate) fn purge_shard_pk_index_for_table(&self, table: &str) {
         self.shard_pk_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(cached_table, _, _), _| cached_table != table);
+        // Sub-slice 8: the parallel DEVICE index cache is purged at the SAME lifecycle sites (it pins the
+        // shard buffer + holds a device allocation), 1:1 with the host `shard_pk_index`.
+        self.shard_pk_device_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|(cached_table, _, _), _| cached_table != table);

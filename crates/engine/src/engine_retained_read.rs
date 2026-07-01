@@ -1108,6 +1108,16 @@ impl Engine {
                 return None;
             }
         }
+        // Sub-slice 8: PREFER the fully-GPU dense-emit path (device-resident per-shard index + the
+        // `gpu_db_resident_i32_index_probe_dense` kernel probes+gathers+emits on the GPU — no host per-needle
+        // probe, one bulk DtoH per shard). Returns None -> fall through to the host-probe path below when a
+        // shard is VERSIONED (needs the SV3b deleted_by gate the dense kernel lacks), the shape/ncols is
+        // unsupported (>4 cols), or the index declines (dup) / errors. Byte-identical either way.
+        if let Some(gpu) =
+            self.gather_sharded_int4_point_lookups_batched_gpu(table, filter_idx, selected_indexes, needles)
+        {
+            return Some(gpu);
+        }
         let read_txn_id = self.committed_seq() as i64;
         let groups = self.locate_sharded_pk_batch(table, filter_idx, needles)?;
         let ncols = selected_indexes.len();
@@ -1165,6 +1175,229 @@ impl Engine {
                 None => needle_ranges.push((start, 0)),
             }
         }
+        self.read_state
+            .residency
+            .sharded_point_batch_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(BatchedShardProjection {
+            ncols,
+            values,
+            needle_ranges,
+        })
+    }
+
+    /// Sub-slice 8 (GPU-native probe): ensure the shard's PK hash index is resident ON THE DEVICE (uploaded
+    /// once per shard generation), returning `(device_index, table_mask, hash_shift)` for the dense-emit
+    /// probe kernel. Mirrors R1's `build_wave_resident_int4_index` per shard: DtoH the key column -> build the
+    /// host hash table (`(key<<32)|(row+1)`) -> HtoD upload via `retain_device_memory_copy` -> cache keyed
+    /// `(table, shard_id, col_idx)` validated by `(ptr, row_count)` + the ABA `_resident_guard` pin. `None`
+    /// (caller falls back to the host path) when the shard is empty / oversize, the DtoH fails, the upload
+    /// fails, or the key column has DUPLICATES (the hash declines — cached as `device_index: None` so it is
+    /// not rebuilt every batch).
+    fn ensure_shard_pk_device_index(
+        &self,
+        table_name: &str,
+        shard_id: u32,
+        col_idx: usize,
+        device_memory: &Arc<CudaResidentDeviceMemory>,
+        filter_offset: u64,
+        row_count: usize,
+    ) -> Option<(Arc<CudaResidentDeviceMemory>, u32, u32)> {
+        let device_ptr = device_memory.device_ptr();
+        let cache_key = (table_name.to_string(), shard_id, col_idx);
+        // Fast path: a valid cached device index -> return it (or None if it declined at build).
+        {
+            let cache = self
+                .read_state
+                .residency
+                .shard_pk_device_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.resident_device_ptr == device_ptr && entry.row_count == row_count {
+                    return entry
+                        .device_index
+                        .clone()
+                        .map(|di| (di, entry.table_mask, entry.hash_shift));
+                }
+            }
+        }
+        // Miss / stale ptr: build the host hash table + upload to device, OUTSIDE the lock.
+        let row_count_u64 = row_count as u64;
+        if row_count == 0 || row_count_u64 >= u32::MAX as u64 {
+            return None;
+        }
+        let keys = device_memory.read_resident_i32_column(filter_offset, row_count).ok()?;
+        if keys.len() != row_count {
+            return None;
+        }
+        let (device_index, table_mask, hash_shift) =
+            match build_int4_pk_hash_table_host(&keys, row_count_u64) {
+                Some((index, table_mask, hash_shift)) => {
+                    let index_bytes: Vec<u8> =
+                        index.iter().flat_map(|entry| entry.to_le_bytes()).collect();
+                    let runtime = self.cuda_driver_probe_runtime();
+                    let gpu_id = device_memory.metadata().gpu_id;
+                    // An upload failure (e.g. OOM) is TRANSIENT -> return None WITHOUT caching (retry next
+                    // batch); the caller falls back to the host path meanwhile.
+                    let Ok(mem) = runtime.retain_device_memory_copy(gpu_id, &index_bytes) else {
+                        return None;
+                    };
+                    (Some(Arc::new(mem)), table_mask, hash_shift)
+                }
+                // Duplicate / oversize key column -> declined; CACHE `None` so it is not rebuilt every batch.
+                None => (None, 0, 0),
+            };
+        let result = device_index.clone().map(|di| (di, table_mask, hash_shift));
+        let entry = CachedShardPkDeviceIndex {
+            resident_device_ptr: device_ptr,
+            row_count,
+            _resident_guard: Arc::clone(device_memory),
+            device_index,
+            table_mask,
+            hash_shift,
+        };
+        self.read_state
+            .residency
+            .shard_pk_device_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(cache_key, entry);
+        result
+    }
+
+    /// Sub-slice 8 (GPU-native probe): the FULLY-GPU batched cross-shard point-lookup — the charter-faithful
+    /// completion of lpb-for-shards. Per shard: ensure the device-resident PK index, then launch the
+    /// `gpu_db_resident_i32_index_probe_dense` kernel (`submit_match_project_i32_index_probe_dense_from_payload`)
+    /// which PROBES each needle + GATHERS the projected columns + DENSE-EMITS on the GPU — no host per-needle
+    /// probe, one bulk DtoH per shard. The per-shard dense outputs merge in ONE O(shards*needles) host pass
+    /// (status scan + flat compaction, NO per-needle allocation), scattered to NEEDLE ORDER.
+    ///
+    /// Returns `None` (the caller falls back to the host-probe `gather_sharded_int4_point_lookups_batched`
+    /// body, which applies the SV3b deleted_by gate) when: the projection is >4 int4 columns (the dense
+    /// kernel gathers <=4); ANY surviving shard is VERSIONED (has a `deleted_by` region — the dense kernel has
+    /// NO visibility gate, so a versioned shard MUST take the gated host path); a shard is invalid; the device
+    /// index declines (dup) / fails; a needle Hits >1 shard (cross-shard dup); or any device error. The
+    /// DELETE-FREE majority (incl. the benchmark) takes this fully-GPU path. Increments
+    /// `sharded_point_gpu_probe_hits` + `sharded_point_batch_hits`.
+    fn gather_sharded_int4_point_lookups_batched_gpu(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        selected_indexes: &[usize],
+        needles: &[i32],
+    ) -> Option<BatchedShardProjection> {
+        let ncols = selected_indexes.len();
+        // The dense kernel gathers 1..=4 projection columns.
+        if ncols == 0 || ncols > 4 {
+            return None;
+        }
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let n = needles.len();
+        // Build the per-shard descriptor list for the MULTI-SHARD kernel: for each non-empty, delete-free,
+        // valid shard, ensure its DEVICE index + capture (device buffer, device index, mask, shift, capacity-
+        // strided projection offsets, row_count). ONE kernel then probes ALL shards per needle + dense-emits a
+        // single needle-indexed output (no S*N DtoH, no host merge).
+        let mut probe_shards: Vec<gpu_db_execution::MultiShardProbeShard> = Vec::new();
+        for shard in table_shards.iter() {
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
+                return None;
+            }
+            if shard.row_count == 0 {
+                continue;
+            }
+            // DELETE-FREE gate: a VERSIONED shard needs the SV3b `deleted_by[slot]` visibility gate, which the
+            // dense kernel does not apply -> fall back to the host gather (which does) for the whole batch.
+            if self
+                .read_state
+                .residency
+                .shard_deleted_by_memory
+                .get(&(table.name.clone(), shard.shard_id))
+                .is_some()
+            {
+                return None;
+            }
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let filter_offset =
+                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
+            let device_memory = self
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&(table.name.clone(), shard.shard_id))?;
+            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
+                &table.name,
+                shard.shard_id,
+                filter_idx,
+                &device_memory,
+                filter_offset,
+                shard.row_count,
+            )?;
+            let mut projection_offsets: Vec<u64> = Vec::with_capacity(ncols);
+            for &idx in selected_indexes {
+                projection_offsets
+                    .push(resident_device_int4_column_offset(&descriptor, table, idx).ok()?);
+            }
+            probe_shards.push(gpu_db_execution::MultiShardProbeShard {
+                resident: device_memory,
+                index: device_index,
+                table_mask,
+                hash_shift,
+                projection_offsets,
+                row_count: shard.row_count as u64,
+            });
+        }
+        // Compact a needle-indexed dense output (status[i]==1 -> 1 row, else 0) in ONE pass -- the SAME
+        // compaction the single-buffer dense path uses; the kernel already wrote needle order, so there is NO
+        // cross-shard host merge. Empty output (no non-empty shards) -> all needles absent.
+        let (values, needle_ranges) = if probe_shards.is_empty() {
+            (Vec::new(), vec![(0u32, 0u32); n])
+        } else {
+            // `self` context = the first shard's buffer (allocation/launch only; the kernel reads each shard's
+            // own ptr from the descriptor array). ONE kernel launch, ONE bulk DtoH.
+            let submission = probe_shards[0]
+                .resident
+                .submit_multi_shard_i32_index_probe_dense(&probe_shards, needles)
+                .ok()?;
+            let (cols, _elapsed) = submission.complete_detached_columnar().ok()?;
+            if cols.status.len() != n {
+                return None;
+            }
+            let mut values: Vec<i32> = Vec::with_capacity(n * ncols);
+            let mut needle_ranges: Vec<(u32, u32)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let start = (values.len() / ncols) as u32;
+                match cols.status[i] {
+                    1 => {
+                        // Found in exactly one shard -> its projected row.
+                        values.extend_from_slice(&cols.values[i * ncols..(i + 1) * ncols]);
+                        needle_ranges.push((start, 1));
+                    }
+                    2 => needle_ranges.push((start, 0)), // absent in every shard
+                    // 3 = the multi-shard kernel found this needle in >1 shard (a CROSS-shard duplicate): it
+                    // can emit only one slot, and the scan returns EVERY match -> decline the WHOLE batch to
+                    // the host path (which also declines cross-shard dups -> the per-query scan). 0 = a thread
+                    // that never wrote (gap guard) -> also decline (never a wrong result).
+                    _ => return None,
+                }
+            }
+            (values, needle_ranges)
+        };
+        self.read_state
+            .residency
+            .sharded_point_gpu_probe_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.read_state
             .residency
             .sharded_point_batch_hits

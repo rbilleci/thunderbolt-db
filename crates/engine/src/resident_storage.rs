@@ -55,6 +55,24 @@ pub(crate) struct CachedShardPkIndex {
     pub(crate) index: Option<CachedShardPkIndexData>,
 }
 
+/// Sub-slice 8 (GPU-NATIVE probe): a per-shard PK hash index resident ON THE DEVICE, so the batched point
+/// lookup PROBES + GATHERS + DENSE-EMITS entirely on the GPU (the `gpu_db_resident_i32_index_probe_dense`
+/// kernel) with no host per-needle probe — mirrors R1's single-buffer `WaveResidentIndex`, per shard. The
+/// host hash table (`(key<<32)|(row+1)`, same format the device kernel probes) is uploaded once per shard
+/// generation via `retain_device_memory_copy`. `_resident_guard` PINS the shard's column buffer (ABA guard);
+/// validated by `(resident_device_ptr, row_count)` exactly like the host `CachedShardPkIndex`. `device_index
+/// = None` = the shard DECLINED at build (duplicate / oversize key column) -> the caller falls back to the
+/// host path (cached so it is not retried every batch).
+#[derive(Debug)]
+pub(crate) struct CachedShardPkDeviceIndex {
+    pub(crate) resident_device_ptr: u64,
+    pub(crate) row_count: usize,
+    pub(crate) _resident_guard: Arc<CudaResidentDeviceMemory>,
+    pub(crate) device_index: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(crate) table_mask: u32,
+    pub(crate) hash_shift: u32,
+}
+
 /// The built per-shard PK index payload: the int4 hash table (`(key<<32)|(row+1)`) + its mask/shift, and the
 /// membership bloom (words + size + hash count). Host-resident (probed on the host; the row is then gathered
 /// from the device). Sub-slice 8 migrates the build/probe on-device.

@@ -2281,6 +2281,17 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    /// Sub-slice 8 v2 (charter-faithful multi-shard probe): probe a BATCH of needles against ALL `shards`'
+    /// device indexes in ONE kernel launch, gathering + dense-emitting on the GPU (1xN output, no host merge).
+    /// `self` is only the allocation/launch context (any shard's device buffer on the same GPU works).
+    pub fn submit_multi_shard_i32_index_probe_dense(
+        &self,
+        shards: &[MultiShardProbeShard],
+        needles: &[i32],
+    ) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_multi_shard_index_probe_dense(self, shards, needles)
+    }
+
     pub fn match_i32_equal_row_indices_from_payload(
         &self,
         filters: &[(u64, i32)],
@@ -10309,6 +10320,10 @@ pub struct CudaI32IndexProbeDenseSubmission {
     stream: Option<PooledStreamOwned>,
     timed: bool,
     _wave_index_guard: Option<Arc<CudaResidentDeviceMemory>>,
+    /// Sub-slice 8 v2 (multi-shard kernel): pins the per-shard device indexes + the descriptor-array device
+    /// buffer alive until the kernel completes (the kernel reads them). Empty/None for the single-shard path.
+    _multi_shard_index_guards: Vec<Arc<CudaResidentDeviceMemory>>,
+    _multi_shard_desc_guard: Option<PooledDeviceBufferOwned>,
 }
 
 fn submit_cuda_resident_i32_index_probe_dense<R: CudaResidentReadSource>(
@@ -10667,6 +10682,436 @@ DONE:
         stream: Some(stream_owned),
         timed,
         _wave_index_guard: Some(Arc::clone(index)),
+        _multi_shard_index_guards: Vec::new(),
+        _multi_shard_desc_guard: None,
+    })
+}
+
+/// Sub-slice 8 v2: one shard's inputs for the MULTI-SHARD dense-emit probe. The kernel reads these from a
+/// device-resident descriptor array (64 bytes/shard) so ONE kernel launch probes ALL shards per needle,
+/// emits ONE dense slot (1xN output, no S*N DtoH, no host merge).
+pub struct MultiShardProbeShard {
+    /// The shard's column BUFFER (probed at the capacity-strided projection offsets).
+    pub resident: Arc<CudaResidentDeviceMemory>,
+    /// The shard's DEVICE hash index (`(key<<32)|(row+1)`), pinned until the kernel completes.
+    pub index: Arc<CudaResidentDeviceMemory>,
+    pub table_mask: u32,
+    pub hash_shift: u32,
+    /// Byte offsets of the projected int4 columns in `resident` (1..=4, capacity-strided).
+    pub projection_offsets: Vec<u64>,
+    /// The shard's live row count (for the projection bounds check).
+    pub row_count: u64,
+}
+
+/// Sub-slice 8 v2 (charter-faithful): the MULTI-SHARD dense-emit point-lookup probe. ONE kernel launch where
+/// each thread (needle) loops over ALL `shards` reading a device DESCRIPTOR ARRAY, probes each shard's device
+/// hash index, and on the FIRST hit gathers the projected columns from that shard's buffer + dense-emits ONE
+/// slot + status; a needle in no shard emits status=2. This replaces the per-shard-kernel + HOST-merge (v1):
+/// the DtoH is `needle_count*projection_count` (NOT `shards*needle_count`), and the merge is eliminated
+/// (the kernel writes needle-indexed output directly). All shards must share `projection_count` (1..=4).
+fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
+    ctx: &CudaResidentDeviceMemory,
+    shards: &[MultiShardProbeShard],
+    needles: &[i32],
+) -> Result<CudaI32IndexProbeDenseSubmission, CudaRuntimeProbeError> {
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const MAX_PROJECTIONS: usize = 4;
+    const DESC_U64_PER_SHARD: usize = 8; // resident_ptr, index_ptr, mask|shift, proj0..3, reserved
+    // PTX: outer SHARD loop over a device descriptor array (64 B/shard) wrapping the single-shard probe +
+    // gather. Each thread probes shard 0, 1, ... until a FOUND (emit slot + status=1) or all miss (status=2).
+    // The hash/probe/gather is byte-identical to `gpu_db_resident_i32_index_probe_dense`; only the shard loop +
+    // per-shard descriptor reads are new. ASCII-only.
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_multi_shard_i32_index_probe_dense(
+    .param .u64 desc_array_ptr,
+    .param .u32 shard_count,
+    .param .u32 needle_count,
+    .param .u32 projection_count,
+    .param .u64 needles_ptr,
+    .param .u64 out_values_ptr,
+    .param .u64 out_status_ptr
+)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<40>;
+
+    ld.param.u64 %rd1, [desc_array_ptr];
+    ld.param.u32 %r1, [shard_count];
+    ld.param.u32 %r2, [needle_count];
+    ld.param.u32 %r3, [projection_count];
+    ld.param.u64 %rd2, [needles_ptr];
+    ld.param.u64 %rd3, [out_values_ptr];
+    ld.param.u64 %rd4, [out_status_ptr];
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra DONE;
+    setp.eq.u32 %p1, %r3, 0;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd5, %r7, 4;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.s32 %r8, [%rd6];
+
+    mov.u32 %r9, 0;
+    mov.u32 %r19, 0;
+
+SHARD:
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra ALLDONE;
+    mul.wide.u32 %rd7, %r9, 64;
+    add.u64 %rd8, %rd1, %rd7;
+    ld.global.u64 %rd9, [%rd8];
+    ld.global.u64 %rd10, [%rd8+8];
+    ld.global.u64 %rd11, [%rd8+16];
+    cvt.u32.u64 %r10, %rd11;
+    shr.u64 %rd12, %rd11, 32;
+    cvt.u32.u64 %r11, %rd12;
+    mul.lo.u32 %r12, %r8, 2654435761;
+    shr.u32 %r13, %r12, %r11;
+    mov.u32 %r14, 0;
+
+PROBE:
+    and.b32 %r13, %r13, %r10;
+    mul.wide.u32 %rd13, %r13, 8;
+    add.u64 %rd14, %rd10, %rd13;
+    ld.global.u64 %rd15, [%rd14];
+    setp.eq.u64 %p2, %rd15, 0;
+    @%p2 bra NEXTSHARD;
+    shr.u64 %rd16, %rd15, 32;
+    cvt.u32.u64 %r15, %rd16;
+    setp.eq.s32 %p2, %r15, %r8;
+    @%p2 bra FOUND;
+    add.u32 %r13, %r13, 1;
+    add.u32 %r14, %r14, 1;
+    setp.ge.u32 %p3, %r14, 256;
+    @%p3 bra NEXTSHARD;
+    bra PROBE;
+
+NEXTSHARD:
+    add.u32 %r9, %r9, 1;
+    bra SHARD;
+
+FOUND:
+    setp.eq.u32 %p5, %r19, 1;
+    @%p5 bra DUP;
+    mov.u32 %r19, 1;
+    cvt.u32.u64 %r16, %rd15;
+    sub.u32 %r16, %r16, 1;
+    cvt.u64.u32 %rd17, %r16;
+    mul.lo.u64 %rd24, %rd17, 4;
+
+    cvt.u64.u32 %rd18, %r7;
+    mul.lo.u64 %rd19, %rd18, 4;
+    add.u64 %rd20, %rd4, %rd19;
+    mov.u32 %r17, 1;
+    st.global.u32 [%rd20], %r17;
+
+    cvt.u64.u32 %rd21, %r3;
+    mul.lo.u64 %rd22, %rd18, %rd21;
+    mul.lo.u64 %rd22, %rd22, 4;
+    add.u64 %rd23, %rd3, %rd22;
+
+    ld.global.u64 %rd25, [%rd8+24];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    st.global.s32 [%rd23], %r18;
+
+    setp.le.u32 %p4, %r3, 1;
+    @%p4 bra AFTEREMIT;
+    ld.global.u64 %rd25, [%rd8+32];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    add.u64 %rd27, %rd23, 4;
+    st.global.s32 [%rd27], %r18;
+
+    setp.le.u32 %p4, %r3, 2;
+    @%p4 bra AFTEREMIT;
+    ld.global.u64 %rd25, [%rd8+40];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    add.u64 %rd27, %rd23, 8;
+    st.global.s32 [%rd27], %r18;
+
+    setp.le.u32 %p4, %r3, 3;
+    @%p4 bra AFTEREMIT;
+    ld.global.u64 %rd25, [%rd8+48];
+    add.u64 %rd26, %rd9, %rd25;
+    add.u64 %rd26, %rd26, %rd24;
+    ld.global.s32 %r18, [%rd26];
+    add.u64 %rd27, %rd23, 12;
+    st.global.s32 [%rd27], %r18;
+
+AFTEREMIT:
+    add.u32 %r9, %r9, 1;
+    bra SHARD;
+
+DUP:
+    cvt.u64.u32 %rd18, %r7;
+    mul.lo.u64 %rd19, %rd18, 4;
+    add.u64 %rd20, %rd4, %rd19;
+    mov.u32 %r17, 3;
+    st.global.u32 [%rd20], %r17;
+    bra DONE;
+
+ALLDONE:
+    setp.eq.u32 %p5, %r19, 1;
+    @%p5 bra DONE;
+    cvt.u64.u32 %rd18, %r7;
+    mul.lo.u64 %rd19, %rd18, 4;
+    add.u64 %rd20, %rd4, %rd19;
+    mov.u32 %r17, 2;
+    st.global.u32 [%rd20], %r17;
+
+DONE:
+    ret;
+}
+"#;
+
+    if shards.is_empty() || needles.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    let projection_count = shards[0].projection_offsets.len();
+    if projection_count == 0 || projection_count > MAX_PROJECTIONS {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(projection_count));
+    }
+    // Build the descriptor array + per-shard bounds check; all shards share projection_count.
+    let mut desc: Vec<u64> = Vec::with_capacity(shards.len() * DESC_U64_PER_SHARD);
+    let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> =
+        Vec::with_capacity(shards.len() * 2);
+    for shard in shards {
+        if shard.projection_offsets.len() != projection_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                shard.projection_offsets.len(),
+            ));
+        }
+        if shard.row_count == 0 || shard.index.device_ptr() == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let allocated = shard.resident.metadata().allocated_bytes;
+        for &byte_offset in &shard.projection_offsets {
+            let end = shard
+                .row_count
+                .checked_mul(std::mem::size_of::<i32>() as u64)
+                .and_then(|bytes| byte_offset.checked_add(bytes))
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if end > allocated {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
+            }
+        }
+        desc.push(shard.resident.device_ptr());
+        desc.push(shard.index.device_ptr());
+        desc.push((shard.table_mask as u64) | ((shard.hash_shift as u64) << 32));
+        let mut offs = [0u64; MAX_PROJECTIONS];
+        for (i, &o) in shard.projection_offsets.iter().enumerate() {
+            offs[i] = o;
+        }
+        desc.extend_from_slice(&offs);
+        desc.push(0); // reserved
+        // Pin the shard's column buffer + its device index alive until the kernel completes.
+        index_guards.push(Arc::clone(&shard.resident));
+        index_guards.push(Arc::clone(&shard.index));
+    }
+    let shard_count_u32 = u32::try_from(shards.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
+    let needle_count_u32 = u32::try_from(needles.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
+    let projection_count_u32 = projection_count as u32;
+
+    let output_bytes = usize::try_from(
+        (needles.len() as u64)
+            .checked_mul(projection_count as u64)
+            .and_then(|c| c.checked_mul(std::mem::size_of::<i32>() as u64))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let status_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let needle_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let desc_bytes = desc
+        .len()
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_memset_d8 = unsafe {
+        ctx.lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| ctx.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        ctx.lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| ctx.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        ctx.lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let primary = ctx.primary_arc();
+    primary.set_current()?;
+
+    let needles_guard = primary.lease_device_buffer_owned(needle_bytes)?;
+    let values_guard = primary.lease_device_buffer_owned(output_bytes)?;
+    let status_guard = primary.lease_device_buffer_owned(status_bytes)?;
+    let desc_guard = primary.lease_device_buffer_owned(desc_bytes)?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function =
+        primary.cached_function(c"gpu_db_resident_multi_shard_i32_index_probe_dense", &ptx)?;
+
+    let mut desc_arg = desc_guard.ptr;
+    let mut shard_count_arg = shard_count_u32;
+    let mut needle_count_arg = needle_count_u32;
+    let mut projection_count_arg = projection_count_u32;
+    let mut needles_arg = needles_guard.ptr;
+    let mut output_arg = values_guard.ptr;
+    let mut status_arg = status_guard.ptr;
+    let mut args = [
+        (&mut desc_arg as *mut u64).cast::<c_void>(),
+        (&mut shard_count_arg as *mut u32).cast::<c_void>(),
+        (&mut needle_count_arg as *mut u32).cast::<c_void>(),
+        (&mut projection_count_arg as *mut u32).cast::<c_void>(),
+        (&mut needles_arg as *mut u64).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut status_arg as *mut u64).cast::<c_void>(),
+    ];
+    let threads_per_block = 128;
+    let blocks = needle_count_u32.div_ceil(threads_per_block);
+
+    let stream_owned = PooledStreamOwned {
+        primary: Arc::clone(&primary),
+        pooled: Some(primary.acquire_pooled_stream()?),
+    };
+    let pooled = stream_owned
+        .pooled
+        .as_ref()
+        .expect("pooled stream just leased");
+    let stream = pooled.stream;
+    let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
+    // HtoD needles + descriptor array, memset status to 0 (the gap guard the completion debug_asserts).
+    let async_ops = match (primary.cu_memcpy_htod_async, primary.cu_memset_d8_async) {
+        (Some(htod), Some(memset)) => Some((htod, memset)),
+        _ => None,
+    };
+    if let Some((htod_async, memset_async)) = async_ops {
+        check_cuda(unsafe {
+            htod_async(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+                stream,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe {
+            htod_async(
+                desc_guard.ptr,
+                desc.as_ptr().cast::<c_void>(),
+                desc_bytes,
+                stream,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { memset_async(status_guard.ptr, 0, status_bytes, stream) })
+            .map_err(drain_err)?;
+    } else {
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe {
+            cu_memcpy_htod(desc_guard.ptr, desc.as_ptr().cast::<c_void>(), desc_bytes)
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(status_guard.ptr, 0, status_bytes) }).map_err(drain_err)?;
+    }
+
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })
+            .map_err(drain_err)?;
+    }
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            blocks,
+            1,
+            1,
+            threads_per_block,
+            1,
+            1,
+            0,
+            stream,
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })
+    .map_err(drain_err)?;
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })
+            .map_err(drain_err)?;
+    }
+
+    Ok(CudaI32IndexProbeDenseSubmission {
+        projection_count,
+        needles_len: needles.len(),
+        primary,
+        values_guard,
+        status_guard,
+        _needles_guard: needles_guard,
+        stream: Some(stream_owned),
+        timed,
+        _wave_index_guard: None,
+        _multi_shard_index_guards: index_guards,
+        _multi_shard_desc_guard: Some(desc_guard),
     })
 }
 
