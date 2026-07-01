@@ -346,6 +346,8 @@ impl Engine {
         };
         let prefix = relational_key_prefix(&update.table);
         let mut updates = Vec::new();
+        // SV5: OLD images (catalog order) captured before the assignments, PARALLEL to `updates`.
+        let mut updated_old_rows: Vec<Vec<SqlValue>> = Vec::new();
         let mut candidate_rows = Vec::new();
         // Unique slots the OLD images RELEASE (prereq #2, Stage-4 audit). An UPDATE that changes a
         // unique column frees its old `(table, column, value)` slot; record those freed slots in the
@@ -377,6 +379,8 @@ impl Engine {
                 let mut old_slots = WriteSet::default();
                 old_slots.add_unique_slots(&table, &row);
                 released_unique_slots.append(&mut old_slots.unique_slots);
+                // SV5: capture the OLD image before the assignments overwrite it (parallel to `updates`).
+                updated_old_rows.push(row.clone());
                 for (idx, value) in &assignments {
                     row[*idx] = value.clone();
                 }
@@ -449,6 +453,7 @@ impl Engine {
                 table: update.table.clone(),
                 installs: updates,
                 value_index_entries,
+                updated_old_rows,
             },
         })
     }

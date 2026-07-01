@@ -111,6 +111,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("the tuple_ids to tombstone in the host store) is itself O(table). That residual host scan is the");
     println!("CPU relational engine cost the mission retires: full O(rows) DELETE needs the resident index to");
     println!("drive DELETE-resolution (or the host store retired for resident tables), NOT more device work.");
+
+    // SV5: single-row UPDATE on a shard-resident table (tombstone old + append new vs re-admit). Same shape
+    // as DELETE: the device re-admit is removed, the host-side prepare_update seq_scan remains O(table).
+    println!();
+    println!("## single-row UPDATE on a shard-resident table (SV5: re-admit vs tombstone-old + append-new)");
+    println!("| base_rows | upd_readmit_mean_us | upd_readmit_max_us | upd_incremental_mean_us | upd_incremental_max_us | speedup |");
+    println!("|---|---|---|---|---|---|");
+    for &base in &bases {
+        let (readmit_mean, readmit_max) = measure_resident_update(base, timed, false)?;
+        let (inc_mean, inc_max) = measure_resident_update(base, timed, true)?;
+        let speedup = if inc_mean > 0.0 { readmit_mean / inc_mean } else { 0.0 };
+        println!(
+            "| {base} | {readmit_mean:.1} | {readmit_max:.1} | {inc_mean:.1} | {inc_max:.1} | {speedup:.1}x |"
+        );
+    }
+    println!();
+    println!("Reading: UPDATE re-admit is O(table); tombstone-old + append-new removes the device re-admit");
+    println!("(same win as DELETE), leaving the host-side prepare_update seq_scan as the O(table) residual =");
+    println!("the same CPU-engine cost the resident index / host-store retirement removes.");
     Ok(())
 }
 
@@ -196,6 +215,53 @@ fn measure_resident_delete(
     let mut samples_us = Vec::with_capacity(n as usize);
     for k in 0..n {
         let sql = format!("DELETE FROM accounts WHERE id = {k}");
+        let start = Instant::now();
+        engine.execute_text(txn, &sql)?;
+        txn += 1;
+        samples_us.push(start.elapsed().as_secs_f64() * 1e6);
+    }
+    let mean = samples_us.iter().sum::<f64>() / samples_us.len().max(1) as f64;
+    let max = samples_us.iter().cloned().fold(0.0_f64, f64::max);
+    Ok((mean, max))
+}
+
+/// SV5: load `base` rows into a SHARD-resident table (untimed), then time `timed` single-row UPDATEs by
+/// unique key. `tombstone` ON routes each UPDATE through tombstone-old + append-new (O(rows)); OFF leaves the
+/// O(table) invalidate + re-admit. Returns (mean_us, max_us) per single-row UPDATE.
+fn measure_resident_update(
+    base: i64,
+    timed: usize,
+    tombstone: bool,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    let mut engine = Engine::new_local();
+    engine.set_shard_residency_enabled(true);
+    engine.set_auto_admit_on_commit(false);
+    engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
+    let mut txn = 2u64;
+    let mut id = 0i64;
+    while id < base {
+        let mut vals = String::new();
+        for _ in 0..INSERT_CHUNK {
+            if id >= base {
+                break;
+            }
+            if !vals.is_empty() {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
+            id += 1;
+        }
+        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        txn += 1;
+    }
+    engine.populate_relational_residency_snapshot("accounts")?;
+    engine.set_auto_admit_on_commit(true);
+    engine.set_resident_update_tombstone_enabled(tombstone);
+    let n = (timed as i64).min(base);
+    let mut samples_us = Vec::with_capacity(n as usize);
+    for k in 0..n {
+        // Change the int4 `balance` column -> a value-changing single-row UPDATE by unique key.
+        let sql = format!("UPDATE accounts SET balance = {} WHERE id = {k}", 900_000 + k);
         let start = Instant::now();
         engine.execute_text(txn, &sql)?;
         txn += 1;

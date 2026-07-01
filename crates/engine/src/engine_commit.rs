@@ -141,6 +141,13 @@ impl Engine {
                     {
                         self.try_tombstone_resident_delete_commit(cat, table, rows, token.index)
                     }
+                    Some(AppliedRowMutation::Update {
+                        table,
+                        old_rows,
+                        new_rows,
+                    }) if self.resident_update_tombstone_enabled() => {
+                        self.try_update_resident_commit(cat, table, old_rows, new_rows, token.index)
+                    }
                     _ => false,
                 };
             if !handled {
@@ -711,7 +718,15 @@ impl Engine {
                     .apply_delete(cat, delete, commit_seq)?
                     .map(|(table, rows)| AppliedRowMutation::Delete { table, rows });
             }
-            Command::Update(update) => self.apply_update(cat, update, commit_seq)?,
+            Command::Update(update) => {
+                applied = self
+                    .apply_update(cat, update, commit_seq)?
+                    .map(|(table, old_rows, new_rows)| AppliedRowMutation::Update {
+                        table,
+                        old_rows,
+                        new_rows,
+                    });
+            }
             _ => {}
         }
 

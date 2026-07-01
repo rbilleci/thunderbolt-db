@@ -86,6 +86,7 @@ impl Engine {
                 table,
                 installs,
                 value_index_entries,
+                updated_old_rows: _,
             } => {
                 self.read_state.mvcc.with_table_mut(&table, |data| {
                     for (tuple_id, _row_key, values) in &installs {
@@ -214,13 +215,30 @@ impl Engine {
         cat: &mut DdlCatalogState,
         update: Update,
         txn_id: TxnId,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>)>, EngineError> {
         // Stage 2 split: PURE prepare (resolve matches + encode new images + preflight +
         // write-set) then a `&mut self` version-rewrite install. `txn_id` is the commit-seq used as
         // both the read boundary and the version stamp, identical to the old direct apply.
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_update(&update, snapshot)?;
-        self.apply_delta_serialized(cat, delta, txn_id, None)
+        // SV5: surface `(table, old_rows, new_rows)` BEFORE `apply_delta` consumes the delta, so a single-
+        // entry UPDATE commit can tombstone the old resident slot + append the new image in place. `old_rows`
+        // (pre-assignment) is parallel to `installs`; `new_rows` = each install's row image. Same order.
+        let applied = match &delta.mutation {
+            PreparedMutation::Update {
+                table,
+                installs,
+                updated_old_rows,
+                ..
+            } => Some((
+                table.clone(),
+                updated_old_rows.clone(),
+                installs.iter().map(|(_id, _key, row)| row.clone()).collect(),
+            )),
+            _ => None,
+        };
+        self.apply_delta_serialized(cat, delta, txn_id, None)?;
+        Ok(applied)
     }
 
     pub(crate) fn preflight_unique_index_constraints(

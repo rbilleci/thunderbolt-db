@@ -178,6 +178,8 @@ impl Engine {
             shard_residency_enabled: std::sync::atomic::AtomicBool::new(false),
             // SV4b: GPU-native incremental DELETE (tombstone instead of re-admit) default OFF (nested A/B lever).
             resident_delete_tombstone_enabled: std::sync::atomic::AtomicBool::new(false),
+            // SV5: GPU-native incremental UPDATE (tombstone old + append new) default OFF (nested A/B lever).
+            resident_update_tombstone_enabled: std::sync::atomic::AtomicBool::new(false),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }

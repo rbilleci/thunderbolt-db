@@ -1704,6 +1704,115 @@ mod capacity_payload_tests {
         assert_eq!(count(&c), 199, "control: COUNT 199 == the flag-ON result (byte-identical semantics)");
     }
 
+    /// SV5 (GPU-native incremental UPDATE, commit WIRING): with `resident_update_tombstone_enabled` ON, a
+    /// single-row SQL UPDATE on a shard-resident table TOMBSTONES the old version's slot + APPENDS the new
+    /// image IN PLACE (no O(table) re-admit) and the GPU read == host MVCC. NON-VACUITY: the deleted_by region
+    /// EXISTING after the UPDATE proves the tombstone-old route ran (re-admit fallback rebuilds ALL-LIVE => NO
+    /// region); the read returns the NEW value; COUNT is unchanged (old hidden + new visible); the OLD value is
+    /// hidden; a MULTI-ROW UPDATE falls back to re-admit (correct); flag-OFF control identical.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sv5_sql_update_tombstones_old_appends_new_matches_host_mvcc() {
+        let load = |e: &Engine| {
+            e.set_shard_residency_enabled(true);
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            for i in 0..200_i64 {
+                e.execute_text(
+                    (i as u64) + 2,
+                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                )
+                .unwrap();
+            }
+        };
+        let count = |e: &Engine| match e
+            .execute_relational_select_text("SELECT COUNT(*) FROM accounts")
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("unexpected COUNT shape {other:?}"),
+        };
+        let balance_of = |e: &Engine, id: i64| -> Option<i32> {
+            let rows = e
+                .execute_relational_select_text(&format!(
+                    "SELECT id, balance FROM accounts WHERE id = {id}"
+                ))
+                .unwrap()
+                .rows;
+            if rows.is_empty() {
+                return None;
+            }
+            match &rows.row(0)[1] {
+                SqlValue::Int4(b) => Some(*b),
+                other => panic!("unexpected row shape {other:?}"),
+            }
+        };
+        let old_balance_visible = |e: &Engine| {
+            // The OLD (id=130, balance=1300) image must be HIDDEN: a lookup by the old balance finds nothing.
+            !e.execute_relational_select_text("SELECT id FROM accounts WHERE balance = 1300")
+                .unwrap()
+                .rows
+                .is_empty()
+        };
+
+        // --- flag ON: the single-row UPDATE routes through tombstone-old + append-new ---
+        let e = Engine::new_local();
+        e.set_resident_update_tombstone_enabled(true);
+        load(&e);
+        assert!(!table_has_any_deleted_by_cell(&e, "accounts"), "no region pre-update");
+        assert_eq!(count(&e), 200);
+        assert_eq!(balance_of(&e, 130), Some(1300), "pre-update balance");
+
+        e.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
+        // NON-VACUITY: the tombstone-old path ran (region allocated). Re-admit fallback would leave NO region.
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "single-row UPDATE routed through tombstone-old + append-new (region allocated)"
+        );
+        assert_eq!(balance_of(&e, 130), Some(9999), "id=130 reads the NEW balance (appended version)");
+        assert!(!old_balance_visible(&e), "the OLD (id=130,balance=1300) image is hidden");
+        assert_eq!(balance_of(&e, 131), Some(1310), "same-shard neighbor untouched");
+        assert_eq!(balance_of(&e, 5), Some(50), "a row in a different shard untouched");
+        assert_eq!(count(&e), 200, "COUNT unchanged (old hidden + new visible) == host MVCC");
+
+        // An int4-UNCHANGED update (same-value: id=5 already has balance 5*10=50) still routes: tombstone-OLD
+        // FIRST locates the old slot on the buffer BEFORE the identical-int4 new row is appended (count 1), so
+        // it tombstones the OLD slot, not the new. Exercises the order-sensitivity the value-changing case can't.
+        e.execute_text(203, "UPDATE accounts SET balance = 50 WHERE id = 5").unwrap();
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "same-value UPDATE still routes through tombstone-old + append-new"
+        );
+        assert_eq!(balance_of(&e, 5), Some(50), "id=5 still reads 50 (old hidden, new appended, same value)");
+        assert_eq!(count(&e), 200, "COUNT unchanged after the int4-unchanged update");
+
+        // A MULTI-ROW UPDATE (2 rows) is NOT yet incremental -> re-admit (all-live rebuild -> no region),
+        // still correct; the earlier single-row update persists (host store rebuilt).
+        e.execute_text(204, "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11").unwrap();
+        assert!(
+            !table_has_any_deleted_by_cell(&e, "accounts"),
+            "multi-row UPDATE fell back to re-admit (no region)"
+        );
+        assert_eq!(balance_of(&e, 10), Some(0));
+        assert_eq!(balance_of(&e, 11), Some(0));
+        assert_eq!(balance_of(&e, 130), Some(9999), "single-row update persists across the re-admit");
+        assert_eq!(count(&e), 200);
+
+        // --- flag OFF control: the SAME single-row UPDATE via re-admit -> identical result, NO region ---
+        let c = Engine::new_local(); // resident_update_tombstone_enabled stays default OFF
+        load(&c);
+        c.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
+        assert!(
+            !table_has_any_deleted_by_cell(&c, "accounts"),
+            "flag OFF: UPDATE re-admits (all-live) -> no region"
+        );
+        assert_eq!(balance_of(&c, 130), Some(9999), "control: new balance");
+        assert_eq!(count(&c), 200, "control: COUNT 200 == the flag-ON result (byte-identical semantics)");
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -2234,6 +2343,25 @@ impl Engine {
 
     pub(crate) fn resident_delete_tombstone_enabled(&self) -> bool {
         self.resident_delete_tombstone_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// SV5: enable GPU-native incremental UPDATE — a single-entry UPDATE commit tombstones the old version's
+    /// resident slot + appends the new image to the open shard IN PLACE (O(rows)) instead of the O(table)
+    /// invalidate + re-admit. DEFAULT OFF (nested under the shard path); OFF => an UPDATE re-admits exactly as
+    /// before (byte-identical). The A/B lever for the incremental-UPDATE win. Interior-mutable.
+    ///
+    /// **DO NOT FLIP ON in production yet (audit P2):** the appended new version has no `created_by`
+    /// lower-bound gate, so a concurrent reader at `committed_seq = C-1` (pre-publish torn read) sees the
+    /// updated key TWICE. Gated on the `created_by` boundary / consistent-snapshot fix + a concurrent-reader
+    /// test. See `Engine::try_update_resident_commit`'s SI CAVEAT.
+    pub fn set_resident_update_tombstone_enabled(&self, on: bool) {
+        self.resident_update_tombstone_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn resident_update_tombstone_enabled(&self) -> bool {
+        self.resident_update_tombstone_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

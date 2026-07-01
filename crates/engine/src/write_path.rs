@@ -98,6 +98,10 @@ pub(crate) enum PreparedMutation {
         table: String,
         installs: Vec<(u64, String, Vec<SqlValue>)>,
         value_index_entries: BTreeMap<ColumnValueKey, Vec<String>>,
+        /// SV5: the OLD row images (catalog order), PARALLEL to `installs` (same order), captured BEFORE the
+        /// assignments overwrote them. The commit path tombstones the old resident slot + appends the new
+        /// image (from `installs`) in place instead of the O(table) re-admit.
+        updated_old_rows: Vec<Vec<SqlValue>>,
     },
     /// Existing versions to tombstone, by tuple_id, in `table`'s partition. `deleted_rows` carries the
     /// resolved row images (catalog order) SV4b surfaces to the commit path so a single-entry DELETE can
@@ -111,7 +115,8 @@ pub(crate) enum PreparedMutation {
 
 /// The row-level mutation a single committed log entry applied, surfaced by `apply_mvcc_entry` so the
 /// commit path can maintain GPU residency INCREMENTALLY for a single-entry commit (INSERT=append,
-/// DELETE=tombstone) instead of the O(table) invalidate + re-admit. `None` for every other command.
+/// DELETE=tombstone, UPDATE=tombstone old + append new) instead of the O(table) invalidate + re-admit.
+/// `None` for every other command.
 #[derive(Debug, Clone)]
 pub(crate) enum AppliedRowMutation {
     Insert {
@@ -121,6 +126,11 @@ pub(crate) enum AppliedRowMutation {
     Delete {
         table: String,
         rows: Vec<Vec<SqlValue>>,
+    },
+    Update {
+        table: String,
+        old_rows: Vec<Vec<SqlValue>>,
+        new_rows: Vec<Vec<SqlValue>>,
     },
 }
 

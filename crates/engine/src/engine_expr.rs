@@ -2204,6 +2204,51 @@ impl Engine {
         )
     }
 
+    /// SV5 (commit path): for a single-entry UPDATE commit, TOMBSTONE the OLD version's resident slot + APPEND
+    /// the NEW image to the open shard IN PLACE, instead of the O(table) invalidate + re-admit. ORDER matters:
+    /// tombstone-OLD FIRST so `locate` runs on the buffer BEFORE the new row is appended -- an UPDATE that
+    /// leaves the int4 columns UNCHANGED still locates EXACTLY the old row (count 1) rather than matching both
+    /// the old + the just-appended new slot. Returns `true` (caller SKIPS re-admit) only if BOTH steps
+    /// succeed; ANY failure (multi-row / NULL / non-int4 / dup-ambiguous / non-resident / no append headroom)
+    /// returns `false` -> the caller invalidates + re-admits, which rebuilds the table all-live from the host
+    /// store (old hidden + new present, the version rewrite already applied) = always correct. So a partial
+    /// tombstone-without-append (append failed after the tombstone) is harmless -- the re-admit supersedes it
+    /// and SV4-prereq-#1 releases the partial region. Runs under commit_mutex + catalog latch.
+    ///
+    /// **SI CAVEAT (audit-flagged P2 — LOAD-BEARING FLIP GATE):** the appended NEW version has NO
+    /// `created_by <= read_txn_id` lower-bound gate (SV deferred `created_by`). The append + `row_count` bump
+    /// happen BEFORE `publish_committed_seq`, and lock-free reads bind `read_txn_id = committed_seq()` then
+    /// load `shards` separately -- so a concurrent reader that observes `committed_seq = C-1` while the shards
+    /// ALREADY carry the appended row sees the key TWICE (old visible via `deleted_by=C > C-1`, new
+    /// wrongly-visible with no created_by gate). INERT today (flag default OFF); but
+    /// `resident_update_tombstone_enabled` MUST NOT be flipped ON until the `created_by` lower-bound gate
+    /// (or a committed_seq<->shards consistent-snapshot fix) lands + a concurrent-reader test gates it. This
+    /// is the roadmap's "old-snapshot visibility / reintroduce created_by" item, elevated to a flip gate.
+    /// (DELETE/SV4b is unaffected -- no new row; INSERT append has the milder premature-insert form.)
+    pub(crate) fn try_update_resident_commit(
+        &self,
+        cat: &DdlCatalogState,
+        table_name: &str,
+        old_rows: &[Vec<SqlValue>],
+        new_rows: &[Vec<SqlValue>],
+        commit_seq: Index,
+    ) -> bool {
+        // First slice: exactly one updated row (the OLTP update-by-key case); multi-row -> re-admit.
+        if old_rows.len() != 1 || new_rows.len() != 1 {
+            return false;
+        }
+        // 1. Tombstone the OLD version's slot (locate on the buffer BEFORE the new row is appended).
+        if !self.try_tombstone_resident_delete_commit(cat, table_name, old_rows, commit_seq) {
+            return false;
+        }
+        // 2. Append the NEW image to the open shard. If this fails AFTER the tombstone, the caller's re-admit
+        //    rebuilds all-live from the host store (which already applied the version rewrite), superseding.
+        if !self.try_append_resident_int4_open_shard(table_name, new_rows) {
+            return false;
+        }
+        true
+    }
+
     /// S10c slice 2a: `&Select`->general BRIDGE for the MULTI-PARTITION resident shapes (single-GPU,
     /// int4-only). Supersedes the slice-1 per-shard host-combine: instead of running the executor once
     /// per shard and folding the results on the HOST, it RECOMPACTS the table's shard buffers into
