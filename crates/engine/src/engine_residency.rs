@@ -1625,6 +1625,85 @@ mod capacity_payload_tests {
         );
     }
 
+    /// SV4b (GPU-native incremental DELETE, commit WIRING): with `resident_delete_tombstone_enabled` ON, a
+    /// single-row SQL DELETE on a shard-resident table LOCATES + tombstones the row's slot IN PLACE (no
+    /// O(table) re-admit) and the GPU read == host MVCC. NON-VACUITY: the deleted_by region EXISTING after
+    /// the DELETE proves the tombstone route ran (a re-admit fallback rebuilds ALL-LIVE => NO region), while
+    /// the flag-OFF control gives the IDENTICAL result via re-admit (NO region). A MULTI-ROW DELETE falls
+    /// back to re-admit (region cleared) and is still correct -- the exact-count safety net.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sv4b_sql_delete_tombstones_in_place_and_matches_host_mvcc() {
+        let load = |e: &Engine| {
+            e.set_shard_residency_enabled(true);
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            for i in 0..200_i64 {
+                e.execute_text(
+                    (i as u64) + 2,
+                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                )
+                .unwrap();
+            }
+        };
+        let count = |e: &Engine| match e
+            .execute_relational_select_text("SELECT COUNT(*) FROM accounts")
+            .unwrap()
+            .rows
+            .row(0)[0]
+        {
+            SqlValue::Int8(n) => n,
+            ref other => panic!("unexpected COUNT shape {other:?}"),
+        };
+        let present = |e: &Engine, id: i64| {
+            !e.execute_relational_select_text(&format!("SELECT id FROM accounts WHERE id = {id}"))
+                .unwrap()
+                .rows
+                .is_empty()
+        };
+
+        // --- flag ON: the single-row DELETE routes through the in-place tombstone ---
+        let e = Engine::new_local();
+        e.set_resident_delete_tombstone_enabled(true);
+        load(&e);
+        assert!(!table_has_any_deleted_by_cell(&e, "accounts"), "delete-free: no region");
+        assert_eq!(count(&e), 200);
+
+        e.execute_text(202, "DELETE FROM accounts WHERE id = 130").unwrap();
+        // NON-VACUITY: the tombstone path ran (region allocated). A re-admit fallback would leave NO region.
+        assert!(
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "single-row DELETE routed through the in-place tombstone (region allocated)"
+        );
+        assert!(!present(&e, 130), "id=130 deleted -> hidden on the GPU route");
+        assert!(present(&e, 129) && present(&e, 131), "same-shard neighbors still visible");
+        assert!(present(&e, 5), "a row in a different shard untouched");
+        assert_eq!(count(&e), 199, "COUNT drops by exactly one (== host MVCC)");
+
+        // A MULTI-ROW DELETE (2 rows) is NOT yet incremental -> exact-count gate returns false -> re-admit,
+        // which rebuilds all-live (region CLEARED by prereq #1) and is still correct.
+        e.execute_text(203, "DELETE FROM accounts WHERE id = 50 OR id = 51").unwrap();
+        assert!(
+            !table_has_any_deleted_by_cell(&e, "accounts"),
+            "multi-row DELETE fell back to re-admit (all-live rebuild -> no region)"
+        );
+        assert!(!present(&e, 50) && !present(&e, 51), "multi-row DELETE removed both rows");
+        assert!(!present(&e, 130), "the earlier single-row delete stays deleted (host store)");
+        assert_eq!(count(&e), 197, "COUNT == host MVCC after 3 total deletes");
+
+        // --- flag OFF control: the SAME single-row DELETE via re-admit -> identical result, NO region ---
+        let c = Engine::new_local(); // resident_delete_tombstone_enabled stays default OFF
+        load(&c);
+        c.execute_text(202, "DELETE FROM accounts WHERE id = 130").unwrap();
+        assert!(
+            !table_has_any_deleted_by_cell(&c, "accounts"),
+            "flag OFF: DELETE re-admits (all-live) -> no region"
+        );
+        assert!(!present(&c, 130), "control: id=130 deleted");
+        assert_eq!(count(&c), 199, "control: COUNT 199 == the flag-ON result (byte-identical semantics)");
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -2141,6 +2220,20 @@ impl Engine {
 
     pub(crate) fn shard_residency_enabled(&self) -> bool {
         self.shard_residency_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// SV4b: enable GPU-native incremental DELETE — a single-entry DELETE commit locates + tombstones the
+    /// deleted rows' resident slots IN PLACE (O(rows)) instead of the O(table) invalidate + re-admit. DEFAULT
+    /// OFF (nested under the shard path); OFF => a DELETE re-admits exactly as before (byte-identical). The
+    /// A/B lever for the incremental-DELETE win. Interior-mutable (the commit path reads it).
+    pub fn set_resident_delete_tombstone_enabled(&self, on: bool) {
+        self.resident_delete_tombstone_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn resident_delete_tombstone_enabled(&self) -> bool {
+        self.resident_delete_tombstone_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

@@ -283,8 +283,12 @@ impl Engine {
 
         let mut write_set = WriteSet::default();
         let mut tuple_ids = Vec::with_capacity(deletes.len());
+        // SV4b: surface the resolved row images (catalog order) so the commit path can locate + tombstone
+        // them on the resident GPU shard in place. Already decoded above for the filter/FK scan -- clone here.
+        let mut deleted_rows = Vec::with_capacity(deletes.len());
         for (tuple_id, key, row) in &deletes {
             tuple_ids.push(*tuple_id);
+            deleted_rows.push(row.clone());
             write_set.rows.push(RowWriteKey {
                 table: delete.table.clone(),
                 row_key: key.clone(),
@@ -300,6 +304,7 @@ impl Engine {
             mutation: PreparedMutation::Delete {
                 table: delete.table.clone(),
                 tuple_ids,
+                deleted_rows,
             },
         })
     }

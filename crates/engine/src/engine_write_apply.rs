@@ -101,7 +101,11 @@ impl Engine {
                     Ok::<(), EngineError>(())
                 })?;
             }
-            PreparedMutation::Delete { table, tuple_ids } => {
+            PreparedMutation::Delete {
+                table,
+                tuple_ids,
+                deleted_rows: _,
+            } => {
                 self.read_state.mvcc.with_table_mut(&table, |data| {
                     for tuple_id in tuple_ids {
                         data.rows
@@ -184,13 +188,25 @@ impl Engine {
         cat: &mut DdlCatalogState,
         delete: Delete,
         txn_id: TxnId,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
         // Stage 2 split: PURE prepare (resolve matches + FK preflight + write-set) then a
         // `&mut self` tombstone install. `txn_id` is the commit-seq used as both the read boundary
         // and the version stamp, identical to the old direct apply (still under the commit lock).
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_delete(&delete, snapshot)?;
-        self.apply_delta_serialized(cat, delta, txn_id, None)
+        // SV4b: surface the resolved deleted rows `(table, rows)` (catalog order) BEFORE `apply_delta`
+        // consumes the delta, so a single-entry DELETE commit can locate + tombstone them on the resident
+        // shard in place. Captured by clone here; `None` is impossible (the delta is a Delete).
+        let applied = match &delta.mutation {
+            PreparedMutation::Delete {
+                table,
+                deleted_rows,
+                ..
+            } => Some((table.clone(), deleted_rows.clone())),
+            _ => None,
+        };
+        self.apply_delta_serialized(cat, delta, txn_id, None)?;
+        Ok(applied)
     }
 
     pub(crate) fn apply_update(

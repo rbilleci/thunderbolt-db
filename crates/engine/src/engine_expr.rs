@@ -2136,6 +2136,74 @@ impl Engine {
         Some(total)
     }
 
+    /// SV4b (commit path): for a single-entry DELETE commit, LOCATE + tombstone the deleted rows' resident
+    /// slots IN PLACE instead of the O(table) invalidate + re-admit. Builds an int4-equality predicate that
+    /// matches the deleted row's resident int4 columns and stamps the located slots. Returns `true` (the
+    /// caller SKIPS re-admit) ONLY when the located+tombstoned count EXACTLY equals the deleted-row count;
+    /// ANY ambiguity or unsupported shape returns `false` -> the caller invalidates + re-admits (rebuild
+    /// all-live from the host store = always correct, so a false here is only a missed optimization, never a
+    /// wrong result). Conservative FIRST-SLICE scope: exactly one deleted row, all int4 columns non-NULL
+    /// plain `Int4`. `cat` is the catalog the commit already holds (NO latch re-entry). Runs under
+    /// commit_mutex + catalog latch, so the per-shard `deleted_by` get-or-allocate is atomic (SV2 prereq #2).
+    /// (Audit note: `cat` is the WORKING catalog while `prepare_delete` decoded the row against the published
+    /// snapshot; for a single-entry non-DDL commit under the held latch these are the same shape, and any
+    /// mismatch is caught by the `row.len() != table.columns.len()` guard below -> fallback.)
+    pub(crate) fn try_tombstone_resident_delete_commit(
+        &self,
+        cat: &DdlCatalogState,
+        table_name: &str,
+        deleted_rows: &[Vec<SqlValue>],
+        commit_seq: Index,
+    ) -> bool {
+        // First slice: exactly one deleted row (the OLTP delete-by-key case); multi-row -> re-admit.
+        if deleted_rows.len() != 1 {
+            return false;
+        }
+        let Some(table) = cat.relational_catalog.get(table_name) else {
+            return false;
+        };
+        let row = &deleted_rows[0];
+        if row.len() != table.columns.len() {
+            return false;
+        }
+        // Build an AND over the table's plain-`Int4` columns: `(Column(idx) = Int4Literal(value))`. Any NULL
+        // or non-`Int4` value in an int4 column -- or a table with zero int4 columns -- returns false (can't
+        // safely / uniquely locate the physical row), and the caller re-admits.
+        let mut predicate: Option<ResidentExpr> = None;
+        for (idx, column) in table.columns.iter().enumerate() {
+            if column.ty != SqlType::Int4 {
+                continue;
+            }
+            let value = match &row[idx] {
+                SqlValue::Int4(v) => *v,
+                _ => return false,
+            };
+            let eq = ResidentExpr::Binary {
+                op: ResidentBinaryOp::Eq,
+                lhs: Box::new(ResidentExpr::Column(idx)),
+                rhs: Box::new(ResidentExpr::Int4Literal(value)),
+            };
+            predicate = Some(match predicate {
+                None => eq,
+                Some(prev) => ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(prev),
+                    rhs: Box::new(eq),
+                },
+            });
+        }
+        let Some(predicate) = predicate else {
+            return false;
+        };
+        // Accept ONLY an EXACT locate (count == the deleted-row count). `None` (not resident / locate error)
+        // or a count mismatch (a duplicate int4-value row, an already-tombstoned slot with the same values,
+        // or a locate miss) -> false -> re-admit. This exact-count gate is the wrong-results safety net.
+        matches!(
+            self.try_tombstone_resident_delete(table, &predicate, commit_seq),
+            Some(n) if n == deleted_rows.len()
+        )
+    }
+
     /// S10c slice 2a: `&Select`->general BRIDGE for the MULTI-PARTITION resident shapes (single-GPU,
     /// int4-only). Supersedes the slice-1 per-shard host-combine: instead of running the executor once
     /// per shard and folding the results on the HOST, it RECOMPACTS the table's shard buffers into

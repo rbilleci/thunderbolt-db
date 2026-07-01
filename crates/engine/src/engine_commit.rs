@@ -96,14 +96,14 @@ impl Engine {
         // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
         // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
         // order is fixed: commit_mutex (held in `commit`) FIRST, then this latch.
-        let appended = {
+        let handled = {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
-            let mut applied_insert: Option<(String, Vec<Vec<SqlValue>>)> = None;
+            let mut applied: Option<AppliedRowMutation> = None;
             for e in &to_apply {
                 commit.sm.apply(e)?;
-                if let Some(rows) = self.apply_mvcc_entry(e, cat)? {
-                    applied_insert = Some(rows);
+                if let Some(m) = self.apply_mvcc_entry(e, cat)? {
+                    applied = Some(m);
                 }
                 commit.repl.mark_applied(e.index);
             }
@@ -118,32 +118,43 @@ impl Engine {
             // guaranteed to find this generation — the catalog is visible no later than `committed_seq`.
             // That, with the per-boundary self-consistency of the data (MVCC versions stamp old/new
             // part-counts at the DDL's commit_seq), rules out a reader straddling a shape-changing DDL.
-            // Slice 1b-ii-c: an INSERT-only commit of EXACTLY ONE applied log entry APPENDS its rows in
-            // place to the resident open shard (O(rows)) instead of invalidating + re-admitting the whole
-            // table (the O(table) dual-store tax). The single-entry guard keeps the residency scope ==
-            // {that one table} — a multi-entry batch / DDL / update / delete falls back to the
-            // conservative invalidate below. Runs BEFORE publish_committed_seq, so a reader that observes
-            // the new committed_seq sees the appended rows; try_append also drops the table's stale GPU
-            // index (audit Finding A). On failure (not-int4-resident / no headroom / device err) it
-            // returns false and we invalidate + re-admit (which rebuilds with fresh headroom).
-            let appended = self.auto_admit_on_commit_enabled()
+            // Slice 1b-ii-c / SV4b: an INSERT or DELETE commit of EXACTLY ONE applied log entry maintains the
+            // resident shard INCREMENTALLY (O(rows touched)) instead of invalidating + re-admitting the whole
+            // table (the O(table) dual-store tax): INSERT appends its rows into the open shard's headroom;
+            // DELETE locates the deleted rows' resident slots (zone-map-pruned) and stamps `deleted_by` in
+            // place. The single-entry guard keeps the residency scope == {that one table} — a multi-entry
+            // batch / DDL / update falls back to the conservative invalidate below. Runs BEFORE
+            // publish_committed_seq, so a reader that observes the new committed_seq sees the change; append
+            // also drops the table's stale GPU index (audit Finding A). On ANY failure (not-int4-resident / no
+            // headroom / non-single-row / NULL-or-dup-ambiguous locate / device err) the helper returns false
+            // and we invalidate + re-admit (which rebuilds all-live from the host store = always correct).
+            // DELETE-tombstoning is gated behind `resident_delete_tombstone_enabled` (default OFF, nested under
+            // the shard path) so its A/B lever is independent; OFF => a DELETE re-admits exactly as before.
+            let handled = self.auto_admit_on_commit_enabled()
                 && to_apply.len() == 1
-                && match applied_insert.as_ref() {
-                    Some((table, rows)) => self.try_append_resident_int4_open_shard(table, rows),
-                    None => false,
+                && match applied.as_ref() {
+                    Some(AppliedRowMutation::Insert { table, rows }) => {
+                        self.try_append_resident_int4_open_shard(table, rows)
+                    }
+                    Some(AppliedRowMutation::Delete { table, rows })
+                        if self.resident_delete_tombstone_enabled() =>
+                    {
+                        self.try_tombstone_resident_delete_commit(cat, table, rows, token.index)
+                    }
+                    _ => false,
                 };
-            if !appended {
+            if !handled {
                 self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
             }
             let prune_below = self.catalog_prune_boundary(token.index);
             self.publish_catalog_snapshot(cat, token.index, prune_below);
-            appended
+            handled
         };
         self.publish_committed_seq(token.index);
         // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
         // after the publish so it snapshots the new generation; never fails the already-durable commit).
-        // Skipped when we appended in place above — that table is already resident + current.
-        if self.auto_admit_on_commit_enabled() && !appended {
+        // Skipped when we maintained residency in place above — that table is already resident + current.
+        if self.auto_admit_on_commit_enabled() && !handled {
             if let Some(tables) = Self::residency_invalidation_scope(&to_apply) {
                 self.auto_admit_resident_tables(&tables);
             }
@@ -489,10 +500,11 @@ impl Engine {
         &self,
         entry: &LogEntry,
         cat: &mut DdlCatalogState,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
-        // Returns the APPLIED insert rows `(table, rows)` for a single INSERT entry (Slice 1b-ii-c:
-        // the caller may append them in place to the resident open shard); `None` for every other
-        // command (and for a non-UTF-8 / unparseable payload — a defensive no-op as before).
+    ) -> Result<Option<AppliedRowMutation>, EngineError> {
+        // Returns the APPLIED row mutation for a single INSERT or DELETE entry (the caller maintains GPU
+        // residency incrementally for a single-entry commit: Insert -> append in place, Delete -> tombstone
+        // in place; Slice 1b-ii-c / SV4b); `None` for every other command (and for a non-UTF-8 /
+        // unparseable payload — a defensive no-op as before).
         let Ok(text) = std::str::from_utf8(&entry.payload) else {
             return Ok(None);
         };
@@ -512,7 +524,7 @@ impl Engine {
             read_txn_id: commit_seq,
         };
 
-        let mut applied_insert: Option<(String, Vec<Vec<SqlValue>>)> = None;
+        let mut applied: Option<AppliedRowMutation> = None;
         match cmd {
             Command::SetKv { key, value } => {
                 // KV lives in its own shard. Read the current version under the loaded
@@ -690,14 +702,20 @@ impl Engine {
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(cat, alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(cat, comment)?,
             Command::Insert(insert) => {
-                applied_insert = self.apply_insert(cat, insert, commit_seq)?;
+                applied = self
+                    .apply_insert(cat, insert, commit_seq)?
+                    .map(|(table, rows)| AppliedRowMutation::Insert { table, rows });
             }
-            Command::Delete(delete) => self.apply_delete(cat, delete, commit_seq)?,
+            Command::Delete(delete) => {
+                applied = self
+                    .apply_delete(cat, delete, commit_seq)?
+                    .map(|(table, rows)| AppliedRowMutation::Delete { table, rows });
+            }
             Command::Update(update) => self.apply_update(cat, update, commit_seq)?,
             _ => {}
         }
 
-        Ok(applied_insert)
+        Ok(applied)
     }
 }
 

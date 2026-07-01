@@ -330,6 +330,11 @@ pub struct Engine {
     /// OFF — production stays on the single buffer until seal/rollover (S-d2) + per-shard bloom index (S-d3)
     /// make the shard path strictly better at scale; this flag is the A/B lever to validate it. Interior-mutable.
     shard_residency_enabled: AtomicBool,
+    /// SV4b: route a single-entry DELETE commit through the GPU-native tombstone (locate + stamp `deleted_by`
+    /// in place, O(rows)) instead of the O(table) invalidate + re-admit. DEFAULT OFF, nested under the shard
+    /// path (a DELETE re-admits exactly as before until this flips) — the independent A/B lever for the
+    /// incremental-DELETE win. Interior-mutable (read on the commit path).
+    resident_delete_tombstone_enabled: AtomicBool,
     /// S-d2c: target row count per shard. When the open shard reaches it, an append SEALS the open shard
     /// (immutable) and ROLLS OVER to a fresh open shard (O(rows), never the O(table) re-admit), so a table
     /// grows as bounded shards to billions of rows. Caps the admit headroom + sizes a rollover shard.

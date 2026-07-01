@@ -88,6 +88,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("hash-scattered table is itself O(table)) is a modest ~tens-of-us win = LOW priority; the index");
     println!("probe is default-OFF anyway, and read-after-write here is not an extra scan cost. Measure-first");
     println!("(this probe) avoided a premature on-device-kernel optimization.");
+
+    // SV4b: single-row DELETE on a SHARD-resident table. Flag OFF = the O(table) invalidate + re-admit (the
+    // same tax as the INSERT re-admit above); flag ON = the GPU-native in-place tombstone (locate + stamp one
+    // `deleted_by` slot, O(rows touched)). The re-admit column grows with base; the tombstone column is flat.
+    println!();
+    println!("## single-row DELETE on a shard-resident table (SV4b: re-admit vs in-place tombstone)");
+    println!("| base_rows | del_readmit_mean_us | del_readmit_max_us | del_tombstone_mean_us | del_tombstone_max_us | speedup |");
+    println!("|---|---|---|---|---|---|");
+    for &base in &bases {
+        let (readmit_mean, readmit_max) = measure_resident_delete(base, timed, false)?;
+        let (tomb_mean, tomb_max) = measure_resident_delete(base, timed, true)?;
+        let speedup = if tomb_mean > 0.0 { readmit_mean / tomb_mean } else { 0.0 };
+        println!(
+            "| {base} | {readmit_mean:.1} | {readmit_max:.1} | {tomb_mean:.1} | {tomb_max:.1} | {speedup:.1}x |"
+        );
+    }
+    println!();
+    println!("Reading (MEASURED, honest): DELETE re-admit is O(table) (1k/4k/16k ~= 3.4/13.3/53.6 ms). The");
+    println!("in-place tombstone ELIMINATES the device re-admit (~2.2x, ~29 ms saved @16k), BUT still GROWS");
+    println!("with base (~24 ms @16k) because the HOST-side DELETE-resolution `prepare_delete` seq_scan (find");
+    println!("the tuple_ids to tombstone in the host store) is itself O(table). That residual host scan is the");
+    println!("CPU relational engine cost the mission retires: full O(rows) DELETE needs the resident index to");
+    println!("drive DELETE-resolution (or the host store retired for resident tables), NOT more device work.");
     Ok(())
 }
 
@@ -134,6 +157,53 @@ fn measure_resident(base: i64, timed: usize) -> Result<(f64, f64, f64), Box<dyn 
     let mean = samples_us.iter().sum::<f64>() / samples_us.len().max(1) as f64;
     let max = samples_us.iter().cloned().fold(0.0_f64, f64::max);
     Ok((admit_ms, mean, max))
+}
+
+/// SV4b: load `base` rows into a SHARD-resident table (untimed), then time `timed` single-row DELETEs by
+/// unique key. `tombstone` ON routes each DELETE through the GPU-native in-place tombstone (O(rows));
+/// OFF leaves the O(table) invalidate + re-admit. Returns (mean_us, max_us) per single-row DELETE.
+fn measure_resident_delete(
+    base: i64,
+    timed: usize,
+    tombstone: bool,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    let mut engine = Engine::new_local();
+    engine.set_shard_residency_enabled(true);
+    engine.set_auto_admit_on_commit(false);
+    engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")?;
+    let mut txn = 2u64;
+    let mut id = 0i64;
+    while id < base {
+        let mut vals = String::new();
+        for _ in 0..INSERT_CHUNK {
+            if id >= base {
+                break;
+            }
+            if !vals.is_empty() {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
+            id += 1;
+        }
+        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        txn += 1;
+    }
+    engine.populate_relational_residency_snapshot("accounts")?;
+    engine.set_auto_admit_on_commit(true);
+    engine.set_resident_delete_tombstone_enabled(tombstone);
+    // Time `timed` single-row DELETEs of distinct existing keys (id = 0, 1, 2, ...); each is one log entry.
+    let n = (timed as i64).min(base);
+    let mut samples_us = Vec::with_capacity(n as usize);
+    for k in 0..n {
+        let sql = format!("DELETE FROM accounts WHERE id = {k}");
+        let start = Instant::now();
+        engine.execute_text(txn, &sql)?;
+        txn += 1;
+        samples_us.push(start.elapsed().as_secs_f64() * 1e6);
+    }
+    let mean = samples_us.iter().sum::<f64>() / samples_us.len().max(1) as f64;
+    let max = samples_us.iter().cloned().fold(0.0_f64, f64::max);
+    Ok((mean, max))
 }
 
 /// With the GPU index probe ON, time a point-lookup READ after each single-row INSERT. Each INSERT commit
