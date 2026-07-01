@@ -1349,6 +1349,22 @@ impl Engine {
                 projection_offsets
                     .push(resident_device_int4_column_offset(&descriptor, table, idx).ok()?);
             }
+            // Sub-slice 8 v3: the filter column's zone map [min,max] for on-device pruning, read the SAME way
+            // the scan's `shard_zone_map_excludes` does (by column NAME from the int4-ordinal-compacted stats).
+            // No stat for the column -> (i32::MIN, i32::MAX) = always in-range (matching the scan, which keeps
+            // a shard with no zone-map stat). NULLs are excluded from the stat -> the kernel's keep-shard-0
+            // fallback handles a needle 0 that would match a NULL-stored-as-0 row in an out-of-[min,max] shard.
+            let (min, max) = table
+                .columns
+                .get(filter_idx)
+                .and_then(|col| {
+                    shard
+                        .resident_device_int4_column_stats
+                        .iter()
+                        .find(|s| s.name == col.name)
+                })
+                .map(|s| (s.min, s.max))
+                .unwrap_or((i32::MIN, i32::MAX));
             probe_shards.push(gpu_db_execution::MultiShardProbeShard {
                 resident: device_memory,
                 index: device_index,
@@ -1356,6 +1372,8 @@ impl Engine {
                 hash_shift,
                 projection_offsets,
                 row_count: shard.row_count as u64,
+                min,
+                max,
             });
         }
         // Compact a needle-indexed dense output (status[i]==1 -> 1 row, else 0) in ONE pass -- the SAME
@@ -1370,6 +1388,7 @@ impl Engine {
                 .resident
                 .submit_multi_shard_i32_index_probe_dense(&probe_shards, needles)
                 .ok()?;
+            let binary_mode = submission.multi_shard_binary_mode;
             let (cols, _elapsed) = submission.complete_detached_columnar().ok()?;
             if cols.status.len() != n {
                 return None;
@@ -1391,6 +1410,12 @@ impl Engine {
                     // that never wrote (gap guard) -> also decline (never a wrong result).
                     _ => return None,
                 }
+            }
+            if binary_mode {
+                self.read_state
+                    .residency
+                    .sharded_point_binary_route_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             (values, needle_ranges)
         };

@@ -87,9 +87,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // In-L2 (small, single shard) + out-of-L2 (large): a point lookup gathers few rows, so "in/out of L2"
     // here is whether the per-shard index (the DtoH'd key column at build) + the gathered slots stay hot.
-    let regimes: [(&str, i64, usize); 2] = [
+    // The many-shard regime forces small shards (ordered inserts -> ascending-disjoint ranges) so the O(1)
+    // BINARY-SEARCH route fires (each needle -> its one shard in O(log shards)); GPU_DB_BENCH_SHARDS sets the
+    // target shard count (default 64). This is the regime where binary routing should BEAT the single-buffer
+    // path (which probes one giant index) and where the linear multi-shard scan degrades O(shards).
+    let many_shards: i64 = env::var("GPU_DB_BENCH_SHARDS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(64);
+    let many_shard_size = (rows / many_shards.max(1)).max(1) as usize;
+    let regimes: [(&str, i64, usize); 3] = [
         ("in-L2 (65536 rows, 1 shard)", 65_536, 65_536),
         ("out-of-L2 (rows, 1 shard)", rows, rows.max(1) as usize),
+        ("out-of-L2 MANY-SHARD (binary route)", rows, many_shard_size),
     ];
     let proj = vec!["id".to_string(), "balance".to_string()];
 
@@ -158,8 +168,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         println!(
-            "batched hits = {} (non-vacuity: the batched path served the sweep)",
-            engine.sharded_point_batch_hits()
+            "batched hits = {} | gpu-probe hits = {} | BINARY-route hits = {} (non-vacuity: which path served)",
+            engine.sharded_point_batch_hits(),
+            engine.sharded_point_gpu_probe_hits(),
+            engine.sharded_point_binary_route_hits()
         );
     }
 

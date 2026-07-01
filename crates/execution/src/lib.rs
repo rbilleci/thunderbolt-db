@@ -10324,6 +10324,10 @@ pub struct CudaI32IndexProbeDenseSubmission {
     /// buffer alive until the kernel completes (the kernel reads them). Empty/None for the single-shard path.
     _multi_shard_index_guards: Vec<Arc<CudaResidentDeviceMemory>>,
     _multi_shard_desc_guard: Option<PooledDeviceBufferOwned>,
+    /// Sub-slice 8 v3 (O(1) routing): true when the multi-shard kernel took the BINARY-SEARCH path (the shards
+    /// were host-proven ascending-disjoint). Pure telemetry for the non-vacuity assert that binary mode fired;
+    /// the result rows are byte-identical to the linear path.
+    pub multi_shard_binary_mode: bool,
 }
 
 fn submit_cuda_resident_i32_index_probe_dense<R: CudaResidentReadSource>(
@@ -10684,6 +10688,7 @@ DONE:
         _wave_index_guard: Some(Arc::clone(index)),
         _multi_shard_index_guards: Vec::new(),
         _multi_shard_desc_guard: None,
+        multi_shard_binary_mode: false,
     })
 }
 
@@ -10701,6 +10706,13 @@ pub struct MultiShardProbeShard {
     pub projection_offsets: Vec<u64>,
     /// The shard's live row count (for the projection bounds check).
     pub row_count: u64,
+    /// Zone map [min, max] of the FILTER column for this shard (from `resident_device_int4_column_stats`);
+    /// the kernel skips this shard for a needle outside [min, max] (on-device prune). Pass `(i32::MIN,
+    /// i32::MAX)` when the shard has no stat for the column -> always in-range (matches the scan, which keeps
+    /// a shard with no zone-map stat). NULLs are EXCLUDED from the stat, so the keep-shard-0 fallback below
+    /// handles a needle (0) that would match a NULL-stored-as-0 row in a shard whose [min,max] excludes 0.
+    pub min: i32,
+    pub max: i32,
 }
 
 /// Sub-slice 8 v2 (charter-faithful): the MULTI-SHARD dense-emit point-lookup probe. ONE kernel launch where
@@ -10748,12 +10760,13 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
     .param .u32 projection_count,
     .param .u64 needles_ptr,
     .param .u64 out_values_ptr,
-    .param .u64 out_status_ptr
+    .param .u64 out_status_ptr,
+    .param .u32 binary_mode
 )
 {
     .reg .pred %p<6>;
-    .reg .b32 %r<24>;
-    .reg .b64 %rd<40>;
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<48>;
 
     ld.param.u64 %rd1, [desc_array_ptr];
     ld.param.u32 %r1, [shard_count];
@@ -10762,6 +10775,7 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
     ld.param.u64 %rd2, [needles_ptr];
     ld.param.u64 %rd3, [out_values_ptr];
     ld.param.u64 %rd4, [out_status_ptr];
+    ld.param.u32 %r26, [binary_mode];
 
     mov.u32 %r4, %tid.x;
     mov.u32 %r5, %ctaid.x;
@@ -10776,17 +10790,85 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
     add.u64 %rd6, %rd2, %rd5;
     ld.global.s32 %r8, [%rd6];
 
+    // BINARY MODE (set by the host ONLY when it proves the shards are ascending-disjoint: max[i-1] < min[i]).
+    // Then a needle maps to EXACTLY ONE shard, so binary-search the min-sorted (== table-order) descriptors for
+    // the containing shard in O(log shards) instead of scanning all. Reuses the linear PROBE/FOUND/emit path by
+    // jumping into SHARD with the candidate index k, bound=k+1, force=1. A gap / out-of-all-ranges falls to
+    // keep-shard-0 (descriptor[0] == table_shards[0]) exactly like the linear ALLDONE fallback.
+    setp.eq.u32 %p1, %r26, 0;
+    @%p1 bra LINEARINIT;
+    mov.u32 %r27, 0;
+    mov.u32 %r28, %r1;
+BSEARCH:
+    setp.ge.u32 %p1, %r27, %r28;
+    @%p1 bra BDONE;
+    add.u32 %r29, %r27, %r28;
+    shr.u32 %r29, %r29, 1;
+    mul.wide.u32 %rd32, %r29, 64;
+    add.u64 %rd33, %rd1, %rd32;
+    ld.global.u64 %rd34, [%rd33+56];
+    cvt.u32.u64 %r30, %rd34;
+    setp.le.s32 %p1, %r30, %r8;
+    @%p1 bra BLO;
+    mov.u32 %r28, %r29;
+    bra BSEARCH;
+BLO:
+    add.u32 %r27, %r29, 1;
+    bra BSEARCH;
+BDONE:
+    setp.eq.u32 %p1, %r27, 0;
+    @%p1 bra BKEEP0;
+    sub.u32 %r9, %r27, 1;
+    mul.wide.u32 %rd32, %r9, 64;
+    add.u64 %rd33, %rd1, %rd32;
+    ld.global.u64 %rd34, [%rd33+56];
+    shr.u64 %rd35, %rd34, 32;
+    cvt.u32.u64 %r21, %rd35;
+    setp.gt.s32 %p1, %r8, %r21;
+    @%p1 bra BKEEP0;
+    add.u32 %r23, %r9, 1;
+    mov.u32 %r24, 1;
+    mov.u32 %r25, 0;
+    mov.u32 %r19, 0;
+    mov.u32 %r22, 1;
+    bra SHARD;
+BKEEP0:
+    mov.u32 %r9, 0;
+    mov.u32 %r23, 1;
+    mov.u32 %r24, 1;
+    mov.u32 %r25, 1;
+    mov.u32 %r19, 0;
+    mov.u32 %r22, 0;
+    bra SHARD;
+
+LINEARINIT:
     mov.u32 %r9, 0;
     mov.u32 %r19, 0;
+    mov.u32 %r22, 0;
+    mov.u32 %r23, %r1;
+    mov.u32 %r24, 0;
+    mov.u32 %r25, 0;
 
 SHARD:
-    setp.ge.u32 %p1, %r9, %r1;
+    setp.ge.u32 %p1, %r9, %r23;
     @%p1 bra ALLDONE;
     mul.wide.u32 %rd7, %r9, 64;
     add.u64 %rd8, %rd1, %rd7;
     ld.global.u64 %rd9, [%rd8];
     ld.global.u64 %rd10, [%rd8+8];
     ld.global.u64 %rd11, [%rd8+16];
+    ld.global.u64 %rd30, [%rd8+56];
+    cvt.u32.u64 %r20, %rd30;
+    shr.u64 %rd31, %rd30, 32;
+    cvt.u32.u64 %r21, %rd31;
+    setp.ne.u32 %p1, %r24, 0;
+    @%p1 bra INRANGE;
+    setp.lt.s32 %p1, %r8, %r20;
+    @%p1 bra NEXTSHARD;
+    setp.gt.s32 %p1, %r8, %r21;
+    @%p1 bra NEXTSHARD;
+INRANGE:
+    mov.u32 %r22, 1;
     cvt.u32.u64 %r10, %rd11;
     shr.u64 %rd12, %rd11, 32;
     cvt.u32.u64 %r11, %rd12;
@@ -10883,6 +10965,17 @@ DUP:
 ALLDONE:
     setp.eq.u32 %p5, %r19, 1;
     @%p5 bra DONE;
+    setp.eq.u32 %p5, %r25, 1;
+    @%p5 bra WRITEABSENT;
+    setp.eq.u32 %p5, %r22, 1;
+    @%p5 bra WRITEABSENT;
+    mov.u32 %r9, 0;
+    mov.u32 %r23, 1;
+    mov.u32 %r24, 1;
+    mov.u32 %r25, 1;
+    bra SHARD;
+
+WRITEABSENT:
     cvt.u64.u32 %rd18, %r7;
     mul.lo.u64 %rd19, %rd18, 4;
     add.u64 %rd20, %rd4, %rd19;
@@ -10933,11 +11026,24 @@ DONE:
             offs[i] = o;
         }
         desc.extend_from_slice(&offs);
-        desc.push(0); // reserved
+        // Slot 7: the filter column's zone map [min, max] packed as `min | (max << 32)` (the kernel skips
+        // this shard for a needle out of range).
+        desc.push((shard.min as u32 as u64) | ((shard.max as u32 as u64) << 32));
         // Pin the shard's column buffer + its device index alive until the kernel completes.
         index_guards.push(Arc::clone(&shard.resident));
         index_guards.push(Arc::clone(&shard.index));
     }
+    // O(1)-routing gate: when the shards are ASCENDING-DISJOINT (max[i-1] < min[i] for every i), each needle
+    // maps to exactly one shard, so the kernel binary-searches (O(log shards)) instead of scanning all shards.
+    // Requires >= 2 shards (1 shard is already O(1) linearly) AND real disjoint zone maps (a missing stat is
+    // (i32::MIN, i32::MAX), which fails the check -> safe linear fallback). Shards are NOT reordered, so binary
+    // mode requires table order to already be min-ascending (the clustered/ordered-insert regime); anything else
+    // (descending, overlapping, unclustered) fails the check and takes the linear path. Byte-identical either way.
+    let binary_mode: u32 = if shards.len() >= 2 && shards.windows(2).all(|w| w[0].max < w[1].min) {
+        1
+    } else {
+        0
+    };
     let shard_count_u32 = u32::try_from(shards.len())
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
     let needle_count_u32 = u32::try_from(needles.len())
@@ -11003,6 +11109,7 @@ DONE:
     let mut needles_arg = needles_guard.ptr;
     let mut output_arg = values_guard.ptr;
     let mut status_arg = status_guard.ptr;
+    let mut binary_mode_arg = binary_mode;
     let mut args = [
         (&mut desc_arg as *mut u64).cast::<c_void>(),
         (&mut shard_count_arg as *mut u32).cast::<c_void>(),
@@ -11011,6 +11118,7 @@ DONE:
         (&mut needles_arg as *mut u64).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
         (&mut status_arg as *mut u64).cast::<c_void>(),
+        (&mut binary_mode_arg as *mut u32).cast::<c_void>(),
     ];
     let threads_per_block = 128;
     let blocks = needle_count_u32.div_ceil(threads_per_block);
@@ -11112,6 +11220,7 @@ DONE:
         _wave_index_guard: None,
         _multi_shard_index_guards: index_guards,
         _multi_shard_desc_guard: Some(desc_guard),
+        multi_shard_binary_mode: binary_mode == 1,
     })
 }
 

@@ -563,6 +563,11 @@ pub(crate) struct ResidencyReadState {
     /// `gpu_db_resident_i32_index_probe_dense` kernel probes+gathers+emits on the GPU, no host per-needle
     /// probe). The non-vacuity signal that the GPU-native path (vs the host-probe fallback) served the batch.
     pub(crate) sharded_point_gpu_probe_hits: std::sync::atomic::AtomicU64,
+    /// Sub-slice 8 v3 (O(1) routing): count of GPU-native batches where the multi-shard kernel took the
+    /// BINARY-SEARCH path (the shards were host-proven ascending-disjoint, so each needle routes to its one
+    /// shard in O(log shards) instead of the O(shards) linear scan). The non-vacuity signal that binary routing
+    /// (vs the linear fallback) actually fired. `Relaxed` monotonic counter.
+    pub(crate) sharded_point_binary_route_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

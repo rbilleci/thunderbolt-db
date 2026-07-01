@@ -2272,10 +2272,19 @@ mod capacity_payload_tests {
             vec![0, 1, 5, 63, 64, 65, 128, 130, 191, 199, 200, 999, -1, 50, 51, 50, 130];
         let hb = e.sharded_point_batch_hits();
         let gpu_hb = e.sharded_point_gpu_probe_hits();
+        let bin_hb = e.sharded_point_binary_route_hits();
         let proj = e
             .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
             .expect("batched path served this shape");
         assert!(e.sharded_point_batch_hits() > hb, "batched path FIRED (non-vacuity)");
+        // Sub-slice 8 v3 (O(1) routing): these 4 shards are ascending-disjoint (ordered inserts), so the kernel
+        // takes the BINARY-SEARCH path (each needle -> its one shard in O(log shards)). Prove it fired so the
+        // byte-identical comparison below is validating the binary route (present/absent/boundary/dup/out-of-
+        // range all covered). Sabotage (a wrong binary candidate) breaks the per-needle equality below.
+        assert!(
+            e.sharded_point_binary_route_hits() > bin_hb,
+            "the O(1) BINARY-SEARCH route FIRED (ascending-disjoint shards)"
+        );
         // Sub-slice 8: this delete-free table takes the FULLY-GPU dense-emit path (not the host-probe
         // fallback) — prove it fired, so the byte-identical comparison below is validating the GPU path.
         assert!(
@@ -2392,6 +2401,137 @@ mod capacity_payload_tests {
             .collect();
         assert_eq!(np.needle_ranges[0].1, 1, "id=2 present");
         assert_eq!(&np.values[0..2], &want_n_i32[..], "batched NULL-blind == single-flight (NULL as 0)");
+    }
+
+    /// SUB-SLICE 8 v3 (zone-map pruning) — the KEEP-SHARD-0 fallback (load-bearing for byte-identicality with
+    /// the scan's zone prune, which keeps shard 0 when a needle is out of EVERY shard's range so its NULL-blind
+    /// predicate can still match). A NULL id (stored 0) sits OUTSIDE the zone map [5,7] (NULLs are excluded from
+    /// min/max), so `WHERE id = 0` PRUNES the shard on-device -> the kernel MUST keep-shard-0 (probe shard 0
+    /// unconditionally) to find the NULL-stored-as-0 row, exactly as the scan does. Sabotage: disabling the
+    /// keep-shard-0 re-entry (`bra SHARD` -> `bra WRITEABSENT`) makes id=0 return 0 rows (diverges from the scan).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_point_batch_keep_shard_0_null_as_zero() {
+        let k = Engine::new_local();
+        k.set_shard_residency_enabled(true);
+        k.set_auto_admit_on_commit(true);
+        k.set_shard_index_probe_enabled(true);
+        k.execute_text(1, "CREATE TABLE knz (id INT, balance INT)").unwrap();
+        // id 5,7 + one NULL (stored 0). Zone map for id = [5,7] (NULL EXCLUDED). No within-shard dup on id.
+        k.execute_text(2, "INSERT INTO knz (id, balance) VALUES (5,50),(7,70)").unwrap();
+        k.execute_text(3, "INSERT INTO knz (id, balance) VALUES (NULL, 99)").unwrap();
+        let t = k.relational_catalog_table("knz").unwrap();
+        let id = crate::rel_exec_helpers::relational_column_index(&t, "id").unwrap();
+        let bal = crate::rel_exec_helpers::relational_column_index(&t, "balance").unwrap();
+        let gpu_hb = k.sharded_point_gpu_probe_hits();
+        // id=0 is OUT of the zone map [5,7] -> pruned on-device -> the kernel must KEEP-SHARD-0 to find the
+        // NULL-stored-as-0 row (the index holds key 0 for the NULL row).
+        let proj = k
+            .gather_sharded_int4_point_lookups_batched(&t, id, &[id, bal], &[0])
+            .expect("batched served (delete-free)");
+        assert!(k.sharded_point_gpu_probe_hits() > gpu_hb, "the GPU zone-prune path fired");
+        let want = k
+            .execute_relational_select_text("SELECT id, balance FROM knz WHERE id = 0")
+            .unwrap()
+            .rows
+            .into_boxed();
+        let got: Vec<Vec<i32>> = (0..proj.needle_ranges[0].1 as usize)
+            .map(|r| {
+                let base = (proj.needle_ranges[0].0 as usize + r) * proj.ncols;
+                proj.values[base..base + proj.ncols].to_vec()
+            })
+            .collect();
+        let want_i32: Vec<Vec<i32>> = want
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| match v {
+                        SqlValue::Int4(x) => *x,
+                        o => panic!("expected int4, got {o:?}"),
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(got, want_i32, "keep-shard-0 finds the NULL-as-0 row for id=0 == scan");
+        assert_eq!(got.len(), 1, "id=0 matches the NULL-stored-as-0 row (NULL-blind, via keep-shard-0)");
+    }
+
+    /// SUB-SLICE 8 v3 (O(1) routing) — the BINARY-SEARCH route at DEPTH across many ascending-disjoint shards.
+    /// 256 ordered rows over shard_size 16 -> ~16 disjoint shards, so each needle routes to its one shard in
+    /// O(log shards) (binary-search depth ~4) instead of the O(shards) linear scan. Needles span EVERY shard
+    /// (present), the exact seal boundaries (15/16/.../240), and out-of-all-ranges keys (300/-5/1000 -> the
+    /// binary BKEEP0 fallback -> absent). Byte-identical to the scan proves the binary search lands on the RIGHT
+    /// shard at every depth. NOTE: multi-shard tables are NULL-FREE by construction (the incremental-rollover
+    /// admit rejects NULLs -> a NULL forces a single shard = LINEAR mode), so binary BKEEP0 only ever resolves
+    /// to absent here; the NULL-as-0 keep-shard-0 corner is a LINEAR-mode concern (see the knz test).
+    /// Sabotage: a wrong binary candidate (or a broken bound) makes a present needle materialize the wrong row.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_point_batch_binary_route_deep_shards() {
+        let k = Engine::new_local();
+        k.set_shard_residency_enabled(true);
+        k.set_auto_admit_on_commit(true);
+        k.set_shard_index_probe_enabled(true);
+        k.set_shard_size_target(16); // 256 rows -> ~16 ascending-disjoint shards
+        k.execute_text(1, "CREATE TABLE acc (id INT, balance INT)").unwrap();
+        for i in 0..256_i64 {
+            k.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO acc (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let t = k.relational_catalog_table("acc").unwrap();
+        assert!(
+            k.resident_shard_count("acc") >= 8,
+            "many disjoint shards -> deep binary search"
+        );
+        let id = crate::rel_exec_helpers::relational_column_index(&t, "id").unwrap();
+        let bal = crate::rel_exec_helpers::relational_column_index(&t, "balance").unwrap();
+        // present in various shards + seal boundaries + out-of-all-ranges (BKEEP0 -> absent).
+        let needles: Vec<i32> =
+            vec![0, 15, 16, 17, 31, 32, 100, 128, 200, 239, 240, 255, 300, -5, 1000];
+        let bin_hb = k.sharded_point_binary_route_hits();
+        let gpu_hb = k.sharded_point_gpu_probe_hits();
+        let proj = k
+            .gather_sharded_int4_point_lookups_batched(&t, id, &[id, bal], &needles)
+            .expect("batched served (delete-free)");
+        assert!(
+            k.sharded_point_gpu_probe_hits() > gpu_hb,
+            "the GPU-native probe fired (not host fallback)"
+        );
+        assert!(
+            k.sharded_point_binary_route_hits() > bin_hb,
+            "the O(1) BINARY-SEARCH route fired (>= 8 disjoint shards)"
+        );
+        for (i, &needle) in needles.iter().enumerate() {
+            let (start, count) = proj.needle_ranges[i];
+            let got: Vec<Vec<i32>> = (0..count as usize)
+                .map(|r| {
+                    let base = (start as usize + r) * proj.ncols;
+                    proj.values[base..base + proj.ncols].to_vec()
+                })
+                .collect();
+            let want = k
+                .execute_relational_select_text(&format!(
+                    "SELECT id, balance FROM acc WHERE id = {needle}"
+                ))
+                .unwrap()
+                .rows
+                .into_boxed();
+            let want_i32: Vec<Vec<i32>> = want
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| match v {
+                            SqlValue::Int4(x) => *x,
+                            o => panic!("expected int4, got {o:?}"),
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(got, want_i32, "binary route id={needle} == scan (right shard at depth)");
+        }
     }
 
     /// STEP 1 (lpb-for-shards) — the BATCHED path applies the SV3b `deleted_by` visibility gate: with in-place
@@ -3064,6 +3204,16 @@ impl Engine {
         self.read_state
             .residency
             .sharded_point_gpu_probe_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sub-slice 8 v3 (O(1) routing): count of GPU-native batches where the multi-shard kernel took the
+    /// BINARY-SEARCH path (host-proven ascending-disjoint shards -> each needle routes to its one shard in
+    /// O(log shards)). Non-vacuity signal that binary routing (vs the linear fallback) fired.
+    pub fn sharded_point_binary_route_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .sharded_point_binary_route_hits
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
