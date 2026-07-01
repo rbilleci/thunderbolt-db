@@ -909,6 +909,295 @@ impl Engine {
         result
     }
 
+    /// Step 1 (lpb-for-shards): BATCHED per-shard PK probe. Ensures the shard's cached hash+bloom index is
+    /// built + `(ptr,row_count)`-validated ONCE (not per needle), then probes EVERY needle against it under a
+    /// SINGLE cache lock, calling `on_hit(needle_index, slot)` per Hit. Returns `false` if the shard DECLINES
+    /// (duplicate / oversize key column, or a device read failure) -> the caller falls back to the scan for
+    /// the whole batch (a hash holds one row/key; the scan returns every match). Same `(ptr,row_count)`
+    /// validation + build-outside-the-lock discipline as the single-key `probe_shard_pk_index_cached`. A
+    /// DECLINED shard's `index` is `None`, so `probe_cached_shard_pk` declines the FIRST needle -> no partial
+    /// `on_hit` before a decline.
+    fn probe_shard_pk_index_cached_batch<F: FnMut(u32, u32)>(
+        &self,
+        table_name: &str,
+        shard_id: u32,
+        col_idx: usize,
+        device_memory: &Arc<CudaResidentDeviceMemory>,
+        filter_offset: u64,
+        row_count: usize,
+        needles: &[i32],
+        mut on_hit: F,
+    ) -> bool {
+        let device_ptr = device_memory.device_ptr();
+        let cache_key = (table_name.to_string(), shard_id, col_idx);
+        // Fast path: a valid cached entry -> probe ALL needles under ONE lock.
+        {
+            let cache = self
+                .read_state
+                .residency
+                .shard_pk_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.resident_device_ptr == device_ptr && entry.row_count == row_count {
+                    for (ni, &key) in needles.iter().enumerate() {
+                        match probe_cached_shard_pk(entry, key) {
+                            ShardPkProbe::Hit(slot) => on_hit(ni as u32, slot),
+                            ShardPkProbe::Miss => {}
+                            ShardPkProbe::Declined => return false,
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        // Miss / stale ptr: build OUTSIDE the lock, probe against the built entry, then publish it.
+        let Ok(keys) = device_memory.read_resident_i32_column(filter_offset, row_count) else {
+            return false;
+        };
+        if keys.len() != row_count {
+            return false;
+        }
+        let index = match build_int4_pk_hash_table_host(&keys, row_count as u64) {
+            Some((hash_table, table_mask, hash_shift)) => {
+                let (bloom_words, bloom_num_bits, bloom_num_hashes) =
+                    build_int4_pk_bloom_host(&keys).unwrap_or((Vec::new(), 0, 0));
+                Some(CachedShardPkIndexData {
+                    hash_table,
+                    table_mask,
+                    hash_shift,
+                    bloom_words,
+                    bloom_num_bits,
+                    bloom_num_hashes,
+                })
+            }
+            None => None,
+        };
+        let entry = CachedShardPkIndex {
+            resident_device_ptr: device_ptr,
+            row_count,
+            _resident_guard: Arc::clone(device_memory),
+            index,
+        };
+        let mut declined = false;
+        for (ni, &key) in needles.iter().enumerate() {
+            match probe_cached_shard_pk(&entry, key) {
+                ShardPkProbe::Hit(slot) => on_hit(ni as u32, slot),
+                ShardPkProbe::Miss => {}
+                ShardPkProbe::Declined => {
+                    declined = true;
+                    break;
+                }
+            }
+        }
+        self.read_state
+            .residency
+            .shard_pk_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(cache_key, entry);
+        !declined
+    }
+
+    /// Step 1 (lpb-for-shards): the BATCHED generation-consistent locate. Loads the table's shards ONCE and,
+    /// per shard, builds the descriptor + captures the (PINNED) buffer + deleted_by region ONCE, then probes
+    /// ALL needles against that shard's cached index -> a `BatchShardGroup` per shard with >=1 hit, carrying
+    /// the captured handles + the `(needle_index, slot)` hits. Same generation-consistency guarantee as
+    /// `locate_resident_pk_via_shard_index_detailed`: every hit's slot is read from the exact pinned buffer it
+    /// was resolved against. `None` (fall back to the scan) if ANY shard is invalid / declines (dup) or a
+    /// needle hits >1 shard (a cross-shard duplicate — the scan returns every match). Filter column int4.
+    fn locate_sharded_pk_batch(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        needles: &[i32],
+    ) -> Option<Vec<BatchShardGroup>> {
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let mut groups: Vec<BatchShardGroup> = Vec::new();
+        let mut hit_shard_count = vec![0u32; needles.len()];
+        for shard in table_shards.iter() {
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
+                return None;
+            }
+            if shard.row_count == 0 {
+                continue;
+            }
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let filter_offset =
+                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
+            let device_memory = self
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&(table.name.clone(), shard.shard_id))?;
+            let mut hits: Vec<(u32, u32)> = Vec::new();
+            let ok = self.probe_shard_pk_index_cached_batch(
+                &table.name,
+                shard.shard_id,
+                filter_idx,
+                &device_memory,
+                filter_offset,
+                shard.row_count,
+                needles,
+                |ni, slot| hits.push((ni, slot)),
+            );
+            if !ok {
+                return None; // this shard declined -> whole batch falls back to the scan
+            }
+            if hits.is_empty() {
+                continue;
+            }
+            for &(ni, _) in &hits {
+                hit_shard_count[ni as usize] += 1;
+            }
+            let deleted_by = self
+                .read_state
+                .residency
+                .shard_deleted_by_memory
+                .get(&(table.name.clone(), shard.shard_id));
+            groups.push(BatchShardGroup {
+                descriptor,
+                device_memory,
+                deleted_by,
+                hits,
+            });
+        }
+        // A needle that Hit in >1 shard is a cross-shard duplicate -> fall back (the scan returns every match).
+        if hit_shard_count.iter().any(|&c| c > 1) {
+            return None;
+        }
+        Some(groups)
+    }
+
+    /// Step 1 (lpb-for-shards): BATCHED cross-shard point-lookup GATHER — the throughput lever over the
+    /// single-flight 3b route. Routes a batch of int4 `needles` through the cross-shard PK index
+    /// (`locate_sharded_pk_batch`), then per shard-group gathers the projected int4 columns at the group's
+    /// slots with ONE kernel + one bulk DtoH PER (shard, column) (`project_i32_rows_from_payload`) —
+    /// amortizing the per-needle launch that caps the single-flight route — and applies the SV3b
+    /// `deleted_by[slot] > read_txn_id` gate (one batched i64 gather per versioned shard). Scatters back to
+    /// NEEDLE ORDER (unique-PK -> each needle 0 or 1 row). `None` (caller falls back to the per-needle route)
+    /// on decline / dup / int4 shape / error. The sharded path is NULL-blind (raw i32), byte-identical to the
+    /// single-flight route by construction. Increments `sharded_point_batch_hits`. The read snapshot is
+    /// `committed_seq()` (matches the single-flight route's pin when no writes interleave).
+    pub(crate) fn gather_sharded_int4_point_lookups_batched(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        selected_indexes: &[usize],
+        needles: &[i32],
+    ) -> Option<BatchedShardProjection> {
+        if selected_indexes.is_empty() {
+            return None;
+        }
+        if table.columns.get(filter_idx).map(|c| c.ty) != Some(SqlType::Int4) {
+            return None;
+        }
+        for &idx in selected_indexes {
+            if table.columns.get(idx).map(|c| c.ty) != Some(SqlType::Int4) {
+                return None;
+            }
+        }
+        let read_txn_id = self.committed_seq() as i64;
+        let groups = self.locate_sharded_pk_batch(table, filter_idx, needles)?;
+        let ncols = selected_indexes.len();
+        // per needle: the projected row (Some) or absent/hidden (None). Unique-PK -> <=1 row/needle.
+        let mut per_needle: Vec<Option<Vec<i32>>> = vec![None; needles.len()];
+        for group in &groups {
+            let slots: Vec<u64> = group.hits.iter().map(|&(_, slot)| slot as u64).collect();
+            // SV3b visibility: ONE batched i64 gather of deleted_by at the slots (versioned shard), else live.
+            let visible: Vec<bool> = match &group.deleted_by {
+                Some(region) => {
+                    let dby = region.project_i64_rows_from_payload(0, &slots).ok()?;
+                    if dby.len() != slots.len() {
+                        return None;
+                    }
+                    dby.iter().map(|&d| d > read_txn_id).collect()
+                }
+                None => vec![true; slots.len()],
+            };
+            // ONE batched i32 gather per projected column at the group's slots.
+            let mut col_values: Vec<Vec<i32>> = Vec::with_capacity(ncols);
+            for &idx in selected_indexes {
+                let col_base =
+                    resident_device_int4_column_offset(&group.descriptor, table, idx).ok()?;
+                let vals = group
+                    .device_memory
+                    .project_i32_rows_from_payload(col_base, &slots)
+                    .ok()?;
+                if vals.len() != slots.len() {
+                    return None;
+                }
+                col_values.push(vals);
+            }
+            // Scatter to needle order (unique-PK -> at most one visible hit per needle).
+            for (j, &(ni, _)) in group.hits.iter().enumerate() {
+                if !visible[j] {
+                    continue;
+                }
+                let mut row = Vec::with_capacity(ncols);
+                for col in col_values.iter() {
+                    row.push(col[j]);
+                }
+                per_needle[ni as usize] = Some(row);
+            }
+        }
+        // Flatten to needle order + per-needle ranges (row-major, ncols wide).
+        let mut values: Vec<i32> = Vec::new();
+        let mut needle_ranges: Vec<(u32, u32)> = Vec::with_capacity(needles.len());
+        for row in &per_needle {
+            let start = (values.len() / ncols) as u32;
+            match row {
+                Some(r) => {
+                    values.extend_from_slice(r);
+                    needle_ranges.push((start, 1));
+                }
+                None => needle_ranges.push((start, 0)),
+            }
+        }
+        self.read_state
+            .residency
+            .sharded_point_batch_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(BatchedShardProjection {
+            ncols,
+            values,
+            needle_ranges,
+        })
+    }
+
+    /// Step 1 (lpb-for-shards) benchmark + telemetry entry: resolve the table + columns, run the BATCHED
+    /// cross-shard point-lookup gather over `needles`, and return the number of needles that materialized a
+    /// row (a sanity signal for the benchmark), or `None` if the batched path declined. `sharded_point_batch_hits`
+    /// counts the served batches.
+    pub fn bench_sharded_point_lookup_batch(
+        &self,
+        table_name: &str,
+        filter_col: &str,
+        proj_cols: &[String],
+        needles: &[i32],
+    ) -> Option<usize> {
+        let table = self.relational_catalog_table(table_name)?;
+        let filter_idx = crate::rel_exec_helpers::relational_column_index(&table, filter_col).ok()?;
+        let mut selected_indexes = Vec::with_capacity(proj_cols.len());
+        for c in proj_cols {
+            selected_indexes.push(crate::rel_exec_helpers::relational_column_index(&table, c).ok()?);
+        }
+        let proj =
+            self.gather_sharded_int4_point_lookups_batched(&table, filter_idx, &selected_indexes, needles)?;
+        Some(proj.needle_ranges.iter().filter(|&&(_, c)| c > 0).count())
+    }
+
     fn complete_relational_retained_int4_projection_submission(
         &self,
         pending: RelationalRetainedInt4ProjectionSubmission,
@@ -1449,6 +1738,28 @@ pub(crate) struct ShardPkHit {
     pub(crate) descriptor: RelationalResidencySnapshot,
     pub(crate) device_memory: Arc<CudaResidentDeviceMemory>,
     pub(crate) deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+}
+
+/// Step 1 (lpb-for-shards): a shard's BATCHED hits — the generation-consistent captured handles (descriptor,
+/// PINNED int4 buffer, deleted_by region, all from ONE `shards.load()` snapshot) + the `(needle_index, slot)`
+/// list of the batch's needles that Hit in this shard. Same pin/consistency discipline as `ShardPkHit`.
+struct BatchShardGroup {
+    descriptor: RelationalResidencySnapshot,
+    device_memory: Arc<CudaResidentDeviceMemory>,
+    deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+    hits: Vec<(u32, u32)>, // (needle_index, local slot)
+}
+
+/// Step 1 (lpb-for-shards): the batched point-lookup projection. `values` is row-major int4, `ncols` wide, in
+/// NEEDLE ORDER; `needle_ranges[i] = (start_row, row_count)` slices needle i's rows (unique-PK -> count 0 or
+/// 1). The schema (columns / access_path) is shape metadata the caller wraps around this raw projection.
+/// `values`/`ncols` are consumed by the differential tests now + the production batch-result wiring next
+/// (the coalescer/facade slice); the bench reads only `needle_ranges`, hence the allow.
+#[allow(dead_code)]
+pub(crate) struct BatchedShardProjection {
+    pub(crate) ncols: usize,
+    pub(crate) values: Vec<i32>,
+    pub(crate) needle_ranges: Vec<(u32, u32)>,
 }
 
 /// Sub-slice 3: the result of probing a shard's cached PK index for a key.

@@ -2239,6 +2239,171 @@ mod capacity_payload_tests {
         assert_eq!(fired0, 1, "route FIRED on the NULL-key point lookup (byte-identical to the scan)");
     }
 
+    /// STEP 1 (lpb-for-shards) — the BATCHED cross-shard point-lookup gather returns, per needle, rows
+    /// BYTE-IDENTICAL to the single-flight 3b route (which is itself == scan == host), across
+    /// present / absent / multi-shard / NULL-blind, and the batched path FIRES (`sharded_point_batch_hits`
+    /// advances). Sabotage: dropping the slot from the gather (`project_i32_rows_from_payload(col_base, [0;n])`)
+    /// returns row-0 values for every needle → diverges from the single-flight route.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_point_batch_matches_single_flight_route() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_index_probe_enabled(true); // the single-flight 3b route is the per-needle oracle
+        e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        let bal_col = crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
+
+        // A batch of needles spanning all 4 shards + absent keys + boundaries, plus REPEATED values (50, 130
+        // appear twice) — the per-needle oracle loop asserts BOTH positions of a repeated key materialize the
+        // same row, guarding the per-`needle_index` `hit_shard_count` accounting against treating a repeated
+        // needle value as a (spurious) cross-shard duplicate (audit coverage follow-up).
+        let needles: Vec<i32> =
+            vec![0, 1, 5, 63, 64, 65, 128, 130, 191, 199, 200, 999, -1, 50, 51, 50, 130];
+        let hb = e.sharded_point_batch_hits();
+        let proj = e
+            .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
+            .expect("batched path served this shape");
+        assert!(e.sharded_point_batch_hits() > hb, "batched path FIRED (non-vacuity)");
+        assert_eq!(proj.ncols, 2, "id, balance");
+        // Per-needle rows from the flat batched projection.
+        let batched: Vec<Vec<Vec<i32>>> = (0..needles.len())
+            .map(|i| {
+                let (start, count) = proj.needle_ranges[i];
+                (0..count as usize)
+                    .map(|r| {
+                        let base = (start as usize + r) * proj.ncols;
+                        proj.values[base..base + proj.ncols].to_vec()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Single-flight 3b route (== scan == host) as the per-needle oracle.
+        for (i, &k) in needles.iter().enumerate() {
+            let rows = e
+                .execute_relational_select_text(&format!(
+                    "SELECT id, balance FROM accounts WHERE id = {k}"
+                ))
+                .unwrap()
+                .rows
+                .into_boxed();
+            let want: Vec<Vec<i32>> = rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|v| match v {
+                            SqlValue::Int4(x) => *x,
+                            other => panic!("expected int4, got {other:?}"),
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(batched[i], want, "batched == single-flight route for id={k}");
+        }
+
+        // DUP-FALLBACK: a duplicate int4 key -> the batched path declines (None) -> caller scans.
+        let d = Engine::new_local();
+        d.set_shard_residency_enabled(true);
+        d.set_auto_admit_on_commit(true);
+        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)").unwrap();
+        d.execute_text(2, "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)").unwrap();
+        let dt = d.relational_catalog_table("dup").unwrap();
+        let did = crate::rel_exec_helpers::relational_column_index(&dt, "id").unwrap();
+        let dbal = crate::rel_exec_helpers::relational_column_index(&dt, "balance").unwrap();
+        assert!(
+            d.gather_sharded_int4_point_lookups_batched(&dt, did, &[did, dbal], &[1, 2]).is_none(),
+            "duplicate key -> batched path declines -> None (caller falls back to the scan)"
+        );
+
+        // NULL-BLIND: batched == single-flight on a table with NULLs (both read raw i32, NULL as 0).
+        let n = Engine::new_local();
+        n.set_shard_residency_enabled(true);
+        n.set_auto_admit_on_commit(true);
+        n.set_shard_index_probe_enabled(true);
+        n.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
+        n.execute_text(2, "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30)").unwrap();
+        let nt = n.relational_catalog_table("nn").unwrap();
+        let nid = crate::rel_exec_helpers::relational_column_index(&nt, "id").unwrap();
+        let nbal = crate::rel_exec_helpers::relational_column_index(&nt, "balance").unwrap();
+        let np = n
+            .gather_sharded_int4_point_lookups_batched(&nt, nid, &[nid, nbal], &[2])
+            .expect("batched served");
+        let want_n = n
+            .execute_relational_select_text("SELECT id, balance FROM nn WHERE id = 2")
+            .unwrap()
+            .rows
+            .into_boxed();
+        let want_n_i32: Vec<i32> = want_n[0]
+            .iter()
+            .map(|v| match v {
+                SqlValue::Int4(x) => *x,
+                other => panic!("expected int4, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(np.needle_ranges[0].1, 1, "id=2 present");
+        assert_eq!(&np.values[0..2], &want_n_i32[..], "batched NULL-blind == single-flight (NULL as 0)");
+    }
+
+    /// STEP 1 (lpb-for-shards) — the BATCHED path applies the SV3b `deleted_by` visibility gate: with in-place
+    /// tombstoning ON, a deleted needle materializes ZERO rows in the batch == the single-flight route, while
+    /// live neighbors in the SAME versioned shard still materialize. Sabotage: inverting the gate leaks the
+    /// tombstoned row into the batch.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_point_batch_deleted_by_gate() {
+        let t = Engine::new_local();
+        t.set_shard_residency_enabled(true);
+        t.set_auto_admit_on_commit(true);
+        t.set_resident_delete_tombstone_enabled(true); // stamp deleted_by in place -> versioned shard
+        t.set_shard_index_probe_enabled(true);
+        t.set_shard_size_target(64);
+        t.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            t.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        t.execute_text(300, "DELETE FROM accounts WHERE id = 130").unwrap();
+        let table = t.relational_catalog_table("accounts").unwrap();
+        let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
+        let bal_col = crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
+
+        let needles: Vec<i32> = vec![129, 130, 131];
+        let proj = t
+            .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
+            .expect("batched served");
+        let count = |i: usize| proj.needle_ranges[i].1;
+        assert_eq!(count(0), 1, "id=129 live -> 1 row");
+        assert_eq!(count(1), 0, "id=130 tombstoned -> hidden by the batched deleted_by gate");
+        assert_eq!(count(2), 1, "id=131 live neighbor in the same versioned shard -> 1 row");
+
+        // == single-flight route (row counts).
+        for &k in &needles {
+            let want = t
+                .execute_relational_select_text(&format!(
+                    "SELECT id, balance FROM accounts WHERE id = {k}"
+                ))
+                .unwrap()
+                .rows
+                .len();
+            let idx = needles.iter().position(|&x| x == k).unwrap();
+            assert_eq!(count(idx) as usize, want, "batched row count == single-flight for id={k}");
+        }
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -2818,6 +2983,15 @@ impl Engine {
         self.read_state
             .residency
             .shard_index_route_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Step 1 (lpb-for-shards): count of BATCHES served by the batched cross-shard point-lookup gather
+    /// (`gather_sharded_int4_point_lookups_batched`). Non-vacuity signal that the batched path fired.
+    pub fn sharded_point_batch_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .sharded_point_batch_hits
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

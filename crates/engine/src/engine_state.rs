@@ -547,6 +547,11 @@ pub(crate) struct ResidencyReadState {
     /// fired — output equality can't prove it (the index route and the full scan return byte-identical
     /// rows by construction; only the SET of shards gathered differs). `Relaxed` monotonic counter.
     pub(crate) shard_index_route_hits: std::sync::atomic::AtomicU64,
+    /// Step 1 (lpb-for-shards): count of BATCHES served by the batched cross-shard point-lookup path
+    /// (`gather_sharded_int4_point_lookups_batched` — one batched locate + one kernel-gather per
+    /// (shard, projected column) instead of a launch per needle). The non-vacuity signal that the batched
+    /// path fired (vs a per-needle fallback). `Relaxed` monotonic counter.
+    pub(crate) sharded_point_batch_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
