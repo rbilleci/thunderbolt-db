@@ -2975,6 +2975,20 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// lpb-for-shards wiring: enable serving a shard-resident int4 point-lookup BATCH (from the facade
+    /// batcher) via the batched cross-shard gather instead of per-query single-flight. DEFAULT OFF; OFF =>
+    /// `submit_sharded_point_lookups_batched` returns `None` (byte-identical). The A/B lever that LANDS the
+    /// ~310x batched throughput on real workloads. Public (the facade toggles + the batched entry reads it).
+    pub fn set_shard_batched_point_read_enabled(&self, on: bool) {
+        self.shard_batched_point_read_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn shard_batched_point_read_enabled(&self) -> bool {
+        self.shard_batched_point_read_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Sub-slice 3b: count of sharded point-lookup reads served by the CROSS-SHARD PK INDEX route (the cached
     /// `locate` restricted the gathered shard set). The non-vacuity signal that the index route actually fired
     /// — output equality can't prove it (the index route and the full scan return byte-identical rows by

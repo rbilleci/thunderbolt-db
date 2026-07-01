@@ -563,12 +563,22 @@ fn classify_batchable_point_lookup(shared: &SharedEngine, sql: &str) -> Option<(
     {
         let engine = shared.read_engine().ok()?;
         let decision = engine.plan_relational_resident_route(&select);
-        if !decision.accepted
-            || !matches!(
+        // Single-buffer resident int4 point lookups are always batchable (via the retained template).
+        // lpb-for-shards: a SHARD-resident int4 point lookup (`sharded_int4_equality_[multi_column_]projection`)
+        // is ALSO admitted when `shard_batched_point_read_enabled` is ON — the batcher serves it via the
+        // batched cross-shard gather (`submit_sharded_point_lookups_batched`). Mixed int4+text is excluded on
+        // both (text kernel is not coalescer-thread-safe). Flag OFF => sharded shapes take the per-query path
+        // (unchanged / byte-identical).
+        let single_buffer_batchable = matches!(
+            decision.query_shape.as_str(),
+            "int4_equality_projection" | "int4_equality_multi_column_projection"
+        );
+        let sharded_batchable = engine.shard_batched_point_read_enabled()
+            && matches!(
                 decision.query_shape.as_str(),
-                "int4_equality_projection" | "int4_equality_multi_column_projection"
-            )
-        {
+                "sharded_int4_equality_projection" | "sharded_int4_equality_multi_column_projection"
+            );
+        if !decision.accepted || !(single_buffer_batchable || sharded_batchable) {
             return None;
         }
     }

@@ -345,6 +345,12 @@ pub struct Engine {
     /// for the membership-pruning win that lets the shard path stay O(1) even when zone-maps degrade under
     /// UPDATE key-scatter (scalability-ledger #4/#8). Interior-mutable (the read path reads it).
     shard_index_probe_enabled: AtomicBool,
+    /// lpb-for-shards wiring: admit a shard-resident int4 point-lookup BATCH into the facade point-lookup
+    /// batcher and serve it via the batched cross-shard gather (`submit_sharded_point_lookups_batched`)
+    /// instead of degrading to per-query single-flight. DEFAULT OFF (nested under shard residency): OFF =>
+    /// `submit_sharded_point_lookups_batched` returns `None` and the batcher keeps its existing behavior
+    /// (byte-identical). The A/B lever that LANDS the ~310x batched throughput on real workloads. Interior-mutable.
+    shard_batched_point_read_enabled: AtomicBool,
     /// S-d2c: target row count per shard. When the open shard reaches it, an append SEALS the open shard
     /// (immutable) and ROLLS OVER to a fresh open shard (O(rows), never the O(table) re-admit), so a table
     /// grows as bounded shards to billions of rows. Caps the admit headroom + sizes a rollover shard.

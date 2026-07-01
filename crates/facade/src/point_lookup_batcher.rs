@@ -53,7 +53,7 @@ use gpu_db_engine::{Engine, ExecuteError, RelationalRetainedBatchResult};
 use gpu_db_sql::Select;
 use tokio::sync::oneshot;
 
-use crate::{map_column, DbError, DbValue, ErrorCategory, QueryOutcome, SharedEngine};
+use crate::{map_column, map_value, DbError, DbValue, ErrorCategory, QueryOutcome, SharedEngine};
 
 /// Default flush triggers. `max_wait` is now the *ceiling* of an adaptive wait
 /// (see [`AdaptiveWait`]): at connection-count 1 a lone request flushes with
@@ -482,13 +482,32 @@ fn point_lookup_shape_key(select: &Select) -> String {
 /// needles into a single `equal_any` submission, and answers each request from its needle's sliced
 /// result. Any prepare/submit/complete error is fanned out to every waiter (no hung connection).
 fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
-    // Prepare the shared template once for the whole group (group is non-empty by construction). A
-    // prepare error (e.g. the snapshot went non-resident since classify) fails the group uniformly —
-    // every request in it shares the table, so they would all fail anyway.
+    // Deduplicate needles into one submission, then map each request back to its needle's result.
+    let (distinct_needles, request_result_index) = dedup_needles(&group);
+    // lpb-for-shards: a SHARD-resident int4 point-lookup batch has NO single-buffer snapshot, so serve it via
+    // the batched cross-shard gather when `shard_batched_point_read_enabled` is ON. `None` = the flag is OFF,
+    // the table is not shard-resident, or the gather declined (e.g. a duplicate int4 key) -> fall through to
+    // the single-buffer template (single-buffer tables) / the per-query fallback (shard-resident decline).
+    if let Some(batched) =
+        engine.submit_sharded_point_lookups_batched(&group[0].select, &distinct_needles)
+    {
+        debug_assert_eq!(batched.needle_count(), distinct_needles.len());
+        distribute_results_batched(group, request_result_index, batched);
+        return;
+    }
+    // Prepare the shared single-buffer template once for the whole group (group is non-empty by construction).
     let template = match engine.prepare_relational_retained_read_template(&group[0].select) {
         Ok(template) => template,
         Err(err) => {
-            fail_group(group, err);
+            // No single-buffer snapshot. A SHARD-resident group reaches here only when the batched gather
+            // DECLINED (e.g. a duplicate key in the int4 filter column) -> serve it PER-QUERY (byte-identical
+            // to the unbatched path) rather than failing valid queries. A truly non-resident table (the
+            // snapshot went away since classify) still fails the group uniformly.
+            if engine.resident_shard_count(&group[0].select.table) > 0 {
+                run_group_per_query(engine, group);
+            } else {
+                fail_group(group, err);
+            }
             return;
         }
     };
@@ -508,8 +527,6 @@ fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
         }
         return;
     }
-    // Deduplicate needles into one submission, then map each request back to its needle's result.
-    let (distinct_needles, request_result_index) = dedup_needles(&group);
     let batched = match submit_and_complete_template_batched(engine, &template, &distinct_needles) {
         Ok(batched) => batched,
         Err(err) => {
@@ -519,6 +536,28 @@ fn run_group(engine: &Engine, group: Vec<PointLookupRequest>) {
     };
     debug_assert_eq!(batched.needle_count(), distinct_needles.len());
     distribute_results_batched(group, request_result_index, batched);
+}
+
+/// lpb-for-shards per-query fallback: serve each request in a shard-resident group individually via the
+/// engine's per-query select path (BYTE-IDENTICAL to the unbatched path), used when the batched cross-shard
+/// gather declines (e.g. a duplicate int4 key makes the per-shard hash decline) and there is no single-buffer
+/// template to fall back to. Slower than the batch, but correct — never fails a valid query.
+fn run_group_per_query(engine: &Engine, group: Vec<PointLookupRequest>) {
+    for request in group {
+        let outcome = match engine.execute_relational_select(&request.select) {
+            Ok(result) => {
+                let columns = result.columns.iter().map(map_column).collect();
+                let rows = result
+                    .rows
+                    .iter()
+                    .map(|row| row.iter().cloned().map(map_value).collect())
+                    .collect();
+                Ok(QueryOutcome::Rows { columns, rows })
+            }
+            Err(err) => Err(map_execute_error_local(err)),
+        };
+        let _ = request.respond.send(outcome);
+    }
 }
 
 /// Deduplicate a group's needles, returning the distinct needles (first-seen order) and, per request,
@@ -783,6 +822,90 @@ mod tests {
         assert_eq!(got_2a, ref_2, "batched needle=2 must match per-query");
         assert_eq!(got_2b, ref_2, "duplicate needle=2 must get the same result");
         assert_eq!(got_1, ref_1, "batched needle=1 must match per-query");
+    }
+
+    /// lpb-for-shards WIRING (Step 1 landing): a SHARD-resident int4 point-lookup batch is classified
+    /// batchable (flag ON), served end-to-end through the facade batcher by the batched cross-shard gather,
+    /// and returns per-needle results BYTE-IDENTICAL to the per-query path (across present / absent /
+    /// multi-shard); the WIRED batched path FIRES (`sharded_point_batch_hits` advances). Also covers the
+    /// per-query FALLBACK: a duplicate int4 key declines the gather -> the group is served per-query
+    /// (multi-row), NOT failed.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU (resident route)"]
+    fn wired_sharded_batch_matches_per_query() {
+        use gpu_db_engine::Engine;
+
+        let engine = Engine::new_local();
+        engine.set_shard_residency_enabled(true);
+        engine.set_auto_admit_on_commit(true);
+        engine.set_shard_batched_point_read_enabled(true);
+        engine.set_shard_index_probe_enabled(true);
+        engine.set_shard_size_target(64); // 200 rows -> several shards
+        engine.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200i64 {
+            engine
+                .execute_text(
+                    (i as u64) + 2,
+                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                )
+                .unwrap();
+        }
+        // Skip if no GPU (auto-admit produced no shards).
+        if engine.resident_shard_count("accounts") == 0 {
+            return;
+        }
+        let shared = Arc::new(SharedEngine::from_engine(engine));
+        let batcher =
+            PointLookupBatcher::with_triggers(Arc::clone(&shared), 16, Duration::from_millis(5));
+        let hb = shared.read_engine().unwrap().sharded_point_batch_hits();
+
+        let needles = [0i32, 1, 5, 64, 128, 130, 199, 999, -1];
+        let sql = |k: i32| format!("SELECT id, balance FROM accounts WHERE id = {k}");
+        let mut rxs = Vec::new();
+        for &k in &needles {
+            match execute_on_shared_engine_batched(&shared, &batcher, &sql(k)) {
+                BatchedDispatch::Batched(rx) => rxs.push(rx),
+                BatchedDispatch::Immediate(_) => panic!(
+                    "shard-resident int4 point lookup + flag ON must BATCH, not take the immediate path"
+                ),
+            }
+        }
+        let got: Vec<QueryOutcome> = rxs
+            .into_iter()
+            .map(|rx| recv_within(rx, Duration::from_secs(5)).expect("answered").expect("ok"))
+            .collect();
+        assert!(
+            shared.read_engine().unwrap().sharded_point_batch_hits() > hb,
+            "the WIRED batched sharded path fired (non-vacuity)"
+        );
+        for (i, &k) in needles.iter().enumerate() {
+            let want = execute_on_shared_engine(&shared, &sql(k)).unwrap();
+            assert_eq!(got[i], want, "wired batched == per-query for id={k}");
+        }
+
+        // Per-query FALLBACK: a duplicate int4 key -> the gather declines -> per-query fallback (multi-row),
+        // NOT a group failure.
+        execute_on_shared_engine(&shared, "CREATE TABLE dup (id INT, balance INT)").unwrap();
+        execute_on_shared_engine(&shared, "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)")
+            .unwrap();
+        if shared.read_engine().unwrap().resident_shard_count("dup") > 0 {
+            let want_dup =
+                execute_on_shared_engine(&shared, "SELECT id, balance FROM dup WHERE id = 1").unwrap();
+            let got_dup = match execute_on_shared_engine_batched(
+                &shared,
+                &batcher,
+                "SELECT id, balance FROM dup WHERE id = 1",
+            ) {
+                BatchedDispatch::Batched(rx) => {
+                    recv_within(rx, Duration::from_secs(5)).expect("answered").expect("ok")
+                }
+                BatchedDispatch::Immediate(r) => r.expect("ok"),
+            };
+            assert_eq!(got_dup, want_dup, "dup-key batched (per-query fallback) == per-query");
+            if let QueryOutcome::Rows { rows, .. } = &want_dup {
+                assert_eq!(rows.len(), 2, "id=1 has 2 rows (fallback served the multi-row result)");
+            }
+        }
     }
 
     #[test]

@@ -182,6 +182,8 @@ impl Engine {
             resident_update_tombstone_enabled: std::sync::atomic::AtomicBool::new(false),
             // Sub-slice 3b: cross-shard PK-index point-lookup route default OFF (nested under shard residency).
             shard_index_probe_enabled: std::sync::atomic::AtomicBool::new(false),
+            // lpb-for-shards wiring: batched shard point-read routing default OFF (nested A/B lever).
+            shard_batched_point_read_enabled: std::sync::atomic::AtomicBool::new(false),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }

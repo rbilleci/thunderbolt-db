@@ -378,7 +378,7 @@ fn mandatory_int4_equalities(expr: &ResidentExpr, out: &mut Vec<(usize, i32)>) {
 /// equality group of one predicate, operator `Eq`, an int4 filter column, and an int4 needle. Any other
 /// shape (multiple predicates, a range, a non-int4 column/value, no filter) returns `None` so the caller
 /// runs the scan path unchanged. Must be called BEFORE the caller clears `bound`'s filters.
-fn shard_point_lookup_int4_eq(
+pub(crate) fn shard_point_lookup_int4_eq(
     bound: &BoundRelationalSelect,
     table: &RelationalTable,
 ) -> Option<(usize, i32)> {

@@ -1198,6 +1198,54 @@ impl Engine {
         Some(proj.needle_ranges.iter().filter(|&&(_, c)| c > 0).count())
     }
 
+    /// lpb-for-shards WIRING: serve a shard-resident int4 point-lookup BATCH as ONE dispatchable
+    /// `RelationalRetainedBatchResult` — the SAME type the single-buffer lpb coalescer produces, so the facade
+    /// batcher's `distribute_results_batched` handles it UNCHANGED (columns mapped once, sliced per needle).
+    /// Binds `select`, verifies it is a shard-resident single int4-`Eq` point lookup, runs
+    /// `gather_sharded_int4_point_lookups_batched` over `needles`, and wraps the projection with the shared
+    /// schema. Returns `None` (the batcher keeps its existing behavior — byte-identical) when the flag is OFF,
+    /// the table is not shard-resident, the shape is not a single int4 equality, or the gather declines
+    /// (dup / non-int4 / error). `needles` must be DISTINCT (the caller dedups), per the gather's contract.
+    /// `access_path` is a label (`FullTableScan`) — the batcher's dispatch consumes only `columns` +
+    /// `needle_values`, never `access_path`.
+    pub fn submit_sharded_point_lookups_batched(
+        &self,
+        select: &Select,
+        needles: &[i32],
+    ) -> Option<RelationalRetainedBatchResult> {
+        if !self.shard_batched_point_read_enabled() {
+            return None;
+        }
+        let (table, bound, _copin_s) = self.bind_relational_select_for_execution(select).ok()?;
+        if self.resident_shard_count(&table.name) == 0 {
+            return None; // not shard-resident -> the batcher's single-buffer / per-query path
+        }
+        let (filter_idx, _needle) = crate::engine_expr::shard_point_lookup_int4_eq(&bound, &table)?;
+        let proj = self.gather_sharded_int4_point_lookups_batched(
+            &table,
+            filter_idx,
+            &bound.selected_indexes,
+            needles,
+        )?;
+        let gpu_id = self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(&table.name)
+            .and_then(|s| s.first())
+            .map(|s| s.gpu_id)
+            .unwrap_or(0);
+        Some(RelationalRetainedBatchResult {
+            columns: Arc::new(bound.selected_columns),
+            access_path: Arc::new(RelationalAccessPath::FullTableScan),
+            gpu_id,
+            values: proj.values,
+            ncols: proj.ncols,
+            needle_ranges: proj.needle_ranges,
+        })
+    }
+
     fn complete_relational_retained_int4_projection_submission(
         &self,
         pending: RelationalRetainedInt4ProjectionSubmission,
