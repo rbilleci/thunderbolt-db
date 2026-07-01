@@ -516,6 +516,10 @@ pub(crate) struct ResidencyReadState {
     /// (append and re-admit are byte-identical), and device-ptr stability can't either (a same-size
     /// re-admit reuses the just-freed address). `Relaxed` monotonic counter.
     pub(crate) open_shard_append_hits: std::sync::atomic::AtomicU64,
+    /// S-d3: count of shards actually GATHERED (recompacted) by the sharded read after zone-map pruning.
+    /// The non-vacuity signal that pruning fired — output equality can't prove a shard was skipped
+    /// (a pruned shard holds no matching rows, so the result is identical either way). `Relaxed` monotonic.
+    pub(crate) sharded_shards_gathered: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

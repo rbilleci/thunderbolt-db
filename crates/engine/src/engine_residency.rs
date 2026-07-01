@@ -289,6 +289,17 @@ pub(crate) fn build_relational_device_payload_with_capacity(
     ))
 }
 
+/// Decode a fixed-width int4 SqlValue to its i32 residency encoding, matching
+/// `compute_open_shard_int4_append_chunks` byte-for-byte (Int4/Date pass through, Int2 widens,
+/// NULL materializes as 0). Used to extend a shard's zone map (min/max) on in-place append.
+pub(crate) fn sql_value_as_int4(value: &SqlValue) -> i32 {
+    match value {
+        SqlValue::Int4(v) | SqlValue::Date(v) => *v,
+        SqlValue::Int2(v) => i32::from(*v),
+        _ => 0,
+    }
+}
+
 /// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
 /// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
 /// slots. Each chunk lands EXACTLY where the capacity-aware read offsets expect it (column `c` at
@@ -1060,6 +1071,96 @@ mod capacity_payload_tests {
         );
     }
 
+    /// S-d3: per-shard zone maps (min/max) PRUNE the sharded read. A table grown as several bounded shards
+    /// by ORDERED committed INSERTs gives each shard a disjoint key range, so a point lookup gathers ~1
+    /// shard instead of recompacting all of them — O(1), not O(num_shards).
+    ///
+    /// NON-VACUITY / anti-sabotage, all keyed off the `sharded_shards_gathered` telemetry (output equality
+    /// alone can't see a skipped shard — a pruned shard holds no matching rows either way):
+    ///  1. the table really is MULTIPLE shards (>= 3), so pruning to 1 is a real reduction;
+    ///  2. a point lookup gathers EXACTLY 1 shard (a broken prune keeping all would read `shard_count`);
+    ///  3. a full scan (no predicate) gathers ALL shards (proves the counter isn't hardwired to 1, and that
+    ///     no-filter never prunes);
+    ///  4. EVERY key across shard boundaries — including the MAX key, which was appended IN PLACE into the
+    ///     open shard AFTER its rollover-admit — still reads its row (a broken append-time zone-map
+    ///     extension would leave the open shard's max stale and WRONGLY prune the just-appended key -> 0 rows);
+    ///  5. an absent key (beyond every range) prunes to the keep-one fallback (1 shard) and returns empty.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn shard_zone_map_prunes_point_lookup() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64); // small -> several shards with disjoint ascending key ranges
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let shard_count = {
+            let shards = e.read_state.residency.shards.load();
+            shards.get("accounts").expect("shard-resident").len()
+        };
+        // (1) multiple shards, so a prune to 1 is meaningful.
+        assert!(
+            shard_count >= 3,
+            "need several shards for pruning to matter (got {shard_count})"
+        );
+
+        let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
+        let gathered = |e: &Engine| e.sharded_shards_gathered();
+
+        // (2) a point lookup landing inside one shard's range gathers EXACTLY one shard.
+        let before = gathered(&e);
+        let pt = sel("SELECT id, balance FROM accounts WHERE id = 137");
+        let one = gathered(&e) - before;
+        assert_eq!(pt.len(), 1, "id=137 present");
+        assert_eq!(pt.row(0), &[SqlValue::Int4(137), SqlValue::Int4(1370)]);
+        assert_eq!(
+            one, 1,
+            "zone-map prune must gather exactly ONE shard for a point lookup (got {one} of {shard_count})"
+        );
+
+        // (3) COUNT(*) (shape `sharded_count_all`) routes through the SAME recompaction function but carries
+        //     NO predicate at all, so it never prunes and gathers ALL shards — proving the counter reaches
+        //     `shard_count` (it is not pinned to 1) and that pruning is precisely what cut the equality lookup
+        //     to one shard.
+        let before = gathered(&e);
+        let cnt = sel("SELECT COUNT(*) FROM accounts");
+        let scanned = gathered(&e) - before;
+        assert_eq!(cnt.row(0), &[SqlValue::Int8(200)], "COUNT(*) across all shards");
+        assert_eq!(
+            scanned, shard_count as u64,
+            "an unpruned COUNT(*) must gather ALL shards, proving the counter isn't pinned to 1"
+        );
+
+        // (4) every boundary + the MAX key (appended in place into the open shard) still reads correctly,
+        //     each gathering exactly one shard -> no key is ever wrongly pruned.
+        for id in [0_i64, 63, 64, 127, 128, 191, 199] {
+            let before = gathered(&e);
+            let r = sel(&format!("SELECT id, balance FROM accounts WHERE id = {id}"));
+            let g = gathered(&e) - before;
+            assert_eq!(r.len(), 1, "id={id} must be found (never wrongly pruned)");
+            assert_eq!(
+                r.row(0),
+                &[SqlValue::Int4(id as i32), SqlValue::Int4((id * 10) as i32)],
+                "id={id} value correct after pruning"
+            );
+            assert_eq!(g, 1, "id={id} prunes to exactly one shard (got {g})");
+        }
+
+        // (5) a key beyond every shard's range prunes to the keep-one fallback and returns empty.
+        let before = gathered(&e);
+        let miss = sel("SELECT id, balance FROM accounts WHERE id = 100000");
+        let g = gathered(&e) - before;
+        assert_eq!(miss.len(), 0, "absent key returns no rows");
+        assert_eq!(g, 1, "an out-of-range needle prunes to the single keep-one fallback shard");
+    }
+
     /// `capacity > row_count` pads each i32 section to `capacity` (real values then zero headroom);
     /// the header still records `row_count`; section offsets derive from `capacity`.
     #[test]
@@ -1327,6 +1428,10 @@ impl Engine {
                     && snapshot.resident_device_null_columns.is_empty()
                     && snapshot.column_count == snapshot.resident_device_int4_columns.len()
                     && capacity > row_count,
+                // S-d3: the zone map (min/max per int4 column) for shard pruning.
+                resident_device_int4_column_stats: snapshot
+                    .resident_device_int4_column_stats
+                    .clone(),
                 resident_bytes,
                 allocated_bytes: device_payload.len() as u64,
                 count_header_byte_offset: 0,
@@ -1591,6 +1696,16 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// S-d3: count of shards actually GATHERED (recompacted) by the sharded read after zone-map pruning.
+    /// The non-vacuity signal that pruning fired — output equality can't prove a shard was skipped, since
+    /// a pruned shard holds no matching rows and the result is identical either way.
+    pub fn sharded_shards_gathered(&self) -> u64 {
+        self.read_state
+            .residency
+            .sharded_shards_gathered
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Slice 1b-ii: append an INSERT's APPLIED rows IN PLACE into the table's resident OPEN shard's
     /// capacity headroom, instead of a full re-admit. `new_rows` MUST be the post-coercion/post-default
     /// applied images (the WriteDelta's `PreparedMutation::Insert.inserted_rows`), in catalog order, so
@@ -1776,11 +1891,29 @@ impl Engine {
                 return false;
             }
             let appended_bytes = (k * column_count * std::mem::size_of::<i32>()) as u64;
+            // S-d3: extend the open shard's zone map (min/max per int4 column) to cover the appended rows,
+            // so a point-lookup prune never wrongly skips a shard holding a just-appended needle. O(k*cols).
+            let new_min_max: Vec<(i32, i32)> = (0..column_count)
+                .map(|c| {
+                    new_rows.iter().fold((i32::MAX, i32::MIN), |(lo, hi), row| {
+                        let v = sql_value_as_int4(&row[c]);
+                        (lo.min(v), hi.max(v))
+                    })
+                })
+                .collect();
             self.read_state.residency.with_shards_mut(|shards| {
                 if let Some(table_shards) = shards.get_mut(table) {
                     if let Some(open) = table_shards.last_mut() {
                         open.row_count += k;
                         open.resident_bytes = open.resident_bytes.saturating_add(appended_bytes);
+                        for (stat, (lo, hi)) in open
+                            .resident_device_int4_column_stats
+                            .iter_mut()
+                            .zip(new_min_max.iter())
+                        {
+                            stat.min = stat.min.min(*lo);
+                            stat.max = stat.max.max(*hi);
+                        }
                     }
                 }
             });
@@ -1797,15 +1930,15 @@ impl Engine {
         let new_capacity = self
             .shard_size_target()
             .max(k.saturating_mul(2).next_power_of_two());
-        let device_payload = match build_relational_device_payload_with_capacity(
+        let (device_payload, int4_stats) = match build_relational_device_payload_with_capacity(
             &column_names,
             &column_types,
             new_rows,
             new_capacity,
         ) {
-            // Pure int4 + NULL-free (the caller rejects NULLs) -> the text/bool/stats/b128/null outputs are
-            // empty; only the columnar payload matters.
-            Ok((payload, _text, _bool, _stats, _b128, _null)) => payload,
+            // Pure int4 + NULL-free (the caller rejects NULLs) -> text/bool/b128/null outputs are empty; keep
+            // the columnar payload + the int4 zone-map stats (min/max over the k rows) for pruning (S-d3).
+            Ok((payload, _text, _bool, stats, _b128, _null)) => (payload, stats),
             Err(_) => return false,
         };
         let Some(new_device_memory) = self.relational_residency_device_memory(gpu_id, &device_payload)
@@ -1820,6 +1953,7 @@ impl Engine {
             row_count: k,
             capacity: new_capacity,
             int4_appendable: true,
+            resident_device_int4_column_stats: int4_stats,
             resident_bytes: (8 + k * column_count * std::mem::size_of::<i32>()) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
@@ -2358,6 +2492,8 @@ impl Engine {
                 // append targets.
                 capacity: shard.row_count,
                 int4_appendable: false,
+                // S-d3: benchmark shards carry no zone map -> never pruned (always gathered).
+                resident_device_int4_column_stats: Vec::new(),
                 resident_bytes: shard.resident_bytes,
                 allocated_bytes: shard.allocated_bytes,
                 count_header_byte_offset: 0,

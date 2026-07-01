@@ -665,6 +665,11 @@ pub(crate) struct RelationalResidentShard {
     /// eligibility the single-buffer append checks). Set at admission from the shard's column layout; the
     /// append is declined (re-admit) when false. Benchmark/sealed shards are not append targets (false).
     pub(crate) int4_appendable: bool,
+    /// S-d3: per-int4-column ZONE MAP (min/max over THIS shard's live rows, in int4-ordinal order). A point
+    /// lookup / range query PRUNES shards whose `[min,max]` for the filter column excludes the needle, so it
+    /// recompacts ~1 shard instead of all of them (O(1), not O(num_shards)). Maintained on append (merge the
+    /// new rows' min/max). Empty = not pruned (always gathered) — e.g. benchmark shards.
+    pub(crate) resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     pub(crate) resident_bytes: u64,
     pub(crate) allocated_bytes: u64,
     pub(crate) count_header_byte_offset: u64,
