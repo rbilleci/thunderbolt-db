@@ -588,6 +588,19 @@ impl Engine {
                         read_txn_id: self.committed_seq() as TxnId,
                     },
                 )?;
+                // PG: ADD PRIMARY KEY over existing data requires the column non-null (23502) —
+                // checked in PREFLIGHT (a failure inside apply would strand the entry in the commit
+                // pipeline), byte-identical to the apply-layer guard in
+                // `apply_create_index_with_constraint_flags`.
+                if rows
+                    .iter()
+                    .any(|row| matches!(row[column_idx], SqlValue::Null))
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{}\" of relation \"{}\" contains null values",
+                        add.column, add.table
+                    )));
+                }
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
             Command::AddUniqueConstraint(add) => {
@@ -1307,6 +1320,15 @@ impl Engine {
                     }
                     new_rows.push(values.into_iter().map(Option::unwrap).collect());
                 }
+                // PG constraint order: PK not-null (23502) BEFORE unique — over the NEW rows only.
+                // MUST run in PREFLIGHT: a constraint error past this point fires inside apply,
+                // AFTER the entry entered the commit pipeline, and the stuck entry re-applies on
+                // every subsequent commit (the exact hazard the preflight exists to prevent —
+                // identical to why unique/check/FK are mirrored here).
+                Self::validate_primary_key_not_null(
+                    table,
+                    new_rows.iter().map(|row: &Vec<SqlValue>| row.as_slice()),
+                )?;
                 if !table.indexes.iter().any(|index| index.unique)
                     && table.check_constraints.is_empty()
                     && table.foreign_keys.is_empty()
@@ -1452,6 +1474,9 @@ impl Engine {
                     )?;
                 } else {
                     let mut candidate_rows = Vec::new();
+                    // The post-assignment images of the MATCHED rows only (PG validates per updated
+                    // tuple; a zero-match `UPDATE ... SET pk = NULL` succeeds, exactly as in PG).
+                    let mut updated_images: Vec<Vec<SqlValue>> = Vec::new();
                     let mut cursor = table_rows
                         .store()
                         .seq_scan_open(visibility)
@@ -1470,9 +1495,16 @@ impl Engine {
                             for (idx, value) in &assignments {
                                 row[*idx] = value.clone();
                             }
+                            updated_images.push(row.clone());
                         }
                         candidate_rows.push(row);
                     }
+                    // PK not-null BEFORE unique (see the Insert arm: this must reject in
+                    // PREFLIGHT, never inside apply).
+                    Self::validate_primary_key_not_null(
+                        table,
+                        updated_images.iter().map(Vec::as_slice),
+                    )?;
                     Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
                     Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
                     self.validate_foreign_keys_with_table_rows(

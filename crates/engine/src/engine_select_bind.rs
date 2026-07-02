@@ -532,16 +532,22 @@ impl Engine {
                         .collect::<Vec<_>>()
                 }
                 SelectProjection::Sum { column } => {
+                    // PG: SUM skips NULL inputs; SUM over zero (non-NULL) inputs is NULL, not 0.
+                    // (Previously a NULL input hard-errored via `int4_aggregate_value` — PG computes.)
                     let sum_idx = validate_sum_column(&table, column)?;
-                    let values = rows
-                        .iter()
-                        .map(|row| int4_aggregate_value(&row[sum_idx], "SUM").map(i64::from))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    // PG: SUM over zero rows is NULL, not 0.
-                    let cell = if values.is_empty() {
-                        SqlValue::Null
+                    let mut sum = 0_i64;
+                    let mut saw_value = false;
+                    for row in &rows {
+                        if matches!(row[sum_idx], SqlValue::Null) {
+                            continue;
+                        }
+                        sum += i64::from(int4_aggregate_value(&row[sum_idx], "SUM")?);
+                        saw_value = true;
+                    }
+                    let cell = if saw_value {
+                        SqlValue::Int8(sum)
                     } else {
-                        SqlValue::Int8(values.into_iter().sum::<i64>())
+                        SqlValue::Null
                     };
                     vec![vec![cell]]
                 }
@@ -550,24 +556,36 @@ impl Engine {
                         .group_by_index
                         .expect("grouped SUM validation requires GROUP BY");
                     let sum_idx = validate_sum_column(&table, sum_column)?;
-                    let mut sums: BTreeMap<SqlValue, i64> = BTreeMap::new();
+                    // PG: SUM skips NULL inputs per group; a group whose inputs are all NULL keeps
+                    // its row with a NULL sum (`None` here), never 0 and never a dropped group.
+                    let mut sums: BTreeMap<SqlValue, Option<i64>> = BTreeMap::new();
                     for row in rows {
+                        let entry = sums.entry(row[group_idx].clone()).or_insert(None);
+                        if matches!(row[sum_idx], SqlValue::Null) {
+                            continue;
+                        }
                         let value = i64::from(int4_aggregate_value(&row[sum_idx], "SUM")?);
-                        *sums.entry(row[group_idx].clone()).or_default() += value;
+                        *entry = Some(entry.unwrap_or(0) + value);
                     }
                     sums.into_iter()
-                        .map(|(value, sum)| vec![value, SqlValue::Int8(sum)])
+                        .map(|(value, sum)| {
+                            vec![value, sum.map_or(SqlValue::Null, SqlValue::Int8)]
+                        })
                         .collect::<Vec<_>>()
                 }
                 SelectProjection::Avg { column } => {
+                    // PG: AVG skips NULL inputs — both in the sum AND the divisor; AVG over zero
+                    // non-NULL inputs is NULL, not the canonical-zero numeric sentinel.
                     let avg_idx = validate_avg_column(&table, column)?;
                     let mut sum = 0_i128;
                     let mut count = 0_usize;
                     for row in &rows {
+                        if matches!(row[avg_idx], SqlValue::Null) {
+                            continue;
+                        }
                         sum += i128::from(int4_aggregate_value(&row[avg_idx], "AVG")?);
                         count += 1;
                     }
-                    // PG: AVG over zero rows is NULL, not the canonical-zero numeric sentinel.
                     let cell = if count == 0 {
                         SqlValue::Null
                     } else {
@@ -580,31 +598,45 @@ impl Engine {
                         .group_by_index
                         .expect("grouped AVG validation requires GROUP BY");
                     let avg_idx = validate_avg_column(&table, avg_column)?;
+                    // PG: AVG skips NULL inputs per group (sum AND divisor); an all-NULL group keeps
+                    // its row with a NULL average.
                     let mut averages: BTreeMap<SqlValue, (i128, usize)> = BTreeMap::new();
                     for row in rows {
-                        let value = int4_aggregate_value(&row[avg_idx], "AVG")?;
                         let entry = averages.entry(row[group_idx].clone()).or_default();
+                        if matches!(row[avg_idx], SqlValue::Null) {
+                            continue;
+                        }
+                        let value = int4_aggregate_value(&row[avg_idx], "AVG")?;
                         entry.0 += i128::from(value);
                         entry.1 += 1;
                     }
                     averages
                         .into_iter()
-                        .map(|(value, (sum, count))| vec![value, average_sql_value(sum, count)])
+                        .map(|(value, (sum, count))| {
+                            let cell = if count == 0 {
+                                SqlValue::Null
+                            } else {
+                                average_sql_value(sum, count)
+                            };
+                            vec![value, cell]
+                        })
                         .collect::<Vec<_>>()
                 }
                 SelectProjection::Min { column } | SelectProjection::Max { column } => {
                     let value_idx = relational_column_index(&table, column)?;
+                    // PG: MIN/MAX skip NULL inputs (`compare_sql_values` orders NULL lowest, so an
+                    // unfiltered reduce would wrongly return NULL for MIN the moment one NULL row
+                    // exists). Zero non-NULL inputs -> NULL (PG; also covers the zero-row case).
+                    let non_null = rows
+                        .iter()
+                        .map(|row| &row[value_idx])
+                        .filter(|value| !matches!(value, SqlValue::Null));
                     let value = if matches!(select.projection, SelectProjection::Min { .. }) {
-                        rows.iter()
-                            .map(|row| row[value_idx].clone())
-                            .min_by(compare_sql_values)
+                        non_null.min_by(|a, b| compare_sql_values(a, b))
                     } else {
-                        rows.iter()
-                            .map(|row| row[value_idx].clone())
-                            .max_by(compare_sql_values)
+                        non_null.max_by(|a, b| compare_sql_values(a, b))
                     }
-                    // PG: MIN/MAX over zero rows is NULL, not an empty-text sentinel (legacy CPU parity,
-                    // interim debt ADR-006; PG-correctness wins -- `sql-spec-over-cpu-parity`).
+                    .cloned()
                     .unwrap_or(SqlValue::Null);
                     vec![vec![value]]
                 }
@@ -619,19 +651,23 @@ impl Engine {
                     let value_idx = relational_column_index(&table, min_column)?;
                     let choose_min =
                         matches!(select.projection, SelectProjection::GroupedMin { .. });
+                    // PG: MIN/MAX skip NULL inputs per group; an all-NULL group keeps its row with a
+                    // NULL extreme (the `SqlValue::Null` seed, replaced by the first non-NULL value).
                     let mut extrema: BTreeMap<SqlValue, SqlValue> = BTreeMap::new();
                     for row in rows {
-                        extrema
+                        let current = extrema
                             .entry(row[group_idx].clone())
-                            .and_modify(|current| {
-                                let ordering = compare_sql_values(&row[value_idx], current);
-                                if (choose_min && ordering.is_lt())
-                                    || (!choose_min && ordering.is_gt())
-                                {
-                                    *current = row[value_idx].clone();
-                                }
-                            })
-                            .or_insert_with(|| row[value_idx].clone());
+                            .or_insert(SqlValue::Null);
+                        if matches!(row[value_idx], SqlValue::Null) {
+                            continue;
+                        }
+                        let replace = matches!(current, SqlValue::Null) || {
+                            let ordering = compare_sql_values(&row[value_idx], current);
+                            (choose_min && ordering.is_lt()) || (!choose_min && ordering.is_gt())
+                        };
+                        if replace {
+                            *current = row[value_idx].clone();
+                        }
                     }
                     extrema
                         .into_iter()

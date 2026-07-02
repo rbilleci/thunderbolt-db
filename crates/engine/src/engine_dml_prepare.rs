@@ -135,6 +135,8 @@ impl Engine {
                 rows.extend(new_rows.clone());
                 Ok(rows)
             };
+        // PG constraint order: not-null (23502) BEFORE unique — over the NEW rows only, O(new).
+        Self::validate_primary_key_not_null(&table, new_rows.iter().map(Vec::as_slice))?;
         if table.indexes.iter().any(|index| index.unique) {
             let unique_preflight_started = Instant::now();
             if candidate_rows.is_none() {
@@ -645,6 +647,8 @@ impl Engine {
         touched_keys: &BTreeSet<String>,
         visibility: StorageVisibility,
     ) -> Result<(), EngineError> {
+        // 0. PK NOT NULL (PG 23502): checked FIRST, before unique — byte-identical to the scan arm.
+        Self::validate_primary_key_not_null(table, new_images.iter().map(Vec::as_slice))?;
         // 1. UNIQUE: in-batch duplicates among the new images (the scan validator's BTreeSet pass,
         //    NULLs collide) + each new value vs the UNTOUCHED visible rows via the index.
         for index in table.indexes.iter().filter(|index| index.unique) {
@@ -993,6 +997,13 @@ impl Engine {
                 )?;
             }
         } else {
+            // PG constraint order: not-null (23502) BEFORE unique — over the post-assignment NEW
+            // images only, O(touched). (The index arm gets the identical check inside
+            // `validate_dml_constraints_via_index`.)
+            Self::validate_primary_key_not_null(
+                &table,
+                updates.iter().map(|(_, _, row)| row.as_slice()),
+            )?;
             if constrained {
                 candidate_rows.extend(updates.iter().map(|(_, _, row)| row.clone()));
             }

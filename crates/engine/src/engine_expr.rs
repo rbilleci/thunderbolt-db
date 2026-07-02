@@ -4664,6 +4664,51 @@ impl Engine {
             }
         };
 
+        // PG aggregate semantics skip NULL inputs: SUM/AVG/MIN/MAX(col) aggregate the NON-NULL values
+        // (all-NULL -> SQL NULL via the empty-set guard below) and COUNT(DISTINCT col) counts distinct
+        // NON-NULL values. The scalar reductions below are RAW payload reduces (a NULL row's placeholder
+        // is 0 — it would poison MIN toward 0 and inflate AVG's divisor), so when the aggregate column
+        // carries a validity bitmap, AND `col IS NOT NULL` into the predicate: the survivors then
+        // exclude NULL inputs BEFORE the reduce, AVG's divisor (`indices.len()`) is exactly the non-NULL
+        // count, and the existing IsNull lowering + 3VL VM (+ the SV3b/SV6 visibility conjuncts, when
+        // versioned) do all the work. COUNT(*) is deliberately NOT augmented (it counts NULL rows). A
+        // bitmap-free column (the no-NULLs majority — bitmaps are data-driven) adds no conjunct and the
+        // full-scan `(0..n)` fast arm below is untouched: byte-identical to before.
+        //
+        // LEDGERED trade (audit F1): the conjunct is UNCONDITIONAL. On the no-fallback text path, a
+        // nullable NON-int4 aggregate column (or an int4 aggregate whose WHERE makes the augmented
+        // predicate mixed-width) is no longer VM-lowerable -> CLEAN ERROR where the pre-fix code
+        // returned a NULL-BLIND value (wrong for MIN/MAX/AVG, coincidentally right for SUM). A clean
+        // error strictly dominates a silent wrong result; do NOT "fix" this by dropping the conjunct
+        // on un-lowerable shapes — route those to the (now NULL-correct) host finalizer instead when
+        // the coverage gap matters (type-coverage ledger).
+        let aggregate_validity_conjunct: Option<ResidentExpr> = match &select.projection {
+            SelectProjection::Sum { column }
+            | SelectProjection::Avg { column }
+            | SelectProjection::Min { column }
+            | SelectProjection::Max { column }
+            | SelectProjection::CountDistinct { column } => {
+                let col_idx = relational_column_index(table, column)?;
+                resident_device_null_column_offset(&snapshot, table, col_idx)?.map(|_| {
+                    ResidentExpr::IsNull {
+                        col: col_idx,
+                        is_not_null: true,
+                    }
+                })
+            }
+            _ => None,
+        };
+        let augmented_predicate: Option<ResidentExpr> =
+            aggregate_validity_conjunct.map(|validity| match predicate {
+                Some(pred) => ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(pred.clone()),
+                    rhs: Box::new(validity),
+                },
+                None => validity,
+            });
+        let predicate = augmented_predicate.as_ref().or(predicate);
+
         // Evaluate the predicate on the GPU -> surviving row indices (ascending). With no WHERE clause
         // every row survives, so the indices are the full 0..row_count scan (the aggregate + projection
         // paths below are index-driven and need no other change).
@@ -6921,17 +6966,11 @@ impl Engine {
                 // filtered set returns 0 (the lone exception to the SUM/AVG empty-set NULL hard-error).
                 SelectProjection::CountDistinct { column } => {
                     let value_idx = relational_column_index(table, column)?;
-                    // M3 (doc 21): COUNT(DISTINCT v) counts distinct NON-NULL values (PG). The sort/mark/SUM
-                    // pass has no value validity, so a NULL v would be counted as a distinct value (an
-                    // over-count). Clean-error a nullable value rather than silently mis-count (the grouped
-                    // path guards this too); excluding NULL v is the follow-up.
-                    if resident_device_null_column_offset(&snapshot, table, value_idx)?.is_some() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                            "COUNT(DISTINCT) over a nullable column is not yet supported on the GPU \
-                             (M3 3VL follow-up: excluding NULL values from the distinct count)"
-                                .to_string(),
-                        )));
-                    }
+                    // M3 (doc 21): COUNT(DISTINCT v) counts distinct NON-NULL values (PG). A nullable
+                    // v is handled by the aggregate validity conjunct ANDed into the predicate above
+                    // (`v IS NOT NULL`), so the surviving `indices` here contain no NULL values — the
+                    // raw sort/mark/SUM pass over them is PG-exact. (The GROUPED COUNT(DISTINCT)
+                    // paths still guard nullable values with a clean error.)
                     if indices_u64.is_empty() {
                         SqlValue::Int8(0)
                     } else {

@@ -1407,6 +1407,171 @@ fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
 }
 
 #[test]
+fn gpu_sharded_scalar_aggregate_skips_null_values_and_all_null_is_null() {
+    // D1 (read-path assessment): THE FLIP remapped scalar aggregates onto the SHARDED bridge, whose
+    // general-executor reductions are RAW payload reduces — a NULL's placeholder 0 poisoned MIN toward
+    // 0, inflated AVG's divisor, and turned an all-NULL SUM into 0. The aggregate validity conjunct
+    // (`col IS NOT NULL` ANDed into the predicate before the survivor compaction) restores PG
+    // semantics ON-DEVICE under the DEFAULT (sharded) layout. This is the sharded-default twin of
+    // `gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null` (which pins the
+    // single-buffer layer); expected values are closed-form construction, NOT a CPU-operator oracle.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE events_shnull (amount INT, allnull INT, grp INT)")
+        .unwrap();
+    // amount: 10, NULL, 30, NULL, 20, 5 -> non-NULL {10, 30, 20, 5}: count 4, sum 65, min 5, max 30.
+    // allnull: every row NULL. grp: 1 on every row (a NON-NULL filter column whose predicate PASSES
+    // the NULL-amount rows — isolating the validity conjunct from predicate 3VL).
+    e.execute_text(
+        2,
+        "INSERT INTO events_shnull (amount, allnull, grp) VALUES (10, NULL, 1), (NULL, NULL, 1), \
+         (30, NULL, 1), (NULL, NULL, 1), (20, NULL, 1), (5, NULL, 1)",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("events_shnull")
+        .unwrap();
+    if e.resident_shard_count("events_shnull") == 0 {
+        return; // no GPU -> the sharded arm cannot admit; nothing to exercise
+    }
+
+    let run = |sql: &str| {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        e.execute_relational_select(&select).unwrap()
+    };
+
+    // Unfiltered aggregates over the partially-NULL column: NULL rows are excluded from the reduce
+    // AND from AVG's divisor. `executed_target` gates non-vacuity: the DEFAULT route must serve
+    // these on the GPU (a CPU demotion or a fallback would fail here, not silently pass).
+    let cases: [(&str, SqlValue); 4] = [
+        (
+            "SELECT SUM(amount) FROM events_shnull",
+            SqlValue::Int8(65),
+        ),
+        (
+            "SELECT AVG(amount) FROM events_shnull",
+            crate::rel_exec_helpers::average_sql_value(65, 4),
+        ),
+        ("SELECT MIN(amount) FROM events_shnull", SqlValue::Int4(5)),
+        ("SELECT MAX(amount) FROM events_shnull", SqlValue::Int4(30)),
+    ];
+    for (sql, expected) in cases {
+        let resident = run(sql);
+        assert_eq!(resident.rows, vec![vec![expected]], "{sql}");
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(resident.fallback_reason, None, "{sql}");
+    }
+
+    // COUNT(*) control: the validity conjunct must NOT leak into CountAll — COUNT counts NULL rows.
+    let count = run("SELECT COUNT(*) FROM events_shnull");
+    assert_eq!(count.rows, vec![vec![SqlValue::Int8(6)]], "COUNT(*) counts NULL rows");
+
+    // All-NULL column: SUM/AVG/MIN/MAX are SQL NULL (zero surviving non-NULL inputs).
+    for sql in [
+        "SELECT SUM(allnull) FROM events_shnull",
+        "SELECT AVG(allnull) FROM events_shnull",
+        "SELECT MIN(allnull) FROM events_shnull",
+        "SELECT MAX(allnull) FROM events_shnull",
+    ] {
+        let resident = run(sql);
+        assert_eq!(
+            resident.rows,
+            vec![vec![SqlValue::Null]],
+            "{sql} over an all-NULL column must be NULL"
+        );
+    }
+
+    // CROSS-COLUMN filtered aggregate on the GPU: `grp BETWEEN 0 AND 2` passes EVERY row (including
+    // NULL-amount rows), so predicate 3VL cannot be what excludes them — only the validity conjunct
+    // can (a same-column filter would mask the exposure: `amount <= 10` already drops NULL via 3VL
+    // UNKNOWN). AVG is the sharpest detector: a NULL-blind reduce inflates the DIVISOR (÷6 not ÷4)
+    // even though the placeholder 0s don't change the sum. `sharded_int4_between_avg` is the
+    // cross-column shape the sharded route serves on-device — `executed_target` gates that.
+    let between_avg = run("SELECT AVG(amount) FROM events_shnull WHERE grp BETWEEN 0 AND 2");
+    assert_eq!(
+        between_avg.rows,
+        vec![vec![crate::rel_exec_helpers::average_sql_value(65, 4)]],
+        "cross-column filtered AVG divides by the NON-NULL count via the validity conjunct"
+    );
+    assert_eq!(between_avg.executed_target, DeviceTarget::Gpu(0));
+    assert_eq!(between_avg.fallback_reason, None);
+
+    // CROSS-COLUMN Eq-filtered MIN/SUM: a LEDGERED route gap (no sharded/single-buffer shape maps a
+    // cross-column equality-filtered MIN/SUM — the F1 audit's "Eq-filtered SUM is CPU on both
+    // layouts" sibling), so these serve from the CPU-pinned fallback. The VALUES must still be
+    // PG-exact — this pins the host finalizer's NULL-skip semantics (previously host MIN returned
+    // NULL the moment one NULL row existed, and host SUM hard-errored on a NULL input). No
+    // executed_target assert: when the shape gap closes these move on-device.
+    let filtered_min = run("SELECT MIN(amount) FROM events_shnull WHERE grp = 1");
+    assert_eq!(
+        filtered_min.rows,
+        vec![vec![SqlValue::Int4(5)]],
+        "cross-column Eq-filtered MIN skips NULL inputs (host fallback), never NULL-as-smallest"
+    );
+    let filtered_sum = run("SELECT SUM(amount) FROM events_shnull WHERE grp = 1");
+    assert_eq!(
+        filtered_sum.rows,
+        vec![vec![SqlValue::Int8(65)]],
+        "cross-column Eq-filtered SUM skips NULL inputs (host fallback), never an error"
+    );
+
+    // Same-column filtered control (predicate 3VL + validity conjunct compose): `<= 10` is a predicate
+    // the NULL placeholder 0 WOULD pass — the survivors must be {10, 5}, never the phantom 0.
+    let same_col = run("SELECT MIN(amount) FROM events_shnull WHERE amount <= 10");
+    assert_eq!(same_col.rows, vec![vec![SqlValue::Int4(5)]]);
+}
+
+#[test]
+fn gpu_sharded_count_distinct_over_nullable_column_counts_non_null() {
+    // The aggregate validity conjunct also unlocks scalar COUNT(DISTINCT v) over a nullable v — PG
+    // counts distinct NON-NULL values (previously a clean "M3 3VL follow-up" error). Reached via the
+    // TEXT entry (the hand-rolled grammar has no COUNT(DISTINCT); libpg_query maps it), which resolves
+    // the sharded unified source inside the general executor. All-NULL -> 0 (PG: COUNT over zero rows
+    // is 0, not NULL). The GROUPED COUNT(DISTINCT) paths keep their nullable clean-error.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE events_cd (amount INT, allnull INT)")
+        .unwrap();
+    // amount: {10, NULL, 30, NULL, 20, 5, 10} -> distinct non-NULL {10, 30, 20, 5} = 4.
+    e.execute_text(
+        2,
+        "INSERT INTO events_cd (amount, allnull) VALUES (10, NULL), (NULL, NULL), (30, NULL), \
+         (NULL, NULL), (20, NULL), (5, NULL), (10, NULL)",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("events_cd").unwrap();
+    if e.resident_shard_count("events_cd") == 0 {
+        return; // no GPU
+    }
+    let distinct = e
+        .execute_relational_select_text("SELECT COUNT(DISTINCT amount) FROM events_cd")
+        .unwrap();
+    assert_eq!(
+        distinct.rows,
+        vec![vec![SqlValue::Int8(4)]],
+        "COUNT(DISTINCT) counts distinct NON-NULL values"
+    );
+    assert_eq!(distinct.executed_target, DeviceTarget::Gpu(0));
+    let all_null = e
+        .execute_relational_select_text("SELECT COUNT(DISTINCT allnull) FROM events_cd")
+        .unwrap();
+    assert_eq!(
+        all_null.rows,
+        vec![vec![SqlValue::Int8(0)]],
+        "COUNT(DISTINCT) over an all-NULL column is 0 (PG), not NULL and not 1"
+    );
+    // The GROUPED COUNT(DISTINCT) paths do NOT take the scalar validity conjunct (they group before
+    // counting) — their nullable clean-error guard must stay until validity threads through the
+    // grouped distinct pass (never a silent over-count).
+    assert!(
+        e.execute_resident_expr_select_sql(
+            "SELECT amount, COUNT(DISTINCT allnull) FROM events_cd GROUP BY amount"
+        )
+        .is_err(),
+        "grouped COUNT(DISTINCT) over a nullable value still clean-errors"
+    );
+}
+
+#[test]
 fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
     // M3 Slice A: filtered (compare + BETWEEN) SUM/AVG/MIN/MAX over a NULLABLE int4 column skip NULL rows
     // ON THE GPU, and a no-surviving-row result is SQL NULL. Closed-form construction oracle (not CPU).

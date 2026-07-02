@@ -1886,9 +1886,11 @@ fn gpu_group_by_nullable_composite_key_per_member_null_on_device() {
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn gpu_count_distinct_over_a_nullable_value_clean_errors() {
-    // M3 (doc 21): COUNT(DISTINCT v) over a NULLABLE value must EXCLUDE NULLs (PG); the sort-based reps
-    // pass has no value validity (it would over-count NULL as a distinct value), so clean-error rather than
-    // silently mis-count. (A non-null COUNT(DISTINCT) is unaffected -- covered by the count_distinct suite.)
+    // M3 (doc 21): COUNT(DISTINCT v) over a NULLABLE value must EXCLUDE NULLs (PG). The SCALAR form
+    // now COMPUTES this (the aggregate validity conjunct ANDs `v IS NOT NULL` into the predicate, so
+    // the distinct pass sees no NULLs — the former clean-error is resolved); the GROUPED paths still
+    // have no value validity in the sort-based reps pass, so they keep the clean error rather than
+    // silently over-count. (A non-null COUNT(DISTINCT) is unaffected -- the count_distinct suite.)
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
     e.execute_text(
@@ -1908,10 +1910,13 @@ fn gpu_count_distinct_over_a_nullable_value_clean_errors() {
             .is_err(),
         "grouped COUNT(DISTINCT) over a nullable value clean-errors (no silent over-count)"
     );
-    assert!(
-        e.execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t")
-            .is_err(),
-        "scalar COUNT(DISTINCT) over a nullable value clean-errors (no silent over-count)"
+    let scalar = e
+        .execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t")
+        .unwrap();
+    assert_eq!(
+        scalar.rows,
+        vec![vec![SqlValue::Int8(2)]],
+        "scalar COUNT(DISTINCT v) counts distinct NON-NULL values (10 and 20 = 2), excluding NULL"
     );
 }
 

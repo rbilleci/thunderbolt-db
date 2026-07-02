@@ -2474,3 +2474,111 @@ fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
     );
     assert_eq!(max_result.fallback_reason, None);
 }
+
+#[test]
+fn primary_key_rejects_null_on_insert_and_update() {
+    // PG: PRIMARY KEY implies NOT NULL (23502) — a NULL may never enter a PK column. Previously the
+    // PK was validated only as a unique index whose BTreeSet collides NULLs, so exactly ONE NULL row
+    // could slip in (and would then poison the resident PK index routes + the NULL-blind aggregate
+    // fast paths). Both validator arms (index-driven + scan fallback) must reject it identically.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE pk_nn (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+
+    // INSERT of an explicit NULL PK: rejected, nothing written.
+    let err = e
+        .execute_text(2, "INSERT INTO pk_nn (id, v) VALUES (NULL, 1)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("null value in column \"id\" of relation \"pk_nn\" violates not-null constraint"),
+        "{err}"
+    );
+    // Multi-row INSERT with one NULL among valid rows: the whole statement fails (atomicity).
+    let err = e
+        .execute_text(3, "INSERT INTO pk_nn (id, v) VALUES (7, 7), (NULL, 8)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("violates not-null constraint"), "{err}");
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM pk_nn").unwrap() else {
+        panic!("expected SELECT plan");
+    };
+    assert_eq!(
+        e.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(0)]],
+        "failed inserts must write nothing"
+    );
+
+    // Valid rows land; UPDATE to NULL is rejected on BOTH validator arms (the index-driven default
+    // and the scan fallback behind the kill switch), byte-identical message; rows stay intact.
+    e.execute_text(4, "INSERT INTO pk_nn (id, v) VALUES (1, 1), (2, 2)")
+        .unwrap();
+    let mut txn = 5;
+    for index_arm in [true, false] {
+        e.set_dml_value_index_resolve_enabled(index_arm);
+        let err = e
+            .execute_text(txn, "UPDATE pk_nn SET id = NULL WHERE v = 1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "null value in column \"id\" of relation \"pk_nn\" violates not-null constraint"
+            ),
+            "index_arm={index_arm}: {err}"
+        );
+        txn += 1;
+    }
+    e.set_dml_value_index_resolve_enabled(true);
+    assert_eq!(
+        e.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(2)]],
+        "failed updates must change nothing"
+    );
+    // A valid UPDATE of the PK still works (the check is NULL-only, not immutability).
+    e.execute_text(txn, "UPDATE pk_nn SET id = 3 WHERE v = 1").unwrap();
+
+    // Control: a plain (non-PK) UNIQUE column keeps this engine's existing NULL semantics unchanged
+    // (one NULL admitted; a second collides) — the not-null check is scoped to the PK.
+    e.execute_text(txn + 1, "CREATE TABLE uq_ctl (id INT PRIMARY KEY, u INT UNIQUE)")
+        .unwrap();
+    e.execute_text(txn + 2, "INSERT INTO uq_ctl (id, u) VALUES (1, NULL)")
+        .unwrap();
+    let err = e
+        .execute_text(txn + 3, "INSERT INTO uq_ctl (id, u) VALUES (2, NULL)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("duplicate key value"), "{err}");
+}
+
+#[test]
+fn alter_add_primary_key_rejects_null_bearing_column() {
+    // PG: promoting a null-bearing column to PRIMARY KEY fails (the creation-time half of the PK
+    // NOT NULL invariant the DML validators rely on). After the NULL row is gone the promotion
+    // succeeds, and the promoted PK then enforces not-null on subsequent writes.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE promote (id INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO promote (id, v) VALUES (NULL, 1), (2, 2)")
+        .unwrap();
+    let err = e
+        .execute_text(
+            3,
+            "ALTER TABLE ONLY public.promote ADD CONSTRAINT promote_pkey PRIMARY KEY (id)",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("column \"id\" of relation \"promote\" contains null values"),
+        "{err}"
+    );
+    e.execute_text(4, "DELETE FROM promote WHERE v = 1").unwrap();
+    e.execute_text(
+        5,
+        "ALTER TABLE ONLY public.promote ADD CONSTRAINT promote_pkey PRIMARY KEY (id)",
+    )
+    .unwrap();
+    let err = e
+        .execute_text(6, "INSERT INTO promote (id, v) VALUES (NULL, 3)")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("violates not-null constraint"), "{err}");
+}

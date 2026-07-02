@@ -266,6 +266,18 @@ impl Engine {
                 read_txn_id: self.committed_seq() as TxnId,
             };
             let rows = self.visible_relational_rows(&table, visibility)?;
+            // PG: ADD PRIMARY KEY over existing data requires the column non-null (23502) — the
+            // creation-time half of the PK NOT NULL invariant the DML validators rely on.
+            if primary_key
+                && rows
+                    .iter()
+                    .any(|row| matches!(row[column_idx], SqlValue::Null))
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "column \"{}\" of relation \"{}\" contains null values",
+                    create.column, create.table
+                )));
+            }
             Self::validate_unique_values(&rows, column_idx, &create.name)?;
         }
         cat.relational_catalog
@@ -506,6 +518,42 @@ impl Engine {
             }
         }
         Ok(rows)
+    }
+
+    /// PG: PRIMARY KEY implies NOT NULL — a NULL may never enter a PK column (PG rejects it with a
+    /// 23502 not-null violation BEFORE the unique check; previously this engine admitted exactly one
+    /// NULL per PK because the PK was validated only as a unique index whose BTreeSet collides NULLs).
+    /// `rows` = the NEW images only — existing rows are guaranteed by creation-time validation
+    /// (`apply_create_index_with_constraint_flags` rejects a PK over null-bearing data), exactly PG's
+    /// model. Checked in BOTH validator arms (scan + index-driven) with this one byte-identical
+    /// message; a table can carry at most one PK (`apply_add_primary_key` enforces it), so this is a
+    /// single pass over the new images.
+    pub(crate) fn validate_primary_key_not_null<'a>(
+        table: &RelationalTable,
+        rows: impl IntoIterator<Item = &'a [SqlValue]>,
+    ) -> Result<(), EngineError> {
+        let Some(column_idx) = table
+            .indexes
+            .iter()
+            .find(|index| index.primary_key)
+            .and_then(|index| {
+                table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == index.column)
+            })
+        else {
+            return Ok(());
+        };
+        for row in rows {
+            if matches!(row[column_idx], SqlValue::Null) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                    table.columns[column_idx].name, table.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_unique_values(
