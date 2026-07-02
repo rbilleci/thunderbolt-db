@@ -3556,6 +3556,70 @@ mod capacity_payload_tests {
         );
     }
 
+    /// RETIREMENT A4e — the CONCURRENT form: single-row INSERT waves (the SLO workload) on an
+    /// ELIDED table through `execute_dml_concurrent`, racing a hammering reader. The wave arm's
+    /// native hooks must ENTER elision after the first handled append and stay there through
+    /// rollovers (steady state = ZERO rehydrations — a de-elision would mean the incremental path
+    /// silently degraded); results match the install twin; the reader never errors.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a4e_concurrent_insert_waves_elide_and_match_twin() {
+        let run = |elide: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_host_install_elision_enabled(elide);
+            e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+            // TWO serialized chunks: the SECOND re-admits the table SHARDED (target 64) — the
+            // wave appends then take the rollover-capable shard path. A dense SINGLE-BUFFER
+            // table's append always declines (no rollover), so such a table never ENTERS elision
+            // (safety by construction) — and this test would be vacuous.
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", k * 10))
+                    .collect();
+                e.execute_text(
+                    2 + chunk as u64,
+                    &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+            }
+            // NO concurrent reader here: a reader hammering the wave path trips the PRE-EXISTING
+            // ADR-013 D4 publication tear ("resident shard 0 has no retained device memory" —
+            // shard metadata paired with a separate device-memory map get mid-rollover), with
+            // elision ON *and* OFF — live evidence for the generation-atomic publication gate
+            // (pre2), not an elision defect. This test pins the DATA PLANE.
+            for t in 0..300_u64 {
+                e.execute_dml_concurrent(
+                    100 + t,
+                    &format!("INSERT INTO t (id, v) VALUES ({}, {})", 1000 + t, t),
+                )
+                .unwrap();
+            }
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            (e, rows)
+        };
+        let (off, off_rows) = run(false);
+        let (on, on_rows) = run(true);
+        assert_eq!(on_rows.len(), 500, "200 + 300 waves");
+        assert_eq!(on_rows, off_rows, "concurrent elided == install twin");
+        assert!(
+            on.host_install_elisions() >= 250,
+            "non-vacuity: the waves must have SKIPPED installs (got {})",
+            on.host_install_elisions()
+        );
+        assert!(
+            on.table_install_elided("t"),
+            "steady state must STAY elided through ~5 rollovers (a de-elision = degradation)"
+        );
+        assert_eq!(off.host_install_elisions(), 0);
+    }
+
     /// RETIREMENT A4c — the DEVICE GATHER differential: `gather_resident_table_rows_from_device`
     /// (the re-admit / de-elision rebuild source) == the host store's visible rows, (row_id, row)
     /// for (row_id, row), across the full write lineage (admission, SV5 version-split update,

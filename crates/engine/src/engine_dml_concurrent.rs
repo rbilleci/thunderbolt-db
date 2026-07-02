@@ -242,6 +242,7 @@ impl Engine {
         // invalidate + re-admit from the EMPTY host store. Concurrent-native elision hooks are
         // the ledgered follow-up (they are what the SLO target ultimately needs).
         if self.host_install_elision_enabled()
+            && !matches!(cmd, Command::Insert(_))
             && Self::dml_mutated_tables(&cmd)
                 .iter()
                 .any(|table| self.table_install_elided(table))
@@ -645,6 +646,70 @@ impl Engine {
                     }
                     _ => None,
                 };
+            // RETIREMENT A4e (concurrent-native hooks): the (upserts, removals) an elided-table
+            // rehydration would need — extracted BEFORE apply consumes the delta. Flag OFF = None.
+            let elided_hook: Option<(
+                String,
+                std::collections::BTreeMap<u64, Vec<SqlValue>>,
+                std::collections::BTreeSet<u64>,
+            )> = if self.host_install_elision_enabled() {
+                match &delta.mutation {
+                    crate::write_path::PreparedMutation::Insert {
+                        table,
+                        inserted_rows,
+                        ..
+                    } => {
+                        let prefix = relational_key_prefix(table);
+                        Some((
+                            table.clone(),
+                            inserted_rows
+                                .iter()
+                                .filter_map(|(key, values)| {
+                                    crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                        .map(|id| (id, values.clone()))
+                                })
+                                .collect(),
+                            Default::default(),
+                        ))
+                    }
+                    crate::write_path::PreparedMutation::Update {
+                        table, installs, ..
+                    } => {
+                        let prefix = relational_key_prefix(table);
+                        Some((
+                            table.clone(),
+                            installs
+                                .iter()
+                                .filter_map(|(_id, key, row)| {
+                                    crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                        .map(|id| (id, row.clone()))
+                                })
+                                .collect(),
+                            Default::default(),
+                        ))
+                    }
+                    crate::write_path::PreparedMutation::Delete { table, .. } => {
+                        let prefix = relational_key_prefix(table);
+                        Some((
+                            table.clone(),
+                            Default::default(),
+                            delta
+                                .write_set
+                                .rows
+                                .iter()
+                                .filter_map(|row| {
+                                    crate::engine_residency::parse_relational_row_id(
+                                        &row.row_key,
+                                        &prefix,
+                                    )
+                                })
+                                .collect(),
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
             self.apply_delta(delta, commit_seq, None)
                 .unwrap_or_else(|err| {
                     panic!(
@@ -663,6 +728,41 @@ impl Engine {
                     .is_some_and(|(table, rows, row_ids)| {
                         self.try_append_resident_int4_open_shard(table, rows, None, Some(row_ids))
                     });
+            // RETIREMENT A4e (concurrent-native lifecycle, mirrors the serialized arm): a handled
+            // append on an eligible strictly-Int4 table ENTERS elision; an UNHANDLED commit on an
+            // elided table REHYDRATES (device gather @ C-1 + this commit's delta) BEFORE the
+            // invalidate below re-admits — else the re-admit would rebuild from the EMPTY store.
+            // Rehydration failure post-apply is an invariant violation: panic like the apply.
+            if let Some((table_name, upserts, removals)) = elided_hook {
+                if appended && !self.table_install_elided(&table_name) {
+                    if let Some(table) = self.relational_catalog_table(&table_name) {
+                        if table
+                            .columns
+                            .iter()
+                            .all(|column| column.ty == gpu_db_sql::SqlType::Int4)
+                        {
+                            self.set_table_install_elided(&table_name, true);
+                        }
+                    }
+                } else if !appended && self.table_install_elided(&table_name) {
+                    let table = self
+                        .relational_catalog_table(&table_name)
+                        .expect("an elided table is in the catalog");
+                    self.rehydrate_elided_table(
+                        &table,
+                        commit_seq.saturating_sub(1),
+                        &upserts,
+                        &removals,
+                        commit_seq,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "commit-path invariant violation: elided rehydration at commit_seq \
+                             {commit_seq} failed: {err}"
+                        )
+                    });
+                }
+            }
             if !appended {
                 self.invalidate_relational_residency_tables_concurrent(
                     &item.residency_tables,
