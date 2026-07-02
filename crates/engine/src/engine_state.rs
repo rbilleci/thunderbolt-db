@@ -597,6 +597,13 @@ pub(crate) struct ResidencyReadState {
     /// (unique/FK validators). Both answers count — FALSE (no visible row carries the value) is the
     /// load-bearing one. `Relaxed` monotonic counter.
     pub(crate) dml_device_validate_hits: std::sync::atomic::AtomicU64,
+    /// RETIREMENT A4e: tables whose commits ELIDE the host tuple-store + value-index install
+    /// (device-authoritative). Entered after first admission when eligible under the default-OFF
+    /// flag; LEFT (sticky de-elision) via rehydration when any resolve/gather declines. COW set —
+    /// readers load() wait-free on the apply path.
+    pub(crate) elided_tables: ArcSwap<std::collections::BTreeSet<String>>,
+    /// RETIREMENT A4e: commits that skipped the host install (the non-vacuity signal).
+    pub(crate) host_install_elisions: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

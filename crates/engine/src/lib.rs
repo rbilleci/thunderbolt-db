@@ -414,6 +414,7 @@ pub struct Engine {
     /// value-index resolve (slice 1), then the scan.
     dml_device_resolve_enabled: std::sync::atomic::AtomicBool,
     dml_device_validate_enabled: std::sync::atomic::AtomicBool,
+    host_install_elision_enabled: std::sync::atomic::AtomicBool,
     /// S-d2c: the target row count per shard (the rollover/seal threshold; default 4M). Settable
     /// small in tests. Interior-mutable.
     shard_size_target: std::sync::atomic::AtomicUsize,

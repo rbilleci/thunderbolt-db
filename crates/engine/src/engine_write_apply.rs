@@ -38,6 +38,22 @@ impl Engine {
                     "apply_delta (&self) cannot install nextval sequence advances; route through \
                      apply_delta_serialized"
                 );
+                // RETIREMENT A4e: an ELIDED (device-authoritative) table SKIPS the host tuple +
+                // value-index install — the device append (the commit arm's incremental path) is
+                // the data plane; WAL is durability. The ROW-ID allocator MUST still advance
+                // (prepare computed this delta's row keys from it; skipping would reuse
+                // identities). tuple_ids are a host-store-only artifact — none are consumed.
+                if self.table_install_elided(&table) {
+                    self.read_state
+                        .mvcc
+                        .advance_row_id(inserted_rows.len() as u64);
+                    self.read_state
+                        .residency
+                        .host_install_elisions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
+                    return Ok(());
+                }
                 // Reserve the globally-unique tuple ids up front (the old in-line bump consumed one
                 // per row from the single shared allocator; `next_tuple_id` is now shared across all
                 // partitions so ids are identical). Advance the relational row-id allocator by the
@@ -88,6 +104,15 @@ impl Engine {
                 value_index_entries,
                 updated_old_rows: _,
             } => {
+                // RETIREMENT A4e: elided tables have no host tuples to rewrite — the device
+                // tombstone+append (SV5/A4b) is the data plane.
+                if self.table_install_elided(&table) {
+                    self.read_state
+                        .residency
+                        .host_install_elisions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
                 self.read_state.mvcc.with_table_mut(&table, |data| {
                     for (tuple_id, _row_key, values) in &installs {
                         data.rows
@@ -107,6 +132,15 @@ impl Engine {
                 tuple_ids,
                 deleted_rows: _,
             } => {
+                // RETIREMENT A4e: elided tables have no host tuples to tombstone — the device
+                // tombstone (SV4b/A4b) is the data plane.
+                if self.table_install_elided(&table) {
+                    self.read_state
+                        .residency
+                        .host_install_elisions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
                 self.read_state.mvcc.with_table_mut(&table, |data| {
                     for tuple_id in tuple_ids {
                         data.rows

@@ -605,14 +605,24 @@ impl Engine {
             if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
                 continue; // a row this statement touches: excluded, like the host probe
             }
-            let fetched = table_rows
-                .store()
-                .tuple_fetch_by_key(&key, visibility)
-                .ok()?;
-            let Some(tuple) = fetched else {
-                continue; // no visible version at this snapshot
+            // RETIREMENT A4e: elided tables materialize from the device (the host store is
+            // empty); visibility rides the regions (A4a).
+            let row = if self.table_install_elided(&table.name) {
+                match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
+                    Some(Some(row)) => row,
+                    Some(None) => continue,
+                    None => return None,
+                }
+            } else {
+                let fetched = table_rows
+                    .store()
+                    .tuple_fetch_by_key(&key, visibility)
+                    .ok()?;
+                let Some(tuple) = fetched else {
+                    continue; // no visible version at this snapshot
+                };
+                decode_relational_row(&tuple.value, &table.columns).ok()?
             };
-            let row = decode_relational_row(&tuple.value, &table.columns).ok()?;
             if row[column_idx] == *value {
                 answer = true;
                 break;

@@ -3454,6 +3454,108 @@ mod capacity_payload_tests {
         }
     }
 
+    /// RETIREMENT A4e — the ELISION differential: twin engines (elision ON vs OFF) run the same
+    /// lifecycle — admission, elided steady-state INSERTs, point DELETE/UPDATE (the A2 resolve
+    /// materializing from the DEVICE, tuple-fetch impossible: the store is empty), a UNIQUE
+    /// constraint probe on the elided table (A3 via the materializer), then an OR-group UPDATE
+    /// whose resolve DECLINES -> REHYDRATION (sticky de-elision) -> host path. Every read matches;
+    /// post-rehydration the host store is COMPLETE again (differential vs the OFF twin's store).
+    /// NON-VACUITY: host_install_elisions advances; while elided the host store prefix is EMPTY
+    /// for the elided-era rows (proving installs really were skipped, not just unread).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a4e_elision_lifecycle_matches_install_twin() {
+        let run = |elide: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_host_install_elision_enabled(elide);
+            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", k * 10))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let statements = [
+                "INSERT INTO t (id, v) VALUES (500, 5000)", // elided steady-state insert
+                "INSERT INTO t (id, v) VALUES (501, 5010)",
+                "UPDATE t SET v = 999 WHERE id = 130", // device resolve + materializer
+                "DELETE FROM t WHERE id = 42",         // device resolve + materializer
+                "INSERT INTO t (id, v) VALUES (130, 1)", // unique violation THROUGH the elided probe
+                "UPDATE t SET v = -5 WHERE id = 10 OR id = 11", // OR-group: decline -> REHYDRATE
+                "INSERT INTO t (id, v) VALUES (502, 5020)", // post-rehydration: normal installs
+            ];
+            let mut outcomes: Vec<Result<(), String>> = Vec::new();
+            for sql in &statements {
+                outcomes.push(
+                    e.execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
+                );
+                seq += 1;
+            }
+            let rows = e
+                .execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            (e, outcomes, rows)
+        };
+        let (on, on_out, on_rows) = run(true);
+        let (off, off_out, off_rows) = run(false);
+        assert_eq!(on_out, off_out, "outcome ladder: elided == install twin");
+        let mut on_sorted = on_rows;
+        let mut off_sorted = off_rows;
+        on_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        off_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(on_sorted, off_sorted, "reads: elided == install twin");
+        assert!(
+            on.host_install_elisions() > 0,
+            "non-vacuity: commits must actually have SKIPPED host installs"
+        );
+        assert_eq!(off.host_install_elisions(), 0, "flag OFF never elides");
+        assert!(
+            !on.table_install_elided("t"),
+            "the OR-group decline must have STICKY-de-elided the table"
+        );
+        // Post-rehydration store completeness: both stores hold the SAME visible relational rows.
+        let store_rows = |e: &Engine| -> Vec<(String, Vec<SqlValue>)> {
+            let table = e.relational_catalog_table("t").unwrap();
+            let table_rows = e.read_state.mvcc.table_rows("t");
+            let prefix = relational_key_prefix("t");
+            let mut out = Vec::new();
+            let mut cursor = table_rows
+                .store()
+                .seq_scan_open(crate::StorageVisibility {
+                    read_txn_id: e.committed_seq(),
+                })
+                .unwrap();
+            while let Some(tuple) = cursor.next() {
+                if tuple.key.starts_with(&prefix) {
+                    out.push((
+                        tuple.key.clone(),
+                        decode_relational_row(&tuple.value, &table.columns).unwrap(),
+                    ));
+                }
+            }
+            out.sort();
+            out
+        };
+        assert_eq!(
+            store_rows(&on),
+            store_rows(&off),
+            "post-rehydration host store == the install twin's, key for key"
+        );
+    }
+
     /// RETIREMENT A4c — the DEVICE GATHER differential: `gather_resident_table_rows_from_device`
     /// (the re-admit / de-elision rebuild source) == the host store's visible rows, (row_id, row)
     /// for (row_id, row), across the full write lineage (admission, SV5 version-split update,
@@ -5582,6 +5684,53 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// RETIREMENT A4e: enable/disable the HOST-INSTALL ELISION (default OFF — the A/B lever; the
+    /// flip is gated on the SLO measurement + the ADR-013 stamps/publication gates + audits).
+    pub fn set_host_install_elision_enabled(&self, on: bool) {
+        self.host_install_elision_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn host_install_elision_enabled(&self) -> bool {
+        self.host_install_elision_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// RETIREMENT A4e: is `table` device-authoritative (commits skip the host install)?
+    pub(crate) fn table_install_elided(&self, table: &str) -> bool {
+        self.read_state
+            .residency
+            .elided_tables
+            .load()
+            .contains(table)
+    }
+
+    /// RETIREMENT A4e: commits that skipped the host install (non-vacuity telemetry).
+    pub fn host_install_elisions(&self) -> u64 {
+        self.read_state
+            .residency
+            .host_install_elisions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// RETIREMENT A4e: COW-add/remove a table from the elided set (serialized commit path only).
+    pub(crate) fn set_table_install_elided(&self, table: &str, elided: bool) {
+        let cur = self.read_state.residency.elided_tables.load();
+        if cur.contains(table) == elided {
+            return;
+        }
+        let mut next = (**cur).clone();
+        if elided {
+            next.insert(table.to_string());
+        } else {
+            next.remove(table);
+        }
+        self.read_state
+            .residency
+            .elided_tables
+            .store(std::sync::Arc::new(next));
+    }
+
     /// S-d2c: set the target row count per shard (the rollover/seal threshold). Settable small in tests.
     pub fn set_shard_size_target(&self, rows: usize) {
         self.shard_size_target
@@ -6778,6 +6927,110 @@ impl Engine {
                 device_memory,
                 &read_state.residency,
             );
+        Ok(())
+    }
+
+    /// RETIREMENT A4e: REHYDRATE an elided table — the STICKY DE-ELISION transition. The A4c
+    /// gather (at `read_txn`, the last seq whose state the device fully holds) repopulates the
+    /// host tuple store + value indexes THROUGH the normal install path (clearing the stale
+    /// pre-elision prefix first), then the table LEAVES the elided set. Callers: a DML
+    /// prepare/probe whose device resolve declines on an elided table (then the host path
+    /// proceeds, always correct), and the commit arm's !handled fallback (then the re-admit
+    /// rebuilds from the now-complete store). `extra_rows` carries an in-flight commit's rows
+    /// (the mutation the device could NOT absorb — e.g. a NULL append) that the gather at
+    /// `read_txn = C-1` cannot see. Returns Err when the gather declines — for an elided table
+    /// that is a broken invariant (elision eligibility ⊆ gather eligibility), and failing LOUDLY
+    /// beats a silently incomplete store.
+    pub(crate) fn rehydrate_elided_table(
+        &self,
+        table: &RelationalTable,
+        read_txn: u64,
+        upserts: &std::collections::BTreeMap<u64, Vec<SqlValue>>,
+        removals: &std::collections::BTreeSet<u64>,
+        commit_seq: u64,
+    ) -> Result<(), EngineError> {
+        let gathered = self
+            .gather_resident_table_rows_from_device(table, read_txn)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "rehydration gather declined for elided table \"{}\" — device-authoritative \
+                     invariant broken (WAL replay is the recovery path)",
+                    table.name
+                ))
+            })?;
+        let prefix = relational_key_prefix(&table.name);
+        // The gather is the device truth at read_txn; the in-flight commit's delta (the mutation
+        // the device could NOT absorb) applies ON TOP: upserts overwrite by identity (an UPDATE
+        // keeps its row_id — the new image wins), removals drop (a DELETE the apply skipped).
+        let mut merged: std::collections::BTreeMap<u64, Vec<SqlValue>> =
+            gathered.into_iter().collect();
+        for (row_id, row) in upserts {
+            merged.insert(*row_id, row.clone());
+        }
+        for row_id in removals {
+            merged.remove(row_id);
+        }
+        let install: Vec<(u64, Vec<SqlValue>)> = merged.into_iter().collect();
+        let visibility = crate::StorageVisibility {
+            read_txn_id: read_txn,
+        };
+        self.read_state.mvcc.with_table_mut(&table.name, |data| {
+            // RECONCILE, not clear+reinsert: the stale pre-elision prefix rows update in place
+            // (same key -> tuple_update), gathered-only keys insert, host-only keys (deleted
+            // during the elided era) tombstone. The per-table value_index rebuilds wholesale.
+            let mut stale: std::collections::BTreeMap<String, u64> = Default::default();
+            {
+                let mut cursor = data
+                    .rows
+                    .seq_scan_open(visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                while let Some(tuple) = cursor.next() {
+                    if tuple.key.starts_with(&prefix) {
+                        stale.insert(tuple.key.clone(), tuple.tuple_id);
+                    }
+                }
+            }
+            for (row_id, row) in &install {
+                let key = relational_row_key(&table.name, *row_id);
+                if let Some(tuple_id) = stale.remove(&key) {
+                    data.rows
+                        .tuple_update(tuple_id, encode_relational_row(row), commit_seq)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                } else {
+                    let tuple_id = self.read_state.mvcc.reserve_tuple_id();
+                    data.rows
+                        .tuple_insert_reserved_key_with_id(
+                            tuple_id,
+                            gpu_db_storage::NewTuple {
+                                key: key.clone(),
+                                value: encode_relational_row(row),
+                            },
+                            commit_seq,
+                        )
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+            }
+            for (_key, tuple_id) in stale {
+                data.rows
+                    .tuple_delete(tuple_id, commit_seq)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            }
+            data.value_index.clear();
+            for (row_id, row) in &install {
+                let key = relational_row_key(&table.name, *row_id);
+                for (idx, column) in table.columns.iter().enumerate() {
+                    let slot_key = crate::resident_storage::ColumnValueKey {
+                        column: column.name.clone(),
+                        value: relational_index_value(&row[idx]),
+                    };
+                    let mut slot = data.value_index.get(&slot_key).cloned().unwrap_or_default();
+                    slot.push_back(key.clone());
+                    data.value_index.insert(slot_key, slot);
+                }
+            }
+            Ok::<(), EngineError>(())
+        })?;
+        self.set_table_install_elided(&table.name, false);
         Ok(())
     }
 

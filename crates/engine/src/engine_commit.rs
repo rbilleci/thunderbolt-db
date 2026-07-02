@@ -336,6 +336,43 @@ impl Engine {
                     }
                     _ => false,
                 };
+            // RETIREMENT A4e: the ELIDED lifecycle. A handled incremental commit on an eligible
+            // strictly-Int4 table ENTERS elision (subsequent applies skip the host install); an
+            // UNHANDLED commit on an elided table REHYDRATES FIRST (device gather @ C-1 + this
+            // commit's delta -> the host store is complete again, sticky de-elision) so the
+            // invalidate+re-admit below rebuilds from a truthful store.
+            if let Some(applied_ref) = applied.as_ref() {
+                let table_name = match applied_ref {
+                    AppliedRowMutation::Insert { table, .. }
+                    | AppliedRowMutation::Delete { table, .. }
+                    | AppliedRowMutation::Update { table, .. } => table.as_str(),
+                };
+                if handled
+                    && self.host_install_elision_enabled()
+                    && !self.table_install_elided(table_name)
+                {
+                    if let Some(table) = cat.relational_catalog.get(table_name) {
+                        if table
+                            .columns
+                            .iter()
+                            .all(|column| column.ty == gpu_db_sql::SqlType::Int4)
+                        {
+                            self.set_table_install_elided(table_name, true);
+                        }
+                    }
+                } else if !handled && self.table_install_elided(table_name) {
+                    let (upserts, removals) = Self::elided_commit_delta(applied_ref);
+                    if let Some(table) = cat.relational_catalog.get(table_name) {
+                        self.rehydrate_elided_table(
+                            table,
+                            publish_index.saturating_sub(1),
+                            &upserts,
+                            &removals,
+                            publish_index,
+                        )?;
+                    }
+                }
+            }
             if !handled {
                 self.invalidate_relational_residency_for_commit(&to_apply, txn_id, publish_index);
             }
@@ -353,6 +390,54 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// RETIREMENT A4e: an unhandled commit's (upserts, removals) by row identity — the delta the
+    /// device could not absorb, applied on top of the rehydration gather. Identities: INSERT/
+    /// UPDATE carry `row_ids` on the mutation; DELETE parses the write-set's row keys.
+    fn elided_commit_delta(
+        applied: &AppliedRowMutation,
+    ) -> (
+        std::collections::BTreeMap<u64, Vec<SqlValue>>,
+        std::collections::BTreeSet<u64>,
+    ) {
+        let mut upserts = std::collections::BTreeMap::new();
+        let mut removals = std::collections::BTreeSet::new();
+        match applied {
+            AppliedRowMutation::Insert {
+                table,
+                rows,
+                row_ids,
+                ..
+            } => {
+                let _ = table;
+                for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                    upserts.insert(*row_id, row.clone());
+                }
+            }
+            AppliedRowMutation::Update {
+                new_rows, row_ids, ..
+            } => {
+                if let Some(ids) = row_ids {
+                    for (row_id, row) in ids.iter().zip(new_rows.iter()) {
+                        upserts.insert(*row_id, row.clone());
+                    }
+                }
+            }
+            AppliedRowMutation::Delete {
+                table, write_set, ..
+            } => {
+                let prefix = relational_key_prefix(table);
+                for row in &write_set.rows {
+                    if let Some(row_id) =
+                        crate::engine_residency::parse_relational_row_id(&row.row_key, &prefix)
+                    {
+                        removals.insert(row_id);
+                    }
+                }
+            }
+        }
+        (upserts, removals)
     }
 
     pub(crate) fn commit_mutation_at_with_current_apply<F>(

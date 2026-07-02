@@ -87,6 +87,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             Engine::new_local()
         };
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
+        // RETIREMENT A4e: GPU_DB_BENCH_ELIDE=1 measures the host-install ELISION arm (the
+        // device-authoritative commit path; requires auto-admit so the table enters elision).
+        if std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1") {
+            e.set_auto_admit_on_commit(true);
+            e.set_host_install_elision_enabled(true);
+        }
 
         let engine = Arc::new(e);
         let stop = Arc::new(AtomicBool::new(false));

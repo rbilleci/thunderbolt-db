@@ -198,6 +198,7 @@ impl Engine {
             // the fallback chain (value-index resolve -> scan) remains complete behind it.
             dml_device_resolve_enabled: std::sync::atomic::AtomicBool::new(true),
             dml_device_validate_enabled: std::sync::atomic::AtomicBool::new(true),
+            host_install_elision_enabled: std::sync::atomic::AtomicBool::new(false),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }
