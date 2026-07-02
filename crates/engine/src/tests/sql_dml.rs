@@ -2491,7 +2491,9 @@ fn primary_key_rejects_null_on_insert_and_update() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("null value in column \"id\" of relation \"pk_nn\" violates not-null constraint"),
+        err.contains(
+            "null value in column \"id\" of relation \"pk_nn\" violates not-null constraint"
+        ),
         "{err}"
     );
     // Multi-row INSERT with one NULL among valid rows: the whole statement fails (atomicity).
@@ -2535,12 +2537,16 @@ fn primary_key_rejects_null_on_insert_and_update() {
         "failed updates must change nothing"
     );
     // A valid UPDATE of the PK still works (the check is NULL-only, not immutability).
-    e.execute_text(txn, "UPDATE pk_nn SET id = 3 WHERE v = 1").unwrap();
+    e.execute_text(txn, "UPDATE pk_nn SET id = 3 WHERE v = 1")
+        .unwrap();
 
     // Control: a plain (non-PK) UNIQUE column keeps this engine's existing NULL semantics unchanged
     // (one NULL admitted; a second collides) — the not-null check is scoped to the PK.
-    e.execute_text(txn + 1, "CREATE TABLE uq_ctl (id INT PRIMARY KEY, u INT UNIQUE)")
-        .unwrap();
+    e.execute_text(
+        txn + 1,
+        "CREATE TABLE uq_ctl (id INT PRIMARY KEY, u INT UNIQUE)",
+    )
+    .unwrap();
     e.execute_text(txn + 2, "INSERT INTO uq_ctl (id, u) VALUES (1, NULL)")
         .unwrap();
     let err = e
@@ -2556,7 +2562,8 @@ fn alter_add_primary_key_rejects_null_bearing_column() {
     // NOT NULL invariant the DML validators rely on). After the NULL row is gone the promotion
     // succeeds, and the promoted PK then enforces not-null on subsequent writes.
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE promote (id INT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE promote (id INT, v INT)")
+        .unwrap();
     e.execute_text(2, "INSERT INTO promote (id, v) VALUES (NULL, 1), (2, 2)")
         .unwrap();
     let err = e
@@ -2570,7 +2577,8 @@ fn alter_add_primary_key_rejects_null_bearing_column() {
         err.contains("column \"id\" of relation \"promote\" contains null values"),
         "{err}"
     );
-    e.execute_text(4, "DELETE FROM promote WHERE v = 1").unwrap();
+    e.execute_text(4, "DELETE FROM promote WHERE v = 1")
+        .unwrap();
     e.execute_text(
         5,
         "ALTER TABLE ONLY public.promote ADD CONSTRAINT promote_pkey PRIMARY KEY (id)",

@@ -3454,6 +3454,92 @@ mod capacity_payload_tests {
         }
     }
 
+    /// RETIREMENT A4c — the DEVICE GATHER differential: `gather_resident_table_rows_from_device`
+    /// (the re-admit / de-elision rebuild source) == the host store's visible rows, (row_id, row)
+    /// for (row_id, row), across the full write lineage (admission, SV5 version-split update,
+    /// tombstoned DELETE, post-churn append, multi-row A4b update). The gather must SKIP
+    /// tombstoned/old-version slots and carry every identity; a NULL-bearing table must DECLINE.
+    /// Sabotage: invert the visibility filter and the tombstoned rows surface -> FAIL.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a4c_device_gather_matches_host_store() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
+            )
+            .unwrap();
+        }
+        e.execute_text(300, "UPDATE accounts SET balance = 9999 WHERE id = 130")
+            .unwrap();
+        e.execute_text(301, "DELETE FROM accounts WHERE id = 42")
+            .unwrap();
+        e.execute_text(302, "INSERT INTO accounts (id, balance) VALUES (500, 5000)")
+            .unwrap();
+        e.execute_text(
+            303,
+            "UPDATE accounts SET balance = 1 WHERE id = 10 OR id = 11",
+        )
+        .unwrap();
+        let now = e.committed_seq();
+        let table = e.relational_catalog_table("accounts").unwrap();
+
+        let mut got = e
+            .gather_resident_table_rows_from_device(&table, now)
+            .expect("the gather must ANSWER for a clean int4 lineage (else A4c is vacuous)");
+        // Host oracle: the seq-scan at the same snapshot, (row_id from key, decoded row).
+        let table_rows = e.read_state.mvcc.table_rows("accounts");
+        let prefix = relational_key_prefix("accounts");
+        let mut want: Vec<(u64, Vec<SqlValue>)> = Vec::new();
+        let mut cursor = table_rows
+            .store()
+            .seq_scan_open(crate::StorageVisibility { read_txn_id: now })
+            .unwrap();
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&prefix) {
+                continue;
+            }
+            let row_id = parse_relational_row_id(&tuple.key, &prefix)
+                .expect("every stored key parses (A1 invariant)");
+            want.push((
+                row_id,
+                decode_relational_row(&tuple.value, &table.columns).unwrap(),
+            ));
+        }
+        drop(cursor);
+        got.sort_by_key(|(row_id, _)| *row_id);
+        want.sort_by_key(|(row_id, _)| *row_id);
+        assert_eq!(
+            got.len(),
+            200,
+            "200 - 1 delete + 1 insert = 200 visible rows"
+        );
+        assert_eq!(
+            got, want,
+            "device gather == host store, identity for identity"
+        );
+
+        // NULL-bearing table: DECLINE (never NULL-as-0 into a rebuild).
+        e.execute_text(400, "CREATE TABLE n (id INT, v INT)")
+            .unwrap();
+        e.execute_text(401, "INSERT INTO n (id, v) VALUES (1, NULL), (2, 20)")
+            .unwrap();
+        let n_table = e.relational_catalog_table("n").unwrap();
+        assert_eq!(
+            e.gather_resident_table_rows_from_device(&n_table, e.committed_seq()),
+            None,
+            "a null-bearing table must DECLINE the raw-i32 gather"
+        );
+    }
+
     /// RETIREMENT A4b — MULTI-ROW incremental DML: multi-row UPDATE/DELETE commits are handled
     /// IN PLACE (per-row exact-1 locate+tombstone, one batched identity-stamped append) instead of
     /// the O(table) invalidate+re-admit. Twin-engine differential (incremental ON vs OFF=re-admit
@@ -6693,6 +6779,111 @@ impl Engine {
                 &read_state.residency,
             );
         Ok(())
+    }
+
+    /// RETIREMENT A4c: gather a shard-resident table's VISIBLE rows + identities ENTIRELY FROM
+    /// THE DEVICE — the rebuild source that replaces the host store for re-admits and for the
+    /// eligibility de-elision transition once A4e stops installing host rows. Per shard: one bulk
+    /// DtoH per int4 column + the row_id/deleted_by/created_by regions, then the host-side
+    /// SV3b/SV6 visibility filter (`created_by <= read_txn < deleted_by`) — an amortized-once
+    /// control-plane readback (the DATA SOURCE is the device generation, not host tuples); the
+    /// device-to-device recompaction that avoids the round-trip is the ledgered follow-up.
+    /// Returns rows in (shard, slot) order with their identities. `None` = DECLINE (caller must
+    /// use the host store): invalid/mismatched shard, null-bearing shard (raw i32 would alias
+    /// NULL as 0), non-strictly-Int4 table (Date/Int2 would mistype — the A4a F1 discipline), a
+    /// missing identity region, an UNSTAMPED live slot (identity hole), or a device-read failure.
+    /// Same born-visible contract as A4a, PLUS snapshot freshness (audit A4c F2): callers must
+    /// run on the SERIALIZED commit path with `read_txn` >= every INSERT-appended slot's commit
+    /// AND the loaded shard snapshot already reflecting every commit <= `read_txn` (re-admit
+    /// callers pass the invalidating commit's seq or newer). Completeness rests on the pinned
+    /// `row_count` bounding born-visible slots and on seq monotonicity making any concurrent
+    /// commit's mutations (seq > read_txn) correctly invisible to the sequential region reads.
+    #[allow(dead_code)]
+    pub(crate) fn gather_resident_table_rows_from_device(
+        &self,
+        table: &RelationalTable,
+        read_txn: u64,
+    ) -> Option<Vec<(u64, Vec<SqlValue>)>> {
+        if table
+            .columns
+            .iter()
+            .any(|column| column.ty != gpu_db_sql::SqlType::Int4)
+        {
+            return None;
+        }
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let mut out: Vec<(u64, Vec<SqlValue>)> = Vec::new();
+        for shard in table_shards.iter() {
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
+                return None;
+            }
+            if !shard.resident_device_null_columns.is_empty() {
+                return None;
+            }
+            if shard.row_count == 0 {
+                continue;
+            }
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let device_memory = self
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&(table.name.clone(), shard.shard_id))?;
+            let key = (table.name.clone(), shard.shard_id);
+            let row_id_region = self.read_state.residency.shard_row_id_memory.get(&key)?;
+            let rows = shard.row_count;
+            // Bulk DtoH: identities (2 i32 halves LE per slot), then each column's live prefix.
+            let id_halves = row_id_region.read_resident_i32_column(0, rows * 2).ok()?;
+            let deleted = match self.read_state.residency.shard_deleted_by_memory.get(&key) {
+                Some(region) => Some(region.read_resident_i32_column(0, rows * 2).ok()?),
+                None => None,
+            };
+            let created = match self.read_state.residency.shard_created_by_memory.get(&key) {
+                Some(region) => Some(region.read_resident_i32_column(0, rows * 2).ok()?),
+                None => None,
+            };
+            let mut columns: Vec<Vec<i32>> = Vec::with_capacity(table.columns.len());
+            for idx in 0..table.columns.len() {
+                let base = crate::relational_model::resident_device_int4_column_offset(
+                    &descriptor,
+                    table,
+                    idx,
+                )
+                .ok()?;
+                columns.push(device_memory.read_resident_i32_column(base, rows).ok()?);
+            }
+            let u64_at = |halves: &[i32], slot: usize| -> u64 {
+                (halves[slot * 2] as u32 as u64) | ((halves[slot * 2 + 1] as u32 as u64) << 32)
+            };
+            for slot in 0..rows {
+                let deleted_by = deleted.as_ref().map_or(u64::MAX, |h| u64_at(h, slot));
+                let created_by = created.as_ref().map_or(0, |h| u64_at(h, slot));
+                if !(created_by <= read_txn && read_txn < deleted_by) {
+                    continue; // not visible at this snapshot (tombstoned / future version)
+                }
+                let row_id = u64_at(&id_halves, slot);
+                if row_id == u64::MAX {
+                    return None; // an UNSTAMPED live slot: identity hole -> host source
+                }
+                let row: Vec<SqlValue> = columns
+                    .iter()
+                    .map(|column| SqlValue::Int4(column[slot]))
+                    .collect();
+                out.push((row_id, row));
+            }
+        }
+        Some(out)
     }
 
     /// Synthesize a single-store-shaped [`RelationalResidencySnapshot`] DESCRIPTOR for ONE shard

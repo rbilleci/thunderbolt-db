@@ -1416,8 +1416,11 @@ fn gpu_sharded_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     // `gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null` (which pins the
     // single-buffer layer); expected values are closed-form construction, NOT a CPU-operator oracle.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE events_shnull (amount INT, allnull INT, grp INT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE events_shnull (amount INT, allnull INT, grp INT)",
+    )
+    .unwrap();
     // amount: 10, NULL, 30, NULL, 20, 5 -> non-NULL {10, 30, 20, 5}: count 4, sum 65, min 5, max 30.
     // allnull: every row NULL. grp: 1 on every row (a NON-NULL filter column whose predicate PASSES
     // the NULL-amount rows — isolating the validity conjunct from predicate 3VL).
@@ -1444,10 +1447,7 @@ fn gpu_sharded_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     // AND from AVG's divisor. `executed_target` gates non-vacuity: the DEFAULT route must serve
     // these on the GPU (a CPU demotion or a fallback would fail here, not silently pass).
     let cases: [(&str, SqlValue); 4] = [
-        (
-            "SELECT SUM(amount) FROM events_shnull",
-            SqlValue::Int8(65),
-        ),
+        ("SELECT SUM(amount) FROM events_shnull", SqlValue::Int8(65)),
         (
             "SELECT AVG(amount) FROM events_shnull",
             crate::rel_exec_helpers::average_sql_value(65, 4),
@@ -1464,7 +1464,11 @@ fn gpu_sharded_scalar_aggregate_skips_null_values_and_all_null_is_null() {
 
     // COUNT(*) control: the validity conjunct must NOT leak into CountAll — COUNT counts NULL rows.
     let count = run("SELECT COUNT(*) FROM events_shnull");
-    assert_eq!(count.rows, vec![vec![SqlValue::Int8(6)]], "COUNT(*) counts NULL rows");
+    assert_eq!(
+        count.rows,
+        vec![vec![SqlValue::Int8(6)]],
+        "COUNT(*) counts NULL rows"
+    );
 
     // All-NULL column: SUM/AVG/MIN/MAX are SQL NULL (zero surviving non-NULL inputs).
     for sql in [
@@ -1538,7 +1542,8 @@ fn gpu_sharded_count_distinct_over_nullable_column_counts_non_null() {
          (NULL, NULL), (20, NULL), (5, NULL), (10, NULL)",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("events_cd").unwrap();
+    e.populate_relational_residency_snapshot("events_cd")
+        .unwrap();
     if e.resident_shard_count("events_cd") == 0 {
         return; // no GPU
     }

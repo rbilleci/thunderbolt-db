@@ -568,9 +568,7 @@ impl Engine {
                         *entry = Some(entry.unwrap_or(0) + value);
                     }
                     sums.into_iter()
-                        .map(|(value, sum)| {
-                            vec![value, sum.map_or(SqlValue::Null, SqlValue::Int8)]
-                        })
+                        .map(|(value, sum)| vec![value, sum.map_or(SqlValue::Null, SqlValue::Int8)])
                         .collect::<Vec<_>>()
                 }
                 SelectProjection::Avg { column } => {

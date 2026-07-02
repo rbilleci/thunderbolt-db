@@ -34,27 +34,32 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: RETIREMENT A3 — device-index validators <<<
+## >>> THE ONE NEXT ACTION: RETIREMENT A4e — the INSTALL ELISION (the SLO slice) <<<
 
 **THE FORK IS DECIDED (user, 2026-07-02): OPTION A — DEVICE-AUTHORITATIVE.** The measured install split
 (value_index 48% / COW publish 32% / tuple 18% / payload 2%) killed the drop-payloads idea; A deletes the
 host value_index + tuple store for resident tables and makes the per-shard DEVICE indexes the resolve
 surface. Program + dependency chain in memory `retirement-program-option-a` (A1 row-identity -> A2 resolve
 -> A3 validators -> A4 install elision = the SLO win, HARD-DEPENDS on multi-row incremental CRUD + device
-re-admit -> A5 deletion). A1 is DONE (`1875441c`, opus SHIP). **A2 is DONE (opus PUSH/SHIP-WITH-FIX
-adopted): `resolve_dml_matches_via_device` — locate -> row_id region -> derived key -> keyed fetch at
-visibility -> recheck -> sort+DEDUP by tuple_id — device-first at all 4 resolve sites behind default-ON
-`dml_device_resolve_enabled`; DELETE 120/127us UPDATE 177/193us @64k/262k FLAT.** Two burn-in bugs the
-differentials MISSED (fallbacks are correctness-preserving, so output equality is blind to them — pin
-MECHANISMS too): (1) update-churned shards thrashed O(shard) rebuild-to-decline per statement -> the
-decline cache is now MONOTONE under appends at the same pinned ptr; (2) an SV5 update-append splits one
-logical row across TWO shards -> the visibility-blind locate returned it twice -> the SV5 gate failed ->
-silent invalidate+re-admit per update + a reader-visible invalid window (SV6 hammer caught it) -> fixed
-by tuple_id dedup, pinned by `a2_same_key_update_chain_stays_on_incremental_path` (device-ptr survival,
-sabotage-verified). START: A3 — migrate the 1b index-driven validators (unique/FK) onto the device
-indexes (the value_index's last consumer besides the resolve fallback), then A4 install elision (the SLO
-win: multi-row incremental CRUD + device-sourced re-admit, re-measure `oltp_commit_slo_benchmark`
-targeting >100k TPS), then A5 deletion.
+re-admit -> A5 deletion). PROGRAM STATE: A1 (`1875441c`) + A2 (`c6c05b6a`, device DML resolve, monotone-decline
+cache, version-split dedup) + A3 (`c5b2a147`, device-index validators via the probe LADDER) + A4a/A4b
+(`d4943b63`, device materialization primitive + MULTI-ROW incremental DML, 2-row DML @262k 115ms->~300us
+~400x) ALL SHIPPED, each opus-audited. A4c (device gather = the re-admit/de-elision rebuild source,
+UNWIRED primitive + differential) audited/pushing now. Baseline SLO: 40,273 sustained TPS @8 writers,
+23.0us/item install (`oltp_commit_slo_benchmark`) — THE NUMBER A4e MUST MOVE (>100k target).
+
+START: A4e — the ELISION. For ELIGIBLE tables (strictly-Int4, null-free, shard-resident,
+identity-complete): commits SKIP the host value_index insert + tuple install; the A2 resolve + A3
+validator fetches switch from `tuple_fetch_by_key` to the A4a materializer; re-admit + the NULL/de-elision
+transition rebuild through the A4c gather (repopulating the host store when a table LEAVES eligibility);
+recovery unchanged (WAL replay still installs then admits — elision is steady-state only). Flag
+`host_install_elision_enabled` default-OFF FIRST (flip after the SLO gate + audits). MIND: ledger #15
+(per-row locate loop uncapped — batched locate kernel or row-count threshold), the born-visible contract
+(A4a/A4c docs), tuple_id consumers (the host apply still tombstones by tuple_id — elided tables must
+route apply through the device paths ONLY, the SV4b/SV5/A4b arms). After A4e: **PAUSE — the user
+explicitly gated A5 ("Before starting on A5, I want you to pause"); present the A4e results (SLO
+number, elision coverage, decline-class status) and WAIT for the go-ahead.** A5's technical gates
+remain: VACUUM #5, NULL/type coverage #14, recovery hardening.
 
 **MULTI-AGENT (2026-07-02): a READ-PATH agent is active.** ALWAYS `git fetch && git rebase origin/main`
 before pushing; contact surfaces: engine_retained_read.rs (ShardPkHit + the shared PK-index cache),
