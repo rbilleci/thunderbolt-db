@@ -177,6 +177,156 @@ fn durable_recovery_rejects_a_torn_trailing_record() {
 }
 
 #[test]
+fn durable_recovery_truncates_a_torn_append_tail_and_continues() {
+    // The append-only writer means a crash mid-append leaves a torn record BEYOND the recorded
+    // durable tail offset. That commit was never acknowledged (WAL-before-visibility: the fsync
+    // never completed), so recovery truncates it and the database keeps serving and appending.
+    // Contrast with `durable_recovery_rejects_a_torn_trailing_record`, where the damage is to an
+    // ACKNOWLEDGED record (below the recorded tail) and recovery must fail loudly.
+    let path = test_wal_path("durable-torn-append");
+    {
+        let e = Engine::with_durable_wal_segment(&path);
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+    }
+    // Simulate the crash mid-append: garbage bytes past the acknowledged tail.
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"\xAB\xCD\xEF torn half-record").unwrap();
+    }
+
+    let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    assert_eq!(recovered.wal_flushed_count(), 2);
+    assert_eq!(select_people_ids(&mut recovered), vec![1]);
+
+    // The truncated segment keeps accepting appends, and a further restart sees them.
+    recovered
+        .execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Linus')")
+        .unwrap();
+    drop(recovered);
+    let mut reopened = Engine::open_durable_wal_segment(&path).unwrap();
+    assert_eq!(select_people_ids(&mut reopened), vec![1, 2]);
+
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn checkpoint_and_truncate_bounds_the_live_segment_and_recovers_with_checkpoint() {
+    // D2: a checkpoint persists the full durable history to a checkpoint segment + control file,
+    // then trims the LIVE segment to only post-checkpoint records — the live file is bounded by
+    // the checkpoint cadence. Recovery pairs the checkpoint with the live suffix.
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-ckpt-truncate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let segment_path = dir.join("live.wal");
+    let control_path = dir.join("CONTROL");
+    let checkpoint_segment_path = dir.join("checkpoint-0001.wal");
+
+    let e = Engine::with_durable_wal_segment(&segment_path);
+    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+    let live_before = e.wal_durable_segment_bytes();
+
+    let meta = e
+        .checkpoint_and_truncate_durable_wal(&control_path, &checkpoint_segment_path)
+        .unwrap();
+    assert_eq!(meta.durable_record_count, 2);
+    assert!(
+        e.wal_durable_segment_bytes() < live_before,
+        "the live segment must shrink at the checkpoint ({} -> {})",
+        live_before,
+        e.wal_durable_segment_bytes()
+    );
+
+    // Post-checkpoint commits land only in the live segment.
+    e.execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Linus')")
+        .unwrap();
+    drop(e);
+
+    let mut recovered =
+        Engine::open_durable_wal_segment_with_checkpoint(&control_path, &segment_path).unwrap();
+    assert_eq!(recovered.wal_flushed_count(), 3);
+    assert_eq!(select_people_ids(&mut recovered), vec![1, 2]);
+
+    // The recovered engine keeps appending durably; a second restart sees everything, and a
+    // SECOND checkpoint is self-contained (full history), not just the suffix.
+    recovered
+        .execute_text(4, "INSERT INTO people (id, name) VALUES (3, 'Grace')")
+        .unwrap();
+    recovered
+        .checkpoint_and_truncate_durable_wal(&control_path, &checkpoint_segment_path)
+        .unwrap();
+    drop(recovered);
+    let mut reopened =
+        Engine::open_durable_wal_segment_with_checkpoint(&control_path, &segment_path).unwrap();
+    assert_eq!(select_people_ids(&mut reopened), vec![1, 2, 3]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checkpoint_size_bound_policy_rotates_only_beyond_the_bound() {
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-ckpt-bound-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let segment_path = dir.join("live.wal");
+    let control_path = dir.join("CONTROL");
+    let checkpoint_segment_path = dir.join("checkpoint-0001.wal");
+
+    let e = Engine::with_durable_wal_segment(&segment_path);
+    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+
+    // Under a generous bound: no rotation, no checkpoint files.
+    let rotated = e
+        .checkpoint_and_truncate_durable_wal_if_larger_than(
+            &control_path,
+            &checkpoint_segment_path,
+            1 << 20,
+        )
+        .unwrap();
+    assert!(!rotated);
+    assert!(!control_path.exists());
+
+    // Over a tiny bound: rotation runs and the live segment shrinks below it.
+    let rotated = e
+        .checkpoint_and_truncate_durable_wal_if_larger_than(
+            &control_path,
+            &checkpoint_segment_path,
+            16,
+        )
+        .unwrap();
+    assert!(rotated);
+    assert!(control_path.exists());
+    assert!(e.wal_durable_segment_bytes() <= 16);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn open_durable_wal_segment_on_missing_path_is_a_fresh_durable_db() {
     let path = test_wal_path("durable-fresh");
     assert!(!path.exists());

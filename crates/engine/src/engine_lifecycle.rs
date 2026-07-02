@@ -331,11 +331,14 @@ impl Engine {
     /// On crash recovery this is the realistic entry point: it replays every record that was fsync-
     /// durable in the segment — reconstructing exactly the committed state, since each record is
     /// re-applied through [`Engine::commit_mutation`], which re-derives the MVCC stamp from the
-    /// commit `Index` (Stage 0 stamp/boundary unification) — and then continues to append durably to
-    /// the same segment. A torn or partially-written trailing record is rejected by the segment's
-    /// CRC at [`read_wal_segment`] time, so a commit whose fsync did not complete is never replayed
-    /// (no visible-but-not-durable state). If the segment does not exist yet, this behaves like
-    /// [`Engine::with_durable_wal_segment`] (a fresh durable database).
+    /// commit `Index` (Stage 0 stamp/boundary unification) — and then continues to APPEND durably to
+    /// the same segment. The append-only writer means a crash mid-append can leave a torn trailing
+    /// record; [`recover_wal_segment`] truncates such a tail at the last valid record boundary
+    /// (that commit was never acknowledged — WAL-before-visibility means it was never visible
+    /// either), while corruption BELOW the segment's recorded durable tail offset — damage to
+    /// acknowledged-durable records — still fails loudly rather than silently dropping data. If
+    /// the segment does not exist yet, this behaves like [`Engine::with_durable_wal_segment`] (a
+    /// fresh durable database).
     pub fn open_durable_wal_segment(
         segment_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, EngineError> {
@@ -347,24 +350,39 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref();
-        let recovered_records = if segment_path.exists() {
-            read_wal_segment(segment_path)?
-        } else {
-            Vec::new()
-        };
+        let recovery = recover_wal_segment(segment_path)?;
         let mut engine = Self::with_planner_config(planner_cfg);
-        // Replay the durable prefix WITHOUT a durable backing so the replay does not rewrite the
-        // segment on every record; then install the durable segment so post-recovery commits append
-        // durably to the same file. The replayed records are then re-marked durable so the segment
-        // (rewritten on the next commit's flush) continues to include them.
-        for record in &recovered_records {
+        // Replay the durable prefix WITHOUT a durable backing so the replay does no segment I/O;
+        // then install the recovered segment so post-recovery commits keep appending to the same
+        // file (the torn tail, if any, is durably truncated at install time).
+        for record in &recovery.records {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
-        engine.commit_state_mut().wal = WalBuffer::with_durable_segment(segment_path);
-        engine
-            .commit_state_mut()
-            .wal
-            .reinstate_durable_records(recovered_records);
+        let records = recovery.records.clone();
+        engine.commit_state_mut().wal =
+            WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
+        Ok(engine)
+    }
+
+    /// Open (recover) a durable database from a checkpoint (control file + checkpoint segment)
+    /// PLUS the live segment's post-checkpoint suffix — the recovery pairing for
+    /// [`Engine::checkpoint_and_truncate_durable_wal`]. Replays the checkpoint's records, then the
+    /// live segment's, and keeps appending durably to the live segment.
+    pub fn open_durable_wal_segment_with_checkpoint(
+        control_path: impl AsRef<std::path::Path>,
+        segment_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.as_ref();
+        let (_control, checkpoint_records) = read_wal_checkpoint(control_path)?;
+        let recovery = recover_wal_segment(segment_path)?;
+        let mut engine = Self::new_local();
+        for record in checkpoint_records.iter().chain(recovery.records.iter()) {
+            engine.commit_mutation(record.txn_id, record.payload.clone())?;
+        }
+        let mut records = checkpoint_records;
+        records.extend_from_slice(&recovery.records);
+        engine.commit_state_mut().wal =
+            WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
         Ok(engine)
     }
 

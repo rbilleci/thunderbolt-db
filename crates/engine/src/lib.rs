@@ -60,12 +60,13 @@ use gpu_db_wal::{
     plan_wal_archive_retention_to_txn, plan_wal_archive_timeline_prune, read_wal_archive,
     read_wal_archive_timeline, read_wal_archive_timeline_registry,
     read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
-    read_wal_segment, register_wal_archive_timeline, restore_wal_archive_object_backup,
-    select_wal_archive_timeline, write_wal_archive_timeline, write_wal_archive_with_timestamps,
-    write_wal_control_file, write_wal_segment, WalArchiveManifest, WalArchiveObjectBackup,
-    WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalArchiveTimeline,
-    WalArchiveTimelineBranch, WalArchiveTimelinePrunePlan, WalArchiveTimelineRegistry,
-    WalArchiveTimelineSelection, WalBuffer, WalControlFile, WalGroupCommitStats, WalRecord,
+    read_wal_segment, recover_wal_segment, register_wal_archive_timeline,
+    restore_wal_archive_object_backup, select_wal_archive_timeline, write_wal_archive_timeline,
+    write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
+    WalArchiveManifest, WalArchiveObjectBackup, WalArchiveRecordTimestamp,
+    WalArchiveRetentionPlan, WalArchiveTimeline, WalArchiveTimelineBranch,
+    WalArchiveTimelinePrunePlan, WalArchiveTimelineRegistry, WalArchiveTimelineSelection,
+    WalBuffer, WalCheckpointMeta, WalControlFile, WalGroupCommitStats, WalRecord,
 };
 
 mod rel_exec_helpers;
