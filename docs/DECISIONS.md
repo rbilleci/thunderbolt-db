@@ -6,6 +6,49 @@ decision, consequences. Supersession is recorded, never silently rewritten. The 
 
 ---
 
+## ADR-013 — A5 read-side gates: universal birth stamps + generation-atomic shard publication
+- **Status:** Accepted (2026-07-02, read-path agent; binding constraints on the retirement program A4/A5).
+- **Context:** Read-path assessment findings D3/D4 (`docs/reviews/read-query-path-assessment.md` §3 + the
+  post-flip delta). **D3:** plain INSERT appends are unstamped/born-visible — the append bumps the published
+  `row_count` BEFORE `publish_committed_seq`, so a reader pinned at `s = C-1` sees commit C's rows (on the
+  scan, the metadata COUNT, and the zero-copy path). This is the same anomaly class SV5-P2 elevated to a
+  do-not-flip gate for UPDATE; SV6 fixed UPDATE by stamping, INSERT was consciously exempted. **D4:** readers
+  assemble a shard's (descriptor, device buffer, `deleted_by`/`created_by`/row-identity regions) from
+  SEPARATE lock-free loads while writers republish (buffers before descriptors; re-admit purges regions then
+  reinstalls the same shard_id) — a racing reader can pair a stale descriptor with a new buffer (wrong
+  offsets / OOB source read) or pass a version-free check against purged regions (tombstone resurrection).
+  The audited 3b `ShardPkHit` capture fixed locate→materialize but not the publication layer. TODAY both are
+  bounded because the host tuple store is the correctness backstop (invalidate + re-admit rebuilds correct
+  state). **A5 deletes that backstop** and makes the device regions the ONLY MVCC.
+- **Decision:** two gates A4/A5 must satisfy BEFORE the host store is deleted:
+  1. **STAMP-ALL-APPENDS (closes D3):** every device row append stamps `created_by = commit_seq` — INSERT
+     included; the `created_by: None` arm is deleted. Maintain a per-shard **`max_created_by` high-water**
+     (O(1), monotone, stamped alongside) so a reader at `s >= hwm` — the newest-boundary common case —
+     treats a created_by-only shard as effectively version-free: the metadata-COUNT / zero-copy fast paths
+     and the reshaping shapes (DISTINCT / GROUP BY / ORDER BY / JOIN guard) stay served, and only a reader
+     pinned inside the append window takes the gated path. Without the high-water, stamping every INSERT
+     would hand the first append to the versioned-table hard-error guard — an availability regression worse
+     than the anomaly.
+  2. **GENERATION-ATOMIC PUBLICATION (closes D4):** a shard’s (descriptor, pinned device buffer, version +
+     row-identity regions, hwm) publish and load as ONE snapshot — the `ShardPkHit` capture applied at the
+     publication layer (e.g. the `Arc`s embedded in `RelationalResidentShard`, one `ArcSwap` store). Every
+     republication event — rollover, DEVICE-SOURCED RE-ADMIT (A4), compaction/VACUUM (#5, mandatory
+     post-A5), recovery rebuild — publishes the whole tuple atomically. No read-side consumer pairs a
+     `shards.load()` with separate later `.get()`s.
+- **Interim rule (effective immediately):** NEW read-side consumers of shard state use the one-snapshot
+  capture pattern; do not add `shards.load()` + fresh region/buffer `.get()` pairings while the gates land.
+- **Consequences:** post-A5 a publication race has no rebuild-from-host repair (only full WAL replay), and an
+  unstamped row has no visibility metadata outside the WAL — so these are prerequisites of
+  device-authoritative MVCC, not hardening. Most of the work lands naturally inside A4’s device-sourced
+  re-admit + A5’s lifecycle rewrite; the residual read-side slice is the consumer migration, the hwm gate,
+  and the concurrency differentials (torn-window re-admit race; pinned double-read across an append;
+  post-INSERT ORDER BY availability). Bonus: the per-region retire-purge choreography (7 sites x 3-4 maps,
+  which every new region class must mirror today) collapses into list republication.
+- **Alternative rejected:** publishing `row_count` AFTER `committed_seq` — inverts the anomaly into
+  committed-but-invisible (breaks read-your-writes after ack) and adds a crash window where durable rows are
+  unreachable until rebuild.
+
+
 ## ADR-012 — Streaming executor: out-of-core execution for working sets > GPU memory
 - **Status:** Accepted (2026-06-29, decision by user).
 - **Context:** STRATA (ADR-010) admits relations that fit a per-GPU **byte budget** and evicts across relations to
