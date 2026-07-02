@@ -280,6 +280,68 @@ fn checkpoint_and_truncate_bounds_the_live_segment_and_recovers_with_checkpoint(
 }
 
 #[test]
+fn checkpoint_truncation_prunes_the_commit_timestamp_map() {
+    // R2 (write-path assessment): the commit-timestamp map grew one entry per commit forever.
+    // The checkpoint boundary discards the covered prefix's timestamps; post-checkpoint commits
+    // keep recording (and stay strictly monotonic via the running max, which pruning never
+    // touches).
+    let dir = std::env::temp_dir().join(format!(
+        "gpu-db-wal-ts-prune-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let segment_path = dir.join("live.wal");
+    let control_path = dir.join("CONTROL");
+    let checkpoint_segment_path = dir.join("checkpoint-0001.wal");
+
+    let e = Engine::with_durable_wal_segment(&segment_path);
+    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+    let max_before = {
+        let commit = e.commit_state();
+        assert_eq!(commit.wal_commit_timestamps_micros.len(), 2);
+        commit.max_commit_timestamp_micros
+    };
+
+    e.checkpoint_and_truncate_durable_wal(&control_path, &checkpoint_segment_path)
+        .unwrap();
+    {
+        let commit = e.commit_state();
+        assert!(
+            commit.wal_commit_timestamps_micros.is_empty(),
+            "checkpointed records' timestamps are discarded with the prefix"
+        );
+        assert_eq!(
+            commit.max_commit_timestamp_micros, max_before,
+            "the monotonicity floor survives the prune"
+        );
+    }
+
+    // Post-checkpoint commits record fresh (still strictly monotonic) timestamps.
+    e.execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Linus')")
+        .unwrap();
+    {
+        let commit = e.commit_state();
+        assert_eq!(commit.wal_commit_timestamps_micros.len(), 1);
+        assert!(commit.max_commit_timestamp_micros > max_before);
+    }
+
+    // Recovery is timestamp-independent: the checkpoint + live suffix still replay fully.
+    drop(e);
+    let mut recovered =
+        Engine::open_durable_wal_segment_with_checkpoint(&control_path, &segment_path).unwrap();
+    assert_eq!(select_people_ids(&mut recovered), vec![1, 2]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn checkpoint_size_bound_policy_rotates_only_beyond_the_bound() {
     let dir = std::env::temp_dir().join(format!(
         "gpu-db-wal-ckpt-bound-{}-{}",

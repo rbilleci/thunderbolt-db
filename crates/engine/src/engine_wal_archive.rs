@@ -119,6 +119,22 @@ impl Engine {
         )?;
         let boundary = commit.wal.flushed_count();
         commit.wal.truncate_durable_segment_prefix(boundary)?;
+        // R2 (write-path assessment): the commit-timestamp map grew by one entry per commit
+        // forever. The checkpoint boundary is its natural discard point — drop the timestamps of
+        // exactly the records the checkpoint covered, mirroring the live segment's own
+        // truncation (commits beyond the boundary — including appended-but-not-yet-group-flushed
+        // ones — keep theirs). PITR-by-timestamp over the pre-checkpoint history must be exported
+        // to a timestamped archive BEFORE checkpointing (the archive manifest carries its own
+        // timestamp metadata); `max_commit_timestamp_micros` keeps new commit timestamps strictly
+        // monotonic regardless of pruning.
+        let checkpointed_txn_ids: std::collections::BTreeSet<TxnId> = commit.wal.flushed_records()
+            [..boundary]
+            .iter()
+            .map(|record| record.txn_id)
+            .collect();
+        commit
+            .wal_commit_timestamps_micros
+            .retain(|txn_id, _| !checkpointed_txn_ids.contains(txn_id));
         Ok(meta)
     }
 
