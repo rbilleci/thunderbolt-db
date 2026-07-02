@@ -34,7 +34,14 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: HOST-STORE RETIREMENT (#2) — the SLO critical path; DESIGN FORK first <<<
+## >>> THE ONE NEXT ACTION: RETIREMENT A1 — the per-shard device row-identity region <<<
+
+**THE FORK IS DECIDED (user, 2026-07-02): OPTION A — DEVICE-AUTHORITATIVE.** The measured install split
+(value_index 48% / COW publish 32% / tuple 18% / payload 2%) killed the drop-payloads idea; A deletes the
+host value_index + tuple store for resident tables and makes the per-shard DEVICE indexes the resolve
+surface. Program + dependency chain in memory `retirement-program-option-a` (A1 row-identity -> A2 resolve
+-> A3 validators -> A4 install elision = the SLO win, HARD-DEPENDS on multi-row incremental CRUD + device
+re-admit -> A5 deletion). START: A1.
 
 **Slices 1+1b are DONE (`9876d297`, `7b48fda8`): ledger #1 is CLOSED** — DML resolve AND validation are
 index-driven in both layers; constrained single-row DML measures 124-195us FLAT (~500x). **Phase D is
