@@ -34,24 +34,17 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: pick the next correctness/SLO slice (4 options) <<<
+## >>> THE ONE NEXT ACTION: (B) sharded predicate NULL 3VL — the LAST shards-default gate <<<
 
-The **READ path is SETTLED** at its architectural ceiling (GPU-native, O(log)-routed, ~parity single-buffer,
-scale-ready). The **WRITE CRUD data plane is GPU-native** (INSERT/DELETE/UPDATE all incremental, behind
-default-OFF flags). What remains is **CORRECTNESS + SLO** — the path to flipping the GPU data plane ON by
-default and DELETING the CPU relational engine. Pick one (the user sets the sequence):
+**FIRST: `git push origin main` is PENDING USER APPROVAL** — SV6 (`01936144`) is committed locally on `main`,
+opus-audited SHIP, but the auto-mode classifier blocks push-to-default-branch. Push it (or authorize the push)
+before starting the next slice.
 
-### (A) `created_by` SI flip-gate — the SECOND shards-default correctness gate  ★ recommended next
-The incremental UPDATE (SV5, `try_update_resident_commit`) appends the new row version with **no `created_by`
-lower-bound gate**, so a concurrent reader at `committed_seq = C-1` can see the key **TWICE** (old + new). This
-is the P2 flip-gate blocking `resident_update_tombstone_enabled`. **Do:** add a `created_by`-style
-consistent-snapshot boundary on the appended version — mirror the SV3b `deleted_by > read_txn` visibility gate
-ON THE GPU with a `created_by <= read_txn` lower bound (the mixed-width predicate VM already does i32 WHERE +
-i64 deleted_by; add created_by the same way) — plus a CONCURRENT-READER differential that reproduces the
-double-read and proves it gone. With the NULL fix (done), this clears the shards-default correctness gates.
-**Charter:** the boundary is a device-side predicate AND, not a host filter.
+The **READ path is SETTLED** at its architectural ceiling. The **WRITE CRUD data plane is GPU-native** and,
+with SV6 (the `created_by` gate) DONE, **the SV5 P2 double-read flip-gate is CLOSED** — the last
+shards-default correctness gate is option B. The user-set sequence: **B → C → D**.
 
-### (B) Finish sharded NULL correctness — predicate three-valued logic on shards
+### (B) Finish sharded NULL correctness — predicate three-valued logic on shards  ★ NOW
 Projection NULL is DONE (M3-for-shards, `3958e847`). TWO follow-ups: (1) `WHERE col IS NULL` / `IS NOT NULL` on
 a sharded-ONLY table currently **ERRORS** ("relation has no resident snapshot" — the IS NULL shape isn't
 sharded-router-eligible, so it falls to a single-buffer path with no snapshot); route it to the sharded scan
@@ -75,13 +68,23 @@ WAL group commit (batch fsync; today size-1, ledger #7) + a CONCURRENT-COMMIT SL
 p99<1ms targets. **Charter:** sequencing + WAL I/O are legitimately host (control plane); the SLO proves the
 write half of the trajectory bet.
 
-**Guidance:** A and B directly gate the **shards-default flip** (turns the GPU data plane ON). C is the deepest
-charter cut. D proves the SLO. Recommend **A** next (pairs with the shipped NULL fix to clear both flip-gates),
-then B, then C, then D.
+**Guidance:** B is the last gate on the **shards-default flip** (turns the GPU data plane ON). C is the deepest
+charter cut. D proves the SLO. Sequence: **B → C → D**.
 
 ---
 
-## Where we are (DONE + on origin/main; HEAD `3958e847`)
+## Where we are (HEAD = local `01936144` — SV6, push pending; origin/main at `3958e847`)
+
+**SV6 `created_by` SI gate — DONE, opus SHIP (`01936144`, 2026-07-02).** The SV5 P2 double-read is FIXED and
+was REPRODUCED first (stamp disabled = HEAD → a C-1 reader saw the key TWICE). Per-shard on-demand
+`created_by` i64 region (`shard_created_by_memory`, fill 0x00 = born-visible, sparse) stamped by the UPDATE
+append BEFORE the row_count bump / shard publish; every sharded read path gates DEVICE-SIDE per the charter:
+scan mask-VM conjunct (`created_by <= read_txn`, cmp Le, via `ResidentVisibility::push_conjuncts`), 3b route
+per-hit, batched gather; the un-gated GPU dense kernel DECLINES stamped shards (defensive today — the
+deleted_by decline masks it — LOAD-BEARING under VACUUM: keep it). Lifecycle purge mirrored at all
+`shard_deleted_by_memory` sites. Five differentials, sabotage-verified per mechanism (the sweep also caught +
+fixed a vacuous rollover variant). Plain INSERT appends stay unstamped/born-visible (deliberate; ledger-noted).
+Baselines: engine CPU 452/0, facade 32/0, GPU sharded/null/route/SV sweep 90/0, clippy HEAD-parity.
 
 **READ PATH — SETTLED (architectural ceiling; banked; GPU-native). Do not re-litigate the perf.**
 - Arc: single-flight 44k/s → 3b index route 22µs → Step-1 batched 13.7M/s → wired → v2 multi-shard kernel
@@ -102,7 +105,7 @@ then B, then C, then D.
   (recompaction fill + GPU read-visibility filter) + mixed-width predicate VM.
 - SV4b (`cb382ea5`): GPU-native incremental DELETE (locate+tombstone) behind `resident_delete_tombstone_
   enabled`. SV5 (`dc2de15f`): GPU-native incremental UPDATE (tombstone-old + append-new) behind
-  `resident_update_tombstone_enabled` — **its created_by flip-gate is option A.**
+  `resident_update_tombstone_enabled` — **its created_by flip-gate is CLOSED by SV6 (`01936144`).**
 - MEASURED: DELETE/UPDATE tombstone = 2.2× re-admit (device re-admit gone) but STILL O(table) — the residual is
   the HOST seq_scan (option C).
 
@@ -149,7 +152,10 @@ track boundaries (memory `working-agreement-sequencing`).
 
 ## Pointers
 
-- **Memory (read first):** `MEMORY.md` index. Key files: `r3-write-path` (the active phase — full slice
+- **Memory (read first):** `MEMORY.md` index at
+  `~/.claude/projects/-home-richard-projects-gpu-database-engine/memory/` (the project moved from
+  `/data/projects` to `/home/richard/projects`; memory migrated 2026-07-02 — the old
+  `-data-projects-...` dir is a synced legacy copy). Key files: `r3-write-path` (the active phase — full slice
   history), `scalability-ledger` (every unscalable O(table)/global-lock cost → the slice that removes it;
   RE-READ each iteration, no new slice may add an unscalable hot path without a row), `stay-gpu-native-charter`,
   `billions-rows-scale`, `zone-map-clustering-limit`, `strata-design`, `working-agreement-sequencing`,
