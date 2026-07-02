@@ -3470,8 +3470,9 @@ mod capacity_payload_tests {
             e.set_auto_admit_on_commit(true);
             e.set_shard_size_target(64);
             e.set_host_install_elision_enabled(elide);
-            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
-                .unwrap();
+            // Constraint-FREE (audit B1: only such tables may elide — constraint validators
+            // read the host store); the UNIQUE never-elides gate is asserted separately below.
+            e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
             let mut seq = 2u64;
             for chunk in 0..2_i64 {
                 let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
@@ -3489,7 +3490,7 @@ mod capacity_payload_tests {
                 "INSERT INTO t (id, v) VALUES (501, 5010)",
                 "UPDATE t SET v = 999 WHERE id = 130", // device resolve + materializer
                 "DELETE FROM t WHERE id = 42",         // device resolve + materializer
-                "INSERT INTO t (id, v) VALUES (130, 1)", // unique violation THROUGH the elided probe
+                "INSERT INTO t (id, v) VALUES (130, 1)", // a dup id row (no constraint): both twins keep BOTH
                 // ADVERSARIAL: DML on ELIDED-ERA rows — they exist ONLY on the device; a
                 // stale-store fetch would silently no-op them.
                 "UPDATE t SET v = 7 WHERE id = 500", // materializer resolves an elided-era row
@@ -3497,6 +3498,9 @@ mod capacity_payload_tests {
                 // OR-group incl an elided-era row: the stale value-index MISSES id=500 -> the
                 // shape early-exit must REHYDRATE first.
                 "UPDATE t SET v = -5 WHERE id = 500 OR id = 11",
+                // Audit B1-DDL vector: DDL on an ELIDED table must rehydrate FIRST (the
+                // execute_text non-DML seam) — its validators read the host store.
+                "ALTER TABLE ONLY t ADD CONSTRAINT t_v_floor CHECK (v > -1000)",
                 "INSERT INTO t (id, v) VALUES (502, 5020)", // post-rehydration: normal installs
             ];
             let mut outcomes: Vec<Result<(), String>> = Vec::new();
@@ -3559,6 +3563,43 @@ mod capacity_payload_tests {
             store_rows(&on),
             store_rows(&off),
             "post-rehydration host store == the install twin's, key for key"
+        );
+
+        // Audit B1 gate: a CONSTRAINT-BEARING table must NEVER enter elision (its validators
+        // read the host store; a stale prefix would silently bypass UNIQUE/FK checks).
+        on.execute_text(400, "CREATE TABLE u (id INT UNIQUE, v INT)")
+            .unwrap();
+        for i in 0..3_i64 {
+            on.execute_text(
+                401 + i as u64,
+                &format!("INSERT INTO u (id, v) VALUES ({i}, {i})"),
+            )
+            .unwrap();
+        }
+        assert!(
+            !on.table_install_elided("u"),
+            "a UNIQUE table must never elide (constraint validators read the host store)"
+        );
+        assert!(
+            on.execute_text(420, "INSERT INTO u (id, v) VALUES (1, 9)")
+                .is_err(),
+            "the UNIQUE constraint must still fire"
+        );
+
+        // Audit SF4 gate: DROP purges the elided flag — a recreated same-name table must INSTALL.
+        on.execute_text(430, "CREATE TABLE d (id INT, v INT)")
+            .unwrap();
+        for i in 0..3_i64 {
+            on.execute_text(
+                431 + i as u64,
+                &format!("INSERT INTO d (id, v) VALUES ({i}, {i})"),
+            )
+            .unwrap();
+        }
+        on.execute_text(440, "DROP TABLE d").unwrap();
+        assert!(
+            !on.table_install_elided("d"),
+            "DROP must purge the elided flag (a recreated table is not device-authoritative)"
         );
     }
 
@@ -4130,8 +4171,7 @@ mod capacity_payload_tests {
             e.set_auto_admit_on_commit(true);
             e.set_shard_size_target(64);
             e.set_dml_device_validate_enabled(device);
-            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
-                .unwrap();
+            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)").unwrap();
             e.execute_text(2, "CREATE TABLE c (id INT, tid INT)")
                 .unwrap();
             e.execute_text(
@@ -5771,6 +5811,36 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// RETIREMENT A4e (audit B1): may `table` ENTER elision? Strictly-Int4 AND CONSTRAINT-FREE
+    /// in BOTH directions — no unique indexes, no checks, no outbound FKs, and NO OTHER TABLE
+    /// REFERENCES IT. Constraint validation (INSERT preflight `visible_relational_rows`, the DDL
+    /// row-validators) reads the HOST store; on an elided table that store is a stale prefix, so
+    /// a unique/FK check would silently pass against MISSING elided-era rows (constraint bypass).
+    /// Constraint-free tables never run those validators; DDL that ADDS a constraint rehydrates
+    /// first (the execute_text DDL seam).
+    pub(crate) fn table_elision_eligible(
+        &self,
+        catalog: &CatalogSnapshot,
+        table_name: &str,
+    ) -> bool {
+        let Some(table) = catalog.relational_catalog.get(table_name) else {
+            return false;
+        };
+        table
+            .columns
+            .iter()
+            .all(|column| column.ty == gpu_db_sql::SqlType::Int4)
+            && !table.indexes.iter().any(|index| index.unique)
+            && table.check_constraints.is_empty()
+            && table.foreign_keys.is_empty()
+            && !catalog.relational_catalog.values().any(|other| {
+                other
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.referenced_table == table_name)
+            })
+    }
+
     /// RETIREMENT A4e: is `table` device-authoritative (commits skip the host install)?
     pub(crate) fn table_install_elided(&self, table: &str) -> bool {
         self.read_state
@@ -7003,6 +7073,39 @@ impl Engine {
                 &read_state.residency,
             );
         Ok(())
+    }
+
+    /// RETIREMENT A4e (audit B3): rehydrate an elided table FROM AN OFF-COMMIT-LOCK context
+    /// (the CPU-shape read seam, the execute_text DDL entry). `rehydrate_elided_table` mutates the
+    /// host store via COW `with_table_mut` — safe ONLY under the commit lock (writers + other
+    /// rehydrators serialize there; a lost-update would leave the table DE-ELIDED WITH A STALE
+    /// STORE = permanent wrong reads). Mid-commit internal reads (matview refresh) already HOLD
+    /// the lock — detected via the same thread-local that suppresses their leader check — so they
+    /// rehydrate directly (a second acquisition would self-deadlock). The elided-ness RE-CHECK
+    /// under the lock closes the race with a rehydrator that won the lock first.
+    pub(crate) fn rehydrate_elided_serialized(&self, table_name: &str) -> Result<(), EngineError> {
+        let rehydrate = |engine: &Self| -> Result<(), EngineError> {
+            if !engine.table_install_elided(table_name) {
+                return Ok(()); // another rehydrator won the race
+            }
+            let Some(table) = engine.relational_catalog_table(table_name) else {
+                return Ok(());
+            };
+            let seq = engine.committed_seq();
+            engine.rehydrate_elided_table(
+                &table,
+                seq,
+                &Default::default(),
+                &Default::default(),
+                seq,
+            )
+        };
+        if self.mvcc_read_skips_leader_check() {
+            // Mid-commit internal read: the commit lock is already held by THIS thread.
+            return rehydrate(self);
+        }
+        let _commit_guard = self.commit_state();
+        rehydrate(self)
     }
 
     /// RETIREMENT A4e: REHYDRATE an elided table — the STICKY DE-ELISION transition. The A4c

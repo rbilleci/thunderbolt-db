@@ -1153,6 +1153,10 @@ impl Engine {
         self.preflight_drop_table(&drop)?;
 
         for name in &drop.names {
+            // RETIREMENT A4e (audit SF4): a dropped table must LEAVE the elided set — a later
+            // CREATE reusing the name would otherwise skip its first installs against a
+            // non-authoritative device (divergence). Mirrors the shard-region purge discipline.
+            self.set_table_install_elided(name, false);
             let Some(table) = cat.relational_catalog.remove(name) else {
                 continue;
             };

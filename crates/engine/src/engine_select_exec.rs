@@ -287,16 +287,12 @@ impl Engine {
         // reconciliation, sticky de-elision), exactly like the DML ladder — any read shape the
         // device routes cannot serve costs one O(table) rehydration instead of wrong results.
         if self.host_install_elision_enabled() && self.table_install_elided(&select.table) {
-            if let Some(table) = self.relational_catalog_table(&select.table) {
-                self.rehydrate_elided_table(
-                    &table,
-                    self.committed_seq(),
-                    &Default::default(),
-                    &Default::default(),
-                    self.committed_seq(),
-                )
+            // Audit B3: the rehydration store-write must hold the COMMIT LOCK (readers hold no
+            // lock; a lost COW update would leave the table de-elided WITH a stale store). The
+            // helper detects mid-commit internal reads (matview refresh) and skips the
+            // self-deadlocking re-acquisition.
+            self.rehydrate_elided_serialized(&select.table)
                 .map_err(ExecuteError::Engine)?;
-            }
         }
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         on_bound_before_pin();

@@ -235,6 +235,31 @@ impl Engine {
             .drain_committed_from(commit.repl.applied_index())
             .cloned()
             .collect();
+        // RETIREMENT A4e (audit B2): a MULTI-ENTRY commit bypasses the single-mutation elision
+        // hooks below (they rehydrate exactly ONE mutation's delta) — every entry's apply would
+        // skip the host install and the final invalidate+re-admit would rebuild every touched
+        // table from its STALE store (elided-era rows lost). Rehydrate every elided table in the
+        // batch's scope FIRST (under this commit lock; state through committed_seq is fully on
+        // device) — the tables de-elide, the applies install normally, the re-admit is truthful.
+        if to_apply.len() > 1 && self.host_install_elision_enabled() {
+            if let Some(scope) = Self::residency_invalidation_scope(&to_apply) {
+                for table_name in &scope {
+                    if self.table_install_elided(table_name) {
+                        let Some(table) = self.relational_catalog_table(table_name) else {
+                            continue;
+                        };
+                        let seq = self.committed_seq();
+                        self.rehydrate_elided_table(
+                            &table,
+                            seq,
+                            &Default::default(),
+                            &Default::default(),
+                            seq,
+                        )?;
+                    }
+                }
+            }
+        }
 
         // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
         // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
@@ -351,14 +376,11 @@ impl Engine {
                     && self.host_install_elision_enabled()
                     && !self.table_install_elided(table_name)
                 {
-                    if let Some(table) = cat.relational_catalog.get(table_name) {
-                        if table
-                            .columns
-                            .iter()
-                            .all(|column| column.ty == gpu_db_sql::SqlType::Int4)
-                        {
-                            self.set_table_install_elided(table_name, true);
-                        }
+                    // Audit B1: eligibility = strictly-Int4 AND constraint-free both directions
+                    // (the published snapshot is the same catalog `cat` mirrors here).
+                    let snapshot = self.catalog_snapshot();
+                    if self.table_elision_eligible(&snapshot, table_name) {
+                        self.set_table_install_elided(table_name, true);
                     }
                 } else if !handled && self.table_install_elided(table_name) {
                     let (upserts, removals) = Self::elided_commit_delta(applied_ref);
@@ -492,6 +514,31 @@ impl Engine {
             .drain_committed_from(commit.repl.applied_index())
             .cloned()
             .collect();
+        // RETIREMENT A4e (audit B2): a MULTI-ENTRY commit bypasses the single-mutation elision
+        // hooks below (they rehydrate exactly ONE mutation's delta) — every entry's apply would
+        // skip the host install and the final invalidate+re-admit would rebuild every touched
+        // table from its STALE store (elided-era rows lost). Rehydrate every elided table in the
+        // batch's scope FIRST (under this commit lock; state through committed_seq is fully on
+        // device) — the tables de-elide, the applies install normally, the re-admit is truthful.
+        if to_apply.len() > 1 && self.host_install_elision_enabled() {
+            if let Some(scope) = Self::residency_invalidation_scope(&to_apply) {
+                for table_name in &scope {
+                    if self.table_install_elided(table_name) {
+                        let Some(table) = self.relational_catalog_table(table_name) else {
+                            continue;
+                        };
+                        let seq = self.committed_seq();
+                        self.rehydrate_elided_table(
+                            &table,
+                            seq,
+                            &Default::default(),
+                            &Default::default(),
+                            seq,
+                        )?;
+                    }
+                }
+            }
+        }
 
         // Hold the catalog latch across the apply loop AND the catalog publish (PART B; lock order:
         // commit_mutex FIRST, then this latch).

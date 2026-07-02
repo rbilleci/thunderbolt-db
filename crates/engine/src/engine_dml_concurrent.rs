@@ -648,6 +648,10 @@ impl Engine {
                 };
             // RETIREMENT A4e (concurrent-native hooks): the (upserts, removals) an elided-table
             // rehydration would need — extracted BEFORE apply consumes the delta. Flag OFF = None.
+            // RETIREMENT A4e (concurrent-native hooks): the (upserts, removals) an elided-table
+            // rehydration would need — extracted BEFORE apply consumes the delta. INSERT-only by
+            // construction (audit note): the entry guard redirects non-INSERT elided DML to the
+            // serialized path, so Update/Delete deltas can never hit the rehydrate hook here.
             let elided_hook: Option<(
                 String,
                 std::collections::BTreeMap<u64, Vec<SqlValue>>,
@@ -672,40 +676,7 @@ impl Engine {
                             Default::default(),
                         ))
                     }
-                    crate::write_path::PreparedMutation::Update {
-                        table, installs, ..
-                    } => {
-                        let prefix = relational_key_prefix(table);
-                        Some((
-                            table.clone(),
-                            installs
-                                .iter()
-                                .filter_map(|(_id, key, row)| {
-                                    crate::engine_residency::parse_relational_row_id(key, &prefix)
-                                        .map(|id| (id, row.clone()))
-                                })
-                                .collect(),
-                            Default::default(),
-                        ))
-                    }
-                    crate::write_path::PreparedMutation::Delete { table, .. } => {
-                        let prefix = relational_key_prefix(table);
-                        Some((
-                            table.clone(),
-                            Default::default(),
-                            delta
-                                .write_set
-                                .rows
-                                .iter()
-                                .filter_map(|row| {
-                                    crate::engine_residency::parse_relational_row_id(
-                                        &row.row_key,
-                                        &prefix,
-                                    )
-                                })
-                                .collect(),
-                        ))
-                    }
+                    _ => None,
                 }
             } else {
                 None
@@ -735,14 +706,10 @@ impl Engine {
             // Rehydration failure post-apply is an invariant violation: panic like the apply.
             if let Some((table_name, upserts, removals)) = elided_hook {
                 if appended && !self.table_install_elided(&table_name) {
-                    if let Some(table) = self.relational_catalog_table(&table_name) {
-                        if table
-                            .columns
-                            .iter()
-                            .all(|column| column.ty == gpu_db_sql::SqlType::Int4)
-                        {
-                            self.set_table_install_elided(&table_name, true);
-                        }
+                    // Audit B1: strictly-Int4 AND constraint-free both directions.
+                    let snapshot = self.catalog_snapshot();
+                    if self.table_elision_eligible(&snapshot, &table_name) {
+                        self.set_table_install_elided(&table_name, true);
                     }
                 } else if !appended && self.table_install_elided(&table_name) {
                     let table = self
@@ -941,6 +908,30 @@ impl Engine {
         timestamp_micros: u64,
     ) -> Result<(), ExecuteError> {
         let cmd = parse_command(text)?;
+        // RETIREMENT A4e (audit B1-DDL/B2): any NON-DML command rehydrates every elided table
+        // FIRST (under the commit lock via the serialized helper) — DDL preflights/validators
+        // (ADD UNIQUE/PK/FK, CREATE INDEX) read the host store via visible_relational_rows, and a
+        // stale prefix would validate a constraint over data that violates it. DDL is rare and
+        // the elided set is tiny; the blunt sweep is the safe shape.
+        if self.host_install_elision_enabled()
+            && !matches!(
+                cmd,
+                Command::Insert(_) | Command::Update(_) | Command::Delete(_) | Command::Select(_)
+            )
+        {
+            let elided: Vec<String> = self
+                .read_state
+                .residency
+                .elided_tables
+                .load()
+                .iter()
+                .cloned()
+                .collect();
+            for table_name in elided {
+                self.rehydrate_elided_serialized(&table_name)
+                    .map_err(ExecuteError::Engine)?;
+            }
+        }
 
         match cmd {
             Command::SetKv { .. }
