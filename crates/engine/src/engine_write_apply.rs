@@ -153,7 +153,7 @@ impl Engine {
         insert: Insert,
         txn_id: TxnId,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet)>, EngineError> {
         // Stage 2 split: PURE prepare (preflight + encode + write-set) then a `&mut self` install,
         // both under the existing commit lock so the result is byte-identical to the old direct
         // apply. `txn_id` is the commit-seq (== `entry.index`), used as BOTH the read boundary and
@@ -162,10 +162,11 @@ impl Engine {
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_insert(&insert, snapshot, profile.as_deref_mut())?;
         // Slice 1b-ii-c: surface the APPLIED rows (post-coercion / post-default, catalog order — the
-        // actual stored images) for the commit path's in-place open-shard append. Captured BEFORE
-        // apply_delta_serialized consumes the delta; byte-identical to what a re-admit rebuild would
-        // store (same encode path). `(table, rows)`; `None` is impossible here (delta is an Insert) but
-        // keeps the type uniform with apply_mvcc_entry's other (non-insert) commands.
+        // actual stored images) for the commit path's in-place open-shard append, plus the delta's
+        // write-set for SI ledger recording (C2). Captured BEFORE apply_delta_serialized consumes
+        // the delta; byte-identical to what a re-admit rebuild would store (same encode path).
+        // `None` is impossible here (delta is an Insert) but keeps the type uniform with
+        // apply_mvcc_entry's other (non-insert) commands.
         let applied = match &delta.mutation {
             PreparedMutation::Insert {
                 table,
@@ -177,6 +178,7 @@ impl Engine {
                     .iter()
                     .map(|(_key, values)| values.clone())
                     .collect(),
+                delta.write_set.clone(),
             )),
             _ => None,
         };
@@ -189,7 +191,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         delete: Delete,
         txn_id: TxnId,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet)>, EngineError> {
         // Stage 2 split: PURE prepare (resolve matches + FK preflight + write-set) then a
         // `&mut self` tombstone install. `txn_id` is the commit-seq used as both the read boundary
         // and the version stamp, identical to the old direct apply (still under the commit lock).
@@ -197,13 +199,14 @@ impl Engine {
         let delta = self.prepare_delete(&delete, snapshot)?;
         // SV4b: surface the resolved deleted rows `(table, rows)` (catalog order) BEFORE `apply_delta`
         // consumes the delta, so a single-entry DELETE commit can locate + tombstone them on the resident
-        // shard in place. Captured by clone here; `None` is impossible (the delta is a Delete).
+        // shard in place, plus the delta's write-set for SI ledger recording (C2). Captured by clone
+        // here; `None` is impossible (the delta is a Delete).
         let applied = match &delta.mutation {
             PreparedMutation::Delete {
                 table,
                 deleted_rows,
                 ..
-            } => Some((table.clone(), deleted_rows.clone())),
+            } => Some((table.clone(), deleted_rows.clone(), delta.write_set.clone())),
             _ => None,
         };
         self.apply_delta_serialized(cat, delta, txn_id, None)?;
@@ -215,15 +218,17 @@ impl Engine {
         cat: &mut DdlCatalogState,
         update: Update,
         txn_id: TxnId,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>)>, EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>, WriteSet)>, EngineError>
+    {
         // Stage 2 split: PURE prepare (resolve matches + encode new images + preflight +
         // write-set) then a `&mut self` version-rewrite install. `txn_id` is the commit-seq used as
         // both the read boundary and the version stamp, identical to the old direct apply.
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_update(&update, snapshot)?;
         // SV5: surface `(table, old_rows, new_rows)` BEFORE `apply_delta` consumes the delta, so a single-
-        // entry UPDATE commit can tombstone the old resident slot + append the new image in place. `old_rows`
-        // (pre-assignment) is parallel to `installs`; `new_rows` = each install's row image. Same order.
+        // entry UPDATE commit can tombstone the old resident slot + append the new image in place, plus
+        // the delta's write-set for SI ledger recording (C2). `old_rows` (pre-assignment) is parallel to
+        // `installs`; `new_rows` = each install's row image. Same order.
         let applied = match &delta.mutation {
             PreparedMutation::Update {
                 table,
@@ -237,6 +242,7 @@ impl Engine {
                     .iter()
                     .map(|(_id, _key, row)| row.clone())
                     .collect(),
+                delta.write_set.clone(),
             )),
             _ => None,
         };

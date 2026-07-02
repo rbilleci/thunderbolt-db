@@ -529,3 +529,83 @@ fn prepare_apply_round_trips_to_same_state_as_public_path() {
         "visible rows diverged"
     );
 }
+
+#[test]
+fn serialized_dml_records_its_write_set_into_the_si_ledger() {
+    // C2 (write-path assessment): the recent-commits ledger used to be populated ONLY by the
+    // concurrent commit path — a SERIALIZED UPDATE was invisible to a concurrent committer's
+    // first-committer-wins check, so a concurrent transaction prepared against an older snapshot
+    // could silently overwrite it (a lost update). Every applied serialized DML now records its
+    // prepare-computed write-set at its commit seq, exactly like the concurrent path.
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10)")
+        .unwrap();
+
+    // A concurrent transaction pins + REGISTERS its read snapshot BEFORE the serialized UPDATE
+    // commits (the RAII guard, exactly as commit_dml_concurrent does — registration is what
+    // keeps ledger entries above the snapshot alive), and prepares a write to the SAME row
+    // (prepare is pure — nothing is installed yet).
+    let stale_snapshot = e.visible_up_to();
+    let _snapshot_guard = e.register_active_snapshot(stale_snapshot);
+    let stale_delta = e
+        .prepare_update(
+            &parse_update("UPDATE t SET v = 99 WHERE id = 1"),
+            e.dml_read_snapshot(stale_snapshot),
+        )
+        .unwrap();
+
+    // The conflicting write commits through the SERIALIZED path (execute_text routing).
+    e.execute_text(3, "UPDATE t SET v = 50 WHERE id = 1")
+        .unwrap();
+    let serialized_commit_seq = e.visible_up_to();
+    assert!(serialized_commit_seq > stale_snapshot);
+
+    let commit = e.commit_state();
+    assert!(
+        commit
+            .ledger
+            .conflicts(&stale_delta.write_set, stale_snapshot),
+        "first-committer-wins: the concurrent txn's stale write to the same row must now \
+         conflict against the serialized UPDATE's recorded write-set"
+    );
+    assert!(
+        !commit
+            .ledger
+            .conflicts(&stale_delta.write_set, serialized_commit_seq),
+        "a snapshot taken AT the serialized commit already saw it — no conflict"
+    );
+}
+
+#[test]
+fn serialized_unique_insert_records_its_unique_slot_into_the_si_ledger() {
+    // C2, unique-slot dimension: a serialized INSERT claiming a unique-index slot must be
+    // visible to a concurrent committer preparing a DIFFERENT row with the SAME unique value
+    // against an older snapshot (their row keys differ; only the unique slot collides).
+    let e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    e.execute_text(2, "CREATE UNIQUE INDEX t_id ON t (id)")
+        .unwrap();
+
+    let stale_snapshot = e.visible_up_to();
+    let _snapshot_guard = e.register_active_snapshot(stale_snapshot);
+    let stale_delta = e
+        .prepare_insert(
+            &parse_insert("INSERT INTO t (id, v) VALUES (7, 1)"),
+            e.dml_read_snapshot(stale_snapshot),
+            None,
+        )
+        .unwrap();
+
+    // A serialized INSERT claims unique slot id=7 after the concurrent txn's snapshot.
+    e.execute_text(3, "INSERT INTO t (id, v) VALUES (7, 2)")
+        .unwrap();
+
+    let commit = e.commit_state();
+    assert!(
+        commit
+            .ledger
+            .conflicts(&stale_delta.write_set, stale_snapshot),
+        "the serialized INSERT's unique slot must collide with the stale duplicate-value insert"
+    );
+}

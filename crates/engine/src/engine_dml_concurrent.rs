@@ -112,8 +112,13 @@ impl Engine {
         // (2) Prepare OFF-LOCK at the read snapshot: validate constraints + compute the conflict
         // write-set. (The delta itself is recomputed at commit_seq under the lock so the live apply
         // matches a WAL replay; this off-lock pass is the expensive validation + the write-set.)
-        self.preflight_unique_index_constraints(&cmd, txn_id)
-            .map_err(ExecuteError::Engine)?;
+        // P2 (write-path assessment): the separate `preflight_unique_index_constraints` pass this
+        // path used to run first was a full duplicate of the validation `prepare_dml` performs —
+        // same validator fns, same error messages — but at a WORSE visibility boundary (the facade
+        // txn id rather than the pinned read snapshot), and it cost an extra O(table)
+        // materialization per statement. The prepare below is the authoritative off-lock
+        // validation; the serialized `execute_text` path keeps its preflight, where it is the gate
+        // that stops a constraint-violating statement from ever reaching the WAL.
         let snapshot = self.dml_read_snapshot(read_snapshot);
         let prepared = self.prepare_dml(&cmd, snapshot)?;
         let residency_tables = Self::dml_mutated_tables(&cmd);

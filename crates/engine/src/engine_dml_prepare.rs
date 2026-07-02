@@ -12,7 +12,7 @@ impl Engine {
         cat: &mut DdlCatalogState,
         insert: Insert,
         txn_id: TxnId,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>)>, EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet)>, EngineError> {
         self.apply_insert_with_profile(cat, insert, txn_id, None)
     }
 
@@ -114,46 +114,57 @@ impl Engine {
             profile.row_prepare_micros += row_prepare_started.elapsed().as_micros();
         }
 
+        // P2 (write-path assessment): ONE shared visible-row materialization for all three
+        // validators — this used to be three separate O(table) scans (+ a `new_rows` clone each)
+        // per prepare, i.e. per constraint dimension. The scan cost lands in the first active
+        // validator's profile bucket (they used to pay one scan each); validation semantics and
+        // errors are unchanged (`prepare_update` already shares its scan the same way).
+        let mut candidate_rows: Option<Vec<Vec<SqlValue>>> = None;
+        let mut materialize_candidates =
+            |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
+                let mut rows = engine.visible_relational_rows(
+                    &table,
+                    StorageVisibility {
+                        read_txn_id: txn_id,
+                    },
+                )?;
+                rows.extend(new_rows.clone());
+                Ok(rows)
+            };
         if table.indexes.iter().any(|index| index.unique) {
             let unique_preflight_started = Instant::now();
-            let mut candidate_rows = self.visible_relational_rows(
+            if candidate_rows.is_none() {
+                candidate_rows = Some(materialize_candidates(self)?);
+            }
+            Self::validate_unique_indexes_for_rows(
                 &table,
-                StorageVisibility {
-                    read_txn_id: txn_id,
-                },
+                candidate_rows.as_ref().expect("materialized above"),
             )?;
-            candidate_rows.extend(new_rows.clone());
-            Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
             if let Some(profile) = profile.as_mut() {
                 profile.unique_preflight_micros += unique_preflight_started.elapsed().as_micros();
             }
         }
         if !table.check_constraints.is_empty() {
             let check_preflight_started = Instant::now();
-            let mut candidate_rows = self.visible_relational_rows(
+            if candidate_rows.is_none() {
+                candidate_rows = Some(materialize_candidates(self)?);
+            }
+            Self::validate_check_constraints_for_rows(
                 &table,
-                StorageVisibility {
-                    read_txn_id: txn_id,
-                },
+                candidate_rows.as_ref().expect("materialized above"),
             )?;
-            candidate_rows.extend(new_rows.clone());
-            Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
             if let Some(profile) = profile.as_mut() {
                 profile.check_preflight_micros += check_preflight_started.elapsed().as_micros();
             }
         }
         if !table.foreign_keys.is_empty() {
             let foreign_key_preflight_started = Instant::now();
-            let mut candidate_rows = self.visible_relational_rows(
-                &table,
-                StorageVisibility {
-                    read_txn_id: txn_id,
-                },
-            )?;
-            candidate_rows.extend(new_rows.clone());
+            if candidate_rows.is_none() {
+                candidate_rows = Some(materialize_candidates(self)?);
+            }
             self.validate_foreign_keys_with_table_rows(
                 &table.name,
-                &candidate_rows,
+                candidate_rows.as_ref().expect("materialized above"),
                 StorageVisibility {
                     read_txn_id: txn_id,
                 },

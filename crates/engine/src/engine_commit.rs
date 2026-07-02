@@ -226,12 +226,35 @@ impl Engine {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
             let mut applied: Option<AppliedRowMutation> = None;
+            let mut recorded_write_set = false;
             for e in &to_apply {
                 commit.sm.apply(e)?;
                 if let Some(m) = self.apply_mvcc_entry(e, cat)? {
+                    // C2 (write-path assessment): record the SERIALIZED path's write-set into the
+                    // SI recent-commits ledger, exactly as the concurrent path records its own —
+                    // so a concurrent committer whose read snapshot predates this commit sees the
+                    // conflict (first-committer-wins) instead of silently overwriting it (a lost
+                    // update). Before this, the ledger was populated only by the concurrent path
+                    // and safety rested on the emergent fact that serialized DML is INSERT-shaped
+                    // in production routing.
+                    commit.ledger.record(m.write_set(), e.index);
+                    recorded_write_set = true;
                     applied = Some(m);
                 }
                 commit.repl.mark_applied(e.index);
+            }
+            if recorded_write_set {
+                // Same bounding policy as the concurrent path's (3e): prune below the oldest
+                // active read snapshot (or everything up to this commit when none are active —
+                // a future snapshot can never conflict against entries at or below its own seq).
+                let prune_boundary = self
+                    .active_snapshots
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .oldest()
+                    .map(|oldest| oldest.saturating_sub(1))
+                    .unwrap_or(publish_index);
+                commit.ledger.prune_below(prune_boundary);
             }
 
             // Publish ordering (Stage 2 — blocker #1; PART B catalog↔data co-pinning). The apply loop
@@ -259,11 +282,11 @@ impl Engine {
             let handled = self.auto_admit_on_commit_enabled()
                 && to_apply.len() == 1
                 && match applied.as_ref() {
-                    Some(AppliedRowMutation::Insert { table, rows }) => {
+                    Some(AppliedRowMutation::Insert { table, rows, .. }) => {
                         // Plain INSERT appends are unstamped/born-visible (SV6 `created_by = None`).
                         self.try_append_resident_int4_open_shard(table, rows, None)
                     }
-                    Some(AppliedRowMutation::Delete { table, rows })
+                    Some(AppliedRowMutation::Delete { table, rows, .. })
                         if self.resident_delete_tombstone_enabled() =>
                     {
                         self.try_tombstone_resident_delete_commit(cat, table, rows, publish_index)
@@ -272,6 +295,7 @@ impl Engine {
                         table,
                         old_rows,
                         new_rows,
+                        ..
                     }) if self.resident_update_tombstone_enabled() => self
                         .try_update_resident_commit(cat, table, old_rows, new_rows, publish_index),
                     _ => false,
@@ -859,21 +883,30 @@ impl Engine {
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(cat, alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(cat, comment)?,
             Command::Insert(insert) => {
-                applied = self
-                    .apply_insert(cat, insert, commit_seq)?
-                    .map(|(table, rows)| AppliedRowMutation::Insert { table, rows });
+                applied =
+                    self.apply_insert(cat, insert, commit_seq)?
+                        .map(|(table, rows, write_set)| AppliedRowMutation::Insert {
+                            table,
+                            rows,
+                            write_set,
+                        });
             }
             Command::Delete(delete) => {
-                applied = self
-                    .apply_delete(cat, delete, commit_seq)?
-                    .map(|(table, rows)| AppliedRowMutation::Delete { table, rows });
+                applied =
+                    self.apply_delete(cat, delete, commit_seq)?
+                        .map(|(table, rows, write_set)| AppliedRowMutation::Delete {
+                            table,
+                            rows,
+                            write_set,
+                        });
             }
             Command::Update(update) => {
                 applied = self.apply_update(cat, update, commit_seq)?.map(
-                    |(table, old_rows, new_rows)| AppliedRowMutation::Update {
+                    |(table, old_rows, new_rows, write_set)| AppliedRowMutation::Update {
                         table,
                         old_rows,
                         new_rows,
+                        write_set,
                     },
                 );
             }
