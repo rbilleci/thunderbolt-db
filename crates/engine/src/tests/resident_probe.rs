@@ -32,7 +32,10 @@ fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() 
         .unwrap();
     let after = e.metrics().snapshot();
     // Closed-form oracle (S9): `SELECT label FROM events WHERE id = 2 LIMIT 1` over {1:'alpha',2:'beta'}.
-    assert_eq!(resident.rows, vec![vec![SqlValue::Text("beta".to_string())]]);
+    assert_eq!(
+        resident.rows,
+        vec![vec![SqlValue::Text("beta".to_string())]]
+    );
     assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
     assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(resident.fallback_reason, None);
@@ -96,8 +99,14 @@ fn resident_snapshot_probe_reads_aggregate_distinct_without_transfer() {
             "SELECT AVG(amount) FROM events WHERE category = 'odd'",
             vec![vec![crate::rel_exec_helpers::average_sql_value(40, 2)]],
         ),
-        ("SELECT MIN(amount) FROM events", vec![vec![SqlValue::Int4(10)]]),
-        ("SELECT MAX(amount) FROM events", vec![vec![SqlValue::Int4(30)]]),
+        (
+            "SELECT MIN(amount) FROM events",
+            vec![vec![SqlValue::Int4(10)]],
+        ),
+        (
+            "SELECT MAX(amount) FROM events",
+            vec![vec![SqlValue::Int4(30)]],
+        ),
     ];
 
     let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
@@ -262,10 +271,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
     let Command::Select(select) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
         unreachable!()
     };
-    let err = e
-        .execute_resident_plan(&select)
-        .unwrap_err()
-        .to_string();
+    let err = e.execute_resident_plan(&select).unwrap_err().to_string();
     assert!(err.contains("has no retained resident device memory"));
 
     let Command::Select(filtered_select) =
@@ -328,9 +334,7 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
         unreachable!()
     };
     let err = e
-        .execute_resident_plan(
-            &filtered_avg_select,
-        )
+        .execute_resident_plan(&filtered_avg_select)
         .unwrap_err()
         .to_string();
     assert!(err.contains("has no retained resident device memory"));
@@ -393,6 +397,9 @@ fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() 
 #[test]
 fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_telemetry() {
     let mut e = Engine::new_local();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
+    // configuration; sharded is the default) — pin the layout it tests.
+    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE events (id INT, amount INT)")
         .unwrap();
     e.execute_text(
@@ -409,9 +416,7 @@ fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_tele
         unreachable!()
     };
     let before = e.metrics().snapshot();
-    let resident = e
-        .execute_resident_plan(&select)
-        .unwrap();
+    let resident = e.execute_resident_plan(&select).unwrap();
     let after = e.metrics().snapshot();
 
     // Closed-form oracle (S9): SUM(amount) over [-5,0,7,-2] = 0.
@@ -440,9 +445,7 @@ fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_tele
         unreachable!()
     };
     let before_empty = e.metrics().snapshot();
-    let empty_resident = e
-        .execute_resident_plan(&empty_select)
-        .unwrap();
+    let empty_resident = e.execute_resident_plan(&empty_select).unwrap();
     let after_empty = e.metrics().snapshot();
 
     // Closed-form oracle (S9): the legacy resident SUM probe returns Int8(0) (the reduction identity)
@@ -485,7 +488,11 @@ fn gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch() {
         // a>=0 -> [5,1,5,0,5,2,1] sorted asc [0,1,1,2,5,5,5]; LIMIT 3 -> [0,1,1].
         (
             "SELECT a FROM p WHERE a >= 0 ORDER BY a LIMIT 3",
-            vec![vec![SqlValue::Int4(0)], vec![SqlValue::Int4(1)], vec![SqlValue::Int4(1)]],
+            vec![
+                vec![SqlValue::Int4(0)],
+                vec![SqlValue::Int4(1)],
+                vec![SqlValue::Int4(1)],
+            ],
         ),
         // a>0 -> [5,1,5,5,2,10,1] sorted desc [10,5,5,5,2,1,1]; LIMIT 4 -> [10,5,5,5].
         (
@@ -505,7 +512,11 @@ fn gpu_s10a_ordered_projection_routes_through_bridge_on_dispatch() {
             unreachable!()
         };
         let result = e.execute_relational_select(&select).unwrap();
-        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(
+            result.executed_target,
+            DeviceTarget::Gpu(0),
+            "off GPU: {sql}"
+        );
         assert_eq!(result.fallback_reason, None, "fell back: {sql}");
         assert_eq!(&result.rows, expected, "rows mismatch: {sql}");
     }
@@ -553,7 +564,11 @@ fn gpu_s10a_ordered_projection_drops_nulls_pg_correct() {
             unreachable!()
         };
         let dispatch = e.execute_relational_select(&select).unwrap();
-        assert_eq!(dispatch.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(
+            dispatch.executed_target,
+            DeviceTarget::Gpu(0),
+            "off GPU: {sql}"
+        );
         assert_eq!(dispatch.fallback_reason, None, "fell back: {sql}");
         assert_eq!(
             &dispatch.rows, expected,
@@ -561,8 +576,14 @@ fn gpu_s10a_ordered_projection_drops_nulls_pg_correct() {
         );
         // The bridge (live dispatch) must match the engine's SQL->Expr general path byte-for-byte.
         let general = e.execute_resident_expr_select_sql(sql).unwrap();
-        assert_eq!(dispatch.rows, general.rows, "bridge != general on NULL data: {sql}");
-        assert_eq!(*dispatch.columns, *general.columns, "bridge cols != general: {sql}");
+        assert_eq!(
+            dispatch.rows, general.rows,
+            "bridge != general on NULL data: {sql}"
+        );
+        assert_eq!(
+            *dispatch.columns, *general.columns,
+            "bridge cols != general: {sql}"
+        );
     }
 }
 
@@ -584,12 +605,22 @@ fn gpu_s10b_distinct_routes_through_bridge_on_dispatch() {
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    let i4 = |vs: &[i32]| vs.iter().map(|&v| vec![SqlValue::Int4(v)]).collect::<Vec<_>>();
+    let i4 = |vs: &[i32]| {
+        vs.iter()
+            .map(|&v| vec![SqlValue::Int4(v)])
+            .collect::<Vec<_>>()
+    };
     let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
         // distinct = {0,1,2,3,5,10}; no ORDER BY -> deterministic default order = key ASC.
         ("SELECT DISTINCT a FROM p", i4(&[0, 1, 2, 3, 5, 10])),
-        ("SELECT DISTINCT a FROM p ORDER BY a DESC LIMIT 3", i4(&[10, 5, 3])),
-        ("SELECT DISTINCT a FROM p WHERE a >= 2 ORDER BY a", i4(&[2, 3, 5, 10])),
+        (
+            "SELECT DISTINCT a FROM p ORDER BY a DESC LIMIT 3",
+            i4(&[10, 5, 3]),
+        ),
+        (
+            "SELECT DISTINCT a FROM p WHERE a >= 2 ORDER BY a",
+            i4(&[2, 3, 5, 10]),
+        ),
         ("SELECT DISTINCT a FROM p WHERE a >= 100 ORDER BY a", vec![]),
     ];
     for (sql, expected) in cases {
@@ -597,7 +628,11 @@ fn gpu_s10b_distinct_routes_through_bridge_on_dispatch() {
             unreachable!()
         };
         let result = e.execute_relational_select(&select).unwrap();
-        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(
+            result.executed_target,
+            DeviceTarget::Gpu(0),
+            "off GPU: {sql}"
+        );
         assert_eq!(result.fallback_reason, None, "fell back: {sql}");
         assert_eq!(&result.rows, expected, "rows mismatch: {sql}");
     }
@@ -630,14 +665,21 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
     let dispatch = e.execute_relational_select(&select).unwrap();
     assert_eq!(dispatch.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(dispatch.fallback_reason, None);
-    let nulls = dispatch.rows.iter().filter(|r| r[0] == SqlValue::Null).count();
+    let nulls = dispatch
+        .rows
+        .iter()
+        .filter(|r| r[0] == SqlValue::Null)
+        .count();
     let zeros = dispatch
         .rows
         .iter()
         .filter(|r| r[0] == SqlValue::Int4(0))
         .count();
     assert_eq!(nulls, 1, "DISTINCT must keep exactly one NULL group: {sql}");
-    assert_eq!(zeros, 0, "phantom Int4(0) from a NULL (the retired probe's bug): {sql}");
+    assert_eq!(
+        zeros, 0,
+        "phantom Int4(0) from a NULL (the retired probe's bug): {sql}"
+    );
     let mut nonnull: Vec<i32> = dispatch
         .rows
         .iter()
@@ -647,7 +689,11 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
         })
         .collect();
     nonnull.sort_unstable();
-    assert_eq!(nonnull, vec![1, 2, 3, 5], "non-null distinct set wrong: {sql}");
+    assert_eq!(
+        nonnull,
+        vec![1, 2, 3, 5],
+        "non-null distinct set wrong: {sql}"
+    );
     // Cross-check: the general SQL->Expr path has NO DISTINCT (it errors), but `SELECT DISTINCT a` is
     // exactly `GROUP BY a` (count dropped) -- so the DISTINCT bridge must equal an explicit GROUP BY run
     // through that general path on the SAME NULL data, proving the transform is faithful (incl. the NULL group).
@@ -662,8 +708,14 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
     std::sync::Arc::make_mut(&mut grouped.columns).truncate(1);
     let keys: Vec<SqlValue> = grouped.rows.iter().map(|row| row[0].clone()).collect();
     grouped.rows = RowBlock::flat(keys, 1);
-    assert_eq!(dispatch.rows, grouped.rows, "DISTINCT bridge != explicit GROUP BY (NULL): {sql}");
-    assert_eq!(*dispatch.columns, *grouped.columns, "bridge cols != GROUP BY cols: {sql}");
+    assert_eq!(
+        dispatch.rows, grouped.rows,
+        "DISTINCT bridge != explicit GROUP BY (NULL): {sql}"
+    );
+    assert_eq!(
+        *dispatch.columns, *grouped.columns,
+        "bridge cols != GROUP BY cols: {sql}"
+    );
 
     // Filtered DISTINCT: a NULL fails `a >= 2` (3VL) -> excluded; result has no NULL and no phantom 0.
     let fsql = "SELECT DISTINCT a FROM p2 WHERE a >= 2 ORDER BY a";
@@ -673,7 +725,11 @@ fn gpu_s10b_distinct_keeps_null_group_pg_correct() {
     let filtered = e.execute_relational_select(&fselect).unwrap();
     assert_eq!(
         filtered.rows,
-        vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(5)]],
+        vec![
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(5)]
+        ],
         "filtered DISTINCT (a>=2): {fsql}"
     );
 }
@@ -700,17 +756,33 @@ fn gpu_s10a_projection_routes_through_bridge_on_dispatch() {
     let i = SqlValue::Int4;
     let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
         // index order preserved (no ORDER BY): a>=5 -> rows 0,2,4,5 = [5,5,5,8].
-        ("SELECT a FROM proj WHERE a >= 5", vec![vec![i(5)], vec![i(5)], vec![i(5)], vec![i(8)]]),
-        ("SELECT a FROM proj WHERE a = 5", vec![vec![i(5)], vec![i(5)], vec![i(5)]]),
-        ("SELECT a, b FROM proj WHERE a = 5 AND b = 3", vec![vec![i(5), i(3)], vec![i(5), i(3)]]),
-        ("SELECT label, a FROM proj WHERE a = 5", vec![vec![t("x"), i(5)], vec![t("z"), i(5)], vec![t("q"), i(5)]]),
+        (
+            "SELECT a FROM proj WHERE a >= 5",
+            vec![vec![i(5)], vec![i(5)], vec![i(5)], vec![i(8)]],
+        ),
+        (
+            "SELECT a FROM proj WHERE a = 5",
+            vec![vec![i(5)], vec![i(5)], vec![i(5)]],
+        ),
+        (
+            "SELECT a, b FROM proj WHERE a = 5 AND b = 3",
+            vec![vec![i(5), i(3)], vec![i(5), i(3)]],
+        ),
+        (
+            "SELECT label, a FROM proj WHERE a = 5",
+            vec![vec![t("x"), i(5)], vec![t("z"), i(5)], vec![t("q"), i(5)]],
+        ),
     ];
     for (sql, expected) in cases {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
         let result = e.execute_relational_select(&select).unwrap();
-        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(
+            result.executed_target,
+            DeviceTarget::Gpu(0),
+            "off GPU: {sql}"
+        );
         assert_eq!(result.fallback_reason, None, "fell back: {sql}");
         assert_eq!(&result.rows, expected, "rows mismatch: {sql}");
     }
@@ -738,16 +810,26 @@ fn gpu_s10a_projection_drops_nulls_pg_correct() {
     let i = SqlValue::Int4;
     // a>=0 keeps the non-NULL 0,5,0 (rows 0,2,4) in index order; NULLs excluded (no phantom 0).
     let cases: &[(&str, Vec<Vec<SqlValue>>)] = &[
-        ("SELECT a FROM projn WHERE a >= 0", vec![vec![i(0)], vec![i(5)], vec![i(0)]]),
+        (
+            "SELECT a FROM projn WHERE a >= 0",
+            vec![vec![i(0)], vec![i(5)], vec![i(0)]],
+        ),
         // a = 0 keeps ONLY the two real 0s (rows 0,4); the 2 NULLs are NOT phantom 0s.
-        ("SELECT a FROM projn WHERE a = 0", vec![vec![i(0)], vec![i(0)]]),
+        (
+            "SELECT a FROM projn WHERE a = 0",
+            vec![vec![i(0)], vec![i(0)]],
+        ),
     ];
     for (sql, expected) in cases {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
         let result = e.execute_relational_select(&select).unwrap();
-        assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
+        assert_eq!(
+            result.executed_target,
+            DeviceTarget::Gpu(0),
+            "off GPU: {sql}"
+        );
         assert_eq!(
             &result.rows, expected,
             "NULL not excluded (probe phantom-0 bug regressed?): {sql}"
@@ -782,14 +864,23 @@ fn gpu_s10a_filter_group_count_routes_through_bridge_on_dispatch() {
         assert_eq!(r.executed_target, DeviceTarget::Gpu(0), "off GPU: {sql}");
         r.rows[0][0].clone()
     };
-    assert_eq!(count(&e, "SELECT COUNT(*) FROM cnt WHERE a = 1 OR a = 5"), SqlValue::Int8(4));
-    assert_eq!(count(&e, "SELECT COUNT(*) FROM cnt WHERE a >= 2 AND a <= 8"), SqlValue::Int8(4));
+    assert_eq!(
+        count(&e, "SELECT COUNT(*) FROM cnt WHERE a = 1 OR a = 5"),
+        SqlValue::Int8(4)
+    );
+    assert_eq!(
+        count(&e, "SELECT COUNT(*) FROM cnt WHERE a >= 2 AND a <= 8"),
+        SqlValue::Int8(4)
+    );
 
     // NULL data: real 0s (x2) + a NULL (x2) + a 5; `a = 0 OR a = 5` counts the 3 real matches, NOT the NULLs.
     let mut e2 = Engine::new_local();
     e2.execute_text(1, "CREATE TABLE cntn (a INT)").unwrap();
-    e2.execute_text(2, "INSERT INTO cntn (a) VALUES (0), (NULL), (5), (NULL), (0), (1)")
-        .unwrap();
+    e2.execute_text(
+        2,
+        "INSERT INTO cntn (a) VALUES (0), (NULL), (5), (NULL), (0), (1)",
+    )
+    .unwrap();
     if e2
         .populate_relational_residency_snapshot("cntn")
         .unwrap()
@@ -959,8 +1050,14 @@ fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
     // Closed-form oracles (S9): id=[1,2,3,4,5]; BETWEEN 2 AND 4 matches {2,3,4} = 3; the inverted
     // BETWEEN 4 AND 2 is an empty range = 0 (still executed on-device, hence the kernel/d2h asserts).
     for (sql, expected) in [
-        ("SELECT COUNT(*) FROM events WHERE id BETWEEN 2 AND 4", SqlValue::Int8(3)),
-        ("SELECT COUNT(*) FROM events WHERE id BETWEEN 4 AND 2", SqlValue::Int8(0)),
+        (
+            "SELECT COUNT(*) FROM events WHERE id BETWEEN 2 AND 4",
+            SqlValue::Int8(3),
+        ),
+        (
+            "SELECT COUNT(*) FROM events WHERE id BETWEEN 4 AND 2",
+            SqlValue::Int8(0),
+        ),
     ] {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
@@ -1059,7 +1156,13 @@ fn gpu_s10a_text_prefix_like_count_routes_through_bridge_on_device() {
     }
     // labels {alpha,alpine,beta,alphabet,gamma,al}: LIKE 'alp%' = 3; 'al%' = 4 (+al); 'beta%' = 1; 'z%' = 0;
     // '%' = all 6 (no NULLs to exclude). The COUNT runs entirely on the device via the bridge.
-    for (pattern, expected) in [("alp%", 3i64), ("al%", 4), ("beta%", 1), ("z%", 0), ("%", 6)] {
+    for (pattern, expected) in [
+        ("alp%", 3i64),
+        ("al%", 4),
+        ("beta%", 1),
+        ("z%", 0),
+        ("%", 6),
+    ] {
         let sql = format!("SELECT COUNT(*) FROM events WHERE label LIKE '{pattern}'");
         let Command::Select(select) = parse_command(&sql).unwrap() else {
             unreachable!()
@@ -1098,7 +1201,13 @@ fn gpu_s10a_text_prefix_like_count_nullable_text_pg_correct_on_device() {
     }
     // 7 rows, one NULL label. LIKE 'alp%' = 3 (NULL excluded), 'al%' = 4, 'beta%' = 1, 'z%' = 0; the
     // empty-prefix '%' = 6 = the non-NULL rows (PG-correct -- the probe returned 7, counting the NULL).
-    for (pattern, expected) in [("alp%", 3i64), ("al%", 4), ("beta%", 1), ("z%", 0), ("%", 6)] {
+    for (pattern, expected) in [
+        ("alp%", 3i64),
+        ("al%", 4),
+        ("beta%", 1),
+        ("z%", 0),
+        ("%", 6),
+    ] {
         let sql = format!("SELECT COUNT(*) FROM events WHERE label LIKE '{pattern}'");
         let Command::Select(select) = parse_command(&sql).unwrap() else {
             unreachable!()
@@ -1124,7 +1233,8 @@ fn gpu_resident_empty_nonnullable_scalar_aggregate_min_max_avg_is_null() {
     let mut e = Engine::new_local();
     // Plain `INT` (no inserted NULLs) routes the NON-nullable arm (`agg_null_offset.is_none()`), the
     // same arm the populated `gpu_resident_device_memory_scalar_aggregate_probe_*` test exercises.
-    e.execute_text(1, "CREATE TABLE events (amount INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE events (amount INT)")
+        .unwrap();
     // No rows inserted: an empty non-nullable column.
     let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
     if snapshot.device_memory_proof.is_none() {
@@ -1181,9 +1291,7 @@ fn gpu_resident_device_memory_scalar_aggregate_probe_materializes_int4_results()
             unreachable!()
         };
         let before = e.metrics().snapshot();
-        let resident = e
-            .execute_resident_plan(&select)
-            .unwrap();
+        let resident = e.execute_resident_plan(&select).unwrap();
         let after = e.metrics().snapshot();
 
         assert_eq!(resident.rows, vec![vec![expected]], "{sql}");
@@ -1227,6 +1335,9 @@ fn gpu_resident_scalar_aggregate_skips_null_values_and_all_null_is_null() {
     // closed-form construction (the non-NULL sum/count/min/max computed by hand, AVG via the engine's
     // own PG-exact finalization) — NOT a CPU-operator oracle, per the GPU-native-oracle charter.
     let mut e = Engine::new_local();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
+    // configuration; sharded is the default) — pin the layout it tests.
+    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE events (amount INT, allnull INT)")
         .unwrap();
     // amount: 10, NULL, 30, NULL, 20, 5  -> non-NULL {10, 30, 20, 5}: count 4, sum 65, min 5, max 30.
@@ -1300,7 +1411,11 @@ fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
     // M3 Slice A: filtered (compare + BETWEEN) SUM/AVG/MIN/MAX over a NULLABLE int4 column skip NULL rows
     // ON THE GPU, and a no-surviving-row result is SQL NULL. Closed-form construction oracle (not CPU).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE events (amount INT)").unwrap();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
+    // configuration; sharded is the default) — pin the layout it tests.
+    e.set_shard_residency_enabled(false);
+    e.execute_text(1, "CREATE TABLE events (amount INT)")
+        .unwrap();
     // amount: 10, NULL, 30, NULL, 20, 5  -> non-NULL {10, 30, 20, 5}.
     e.execute_text(
         2,
@@ -1314,20 +1429,41 @@ fn gpu_resident_filtered_scalar_aggregate_over_nullable_column_skips_null() {
 
     let cases: [(&str, SqlValue); 8] = [
         // compare-nullable: non-NULL rows passing the filter, NULL placeholders excluded by the kernel.
-        ("SELECT SUM(amount) FROM events WHERE amount >= 20", SqlValue::Int8(50)), // {30,20}
-        ("SELECT MIN(amount) FROM events WHERE amount >= 20", SqlValue::Int4(20)),
-        ("SELECT MAX(amount) FROM events WHERE amount <= 10", SqlValue::Int4(10)), // {10,5}
+        (
+            "SELECT SUM(amount) FROM events WHERE amount >= 20",
+            SqlValue::Int8(50),
+        ), // {30,20}
+        (
+            "SELECT MIN(amount) FROM events WHERE amount >= 20",
+            SqlValue::Int4(20),
+        ),
+        (
+            "SELECT MAX(amount) FROM events WHERE amount <= 10",
+            SqlValue::Int4(10),
+        ), // {10,5}
         (
             "SELECT AVG(amount) FROM events WHERE amount <= 10",
             crate::rel_exec_helpers::average_sql_value(15, 2),
         ),
         // no surviving non-NULL row ⇒ SQL NULL (PG: aggregate of no rows is NULL).
-        ("SELECT SUM(amount) FROM events WHERE amount >= 100", SqlValue::Null),
-        ("SELECT MAX(amount) FROM events WHERE amount >= 100", SqlValue::Null),
+        (
+            "SELECT SUM(amount) FROM events WHERE amount >= 100",
+            SqlValue::Null,
+        ),
+        (
+            "SELECT MAX(amount) FROM events WHERE amount >= 100",
+            SqlValue::Null,
+        ),
         // BETWEEN-nullable: the [0,10] lower bound would admit the 0 placeholder, but the kernel's
         // NULL-skip excludes it, so MIN is 5 (a real value), not 0.
-        ("SELECT MIN(amount) FROM events WHERE amount BETWEEN 0 AND 10", SqlValue::Int4(5)),
-        ("SELECT SUM(amount) FROM events WHERE amount BETWEEN 100 AND 200", SqlValue::Null),
+        (
+            "SELECT MIN(amount) FROM events WHERE amount BETWEEN 0 AND 10",
+            SqlValue::Int4(5),
+        ),
+        (
+            "SELECT SUM(amount) FROM events WHERE amount BETWEEN 100 AND 200",
+            SqlValue::Null,
+        ),
     ];
     for (sql, expected) in cases {
         let Command::Select(select) = parse_command(sql).unwrap() else {
@@ -1360,21 +1496,28 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
 
     // Closed-form oracles (S9): amount=[10,30,20,40,5]; amount>=20 -> {20,30,40} (sum 90, count 3).
     for (sql, expected) in [
-        ("SELECT SUM(amount) FROM events WHERE amount >= 20", SqlValue::Int8(90)),
+        (
+            "SELECT SUM(amount) FROM events WHERE amount >= 20",
+            SqlValue::Int8(90),
+        ),
         (
             "SELECT AVG(amount) FROM events WHERE amount >= 20",
             crate::rel_exec_helpers::average_sql_value(90, 3),
         ),
-        ("SELECT MIN(amount) FROM events WHERE amount >= 20", SqlValue::Int4(20)),
-        ("SELECT MAX(amount) FROM events WHERE amount >= 20", SqlValue::Int4(40)),
+        (
+            "SELECT MIN(amount) FROM events WHERE amount >= 20",
+            SqlValue::Int4(20),
+        ),
+        (
+            "SELECT MAX(amount) FROM events WHERE amount >= 20",
+            SqlValue::Int4(40),
+        ),
     ] {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
         let before = e.metrics().snapshot();
-        let resident = e
-            .execute_resident_plan(&select)
-            .unwrap();
+        let resident = e.execute_resident_plan(&select).unwrap();
         let after = e.metrics().snapshot();
 
         assert_eq!(resident.rows, vec![vec![expected]], "{sql}");
@@ -1401,9 +1544,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         unreachable!()
     };
     let err = e
-        .execute_resident_plan(
-            &unsupported_text,
-        )
+        .execute_resident_plan(&unsupported_text)
         .unwrap_err()
         .to_string();
     assert!(err.contains("supports only int4 comparison literals"));
@@ -1414,9 +1555,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         unreachable!()
     };
     let err = e
-        .execute_resident_plan(
-            &unsupported_cross_column,
-        )
+        .execute_resident_plan(&unsupported_cross_column)
         .unwrap_err()
         .to_string();
     assert!(err.contains("requires the predicate column to match the aggregate column"));
@@ -1427,9 +1566,7 @@ fn gpu_resident_device_memory_filtered_scalar_aggregate_probe_materializes_int4_
         unreachable!()
     };
     let before = e.metrics().snapshot();
-    let resident = e
-        .execute_resident_plan(&empty_max)
-        .unwrap();
+    let resident = e.execute_resident_plan(&empty_max).unwrap();
     let after = e.metrics().snapshot();
     // Closed-form oracle (S9): MAX over no surviving rows (amount >= 1000) is SQL NULL -- an aggregate of
     // no rows is NULL (SQL spec). The provably-empty-domain fast path answers from the retained column
@@ -1481,24 +1618,34 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
     // Closed-form oracles (S9): amount=[10,30,20,40,5]; BETWEEN 10 AND 30 -> {10,20,30} (sum 60,
     // count 3); the inverted BETWEEN 40 AND 10 is an empty range -> SQL NULL.
     for (sql, expected) in [
-        ("SELECT SUM(amount) FROM events WHERE amount BETWEEN 10 AND 30", SqlValue::Int8(60)),
+        (
+            "SELECT SUM(amount) FROM events WHERE amount BETWEEN 10 AND 30",
+            SqlValue::Int8(60),
+        ),
         (
             "SELECT AVG(amount) FROM events WHERE amount BETWEEN 10 AND 30",
             crate::rel_exec_helpers::average_sql_value(60, 3),
         ),
-        ("SELECT MIN(amount) FROM events WHERE amount BETWEEN 10 AND 30", SqlValue::Int4(10)),
-        ("SELECT MAX(amount) FROM events WHERE amount BETWEEN 10 AND 30", SqlValue::Int4(30)),
+        (
+            "SELECT MIN(amount) FROM events WHERE amount BETWEEN 10 AND 30",
+            SqlValue::Int4(10),
+        ),
+        (
+            "SELECT MAX(amount) FROM events WHERE amount BETWEEN 10 AND 30",
+            SqlValue::Int4(30),
+        ),
         // Empty (inverted) range: SUM over zero rows is SQL NULL (PG), now that
         // materialize_resident_scalar_stats guards count==0 => Null (was the legacy Int8(0) sentinel).
-        ("SELECT SUM(amount) FROM events WHERE amount BETWEEN 40 AND 10", SqlValue::Null),
+        (
+            "SELECT SUM(amount) FROM events WHERE amount BETWEEN 40 AND 10",
+            SqlValue::Null,
+        ),
     ] {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
         let before = e.metrics().snapshot();
-        let resident = e
-            .execute_resident_plan(&select)
-            .unwrap();
+        let resident = e.execute_resident_plan(&select).unwrap();
         let after = e.metrics().snapshot();
 
         assert_eq!(resident.rows, vec![vec![expected]], "{sql}");
@@ -1537,9 +1684,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
         unreachable!()
     };
     let err = e
-        .execute_resident_plan(
-            &unsupported_text,
-        )
+        .execute_resident_plan(&unsupported_text)
         .unwrap_err()
         .to_string();
     assert!(err.contains("supports only int4 bounds"));
@@ -1550,9 +1695,7 @@ fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_r
         unreachable!()
     };
     let err = e
-        .execute_resident_plan(
-            &unsupported_cross_column,
-        )
+        .execute_resident_plan(&unsupported_cross_column)
         .unwrap_err()
         .to_string();
     assert!(err.contains("requires the predicate column to match the aggregate column"));

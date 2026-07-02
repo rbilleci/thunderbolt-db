@@ -193,7 +193,10 @@ impl RowBlock {
     /// Build directly from a flat row-major value buffer (the fast path: no per-row Vec). `ncols` must be
     /// > 0 unless `values` is empty.
     pub fn flat(values: Vec<SqlValue>, ncols: usize) -> Self {
-        debug_assert!(ncols > 0 || values.is_empty(), "RowBlock: ncols=0 with non-empty values");
+        debug_assert!(
+            ncols > 0 || values.is_empty(),
+            "RowBlock: ncols=0 with non-empty values"
+        );
         Self { values, ncols }
     }
     pub fn len(&self) -> usize {
@@ -223,7 +226,10 @@ impl RowBlock {
         if self.ncols == 0 {
             return Vec::new();
         }
-        self.values.chunks(self.ncols).map(<[SqlValue]>::to_vec).collect()
+        self.values
+            .chunks(self.ncols)
+            .map(<[SqlValue]>::to_vec)
+            .collect()
     }
     /// The `count` rows starting at row `start` as a flat `&[SqlValue]` slice (`count*ncols` values) — for
     /// slicing a multi-needle batched block into one needle's rows, zero-copy.

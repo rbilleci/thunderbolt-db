@@ -29,7 +29,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpu_db_engine::{RowBlock, Engine, RelationalRetainedReadTemplate};
+use gpu_db_engine::{Engine, RelationalRetainedReadTemplate, RowBlock};
 use gpu_db_sql::{parse_command, Command, Select};
 
 fn parse_select(sql: &str) -> Select {
@@ -267,13 +267,12 @@ fn rows_once(
     needles: &[i32],
 ) -> Result<Vec<RowBlock>, Box<dyn Error>> {
     mode.configure(e);
-    Ok(e
-        .complete_relational_retained_read_submission(
-            e.submit_relational_retained_template_point_lookups(template, needles)?,
-        )?
-        .into_iter()
-        .map(|r| r.rows)
-        .collect())
+    Ok(e.complete_relational_retained_read_submission(
+        e.submit_relational_retained_template_point_lookups(template, needles)?,
+    )?
+    .into_iter()
+    .map(|r| r.rows)
+    .collect())
 }
 
 /// Concurrent section: `threads` workers each run `per_thread` batches through ONE shared engine in `mode`.
@@ -294,7 +293,8 @@ fn measure_concurrent(
         let template = engine.prepare_relational_retained_read_template(select)?;
         for b in 0..4 {
             let needles = needles_for_batch(b, batch, step, rows);
-            let sub = engine.submit_relational_retained_template_point_lookups(&template, &needles)?;
+            let sub =
+                engine.submit_relational_retained_template_point_lookups(&template, &needles)?;
             let _ = engine.complete_relational_retained_read_submission(sub)?;
         }
     }
@@ -325,7 +325,9 @@ fn measure_concurrent(
         })
         .collect();
     for w in workers {
-        w.join().expect("worker panicked").map_err(|e| -> Box<dyn Error> { e.into() })?;
+        w.join()
+            .expect("worker panicked")
+            .map_err(|e| -> Box<dyn Error> { e.into() })?;
     }
     let secs = t.elapsed().as_secs_f64();
     let total = (threads * per_thread * batch) as f64;
@@ -346,7 +348,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(1_048_576);
     let batch_sizes = {
         let v = parse_csv_usize(
-            &env::var("GPU_DB_BENCH_BATCH").unwrap_or_else(|_| "1,8,32,256,4096,16384,65536".to_string()),
+            &env::var("GPU_DB_BENCH_BATCH")
+                .unwrap_or_else(|_| "1,8,32,256,4096,16384,65536".to_string()),
         );
         if v.is_empty() {
             vec![256]
@@ -362,8 +365,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let thread_counts =
-        parse_csv_usize(&env::var("GPU_DB_BENCH_THREADS").unwrap_or_else(|_| "1,2,4,8".to_string()));
+    let thread_counts = parse_csv_usize(
+        &env::var("GPU_DB_BENCH_THREADS").unwrap_or_else(|_| "1,2,4,8".to_string()),
+    );
 
     println!(
         "# lpb-index A/B  rows={rows}  batches={batch_sizes:?}  measured_batches={batches}  warmup={warmup}"
@@ -386,14 +390,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("rows={rows}: no GPU resident route accepted — skipping (no GPU?)");
         return Ok(());
     }
-    let exec_target = format!("{:?}", e.execute_relational_select(&select)?.executed_target);
+    let exec_target = format!(
+        "{:?}",
+        e.execute_relational_select(&select)?.executed_target
+    );
     let template = e.prepare_relational_retained_read_template(&select)?;
     println!("# executed_target={exec_target}\n");
 
     // (batch, scan_ops, lpb_ops) for the closing summary.
     let mut headline: Vec<(usize, f64, f64)> = Vec::new();
 
-    println!("## SINGLE-FLIGHT (one caller, varying batch) — the production single-coalescer regime");
+    println!(
+        "## SINGLE-FLIGHT (one caller, varying batch) — the production single-coalescer regime"
+    );
     for &b in &batch_sizes {
         let batch = b.min(rows as usize);
 
@@ -403,11 +412,46 @@ fn main() -> Result<(), Box<dyn Error>> {
         let lpb_rows = rows_once(&e, &template, Mode::Lpb, &probe)?;
         assert_eq!(lpb_rows, scan_rows, "batch={batch}: lpb != scan");
 
-        let scan = measure(&e, &template, Mode::Scan, batch, batches, warmup, step, rows_u)?;
-        let lpb = measure(&e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u)?;
-        let lpb_b = measure_batched(&e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u)?;
+        let scan = measure(
+            &e,
+            &template,
+            Mode::Scan,
+            batch,
+            batches,
+            warmup,
+            step,
+            rows_u,
+        )?;
+        let lpb = measure(
+            &e,
+            &template,
+            Mode::Lpb,
+            batch,
+            batches,
+            warmup,
+            step,
+            rows_u,
+        )?;
+        let lpb_b = measure_batched(
+            &e,
+            &template,
+            Mode::Lpb,
+            batch,
+            batches,
+            warmup,
+            step,
+            rows_u,
+        )?;
         let lpb_dense_b = measure_batched_dense(
-            &e, &template, Mode::Lpb, batch, batches, warmup, step, rows_u, true,
+            &e,
+            &template,
+            Mode::Lpb,
+            batch,
+            batches,
+            warmup,
+            step,
+            rows_u,
+            true,
         )?;
         let sp_scan = if scan.ops_per_s > 0.0 {
             lpb.ops_per_s / scan.ops_per_s
@@ -454,10 +498,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         for &threads in &thread_counts {
             let s = measure_concurrent(
-                &engine, &select, Mode::Scan, conc_batch, threads, per_thread, step, rows_u,
+                &engine,
+                &select,
+                Mode::Scan,
+                conc_batch,
+                threads,
+                per_thread,
+                step,
+                rows_u,
             )?;
             let l = measure_concurrent(
-                &engine, &select, Mode::Lpb, conc_batch, threads, per_thread, step, rows_u,
+                &engine,
+                &select,
+                Mode::Lpb,
+                conc_batch,
+                threads,
+                per_thread,
+                step,
+                rows_u,
             )?;
             let spl = if s > 0.0 { l / s } else { 0.0 };
             println!("  {threads:>8}  {s:>13.0}  {l:>13.0}  {spl:>9.2}x");

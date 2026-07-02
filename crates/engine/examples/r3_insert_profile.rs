@@ -143,8 +143,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1_048_576);
-    let device_info =
-        env::var("GPU_DB_BENCH_DEVICE_INFO").unwrap_or_else(|_| "not reported by runner".to_string());
+    let device_info = env::var("GPU_DB_BENCH_DEVICE_INFO")
+        .unwrap_or_else(|_| "not reported by runner".to_string());
 
     println!("# R3 INSERT Profiler (Step 1 — measure, no optimization)");
     println!();
@@ -157,9 +157,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let path_a = run_path_a(rows)?;
     let (path_b, stages) = run_path_b(rows)?;
 
-    print_wall("Path A — SQL-honest end-to-end (execute_text: parse + plan + apply + commit)", &path_a);
+    print_wall(
+        "Path A — SQL-honest end-to-end (execute_text: parse + plan + apply + commit)",
+        &path_a,
+    );
     println!();
-    print_wall("Path B — profiled apply + commit only (pre-materialized row, NO parse)", &path_b);
+    print_wall(
+        "Path B — profiled apply + commit only (pre-materialized row, NO parse)",
+        &path_b,
+    );
     println!();
     print_stage_decomposition(&stages, &path_b, rows);
     println!();
@@ -244,17 +250,57 @@ fn print_stage_decomposition(stages: &StageTotals, path_b: &WallSamples, rows: u
     println!("- PLANE: [DATA]=data-plane work to MOVE to GPU; [CTRL]=control/durability that stays host;");
     println!("         [DUAL]=artifact of the host-store<->GPU-resident duality, ELIMINATED (not moved).");
     println!("- leaf stages (these partition the work):");
-    print_stage("[DATA] unique_preflight", stages.unique_preflight, rows_f, wall_b_us);
-    print_stage("[DATA] check_preflight", stages.check_preflight, rows_f, wall_b_us);
-    print_stage("[DATA] foreign_key_preflight", stages.foreign_key_preflight, rows_f, wall_b_us);
+    print_stage(
+        "[DATA] unique_preflight",
+        stages.unique_preflight,
+        rows_f,
+        wall_b_us,
+    );
+    print_stage(
+        "[DATA] check_preflight",
+        stages.check_preflight,
+        rows_f,
+        wall_b_us,
+    );
+    print_stage(
+        "[DATA] foreign_key_preflight",
+        stages.foreign_key_preflight,
+        rows_f,
+        wall_b_us,
+    );
     print_stage("[DATA] row_prepare", stages.row_prepare, rows_f, wall_b_us);
     print_stage("[DATA] mvcc_insert", stages.mvcc_insert, rows_f, wall_b_us);
-    print_stage("[DATA] value_index_append", stages.value_index_append, rows_f, wall_b_us);
-    print_stage("[DUAL] residency_invalidation", stages.residency_invalidation, rows_f, wall_b_us);
-    print_stage("[CTRL] render_sql_wal_payload", stages.render_sql_wal_payload, rows_f, wall_b_us);
-    print_stage("[CTRL] wal_commit_flush_boundary", stages.wal_commit_flush_boundary, rows_f, wall_b_us);
+    print_stage(
+        "[DATA] value_index_append",
+        stages.value_index_append,
+        rows_f,
+        wall_b_us,
+    );
+    print_stage(
+        "[DUAL] residency_invalidation",
+        stages.residency_invalidation,
+        rows_f,
+        wall_b_us,
+    );
+    print_stage(
+        "[CTRL] render_sql_wal_payload",
+        stages.render_sql_wal_payload,
+        rows_f,
+        wall_b_us,
+    );
+    print_stage(
+        "[CTRL] wal_commit_flush_boundary",
+        stages.wal_commit_flush_boundary,
+        rows_f,
+        wall_b_us,
+    );
     println!("- roll-ups (CONTAIN the leaves above; cross-check only, not summed):");
-    print_stage("current_apply_total", stages.current_apply_total, rows_f, wall_b_us);
+    print_stage(
+        "current_apply_total",
+        stages.current_apply_total,
+        rows_f,
+        wall_b_us,
+    );
     print_stage("commit_total", stages.commit_total, rows_f, wall_b_us);
 }
 
@@ -277,22 +323,34 @@ fn print_reconciliation(
     let a_us = path_a.mean_us();
     let b_us = path_b.mean_us();
     let parse_us = (a_us - b_us).max(0.0);
-    let parse_pct = if a_us > 0.0 { (parse_us / a_us) * 100.0 } else { 0.0 };
+    let parse_pct = if a_us > 0.0 {
+        (parse_us / a_us) * 100.0
+    } else {
+        0.0
+    };
 
     let leaf_sum_us = stages.leaf_sum() as f64 / rows as f64;
     let b_wall_us = path_b.mean_us();
     let residual_us = (b_wall_us - leaf_sum_us).max(0.0);
 
     println!("## Reconciliation");
-    println!("- Path A mean: {a_us:.3} us/row  ({:.0} rows/s)", path_a.rows_per_sec());
-    println!("- Path B mean: {b_us:.3} us/row  ({:.0} rows/s)", path_b.rows_per_sec());
+    println!(
+        "- Path A mean: {a_us:.3} us/row  ({:.0} rows/s)",
+        path_a.rows_per_sec()
+    );
+    println!(
+        "- Path B mean: {b_us:.3} us/row  ({:.0} rows/s)",
+        path_b.rows_per_sec()
+    );
     println!("- => SQL parse/plan (A - B): {parse_us:.3} us/row ({parse_pct:.1}% of the SQL-honest cost)");
     println!("- leaf-stage sum: {leaf_sum_us:.3} us/row");
     println!("- Path B wrapper residual (B wall - leaf sum): {residual_us:.3} us/row");
     println!(
         "  (residual = Insert-struct build + closure + uncounted commit overhead; large residual or"
     );
-    println!("   sub-us truncation both surface here — read it together with the stage notes above.)");
+    println!(
+        "   sub-us truncation both surface here — read it together with the stage notes above.)"
+    );
     println!();
 
     // Target architecture: host = control plane only; data plane -> GPU. Map the measured cost onto it.
@@ -305,7 +363,8 @@ fn print_reconciliation(
         + stages.value_index_append) as f64
         / r;
     let dual_artifact_us = stages.residency_invalidation as f64 / r;
-    let durability_log_us = (stages.render_sql_wal_payload + stages.wal_commit_flush_boundary) as f64 / r;
+    let durability_log_us =
+        (stages.render_sql_wal_payload + stages.wal_commit_flush_boundary) as f64 / r;
     println!("## Target-architecture mapping (host = control plane; data plane -> GPU)");
     println!("  Of the SQL-honest {a_us:.3} us/row:");
     println!("  - [CTRL] parse/plan (stays host):            {parse_us:.3} us/row");

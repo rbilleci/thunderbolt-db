@@ -269,7 +269,12 @@ impl ShardResidentDeviceMemoryMap {
     /// S-d2c: publish ONE shard's device memory (rollover's new open shard) WITHOUT tombstoning the table's
     /// other shards — a COW add (or in-place publish if the cell already exists). Unlike
     /// `install_table_shards`, leaves the existing sealed shards' cells untouched.
-    pub(crate) fn insert_shard(&self, table: &str, shard_id: u32, memory: CudaResidentDeviceMemory) {
+    pub(crate) fn insert_shard(
+        &self,
+        table: &str,
+        shard_id: u32,
+        memory: CudaResidentDeviceMemory,
+    ) {
         let owner = Some(Arc::new(memory));
         let key = (table.to_string(), shard_id);
         if let Some(cell) = self.cells.load().get(&key) {

@@ -220,7 +220,10 @@ pub(crate) fn build_relational_device_payload_with_capacity(
     // starts later). Iterates ALL columns in catalog order — a NULL can appear in any type, its value
     // riding the don't-care placeholder its own typed section wrote above.
     for (col_idx, name) in column_names.iter().enumerate() {
-        if !rows.iter().any(|row| matches!(row[col_idx], SqlValue::Null)) {
+        if !rows
+            .iter()
+            .any(|row| matches!(row[col_idx], SqlValue::Null))
+        {
             continue;
         }
         let bitmap_byte_offset = device_payload.len() as u64;
@@ -277,8 +280,7 @@ pub(crate) fn build_relational_device_payload_with_capacity(
             bytes_len: text_bytes.len() as u64,
         });
     }
-    device_payload[..std::mem::size_of::<u64>()]
-        .copy_from_slice(&(row_count as u64).to_le_bytes());
+    device_payload[..std::mem::size_of::<u64>()].copy_from_slice(&(row_count as u64).to_le_bytes());
     Ok((
         device_payload,
         resident_device_text_columns,
@@ -461,7 +463,11 @@ mod capacity_payload_tests {
         let bool_off = b128_off + n * 16;
         let null_off = bool_off + words * 4;
         let expected_len = null_off + words * 4;
-        assert_eq!(p.len(), expected_len, "exact dense multi-type payload length");
+        assert_eq!(
+            p.len(),
+            expected_len,
+            "exact dense multi-type payload length"
+        );
         assert_eq!(
             u64::from_le_bytes(p[0..8].try_into().unwrap()),
             n as u64,
@@ -469,13 +475,20 @@ mod capacity_payload_tests {
         );
         // i64 section spot-check: row 5 = 5000.
         let off = i64_off + 5 * 8;
-        assert_eq!(i64::from_le_bytes(p[off..off + 8].try_into().unwrap()), 5000);
+        assert_eq!(
+            i64::from_le_bytes(p[off..off + 8].try_into().unwrap()),
+            5000
+        );
         // bool bitmap: row0 flag=true -> bit0 set; row1 flag=false -> bit1 clear.
         let bool_word = u32::from_le_bytes(p[bool_off..bool_off + 4].try_into().unwrap());
         assert_eq!(bool_word & 0b11, 0b01, "flag bits: row0 set, row1 clear");
         // NULL validity bitmap (1 = present): row0=NULL -> bit0 clear; row1=present -> bit1 set.
         let null_word = u32::from_le_bytes(p[null_off..null_off + 4].try_into().unwrap());
-        assert_eq!(null_word & 0b11, 0b10, "validity bits: row0 NULL, row1 present");
+        assert_eq!(
+            null_word & 0b11,
+            0b10,
+            "validity bits: row0 NULL, row1 present"
+        );
     }
 
     /// Proves the offset helpers are CAPACITY-aware (opus audit #5: the only thing that actually
@@ -520,15 +533,27 @@ mod capacity_payload_tests {
 
         // capacity = 8 > row_count = 3: each int4 section is capacity*4 = 32 bytes.
         let s8 = snapshot(8);
-        assert_eq!(resident_device_int4_column_offset(&s8, &table, 0).unwrap(), 8);
-        assert_eq!(resident_device_int4_column_offset(&s8, &table, 1).unwrap(), 8 + 8 * 4);
+        assert_eq!(
+            resident_device_int4_column_offset(&s8, &table, 0).unwrap(),
+            8
+        );
+        assert_eq!(
+            resident_device_int4_column_offset(&s8, &table, 1).unwrap(),
+            8 + 8 * 4
+        );
         // int8 col `c` starts AFTER both capacity-padded int4 sections: 8 + 2*(8*4) = 72.
-        assert_eq!(resident_device_int8_column_offset(&s8, &table, 2).unwrap(), 8 + 2 * 8 * 4);
+        assert_eq!(
+            resident_device_int8_column_offset(&s8, &table, 2).unwrap(),
+            8 + 2 * 8 * 4
+        );
 
         // Dense (capacity == row_count == 3): int8 col `c` at 8 + 2*(3*4) = 32 — proving capacity, not
         // row_count, drives the stride (a row_count stride would give 32 for BOTH cases).
         let s3 = snapshot(3);
-        assert_eq!(resident_device_int8_column_offset(&s3, &table, 2).unwrap(), 8 + 2 * 3 * 4);
+        assert_eq!(
+            resident_device_int8_column_offset(&s3, &table, 2).unwrap(),
+            8 + 2 * 3 * 4
+        );
     }
 
     /// 1b-ii: int4 open-shard append chunks land at the capacity-aware read offsets (column c at
@@ -558,10 +583,13 @@ mod capacity_payload_tests {
         assert_eq!(chunks[2].bytes, 5_u64.to_le_bytes().to_vec());
 
         // ineligible (text) -> Err (caller falls back to re-admit).
-        assert!(
-            compute_open_shard_int4_append_chunks(&[SqlType::Int4, SqlType::Text], capacity, 0, &[])
-                .is_err()
-        );
+        assert!(compute_open_shard_int4_append_chunks(
+            &[SqlType::Int4, SqlType::Text],
+            capacity,
+            0,
+            &[]
+        )
+        .is_err());
         // capacity overflow -> Err (caller seals + rolls a new shard).
         let two = vec![vec![SqlValue::Int4(0)], vec![SqlValue::Int4(1)]];
         assert!(compute_open_shard_int4_append_chunks(&[SqlType::Int4], 4, 3, &two).is_err());
@@ -578,7 +606,11 @@ mod capacity_payload_tests {
         )
         .unwrap();
         assert_eq!(mixed[0].bytes, le(&[7, 0]), "int2 widened + null->0");
-        assert_eq!(mixed[1].byte_offset, 8 + 4 * 4, "date section after the int2 section");
+        assert_eq!(
+            mixed[1].byte_offset,
+            8 + 4 * 4,
+            "date section after the int2 section"
+        );
         assert_eq!(mixed[1].bytes, le(&[100, 0]), "date pass-through + null->0");
         // a wrong-typed value in an eligible column -> Err (clean, no panic).
         assert!(compute_open_shard_int4_append_chunks(
@@ -639,6 +671,11 @@ mod capacity_payload_tests {
         };
 
         let e = Engine::new_local();
+        // THE FLIP: this test gates the SINGLE-BUFFER layer's in-place append + retained-template +
+        // wave-index contract (1b-ii-c / Finding A). Sharded tables are served by the sharded batched
+        // gather in production (the retained-template API cleanly rejects sharded shapes); the SHARDED
+        // append path has its own gates (rollover + SV6 + zone-map suites). Pin the layer under test.
+        e.set_shard_residency_enabled(false);
         e.set_auto_admit_on_commit(true);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
@@ -647,7 +684,10 @@ mod capacity_payload_tests {
         for i in 0..300_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -661,7 +701,10 @@ mod capacity_payload_tests {
         for i in 300..350_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -704,7 +747,11 @@ mod capacity_payload_tests {
         // ABSOLUTE: the in-place-appended key 342 resolves to its appended bytes; 999 is absent.
         let at = |n: i32| index[needles.iter().position(|&x| x == n).unwrap()].clone();
         let row342 = at(342);
-        assert_eq!(row342.len(), 1, "appended key 342 present via the device route");
+        assert_eq!(
+            row342.len(),
+            1,
+            "appended key 342 present via the device route"
+        );
         assert_eq!(
             row342.row(0),
             &[SqlValue::Int4(342), SqlValue::Int4(3420)],
@@ -717,8 +764,11 @@ mod capacity_payload_tests {
         // The append must have INVALIDATED the cached index so the rebuild sees the new key; a stale,
         // generation-blind HIT (cache keyed only on the unchanged ptr) would miss it. Remove the
         // wave_index invalidation in try_append -> this lookup returns empty -> fail.
-        e.execute_text(20_000, "INSERT INTO accounts (id, balance) VALUES (360, 3600)")
-            .unwrap();
+        e.execute_text(
+            20_000,
+            "INSERT INTO accounts (id, balance) VALUES (360, 3600)",
+        )
+        .unwrap();
         let after = run(&e, &select_unique, &[360]);
         assert_eq!(
             after[0].len(),
@@ -736,8 +786,11 @@ mod capacity_payload_tests {
         // fall back to re-admit (build the validity bitmap), NOT append in place. Remove the NULL guard
         // in try_append -> this insert appends -> the counter advances -> this assertion fails.
         let hits_pre_null = e.open_shard_append_hits();
-        e.execute_text(10_000, "INSERT INTO accounts (id, balance) VALUES (5000, NULL)")
-            .unwrap();
+        e.execute_text(
+            10_000,
+            "INSERT INTO accounts (id, balance) VALUES (5000, NULL)",
+        )
+        .unwrap();
         assert_eq!(
             e.open_shard_append_hits(),
             hits_pre_null,
@@ -764,7 +817,10 @@ mod capacity_payload_tests {
             for i in 0..200_i64 {
                 e.execute_text(
                     (i as u64) + 2,
-                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                    &format!(
+                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                        i * 10
+                    ),
                 )
                 .unwrap();
             }
@@ -773,6 +829,9 @@ mod capacity_payload_tests {
         // Resident path: auto-admit -> the open-shard append fires repeatedly, accumulating host_rows
         // SEGMENTS between headroom-overflow re-admits.
         let e = Engine::new_local();
+        // THE FLIP: this test exercises the SINGLE-BUFFER layer (a supported, settable configuration;
+        // sharded is the default) — pin the layout under test.
+        e.set_shard_residency_enabled(false);
         e.set_auto_admit_on_commit(true);
         load(&e);
         // NON-VACUITY: the appends produced MULTIPLE host_rows segments — else cross-segment iteration
@@ -791,17 +850,19 @@ mod capacity_payload_tests {
         load(&base);
 
         let resident = |sql: &str| match parse_command(sql).unwrap() {
-            Command::Select(s) => e
-                .execute_relational_select_with_resident_snapshot_probe(&s) // iterates host_rows segments
-                .unwrap()
-                .rows,
+            Command::Select(s) => {
+                e.execute_relational_select_with_resident_snapshot_probe(&s) // iterates host_rows segments
+                    .unwrap()
+                    .rows
+            }
             _ => panic!("not a SELECT"),
         };
         let baseline = |sql: &str| match parse_command(sql).unwrap() {
-            Command::Select(s) => base
-                .execute_relational_select_with_cuda_driver_probe(&s)
-                .unwrap()
-                .rows,
+            Command::Select(s) => {
+                base.execute_relational_select_with_cuda_driver_probe(&s)
+                    .unwrap()
+                    .rows
+            }
             _ => panic!("not a SELECT"),
         };
         // No ORDER BY: the result order IS the host_rows_iter (segment) order, so this differential is
@@ -820,7 +881,11 @@ mod capacity_payload_tests {
             baseline(point),
             "segmented host_rows point lookup must match the baseline"
         );
-        assert_eq!(r_scan.len(), 200, "all 200 rows present via the segmented host path");
+        assert_eq!(
+            r_scan.len(),
+            200,
+            "all 200 rows present via the segmented host path"
+        );
     }
 
     /// Billions-of-rows S-d1: admitting a table as a (single dense) SEGMENTED shard — `shard_residency`
@@ -849,11 +914,15 @@ mod capacity_payload_tests {
                     vals.push_str(&format!("({id}, {})", id * 10));
                     id += 1;
                 }
-                e.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))
-                    .unwrap();
+                e.execute_text(
+                    txn,
+                    &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+                )
+                .unwrap();
                 txn += 1;
             }
-            e.populate_relational_residency_snapshot("accounts").unwrap();
+            e.populate_relational_residency_snapshot("accounts")
+                .unwrap();
             let in_shards = e
                 .read_state
                 .residency
@@ -861,9 +930,8 @@ mod capacity_payload_tests {
                 .load()
                 .get("accounts")
                 .is_some_and(|s| !s.is_empty());
-            let sel = |sql: &str| -> RowBlock {
-                e.execute_relational_select_text(sql).unwrap().rows
-            };
+            let sel =
+                |sql: &str| -> RowBlock { e.execute_relational_select_text(sql).unwrap().rows };
             (
                 sel("SELECT id, balance FROM accounts WHERE id = 137"),
                 sel("SELECT id, balance FROM accounts ORDER BY id"),
@@ -885,9 +953,18 @@ mod capacity_payload_tests {
         // point-lookup + COUNT(*) ARE served by the sharded route (the non-vacuous sharded gates); the
         // ORDER BY scan on a shard table takes the CPU fallback (a shard has no `snapshots` entry, so the
         // gpu-sortable gate declines) — kept as a correctness check (CPU shard path == GPU single buffer).
-        assert_eq!(on_pt, off_pt, "sharded point lookup == single-buffer baseline");
-        assert_eq!(on_scan, off_scan, "scan (CPU fallback) == single-buffer baseline");
-        assert_eq!(on_cnt, off_cnt, "sharded COUNT(*) == single-buffer baseline");
+        assert_eq!(
+            on_pt, off_pt,
+            "sharded point lookup == single-buffer baseline"
+        );
+        assert_eq!(
+            on_scan, off_scan,
+            "scan (CPU fallback) == single-buffer baseline"
+        );
+        assert_eq!(
+            on_cnt, off_cnt,
+            "sharded COUNT(*) == single-buffer baseline"
+        );
         assert_eq!(on_scan.len(), 1000, "all 1000 rows present");
 
         // S-d2a non-vacuity: the OPEN shard carries capacity HEADROOM (capacity > row_count), and the
@@ -896,7 +973,8 @@ mod capacity_payload_tests {
         {
             let mut e = Engine::new_local();
             e.set_shard_residency_enabled(true);
-            e.execute_text(1, "CREATE TABLE t (id INT, balance INT)").unwrap();
+            e.execute_text(1, "CREATE TABLE t (id INT, balance INT)")
+                .unwrap();
             e.execute_text(2, "INSERT INTO t (id, balance) VALUES (1,10),(2,20),(3,30)")
                 .unwrap();
             e.populate_relational_residency_snapshot("t").unwrap();
@@ -935,23 +1013,35 @@ mod capacity_payload_tests {
                 .get("accounts")
                 .is_some_and(|s| !s.is_empty())
         };
-        let in_snaps =
-            |e: &Engine| e.read_state.residency.snapshots.load().get("accounts").is_some();
+        let in_snaps = |e: &Engine| {
+            e.read_state
+                .residency
+                .snapshots
+                .load()
+                .get("accounts")
+                .is_some()
+        };
 
         // OFF -> single buffer.
         e.set_shard_residency_enabled(false);
-        e.populate_relational_residency_snapshot("accounts").unwrap();
-        assert!(in_snaps(&e) && !in_shards(&e), "OFF admits the single buffer");
+        e.populate_relational_residency_snapshot("accounts")
+            .unwrap();
+        assert!(
+            in_snaps(&e) && !in_shards(&e),
+            "OFF admits the single buffer"
+        );
         // Flip ON -> shard; the stale snapshot must be cleared.
         e.set_shard_residency_enabled(true);
-        e.populate_relational_residency_snapshot("accounts").unwrap();
+        e.populate_relational_residency_snapshot("accounts")
+            .unwrap();
         assert!(
             in_shards(&e) && !in_snaps(&e),
             "OFF->ON re-admit must clear the stale snapshot"
         );
         // Flip OFF -> single buffer; the stale shard must be cleared (the wrong-rows footgun).
         e.set_shard_residency_enabled(false);
-        e.populate_relational_residency_snapshot("accounts").unwrap();
+        e.populate_relational_residency_snapshot("accounts")
+            .unwrap();
         assert!(
             in_snaps(&e) && !in_shards(&e),
             "ON->OFF re-admit must clear the stale shard (else it shadows the fresh snapshot)"
@@ -984,7 +1074,10 @@ mod capacity_payload_tests {
         let base: Vec<String> = (0..300_i64).map(|i| format!("({i}, {})", i * 10)).collect();
         e.execute_text(
             2,
-            &format!("INSERT INTO accounts (id, balance) VALUES {}", base.join(",")),
+            &format!(
+                "INSERT INTO accounts (id, balance) VALUES {}",
+                base.join(",")
+            ),
         )
         .unwrap();
         let shard_state = |e: &Engine| -> (usize, usize) {
@@ -997,7 +1090,10 @@ mod capacity_payload_tests {
         for i in 300..350_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -1009,7 +1105,10 @@ mod capacity_payload_tests {
             50,
             "all 50 in-headroom commits must append in place to the open shard (re-admit would give 0)"
         );
-        assert_eq!(count_after, count_before, "no rollover/re-admit -> shard count unchanged");
+        assert_eq!(
+            count_after, count_before,
+            "no rollover/re-admit -> shard count unchanged"
+        );
         assert_eq!(
             open_row_count, 350,
             "the open shard's row_count grew to 350 via in-place append"
@@ -1018,7 +1117,11 @@ mod capacity_payload_tests {
         // Reads over the sharded route include the in-place-appended rows.
         let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
         let pt = sel("SELECT id, balance FROM accounts WHERE id = 342");
-        assert_eq!(pt.len(), 1, "appended key 342 present via the sharded route");
+        assert_eq!(
+            pt.len(),
+            1,
+            "appended key 342 present via the sharded route"
+        );
         assert_eq!(pt.row(0), &[SqlValue::Int4(342), SqlValue::Int4(3420)]);
         assert_eq!(
             sel("SELECT COUNT(*) FROM accounts").row(0),
@@ -1045,7 +1148,10 @@ mod capacity_payload_tests {
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -1060,7 +1166,10 @@ mod capacity_payload_tests {
             shard_count >= 3,
             "rollover must grow the table as multiple shards (got {shard_count})"
         );
-        assert_eq!(total_rows, 200, "per-shard row_counts sum to the table total");
+        assert_eq!(
+            total_rows, 200,
+            "per-shard row_counts sum to the table total"
+        );
 
         // Reads recompact across all shards: point lookups landing in different shards + COUNT(*).
         let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
@@ -1103,6 +1212,10 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn shard_zone_map_prunes_point_lookup() {
         let e = Engine::new_local();
+        // THE FLIP: this test exercises the re-admit/scan-layer semantics — pin the pre-flip
+        // configuration it tests (each flag remains a supported kill switch).
+        e.set_shard_index_probe_enabled(false);
+        e.set_shard_batched_point_read_enabled(false);
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64); // small -> several shards with disjoint ascending key ranges
@@ -1111,7 +1224,10 @@ mod capacity_payload_tests {
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -1139,17 +1255,38 @@ mod capacity_payload_tests {
             "zone-map prune must gather exactly ONE shard for a point lookup (got {one} of {shard_count})"
         );
 
-        // (3) COUNT(*) (shape `sharded_count_all`) routes through the SAME recompaction function but carries
-        //     NO predicate at all, so it never prunes and gathers ALL shards — proving the counter reaches
-        //     `shard_count` (it is not pinned to 1) and that pruning is precisely what cut the equality lookup
-        //     to one shard.
+        // (3) an unpredicated SUM (shape `sharded_int4_scalar_aggregate`) routes through the SAME
+        //     recompaction function but carries NO predicate at all, so it never prunes and gathers ALL
+        //     shards — proving the counter reaches `shard_count` (it is not pinned to 1) and that pruning
+        //     is precisely what cut the equality lookup to one shard. (An unpredicated COUNT(*) no longer
+        //     gathers anything: the FLIP metadata fast path answers it from `sum(shard.row_count)` on a
+        //     version-free table — asserted as the 0-gather control below.)
+        let before = gathered(&e);
+        let total = sel("SELECT SUM(balance) FROM accounts");
+        let scanned = gathered(&e) - before;
+        assert_eq!(
+            total.row(0),
+            &[SqlValue::Int8((0..200_i64).map(|i| i * 10).sum())],
+            "SUM(balance) across all shards"
+        );
+        assert_eq!(
+            scanned, shard_count as u64,
+            "an unpruned SUM must gather ALL shards, proving the counter isn't pinned to 1"
+        );
+        // FLIP metadata COUNT: version-free unpredicated COUNT(*) is served from shard metadata — exact
+        // AND gather-free. Sabotage: route it through the recompaction instead and the 0 becomes
+        // shard_count (or break row_count accounting and the value diverges).
         let before = gathered(&e);
         let cnt = sel("SELECT COUNT(*) FROM accounts");
         let scanned = gathered(&e) - before;
-        assert_eq!(cnt.row(0), &[SqlValue::Int8(200)], "COUNT(*) across all shards");
         assert_eq!(
-            scanned, shard_count as u64,
-            "an unpruned COUNT(*) must gather ALL shards, proving the counter isn't pinned to 1"
+            cnt.row(0),
+            &[SqlValue::Int8(200)],
+            "COUNT(*) across all shards"
+        );
+        assert_eq!(
+            scanned, 0,
+            "version-free COUNT(*) is metadata-served (no shard gathered)"
         );
 
         // (4) every boundary + the MAX key (appended in place into the open shard) still reads correctly,
@@ -1172,7 +1309,10 @@ mod capacity_payload_tests {
         let miss = sel("SELECT id, balance FROM accounts WHERE id = 100000");
         let g = gathered(&e) - before;
         assert_eq!(miss.len(), 0, "absent key returns no rows");
-        assert_eq!(g, 1, "an out-of-range needle prunes to the single keep-one fallback shard");
+        assert_eq!(
+            g, 1,
+            "an out-of-range needle prunes to the single keep-one fallback shard"
+        );
     }
 
     /// Read a shard's ON-DEMAND `deleted_by` region back from device (DtoH), first `count` slots. Returns
@@ -1269,7 +1409,10 @@ mod capacity_payload_tests {
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -1281,7 +1424,10 @@ mod capacity_payload_tests {
                 "need rollover into multiple shards (got {})",
                 table_shards.len()
             );
-            table_shards.iter().map(|s| (s.shard_id, s.row_count)).collect()
+            table_shards
+                .iter()
+                .map(|s| (s.shard_id, s.row_count))
+                .collect()
         };
         for (shard_id, row_count) in shard_ids {
             assert!(
@@ -1317,7 +1463,14 @@ mod capacity_payload_tests {
             "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30),(4,40),(5,50)",
         )
         .unwrap();
-        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        let shard_id = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .unwrap()[0]
+            .shard_id;
 
         // Before any delete: NO region (the zero-cost property).
         assert!(
@@ -1343,7 +1496,11 @@ mod capacity_payload_tests {
             .execute_relational_select_text("SELECT id, balance FROM accounts")
             .unwrap()
             .rows;
-        assert_eq!(rows.len(), 5, "columns intact: all rows still read (visibility is SV3)");
+        assert_eq!(
+            rows.len(),
+            5,
+            "columns intact: all rows still read (visibility is SV3)"
+        );
         let mut seen: Vec<(i32, i32)> = (0..rows.len())
             .map(|i| match (&rows.row(i)[0], &rows.row(i)[1]) {
                 (SqlValue::Int4(id), SqlValue::Int4(bal)) => (*id, *bal),
@@ -1384,13 +1541,26 @@ mod capacity_payload_tests {
     fn shard_deleted_by_region_released_on_invalidate_and_drop() {
         // --- Path A: an invalidating commit (SQL DELETE -> invalidate + re-admit) releases the region ---
         let e = Engine::new_local();
+        // THE FLIP: this test exercises the re-admit/scan-layer semantics — pin the pre-flip
+        // configuration it tests (each flag remains a supported kill switch).
+        e.set_resident_delete_tombstone_enabled(false);
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
-        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)")
-            .unwrap();
-        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        e.execute_text(
+            2,
+            "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)",
+        )
+        .unwrap();
+        let shard_id = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .unwrap()[0]
+            .shard_id;
         // The SV2 primitive allocates the region on this first tombstone.
         assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
         assert!(
@@ -1398,7 +1568,8 @@ mod capacity_payload_tests {
             "precondition: the tombstone allocated a live deleted_by region"
         );
         // A DELETE goes through invalidate + the O(table) re-admit today (the path SV4 will replace).
-        e.execute_text(3, "DELETE FROM accounts WHERE id = 2").unwrap();
+        e.execute_text(3, "DELETE FROM accounts WHERE id = 2")
+            .unwrap();
         assert!(
             !table_has_any_deleted_by_cell(&e, "accounts"),
             "invalidate/re-admit must release the stale deleted_by region (leak + wrong-results guard)"
@@ -1416,12 +1587,23 @@ mod capacity_payload_tests {
             })
             .collect();
         ids.sort_unstable();
-        assert_eq!(ids, vec![1, 3], "id=2 deleted; id=1 all-live again (stale tombstone released)");
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "id=2 deleted; id=1 all-live again (stale tombstone released)"
+        );
 
         // --- Path B: DROP TABLE releases the region ---
         e.execute_text(4, "INSERT INTO accounts (id, balance) VALUES (7,70)")
             .unwrap();
-        let shard_id2 = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        let shard_id2 = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .unwrap()[0]
+            .shard_id;
         assert!(e.tombstone_resident_shard_slots("accounts", shard_id2, &[0], 888));
         assert!(
             table_has_any_deleted_by_cell(&e, "accounts"),
@@ -1450,11 +1632,22 @@ mod capacity_payload_tests {
         e.set_auto_admit_on_commit(false); // NO re-admit after the DELETE -> isolates the invalidate mirror
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
-        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)")
-            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)",
+        )
+        .unwrap();
         // Explicit shard-resident admit (auto-admit is off).
-        e.populate_relational_residency_snapshot("accounts").unwrap();
-        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        e.populate_relational_residency_snapshot("accounts")
+            .unwrap();
+        let shard_id = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .unwrap()[0]
+            .shard_id;
         assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
         assert!(
             table_has_any_deleted_by_cell(&e, "accounts"),
@@ -1462,7 +1655,8 @@ mod capacity_payload_tests {
         );
         // DELETE invalidates residency; with auto-admit OFF nothing re-admits -> the serialized-commit
         // invalidate mirror is the ONLY thing that can release the region.
-        e.execute_text(3, "DELETE FROM accounts WHERE id = 2").unwrap();
+        e.execute_text(3, "DELETE FROM accounts WHERE id = 2")
+            .unwrap();
         assert!(
             !table_has_any_deleted_by_cell(&e, "accounts"),
             "the serialized-commit invalidate mirror must release the region even with no re-admit"
@@ -1481,17 +1675,29 @@ mod capacity_payload_tests {
         e.set_shard_residency_enabled(true);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
-        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)")
+        e.execute_text(
+            2,
+            "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)",
+        )
+        .unwrap();
+        e.populate_relational_residency_snapshot("accounts")
             .unwrap();
-        e.populate_relational_residency_snapshot("accounts").unwrap();
-        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        let shard_id = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .unwrap()[0]
+            .shard_id;
         assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[1], 777));
         assert!(
             table_has_any_deleted_by_cell(&e, "accounts"),
             "precondition: the tombstone allocated a live deleted_by region"
         );
         // Warmup/refresh re-admit -- NO commit, so NO invalidate precedes it (the path Finding 2 patched).
-        e.populate_relational_residency_snapshot("accounts").unwrap();
+        e.populate_relational_residency_snapshot("accounts")
+            .unwrap();
         assert!(
             !table_has_any_deleted_by_key(&e, "accounts"),
             "warmup re-admit (no preceding invalidate) must erase the stale deleted_by region"
@@ -1516,7 +1722,14 @@ mod capacity_payload_tests {
             .unwrap();
         e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20)")
             .unwrap();
-        let shard_id = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        let shard_id = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .unwrap()[0]
+            .shard_id;
         assert!(e.tombstone_resident_shard_slots("accounts", shard_id, &[0], 5));
         assert!(
             table_has_any_deleted_by_cell(&e, "accounts"),
@@ -1558,19 +1771,36 @@ mod capacity_payload_tests {
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
         let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
 
         // Baseline (delete-free): every shard is un-versioned -> the read takes the `None` visibility path.
-        assert_eq!(sel("SELECT id FROM accounts WHERE id = 0").len(), 1, "id=0 present pre-delete");
-        assert_eq!(sel("SELECT COUNT(*) FROM accounts").row(0), &[SqlValue::Int8(200)]);
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 0").len(),
+            1,
+            "id=0 present pre-delete"
+        );
+        assert_eq!(
+            sel("SELECT COUNT(*) FROM accounts").row(0),
+            &[SqlValue::Int8(200)]
+        );
 
         // Tombstone id=0 (shard 0, slot 0) at a commit seq well below the read snapshot so
         // `deleted_by(=5) > read_txn_id` is FALSE and the row is hidden.
-        let shard0 = e.read_state.residency.shards.load().get("accounts").unwrap()[0].shard_id;
+        let shard0 = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .unwrap()[0]
+            .shard_id;
         assert!(
             e.tombstone_resident_shard_slots("accounts", shard0, &[0], 5),
             "tombstone id=0 at slot 0"
@@ -1594,7 +1824,11 @@ mod capacity_payload_tests {
         // (3) a LIVE neighbor in the SAME now-versioned shard still reads -- the live sentinel passes the
         //     visibility compare (guards the fill-vs-tombstone boundary + the signed-safe sentinel).
         let n1 = sel("SELECT id, balance FROM accounts WHERE id = 1");
-        assert_eq!(n1.len(), 1, "live neighbor id=1 in the versioned shard still visible");
+        assert_eq!(
+            n1.len(),
+            1,
+            "live neighbor id=1 in the versioned shard still visible"
+        );
         assert_eq!(n1.row(0), &[SqlValue::Int4(1), SqlValue::Int4(10)]);
 
         // (4) a point lookup pruned to a DIFFERENT, un-tombstoned shard is unaffected (no region -> `None`).
@@ -1622,14 +1856,24 @@ mod capacity_payload_tests {
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
         let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
         // Pre-delete: delete-free reads are byte-identical (all 200 rows live, none hidden).
-        assert_eq!(sel("SELECT COUNT(*) FROM accounts").row(0), &[SqlValue::Int8(200)]);
-        assert_eq!(sel("SELECT id FROM accounts WHERE id = 130").len(), 1, "id=130 present pre-delete");
+        assert_eq!(
+            sel("SELECT COUNT(*) FROM accounts").row(0),
+            &[SqlValue::Int8(200)]
+        );
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 130").len(),
+            1,
+            "id=130 present pre-delete"
+        );
 
         // Build the point predicate `id = 130` (id is catalog column 0) and DELETE it via the GPU primitive.
         let table = e.relational_catalog_table("accounts").unwrap();
@@ -1646,10 +1890,26 @@ mod capacity_payload_tests {
         assert_eq!(n, 1, "exactly one resident row matched id=130");
 
         // The matched row is now hidden; its neighbors + other shards are UNTOUCHED (proves the RIGHT slot).
-        assert_eq!(sel("SELECT id FROM accounts WHERE id = 130").len(), 0, "id=130 tombstoned -> hidden");
-        assert_eq!(sel("SELECT id FROM accounts WHERE id = 129").len(), 1, "same-shard neighbor 129 still visible");
-        assert_eq!(sel("SELECT id FROM accounts WHERE id = 131").len(), 1, "same-shard neighbor 131 still visible");
-        assert_eq!(sel("SELECT id FROM accounts WHERE id = 5").len(), 1, "a row in a DIFFERENT shard untouched");
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 130").len(),
+            0,
+            "id=130 tombstoned -> hidden"
+        );
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 129").len(),
+            1,
+            "same-shard neighbor 129 still visible"
+        );
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 131").len(),
+            1,
+            "same-shard neighbor 131 still visible"
+        );
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 5").len(),
+            1,
+            "a row in a DIFFERENT shard untouched"
+        );
         assert_eq!(
             sel("SELECT COUNT(*) FROM accounts").row(0),
             &[SqlValue::Int8(199)],
@@ -1670,11 +1930,15 @@ mod capacity_payload_tests {
             e.set_shard_residency_enabled(true);
             e.set_auto_admit_on_commit(true);
             e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8
-            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+                .unwrap();
             for i in 0..200_i64 {
                 e.execute_text(
                     (i as u64) + 2,
-                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                    &format!(
+                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                        i * 10
+                    ),
                 )
                 .unwrap();
             }
@@ -1699,41 +1963,64 @@ mod capacity_payload_tests {
         let e = Engine::new_local();
         e.set_resident_delete_tombstone_enabled(true);
         load(&e);
-        assert!(!table_has_any_deleted_by_cell(&e, "accounts"), "delete-free: no region");
+        assert!(
+            !table_has_any_deleted_by_cell(&e, "accounts"),
+            "delete-free: no region"
+        );
         assert_eq!(count(&e), 200);
 
-        e.execute_text(202, "DELETE FROM accounts WHERE id = 130").unwrap();
+        e.execute_text(202, "DELETE FROM accounts WHERE id = 130")
+            .unwrap();
         // NON-VACUITY: the tombstone path ran (region allocated). A re-admit fallback would leave NO region.
         assert!(
             table_has_any_deleted_by_cell(&e, "accounts"),
             "single-row DELETE routed through the in-place tombstone (region allocated)"
         );
-        assert!(!present(&e, 130), "id=130 deleted -> hidden on the GPU route");
-        assert!(present(&e, 129) && present(&e, 131), "same-shard neighbors still visible");
+        assert!(
+            !present(&e, 130),
+            "id=130 deleted -> hidden on the GPU route"
+        );
+        assert!(
+            present(&e, 129) && present(&e, 131),
+            "same-shard neighbors still visible"
+        );
         assert!(present(&e, 5), "a row in a different shard untouched");
         assert_eq!(count(&e), 199, "COUNT drops by exactly one (== host MVCC)");
 
         // A MULTI-ROW DELETE (2 rows) is NOT yet incremental -> exact-count gate returns false -> re-admit,
         // which rebuilds all-live (region CLEARED by prereq #1) and is still correct.
-        e.execute_text(203, "DELETE FROM accounts WHERE id = 50 OR id = 51").unwrap();
+        e.execute_text(203, "DELETE FROM accounts WHERE id = 50 OR id = 51")
+            .unwrap();
         assert!(
             !table_has_any_deleted_by_cell(&e, "accounts"),
             "multi-row DELETE fell back to re-admit (all-live rebuild -> no region)"
         );
-        assert!(!present(&e, 50) && !present(&e, 51), "multi-row DELETE removed both rows");
-        assert!(!present(&e, 130), "the earlier single-row delete stays deleted (host store)");
+        assert!(
+            !present(&e, 50) && !present(&e, 51),
+            "multi-row DELETE removed both rows"
+        );
+        assert!(
+            !present(&e, 130),
+            "the earlier single-row delete stays deleted (host store)"
+        );
         assert_eq!(count(&e), 197, "COUNT == host MVCC after 3 total deletes");
 
         // --- flag OFF control: the SAME single-row DELETE via re-admit -> identical result, NO region ---
-        let c = Engine::new_local(); // resident_delete_tombstone_enabled stays default OFF
+        let c = Engine::new_local();
+        c.set_resident_delete_tombstone_enabled(false); // THE FLIP: the control pins the re-admit path
         load(&c);
-        c.execute_text(202, "DELETE FROM accounts WHERE id = 130").unwrap();
+        c.execute_text(202, "DELETE FROM accounts WHERE id = 130")
+            .unwrap();
         assert!(
             !table_has_any_deleted_by_cell(&c, "accounts"),
             "flag OFF: DELETE re-admits (all-live) -> no region"
         );
         assert!(!present(&c, 130), "control: id=130 deleted");
-        assert_eq!(count(&c), 199, "control: COUNT 199 == the flag-ON result (byte-identical semantics)");
+        assert_eq!(
+            count(&c),
+            199,
+            "control: COUNT 199 == the flag-ON result (byte-identical semantics)"
+        );
     }
 
     /// SV5 (GPU-native incremental UPDATE, commit WIRING): with `resident_update_tombstone_enabled` ON, a
@@ -1749,11 +2036,15 @@ mod capacity_payload_tests {
             e.set_shard_residency_enabled(true);
             e.set_auto_admit_on_commit(true);
             e.set_shard_size_target(64);
-            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+                .unwrap();
             for i in 0..200_i64 {
                 e.execute_text(
                     (i as u64) + 2,
-                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                    &format!(
+                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                        i * 10
+                    ),
                 )
                 .unwrap();
             }
@@ -1794,55 +2085,101 @@ mod capacity_payload_tests {
         let e = Engine::new_local();
         e.set_resident_update_tombstone_enabled(true);
         load(&e);
-        assert!(!table_has_any_deleted_by_cell(&e, "accounts"), "no region pre-update");
+        assert!(
+            !table_has_any_deleted_by_cell(&e, "accounts"),
+            "no region pre-update"
+        );
         assert_eq!(count(&e), 200);
         assert_eq!(balance_of(&e, 130), Some(1300), "pre-update balance");
 
-        e.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
+        e.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130")
+            .unwrap();
         // NON-VACUITY: the tombstone-old path ran (region allocated). Re-admit fallback would leave NO region.
         assert!(
             table_has_any_deleted_by_cell(&e, "accounts"),
             "single-row UPDATE routed through tombstone-old + append-new (region allocated)"
         );
-        assert_eq!(balance_of(&e, 130), Some(9999), "id=130 reads the NEW balance (appended version)");
-        assert!(!old_balance_visible(&e), "the OLD (id=130,balance=1300) image is hidden");
-        assert_eq!(balance_of(&e, 131), Some(1310), "same-shard neighbor untouched");
-        assert_eq!(balance_of(&e, 5), Some(50), "a row in a different shard untouched");
-        assert_eq!(count(&e), 200, "COUNT unchanged (old hidden + new visible) == host MVCC");
+        assert_eq!(
+            balance_of(&e, 130),
+            Some(9999),
+            "id=130 reads the NEW balance (appended version)"
+        );
+        assert!(
+            !old_balance_visible(&e),
+            "the OLD (id=130,balance=1300) image is hidden"
+        );
+        assert_eq!(
+            balance_of(&e, 131),
+            Some(1310),
+            "same-shard neighbor untouched"
+        );
+        assert_eq!(
+            balance_of(&e, 5),
+            Some(50),
+            "a row in a different shard untouched"
+        );
+        assert_eq!(
+            count(&e),
+            200,
+            "COUNT unchanged (old hidden + new visible) == host MVCC"
+        );
 
         // An int4-UNCHANGED update (same-value: id=5 already has balance 5*10=50) still routes: tombstone-OLD
         // FIRST locates the old slot on the buffer BEFORE the identical-int4 new row is appended (count 1), so
         // it tombstones the OLD slot, not the new. Exercises the order-sensitivity the value-changing case can't.
-        e.execute_text(203, "UPDATE accounts SET balance = 50 WHERE id = 5").unwrap();
+        e.execute_text(203, "UPDATE accounts SET balance = 50 WHERE id = 5")
+            .unwrap();
         assert!(
             table_has_any_deleted_by_cell(&e, "accounts"),
             "same-value UPDATE still routes through tombstone-old + append-new"
         );
-        assert_eq!(balance_of(&e, 5), Some(50), "id=5 still reads 50 (old hidden, new appended, same value)");
-        assert_eq!(count(&e), 200, "COUNT unchanged after the int4-unchanged update");
+        assert_eq!(
+            balance_of(&e, 5),
+            Some(50),
+            "id=5 still reads 50 (old hidden, new appended, same value)"
+        );
+        assert_eq!(
+            count(&e),
+            200,
+            "COUNT unchanged after the int4-unchanged update"
+        );
 
         // A MULTI-ROW UPDATE (2 rows) is NOT yet incremental -> re-admit (all-live rebuild -> no region),
         // still correct; the earlier single-row update persists (host store rebuilt).
-        e.execute_text(204, "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11").unwrap();
+        e.execute_text(
+            204,
+            "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11",
+        )
+        .unwrap();
         assert!(
             !table_has_any_deleted_by_cell(&e, "accounts"),
             "multi-row UPDATE fell back to re-admit (no region)"
         );
         assert_eq!(balance_of(&e, 10), Some(0));
         assert_eq!(balance_of(&e, 11), Some(0));
-        assert_eq!(balance_of(&e, 130), Some(9999), "single-row update persists across the re-admit");
+        assert_eq!(
+            balance_of(&e, 130),
+            Some(9999),
+            "single-row update persists across the re-admit"
+        );
         assert_eq!(count(&e), 200);
 
         // --- flag OFF control: the SAME single-row UPDATE via re-admit -> identical result, NO region ---
-        let c = Engine::new_local(); // resident_update_tombstone_enabled stays default OFF
+        let c = Engine::new_local();
+        c.set_resident_update_tombstone_enabled(false); // THE FLIP: the control pins the re-admit path
         load(&c);
-        c.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
+        c.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130")
+            .unwrap();
         assert!(
             !table_has_any_deleted_by_cell(&c, "accounts"),
             "flag OFF: UPDATE re-admits (all-live) -> no region"
         );
         assert_eq!(balance_of(&c, 130), Some(9999), "control: new balance");
-        assert_eq!(count(&c), 200, "control: COUNT 200 == the flag-ON result (byte-identical semantics)");
+        assert_eq!(
+            count(&c),
+            200,
+            "control: COUNT 200 == the flag-ON result (byte-identical semantics)"
+        );
     }
 
     /// SV6 (`created_by` SI flip-gate) — the DOUBLE-READ differential, deterministic torn-window form.
@@ -1870,19 +2207,33 @@ mod capacity_payload_tests {
             e.set_shard_residency_enabled(true);
             e.set_auto_admit_on_commit(true);
             e.set_shard_size_target(64);
-            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+                .unwrap();
             for i in 0..total_rows {
                 e.execute_text(
                     (i as u64) + 2,
-                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                    &format!(
+                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                        i * 10
+                    ),
                 )
                 .unwrap();
             }
             let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
             let c0 = e.committed_seq();
-            assert_eq!(sel("SELECT id, balance FROM accounts WHERE id = 130").len(), 1, "pre-update: one row");
-            let shard_count =
-                |e: &Engine| e.read_state.residency.shards.load().get("accounts").map_or(0, |s| s.len());
+            assert_eq!(
+                sel("SELECT id, balance FROM accounts WHERE id = 130").len(),
+                1,
+                "pre-update: one row"
+            );
+            let shard_count = |e: &Engine| {
+                e.read_state
+                    .residency
+                    .shards
+                    .load()
+                    .get("accounts")
+                    .map_or(0, |s| s.len())
+            };
             let shards_before = shard_count(&e);
 
             // Apply the incremental UPDATE (tombstone-old + append-new) at commit_seq C0+1 WITHOUT
@@ -1913,7 +2264,11 @@ mod capacity_payload_tests {
             // 258 rows must exercise the ROLLOVER stamp (a new shard appeared). If the admit shape ever
             // changes these row counts, this assert flags the variant instead of silently going vacuous.
             if total_rows == 200 {
-                assert_eq!(shard_count(&e), shards_before, "200 rows: the in-place branch must serve");
+                assert_eq!(
+                    shard_count(&e),
+                    shards_before,
+                    "200 rows: the in-place branch must serve"
+                );
             } else {
                 assert_eq!(
                     shard_count(&e),
@@ -1951,7 +2306,10 @@ mod capacity_payload_tests {
                 &[SqlValue::Int4(130), SqlValue::Int4(9999)],
                 "a reader at C sees the NEW image (old hidden by deleted_by, new admitted by created_by)"
             );
-            assert_eq!(sel("SELECT COUNT(*) FROM accounts").row(0), &[SqlValue::Int8(total_rows)]);
+            assert_eq!(
+                sel("SELECT COUNT(*) FROM accounts").row(0),
+                &[SqlValue::Int8(total_rows)]
+            );
         }
     }
 
@@ -1969,11 +2327,15 @@ mod capacity_payload_tests {
         e.set_resident_delete_tombstone_enabled(true);
         e.set_resident_update_tombstone_enabled(true);
         e.set_shard_size_target(64);
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -2000,12 +2362,17 @@ mod capacity_payload_tests {
             for t in 0..300_u64 {
                 e.execute_text(
                     300 + t,
-                    &format!("UPDATE accounts SET balance = {} WHERE id = 130", 100_000 + t),
+                    &format!(
+                        "UPDATE accounts SET balance = {} WHERE id = 130",
+                        100_000 + t
+                    ),
                 )
                 .unwrap();
             }
             done.store(true, std::sync::atomic::Ordering::Relaxed);
-            let reads = reader.join().expect("reader thread must not panic (SI violation = panic)");
+            let reads = reader
+                .join()
+                .expect("reader thread must not panic (SI violation = panic)");
             assert!(reads > 0, "the reader must have raced at least one read");
         });
         // Quiescent end-state: the last committed value, exactly once.
@@ -2028,21 +2395,30 @@ mod capacity_payload_tests {
     fn sv6_created_by_region_released_on_warmup_readmit() {
         let mut e = Engine::new_local();
         e.set_shard_residency_enabled(true);
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
-        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)").unwrap();
-        e.populate_relational_residency_snapshot("accounts").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)",
+        )
+        .unwrap();
+        e.populate_relational_residency_snapshot("accounts")
+            .unwrap();
         let (shard_id, capacity, gpu_id) = {
             let shards = e.read_state.residency.shards.load();
             let shard = &shards.get("accounts").unwrap()[0];
             (shard.shard_id, shard.capacity, shard.gpu_id)
         };
-        assert!(e.stamp_created_by_resident_shard_slots("accounts", shard_id, 1, 1, capacity, gpu_id, 777));
+        assert!(e.stamp_created_by_resident_shard_slots(
+            "accounts", shard_id, 1, 1, capacity, gpu_id, 777
+        ));
         assert!(
             table_has_any_created_by_cell(&e, "accounts"),
             "precondition: the stamp allocated a live created_by region"
         );
         // Warmup/refresh re-admit -- NO commit, so NO invalidate precedes it.
-        e.populate_relational_residency_snapshot("accounts").unwrap();
+        e.populate_relational_residency_snapshot("accounts")
+            .unwrap();
         assert!(
             !table_has_any_created_by_key(&e, "accounts"),
             "warmup re-admit (no preceding invalidate) must erase the stale created_by region"
@@ -2064,15 +2440,20 @@ mod capacity_payload_tests {
             e.set_resident_delete_tombstone_enabled(true);
             e.set_resident_update_tombstone_enabled(true);
             e.set_shard_size_target(64);
-            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+                .unwrap();
             for i in 0..200_i64 {
                 e.execute_text(
                     (i as u64) + 2,
-                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                    &format!(
+                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                        i * 10
+                    ),
                 )
                 .unwrap();
             }
-            e.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
+            e.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130")
+                .unwrap();
             assert!(
                 table_has_any_created_by_cell(e, "accounts"),
                 "precondition: the incremental UPDATE stamped a live created_by region"
@@ -2085,7 +2466,11 @@ mod capacity_payload_tests {
         // UPDATE can re-stamp it — hence the separate fresh engine for the DROP gate below.)
         let e = Engine::new_local();
         load(&e);
-        e.execute_text(203, "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11").unwrap();
+        e.execute_text(
+            203,
+            "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11",
+        )
+        .unwrap();
         assert!(
             !table_has_any_created_by_cell(&e, "accounts"),
             "re-admit must release the stale created_by region (wrong-results + leak guard)"
@@ -2127,11 +2512,15 @@ mod capacity_payload_tests {
         e.set_shard_index_probe_enabled(true);
         e.set_shard_batched_point_read_enabled(true);
         e.set_shard_size_target(64);
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -2148,7 +2537,10 @@ mod capacity_payload_tests {
             );
             assert!(ok, "the incremental key-moving UPDATE must fire");
         }
-        assert!(table_has_any_created_by_cell(&e, "accounts"), "stamp route proof");
+        assert!(
+            table_has_any_created_by_cell(&e, "accounts"),
+            "stamp route proof"
+        );
         let table = e.relational_catalog_table("accounts").unwrap();
         let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
 
@@ -2179,7 +2571,10 @@ mod capacity_payload_tests {
             batch.needle_ranges[0].1, 0,
             "batched: the moved-to key must be HIDDEN from the C-1 reader (created_by gate)"
         );
-        assert_eq!(batch.needle_ranges[1].1, 1, "batched: the old key is still live at C-1");
+        assert_eq!(
+            batch.needle_ranges[1].1, 1,
+            "batched: the old key is still live at C-1"
+        );
         let start = batch.needle_ranges[1].0 as usize * 2;
         assert_eq!(&batch.values[start..start + 2], &[130, 1300]);
         assert!(
@@ -2192,12 +2587,22 @@ mod capacity_payload_tests {
         let rows = sel("SELECT id, balance FROM accounts WHERE id = 999");
         assert_eq!(rows.len(), 1, "post-publish: the moved-to key is visible");
         assert_eq!(rows.row(0), &[SqlValue::Int4(999), SqlValue::Int4(1300)]);
-        assert_eq!(sel("SELECT id FROM accounts WHERE id = 130").len(), 0, "post-publish: the old key is gone");
+        assert_eq!(
+            sel("SELECT id FROM accounts WHERE id = 130").len(),
+            0,
+            "post-publish: the old key is gone"
+        );
         let batch = e
             .gather_sharded_int4_point_lookups_batched(&table, 0, &[0, 1], &[999, 130])
             .expect("batched gather post-publish");
-        assert_eq!(batch.needle_ranges[0].1, 1, "batched post-publish: 999 visible");
-        assert_eq!(batch.needle_ranges[1].1, 0, "batched post-publish: 130 hidden");
+        assert_eq!(
+            batch.needle_ranges[0].1, 1,
+            "batched post-publish: 999 visible"
+        );
+        assert_eq!(
+            batch.needle_ranges[1].1, 0,
+            "batched post-publish: 130 hidden"
+        );
     }
 
     /// CROSS-SHARD PK INDEX sub-slice 1: the per-shard hash-index locate returns the IDENTICAL physical
@@ -2213,11 +2618,15 @@ mod capacity_payload_tests {
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -2245,8 +2654,16 @@ mod capacity_payload_tests {
                 .locate_resident_pk_via_shard_index(&table, id_col, k)
                 .expect("resident + unique -> Some");
             idx.sort_unstable();
-            assert_eq!(idx, scan_locate(k), "index locate == scan locate for id={k}");
-            assert_eq!(idx.len(), 1, "unique key id={k} -> exactly one (shard,slot) hit");
+            assert_eq!(
+                idx,
+                scan_locate(k),
+                "index locate == scan locate for id={k}"
+            );
+            assert_eq!(
+                idx.len(),
+                1,
+                "unique key id={k} -> exactly one (shard,slot) hit"
+            );
         }
         // Absent key: both empty.
         let mut absent = e
@@ -2261,13 +2678,18 @@ mod capacity_payload_tests {
         let d = Engine::new_local();
         d.set_shard_residency_enabled(true);
         d.set_auto_admit_on_commit(true);
-        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)").unwrap();
-        d.execute_text(2, "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)")
+        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)")
             .unwrap();
+        d.execute_text(
+            2,
+            "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)",
+        )
+        .unwrap();
         let dtable = d.relational_catalog_table("dup").unwrap();
         let did = crate::rel_exec_helpers::relational_column_index(&dtable, "id").unwrap();
         assert!(
-            d.locate_resident_pk_via_shard_index(&dtable, did, 1).is_none(),
+            d.locate_resident_pk_via_shard_index(&dtable, did, 1)
+                .is_none(),
             "duplicate key -> hash declines -> None (caller falls back to the scan)"
         );
     }
@@ -2282,49 +2704,70 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cross_shard_pk_index_cache_rebuilds_on_generation_change() {
         let e = Engine::new_local();
+        // THE FLIP: this test exercises the re-admit/scan-layer semantics — pin the pre-flip
+        // configuration it tests (each flag remains a supported kill switch).
+        e.set_resident_delete_tombstone_enabled(false);
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
         let table = e.relational_catalog_table("accounts").unwrap();
         let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
-        let scan_locate = |t: &crate::relational_model::RelationalTable, k: i32| -> Vec<(u32, u32)> {
-            let pred = crate::engine_expr::ResidentExpr::Binary {
-                op: crate::engine_expr::ResidentBinaryOp::Eq,
-                lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
-                rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(k)),
+        let scan_locate =
+            |t: &crate::relational_model::RelationalTable, k: i32| -> Vec<(u32, u32)> {
+                let pred = crate::engine_expr::ResidentExpr::Binary {
+                    op: crate::engine_expr::ResidentBinaryOp::Eq,
+                    lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
+                    rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(k)),
+                };
+                let mut v: Vec<(u32, u32)> = e
+                    .locate_resident_delete_slots(t, &pred)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|(s, slots)| slots.into_iter().map(move |x| (s, x)))
+                    .collect();
+                v.sort_unstable();
+                v
             };
-            let mut v: Vec<(u32, u32)> = e
-                .locate_resident_delete_slots(t, &pred)
-                .unwrap()
-                .into_iter()
-                .flat_map(|(s, slots)| slots.into_iter().map(move |x| (s, x)))
-                .collect();
-            v.sort_unstable();
-            v
-        };
 
         // Populate the cache (first locate builds + caches the per-shard indexes).
-        assert_eq!(e.locate_resident_pk_via_shard_index(&table, id_col, 51).unwrap().len(), 1);
+        assert_eq!(
+            e.locate_resident_pk_via_shard_index(&table, id_col, 51)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
-            !e.read_state.residency.shard_pk_index.lock().unwrap().is_empty(),
+            !e.read_state
+                .residency
+                .shard_pk_index
+                .lock()
+                .unwrap()
+                .is_empty(),
             "the per-shard PK index cache is populated after a locate"
         );
 
         // GENERATION CHANGE: a DELETE (delete-tombstone flag OFF) invalidates + re-admits -> new device ptrs
         // AND shifts shard-0 rows (id=50 removed -> id=51 moves from slot 51 to slot 50).
-        e.execute_text(202, "DELETE FROM accounts WHERE id = 50").unwrap();
+        e.execute_text(202, "DELETE FROM accounts WHERE id = 50")
+            .unwrap();
         let table2 = e.relational_catalog_table("accounts").unwrap();
 
         // The stale cached index (old ptr) must NOT be served: ptr-validation rebuilds against the new buffer.
-        let mut after = e.locate_resident_pk_via_shard_index(&table2, id_col, 51).unwrap();
+        let mut after = e
+            .locate_resident_pk_via_shard_index(&table2, id_col, 51)
+            .unwrap();
         after.sort_unstable();
         assert_eq!(
             after,
@@ -2333,7 +2776,9 @@ mod capacity_payload_tests {
         );
         assert_eq!(after.len(), 1, "id=51 still present (only id=50 deleted)");
         assert!(
-            e.locate_resident_pk_via_shard_index(&table2, id_col, 50).unwrap().is_empty(),
+            e.locate_resident_pk_via_shard_index(&table2, id_col, 50)
+                .unwrap()
+                .is_empty(),
             "id=50 is deleted -> not located"
         );
     }
@@ -2350,37 +2795,50 @@ mod capacity_payload_tests {
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64); // 200 rows -> shards 64/64/64/8; the last (open) shard is appendable
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
         let table = e.relational_catalog_table("accounts").unwrap();
         let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
-        let scan_slots = |t: &crate::relational_model::RelationalTable, k: i32| -> Vec<(u32, u32)> {
-            let pred = crate::engine_expr::ResidentExpr::Binary {
-                op: crate::engine_expr::ResidentBinaryOp::Eq,
-                lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
-                rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(k)),
+        let scan_slots =
+            |t: &crate::relational_model::RelationalTable, k: i32| -> Vec<(u32, u32)> {
+                let pred = crate::engine_expr::ResidentExpr::Binary {
+                    op: crate::engine_expr::ResidentBinaryOp::Eq,
+                    lhs: Box::new(crate::engine_expr::ResidentExpr::Column(id_col)),
+                    rhs: Box::new(crate::engine_expr::ResidentExpr::Int4Literal(k)),
+                };
+                let mut v: Vec<(u32, u32)> = e
+                    .locate_resident_delete_slots(t, &pred)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|(s, slots)| slots.into_iter().map(move |x| (s, x)))
+                    .collect();
+                v.sort_unstable();
+                v
             };
-            let mut v: Vec<(u32, u32)> = e
-                .locate_resident_delete_slots(t, &pred)
-                .unwrap()
-                .into_iter()
-                .flat_map(|(s, slots)| slots.into_iter().map(move |x| (s, x)))
-                .collect();
-            v.sort_unstable();
-            v
-        };
         // Populate the OPEN shard's cache entry (id=195 lives in the last/open shard).
-        assert_eq!(e.locate_resident_pk_via_shard_index(&table, id_col, 195).unwrap().len(), 1);
+        assert_eq!(
+            e.locate_resident_pk_via_shard_index(&table, id_col, 195)
+                .unwrap()
+                .len(),
+            1
+        );
         // In-place append (id=250 -> the open shard grows by one row, SAME ptr, +row_count).
-        e.execute_text(202, "INSERT INTO accounts (id, balance) VALUES (250, 2500)").unwrap();
+        e.execute_text(202, "INSERT INTO accounts (id, balance) VALUES (250, 2500)")
+            .unwrap();
         let table2 = e.relational_catalog_table("accounts").unwrap();
-        let mut appended = e.locate_resident_pk_via_shard_index(&table2, id_col, 250).unwrap();
+        let mut appended = e
+            .locate_resident_pk_via_shard_index(&table2, id_col, 250)
+            .unwrap();
         appended.sort_unstable();
         assert_eq!(
             appended,
@@ -2398,14 +2856,21 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cross_shard_pk_index_cache_purged_on_lifecycle() {
         let e = Engine::new_local();
+        // THE FLIP: this test exercises the re-admit/scan-layer semantics — pin the pre-flip
+        // configuration it tests (each flag remains a supported kill switch).
+        e.set_resident_delete_tombstone_enabled(false);
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -2425,7 +2890,8 @@ mod capacity_payload_tests {
         };
         let locate = |k: i32| {
             let table = e.relational_catalog_table("accounts").unwrap();
-            e.locate_resident_pk_via_shard_index(&table, id_col, k).unwrap()
+            e.locate_resident_pk_via_shard_index(&table, id_col, k)
+                .unwrap()
         };
 
         // Populate the cache.
@@ -2433,8 +2899,13 @@ mod capacity_payload_tests {
         assert!(entries("accounts") > 0, "cache populated after a locate");
 
         // An invalidating commit (DELETE -> invalidate + re-admit) purges the table's cache.
-        e.execute_text(202, "DELETE FROM accounts WHERE id = 5").unwrap();
-        assert_eq!(entries("accounts"), 0, "invalidate/re-admit purged the cache (no leaked pinned buffers)");
+        e.execute_text(202, "DELETE FROM accounts WHERE id = 5")
+            .unwrap();
+        assert_eq!(
+            entries("accounts"),
+            0,
+            "invalidate/re-admit purged the cache (no leaked pinned buffers)"
+        );
 
         // Re-populate, then DROP TABLE purges via apply_drop_table.
         assert_eq!(locate(130).len(), 1);
@@ -2457,22 +2928,31 @@ mod capacity_payload_tests {
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
         let rows = |sql: &str| -> Vec<Vec<SqlValue>> {
-            e.execute_relational_select_text(sql).unwrap().rows.into_boxed()
+            e.execute_relational_select_text(sql)
+                .unwrap()
+                .rows
+                .into_boxed()
         };
 
         // Present keys spanning all 4 shards + boundaries, absent keys, and single/multi-column int4
         // projections — the EXPLICIT-projection shapes that route through the sharded general path.
         let mut sqls: Vec<String> = Vec::new();
-        for k in [0_i32, 1, 5, 63, 64, 65, 128, 130, 191, 192, 199, 200, 999, -1] {
+        for k in [
+            0_i32, 1, 5, 63, 64, 65, 128, 130, 191, 192, 199, 200, 999, -1,
+        ] {
             sqls.push(format!("SELECT id, balance FROM accounts WHERE id = {k}"));
         }
         sqls.push("SELECT balance FROM accounts WHERE id = 64".to_string());
@@ -2487,7 +2967,11 @@ mod capacity_payload_tests {
         for (s, want) in sqls.iter().zip(&oracle) {
             let hb = e.shard_index_route_hits();
             assert_eq!(&rows(s), want, "index route == scan for `{s}`");
-            assert_eq!(e.shard_index_route_hits() - hb, 1, "index route FIRED for `{s}` (non-vacuity)");
+            assert_eq!(
+                e.shard_index_route_hits() - hb,
+                1,
+                "index route FIRED for `{s}` (non-vacuity)"
+            );
         }
 
         // `SELECT *` gets a different query_shape and routes through a different resident path (NOT the
@@ -2497,7 +2981,11 @@ mod capacity_payload_tests {
         e.set_shard_index_probe_enabled(false);
         let want_star = rows("SELECT * FROM accounts WHERE id = 130");
         e.set_shard_index_probe_enabled(true);
-        assert_eq!(rows("SELECT * FROM accounts WHERE id = 130"), want_star, "SELECT * unaffected by the flag");
+        assert_eq!(
+            rows("SELECT * FROM accounts WHERE id = 130"),
+            want_star,
+            "SELECT * unaffected by the flag"
+        );
 
         // DUP-FALLBACK: a duplicate int4 key declines the hash -> the route falls back to the scan (no hit),
         // still byte-identical (the scan returns EVERY match, a hash holds one row/key).
@@ -2505,15 +2993,24 @@ mod capacity_payload_tests {
         d.set_shard_residency_enabled(true);
         d.set_auto_admit_on_commit(true);
         d.set_shard_index_probe_enabled(true);
-        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)").unwrap();
-        d.execute_text(2, "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)").unwrap();
+        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)")
+            .unwrap();
+        d.execute_text(
+            2,
+            "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)",
+        )
+        .unwrap();
         let dhb = d.shard_index_route_hits();
         let got = d
             .execute_relational_select_text("SELECT id, balance FROM dup WHERE id = 1")
             .unwrap()
             .rows
             .into_boxed();
-        assert_eq!(d.shard_index_route_hits(), dhb, "duplicate key -> route declines -> scan (no hit)");
+        assert_eq!(
+            d.shard_index_route_hits(),
+            dhb,
+            "duplicate key -> route declines -> scan (no hit)"
+        );
         d.set_shard_index_probe_enabled(false);
         let want = d
             .execute_relational_select_text("SELECT id, balance FROM dup WHERE id = 1")
@@ -2525,13 +3022,22 @@ mod capacity_payload_tests {
 
         // GENERATION-REBUILD: a DELETE (tombstone flag OFF) invalidates + re-admits (new device ptrs, shifted
         // slots); the route on the rebuilt table still == scan (ptr-validated cache rebuild, purged on re-admit).
-        e.execute_text(300, "DELETE FROM accounts WHERE id = 50").unwrap();
+        e.execute_text(300, "DELETE FROM accounts WHERE id = 50")
+            .unwrap();
         e.set_shard_index_probe_enabled(false);
         let want51 = rows("SELECT id, balance FROM accounts WHERE id = 51");
         let want50 = rows("SELECT id, balance FROM accounts WHERE id = 50");
         e.set_shard_index_probe_enabled(true);
-        assert_eq!(rows("SELECT id, balance FROM accounts WHERE id = 51"), want51, "post-re-admit route == scan (survivor)");
-        assert_eq!(rows("SELECT id, balance FROM accounts WHERE id = 50"), want50, "post-re-admit route == scan (deleted)");
+        assert_eq!(
+            rows("SELECT id, balance FROM accounts WHERE id = 51"),
+            want51,
+            "post-re-admit route == scan (survivor)"
+        );
+        assert_eq!(
+            rows("SELECT id, balance FROM accounts WHERE id = 50"),
+            want50,
+            "post-re-admit route == scan (deleted)"
+        );
         assert!(want50.is_empty(), "id=50 deleted");
         assert_eq!(want51.len(), 1, "id=51 survives");
     }
@@ -2549,27 +3055,41 @@ mod capacity_payload_tests {
         t.set_auto_admit_on_commit(true);
         t.set_resident_delete_tombstone_enabled(true); // stamp deleted_by IN PLACE -> versioned shard
         t.set_shard_size_target(64);
-        t.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        t.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             t.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
         // Tombstone id=130 IN PLACE (shard 2, slot 2) -> shard 2 becomes versioned (has a deleted_by region).
-        t.execute_text(300, "DELETE FROM accounts WHERE id = 130").unwrap();
+        t.execute_text(300, "DELETE FROM accounts WHERE id = 130")
+            .unwrap();
         let rows = |on: bool, sql: &str| -> Vec<Vec<SqlValue>> {
             t.set_shard_index_probe_enabled(on);
-            t.execute_relational_select_text(sql).unwrap().rows.into_boxed()
+            t.execute_relational_select_text(sql)
+                .unwrap()
+                .rows
+                .into_boxed()
         };
         // Tombstoned row hidden by the gate == scan (both empty), and the route DID fire (versioned shard).
         let want_del = rows(false, "SELECT id, balance FROM accounts WHERE id = 130");
         let hb = t.shard_index_route_hits();
         let got_del = rows(true, "SELECT id, balance FROM accounts WHERE id = 130");
-        assert!(t.shard_index_route_hits() > hb, "route fired on the versioned shard");
+        assert!(
+            t.shard_index_route_hits() > hb,
+            "route fired on the versioned shard"
+        );
         assert_eq!(got_del, want_del, "index route deleted_by gate == scan");
-        assert!(got_del.is_empty(), "tombstoned id=130 hidden by the deleted_by gate");
+        assert!(
+            got_del.is_empty(),
+            "tombstoned id=130 hidden by the deleted_by gate"
+        );
         // A LIVE neighbor in the SAME versioned shard is still returned == scan.
         let want_live = rows(false, "SELECT id, balance FROM accounts WHERE id = 131");
         let got_live = rows(true, "SELECT id, balance FROM accounts WHERE id = 131");
@@ -2591,7 +3111,11 @@ mod capacity_payload_tests {
         let sel = |e: &Engine, on: bool, sql: &str| -> (Vec<Vec<SqlValue>>, u64) {
             e.set_shard_index_probe_enabled(on);
             let hb = e.shard_index_route_hits();
-            let r = e.execute_relational_select_text(sql).unwrap().rows.into_boxed();
+            let r = e
+                .execute_relational_select_text(sql)
+                .unwrap()
+                .rows
+                .into_boxed();
             (r, e.shard_index_route_hits() - hb)
         };
 
@@ -2600,12 +3124,23 @@ mod capacity_payload_tests {
         let n = Engine::new_local();
         n.set_shard_residency_enabled(true);
         n.set_auto_admit_on_commit(true);
-        n.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
-        n.execute_text(2, "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30)").unwrap();
+        n.execute_text(1, "CREATE TABLE nn (id INT, balance INT)")
+            .unwrap();
+        n.execute_text(
+            2,
+            "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30)",
+        )
+        .unwrap();
         let (want_bal, _) = sel(&n, false, "SELECT id, balance FROM nn WHERE id = 2");
         let (got_bal, fired_bal) = sel(&n, true, "SELECT id, balance FROM nn WHERE id = 2");
-        assert_eq!(got_bal, want_bal, "null-bearing: route declined -> route-ON == route-OFF (scan)");
-        assert_eq!(fired_bal, 0, "route DECLINED on the null-bearing table (M3 scan serves it)");
+        assert_eq!(
+            got_bal, want_bal,
+            "null-bearing: route declined -> route-ON == route-OFF (scan)"
+        );
+        assert_eq!(
+            fired_bal, 0,
+            "route DECLINED on the null-bearing table (M3 scan serves it)"
+        );
         assert_eq!(
             got_bal,
             vec![vec![SqlValue::Int4(2), SqlValue::Null]],
@@ -2614,19 +3149,31 @@ mod capacity_payload_tests {
         let (want_id, _) = sel(&n, false, "SELECT id FROM nn WHERE id = 2");
         let (got_id, fired_id) = sel(&n, true, "SELECT id FROM nn WHERE id = 2");
         assert_eq!(got_id, want_id, "route declined -> == scan");
-        assert_eq!(fired_id, 0, "route DECLINED (the table carries a null bitmap)");
+        assert_eq!(
+            fired_id, 0,
+            "route DECLINED (the table carries a null bitmap)"
+        );
 
         // (b) the NULL-KEY table (a NULL id stored as 0): the route DECLINES here too -> route-ON == route-OFF.
         let k = Engine::new_local();
         k.set_shard_residency_enabled(true);
         k.set_auto_admit_on_commit(true);
-        k.execute_text(1, "CREATE TABLE kn (id INT, balance INT)").unwrap();
-        k.execute_text(2, "INSERT INTO kn (id, balance) VALUES (5,50),(7,70)").unwrap();
-        k.execute_text(3, "INSERT INTO kn (id, balance) VALUES (NULL, 99)").unwrap();
+        k.execute_text(1, "CREATE TABLE kn (id INT, balance INT)")
+            .unwrap();
+        k.execute_text(2, "INSERT INTO kn (id, balance) VALUES (5,50),(7,70)")
+            .unwrap();
+        k.execute_text(3, "INSERT INTO kn (id, balance) VALUES (NULL, 99)")
+            .unwrap();
         let (want0, _) = sel(&k, false, "SELECT id, balance FROM kn WHERE id = 0");
         let (got0, fired0) = sel(&k, true, "SELECT id, balance FROM kn WHERE id = 0");
-        assert_eq!(got0, want0, "NULL-key table: route declined -> route-ON == route-OFF (scan)");
-        assert_eq!(fired0, 0, "route DECLINED on the null-bearing (NULL-id) table");
+        assert_eq!(
+            got0, want0,
+            "NULL-key table: route declined -> route-ON == route-OFF (scan)"
+        );
+        assert_eq!(
+            fired0, 0,
+            "route DECLINED on the null-bearing (NULL-id) table"
+        );
     }
 
     /// SLICE B (sharded predicate NULL 3VL — the LAST shards-default gate): every NULL-semantics
@@ -2642,7 +3189,8 @@ mod capacity_payload_tests {
     fn sharded_predicate_null_3vl_matches_single_buffer_oracle() {
         let load = |e: &Engine| {
             e.set_auto_admit_on_commit(true);
-            e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
+            e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)")
+                .unwrap();
             e.execute_text(
                 2,
                 "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30),(NULL,99)",
@@ -2683,6 +3231,109 @@ mod capacity_payload_tests {
         }
     }
 
+    /// THE FLIP (audit F1 regression gate): every filtered/range int4 shape the audit found demoted to
+    /// the CPU host scan under the sharded-by-default layout is now GPU-SERVED via the sharded bridge
+    /// AND matches the single-buffer oracle. `executed_target == Gpu` is the non-vacuity proof (results
+    /// alone can't distinguish the host scan — it is correct, just off-charter and ~1000x slower).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn flip_f1_filtered_shapes_gpu_served_and_match_single_buffer_oracle() {
+        let load = |e: &Engine| {
+            e.set_auto_admit_on_commit(true);
+            e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
+                .unwrap();
+            for chunk in 0..4_i64 {
+                let values: Vec<String> = (chunk * 50..(chunk + 1) * 50)
+                    .map(|i| format!("({i},{},{})", i % 7, i % 3))
+                    .collect();
+                e.execute_text(
+                    2 + chunk as u64,
+                    &format!("INSERT INTO t (a, b, c) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+            }
+        };
+        let o = Engine::new_local(); // single-buffer ORACLE
+        o.set_shard_residency_enabled(false);
+        load(&o);
+        let e = Engine::new_local(); // sharded by default
+        load(&e);
+        assert!(
+            e.read_state.residency.shards.load().get("t").is_some(),
+            "precondition: t is SHARD-resident under the default"
+        );
+        for sql in [
+            "SELECT COUNT(*) FROM t WHERE a = 137", // int4_equality_count
+            "SELECT COUNT(*) FROM t WHERE a < 60",  // int4_range_count
+            "SELECT SUM(a) FROM t WHERE a = 137",   // int4_filtered_scalar_aggregate (SUM)
+            "SELECT SUM(a) FROM t WHERE a BETWEEN 10 AND 40", // int4_between_scalar_aggregate
+            "SELECT a FROM t WHERE a > 190",        // int4_projection (range)
+            "SELECT a FROM t WHERE b = 1 AND c = 2", // int4_composite_equality_multi_column_projection
+        ] {
+            let want = o.execute_relational_select_text(sql).unwrap();
+            let got = e.execute_relational_select_text(sql).unwrap();
+            assert_eq!(
+                got.rows, want.rows,
+                "sharded == single-buffer oracle for: {sql}"
+            );
+            // The F1 contract: the sharded DEFAULT never NEWLY demotes a shape to the host — it
+            // is GPU-served, or the single-buffer oracle was ALSO host-served (a pre-existing,
+            // layout-independent gap, not a flip regression).
+            eprintln!(
+                "[f1] {sql}: sharded={:?} oracle={:?}",
+                got.executed_target, want.executed_target
+            );
+            assert!(
+                got.executed_target == DeviceTarget::Gpu(0)
+                    || got.executed_target == want.executed_target,
+                "F1: NEW cpu demotion under the sharded default for {sql}: sharded={:?} oracle={:?}",
+                got.executed_target,
+                want.executed_target
+            );
+        }
+    }
+
+    /// THE FLIP (audit P3): the sharded JOIN arm — both relations shard-resident (purely int4), the
+    /// join runs the GPU hash-join over the unified/zero-copy sources; result matches the pinned
+    /// single-buffer oracle. (Pre-flip, every suite join used a text column -> single-buffer, so the
+    /// arm was unexercised.)
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn flip_sharded_join_matches_single_buffer_oracle() {
+        let load = |e: &Engine| {
+            e.set_auto_admit_on_commit(true);
+            e.execute_text(1, "CREATE TABLE l (k INT, v INT)").unwrap();
+            e.execute_text(2, "INSERT INTO l (k, v) VALUES (1,10),(2,20),(3,30),(4,40)")
+                .unwrap();
+            e.execute_text(3, "CREATE TABLE r (k INT, w INT)").unwrap();
+            e.execute_text(4, "INSERT INTO r (k, w) VALUES (2,200),(3,300),(5,500)")
+                .unwrap();
+        };
+        let o = Engine::new_local();
+        o.set_shard_residency_enabled(false);
+        load(&o);
+        let e = Engine::new_local();
+        load(&e);
+        assert!(
+            e.read_state.residency.shards.load().get("l").is_some()
+                && e.read_state.residency.shards.load().get("r").is_some(),
+            "precondition: both relations SHARD-resident under the default"
+        );
+        let sql = "SELECT l.k, l.v, r.w FROM l JOIN r ON l.k = r.k ORDER BY l.k";
+        let want = o
+            .execute_relational_select_text(sql)
+            .unwrap()
+            .rows
+            .into_boxed();
+        let got = e
+            .execute_relational_select_text(sql)
+            .unwrap()
+            .rows
+            .into_boxed();
+        assert_eq!(got, want, "sharded join == single-buffer oracle");
+        assert_eq!(got.len(), 2, "k=2 and k=3 match");
+    }
+
     /// SLICE B (audit P2 regression gate): a MIXED-TYPE shard-resident table (text column) keeps the CPU
     /// pinned path for sortable projections — the sortable gate's shard arm requires a PURELY
     /// int4-section table because the unified exec source gathers only int4 sections; routing a text
@@ -2694,25 +3345,37 @@ mod capacity_payload_tests {
     fn sharded_mixed_type_sortable_projection_keeps_cpu_path() {
         let load = |e: &Engine| {
             e.set_auto_admit_on_commit(true);
-            e.execute_text(1, "CREATE TABLE mt (id INT, name TEXT)").unwrap();
-            e.execute_text(2, "INSERT INTO mt (id, name) VALUES (3,'c'),(1,'a'),(2,'b')").unwrap();
+            e.execute_text(1, "CREATE TABLE mt (id INT, name TEXT)")
+                .unwrap();
+            e.execute_text(
+                2,
+                "INSERT INTO mt (id, name) VALUES (3,'c'),(1,'a'),(2,'b')",
+            )
+            .unwrap();
         };
         let o = Engine::new_local(); // single-buffer oracle
         load(&o);
         let e = Engine::new_local();
         e.set_shard_residency_enabled(true);
         load(&e);
+        // THE FLIP: sharded admission is scoped to PURELY-int4-section tables, so a mixed-type table
+        // admits SINGLE-BUFFER by design (keeping its proven GPU text paths). The sortable-gate guard
+        // (`shard_resident_int4_only`) remains as defense for explicitly-installed mixed shards.
         assert!(
-            e.read_state.residency.snapshots.load().get("mt").is_none()
-                && e.read_state.residency.shards.load().get("mt").is_some(),
-            "precondition: mt is SHARD-resident only"
+            e.read_state.residency.snapshots.load().get("mt").is_some()
+                && e.read_state.residency.shards.load().get("mt").is_none(),
+            "precondition: a mixed-type table admits SINGLE-BUFFER under the flip"
         );
         for sql in [
             "SELECT id, name FROM mt ORDER BY id",
             "SELECT id, name FROM mt ORDER BY id DESC",
             "SELECT id, name FROM mt",
         ] {
-            let want = o.execute_relational_select_text(sql).unwrap().rows.into_boxed();
+            let want = o
+                .execute_relational_select_text(sql)
+                .unwrap()
+                .rows
+                .into_boxed();
             let got = e
                 .execute_relational_select_text(sql)
                 .unwrap_or_else(|err| panic!("mixed-type sharded must serve {sql}: {err}"))
@@ -2735,7 +3398,8 @@ mod capacity_payload_tests {
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
         e.set_resident_delete_tombstone_enabled(true);
-        e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)")
+            .unwrap();
         e.execute_text(
             2,
             "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30),(4,NULL)",
@@ -2749,7 +3413,10 @@ mod capacity_payload_tests {
             "route proof: the incremental tombstone fired (re-admit would leave no region)"
         );
         let run = |sql: &str| -> Vec<Vec<SqlValue>> {
-            e.execute_relational_select_text(sql).unwrap().rows.into_boxed()
+            e.execute_relational_select_text(sql)
+                .unwrap()
+                .rows
+                .into_boxed()
         };
         assert_eq!(
             run("SELECT id FROM nn WHERE balance IS NULL"),
@@ -2794,11 +3461,18 @@ mod capacity_payload_tests {
         let e = Engine::new_local();
         e.set_shard_residency_enabled(true);
         e.set_auto_admit_on_commit(true);
-        e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
-        e.execute_text(2, "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30),(4,40)")
+        e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)")
             .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30),(4,40)",
+        )
+        .unwrap();
         let run = |sql: &str| -> Vec<Vec<SqlValue>> {
-            e.execute_relational_select_text(sql).unwrap().rows.into_boxed()
+            e.execute_relational_select_text(sql)
+                .unwrap()
+                .rows
+                .into_boxed()
         };
         // NULL in the PROJECTED column materializes as SQL NULL (the documented bug was Int4(0)).
         assert_eq!(
@@ -2832,11 +3506,15 @@ mod capacity_payload_tests {
         e.set_auto_admit_on_commit(true);
         e.set_shard_index_probe_enabled(true); // the single-flight 3b route is the per-needle oracle
         e.set_shard_size_target(64); // 200 rows -> shards 64,64,64,8
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -2848,15 +3526,19 @@ mod capacity_payload_tests {
         // appear twice) — the per-needle oracle loop asserts BOTH positions of a repeated key materialize the
         // same row, guarding the per-`needle_index` `hit_shard_count` accounting against treating a repeated
         // needle value as a (spurious) cross-shard duplicate (audit coverage follow-up).
-        let needles: Vec<i32> =
-            vec![0, 1, 5, 63, 64, 65, 128, 130, 191, 199, 200, 999, -1, 50, 51, 50, 130];
+        let needles: Vec<i32> = vec![
+            0, 1, 5, 63, 64, 65, 128, 130, 191, 199, 200, 999, -1, 50, 51, 50, 130,
+        ];
         let hb = e.sharded_point_batch_hits();
         let gpu_hb = e.sharded_point_gpu_probe_hits();
         let bin_hb = e.sharded_point_binary_route_hits();
         let proj = e
             .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
             .expect("batched path served this shape");
-        assert!(e.sharded_point_batch_hits() > hb, "batched path FIRED (non-vacuity)");
+        assert!(
+            e.sharded_point_batch_hits() > hb,
+            "batched path FIRED (non-vacuity)"
+        );
         // Sub-slice 8 v3 (O(1) routing): these 4 shards are ascending-disjoint (ordered inserts), so the kernel
         // takes the BINARY-SEARCH path (each needle -> its one shard in O(log shards)). Prove it fired so the
         // byte-identical comparison below is validating the binary route (present/absent/boundary/dup/out-of-
@@ -2905,20 +3587,29 @@ mod capacity_payload_tests {
                         .collect()
                 })
                 .collect();
-            assert_eq!(batched[i], want, "batched == single-flight route for id={k}");
+            assert_eq!(
+                batched[i], want,
+                "batched == single-flight route for id={k}"
+            );
         }
 
         // DUP-FALLBACK: a duplicate int4 key -> the batched path declines (None) -> caller scans.
         let d = Engine::new_local();
         d.set_shard_residency_enabled(true);
         d.set_auto_admit_on_commit(true);
-        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)").unwrap();
-        d.execute_text(2, "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)").unwrap();
+        d.execute_text(1, "CREATE TABLE dup (id INT, balance INT)")
+            .unwrap();
+        d.execute_text(
+            2,
+            "INSERT INTO dup (id, balance) VALUES (1,10),(1,20),(2,30)",
+        )
+        .unwrap();
         let dt = d.relational_catalog_table("dup").unwrap();
         let did = crate::rel_exec_helpers::relational_column_index(&dt, "id").unwrap();
         let dbal = crate::rel_exec_helpers::relational_column_index(&dt, "balance").unwrap();
         assert!(
-            d.gather_sharded_int4_point_lookups_batched(&dt, did, &[did, dbal], &[1, 2]).is_none(),
+            d.gather_sharded_int4_point_lookups_batched(&dt, did, &[did, dbal], &[1, 2])
+                .is_none(),
             "duplicate key -> batched path declines -> None (caller falls back to the scan)"
         );
 
@@ -2931,12 +3622,17 @@ mod capacity_payload_tests {
         x.set_auto_admit_on_commit(true);
         x.set_shard_index_probe_enabled(true);
         x.set_shard_size_target(64);
-        x.execute_text(1, "CREATE TABLE xdup (id INT, balance INT)").unwrap();
+        x.execute_text(1, "CREATE TABLE xdup (id INT, balance INT)")
+            .unwrap();
         for i in 0..200i64 {
             // id = i%100 -> id 5 at row 5 (shard 0) AND row 105 (shard 1): a CROSS-shard dup, unique per shard.
             x.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO xdup (id, balance) VALUES ({}, {})", i % 100, i * 10),
+                &format!(
+                    "INSERT INTO xdup (id, balance) VALUES ({}, {})",
+                    i % 100,
+                    i * 10
+                ),
             )
             .unwrap();
         }
@@ -2944,7 +3640,8 @@ mod capacity_payload_tests {
         let xid = crate::rel_exec_helpers::relational_column_index(&xt, "id").unwrap();
         let xbal = crate::rel_exec_helpers::relational_column_index(&xt, "balance").unwrap();
         assert!(
-            x.gather_sharded_int4_point_lookups_batched(&xt, xid, &[xid, xbal], &[5]).is_none(),
+            x.gather_sharded_int4_point_lookups_batched(&xt, xid, &[xid, xbal], &[5])
+                .is_none(),
             "cross-shard duplicate key -> batched declines -> None (scan returns BOTH rows)"
         );
         let xrows = x
@@ -2952,7 +3649,10 @@ mod capacity_payload_tests {
             .unwrap()
             .rows
             .len();
-        assert_eq!(xrows, 2, "cross-shard dup id=5 -> 2 rows (row 5 + row 105) via the scan");
+        assert_eq!(
+            xrows, 2,
+            "cross-shard dup id=5 -> 2 rows (row 5 + row 105) via the scan"
+        );
         // (NULL-bearing tables are covered by `sharded_point_batch_declines_on_null_bearing` — the batched
         // gather declines them post-M3, so this NULL-free differential no longer exercises a NULL sub-case.)
     }
@@ -2972,8 +3672,10 @@ mod capacity_payload_tests {
         f.set_shard_residency_enabled(true);
         f.set_auto_admit_on_commit(true);
         f.set_shard_index_probe_enabled(true);
-        f.execute_text(1, "CREATE TABLE nf (id INT, balance INT)").unwrap();
-        f.execute_text(2, "INSERT INTO nf (id, balance) VALUES (5,50),(7,70)").unwrap();
+        f.execute_text(1, "CREATE TABLE nf (id INT, balance INT)")
+            .unwrap();
+        f.execute_text(2, "INSERT INTO nf (id, balance) VALUES (5,50),(7,70)")
+            .unwrap();
         let tf = f.relational_catalog_table("nf").unwrap();
         let idf = crate::rel_exec_helpers::relational_column_index(&tf, "id").unwrap();
         let balf = crate::rel_exec_helpers::relational_column_index(&tf, "balance").unwrap();
@@ -2988,9 +3690,12 @@ mod capacity_payload_tests {
         k.set_shard_residency_enabled(true);
         k.set_auto_admit_on_commit(true);
         k.set_shard_index_probe_enabled(true);
-        k.execute_text(1, "CREATE TABLE knz (id INT, balance INT)").unwrap();
-        k.execute_text(2, "INSERT INTO knz (id, balance) VALUES (5,50),(7,70)").unwrap();
-        k.execute_text(3, "INSERT INTO knz (id, balance) VALUES (NULL, 99)").unwrap();
+        k.execute_text(1, "CREATE TABLE knz (id INT, balance INT)")
+            .unwrap();
+        k.execute_text(2, "INSERT INTO knz (id, balance) VALUES (5,50),(7,70)")
+            .unwrap();
+        k.execute_text(3, "INSERT INTO knz (id, balance) VALUES (NULL, 99)")
+            .unwrap();
         let t = k.relational_catalog_table("knz").unwrap();
         let id = crate::rel_exec_helpers::relational_column_index(&t, "id").unwrap();
         let bal = crate::rel_exec_helpers::relational_column_index(&t, "balance").unwrap();
@@ -3019,7 +3724,8 @@ mod capacity_payload_tests {
         k.set_auto_admit_on_commit(true);
         k.set_shard_index_probe_enabled(true);
         k.set_shard_size_target(16); // 256 rows -> ~16 ascending-disjoint shards
-        k.execute_text(1, "CREATE TABLE acc (id INT, balance INT)").unwrap();
+        k.execute_text(1, "CREATE TABLE acc (id INT, balance INT)")
+            .unwrap();
         for i in 0..256_i64 {
             k.execute_text(
                 (i as u64) + 2,
@@ -3035,8 +3741,9 @@ mod capacity_payload_tests {
         let id = crate::rel_exec_helpers::relational_column_index(&t, "id").unwrap();
         let bal = crate::rel_exec_helpers::relational_column_index(&t, "balance").unwrap();
         // present in various shards + seal boundaries + out-of-all-ranges (BKEEP0 -> absent).
-        let needles: Vec<i32> =
-            vec![0, 15, 16, 17, 31, 32, 100, 128, 200, 239, 240, 255, 300, -5, 1000];
+        let needles: Vec<i32> = vec![
+            0, 15, 16, 17, 31, 32, 100, 128, 200, 239, 240, 255, 300, -5, 1000,
+        ];
         let bin_hb = k.sharded_point_binary_route_hits();
         let gpu_hb = k.sharded_point_gpu_probe_hits();
         let proj = k
@@ -3076,7 +3783,10 @@ mod capacity_payload_tests {
                         .collect()
                 })
                 .collect();
-            assert_eq!(got, want_i32, "binary route id={needle} == scan (right shard at depth)");
+            assert_eq!(
+                got, want_i32,
+                "binary route id={needle} == scan (right shard at depth)"
+            );
         }
     }
 
@@ -3093,15 +3803,20 @@ mod capacity_payload_tests {
         t.set_resident_delete_tombstone_enabled(true); // stamp deleted_by in place -> versioned shard
         t.set_shard_index_probe_enabled(true);
         t.set_shard_size_target(64);
-        t.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        t.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         for i in 0..200_i64 {
             t.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
-        t.execute_text(300, "DELETE FROM accounts WHERE id = 130").unwrap();
+        t.execute_text(300, "DELETE FROM accounts WHERE id = 130")
+            .unwrap();
         let table = t.relational_catalog_table("accounts").unwrap();
         let id_col = crate::rel_exec_helpers::relational_column_index(&table, "id").unwrap();
         let bal_col = crate::rel_exec_helpers::relational_column_index(&table, "balance").unwrap();
@@ -3121,8 +3836,16 @@ mod capacity_payload_tests {
         );
         let count = |i: usize| proj.needle_ranges[i].1;
         assert_eq!(count(0), 1, "id=129 live -> 1 row");
-        assert_eq!(count(1), 0, "id=130 tombstoned -> hidden by the batched deleted_by gate");
-        assert_eq!(count(2), 1, "id=131 live neighbor in the same versioned shard -> 1 row");
+        assert_eq!(
+            count(1),
+            0,
+            "id=130 tombstoned -> hidden by the batched deleted_by gate"
+        );
+        assert_eq!(
+            count(2),
+            1,
+            "id=131 live neighbor in the same versioned shard -> 1 row"
+        );
 
         // == single-flight route (row counts).
         for &k in &needles {
@@ -3134,7 +3857,11 @@ mod capacity_payload_tests {
                 .rows
                 .len();
             let idx = needles.iter().position(|&x| x == k).unwrap();
-            assert_eq!(count(idx) as usize, want, "batched row count == single-flight for id={k}");
+            assert_eq!(
+                count(idx) as usize,
+                want,
+                "batched row count == single-flight for id={k}"
+            );
         }
     }
 
@@ -3145,9 +3872,10 @@ mod capacity_payload_tests {
         let (names, types) = int4_cols();
         let rows = int4_rows(3);
         let capacity = 8;
-        let payload = build_relational_device_payload_with_capacity(&names, &types, &rows, capacity)
-            .unwrap()
-            .0;
+        let payload =
+            build_relational_device_payload_with_capacity(&names, &types, &rows, capacity)
+                .unwrap()
+                .0;
         // Layout: 8-byte header, int4 col0 (capacity*4), int4 col1 (capacity*4).
         assert_eq!(payload.len(), 8 + 2 * capacity * 4);
         let header = u64::from_le_bytes(payload[0..8].try_into().unwrap());
@@ -3270,8 +3998,11 @@ impl Engine {
             .iter()
             .map(|column| column.name.clone())
             .collect();
-        let column_types: Vec<SqlType> =
-            catalog_table.columns.iter().map(|column| column.ty).collect();
+        let column_types: Vec<SqlType> = catalog_table
+            .columns
+            .iter()
+            .map(|column| column.ty)
+            .collect();
         // Slice 1b-ii: a PURELY-int4 table is laid down as an OPEN shard with capacity headroom (~2x
         // rows, power-of-two) so committed INSERTs append in place (amortized O(1)/row) instead of
         // re-uploading the whole table every commit. Other shapes (and huge / empty tables) stay dense.
@@ -3328,7 +4059,11 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&gpu_id);
-        let admission_budget_bytes = cat.relational_resident_cache.budget_bytes_by_gpu.get(&gpu_id).copied();
+        let admission_budget_bytes = cat
+            .relational_resident_cache
+            .budget_bytes_by_gpu
+            .get(&gpu_id)
+            .copied();
         let (evicted_tables_on_admission, resident_bytes_after_admission) =
             self.admit_relational_residency_snapshot_inner(cat, table, gpu_id, resident_bytes)?;
         let device_memory = self.relational_residency_device_memory(gpu_id, &device_payload);
@@ -3378,14 +4113,20 @@ impl Engine {
             device_memory_proof,
         };
         let read_state = Arc::clone(&self.read_state);
-        // Billions-of-rows segmented layout (S-d1, default-OFF `shard_residency_enabled`): admit as a
-        // SEGMENTED shard list — ONE dense shard for now; seal/rollover into many shards is S-d2 — routed
-        // through the sharded resident read path, instead of the single capacity-padded unified buffer
-        // (which caps at ~536M rows and re-admits O(table)). The single dense shard reuses the SAME columnar
-        // payload + layout the single buffer uses (header at offset 0, dense columns), so the (already
-        // tested) sharded read path reads it identically. Requires GPU device memory; without it (no GPU)
-        // we fall through to the single-buffer/host path. Append/seal/per-shard-index land in S-d2/S-d3.
-        if self.shard_residency_enabled() && device_memory.is_some() {
+        // Billions-of-rows segmented layout (S-d1; DEFAULT ON since THE FLIP): admit as a SEGMENTED shard
+        // list — routed through the sharded resident read path, instead of the single capacity-padded
+        // unified buffer (which caps at ~536M rows and re-admits O(table)). The single dense shard reuses
+        // the SAME columnar payload + layout the single buffer uses (header at offset 0, dense columns), so
+        // the (already tested) sharded read path reads it identically. Requires GPU device memory; without
+        // it (no GPU) we fall through to the single-buffer/host path.
+        //
+        // THE FLIP scopes sharded admission to PURELY-int4-section tables (int4/int2/date — `purely_int4`
+        // above): the shard read stack (unified exec source, index routes, dense kernels) is int4-only
+        // today, so sharding a MIXED-type table would DEMOTE its text/int8/numeric shapes from the proven
+        // single-buffer GPU paths to the CPU fallback — the opposite of the flip's goal (caught by the
+        // burn-in: the single-buffer text-probe suite). Mixed-type tables keep the single-buffer layout
+        // until shards carry every section (type-coverage ledger item).
+        if self.shard_residency_enabled() && device_memory.is_some() && purely_int4 {
             // Audit (S-d1) fix: this re-admit makes the SHARD representation authoritative — clear any prior
             // single-buffer cell for the table so a runtime flag flip (OFF->ON) cannot leave a stale
             // snapshot/device_memory shadowing the shards. Idempotent (a no-op when none exists).
@@ -3398,10 +4139,16 @@ impl Engine {
             // invalidate -- so erase any stale `deleted_by` regions for the table (keyed by the reused
             // shard_id) or the fresh shard would inherit them (SV4 wrong-results). Symmetric to the
             // single-buffer path below. INERT until SV4 (no region exists today).
-            read_state.residency.shard_deleted_by_memory.remove_table(table);
+            read_state
+                .residency
+                .shard_deleted_by_memory
+                .remove_table(table);
             // SV6: erase stale `created_by` regions symmetrically -- a fresh all-live shard 0 inheriting a
             // stale stamp region would wrongly HIDE rebuilt rows from older-snapshot readers.
-            read_state.residency.shard_created_by_memory.remove_table(table);
+            read_state
+                .residency
+                .shard_created_by_memory
+                .remove_table(table);
             // Sub-slice 3b: this sharded re-admit replaces the table's shards -> purge stale cached indexes.
             read_state.residency.purge_shard_pk_index_for_table(table);
             let dm = device_memory.expect("device_memory.is_some() checked");
@@ -3463,20 +4210,24 @@ impl Engine {
         // SV4 prereq #1 (lifecycle): the single-buffer path replaces the table's shards, so clear any stale
         // `deleted_by` regions -- a flag flip / re-admit must not leave a tombstone region shadowing the fresh
         // all-live buffer (wrong-results guard). INERT until SV4 (no region exists today).
-        read_state.residency.shard_deleted_by_memory.remove_table(table);
+        read_state
+            .residency
+            .shard_deleted_by_memory
+            .remove_table(table);
         // SV6: clear stale `created_by` regions symmetrically (same wrong-results guard).
-        read_state.residency.shard_created_by_memory.remove_table(table);
+        read_state
+            .residency
+            .shard_created_by_memory
+            .remove_table(table);
         // Sub-slice 3b: the single-buffer path replaces the table's shards -> purge stale cached indexes.
         read_state.residency.purge_shard_pk_index_for_table(table);
-        cat
-            .relational_resident_cache
-            .install_snapshot(
-                catalog_table.name,
-                snapshot.clone(),
-                resident_rows,
-                device_memory,
-                &read_state.residency,
-            );
+        cat.relational_resident_cache.install_snapshot(
+            catalog_table.name,
+            snapshot.clone(),
+            resident_rows,
+            device_memory,
+            &read_state.residency,
+        );
         Ok(snapshot)
     }
 
@@ -3487,12 +4238,16 @@ impl Engine {
         gpu_id: u16,
         resident_bytes: u64,
     ) -> Result<(Vec<String>, u64), ExecuteError> {
-        let Some(budget_bytes) = cat.relational_resident_cache.budget_bytes_by_gpu.get(&gpu_id).copied() else {
+        let Some(budget_bytes) = cat
+            .relational_resident_cache
+            .budget_bytes_by_gpu
+            .get(&gpu_id)
+            .copied()
+        else {
             let resident_bytes_after_admission = self
                 .relational_resident_bytes_for_gpu_excluding(gpu_id, table)
                 .saturating_add(resident_bytes);
-            cat
-                .relational_resident_cache
+            cat.relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
                     gpu_id,
@@ -3509,8 +4264,7 @@ impl Engine {
         };
         if resident_bytes > budget_bytes {
             let current_bytes = self.relational_resident_bytes_for_gpu(gpu_id);
-            cat
-                .relational_resident_cache
+            cat.relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
                     gpu_id,
@@ -3531,8 +4285,7 @@ impl Engine {
         let current_bytes_before = current_bytes;
         let mut evicted_tables = Vec::new();
         if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
-            cat
-                .relational_resident_cache
+            cat.relational_resident_cache
                 .record_decision(RelationalResidentCacheDecision {
                     table: table.to_string(),
                     gpu_id,
@@ -3569,15 +4322,16 @@ impl Engine {
                 break;
             }
             let read_state = Arc::clone(&self.read_state);
-            cat
-                .relational_resident_cache
-                .remove_table(&map_key, &read_state.residency, &read_state.route_telemetry);
+            cat.relational_resident_cache.remove_table(
+                &map_key,
+                &read_state.residency,
+                &read_state.route_telemetry,
+            );
             current_bytes = current_bytes.saturating_sub(bytes);
             evicted_tables.push(map_key);
         }
 
-        cat
-            .relational_resident_cache
+        cat.relational_resident_cache
             .record_decision(RelationalResidentCacheDecision {
                 table: table.to_string(),
                 gpu_id,
@@ -3911,11 +4665,15 @@ impl Engine {
         // The append op reads each value's SqlValue variant (Int4/Date/Int2) for encoding; the column
         // TYPES only gate eligibility + count, and a purely-int4 table is all-i32-section by definition.
         let column_types = vec![SqlType::Int4; column_count];
-        let chunks =
-            match compute_open_shard_int4_append_chunks(&column_types, capacity, row_start, new_rows) {
-                Ok(chunks) => chunks,
-                Err(_) => return false,
-            };
+        let chunks = match compute_open_shard_int4_append_chunks(
+            &column_types,
+            capacity,
+            row_start,
+            new_rows,
+        ) {
+            Ok(chunks) => chunks,
+            Err(_) => return false,
+        };
         if device_memory.append_owned_chunks(chunks).is_err() {
             // A partial/failed append leaves bytes only in the (still-invisible) headroom beyond
             // row_count; returning false makes the caller invalidate + re-admit, discarding them.
@@ -3983,7 +4741,17 @@ impl Engine {
             .clone();
         let k = new_rows.len();
         // Read the OPEN (last) shard's state once.
-        let (shard_id, capacity, row_count, row_start, column_count, column_names, gpu_id, schema, max_shard_id) = {
+        let (
+            shard_id,
+            capacity,
+            row_count,
+            row_start,
+            column_count,
+            column_names,
+            gpu_id,
+            schema,
+            max_shard_id,
+        ) = {
             let shards = self.read_state.residency.shards.load();
             let Some(table_shards) = shards.get(table) else {
                 return false;
@@ -4020,11 +4788,15 @@ impl Engine {
             };
             // The append position within THIS shard's buffer is its LOCAL row_count (rows [0, row_count)
             // are live; the new rows go at [row_count, row_count+k)), NOT the shard's global `row_start`.
-            let chunks =
-                match compute_open_shard_int4_append_chunks(&column_types, capacity, row_count, new_rows) {
-                    Ok(chunks) => chunks,
-                    Err(_) => return false,
-                };
+            let chunks = match compute_open_shard_int4_append_chunks(
+                &column_types,
+                capacity,
+                row_count,
+                new_rows,
+            ) {
+                Ok(chunks) => chunks,
+                Err(_) => return false,
+            };
             // `deleted_by` needs no write on append — the headroom was pre-filled with the live sentinel at
             // admission, so appended rows are born live. SV6: an UPDATE-appended NEW VERSION additionally
             // stamps `created_by = commit_seq` (below); a plain INSERT append stays unstamped (born-visible).
@@ -4099,7 +4871,8 @@ impl Engine {
         };
         // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
         // `deleted_by` is on-demand (allocated in `shard_deleted_by_memory` on the shard's first delete).
-        let Some(new_device_memory) = self.relational_residency_device_memory(gpu_id, &device_payload)
+        let Some(new_device_memory) =
+            self.relational_residency_device_memory(gpu_id, &device_payload)
         else {
             return false;
         };
@@ -4144,18 +4917,18 @@ impl Engine {
             else {
                 return false;
             };
-            self.read_state.residency.shard_created_by_memory.insert_shard(
-                table,
-                new_shard_id,
-                created_region,
-            );
+            self.read_state
+                .residency
+                .shard_created_by_memory
+                .insert_shard(table, new_shard_id, created_region);
         }
         // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard
         // in the shards list always finds its device memory (the recompaction loads the list then the memory).
-        self.read_state
-            .residency
-            .shard_device_memory
-            .insert_shard(table, new_shard_id, new_device_memory);
+        self.read_state.residency.shard_device_memory.insert_shard(
+            table,
+            new_shard_id,
+            new_device_memory,
+        );
         self.read_state.residency.with_shards_mut(|shards| {
             if let Some(table_shards) = shards.get_mut(table) {
                 table_shards.push(new_shard);
@@ -4242,15 +5015,16 @@ impl Engine {
                 // read_txn_id` uses the SIGNED s64 kernel) — `u64::MAX` would be -1 as signed and a live row
                 // would wrongly FAIL `> read_txn_id`. 0x7F7F... ≈ 9.1e18 > every real commit `Index`; byte
                 // 0x7F is also uniform so the same value is producible by the SV3a recompaction memset-fill.
-                let live_payload = vec![DELETED_BY_LIVE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
-                let Some(region) = self.relational_residency_device_memory(gpu_id, &live_payload) else {
+                let live_payload =
+                    vec![DELETED_BY_LIVE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+                let Some(region) = self.relational_residency_device_memory(gpu_id, &live_payload)
+                else {
                     return false;
                 };
-                self.read_state.residency.shard_deleted_by_memory.insert_shard(
-                    table,
-                    shard_id,
-                    region,
-                );
+                self.read_state
+                    .residency
+                    .shard_deleted_by_memory
+                    .insert_shard(table, shard_id, region);
                 match self
                     .read_state
                     .residency
@@ -4316,11 +5090,10 @@ impl Engine {
                 let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) else {
                     return false;
                 };
-                self.read_state.residency.shard_created_by_memory.insert_shard(
-                    table,
-                    shard_id,
-                    region,
-                );
+                self.read_state
+                    .residency
+                    .shard_created_by_memory
+                    .insert_shard(table, shard_id, region);
                 match self
                     .read_state
                     .residency
@@ -4392,8 +5165,11 @@ impl Engine {
         rows: &[Vec<SqlValue>],
     ) -> Result<(RelationalResidencySnapshot, CudaResidentDeviceMemory), ExecuteError> {
         let gpu_id = self.planner.default_gpu_id();
-        let column_names: Vec<String> =
-            table.columns.iter().map(|column| column.name.clone()).collect();
+        let column_names: Vec<String> = table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
         let column_types: Vec<SqlType> = table.columns.iter().map(|column| column.ty).collect();
         // The resident-column lists name (in catalog order) the columns living in each type-grouped
         // payload section; the descriptor's offset helpers index `build_relational_device_payload`'s
@@ -4744,8 +5520,7 @@ impl Engine {
         let table = install.table;
         if install.shards.is_empty() {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "benchmark resident shard admission requires at least one shard"
-                    .to_string(),
+                "benchmark resident shard admission requires at least one shard".to_string(),
             )));
         }
         let catalog_table = self
@@ -4765,29 +5540,25 @@ impl Engine {
             ))));
         }
 
-        let total_resident_bytes =
-            install
-                .shards
-                .iter()
-                .try_fold(0_u64, |total, shard| {
-                    if shard.row_count == 0 {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "benchmark resident shard {} has no rows",
-                            shard.shard_id
-                        ))));
-                    }
-                    if shard.chunks.is_empty() {
-                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "benchmark resident shard {} has no retained chunks",
-                            shard.shard_id
-                        ))));
-                    }
-                    total.checked_add(shard.resident_bytes).ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(
-                            "benchmark resident shard byte count overflowed".to_string(),
-                        ))
-                    })
-                })?;
+        let total_resident_bytes = install.shards.iter().try_fold(0_u64, |total, shard| {
+            if shard.row_count == 0 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "benchmark resident shard {} has no rows",
+                    shard.shard_id
+                ))));
+            }
+            if shard.chunks.is_empty() {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "benchmark resident shard {} has no retained chunks",
+                    shard.shard_id
+                ))));
+            }
+            total.checked_add(shard.resident_bytes).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "benchmark resident shard byte count overflowed".to_string(),
+                ))
+            })
+        })?;
         let (_evicted_tables_on_admission, _resident_bytes_after_admission) =
             self.admit_relational_residency_snapshot(table, install.gpu_id, total_resident_bytes)?;
 
@@ -5526,12 +6297,10 @@ impl Engine {
             Some(shape) => shape,
             None => {
                 if let Some(shards) = shards_guard.get(&table.name) {
-                    if let Some(shape) =
-                        sharded_resident_route_query_shape(select, &table, &bound)
+                    if let Some(shape) = sharded_resident_route_query_shape(select, &table, &bound)
                     {
-                        return self.plan_relational_sharded_resident_route(
-                            select, &table, shape, shards,
-                        );
+                        return self
+                            .plan_relational_sharded_resident_route(select, &table, shape, shards);
                     }
                 }
                 return Self::resident_route_reject(
@@ -5633,14 +6402,8 @@ impl Engine {
         query_shape: String,
         shards: &[RelationalResidentShard],
     ) -> RelationalResidentRouteDecisionStatus {
-        let total_rows = shards
-            .iter()
-            .map(|shard| shard.row_count)
-            .sum::<usize>();
-        let total_resident_bytes = shards
-            .iter()
-            .map(|shard| shard.resident_bytes)
-            .sum::<u64>();
+        let total_rows = shards.iter().map(|shard| shard.row_count).sum::<usize>();
+        let total_resident_bytes = shards.iter().map(|shard| shard.resident_bytes).sum::<u64>();
         let gpu_id = shards.first().map(|shard| shard.gpu_id);
         let sharded_query_shape = if query_shape == "count_all" {
             "sharded_count_all".to_string()
@@ -5657,6 +6420,34 @@ impl Engine {
                 | "sharded_int4_filtered_max"
         ) {
             query_shape
+        } else if matches!(
+            query_shape.as_str(),
+            "int4_equality_count"
+                | "int4_range_count"
+                | "int4_between_scalar_aggregate"
+                | "int4_projection"
+                | "int4_composite_equality_multi_column_projection"
+        ) {
+            // THE FLIP audit F1: these filtered/range int4 shapes had NO sharded mapping, so the
+            // now-default sharded layout demoted them to the CPU host scan (GPU-served pre-flip).
+            // The `sharded_` prefix routes them to the sharded BRIDGE (their unprefixed names
+            // dispatch to the single-buffer enumerated kernels), whose general executor evaluates
+            // the predicate + projection/aggregate on-device over the unified (or zero-copy
+            // single-shard) source.
+            format!("sharded_{query_shape}")
+        } else if query_shape == "int4_filter_group_count" {
+            // THE FLIP (burn-in): an OR-of-int4-equalities COUNT fell to the CPU engine on a sharded
+            // table (no sharded mapping — the SUM cliff's sibling). The shape keeps its single-buffer
+            // name: the dispatch arm routes it to the grouped bridge, whose `src: None` now resolves
+            // the sharded unified source inside `execute_resident_expr_select_with_binding`.
+            query_shape
+        } else if query_shape == "int4_scalar_aggregate" {
+            // FLIP slice (measured): an UNFILTERED scalar aggregate (bare SUM/AVG/MIN/MAX) had NO sharded
+            // mapping, so it fell through the dispatch to the CPU engine's host scan — MEASURED p50
+            // 496,554us vs the bridge-served sharded COUNT's 460us at 524k rows (~1000x, a charter
+            // violation in the hot path). The bridge's COUNT-precheck + general run computes scalar
+            // aggregates on the unified device buffer, so route it there.
+            "sharded_int4_scalar_aggregate".to_string()
         } else if query_shape == "int4_filtered_scalar_aggregate"
             && matches!(select.projection, SelectProjection::Avg { .. })
         {
@@ -5669,6 +6460,11 @@ impl Engine {
             && matches!(select.projection, SelectProjection::Max { .. })
         {
             "sharded_int4_filtered_max".to_string()
+        } else if query_shape == "int4_filtered_scalar_aggregate" {
+            // THE FLIP audit F1 (residue): the filtered aggregates NOT covered by the tuned
+            // avg/min/max mappings above (a filtered SUM) route to the sharded bridge's general
+            // executor instead of falling to the CPU host scan.
+            "sharded_int4_filtered_scalar_aggregate".to_string()
         } else if query_shape == "int4_distinct_projection" {
             "sharded_int4_distinct_projection".to_string()
         } else if query_shape == "int4_filtered_distinct_projection" {
@@ -5757,6 +6553,14 @@ impl Engine {
         if !matches!(
             decision.query_shape.as_str(),
             "sharded_count_all"
+                | "sharded_int4_scalar_aggregate"
+                | "int4_filter_group_count"
+                | "sharded_int4_equality_count"
+                | "sharded_int4_range_count"
+                | "sharded_int4_filtered_scalar_aggregate"
+                | "sharded_int4_between_scalar_aggregate"
+                | "sharded_int4_projection"
+                | "sharded_int4_composite_equality_multi_column_projection"
                 | "sharded_int4_equality_projection"
                 | "sharded_int4_equality_multi_column_projection"
                 | "sharded_int4_equality_sum"
@@ -5782,8 +6586,7 @@ impl Engine {
             let SelectProjection::Columns(columns) = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
-                decision.reason =
-                    "sharded resident routing requires projected columns".to_string();
+                decision.reason = "sharded resident routing requires projected columns".to_string();
                 return decision;
             };
             for column in columns {
@@ -5798,12 +6601,27 @@ impl Engine {
             for filter in select.filter_groups.iter().flatten() {
                 required_int4_columns.insert(filter.column.clone());
             }
+        } else if decision.query_shape == "sharded_int4_scalar_aggregate" {
+            // FLIP slice: an UNFILTERED scalar aggregate (bare SUM/AVG/MIN/MAX over an int4 column —
+            // the single-buffer `int4_scalar_aggregate` shape, remapped). Only the aggregate column is
+            // required; there are no filters by shape definition.
+            let (SelectProjection::Sum { column }
+            | SelectProjection::Avg { column }
+            | SelectProjection::Min { column }
+            | SelectProjection::Max { column }) = &select.projection
+            else {
+                decision.cache_state = "Absent".to_string();
+                decision.valid = false;
+                decision.reason =
+                    "sharded resident routing requires SUM/AVG/MIN/MAX(int4_column)".to_string();
+                return decision;
+            };
+            required_int4_columns.insert(column.clone());
         } else if decision.query_shape == "sharded_int4_equality_sum" {
             let SelectProjection::Sum { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
-                decision.reason =
-                    "sharded resident routing requires SUM(int4_column)".to_string();
+                decision.reason = "sharded resident routing requires SUM(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -5823,8 +6641,7 @@ impl Engine {
             let SelectProjection::Avg { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
-                decision.reason =
-                    "sharded resident routing requires AVG(int4_column)".to_string();
+                decision.reason = "sharded resident routing requires AVG(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -5841,8 +6658,7 @@ impl Engine {
             let SelectProjection::Min { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
-                decision.reason =
-                    "sharded resident routing requires MIN(int4_column)".to_string();
+                decision.reason = "sharded resident routing requires MIN(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -5859,8 +6675,7 @@ impl Engine {
             let SelectProjection::Max { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;
-                decision.reason =
-                    "sharded resident routing requires MAX(int4_column)".to_string();
+                decision.reason = "sharded resident routing requires MAX(int4_column)".to_string();
                 return decision;
             };
             required_int4_columns.insert(column.clone());
@@ -5980,8 +6795,7 @@ impl Engine {
             decision.valid &= valid;
             if memory_pressure_active || shard.invalidated_by_memory_pressure {
                 decision.cache_state = "InvalidatedByMemoryPressure".to_string();
-            } else if shard.invalidated_by_txn_id.is_some()
-                || shard.invalidated_at_index.is_some()
+            } else if shard.invalidated_by_txn_id.is_some() || shard.invalidated_at_index.is_some()
             {
                 decision.cache_state = "Invalidated".to_string();
             }
@@ -6016,8 +6830,7 @@ impl Engine {
         if !decision.valid {
             decision.reason = format!("resident shard set is {}", decision.cache_state);
         } else if !has_all_device_memory {
-            decision.reason =
-                "resident shard set has missing retained device memory".to_string();
+            decision.reason = "resident shard set has missing retained device memory".to_string();
         } else {
             decision.accepted = true;
             decision.reason = "sharded resident route accepted".to_string();

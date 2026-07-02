@@ -25,11 +25,7 @@ pub(crate) enum ResidentPredicate {
         comparison: CudaI32Comparison,
     },
     /// `int4_col BETWEEN lower AND upper` (both inclusive).
-    Int4Between {
-        col: usize,
-        lower: i32,
-        upper: i32,
-    },
+    Int4Between { col: usize, lower: i32, upper: i32 },
 }
 
 /// A single-row scalar aggregate the resident plan computes over the predicate-selected rows (P0
@@ -184,12 +180,14 @@ fn compile_resident_scalar_aggregate_predicate(
             }
             let lower = lower.ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident scalar aggregate BETWEEN requires a lower inclusive bound".to_string(),
+                    "resident scalar aggregate BETWEEN requires a lower inclusive bound"
+                        .to_string(),
                 ))
             })?;
             let upper = upper.ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident scalar aggregate BETWEEN requires an upper inclusive bound".to_string(),
+                    "resident scalar aggregate BETWEEN requires an upper inclusive bound"
+                        .to_string(),
                 ))
             })?;
             return Ok(ResidentPredicate::Int4Between {
@@ -287,8 +285,12 @@ fn materialize_resident_scalar_stats(
                 )))
             })?,
         ),
-        ResidentScalarAggregate::Min { .. } => stats.min.map(SqlValue::Int4).unwrap_or(SqlValue::Null),
-        ResidentScalarAggregate::Max { .. } => stats.max.map(SqlValue::Int4).unwrap_or(SqlValue::Null),
+        ResidentScalarAggregate::Min { .. } => {
+            stats.min.map(SqlValue::Int4).unwrap_or(SqlValue::Null)
+        }
+        ResidentScalarAggregate::Max { .. } => {
+            stats.max.map(SqlValue::Int4).unwrap_or(SqlValue::Null)
+        }
         ResidentScalarAggregate::Count => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident scalar stats materialization received COUNT".to_string(),
@@ -442,7 +444,12 @@ impl Engine {
                 let null_bitmap_offset = resident_device_null_column_offset(snapshot, table, col)?;
                 let row_count = resident_snapshot_row_count(snapshot)?;
                 let matched = device_memory
-                    .count_i32_equal_from_payload(byte_offset, row_count, needle, null_bitmap_offset)
+                    .count_i32_equal_from_payload(
+                        byte_offset,
+                        row_count,
+                        needle,
+                        null_bitmap_offset,
+                    )
                     .map_err(|err| {
                         ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                     })?;
@@ -525,17 +532,13 @@ impl Engine {
         ) = (aggregate, predicate)
         {
             if agg_null_offset.is_none()
-                && resident_device_int4_column_stats(snapshot, table, col)
-                    .is_some_and(|stats| resident_i32_comparison_domain_is_empty(stats, *needle, *comparison))
+                && resident_device_int4_column_stats(snapshot, table, col).is_some_and(|stats| {
+                    resident_i32_comparison_domain_is_empty(stats, *needle, *comparison)
+                })
             {
                 self.metrics
                     .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
-                return Ok(self.resident_scalar_result(
-                    bound,
-                    SqlValue::Null,
-                    gpu_id,
-                    access_path,
-                ));
+                return Ok(self.resident_scalar_result(bound, SqlValue::Null, gpu_id, access_path));
             }
         }
 
@@ -576,7 +579,14 @@ impl Engine {
                     self.metrics.observe_kernel_exec_ms(
                         elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
                     );
-                    Ok(self.resident_scalar_result(bound, SqlValue::Int8(sum), gpu_id, access_path))
+                    Ok(
+                        self.resident_scalar_result(
+                            bound,
+                            SqlValue::Int8(sum),
+                            gpu_id,
+                            access_path,
+                        ),
+                    )
                 }
                 ResidentScalarAggregate::Avg { .. }
                 | ResidentScalarAggregate::Min { .. }
@@ -647,7 +657,9 @@ impl Engine {
                 let started = Instant::now();
                 let (count, sum, min, max) = device_memory
                     .nullable_scalar_stats_i32_from_payload(byte_offset, row_count, agg_null_offset)
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
                 let elapsed = started.elapsed();
                 let result_value = finalize_direct_scalar_stats(aggregate, count, sum, min, max)?;
                 let result_d2h_bytes = (std::mem::size_of::<u64>()
@@ -682,7 +694,9 @@ impl Engine {
                         *comparison,
                         agg_null_offset,
                     )
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
                 let elapsed = started.elapsed();
                 let result_value = finalize_direct_scalar_stats(aggregate, count, sum, min, max)?;
                 let result_d2h_bytes = (std::mem::size_of::<u64>()
@@ -715,7 +729,9 @@ impl Engine {
                         *comparison,
                         None,
                     )
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
                 let elapsed = started.elapsed();
                 let result_value = finalize_direct_scalar_stats(aggregate, count, sum, min, max)?;
                 let result_d2h_bytes = (std::mem::size_of::<u64>()
@@ -723,8 +739,9 @@ impl Engine {
                     + (2 * std::mem::size_of::<i32>()))
                     as u64;
                 self.metrics.observe_d2h_bytes(result_d2h_bytes);
-                self.metrics
-                    .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+                self.metrics.observe_kernel_exec_ms(
+                    elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                );
                 Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
             }
             // M3 filtered-nullable (BETWEEN): the NULL-aware between-stats kernel excludes NULL values
@@ -740,7 +757,9 @@ impl Engine {
                         upper,
                         agg_null_offset,
                     )
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
                 let elapsed = started.elapsed();
                 let result_value = if stats.count == 0 {
                     SqlValue::Null
@@ -768,7 +787,9 @@ impl Engine {
                 let started = Instant::now();
                 let stats = device_memory
                     .stats_i32_between_from_payload(byte_offset, row_count, lower, upper)
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
                 let elapsed = started.elapsed();
                 let result_value = materialize_resident_scalar_stats(aggregate, &stats)?;
                 let result_d2h_bytes = if lower > upper {
@@ -787,12 +808,12 @@ impl Engine {
                 }
                 Ok(self.resident_scalar_result(bound, result_value, gpu_id, access_path))
             }
-            ResidentPredicate::Int4Equal { .. } => Err(ExecuteError::Engine(
-                EngineError::ApplyFailed(
+            ResidentPredicate::Int4Equal { .. } => {
+                Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "resident scalar aggregate compiler does not emit an equality predicate"
                         .to_string(),
-                ),
-            )),
+                )))
+            }
         }
     }
 
@@ -1473,12 +1494,12 @@ impl Engine {
                     // See the multi-column route above: typed columns take the CPU path; this
                     // GPU projection only handles int4/text.
                     SqlType::Int2
-                | SqlType::Int8
-                | SqlType::Numeric { .. }
-                | SqlType::Bool
-                | SqlType::Date
-                | SqlType::Timestamp
-                | SqlType::Uuid => {
+                    | SqlType::Int8
+                    | SqlType::Numeric { .. }
+                    | SqlType::Bool
+                    | SqlType::Date
+                    | SqlType::Timestamp
+                    | SqlType::Uuid => {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "resident device-memory projection supports only int4/text columns"
                                 .to_string(),

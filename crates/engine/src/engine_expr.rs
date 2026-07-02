@@ -65,7 +65,10 @@ pub(crate) enum ResidentExpr {
     /// kernel as a bool column, pointed at the column's validity bitmap (1 = valid/present), with
     /// `negate = !is_not_null`. A column with no validity bitmap (no NULLs) lowers to an all-constant
     /// mask. Not an arithmetic operand -- the arith/compare paths reject it.
-    IsNull { col: usize, is_not_null: bool },
+    IsNull {
+        col: usize,
+        is_not_null: bool,
+    },
     Binary {
         op: ResidentBinaryOp,
         lhs: Box<ResidentExpr>,
@@ -310,7 +313,9 @@ fn resident_predicate_from_bound_filters(
                 ResidentExpr::Binary {
                     op: ResidentBinaryOp::Like,
                     lhs: Box::new(ResidentExpr::Column(*idx)),
-                    rhs: Box::new(ResidentExpr::TextLiteral(like_pattern_for_literal_prefix(prefix))),
+                    rhs: Box::new(ResidentExpr::TextLiteral(like_pattern_for_literal_prefix(
+                        prefix,
+                    ))),
                 }
             } else {
                 ResidentExpr::Binary {
@@ -560,7 +565,11 @@ pub(crate) fn gpu_sort_permutation(
     let has_null_key = classified
         .iter()
         .any(|&(idx, _)| rows.iter().any(|r| matches!(r[idx], SqlValue::Null)));
-    let non_int: Vec<(usize, u8)> = classified.iter().copied().filter(|&(_, k)| k != 0).collect();
+    let non_int: Vec<(usize, u8)> = classified
+        .iter()
+        .copied()
+        .filter(|&(_, k)| k != 0)
+        .collect();
     let perm: Vec<u32> = if non_int.is_empty() && !has_null_key {
         device_memory
             .bitonic_sort_multikey(&int_keys, n, num_int, desc_mask)
@@ -578,7 +587,11 @@ pub(crate) fn gpu_sort_permutation(
             .map(|r| classified.iter().map(|&(idx, _)| r[idx].clone()).collect())
             .collect();
         let (payload, text_layouts, _bool, _int4, b128_layouts, null_layouts) =
-            crate::engine_residency::build_relational_device_payload(&names, &types, &payload_rows)?;
+            crate::engine_residency::build_relational_device_payload(
+                &names,
+                &types,
+                &payload_rows,
+            )?;
         // null_offs[ki] = key ki's validity-bitmap byte offset in the payload (u64::MAX = the column has no
         // NULL ⇒ pure value compare). Found by the key's own name, so an int key gets its bitmap too.
         let null_off_of = |ki: usize| -> u64 {
@@ -612,7 +625,11 @@ pub(crate) fn gpu_sort_permutation(
                 }
                 k => {
                     let off = b128_layouts[b128_idx].1;
-                    let tag = if k == 2 { 0x8000_0000_u32 } else { 0xC000_0000_u32 };
+                    let tag = if k == 2 {
+                        0x8000_0000_u32
+                    } else {
+                        0xC000_0000_u32
+                    };
                     key_plan.push(tag | b128_cols.len() as u32);
                     b128_cols.push(off);
                     b128_idx += 1;
@@ -626,8 +643,16 @@ pub(crate) fn gpu_sort_permutation(
         // its value from `int_keys` but its NULL-ness from the payload bitmap -- no host sentinel.
         device_memory
             .bitonic_sort_hetero_on_payload(
-                &payload, &indices, &int_keys, num_int, &text_cols, &b128_cols, &key_plan, desc_mask,
-                &null_offs, nulls_first_mask,
+                &payload,
+                &indices,
+                &int_keys,
+                num_int,
+                &text_cols,
+                &b128_cols,
+                &key_plan,
+                desc_mask,
+                &null_offs,
+                nulls_first_mask,
             )
             .map_err(map_sort_err)?
     };
@@ -640,9 +665,10 @@ pub(crate) fn gpu_sort_permutation(
 /// are ignored for the non-numeric types.
 fn narrow_ordered_value(ty: SqlType, lo: i64, hi: i64, scale: u8) -> SqlValue {
     match ty {
-        SqlType::Numeric { .. } => {
-            SqlValue::Numeric(Decimal128::new((i128::from(hi) << 64) | i128::from(lo as u64), scale))
-        }
+        SqlType::Numeric { .. } => SqlValue::Numeric(Decimal128::new(
+            (i128::from(hi) << 64) | i128::from(lo as u64),
+            scale,
+        )),
         SqlType::Int8 => SqlValue::Int8(lo),
         SqlType::Timestamp => SqlValue::Timestamp(lo),
         SqlType::Int2 => SqlValue::Int2(lo as i16),
@@ -761,8 +787,27 @@ fn composite_group_count_reps(
     };
     let groups = device_memory
         .group_by_i32_count_sum_minmax_from_payload(
-            0, 0, indices, false, false, false, false, false, false, 0, 0, false, 0, 0,
-            key_base_override, 0, comp_w, n_text, text_desc_ptr, None, None,
+            0,
+            0,
+            indices,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            0,
+            0,
+            false,
+            0,
+            0,
+            key_base_override,
+            0,
+            comp_w,
+            n_text,
+            text_desc_ptr,
+            None,
+            None,
             // COUNT(DISTINCT) representative pass: reads only g.key_i128 (no stat field), so the mask is
             // immaterial -- pass ALL (no prune, fully behavior-preserving for this internal pass).
             gpu_db_execution::grouped_agg_mask::ALL,
@@ -985,11 +1030,13 @@ fn expr_mentions_date(expr: &ResidentExpr, table: &RelationalTable) -> bool {
 /// column) is a type error -- a date column compares only to a date literal or another date column.
 fn date_literal_days(expr: &ResidentExpr) -> Result<i32, ExecuteError> {
     match expr {
-        ResidentExpr::TextLiteral(text) => gpu_db_sql::datetime::parse_date(text).ok_or_else(|| {
-            ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                "invalid input syntax for type date: \"{text}\""
-            )))
-        }),
+        ResidentExpr::TextLiteral(text) => {
+            gpu_db_sql::datetime::parse_date(text).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "invalid input syntax for type date: \"{text}\""
+                )))
+            })
+        }
         _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(
             "a date column compares only to a date literal or another date column".to_string(),
         ))),
@@ -1333,7 +1380,11 @@ fn compile_numeric_arith(
                 // contributes its canonical mantissa + canonical scale (so `* 1.5` adds scale 1).
                 return match (lhs_lit, rhs_lit) {
                     (None, Some(literal)) | (Some(literal), None) => {
-                        let value = if lhs_lit.is_none() { lhs.as_ref() } else { rhs.as_ref() };
+                        let value = if lhs_lit.is_none() {
+                            lhs.as_ref()
+                        } else {
+                            rhs.as_ref()
+                        };
                         let value_scale = compile_numeric_arith(value, table, snapshot, program)?;
                         let canonical = literal.canonical();
                         program.push(ExprStep::ScalarBinary {
@@ -1341,7 +1392,9 @@ fn compile_numeric_arith(
                             scalar: scalar_i32(canonical.mantissa)?,
                             scalar_on_left: false, // multiply is commutative
                         });
-                        value_scale.checked_add(canonical.scale).ok_or_else(scale_overflow)
+                        value_scale
+                            .checked_add(canonical.scale)
+                            .ok_or_else(scale_overflow)
                     }
                     (None, None) => {
                         let lhs_scale = compile_numeric_arith(lhs, table, snapshot, program)?;
@@ -1457,7 +1510,8 @@ fn compile_numeric_compare(
             push_leaf_validity_and(&[lhs, rhs], table, snapshot, program)
         }
         (Some(_), Some(_)) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "the general GPU executor does not evaluate literal-only numeric comparisons".to_string(),
+            "the general GPU executor does not evaluate literal-only numeric comparisons"
+                .to_string(),
         ))),
     }
 }
@@ -1693,7 +1747,10 @@ fn predicate_vm_elem_type(
         )
     }) {
         Some(ResidentElemType::I32)
-    } else if cols.iter().all(|&col| matches!(ty(col), Some(SqlType::Int8))) {
+    } else if cols
+        .iter()
+        .all(|&col| matches!(ty(col), Some(SqlType::Int8)))
+    {
         Some(ResidentElemType::I64)
     } else {
         None
@@ -1774,7 +1831,8 @@ fn compile_predicate_program(
     }
     let Some(cmp) = predicate_compare_code(*op) else {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "resident predicate node must be a comparison (eq/ne/lt/le/gt/ge) or AND/OR".to_string(),
+            "resident predicate node must be a comparison (eq/ne/lt/le/gt/ge) or AND/OR"
+                .to_string(),
         )));
     };
     match (lhs.as_ref(), rhs.as_ref()) {
@@ -1917,8 +1975,12 @@ fn compile_bool_leaf(
     let is_bool_col =
         |idx: usize| table.columns.get(idx).map(|column| column.ty) == Some(SqlType::Bool);
     let (col, literal) = match (lhs, rhs) {
-        (ResidentExpr::Column(col), ResidentExpr::BoolLiteral(b)) if is_bool_col(*col) => (*col, *b),
-        (ResidentExpr::BoolLiteral(b), ResidentExpr::Column(col)) if is_bool_col(*col) => (*col, *b),
+        (ResidentExpr::Column(col), ResidentExpr::BoolLiteral(b)) if is_bool_col(*col) => {
+            (*col, *b)
+        }
+        (ResidentExpr::BoolLiteral(b), ResidentExpr::Column(col)) if is_bool_col(*col) => {
+            (*col, *b)
+        }
         _ => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "a bool comparison must be a bool column against a true/false literal".to_string(),
@@ -2442,38 +2504,72 @@ impl Engine {
 
         // Validate each shard + resolve its pinned device memory (the per-shard identity + validity
         // prechecks mirror the probe's at engine_resident_probe.rs ~873), or return the error a probe did.
-        let source_for = |shard: &RelationalResidentShard| -> Result<ResidentExecSource, ExecuteError> {
-            if shard.schema != table.schema || shard.table != table.name {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident shard no longer matches catalog table identity".to_string(),
-                )));
-            }
-            let memory_pressure_active = runtime_snapshot
-                .memory_pressured_gpu_ids
-                .contains(&shard.gpu_id);
-            if !shard.is_valid(memory_pressure_active) {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "resident shard {} is invalid",
-                    shard.shard_id
-                ))));
-            }
-            let device_memory = self
+        let source_for =
+            |shard: &RelationalResidentShard| -> Result<ResidentExecSource, ExecuteError> {
+                if shard.schema != table.schema || shard.table != table.name {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident shard no longer matches catalog table identity".to_string(),
+                    )));
+                }
+                let memory_pressure_active = runtime_snapshot
+                    .memory_pressured_gpu_ids
+                    .contains(&shard.gpu_id);
+                if !shard.is_valid(memory_pressure_active) {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident shard {} is invalid",
+                        shard.shard_id
+                    ))));
+                }
+                let device_memory = self
+                    .read_state
+                    .residency
+                    .shard_device_memory
+                    .get(&(table.name.clone(), shard.shard_id))
+                    .ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "resident shard {} has no retained device memory",
+                            shard.shard_id
+                        )))
+                    })?;
+                Ok(ResidentExecSource {
+                    descriptor: Arc::new(self.resident_snapshot_for_shard(shard, table)),
+                    device_memory,
+                    row_count: shard.row_count as u64,
+                })
+            };
+
+        // FLIP slice — ZERO-COPY single-shard fast path (measured: the per-read recompaction DtoD copy
+        // costs ~440-460us at 524k rows vs the single-buffer's 19us COUNT — ledger #4). When the
+        // zone-map prune leaves EXACTLY ONE shard and that shard is VERSION-FREE (no deleted_by /
+        // created_by region — a version region lives in a SEPARATE device buffer, so it cannot be
+        // addressed by an absolute offset inside the shard's own buffer), serve the shard's OWN buffer
+        // directly: `resident_snapshot_for_shard` already describes it (capacity-strided, its own null
+        // bitmaps), and every consumer reads through the descriptor's offset helpers. No DtoD, no
+        // allocation. A versioned or multi-shard survivor set takes the recompaction below unchanged.
+        if shards.len() == 1 {
+            let shard = &shards[0];
+            let key = (table.name.clone(), shard.shard_id);
+            let version_free = self
                 .read_state
                 .residency
-                .shard_device_memory
-                .get(&(table.name.clone(), shard.shard_id))
-                .ok_or_else(|| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "resident shard {} has no retained device memory",
-                        shard.shard_id
-                    )))
-                })?;
-            Ok(ResidentExecSource {
-                descriptor: Arc::new(self.resident_snapshot_for_shard(shard, table)),
-                device_memory,
-                row_count: shard.row_count as u64,
-            })
-        };
+                .shard_deleted_by_memory
+                .get(&key)
+                .is_none()
+                && self
+                    .read_state
+                    .residency
+                    .shard_created_by_memory
+                    .get(&key)
+                    .is_none();
+            if version_free {
+                let src = source_for(shard)?;
+                return Ok(ShardedUnifiedExecSource {
+                    src,
+                    visibility: None,
+                    gpu_id,
+                });
+            }
+        }
 
         // The unified int4-only buffer lays the table's int4 columns out in catalog order, each contiguous
         // over `total_row_count` rows after the 8-byte row-count header — exactly the whole-table single
@@ -2505,7 +2601,11 @@ impl Engine {
                     shard.shard_id, shard.resident_device_int4_columns, int4_columns
                 ))));
             }
-            shard_ptrs.push((src.device_memory.device_ptr(), shard.row_count, shard.capacity));
+            shard_ptrs.push((
+                src.device_memory.device_ptr(),
+                shard.row_count,
+                shard.capacity,
+            ));
             total_row_count = total_row_count.saturating_add(shard.row_count);
         }
 
@@ -2564,9 +2664,11 @@ impl Engine {
                 &mut created_by_offset,
             ),
         ] {
-            let has_region = shards
-                .iter()
-                .any(|shard| region_map.get(&(table.name.clone(), shard.shard_id)).is_some());
+            let has_region = shards.iter().any(|shard| {
+                region_map
+                    .get(&(table.name.clone(), shard.shard_id))
+                    .is_some()
+            });
             if !has_region {
                 continue;
             }
@@ -2765,17 +2867,58 @@ impl Engine {
                         .any(|s| !s.resident_device_null_columns.is_empty())
                 });
             if !any_shard_has_nulls {
-                if let Some(result) = self
-                    .try_shard_index_point_route(select, &table, &bound, filter_idx, needle, copin_s)
-                {
+                if let Some(result) = self.try_shard_index_point_route(
+                    select, &table, &bound, filter_idx, needle, copin_s,
+                ) {
                     return Ok(result);
+                }
+            }
+        }
+        // FLIP slice — METADATA COUNT fast path (measured: the unpredicated sharded COUNT(*) paid the
+        // full recompaction DtoD, p50 ~430-530us at 524k rows vs single-buffer's 19us). An unpredicated
+        // COUNT(*) over ALL-version-free shards is exactly `sum(shard.row_count)` — descriptor metadata
+        // the route planner already reads (control plane; no row data touched, no kernel, no copy). Any
+        // version region (a tombstone could hide rows / a stamp could hide appended versions) or any
+        // predicate falls through to the device path unchanged.
+        if matches!(select.projection, SelectProjection::CountAll) && predicate.is_none() {
+            let shards_guard = self.read_state.residency.shards.load();
+            if let Some(shards) = shards_guard.get(&table.name) {
+                let version_free = shards.iter().all(|shard| {
+                    let key = (table.name.clone(), shard.shard_id);
+                    self.read_state
+                        .residency
+                        .shard_deleted_by_memory
+                        .get(&key)
+                        .is_none()
+                        && self
+                            .read_state
+                            .residency
+                            .shard_created_by_memory
+                            .get(&key)
+                            .is_none()
+                });
+                if version_free && !shards.is_empty() {
+                    let total: i64 = shards.iter().map(|s| s.row_count as i64).sum();
+                    let gpu_id = shards[0].gpu_id;
+                    drop(shards_guard);
+                    let (_query, access_path) =
+                        self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
+                    return Ok(RelationalSelectResult {
+                        columns: Arc::new(bound.selected_columns.clone()),
+                        rows: vec![vec![SqlValue::Int8(total)]].into(),
+                        planned_target: DeviceTarget::Gpu(gpu_id),
+                        executed_target: DeviceTarget::Gpu(gpu_id),
+                        fallback_reason: None,
+                        access_path: Arc::new(access_path),
+                    });
                 }
             }
         }
         // SLICE B: the shard load + zone-map prune + int4/version/null-bitmap recompaction live in
         // `build_sharded_unified_exec_source`, SHARED with the SQL->Expr PG path so IS NULL and every
         // other general-executor shape run over sharded tables through the SAME on-device execution.
-        let unified = self.build_sharded_unified_exec_source(&table, predicate.as_ref(), copin_s)?;
+        let unified =
+            self.build_sharded_unified_exec_source(&table, predicate.as_ref(), copin_s)?;
         let gpu_id = unified.gpu_id;
         let visibility = unified.visibility;
         let unified_src = unified.src;
@@ -3203,7 +3346,9 @@ impl Engine {
         };
         let indices: Vec<u32> = (0..m).collect();
         device_memory
-            .group_by_i32_count_sum_kernel_timed(key_off, val_off, &indices, two_level, runs, agg_mask)
+            .group_by_i32_count_sum_kernel_timed(
+                key_off, val_off, &indices, two_level, runs, agg_mask,
+            )
             .map(|(_, ms)| ms)
             .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))
     }
@@ -3226,6 +3371,39 @@ impl Engine {
     ) -> Result<(RelationalResidencyEntry, JoinDeviceMemory, usize), ExecuteError> {
         match rows {
             None => {
+                // THE FLIP: a SHARD-resident relation (no single-buffer entry) joins via its UNIFIED
+                // exec source — the same GPU pre-filter/key-projection/hash-join kernels run over the
+                // recompacted (or zero-copy single-shard) buffer. A VERSIONED sharded relation
+                // clean-errors: the join kernels do not thread the visibility conjuncts (never a
+                // tombstone leak). No host rows ride the entry — the join is GPU-only (charter).
+                if self.relational_residency_entry(name).is_none()
+                    && self
+                        .read_state
+                        .residency
+                        .shards
+                        .load()
+                        .get(name)
+                        .is_some_and(|shards| !shards.is_empty())
+                {
+                    let unified = self
+                        .build_sharded_unified_exec_source(table, None, { self.committed_seq() })?;
+                    if unified.visibility.is_some() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "relation \"{name}\" is a VERSIONED sharded table: the join path does \
+                             not thread the MVCC visibility conjuncts yet"
+                        ))));
+                    }
+                    let row_count = unified.src.descriptor.row_count;
+                    let entry = RelationalResidencyEntry::from_dense_host_rows(
+                        unified.src.descriptor,
+                        Vec::new(),
+                    );
+                    return Ok((
+                        entry,
+                        JoinDeviceMemory::Resident(unified.src.device_memory),
+                        row_count,
+                    ));
+                }
                 let entry = self.relational_residency_entry(name).ok_or_else(|| {
                     ExecuteError::Engine(EngineError::ApplyFailed(format!(
                         "relation \"{name}\" has no resident snapshot (the join path is GPU-only)"
@@ -3277,7 +3455,8 @@ impl Engine {
     ) -> Result<bool, ExecuteError> {
         let null_row = vec![vec![SqlValue::Null; table.columns.len()]];
         let (snapshot, memory) = self.build_transient_relation_residency(table, &null_row)?;
-        let survivors = self.lower_resident_predicate(predicate, table, &snapshot, &memory, 1, None)?;
+        let survivors =
+            self.lower_resident_predicate(predicate, table, &snapshot, &memory, 1, None)?;
         Ok(!survivors.is_empty())
     }
 
@@ -3338,10 +3517,9 @@ impl Engine {
                     for (i, table) in tables.iter().take(upto + 1).enumerate() {
                         if let Ok(ci) = relational_column_index(table, &c.column) {
                             if found.is_some() {
-                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                    "column reference \"{}\" is ambiguous",
-                                    c.column
-                                ))));
+                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                    format!("column reference \"{}\" is ambiguous", c.column),
+                                )));
                             }
                             found = Some((i, ci));
                         }
@@ -3395,7 +3573,8 @@ impl Engine {
                 }
                 if common.is_empty() {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "NATURAL JOIN has no common column name between the two relations".to_string(),
+                        "NATURAL JOIN has no common column name between the two relations"
+                            .to_string(),
                     )));
                 }
                 common
@@ -3440,9 +3619,8 @@ impl Engine {
             // Determine the key kind + validate types. A single-conjunct key may be TEXT (-> the GPU text
             // hash join: FNV + byte-verify), NUMERIC/UUID (-> the SAME kernel over the 16-byte canonical
             // value), or INT (-> the i64 hash join). A 2-conjunct composite is INT-only (i64-packed).
-            let non_int = |t: SqlType| {
-                matches!(t, SqlType::Text | SqlType::Numeric { .. } | SqlType::Uuid)
-            };
+            let non_int =
+                |t: SqlType| matches!(t, SqlType::Text | SqlType::Numeric { .. } | SqlType::Uuid);
             let has_non_int = conj_keys.iter().any(|&(acc_rel, acc_col, new_col)| {
                 non_int(tables[acc_rel].columns[acc_col].ty)
                     || non_int(tables[new_rel].columns[new_col].ty)
@@ -3557,8 +3735,7 @@ impl Engine {
         // table's published memory, or a SYNTHESIZED catalog relation's transient upload.
         let mut sides: Vec<(RelationalResidencyEntry, JoinDeviceMemory, usize)> =
             Vec::with_capacity(n_rel);
-        for (row_opt, (relation, table)) in
-            rows.into_iter().zip(plan.relations.iter().zip(&tables))
+        for (row_opt, (relation, table)) in rows.into_iter().zip(plan.relations.iter().zip(&tables))
         {
             sides.push(self.resolve_join_side(&relation.table, table, row_opt)?);
         }
@@ -3623,17 +3800,27 @@ impl Engine {
             if *row_count == 0 {
                 return Ok(vec![0; abs.len()]);
             }
-            let idxs: Vec<u64> =
-                abs.iter().map(|&i| if i == JOIN_NULL_ROW { 0 } else { u64::from(i) }).collect();
+            let idxs: Vec<u64> = abs
+                .iter()
+                .map(|&i| if i == JOIN_NULL_ROW { 0 } else { u64::from(i) })
+                .collect();
             match tables[ri].columns[col_idx].ty {
                 SqlType::Int8 | SqlType::Timestamp => {
-                    let off =
-                        resident_device_int8_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
-                    dm.mem().project_i64_rows_from_payload(off, &idxs).map_err(map_err)
+                    let off = resident_device_int8_column_offset(
+                        &entry.descriptor,
+                        &tables[ri],
+                        col_idx,
+                    )?;
+                    dm.mem()
+                        .project_i64_rows_from_payload(off, &idxs)
+                        .map_err(map_err)
                 }
                 _ => {
-                    let off =
-                        resident_device_int4_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
+                    let off = resident_device_int4_column_offset(
+                        &entry.descriptor,
+                        &tables[ri],
+                        col_idx,
+                    )?;
                     Ok(dm
                         .mem()
                         .project_i32_rows_from_payload(off, &idxs)
@@ -3664,22 +3851,35 @@ impl Engine {
             } else {
                 (right_keys, left_keys, right_valid, left_valid)
             };
-            match ctx.hash_join_inner_i64(first_build, first_probe, first_bv, first_pv).map_err(map_err)? {
-                HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
-                    Ok((smaller_is_left, build_idxs, probe_idxs))
-                }
+            match ctx
+                .hash_join_inner_i64(first_build, first_probe, first_bv, first_pv)
+                .map_err(map_err)?
+            {
+                HashJoinOutcome::Pairs {
+                    build_idxs,
+                    probe_idxs,
+                } => Ok((smaller_is_left, build_idxs, probe_idxs)),
                 HashJoinOutcome::DuplicateBuildKey => {
                     // Retry building the OTHER side -- swap keys AND their bitmaps.
-                    match ctx.hash_join_inner_i64(first_probe, first_build, first_pv, first_bv).map_err(map_err)? {
-                        HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
-                            Ok((!smaller_is_left, build_idxs, probe_idxs))
-                        }
+                    match ctx
+                        .hash_join_inner_i64(first_probe, first_build, first_pv, first_bv)
+                        .map_err(map_err)?
+                    {
+                        HashJoinOutcome::Pairs {
+                            build_idxs,
+                            probe_idxs,
+                        } => Ok((!smaller_is_left, build_idxs, probe_idxs)),
                         HashJoinOutcome::DuplicateBuildKey => {
                             // N:N: both sides have duplicate keys -> the chaining many-to-many join
                             // (each key's build rows x probe rows). Build the chain on the LEFT (acc)
                             // side, so the result is (acc position, new position) directly.
                             let (build_idxs, probe_idxs) = ctx
-                                .hash_join_inner_i64_nn(left_keys, right_keys, left_valid, right_valid)
+                                .hash_join_inner_i64_nn(
+                                    left_keys,
+                                    right_keys,
+                                    left_valid,
+                                    right_valid,
+                                )
                                 .map_err(map_err)?;
                             Ok((true, build_idxs, probe_idxs))
                         }
@@ -3702,15 +3902,23 @@ impl Engine {
             } else {
                 (right, left, right_valid, left_valid)
             };
-            match ctx.hash_join_inner_text(first_build, first_probe, first_bv, first_pv).map_err(map_err)? {
-                HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
-                    Ok((smaller_is_left, build_idxs, probe_idxs))
-                }
+            match ctx
+                .hash_join_inner_text(first_build, first_probe, first_bv, first_pv)
+                .map_err(map_err)?
+            {
+                HashJoinOutcome::Pairs {
+                    build_idxs,
+                    probe_idxs,
+                } => Ok((smaller_is_left, build_idxs, probe_idxs)),
                 HashJoinOutcome::DuplicateBuildKey => {
-                    match ctx.hash_join_inner_text(first_probe, first_build, first_pv, first_bv).map_err(map_err)? {
-                        HashJoinOutcome::Pairs { build_idxs, probe_idxs } => {
-                            Ok((!smaller_is_left, build_idxs, probe_idxs))
-                        }
+                    match ctx
+                        .hash_join_inner_text(first_probe, first_build, first_pv, first_bv)
+                        .map_err(map_err)?
+                    {
+                        HashJoinOutcome::Pairs {
+                            build_idxs,
+                            probe_idxs,
+                        } => Ok((!smaller_is_left, build_idxs, probe_idxs)),
                         HashJoinOutcome::DuplicateBuildKey => {
                             // N:N: both sides have duplicate text/numeric/uuid keys -> the chaining
                             // many-to-many text join (build the chain on the LEFT/acc side -> (acc, new)).
@@ -3729,58 +3937,69 @@ impl Engine {
         // precompute validated the column is TEXT. V1b: `abs` may include a carried JOIN_NULL_ROW (a prior
         // OUTER pad) or a NULL-key row -> the gather uses a 0 placeholder index (the kernel skips it via the
         // validity bitmap); a NULL cell at a real row projects as "" but is likewise skipped.
-        let key_texts = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<String>, ExecuteError> {
-            if abs.is_empty() {
-                return Ok(Vec::new());
-            }
-            let (entry, dm, row_count) = &sides[ri];
-            if *row_count == 0 {
-                return Ok(vec![String::new(); abs.len()]);
-            }
-            let layout = resident_device_text_column_layout(&entry.descriptor, &tables[ri], col_idx)?;
-            let idxs: Vec<u64> =
-                abs.iter().map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) }).collect();
-            dm.mem()
-                .project_text_rows_from_payload(
-                    layout.offsets_byte_offset,
-                    layout.bytes_byte_offset,
-                    layout.bytes_len,
-                    &idxs,
-                )
-                .map_err(map_err)
-        };
+        let key_texts =
+            |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<String>, ExecuteError> {
+                if abs.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let (entry, dm, row_count) = &sides[ri];
+                if *row_count == 0 {
+                    return Ok(vec![String::new(); abs.len()]);
+                }
+                let layout =
+                    resident_device_text_column_layout(&entry.descriptor, &tables[ri], col_idx)?;
+                let idxs: Vec<u64> = abs
+                    .iter()
+                    .map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) })
+                    .collect();
+                dm.mem()
+                    .project_text_rows_from_payload(
+                        layout.offsets_byte_offset,
+                        layout.bytes_byte_offset,
+                        layout.bytes_len,
+                        &idxs,
+                    )
+                    .map_err(map_err)
+            };
         // Gather a NUMERIC/UUID key's 16-byte canonical value from its DEVICE payload (both ride the i128
         // section): the i128's LE bytes ARE the uuid raw bytes / the numeric mantissa LE (the precompute
         // requires equal scale on both sides, so the mantissa compares value-for-value). Returns OWNED
         // 16-byte values (the caller borrows them into &[u8] for the SAME text hash join: a 16-byte "text"
         // -> FNV + 16-byte verify = b128 equality). V1b: a carried JOIN_NULL_ROW / NULL-key row uses a 0
         // placeholder index (the kernel skips it via the validity bitmap).
-        let key_b128 = |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<[u8; 16]>, ExecuteError> {
-            if abs.is_empty() {
-                return Ok(Vec::new());
-            }
-            let (entry, dm, row_count) = &sides[ri];
-            if *row_count == 0 {
-                return Ok(vec![[0u8; 16]; abs.len()]);
-            }
-            let off = resident_device_numeric_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
-            let idxs: Vec<u64> =
-                abs.iter().map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) }).collect();
-            Ok(dm
-                .mem()
-                .project_i128_rows_from_payload(off, &idxs)
-                .map_err(map_err)?
-                .into_iter()
-                .map(|v| v.to_le_bytes())
-                .collect())
-        };
+        let key_b128 =
+            |ri: usize, col_idx: usize, abs: &[u32]| -> Result<Vec<[u8; 16]>, ExecuteError> {
+                if abs.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let (entry, dm, row_count) = &sides[ri];
+                if *row_count == 0 {
+                    return Ok(vec![[0u8; 16]; abs.len()]);
+                }
+                let off =
+                    resident_device_numeric_column_offset(&entry.descriptor, &tables[ri], col_idx)?;
+                let idxs: Vec<u64> = abs
+                    .iter()
+                    .map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) })
+                    .collect();
+                Ok(dm
+                    .mem()
+                    .project_i128_rows_from_payload(off, &idxs)
+                    .map_err(map_err)?
+                    .into_iter()
+                    .map(|v| v.to_le_bytes())
+                    .collect())
+            };
         // Gather relation `ri`'s NULL validity (`true` = the value is present) for key column `col` at the
         // carried ABSOLUTE rows, READ FROM THE DEVICE payload (charter: the NULL decision comes from device
         // memory via the same validity bitmap the result gather uses, never a host host_rows inspection). A
         // carried JOIN_NULL_ROW (a prior OUTER pad) is a NULL key -> invalid (placeholder index 0); a column
         // with no validity bitmap (no nullable values) -> every real row valid. A 0-row relation contributes
         // only pads here (carried from a prior OUTER step) -> all invalid, with no device read.
-        let key_validity = |ri: usize, col: usize, abs: &[u32]| -> Result<Vec<bool>, ExecuteError> {
+        let key_validity = |ri: usize,
+                            col: usize,
+                            abs: &[u32]|
+         -> Result<Vec<bool>, ExecuteError> {
             let n = abs.len();
             if n == 0 {
                 return Ok(Vec::new());
@@ -3790,12 +4009,18 @@ impl Engine {
                 return Ok(vec![false; n]);
             }
             let is_pad: Vec<bool> = abs.iter().map(|&r| r == JOIN_NULL_ROW).collect();
-            let idxs: Vec<u64> =
-                abs.iter().map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) }).collect();
-            let mut valid = match resident_device_null_column_offset(&entry.descriptor, &tables[ri], col)? {
-                Some(off) => dm.mem().project_bool_rows_from_payload(off, &idxs).map_err(map_err)?,
-                None => vec![true; n],
-            };
+            let idxs: Vec<u64> = abs
+                .iter()
+                .map(|&r| if r == JOIN_NULL_ROW { 0 } else { u64::from(r) })
+                .collect();
+            let mut valid =
+                match resident_device_null_column_offset(&entry.descriptor, &tables[ri], col)? {
+                    Some(off) => dm
+                        .mem()
+                        .project_bool_rows_from_payload(off, &idxs)
+                        .map_err(map_err)?,
+                    None => vec![true; n],
+                };
             for (v, &pad) in valid.iter_mut().zip(is_pad.iter()) {
                 if pad {
                     *v = false;
@@ -3851,13 +4076,20 @@ impl Engine {
             let new_idx: &[u32] = survivors_all[new_rel].as_slice();
             let mut acc_valid = vec![true; tuple_count];
             for &(acc_rel, acc_col, _) in conjuncts {
-                for (a, v) in acc_valid.iter_mut().zip(key_validity(acc_rel, acc_col, &work_idx[acc_rel])?) {
+                for (a, v) in
+                    acc_valid
+                        .iter_mut()
+                        .zip(key_validity(acc_rel, acc_col, &work_idx[acc_rel])?)
+                {
                     *a &= v;
                 }
             }
             let mut new_valid = vec![true; new_idx.len()];
             for &(_, _, new_col) in conjuncts {
-                for (a, v) in new_valid.iter_mut().zip(key_validity(new_rel, new_col, new_idx)?) {
+                for (a, v) in new_valid
+                    .iter_mut()
+                    .zip(key_validity(new_rel, new_col, new_idx)?)
+                {
                     *a &= v;
                 }
             }
@@ -4005,7 +4237,10 @@ impl Engine {
         // Gather ONE projected column from relation `ri`'s device payload at the carried rows. A pad row
         // (JOIN_NULL_ROW) uses a 0 placeholder index whose gathered value is overridden to NULL; a relation
         // with 0 rows contributes only pads -> all NULL (no device read at index 0 into an empty payload).
-        let gather_col = |ri: usize, ci: usize, rows: &[u32]| -> Result<Vec<SqlValue>, ExecuteError> {
+        let gather_col = |ri: usize,
+                          ci: usize,
+                          rows: &[u32]|
+         -> Result<Vec<SqlValue>, ExecuteError> {
             let n = rows.len();
             if n == 0 {
                 return Ok(Vec::new());
@@ -4023,9 +4258,11 @@ impl Engine {
             // NULL validity (None = the column holds no NULLs, so every gathered value is real).
             let validity: Option<Vec<bool>> =
                 match resident_device_null_column_offset(&entry.descriptor, table, ci)? {
-                    Some(off) => {
-                        Some(dm.mem().project_bool_rows_from_payload(off, &idxs).map_err(map_err)?)
-                    }
+                    Some(off) => Some(
+                        dm.mem()
+                            .project_bool_rows_from_payload(off, &idxs)
+                            .map_err(map_err)?,
+                    ),
                     None => None,
                 };
             // Per-type value gather (the type matrix; mirrors the resident SELECT projection, exhaustive
@@ -4184,8 +4421,10 @@ impl Engine {
             let end = plan
                 .limit
                 .map_or(perm.len(), |l| start.saturating_add(l).min(perm.len()));
-            let windowed: Vec<Vec<SqlValue>> =
-                perm[start..end].iter().map(|&p| result_rows[p as usize].clone()).collect();
+            let windowed: Vec<Vec<SqlValue>> = perm[start..end]
+                .iter()
+                .map(|&p| result_rows[p as usize].clone())
+                .collect();
             result_rows = windowed;
         }
         Ok(RelationalSelectResult {
@@ -4313,6 +4552,53 @@ impl Engine {
         // INJECTS them (S10c: one shard slice). The identity + validity guards run for BOTH, so a
         // descriptor that drifted from the catalog or got invalidated is rejected either way. No
         // `host_rows` read on this path: a text GROUP BY key result is materialized ON-DEVICE.
+        // THE FLIP: a SHARD-resident table (no single-buffer entry) resolves to the UNIFIED exec source
+        // HERE — one resolution point for every `src: None` caller (the SQL->Expr PG path, the
+        // parity-test wrapper, the CTAS/view bridges), so the general executor serves sharded tables
+        // uniformly (zero-copy at one surviving shard; recompaction otherwise). The unified source
+        // carries its own SV3b/SV6 visibility, which OVERRIDES the caller's `None`; a VERSIONED table
+        // with a reshaping clause (DISTINCT / GROUP BY / ORDER BY / HAVING) clean-errors — those paths
+        // do not thread the visibility conjuncts yet (never a tombstone leak). Single-buffer tables and
+        // `src: Some` callers are byte-identical.
+        let sharded_unified: Option<ShardedUnifiedExecSource> = if src.is_none()
+            && self.relational_residency_entry(&table.name).is_none()
+            && self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(&table.name)
+                .is_some_and(|shards| !shards.is_empty())
+        {
+            let unified = self.build_sharded_unified_exec_source(table, predicate, copin_s)?;
+            if unified.visibility.is_some()
+                && (select.distinct
+                    || select.group_by.is_some()
+                    || !select.order_by.is_empty()
+                    || !select.having_groups.is_empty()
+                    || !order_by_exprs.is_empty()
+                    || group_key_expr.is_some()
+                    || !group_key_columns.is_empty())
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident visibility filter (SV3b/SV6) is not yet wired through the DISTINCT / \
+                     GROUP BY / ORDER BY paths for a versioned sharded table"
+                        .to_string(),
+                )));
+            }
+            Some(unified)
+        } else {
+            None
+        };
+        debug_assert!(
+            sharded_unified.is_none() || visibility.is_none(),
+            "a caller passed src: None + visibility: Some for a sharded table — the unified source's \
+             visibility would silently replace it (audit P3 hardening; thread it via src instead)"
+        );
+        let visibility = sharded_unified
+            .as_ref()
+            .map_or(visibility, |unified| unified.visibility);
+        let src = src.or(sharded_unified.as_ref().map(|unified| &unified.src));
         let (snapshot, device_memory, row_count) = match src {
             Some(src) => {
                 let snapshot = src.descriptor.clone();
@@ -4330,14 +4616,14 @@ impl Engine {
                 (snapshot, src.device_memory.clone(), src.row_count)
             }
             None => {
-                let residency_entry = self
-                    .relational_residency_entry(&table.name)
-                    .ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "relation \"{}\" has no resident snapshot",
-                            table.name
-                        )))
-                    })?;
+                let residency_entry =
+                    self.relational_residency_entry(&table.name)
+                        .ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "relation \"{}\" has no resident snapshot",
+                                table.name
+                            )))
+                        })?;
                 let snapshot = residency_entry.descriptor.clone();
                 if snapshot.schema != table.schema || snapshot.table != table.name {
                     return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -4432,7 +4718,10 @@ impl Engine {
         let count_distinct_groups = |value_idx: usize,
                                      g_vals: &[i64],
                                      idx_u64: &[u64]|
-         -> Result<Vec<gpu_db_execution::GroupByI32Row>, ExecuteError> {
+         -> Result<
+            Vec<gpu_db_execution::GroupByI32Row>,
+            ExecuteError,
+        > {
             let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
                 ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
             };
@@ -4446,50 +4735,49 @@ impl Engine {
                 | SqlType::Timestamp
                 | SqlType::Numeric { .. }
                 | SqlType::Uuid => {
-                    let (matrix, k) =
-                        if matches!(value_ty, SqlType::Numeric { .. } | SqlType::Uuid) {
-                            let off = resident_device_numeric_column_offset(
-                                &snapshot, table, value_idx,
-                            )?;
-                            let v128 = device_memory
-                                .project_i128_rows_from_payload(off, idx_u64)
-                                .map_err(map_err)?;
-                            let mut m = Vec::with_capacity(n * 3);
-                            for i in 0..n {
-                                m.push(g_vals[i]);
-                                m.push((v128[i] >> 64) as i64);
-                                m.push((v128[i] as u64) as i64);
-                            }
-                            (m, 3usize)
-                        } else {
-                            let v_vals: Vec<i64> = match value_ty {
-                                SqlType::Int8 | SqlType::Timestamp => device_memory
-                                    .project_i64_rows_from_payload(
-                                        resident_device_int8_column_offset(
-                                            &snapshot, table, value_idx,
-                                        )?,
-                                        idx_u64,
-                                    )
-                                    .map_err(map_err)?,
-                                _ => device_memory
-                                    .project_i32_rows_from_payload(
-                                        resident_device_int4_column_offset(
-                                            &snapshot, table, value_idx,
-                                        )?,
-                                        idx_u64,
-                                    )
-                                    .map_err(map_err)?
-                                    .into_iter()
-                                    .map(i64::from)
-                                    .collect(),
-                            };
-                            let mut m = Vec::with_capacity(n * 2);
-                            for i in 0..n {
-                                m.push(g_vals[i]);
-                                m.push(v_vals[i]);
-                            }
-                            (m, 2usize)
+                    let (matrix, k) = if matches!(value_ty, SqlType::Numeric { .. } | SqlType::Uuid)
+                    {
+                        let off =
+                            resident_device_numeric_column_offset(&snapshot, table, value_idx)?;
+                        let v128 = device_memory
+                            .project_i128_rows_from_payload(off, idx_u64)
+                            .map_err(map_err)?;
+                        let mut m = Vec::with_capacity(n * 3);
+                        for i in 0..n {
+                            m.push(g_vals[i]);
+                            m.push((v128[i] >> 64) as i64);
+                            m.push((v128[i] as u64) as i64);
+                        }
+                        (m, 3usize)
+                    } else {
+                        let v_vals: Vec<i64> = match value_ty {
+                            SqlType::Int8 | SqlType::Timestamp => device_memory
+                                .project_i64_rows_from_payload(
+                                    resident_device_int8_column_offset(
+                                        &snapshot, table, value_idx,
+                                    )?,
+                                    idx_u64,
+                                )
+                                .map_err(map_err)?,
+                            _ => device_memory
+                                .project_i32_rows_from_payload(
+                                    resident_device_int4_column_offset(
+                                        &snapshot, table, value_idx,
+                                    )?,
+                                    idx_u64,
+                                )
+                                .map_err(map_err)?
+                                .into_iter()
+                                .map(i64::from)
+                                .collect(),
                         };
+                        let mut m = Vec::with_capacity(n * 2);
+                        for i in 0..n {
+                            m.push(g_vals[i]);
+                            m.push(v_vals[i]);
+                        }
+                        (m, 2usize)
+                    };
                     let perm = device_memory
                         .bitonic_sort_multikey(&matrix, n, k, 0)
                         .map_err(map_err)?;
@@ -4498,8 +4786,7 @@ impl Engine {
                         .map_err(map_err)?
                 }
                 SqlType::Text => {
-                    let layout =
-                        resident_device_text_column_layout(&snapshot, table, value_idx)?;
+                    let layout = resident_device_text_column_layout(&snapshot, table, value_idx)?;
                     let key_plan: Vec<u32> = vec![0, 0x4000_0000_u32];
                     let perm = device_memory
                         .bitonic_sort_hetero(
@@ -4557,9 +4844,9 @@ impl Engine {
                     0,
                     g_sorted.device_ptr(),
                     new_distinct.device_ptr(),
-                    0, // comp_w (not a wide-key composite)
-                    0, // n_text (no text members)
-                    0, // text_desc_ptr
+                    0,    // comp_w (not a wide-key composite)
+                    0,    // n_text (no text members)
+                    0,    // text_desc_ptr
                     None, // value_null_off (COUNT(DISTINCT) over the marked tuple matrix)
                     None, // key_null_off (the marked-tuple matrix key is non-null by construction)
                     // COUNT(DISTINCT) SUM-of-new-distinct pass: the result builder reads this pass's
@@ -4826,7 +5113,8 @@ impl Engine {
             // 2-member fast path: both fixed-int, OR exactly one text + one fixed-int. A NULLABLE composite
             // takes the general WIDE-KEY path instead (composite_cols = None) -- the i64/i128 pack has no
             // room for a per-member validity bit, but the wide key carries a validity word.
-            let composite_cols: Option<(usize, SqlType, usize, SqlType)> = match &composite_members {
+            let composite_cols: Option<(usize, SqlType, usize, SqlType)> = match &composite_members
+            {
                 Some(m) if m.len() == 2 && !composite_key_has_null => {
                     let (c0, t0) = m[0];
                     let (c1, t1) = m[1];
@@ -4866,8 +5154,9 @@ impl Engine {
             // OTHER (fixed-width) member folded into the hash/verify (key_base_override). Otherwise both
             // members are fixed: i128-packed iff a member is int8/timestamp (combined width > 64 bits),
             // else i64-packed. Drives key_is_text / key_is_i128 / key_is_int8 / the pack / the result.
-            let composite_is_text = composite_cols
-                .is_some_and(|(_, t0, _, t1)| matches!(t0, SqlType::Text) != matches!(t1, SqlType::Text));
+            let composite_is_text = composite_cols.is_some_and(|(_, t0, _, t1)| {
+                matches!(t0, SqlType::Text) != matches!(t1, SqlType::Text)
+            });
             let composite_is_i128 = !composite_is_text
                 && composite_cols.is_some_and(|(_, t0, _, t1)| {
                     matches!(t0, SqlType::Int8 | SqlType::Timestamp)
@@ -4966,7 +5255,8 @@ impl Engine {
             // from the representative row. key_offsets_off/key_bytes_off locate the Arrow varlen column.
             // A (fixed, text) composite ALSO uses the text-key b128 claim, with the fixed member folded
             // into the hash/verify via key_base_override (set below).
-            let key_is_text = composite_is_text || (!is_expr_key && matches!(key_ty, SqlType::Text));
+            let key_is_text =
+                composite_is_text || (!is_expr_key && matches!(key_ty, SqlType::Text));
             // A bool key is materialized bool->int4 (0/1) into a derived buffer + grouped via
             // key_base_override (like an expression key); int4-width, never i128/text.
             let key_is_bool = !is_expr_key && matches!(key_ty, SqlType::Bool);
@@ -5041,7 +5331,9 @@ impl Engine {
                     };
                     let buf = device_memory
                         .arith_value_column_device(&program, row_count, elem)
-                        .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
+                        .map_err(|e| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+                        })?;
                     let ptr = buf.device_ptr();
                     _derived_key_buf = Some(buf);
                     ptr
@@ -5056,7 +5348,9 @@ impl Engine {
                     let offset = resident_device_bool_column_offset(&snapshot, table, group_idx)?;
                     let buf = device_memory
                         .bool_to_int4_column_device(offset, row_count)
-                        .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
+                        .map_err(|e| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+                        })?;
                     let ptr = buf.device_ptr();
                     _derived_key_buf = Some(buf);
                     ptr
@@ -5179,7 +5473,9 @@ impl Engine {
                             0,
                             &validity_descs,
                         )
-                        .map_err(|e| ExecuteError::Engine(EngineError::ApplyFailed(e.to_string())))?;
+                        .map_err(|e| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(e.to_string()))
+                        })?;
                     let ptr = buf.device_ptr();
                     _derived_key_buf = Some(buf);
                     ptr
@@ -5198,8 +5494,7 @@ impl Engine {
                     let mut flat: Vec<u64> = Vec::new();
                     for &(idx, ty) in members {
                         if matches!(ty, SqlType::Text) {
-                            let layout =
-                                resident_device_text_column_layout(&snapshot, table, idx)?;
+                            let layout = resident_device_text_column_layout(&snapshot, table, idx)?;
                             flat.push(layout.offsets_byte_offset);
                             flat.push(layout.bytes_byte_offset);
                         }
@@ -5334,138 +5629,137 @@ impl Engine {
                     }
                 }
             }
-            let run_pass =
-                |value_idx_opt: Option<usize>, has_minmax: bool| -> Result<Pass, ExecuteError> {
-                    // A None value column is the COUNT(*)-only pass: group over the key, read .count.
-                    let value_idx = value_idx_opt.unwrap_or(group_idx);
-                    let value_ty = table.columns[value_idx].ty;
-                    // M3 (doc 21) 3VL: a value pass over a NULLABLE column skips NULL values ON-DEVICE so
-                    // its count/sum/min/max are over only the non-NULL rows (COUNT(*) passes None and
-                    // counts every row). `None` = no bitmap (no NULLs) ⇒ byte-identical. Only the
-                    // single-level kernel honors it, so a nullable value forces single-level (below).
-                    let pass_value_null_off = if value_idx_opt.is_some() {
-                        resident_device_null_column_offset(&snapshot, table, value_idx)?
+            let run_pass = |value_idx_opt: Option<usize>,
+                            has_minmax: bool|
+             -> Result<Pass, ExecuteError> {
+                // A None value column is the COUNT(*)-only pass: group over the key, read .count.
+                let value_idx = value_idx_opt.unwrap_or(group_idx);
+                let value_ty = table.columns[value_idx].ty;
+                // M3 (doc 21) 3VL: a value pass over a NULLABLE column skips NULL values ON-DEVICE so
+                // its count/sum/min/max are over only the non-NULL rows (COUNT(*) passes None and
+                // counts every row). `None` = no bitmap (no NULLs) ⇒ byte-identical. Only the
+                // single-level kernel honors it, so a nullable value forces single-level (below).
+                let pass_value_null_off = if value_idx_opt.is_some() {
+                    resident_device_null_column_offset(&snapshot, table, value_idx)?
+                } else {
+                    None
+                };
+                let value_scale: u8 = match value_ty {
+                    SqlType::Numeric { scale, .. } => scale,
+                    _ => 0,
+                };
+                // Classify by the value TYPE (the device read width). MIN/MAX accept every ordered
+                // type; SUM/AVG over an unsupported type is rejected at bind. COUNT reads no value.
+                let (value_is_int8, value_is_numeric, value_is_uuid, value_is_text) =
+                    if value_idx_opt.is_none() {
+                        (false, false, false, false)
                     } else {
-                        None
-                    };
-                    let value_scale: u8 = match value_ty {
-                        SqlType::Numeric { scale, .. } => scale,
-                        _ => 0,
-                    };
-                    // Classify by the value TYPE (the device read width). MIN/MAX accept every ordered
-                    // type; SUM/AVG over an unsupported type is rejected at bind. COUNT reads no value.
-                    let (value_is_int8, value_is_numeric, value_is_uuid, value_is_text) =
-                        if value_idx_opt.is_none() {
-                            (false, false, false, false)
-                        } else {
-                            match value_ty {
-                                SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
-                                    (false, false, false, false)
-                                }
-                                SqlType::Int8 | SqlType::Timestamp => (true, false, false, false),
-                                SqlType::Numeric { .. } => (false, true, false, false),
-                                SqlType::Uuid => (false, false, true, false),
-                                SqlType::Text => (false, false, false, true),
-                                // bool value (MIN/MAX): materialized bool->int4, read via
-                                // value_base_override on the int4 value path.
-                                SqlType::Bool => (false, false, false, false),
+                        match value_ty {
+                            SqlType::Int4 | SqlType::Int2 | SqlType::Date => {
+                                (false, false, false, false)
                             }
-                        };
-                    let value_is_bool =
-                        value_idx_opt.is_some() && matches!(value_ty, SqlType::Bool);
-                    let value_offset = if value_idx_opt.is_none() || value_is_text || value_is_bool {
-                        // bool: value_offset is unused (value_base_override is set); key_offset is a safe
-                        // placeholder (avoids resolving an int4 offset on a bitmap bool column).
-                        key_offset
-                    } else if value_is_numeric || value_is_uuid {
-                        resident_device_numeric_column_offset(&snapshot, table, value_idx)?
-                    } else if value_is_int8 {
-                        resident_device_int8_column_offset(&snapshot, table, value_idx)?
-                    } else {
-                        resident_device_int4_column_offset(&snapshot, table, value_idx)?
+                            SqlType::Int8 | SqlType::Timestamp => (true, false, false, false),
+                            SqlType::Numeric { .. } => (false, true, false, false),
+                            SqlType::Uuid => (false, false, true, false),
+                            SqlType::Text => (false, false, false, true),
+                            // bool value (MIN/MAX): materialized bool->int4, read via
+                            // value_base_override on the int4 value path.
+                            SqlType::Bool => (false, false, false, false),
+                        }
                     };
-                    // MIN/MAX over a bool VALUE: materialize bool->int4 (0/1) into a derived buffer + read
-                    // it via value_base_override. Held alive across the kernel call (closure-local lease).
-                    let _derived_value_buf;
-                    let value_base_override: u64 = if value_is_bool && row_count > 0 {
-                        let offset = resident_device_bool_column_offset(&snapshot, table, value_idx)?;
-                        let buf = device_memory
-                            .bool_to_int4_column_device(offset, row_count)
-                            .map_err(map_err)?;
-                        let ptr = buf.device_ptr();
-                        _derived_value_buf = Some(buf);
-                        ptr
-                    } else {
-                        _derived_value_buf = None;
-                        0
-                    };
-                    let (value_offsets_off, value_bytes_off) = if value_is_text {
-                        let layout =
-                            resident_device_text_column_layout(&snapshot, table, value_idx)?;
-                        (layout.offsets_byte_offset, layout.bytes_byte_offset)
-                    } else {
-                        (0, 0)
-                    };
-                    let use_single_level = has_minmax
-                        || value_is_int8
-                        || value_is_numeric
-                        || value_is_uuid
-                        || value_is_text
-                        || value_is_bool
-                        || key_is_int8
-                        || key_is_i128
-                        || key_is_text
-                        || key_is_bool
-                        || composite_is_widekey
-                        || force_single;
-                    let groups = if use_single_level {
-                        device_memory.group_by_i32_count_sum_minmax_from_payload(
-                            key_offset,
-                            value_offset,
-                            &indices,
-                            value_is_int8,
-                            key_is_int8,
-                            value_is_numeric,
-                            value_is_uuid,
-                            key_is_i128,
-                            key_is_text,
-                            key_offsets_off,
-                            key_bytes_off,
-                            value_is_text,
-                            value_offsets_off,
-                            value_bytes_off,
-                            key_base_override,
-                            value_base_override,
-                            widekey_w,
-                            widekey_n_text,
-                            widekey_text_desc_ptr,
-                            pass_value_null_off,
-                            pass_key_null_off,
-                            // The query-wide pruning mask: this pass computes a superset of what its column
-                            // needs; the executor reads only the masked-in field(s) it requested.
-                            agg_mask,
-                        )
-                    } else {
-                        device_memory.group_by_i32_count_sum_from_payload(
-                            key_offset,
-                            value_offset,
-                            &indices,
-                            agg_mask,
-                        )
-                    }
-                    .map_err(map_err)?;
-                    Ok(Pass {
-                        value_idx,
-                        groups,
-                        value_ty,
-                        value_scale,
+                let value_is_bool = value_idx_opt.is_some() && matches!(value_ty, SqlType::Bool);
+                let value_offset = if value_idx_opt.is_none() || value_is_text || value_is_bool {
+                    // bool: value_offset is unused (value_base_override is set); key_offset is a safe
+                    // placeholder (avoids resolving an int4 offset on a bitmap bool column).
+                    key_offset
+                } else if value_is_numeric || value_is_uuid {
+                    resident_device_numeric_column_offset(&snapshot, table, value_idx)?
+                } else if value_is_int8 {
+                    resident_device_int8_column_offset(&snapshot, table, value_idx)?
+                } else {
+                    resident_device_int4_column_offset(&snapshot, table, value_idx)?
+                };
+                // MIN/MAX over a bool VALUE: materialize bool->int4 (0/1) into a derived buffer + read
+                // it via value_base_override. Held alive across the kernel call (closure-local lease).
+                let _derived_value_buf;
+                let value_base_override: u64 = if value_is_bool && row_count > 0 {
+                    let offset = resident_device_bool_column_offset(&snapshot, table, value_idx)?;
+                    let buf = device_memory
+                        .bool_to_int4_column_device(offset, row_count)
+                        .map_err(map_err)?;
+                    let ptr = buf.device_ptr();
+                    _derived_value_buf = Some(buf);
+                    ptr
+                } else {
+                    _derived_value_buf = None;
+                    0
+                };
+                let (value_offsets_off, value_bytes_off) = if value_is_text {
+                    let layout = resident_device_text_column_layout(&snapshot, table, value_idx)?;
+                    (layout.offsets_byte_offset, layout.bytes_byte_offset)
+                } else {
+                    (0, 0)
+                };
+                let use_single_level = has_minmax
+                    || value_is_int8
+                    || value_is_numeric
+                    || value_is_uuid
+                    || value_is_text
+                    || value_is_bool
+                    || key_is_int8
+                    || key_is_i128
+                    || key_is_text
+                    || key_is_bool
+                    || composite_is_widekey
+                    || force_single;
+                let groups = if use_single_level {
+                    device_memory.group_by_i32_count_sum_minmax_from_payload(
+                        key_offset,
+                        value_offset,
+                        &indices,
                         value_is_int8,
+                        key_is_int8,
                         value_is_numeric,
                         value_is_uuid,
+                        key_is_i128,
+                        key_is_text,
+                        key_offsets_off,
+                        key_bytes_off,
                         value_is_text,
-                        is_count_distinct: false,
-                    })
-                };
+                        value_offsets_off,
+                        value_bytes_off,
+                        key_base_override,
+                        value_base_override,
+                        widekey_w,
+                        widekey_n_text,
+                        widekey_text_desc_ptr,
+                        pass_value_null_off,
+                        pass_key_null_off,
+                        // The query-wide pruning mask: this pass computes a superset of what its column
+                        // needs; the executor reads only the masked-in field(s) it requested.
+                        agg_mask,
+                    )
+                } else {
+                    device_memory.group_by_i32_count_sum_from_payload(
+                        key_offset,
+                        value_offset,
+                        &indices,
+                        agg_mask,
+                    )
+                }
+                .map_err(map_err)?;
+                Ok(Pass {
+                    value_idx,
+                    groups,
+                    value_ty,
+                    value_scale,
+                    value_is_int8,
+                    value_is_numeric,
+                    value_is_uuid,
+                    value_is_text,
+                    is_count_distinct: false,
+                })
+            };
             let mut passes: Vec<Pass> = if value_indices.is_empty() {
                 // COUNT(*) only: a single pass over the key column.
                 vec![run_pass(None, false)?]
@@ -5708,116 +6002,117 @@ impl Engine {
             // validity (a nullable member is SqlValue::Null), at every group's key rep index across ALL
             // passes (covers materialize_key in #30 AND the result builder, incl. NULL-key groups whose
             // members the result builder reads from the rep row).
-            let materialize_col_at = |col: usize, reps: &[u64]| -> Result<Vec<SqlValue>, ExecuteError> {
-                if reps.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let validity: Option<Vec<bool>> =
-                    match resident_device_null_column_offset(&snapshot, table, col)? {
-                        Some(off) => Some(
-                            device_memory
-                                .project_bool_rows_from_payload(off, reps)
-                                .map_err(map_err)?,
-                        ),
-                        None => None,
-                    };
-                let base: Vec<SqlValue> = match table.columns[col].ty {
-                    SqlType::Int8 => device_memory
-                        .project_i64_rows_from_payload(
-                            resident_device_int8_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(SqlValue::Int8)
-                        .collect(),
-                    SqlType::Timestamp => device_memory
-                        .project_i64_rows_from_payload(
-                            resident_device_int8_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(SqlValue::Timestamp)
-                        .collect(),
-                    SqlType::Numeric { scale, .. } => device_memory
-                        .project_i128_rows_from_payload(
-                            resident_device_numeric_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(|v| SqlValue::Numeric(Decimal128::new(v, scale)))
-                        .collect(),
-                    SqlType::Uuid => device_memory
-                        .project_i128_rows_from_payload(
-                            resident_device_numeric_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(|v| SqlValue::Uuid(v.to_le_bytes()))
-                        .collect(),
-                    SqlType::Date => device_memory
-                        .project_i32_rows_from_payload(
-                            resident_device_int4_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(SqlValue::Date)
-                        .collect(),
-                    SqlType::Int2 => device_memory
-                        .project_i32_rows_from_payload(
-                            resident_device_int4_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(|v| SqlValue::Int2(v as i16))
-                        .collect(),
-                    SqlType::Bool => device_memory
-                        .project_bool_rows_from_payload(
-                            resident_device_bool_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
-                        .into_iter()
-                        .map(SqlValue::Bool)
-                        .collect(),
-                    SqlType::Text => {
-                        let layout = resident_device_text_column_layout(&snapshot, table, col)?;
-                        device_memory
-                            .project_text_rows_from_payload(
-                                layout.offsets_byte_offset,
-                                layout.bytes_byte_offset,
-                                layout.bytes_len,
+            let materialize_col_at =
+                |col: usize, reps: &[u64]| -> Result<Vec<SqlValue>, ExecuteError> {
+                    if reps.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let validity: Option<Vec<bool>> =
+                        match resident_device_null_column_offset(&snapshot, table, col)? {
+                            Some(off) => Some(
+                                device_memory
+                                    .project_bool_rows_from_payload(off, reps)
+                                    .map_err(map_err)?,
+                            ),
+                            None => None,
+                        };
+                    let base: Vec<SqlValue> = match table.columns[col].ty {
+                        SqlType::Int8 => device_memory
+                            .project_i64_rows_from_payload(
+                                resident_device_int8_column_offset(&snapshot, table, col)?,
                                 reps,
                             )
                             .map_err(map_err)?
                             .into_iter()
-                            .map(SqlValue::Text)
-                            .collect()
-                    }
-                    SqlType::Int4 => device_memory
-                        .project_i32_rows_from_payload(
-                            resident_device_int4_column_offset(&snapshot, table, col)?,
-                            reps,
-                        )
-                        .map_err(map_err)?
+                            .map(SqlValue::Int8)
+                            .collect(),
+                        SqlType::Timestamp => device_memory
+                            .project_i64_rows_from_payload(
+                                resident_device_int8_column_offset(&snapshot, table, col)?,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(SqlValue::Timestamp)
+                            .collect(),
+                        SqlType::Numeric { scale, .. } => device_memory
+                            .project_i128_rows_from_payload(
+                                resident_device_numeric_column_offset(&snapshot, table, col)?,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(|v| SqlValue::Numeric(Decimal128::new(v, scale)))
+                            .collect(),
+                        SqlType::Uuid => device_memory
+                            .project_i128_rows_from_payload(
+                                resident_device_numeric_column_offset(&snapshot, table, col)?,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(|v| SqlValue::Uuid(v.to_le_bytes()))
+                            .collect(),
+                        SqlType::Date => device_memory
+                            .project_i32_rows_from_payload(
+                                resident_device_int4_column_offset(&snapshot, table, col)?,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(SqlValue::Date)
+                            .collect(),
+                        SqlType::Int2 => device_memory
+                            .project_i32_rows_from_payload(
+                                resident_device_int4_column_offset(&snapshot, table, col)?,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(|v| SqlValue::Int2(v as i16))
+                            .collect(),
+                        SqlType::Bool => device_memory
+                            .project_bool_rows_from_payload(
+                                resident_device_bool_column_offset(&snapshot, table, col)?,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(SqlValue::Bool)
+                            .collect(),
+                        SqlType::Text => {
+                            let layout = resident_device_text_column_layout(&snapshot, table, col)?;
+                            device_memory
+                                .project_text_rows_from_payload(
+                                    layout.offsets_byte_offset,
+                                    layout.bytes_byte_offset,
+                                    layout.bytes_len,
+                                    reps,
+                                )
+                                .map_err(map_err)?
+                                .into_iter()
+                                .map(SqlValue::Text)
+                                .collect()
+                        }
+                        SqlType::Int4 => device_memory
+                            .project_i32_rows_from_payload(
+                                resident_device_int4_column_offset(&snapshot, table, col)?,
+                                reps,
+                            )
+                            .map_err(map_err)?
+                            .into_iter()
+                            .map(SqlValue::Int4)
+                            .collect(),
+                    };
+                    Ok(base
                         .into_iter()
-                        .map(SqlValue::Int4)
-                        .collect(),
+                        .enumerate()
+                        .map(|(i, v)| match &validity {
+                            Some(val) if !val[i] => SqlValue::Null,
+                            _ => v,
+                        })
+                        .collect())
                 };
-                Ok(base
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| match &validity {
-                        Some(val) if !val[i] => SqlValue::Null,
-                        _ => v,
-                    })
-                    .collect())
-            };
             let member_cell: std::collections::HashMap<(usize, usize), SqlValue> = {
                 let member_cols: Vec<usize> = if let Some(m) = &widekey_cols {
                     m.iter().map(|&(c, _)| c).collect()
@@ -5874,7 +6169,11 @@ impl Engine {
                     if composite_is_text {
                         let rep_idx = gk.key_i128 as u64 as usize;
                         let (cc0, ct0, cc1, _) = composite_cols.unwrap();
-                        let text_col = if matches!(ct0, SqlType::Text) { cc0 } else { cc1 };
+                        let text_col = if matches!(ct0, SqlType::Text) {
+                            cc0
+                        } else {
+                            cc1
+                        };
                         member_cell[&(rep_idx, text_col)].clone()
                     } else if composite_is_i128 {
                         SqlValue::Numeric(Decimal128::new(gk.key_i128, 0))
@@ -5967,7 +6266,10 @@ impl Engine {
                         &key_types,
                         &device_memory,
                     )?;
-                    pass.groups = perm.iter().map(|&p| pass.groups[p as usize].clone()).collect();
+                    pass.groups = perm
+                        .iter()
+                        .map(|&p| pass.groups[p as usize].clone())
+                        .collect();
                 }
             }
             // S2.2b-i: MIN/MAX over a TEXT value, materialized ON-DEVICE. For each text value pass, gather
@@ -6021,8 +6323,7 @@ impl Engine {
                 } else {
                     1
                 };
-                let mut row: Vec<SqlValue> =
-                    Vec::with_capacity(aggregates.len() + n_group_cols);
+                let mut row: Vec<SqlValue> = Vec::with_capacity(aggregates.len() + n_group_cols);
                 if let Some(members) = &widekey_cols {
                     // Wide-key: the b128 slot's lo = the representative row index -- read EACH member from
                     // the rep row, materialized ON-DEVICE into member_cell, in DECLARED order.
@@ -6087,59 +6388,64 @@ impl Engine {
                             if g.count == 0 {
                                 SqlValue::Null
                             } else {
-                            // For int8/numeric the SUM is the i128 (sum_hi:sum); else sign-extend.
-                            let sum_i128 = if pass.value_is_int8 || pass.value_is_numeric {
-                                (i128::from(g.sum_hi) << 64) | i128::from(g.sum as u64)
-                            } else {
-                                i128::from(g.sum)
-                            };
-                            match aggregate.kind {
-                                GroupedAggKind::Sum if pass.value_is_numeric => {
-                                    SqlValue::Numeric(Decimal128::new(sum_i128, pass.value_scale))
+                                // For int8/numeric the SUM is the i128 (sum_hi:sum); else sign-extend.
+                                let sum_i128 = if pass.value_is_int8 || pass.value_is_numeric {
+                                    (i128::from(g.sum_hi) << 64) | i128::from(g.sum as u64)
+                                } else {
+                                    i128::from(g.sum)
+                                };
+                                match aggregate.kind {
+                                    GroupedAggKind::Sum if pass.value_is_numeric => {
+                                        SqlValue::Numeric(Decimal128::new(
+                                            sum_i128,
+                                            pass.value_scale,
+                                        ))
+                                    }
+                                    GroupedAggKind::Sum if pass.value_is_int8 => {
+                                        SqlValue::Numeric(Decimal128::new(sum_i128, 0))
+                                    }
+                                    GroupedAggKind::Sum => SqlValue::Int8(g.sum),
+                                    GroupedAggKind::Avg if pass.value_is_numeric => {
+                                        avg_numeric_sql_value(
+                                            sum_i128,
+                                            g.count as usize,
+                                            pass.value_scale,
+                                        )
+                                    }
+                                    GroupedAggKind::Avg => {
+                                        average_sql_value(sum_i128, g.count as usize)
+                                    }
+                                    GroupedAggKind::Min if pass.value_is_uuid => {
+                                        SqlValue::Uuid(g.min_uuid)
+                                    }
+                                    GroupedAggKind::Max if pass.value_is_uuid => {
+                                        SqlValue::Uuid(g.max_uuid)
+                                    }
+                                    // S2.2b-i: device-gathered MIN/MAX text (text_value_minmax), aligned with
+                                    // reference.groups by index i. count==0 was handled above (returns NULL).
+                                    GroupedAggKind::Min if pass.value_is_text => SqlValue::Text(
+                                        text_value_minmax[&pass.value_idx].0[i].clone(),
+                                    ),
+                                    GroupedAggKind::Max if pass.value_is_text => SqlValue::Text(
+                                        text_value_minmax[&pass.value_idx].1[i].clone(),
+                                    ),
+                                    GroupedAggKind::Min => narrow_ordered_value(
+                                        pass.value_ty,
+                                        g.min,
+                                        g.min_hi,
+                                        pass.value_scale,
+                                    ),
+                                    GroupedAggKind::Max => narrow_ordered_value(
+                                        pass.value_ty,
+                                        g.max,
+                                        g.max_hi,
+                                        pass.value_scale,
+                                    ),
+                                    GroupedAggKind::Count => unreachable!("count handled above"),
+                                    GroupedAggKind::CountDistinct => {
+                                        unreachable!("count distinct handled above")
+                                    }
                                 }
-                                GroupedAggKind::Sum if pass.value_is_int8 => {
-                                    SqlValue::Numeric(Decimal128::new(sum_i128, 0))
-                                }
-                                GroupedAggKind::Sum => SqlValue::Int8(g.sum),
-                                GroupedAggKind::Avg if pass.value_is_numeric => avg_numeric_sql_value(
-                                    sum_i128,
-                                    g.count as usize,
-                                    pass.value_scale,
-                                ),
-                                GroupedAggKind::Avg => {
-                                    average_sql_value(sum_i128, g.count as usize)
-                                }
-                                GroupedAggKind::Min if pass.value_is_uuid => {
-                                    SqlValue::Uuid(g.min_uuid)
-                                }
-                                GroupedAggKind::Max if pass.value_is_uuid => {
-                                    SqlValue::Uuid(g.max_uuid)
-                                }
-                                // S2.2b-i: device-gathered MIN/MAX text (text_value_minmax), aligned with
-                                // reference.groups by index i. count==0 was handled above (returns NULL).
-                                GroupedAggKind::Min if pass.value_is_text => {
-                                    SqlValue::Text(text_value_minmax[&pass.value_idx].0[i].clone())
-                                }
-                                GroupedAggKind::Max if pass.value_is_text => {
-                                    SqlValue::Text(text_value_minmax[&pass.value_idx].1[i].clone())
-                                }
-                                GroupedAggKind::Min => narrow_ordered_value(
-                                    pass.value_ty,
-                                    g.min,
-                                    g.min_hi,
-                                    pass.value_scale,
-                                ),
-                                GroupedAggKind::Max => narrow_ordered_value(
-                                    pass.value_ty,
-                                    g.max,
-                                    g.max_hi,
-                                    pass.value_scale,
-                                ),
-                                GroupedAggKind::Count => unreachable!("count handled above"),
-                                GroupedAggKind::CountDistinct => {
-                                    unreachable!("count distinct handled above")
-                                }
-                            }
                             }
                         }
                     };
@@ -6297,7 +6603,10 @@ impl Engine {
                         let leaf = ResidentExpr::Binary {
                             op: having_op_to_resident(f.op),
                             lhs: Box::new(ResidentExpr::Column(col_index(&f.column)?)),
-                            rhs: Box::new(having_value_to_resident_literal(&f.value, numeric_mode)?),
+                            rhs: Box::new(having_value_to_resident_literal(
+                                &f.value,
+                                numeric_mode,
+                            )?),
                         };
                         conj = Some(match conj {
                             None => leaf,
@@ -6340,8 +6649,10 @@ impl Engine {
                         having_rows.len() as u64,
                         None,
                     )?;
-                    let kept: Vec<Vec<SqlValue>> =
-                        survivors.iter().map(|&i| rows[i as usize].clone()).collect();
+                    let kept: Vec<Vec<SqlValue>> = survivors
+                        .iter()
+                        .map(|&i| rows[i as usize].clone())
+                        .collect();
                     rows = kept;
                 }
             }
@@ -6356,8 +6667,7 @@ impl Engine {
             // that window from the materialized group rows. With no LIMIT the window is the full range, so
             // this is byte-identical to the prior gpu_sort_result_rows reorder.
             if rows.len() > 1 || select.offset.is_some() || select.limit.is_some() {
-                let col_types: Vec<SqlType> =
-                    bound.selected_columns.iter().map(|c| c.ty).collect();
+                let col_types: Vec<SqlType> = bound.selected_columns.iter().map(|c| c.ty).collect();
                 // The GROUP-KEY result columns (emitted first by the merge): result columns 0..n_group_cols.
                 let n_group_cols = if is_composite_key {
                     2
@@ -6406,8 +6716,10 @@ impl Engine {
                 let end = select
                     .limit
                     .map_or(perm.len(), |l| start.saturating_add(l).min(perm.len()));
-                let windowed: Vec<Vec<SqlValue>> =
-                    perm[start..end].iter().map(|&p| rows[p as usize].clone()).collect();
+                let windowed: Vec<Vec<SqlValue>> = perm[start..end]
+                    .iter()
+                    .map(|&p| rows[p as usize].clone())
+                    .collect();
                 rows = windowed;
             }
             return Ok(RelationalSelectResult {
@@ -6507,11 +6819,9 @@ impl Engine {
                             let byte_offset =
                                 resident_device_int4_column_offset(&snapshot, table, col_idx)?;
                             let value = if is_max {
-                                device_memory
-                                    .max_i32_at_indices_from_payload(byte_offset, &indices)
+                                device_memory.max_i32_at_indices_from_payload(byte_offset, &indices)
                             } else {
-                                device_memory
-                                    .min_i32_at_indices_from_payload(byte_offset, &indices)
+                                device_memory.min_i32_at_indices_from_payload(byte_offset, &indices)
                             }
                             .map_err(map_err)?;
                             SqlValue::Int4(value)
@@ -6520,11 +6830,9 @@ impl Engine {
                             let byte_offset =
                                 resident_device_int8_column_offset(&snapshot, table, col_idx)?;
                             let value = if is_max {
-                                device_memory
-                                    .max_i64_at_indices_from_payload(byte_offset, &indices)
+                                device_memory.max_i64_at_indices_from_payload(byte_offset, &indices)
                             } else {
-                                device_memory
-                                    .min_i64_at_indices_from_payload(byte_offset, &indices)
+                                device_memory.min_i64_at_indices_from_payload(byte_offset, &indices)
                             }
                             .map_err(map_err)?;
                             SqlValue::Int8(value)
@@ -6652,74 +6960,75 @@ impl Engine {
         // (`ORDER BY a+b`) is evaluated on-device into an i64 column (checked int4 overflow -> PG error,
         // never CPU); a plain int column is projected. Both sort arms below use this; an expression key
         // always counts as an int key. `indices` is a param (the else arm below moves `indices_u64`).
-        let materialize_int_key_column = |ki: usize, indices: &[u64]| -> Result<Vec<i64>, ExecuteError> {
-            let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
-                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
-            };
-            if let Some(Some(expr)) = order_by_exprs.get(ki) {
-                let mut program = Vec::new();
-                compile_arith_program(expr, table, &snapshot, &mut program)?;
-                let idx32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
-                // int8 operands -> the i64 arith VM + i64 value width; else int4/I32. Reading an int8
-                // expr as I32 would stride a BIGINT column by 4 bytes -> silently garbage sort keys.
-                let elem = if expr_mentions_int8(expr, table) {
-                    ResidentElemType::I64
-                } else {
-                    ResidentElemType::I32
+        let materialize_int_key_column =
+            |ki: usize, indices: &[u64]| -> Result<Vec<i64>, ExecuteError> {
+                let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                 };
-                // M3 (doc 21): a NULLABLE int4 expression blends the i64::MAX default-end sentinel
-                // ON-DEVICE where any operand is NULL (a validity mask VM run + the on-device blend). int8
-                // nullable + explicit NULLS FIRST/LAST are clean-errored at the routing loop below; a
-                // non-nullable expression keeps the plain (no-validity) path.
-                if elem == ResidentElemType::I32
-                    && predicate_references_nullable_column(expr, table, &snapshot)?
-                {
-                    let mut validity_program = vec![ExprStep::ConstMask { value: true }];
-                    push_leaf_validity_and(&[expr], table, &snapshot, &mut validity_program)?;
+                if let Some(Some(expr)) = order_by_exprs.get(ki) {
+                    let mut program = Vec::new();
+                    compile_arith_program(expr, table, &snapshot, &mut program)?;
+                    let idx32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+                    // int8 operands -> the i64 arith VM + i64 value width; else int4/I32. Reading an int8
+                    // expr as I32 would stride a BIGINT column by 4 bytes -> silently garbage sort keys.
+                    let elem = if expr_mentions_int8(expr, table) {
+                        ResidentElemType::I64
+                    } else {
+                        ResidentElemType::I32
+                    };
+                    // M3 (doc 21): a NULLABLE int4 expression blends the i64::MAX default-end sentinel
+                    // ON-DEVICE where any operand is NULL (a validity mask VM run + the on-device blend). int8
+                    // nullable + explicit NULLS FIRST/LAST are clean-errored at the routing loop below; a
+                    // non-nullable expression keeps the plain (no-validity) path.
+                    if elem == ResidentElemType::I32
+                        && predicate_references_nullable_column(expr, table, &snapshot)?
+                    {
+                        let mut validity_program = vec![ExprStep::ConstMask { value: true }];
+                        push_leaf_validity_and(&[expr], table, &snapshot, &mut validity_program)?;
+                        return device_memory
+                            .arith_value_column_at_indices_nullable(
+                                &program,
+                                &validity_program,
+                                row_count,
+                                &idx32,
+                            )
+                            .map_err(map_err);
+                    }
                     return device_memory
-                        .arith_value_column_at_indices_nullable(
-                            &program,
-                            &validity_program,
-                            row_count,
-                            &idx32,
-                        )
+                        .arith_value_column_at_indices(&program, row_count, &idx32, elem)
                         .map_err(map_err);
                 }
-                return device_memory
-                    .arith_value_column_at_indices(&program, row_count, &idx32, elem)
-                    .map_err(map_err);
-            }
-            let order = &select.order_by[ki];
-            let order_idx = relational_column_index(table, &order.column)?;
-            let keys: Vec<i64> = match table.columns[order_idx].ty {
-                SqlType::Int4 | SqlType::Int2 | SqlType::Date => device_memory
-                    .project_i32_rows_from_payload(
-                        resident_device_int4_column_offset(&snapshot, table, order_idx)?,
-                        indices,
-                    )
-                    .map_err(map_err)?
-                    .into_iter()
-                    .map(i64::from)
-                    .collect(),
-                SqlType::Int8 | SqlType::Timestamp => device_memory
-                    .project_i64_rows_from_payload(
-                        resident_device_int8_column_offset(&snapshot, table, order_idx)?,
-                        indices,
-                    )
-                    .map_err(map_err)?,
-                _ => {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "ORDER BY key is not an i64-sortable int column".to_string(),
-                    )))
-                }
+                let order = &select.order_by[ki];
+                let order_idx = relational_column_index(table, &order.column)?;
+                let keys: Vec<i64> = match table.columns[order_idx].ty {
+                    SqlType::Int4 | SqlType::Int2 | SqlType::Date => device_memory
+                        .project_i32_rows_from_payload(
+                            resident_device_int4_column_offset(&snapshot, table, order_idx)?,
+                            indices,
+                        )
+                        .map_err(map_err)?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect(),
+                    SqlType::Int8 | SqlType::Timestamp => device_memory
+                        .project_i64_rows_from_payload(
+                            resident_device_int8_column_offset(&snapshot, table, order_idx)?,
+                            indices,
+                        )
+                        .map_err(map_err)?,
+                    _ => {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "ORDER BY key is not an i64-sortable int column".to_string(),
+                        )))
+                    }
+                };
+                // M3 (doc 21): NULL placement is done ON-DEVICE by the sort comparator (it reads the per-key
+                // validity bitmap and orders NULL keys to the PG-default end), so the key VALUES here are raw —
+                // a NULL row's placeholder value is never compared. (A nullable key always routes to the
+                // validity-aware hetero comparator below; this raw matrix only feeds that path or the non-null
+                // pure-int path.) No host-side NULL overwrite.
+                Ok(keys)
             };
-            // M3 (doc 21): NULL placement is done ON-DEVICE by the sort comparator (it reads the per-key
-            // validity bitmap and orders NULL keys to the PG-default end), so the key VALUES here are raw —
-            // a NULL row's placeholder value is never compared. (A nullable key always routes to the
-            // validity-aware hetero comparator below; this raw matrix only feeds that path or the non-null
-            // pure-int path.) No host-side NULL overwrite.
-            Ok(keys)
-        };
         // A sort EXPRESSION is int-valued. has_text_key (TEXT only) gates the single-text fast path;
         // has_hetero_key (TEXT/NUMERIC/UUID -- the keys that can't live in the i64 matrix) routes to the
         // heterogeneous comparator.
@@ -6956,9 +7265,9 @@ impl Engine {
         // control-plane; the relational ordering+windowing decision rode the device sort.
         let indices_u64 = if select.offset.is_some() || select.limit.is_some() {
             let start = select.offset.unwrap_or(0).min(indices_u64.len());
-            let end = select
-                .limit
-                .map_or(indices_u64.len(), |l| start.saturating_add(l).min(indices_u64.len()));
+            let end = select.limit.map_or(indices_u64.len(), |l| {
+                start.saturating_add(l).min(indices_u64.len())
+            });
             indices_u64[start..end].to_vec()
         } else {
             indices_u64
@@ -7117,7 +7426,10 @@ impl Engine {
         for row in 0..indices_u64.len() {
             for (c, column) in projected_columns.iter().enumerate() {
                 // A NULL row (validity bit 0) projects as SQL NULL regardless of its placeholder.
-                if projected_validity[c].as_ref().is_some_and(|validity| !validity[row]) {
+                if projected_validity[c]
+                    .as_ref()
+                    .is_some_and(|validity| !validity[row])
+                {
                     flat.push(SqlValue::Null);
                     continue;
                 }
@@ -7488,14 +7800,22 @@ impl Engine {
                     let days = date_literal_days(rhs)?;
                     let off = resident_device_int4_column_offset(snapshot, table, col)?;
                     program.push(ExprStep::LoadColumn { byte_offset: off });
-                    program.push(ExprStep::CompareScalar { cmp, scalar: days, scalar_on_left: false });
+                    program.push(ExprStep::CompareScalar {
+                        cmp,
+                        scalar: days,
+                        scalar_on_left: false,
+                    });
                     push_column_validity_and(col, table, snapshot, &mut program)?;
                 }
                 (None, Some(col)) => {
                     let days = date_literal_days(lhs)?;
                     let off = resident_device_int4_column_offset(snapshot, table, col)?;
                     program.push(ExprStep::LoadColumn { byte_offset: off });
-                    program.push(ExprStep::CompareScalar { cmp, scalar: days, scalar_on_left: true });
+                    program.push(ExprStep::CompareScalar {
+                        cmp,
+                        scalar: days,
+                        scalar_on_left: true,
+                    });
                     push_column_validity_and(col, table, snapshot, &mut program)?;
                 }
                 (Some(a), Some(b)) => {
@@ -7518,19 +7838,30 @@ impl Engine {
         // literal exceeds the i32 CompareScalar scalar).
         if expr_mentions_timestamp(lhs, table) || expr_mentions_timestamp(rhs, table) {
             let mut program = Vec::new();
-            match (timestamp_column_index(lhs, table), timestamp_column_index(rhs, table)) {
+            match (
+                timestamp_column_index(lhs, table),
+                timestamp_column_index(rhs, table),
+            ) {
                 (Some(col), None) => {
                     let micros = timestamp_literal_micros(rhs)?;
                     let off = resident_device_int8_column_offset(snapshot, table, col)?;
                     program.push(ExprStep::LoadColumn { byte_offset: off });
-                    program.push(ExprStep::CompareScalarI64 { cmp, scalar: micros, scalar_on_left: false });
+                    program.push(ExprStep::CompareScalarI64 {
+                        cmp,
+                        scalar: micros,
+                        scalar_on_left: false,
+                    });
                     push_column_validity_and(col, table, snapshot, &mut program)?;
                 }
                 (None, Some(col)) => {
                     let micros = timestamp_literal_micros(lhs)?;
                     let off = resident_device_int8_column_offset(snapshot, table, col)?;
                     program.push(ExprStep::LoadColumn { byte_offset: off });
-                    program.push(ExprStep::CompareScalarI64 { cmp, scalar: micros, scalar_on_left: true });
+                    program.push(ExprStep::CompareScalarI64 {
+                        cmp,
+                        scalar: micros,
+                        scalar_on_left: true,
+                    });
                     push_column_validity_and(col, table, snapshot, &mut program)?;
                 }
                 (Some(a), Some(b)) => {
@@ -7623,8 +7954,14 @@ impl Engine {
             let mantissa = rescale_numeric_literal(literal, col_scale)?;
             let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
             let mut program = vec![
-                ExprStep::LoadColumn { byte_offset: offset },
-                ExprStep::CompareScalarI128 { cmp, scalar: mantissa, scalar_on_left },
+                ExprStep::LoadColumn {
+                    byte_offset: offset,
+                },
+                ExprStep::CompareScalarI128 {
+                    cmp,
+                    scalar: mantissa,
+                    scalar_on_left,
+                },
             ];
             push_column_validity_and(col, table, snapshot, &mut program)?;
             Ok(Some(program))
@@ -7645,8 +7982,12 @@ impl Engine {
                 let a_offset = resident_device_numeric_column_offset(snapshot, table, a)?;
                 let b_offset = resident_device_numeric_column_offset(snapshot, table, b)?;
                 let mut program = vec![
-                    ExprStep::LoadColumn { byte_offset: a_offset },
-                    ExprStep::LoadColumn { byte_offset: b_offset },
+                    ExprStep::LoadColumn {
+                        byte_offset: a_offset,
+                    },
+                    ExprStep::LoadColumn {
+                        byte_offset: b_offset,
+                    },
                     ExprStep::CompareBuffers { cmp },
                 ];
                 push_column_validity_and(a, table, snapshot, &mut program)?;
@@ -7707,7 +8048,14 @@ impl Engine {
                 let needle = uuid_literal_bytes(rhs)?;
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
                 device_memory
-                    .expr_uuid_compare_scalar_filter(offset, &needle, false, cmp, row_count, &validity(col)?)
+                    .expr_uuid_compare_scalar_filter(
+                        offset,
+                        &needle,
+                        false,
+                        cmp,
+                        row_count,
+                        &validity(col)?,
+                    )
                     .map(Some)
                     .map_err(map_err)
             }
@@ -7715,7 +8063,14 @@ impl Engine {
                 let needle = uuid_literal_bytes(lhs)?;
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
                 device_memory
-                    .expr_uuid_compare_scalar_filter(offset, &needle, true, cmp, row_count, &validity(col)?)
+                    .expr_uuid_compare_scalar_filter(
+                        offset,
+                        &needle,
+                        true,
+                        cmp,
+                        row_count,
+                        &validity(col)?,
+                    )
                     .map(Some)
                     .map_err(map_err)
             }
@@ -7725,7 +8080,13 @@ impl Engine {
                 let mut validity_offsets = validity(a)?;
                 validity_offsets.extend(validity(b)?);
                 device_memory
-                    .expr_uuid_compare_columns_filter(a_offset, b_offset, cmp, row_count, &validity_offsets)
+                    .expr_uuid_compare_columns_filter(
+                        a_offset,
+                        b_offset,
+                        cmp,
+                        row_count,
+                        &validity_offsets,
+                    )
                     .map(Some)
                     .map_err(map_err)
             }
@@ -7991,7 +8352,8 @@ impl Engine {
             numeric_column_index(rhs, table),
         ) {
             (Some(col), None) if numeric_literal_value(rhs).is_some() => {
-                let col_scale = column_numeric_scale(table, col).expect("numeric column has a scale");
+                let col_scale =
+                    column_numeric_scale(table, col).expect("numeric column has a scale");
                 let literal = numeric_literal_value(rhs).expect("checked").canonical();
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
                 if literal.scale <= col_scale {
@@ -8017,7 +8379,8 @@ impl Engine {
                 }
             }
             (None, Some(col)) if numeric_literal_value(lhs).is_some() => {
-                let col_scale = column_numeric_scale(table, col).expect("numeric column has a scale");
+                let col_scale =
+                    column_numeric_scale(table, col).expect("numeric column has a scale");
                 let literal = numeric_literal_value(lhs).expect("checked").canonical();
                 let offset = resident_device_numeric_column_offset(snapshot, table, col)?;
                 if literal.scale <= col_scale {
@@ -8028,7 +8391,13 @@ impl Engine {
                         .map_err(map_err)
                 } else {
                     self.numeric_cross_scale_scalar(
-                        offset, col_scale, literal, true, cmp, device_memory, row_count,
+                        offset,
+                        col_scale,
+                        literal,
+                        true,
+                        cmp,
+                        device_memory,
+                        row_count,
                     )
                     .map(Some)
                 }
@@ -8159,9 +8528,8 @@ impl Engine {
         device_memory: &CudaResidentDeviceMemory,
         row_count: u64,
     ) -> Result<Option<Vec<u32>>, ExecuteError> {
-        let is_bool_col = |idx: usize| {
-            table.columns.get(idx).map(|column| column.ty) == Some(SqlType::Bool)
-        };
+        let is_bool_col =
+            |idx: usize| table.columns.get(idx).map(|column| column.ty) == Some(SqlType::Bool);
         let (col, literal) = match (lhs, rhs) {
             (ResidentExpr::Column(col), ResidentExpr::BoolLiteral(b)) if is_bool_col(*col) => {
                 (*col, *b)
@@ -8178,7 +8546,8 @@ impl Engine {
             ResidentBinaryOp::Ne => literal,
             _ => {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "the general GPU executor supports only = / <> against a bool literal".to_string(),
+                    "the general GPU executor supports only = / <> against a bool literal"
+                        .to_string(),
                 )));
             }
         };
@@ -8233,7 +8602,13 @@ impl Engine {
         // mask (true rows). A bare NON-bool column is invalid SQL (PG: "argument of WHERE must be type
         // boolean"), so it hard-errors rather than mis-answering.
         if let ResidentExpr::Column(col) = predicate {
-            return self.lower_bool_column_predicate(*col, table, snapshot, device_memory, row_count);
+            return self.lower_bool_column_predicate(
+                *col,
+                table,
+                snapshot,
+                device_memory,
+                row_count,
+            );
         }
 
         // A standalone `col IS NULL` / `IS NOT NULL` (M3 -- doc 19/21): its NULL validity bitmap straight
@@ -8266,7 +8641,9 @@ impl Engine {
                 compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
                 return device_memory
                     .run_expr_predicate_filter_with_text(&program, &needles, row_count, elem)
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    });
             }
             // A nullable DATE/TIMESTAMP/NUMERIC simple comparison: the generic VM can't lower the literal
             // (temporal/numeric), so build the program directly (date I32 / timestamp+numeric I128/I64)
@@ -8333,9 +8710,15 @@ impl Engine {
         // bool path (type matrix, doc 19): `flag = true` / `flag = false` / `<>` (and `NOT flag`,
         // which the mapper rewrites to `flag = false`) expand the bool bitmap to the mask via negate.
         // None for a non-bool-literal predicate; checked first since a BoolLiteral has no other home.
-        if let Some(indices) =
-            self.try_lower_bool_predicate(*compare, lhs, rhs, table, snapshot, device_memory, row_count)?
-        {
+        if let Some(indices) = self.try_lower_bool_predicate(
+            *compare,
+            lhs,
+            rhs,
+            table,
+            snapshot,
+            device_memory,
+            row_count,
+        )? {
             return Ok(indices);
         }
 
@@ -8577,7 +8960,9 @@ impl Engine {
 
 #[cfg(test)]
 mod zone_map_prune_tests {
-    use super::{mandatory_int4_equalities, shard_zone_map_excludes, ResidentBinaryOp, ResidentExpr};
+    use super::{
+        mandatory_int4_equalities, shard_zone_map_excludes, ResidentBinaryOp, ResidentExpr,
+    };
     use crate::relational_model::ResidentDeviceInt4ColumnStats;
 
     fn stat(name: &str, min: i32, max: i32) -> ResidentDeviceInt4ColumnStats {
@@ -8600,7 +8985,11 @@ mod zone_map_prune_tests {
     fn mixed_type_prune_resolves_column_by_name_not_ordinal() {
         let column_names = ["flag", "a", "b", "c"];
         // a=[128,191] (includes 137), b=[1128,1191] (EXCLUDES 137), c=[128,191].
-        let stats = [stat("a", 128, 191), stat("b", 1128, 1191), stat("c", 128, 191)];
+        let stats = [
+            stat("a", 128, 191),
+            stat("b", 1128, 1191),
+            stat("c", 128, 191),
+        ];
 
         // Correct: `WHERE a = 137` -> catalog col 1 -> name "a" -> [128,191] INCLUDES 137 -> NOT excluded.
         assert!(
@@ -8665,7 +9054,10 @@ mod zone_map_prune_tests {
         // `a = 1 OR b = 2` -> NO mandatory constraint (a match may satisfy only one).
         let mut out = Vec::new();
         mandatory_int4_equalities(&bin(ResidentBinaryOp::Or, eq(1, 1), eq(2, 2)), &mut out);
-        assert!(out.is_empty(), "a top-level OR yields no mandatory equality (no prune)");
+        assert!(
+            out.is_empty(),
+            "a top-level OR yields no mandatory equality (no prune)"
+        );
 
         // `a = 1 AND (b = 2 OR c = 3)` -> only `a = 1` is mandatory.
         let mut out = Vec::new();

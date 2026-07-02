@@ -219,7 +219,8 @@ impl Engine {
         // is shared (captured once from the first job). Collect just the needles + the shared schema — no
         // per-needle Vec (DECISIONS "Result-path optimization").
         let mut needles: Vec<i32> = Vec::with_capacity(jobs.len());
-        let mut shared_schema: Option<(Arc<Vec<RelationalColumn>>, Arc<RelationalAccessPath>)> = None;
+        let mut shared_schema: Option<(Arc<Vec<RelationalColumn>>, Arc<RelationalAccessPath>)> =
+            None;
         let mut batch_table: Option<RelationalTable> = None;
         let mut batch_filter_idx: Option<usize> = None;
         let mut batch_selected_indexes: Option<Vec<usize>> = None;
@@ -306,8 +307,12 @@ impl Engine {
         let (shared_columns, shared_access_path) =
             shared_schema.expect("non-empty batch has a shared schema");
         let (snapshot_gpu_id, before_metrics, batch_started, payload) = match self
-            .submit_resident_int4_equal_any_payload(&table, &selected_indexes, filter_idx, &needles)?
-        {
+            .submit_resident_int4_equal_any_payload(
+                &table,
+                &selected_indexes,
+                filter_idx,
+                &needles,
+            )? {
             Some(out) => out,
             // Resident snapshot present but schema-mismatched / invalidated (the prior `Ok(None)`
             // case): fall through to the slower non-fast-path batch executor, unchanged.
@@ -490,15 +495,7 @@ impl Engine {
         selected_indexes: &[usize],
         filter_idx: usize,
         needles: &[i32],
-    ) -> Result<
-        Option<(
-            u16,
-            RuntimeMetricsSnapshot,
-            Instant,
-            DeferredProbe,
-        )>,
-        ExecuteError,
-    > {
+    ) -> Result<Option<(u16, RuntimeMetricsSnapshot, Instant, DeferredProbe)>, ExecuteError> {
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -513,7 +510,8 @@ impl Engine {
         let snapshot_gpu_id = snapshot.gpu_id;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot row count exceeds retained device-memory proof range".to_string(),
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
             ))
         })?;
         let filter_offset = resident_device_int4_column_offset(&snapshot, table, filter_idx)?;
@@ -622,7 +620,12 @@ impl Engine {
                 ),
             }
         };
-        Ok(Some((snapshot_gpu_id, before_metrics, batch_started, payload)))
+        Ok(Some((
+            snapshot_gpu_id,
+            before_metrics,
+            batch_started,
+            payload,
+        )))
     }
 
     /// ADR-009 R1: fetch (building + caching on demand) the GPU hash index over resident int4 key column
@@ -652,10 +655,9 @@ impl Engine {
                 if existing.column_idx == filter_idx
                     && existing.resident_device_ptr == resident_device_ptr
                 {
-                    return existing
-                        .index_memory
-                        .as_ref()
-                        .map(|memory| (Arc::clone(memory), existing.table_mask, existing.hash_shift));
+                    return existing.index_memory.as_ref().map(|memory| {
+                        (Arc::clone(memory), existing.table_mask, existing.hash_shift)
+                    });
                 }
             }
         }
@@ -1145,9 +1147,12 @@ impl Engine {
         // probe, one bulk DtoH per shard). Returns None -> fall through to the host-probe path below when a
         // shard is VERSIONED (needs the SV3b deleted_by gate the dense kernel lacks), the shape/ncols is
         // unsupported (>4 cols), or the index declines (dup) / errors. Byte-identical either way.
-        if let Some(gpu) =
-            self.gather_sharded_int4_point_lookups_batched_gpu(table, filter_idx, selected_indexes, needles)
-        {
+        if let Some(gpu) = self.gather_sharded_int4_point_lookups_batched_gpu(
+            table,
+            filter_idx,
+            selected_indexes,
+            needles,
+        ) {
             return Some(gpu);
         }
         let read_txn_id = self.committed_seq() as i64;
@@ -1271,7 +1276,9 @@ impl Engine {
         if row_count == 0 || row_count_u64 >= u32::MAX as u64 {
             return None;
         }
-        let keys = device_memory.read_resident_i32_column(filter_offset, row_count).ok()?;
+        let keys = device_memory
+            .read_resident_i32_column(filter_offset, row_count)
+            .ok()?;
         if keys.len() != row_count {
             return None;
         }
@@ -1502,13 +1509,19 @@ impl Engine {
         needles: &[i32],
     ) -> Option<usize> {
         let table = self.relational_catalog_table(table_name)?;
-        let filter_idx = crate::rel_exec_helpers::relational_column_index(&table, filter_col).ok()?;
+        let filter_idx =
+            crate::rel_exec_helpers::relational_column_index(&table, filter_col).ok()?;
         let mut selected_indexes = Vec::with_capacity(proj_cols.len());
         for c in proj_cols {
-            selected_indexes.push(crate::rel_exec_helpers::relational_column_index(&table, c).ok()?);
+            selected_indexes
+                .push(crate::rel_exec_helpers::relational_column_index(&table, c).ok()?);
         }
-        let proj =
-            self.gather_sharded_int4_point_lookups_batched(&table, filter_idx, &selected_indexes, needles)?;
+        let proj = self.gather_sharded_int4_point_lookups_batched(
+            &table,
+            filter_idx,
+            &selected_indexes,
+            needles,
+        )?;
         Some(proj.needle_ranges.iter().filter(|&&(_, c)| c > 0).count())
     }
 
@@ -1643,15 +1656,14 @@ impl Engine {
         // completion); it bridges the columnar dense form back to per-row via `into_rows` (DECISIONS "Tail
         // latency").
         let (projected_rows, kernel_event_elapsed_us) = match pending.payload {
-            DeferredProbe::Atomic(submission) => {
-                submission
-                    .complete_detached()
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
-            }
+            DeferredProbe::Atomic(submission) => submission
+                .complete_detached()
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?,
             DeferredProbe::Dense(submission) => {
-                let (columns, elapsed) = submission
-                    .complete_detached_columnar()
-                    .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+                let (columns, elapsed) =
+                    submission.complete_detached_columnar().map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
                 (columns.into_rows(), elapsed)
             }
         };
@@ -1679,7 +1691,8 @@ impl Engine {
         let ncols = pending.selected_indexes.len();
         let mut by_needle: Vec<Vec<(u64, &[i32])>> = vec![Vec::new(); pending.needle_count];
         for projected in &projected_rows {
-            by_needle[projected.needle_index].push((projected.row_index, projected.values.as_slice()));
+            by_needle[projected.needle_index]
+                .push((projected.row_index, projected.values.as_slice()));
         }
         let row_blocks: Vec<RowBlock> = by_needle
             .into_iter()
@@ -1796,7 +1809,11 @@ impl Engine {
         // friendly), keep status==1, write packed. No host scatter, no `needle_indices` (slot == needle), no
         // count. (The atomic/wave compacted form has empty `status` and takes the scatter path below.)
         if !projected.status.is_empty() {
-            debug_assert_eq!(projected.status.len(), n, "dense status must be one per needle");
+            debug_assert_eq!(
+                projected.status.len(),
+                n,
+                "dense status must be one per needle"
+            );
             let mut values = Vec::with_capacity(projected.values.len());
             let mut needle_ranges = Vec::with_capacity(n);
             let mut acc = 0u32;
@@ -1899,12 +1916,20 @@ impl Engine {
                     _ => 0,
                 },
             ),
-            None => (Arc::new(Vec::new()), Arc::new(RelationalAccessPath::FullTableScan), 0),
+            None => (
+                Arc::new(Vec::new()),
+                Arc::new(RelationalAccessPath::FullTableScan),
+                0,
+            ),
         };
         // Width from the first NON-EMPTY result: an empty first result has ncols 0 but a later result may
         // carry rows, and flattening at ncols 0 would drop them (audit P3). All Ready results of one query
         // shape share the width, so the first non-zero is authoritative.
-        let ncols = results.iter().map(|r| r.rows.ncols()).find(|&n| n > 0).unwrap_or(0);
+        let ncols = results
+            .iter()
+            .map(|r| r.rows.ncols())
+            .find(|&n| n > 0)
+            .unwrap_or(0);
         let mut values: Vec<i32> = Vec::new();
         let mut needle_ranges = Vec::with_capacity(results.len());
         let mut acc = 0u32;
@@ -2073,7 +2098,12 @@ pub(crate) fn build_int4_pk_bloom_host(keys: &[i32]) -> Option<(Vec<u64>, u64, u
 
 /// Cross-shard PK index (sub-slice 2): `true` = key MAYBE present (probe the shard's hash), `false` =
 /// DEFINITELY absent (skip the shard). No false negatives by construction (see `build_int4_pk_bloom_host`).
-pub(crate) fn bloom_maybe_contains(words: &[u64], num_bits: u64, num_hashes: u32, key: i32) -> bool {
+pub(crate) fn bloom_maybe_contains(
+    words: &[u64],
+    num_bits: u64,
+    num_hashes: u32,
+    key: i32,
+) -> bool {
     if num_bits == 0 {
         return true; // no bloom -> can't prune -> conservatively "maybe" (never skip)
     }
@@ -2146,10 +2176,16 @@ fn probe_cached_shard_pk(entry: &CachedShardPkIndex, key: i32) -> ShardPkProbe {
     match &entry.index {
         None => ShardPkProbe::Declined,
         Some(data) => {
-            if !bloom_maybe_contains(&data.bloom_words, data.bloom_num_bits, data.bloom_num_hashes, key) {
+            if !bloom_maybe_contains(
+                &data.bloom_words,
+                data.bloom_num_bits,
+                data.bloom_num_hashes,
+                key,
+            ) {
                 return ShardPkProbe::Miss;
             }
-            match probe_int4_pk_hash_table(&data.hash_table, data.table_mask, data.hash_shift, key) {
+            match probe_int4_pk_hash_table(&data.hash_table, data.table_mask, data.hash_shift, key)
+            {
                 Some(row) => ShardPkProbe::Hit(row),
                 None => ShardPkProbe::Miss,
             }
@@ -2220,7 +2256,10 @@ mod cross_shard_pk_index_tests {
             }
         }
         let fp_rate = fp as f64 / total as f64;
-        assert!(fp_rate < 0.05, "bloom FP rate {fp_rate:.4} must be well under 5% at 10 bits/key, k=7");
+        assert!(
+            fp_rate < 0.05,
+            "bloom FP rate {fp_rate:.4} must be well under 5% at 10 bits/key, k=7"
+        );
         // Empty -> None (no bloom to prune with).
         assert!(build_int4_pk_bloom_host(&[]).is_none());
         // A single-key bloom still contains its key (>= 64-bit min size, no sub-word issue).

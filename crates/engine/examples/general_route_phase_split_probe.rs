@@ -57,7 +57,10 @@ fn build_resident_engine(rows: i64, cats: i64) -> Result<Engine, Box<dyn Error>>
             vals.push_str(&format!("({}, {}, {})", id, id % cats, (id * 7) % 100_000));
             id += 1;
         }
-        e.execute_text(txn, &format!("INSERT INTO events (id, category, value) VALUES {vals}"))?;
+        e.execute_text(
+            txn,
+            &format!("INSERT INTO events (id, category, value) VALUES {vals}"),
+        )?;
         txn += 1;
     }
     e.populate_relational_residency_snapshot("events")?;
@@ -65,10 +68,14 @@ fn build_resident_engine(rows: i64, cats: i64) -> Result<Engine, Box<dyn Error>>
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let rows: i64 =
-        env::var("GPU_DB_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(262_144);
-    let iters: usize =
-        env::var("GPU_DB_BENCH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    let rows: i64 = env::var("GPU_DB_BENCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(262_144);
+    let iters: usize = env::var("GPU_DB_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
     let cats_sweep: Vec<i64> = env::var("GPU_DB_BENCH_CATS")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
@@ -94,10 +101,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         // warmup
         let t_warm = Instant::now();
         for k in 0..8 {
-            let sel = parse_select(&format!("SELECT id, value FROM events WHERE category = {}", k % cats));
+            let sel = parse_select(&format!(
+                "SELECT id, value FROM events WHERE category = {}",
+                k % cats
+            ));
             let _ = e.execute_relational_select(&sel)?;
         }
-        eprintln!("[cats={cats}] warmup(20) {} ms", t_warm.elapsed().as_millis());
+        eprintln!(
+            "[cats={cats}] warmup(20) {} ms",
+            t_warm.elapsed().as_millis()
+        );
         let mut wall = Vec::with_capacity(iters);
         let mut kern = Vec::with_capacity(iters);
         let mut host = Vec::with_capacity(iters);
@@ -127,7 +140,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         let (k50, _, _) = dist(kern);
         let (h50, _, _) = dist(host);
         let (_, w99, _) = dist(wall);
-        let rows_per_s = if w50 > 0 { (out_rows as f64) * 1.0e6 / (w50 as f64) } else { 0.0 };
+        let rows_per_s = if w50 > 0 {
+            (out_rows as f64) * 1.0e6 / (w50 as f64)
+        } else {
+            0.0
+        };
         println!(
             "  {cats:>8} {out_rows:>9} {w50:>11} {k50:>11} {h50:>11} {w99:>11} {rows_per_s:>12.0}"
         );

@@ -130,6 +130,9 @@ fn mutation_invalidates_only_the_mutated_table_residency() {
     // P1-M3 step 2: per-table residency invalidation. A write to one table must no
     // longer evict every other table's residency (the former stop-the-world bug).
     let mut e = Engine::new_local();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
+    // configuration; sharded is the default) — pin the layout it tests.
+    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
     e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();
@@ -161,6 +164,9 @@ fn create_table_does_not_invalidate_existing_residency() {
     // CREATE TABLE introduces a brand-new table with no prior residency, so it must
     // touch no existing table's snapshot (scope contributes the empty set).
     let mut e = Engine::new_local();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
+    // configuration; sharded is the default) — pin the layout it tests.
+    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "INSERT INTO a (id) VALUES (1)").unwrap();
     e.populate_relational_residency_snapshot("a").unwrap();
@@ -181,6 +187,9 @@ fn unscoped_ddl_conservatively_invalidates_unrelated_residency() {
     // mutated table `a` has its snapshot rebuilt by the schema change itself, so we
     // observe the conservative fallback on the untouched table `b`.)
     let mut e = Engine::new_local();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer's semantics (a supported, settable
+    // configuration; sharded is the default) — pin the layout it tests.
+    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
     e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
     e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();

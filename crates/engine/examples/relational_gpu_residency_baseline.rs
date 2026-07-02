@@ -920,8 +920,7 @@ fn timed_resident_device_filtered_count_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result =
-        engine.execute_resident_plan(query)?;
+    let result = engine.execute_resident_plan(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
@@ -1214,8 +1213,7 @@ fn timed_resident_device_scalar_aggregate_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result =
-        engine.execute_resident_plan(query)?;
+    let result = engine.execute_resident_plan(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
@@ -1256,8 +1254,7 @@ fn timed_resident_device_filtered_scalar_aggregate_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine
-        .execute_resident_plan(query)?;
+    let result = engine.execute_resident_plan(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
@@ -1298,8 +1295,7 @@ fn timed_resident_device_between_scalar_aggregate_probe(
 ) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine
-        .execute_resident_plan(query)?;
+    let result = engine.execute_resident_plan(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;

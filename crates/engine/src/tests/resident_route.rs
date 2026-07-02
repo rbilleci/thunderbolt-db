@@ -207,191 +207,193 @@ fn p8_default_resident_route_executes_accepted_shapes() {
         ),
     ];
     for (sql, expected_rows) in cases {
-            let Command::Select(select) = parse_command(sql).unwrap() else {
-                unreachable!()
-            };
-            let resident = e
-                .execute_relational_select_with_resident_route(&select)
-                .unwrap_or_else(|err| panic!("{sql}: {err}"));
-            let before_default_metrics = e.metrics().snapshot();
-            let default = e
-                .execute_relational_select(&select)
-                .unwrap_or_else(|err| panic!("{sql}: {err}"));
-            let after_default_metrics = e.metrics().snapshot();
-            assert_eq!(resident.rows, expected_rows, "{sql}");
-            assert_eq!(default.rows, expected_rows, "{sql}");
-            // Columns: GPU-vs-GPU consistency between the resident route and the default (also-GPU)
-            // path -- no host/CPU oracle (S9).
-            assert_eq!(*resident.columns, *default.columns, "{sql}");
-            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
-            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
-            assert_eq!(resident.fallback_reason, None, "{sql}");
-            assert_eq!(default.planned_target, DeviceTarget::Gpu(0), "{sql}");
-            assert_eq!(default.executed_target, DeviceTarget::Gpu(0), "{sql}");
-            assert_eq!(default.fallback_reason, None, "{sql}");
-            assert_eq!(
-                e.status_snapshot()
-                    .relational_residency
-                    .latest_route_decision("events")
-                    .unwrap()
-                    .h2d_bytes_if_resident,
-                0,
-                "{sql}"
-            );
-            let route_decision = e
-                .status_snapshot()
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            unreachable!()
+        };
+        let resident = e
+            .execute_relational_select_with_resident_route(&select)
+            .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        let before_default_metrics = e.metrics().snapshot();
+        let default = e
+            .execute_relational_select(&select)
+            .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        let after_default_metrics = e.metrics().snapshot();
+        assert_eq!(resident.rows, expected_rows, "{sql}");
+        assert_eq!(default.rows, expected_rows, "{sql}");
+        // Columns: GPU-vs-GPU consistency between the resident route and the default (also-GPU)
+        // path -- no host/CPU oracle (S9).
+        assert_eq!(*resident.columns, *default.columns, "{sql}");
+        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(resident.fallback_reason, None, "{sql}");
+        assert_eq!(default.planned_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(default.executed_target, DeviceTarget::Gpu(0), "{sql}");
+        assert_eq!(default.fallback_reason, None, "{sql}");
+        assert_eq!(
+            e.status_snapshot()
                 .relational_residency
                 .latest_route_decision("events")
                 .unwrap()
-                .clone();
-            let expected_d2h_bytes = match route_decision.query_shape.as_str() {
-                "count_all" | "int4_equality_count" | "int4_range_count" | "int4_filter_group_count" => {
-                    std::mem::size_of::<u64>() as u64
-                }
-                "text_prefix_like_count" => e
-                    .relational_residency_snapshot("events")
+                .h2d_bytes_if_resident,
+            0,
+            "{sql}"
+        );
+        let route_decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("events")
+            .unwrap()
+            .clone();
+        let expected_d2h_bytes = match route_decision.query_shape.as_str() {
+            "count_all"
+            | "int4_equality_count"
+            | "int4_range_count"
+            | "int4_filter_group_count" => std::mem::size_of::<u64>() as u64,
+            "text_prefix_like_count" => {
+                e.relational_residency_snapshot("events")
                     .unwrap()
-                    .resident_bytes,
-                "int4_scalar_aggregate"
-                    if matches!(select.projection, SelectProjection::Sum { .. }) =>
-                {
-                    std::mem::size_of::<i64>() as u64
-                }
-                // Ungrouped scalar aggregate copies a grouped-stats struct (group key +
-                // count + sum + min/max) + result length.
-                "int4_scalar_aggregate" => {
-                    (std::mem::size_of::<i32>()
+                    .resident_bytes
+            }
+            "int4_scalar_aggregate"
+                if matches!(select.projection, SelectProjection::Sum { .. }) =>
+            {
+                std::mem::size_of::<i64>() as u64
+            }
+            // Ungrouped scalar aggregate copies a grouped-stats struct (group key +
+            // count + sum + min/max) + result length.
+            "int4_scalar_aggregate" => {
+                (std::mem::size_of::<i32>()
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>())
+                    + std::mem::size_of::<u64>()) as u64
+            }
+            // Filtered scalar aggregate copies a scalar-stats struct (count + sum +
+            // min/max, no group key) + result length — matches the actual D2H in
+            // run_resident_scalar_aggregate (the unified plan->kernel driver's Int4Compare arm)
+            // and resident_route_d2h_bytes_estimate.
+            "int4_filtered_scalar_aggregate" => {
+                (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>())
+                    + std::mem::size_of::<u64>()) as u64
+            }
+            "int4_between_scalar_aggregate" => {
+                (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>())
+                    + std::mem::size_of::<u64>()) as u64
+            }
+            "int4_grouped_aggregate" | "int4_filtered_grouped_aggregate" => route_decision
+                .d2h_rows_estimate
+                .checked_mul(
+                    std::mem::size_of::<i32>()
                         + std::mem::size_of::<u64>()
                         + std::mem::size_of::<i64>()
-                        + (2 * std::mem::size_of::<i32>())
-                        + std::mem::size_of::<u64>()) as u64
-                }
-                // Filtered scalar aggregate copies a scalar-stats struct (count + sum +
-                // min/max, no group key) + result length — matches the actual D2H in
-                // run_resident_scalar_aggregate (the unified plan->kernel driver's Int4Compare arm)
-                // and resident_route_d2h_bytes_estimate.
-                "int4_filtered_scalar_aggregate" => {
-                    (std::mem::size_of::<u64>()
-                        + std::mem::size_of::<i64>()
-                        + (2 * std::mem::size_of::<i32>())
-                        + std::mem::size_of::<u64>()) as u64
-                }
-                "int4_between_scalar_aggregate" => {
-                    (std::mem::size_of::<u64>()
-                        + std::mem::size_of::<i64>()
-                        + (2 * std::mem::size_of::<i32>())
-                        + std::mem::size_of::<u64>()) as u64
-                }
-                "int4_grouped_aggregate" | "int4_filtered_grouped_aggregate" => route_decision
-                    .d2h_rows_estimate
-                    .checked_mul(
-                        std::mem::size_of::<i32>()
-                            + std::mem::size_of::<u64>()
-                            + std::mem::size_of::<i64>()
-                            + (2 * std::mem::size_of::<i32>()),
-                    )
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .unwrap_or(u64::MAX),
-                "int4_projection" | "int4_ordered_projection" => route_decision
-                    .d2h_rows_estimate
-                    .checked_mul(std::mem::size_of::<i32>())
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .unwrap_or(u64::MAX),
-                "int4_distinct_projection" | "int4_filtered_distinct_projection" => e
-                    .relational_residency_snapshot("events")
-                    .unwrap()
-                    .row_count
-                    .checked_mul(std::mem::size_of::<i32>())
-                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .unwrap_or(u64::MAX),
-                other => panic!("unexpected resident route shape {other} for {sql}"),
-            };
+                        + (2 * std::mem::size_of::<i32>()),
+                )
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX),
+            "int4_projection" | "int4_ordered_projection" => route_decision
+                .d2h_rows_estimate
+                .checked_mul(std::mem::size_of::<i32>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX),
+            "int4_distinct_projection" | "int4_filtered_distinct_projection" => e
+                .relational_residency_snapshot("events")
+                .unwrap()
+                .row_count
+                .checked_mul(std::mem::size_of::<i32>())
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX),
+            other => panic!("unexpected resident route shape {other} for {sql}"),
+        };
+        assert_eq!(
+            route_decision.d2h_bytes_estimate, expected_d2h_bytes,
+            "{sql}"
+        );
+        assert_eq!(route_decision.last_execution_h2d_bytes, Some(0), "{sql}");
+        assert_eq!(
+            route_decision.last_execution_d2h_bytes,
+            Some(
+                after_default_metrics
+                    .d2h_bytes_total
+                    .saturating_sub(before_default_metrics.d2h_bytes_total)
+            ),
+            "{sql}"
+        );
+        assert_eq!(
+            route_decision.last_execution_kernel_samples,
+            Some(
+                after_default_metrics
+                    .kernel_exec_samples
+                    .saturating_sub(before_default_metrics.kernel_exec_samples)
+            ),
+            "{sql}"
+        );
+        assert_eq!(
+            route_decision.last_execution_kernel_ms,
+            Some(
+                after_default_metrics
+                    .kernel_exec_total_ms
+                    .saturating_sub(before_default_metrics.kernel_exec_total_ms)
+            ),
+            "{sql}"
+        );
+        // Kernel-event timing is recorded only by shapes that actually launch a GPU
+        // kernel. Some resident routes are GPU-resident but run no kernel — e.g.
+        // text-prefix count and distinct/projection paths finalize on the CPU after a
+        // D2H copy — so they record no kernel-event time and add no timing sample.
+        // Assert telemetry consistency by what the route observed rather than by
+        // hardcoding per-shape: if a kernel timed this execution, the route decision
+        // matches the engine's last kernel-event metric and exactly one timing sample
+        // lands; otherwise neither moves. (On GPU-less hosts no shape runs a kernel,
+        // so every iteration takes the else branch — keeping CI green.)
+        let kernel_event_timing_delta = after_default_metrics
+            .kernel_event_timing_samples
+            .saturating_sub(before_default_metrics.kernel_event_timing_samples);
+        if route_decision
+            .last_execution_kernel_event_elapsed_us
+            .is_some()
+        {
             assert_eq!(
-                route_decision.d2h_bytes_estimate, expected_d2h_bytes,
+                route_decision.last_execution_kernel_event_elapsed_us,
+                after_default_metrics.last_kernel_event_elapsed_us,
                 "{sql}"
             );
-            assert_eq!(route_decision.last_execution_h2d_bytes, Some(0), "{sql}");
-            assert_eq!(
-                route_decision.last_execution_d2h_bytes,
-                Some(
-                    after_default_metrics
-                        .d2h_bytes_total
-                        .saturating_sub(before_default_metrics.d2h_bytes_total)
-                ),
-                "{sql}"
-            );
-            assert_eq!(
-                route_decision.last_execution_kernel_samples,
-                Some(
-                    after_default_metrics
-                        .kernel_exec_samples
-                        .saturating_sub(before_default_metrics.kernel_exec_samples)
-                ),
-                "{sql}"
-            );
-            assert_eq!(
-                route_decision.last_execution_kernel_ms,
-                Some(
-                    after_default_metrics
-                        .kernel_exec_total_ms
-                        .saturating_sub(before_default_metrics.kernel_exec_total_ms)
-                ),
-                "{sql}"
-            );
-            // Kernel-event timing is recorded only by shapes that actually launch a GPU
-            // kernel. Some resident routes are GPU-resident but run no kernel — e.g.
-            // text-prefix count and distinct/projection paths finalize on the CPU after a
-            // D2H copy — so they record no kernel-event time and add no timing sample.
-            // Assert telemetry consistency by what the route observed rather than by
-            // hardcoding per-shape: if a kernel timed this execution, the route decision
-            // matches the engine's last kernel-event metric and exactly one timing sample
-            // lands; otherwise neither moves. (On GPU-less hosts no shape runs a kernel,
-            // so every iteration takes the else branch — keeping CI green.)
-            let kernel_event_timing_delta = after_default_metrics
-                .kernel_event_timing_samples
-                .saturating_sub(before_default_metrics.kernel_event_timing_samples);
-            if route_decision
-                .last_execution_kernel_event_elapsed_us
-                .is_some()
-            {
-                assert_eq!(
-                    route_decision.last_execution_kernel_event_elapsed_us,
-                    after_default_metrics.last_kernel_event_elapsed_us,
-                    "{sql}"
-                );
-                assert_eq!(kernel_event_timing_delta, 1, "{sql}");
-            } else {
-                assert_eq!(kernel_event_timing_delta, 0, "{sql}");
-            }
-            assert_eq!(
-                route_decision.last_execution_rows,
-                Some(default.rows.len()),
-                "{sql}"
-            );
-            assert!(
-                matches!(
-                    route_decision.query_shape.as_str(),
-                    "count_all"
-                        | "int4_equality_count"
-                        | "int4_range_count"
-                        | "text_prefix_like_count"
-                        | "int4_filter_group_count"
-                        | "int4_scalar_aggregate"
-                        | "int4_filtered_scalar_aggregate"
-                        | "int4_between_scalar_aggregate"
-                        | "int4_grouped_aggregate"
-                        | "int4_filtered_grouped_aggregate"
-                        | "int4_projection"
-                        | "int4_ordered_projection"
-                        | "int4_distinct_projection"
-                        | "int4_filtered_distinct_projection"
-                ),
-                "{sql}"
-            );
+            assert_eq!(kernel_event_timing_delta, 1, "{sql}");
+        } else {
+            assert_eq!(kernel_event_timing_delta, 0, "{sql}");
         }
+        assert_eq!(
+            route_decision.last_execution_rows,
+            Some(default.rows.len()),
+            "{sql}"
+        );
+        assert!(
+            matches!(
+                route_decision.query_shape.as_str(),
+                "count_all"
+                    | "int4_equality_count"
+                    | "int4_range_count"
+                    | "text_prefix_like_count"
+                    | "int4_filter_group_count"
+                    | "int4_scalar_aggregate"
+                    | "int4_filtered_scalar_aggregate"
+                    | "int4_between_scalar_aggregate"
+                    | "int4_grouped_aggregate"
+                    | "int4_filtered_grouped_aggregate"
+                    | "int4_projection"
+                    | "int4_ordered_projection"
+                    | "int4_distinct_projection"
+                    | "int4_filtered_distinct_projection"
+            ),
+            "{sql}"
+        );
+    }
 
     for sql in [
         "SELECT DISTINCT label FROM events ORDER BY label",
@@ -1241,10 +1243,7 @@ fn p8_sharded_resident_key_lookup_merges_matches_and_rejects_invalidated() {
         .unwrap();
     let invalidated = e.plan_relational_resident_route(&select);
     assert!(!invalidated.accepted);
-    assert_eq!(
-        invalidated.query_shape,
-        "sharded_int4_equality_projection"
-    );
+    assert_eq!(invalidated.query_shape, "sharded_int4_equality_projection");
     assert_eq!(invalidated.shard_count, 4);
     assert_eq!(invalidated.cache_state, "Invalidated");
     assert_eq!(invalidated.reason, "resident shard set is Invalidated");
@@ -1461,9 +1460,7 @@ fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_mis
             }
         })
         .collect::<Vec<_>>();
-    missing_layout_shards[2]
-        .resident_device_int4_columns
-        .pop();
+    missing_layout_shards[2].resident_device_int4_columns.pop();
     let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
         BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
@@ -1492,8 +1489,7 @@ fn p8_sharded_resident_multi_column_lookup_merges_projected_rows_and_rejects_mis
 
 #[test]
 #[ignore = "requires a local NVIDIA driver and GPU"]
-fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_per_shard()
-{
+fn p8_sharded_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_per_shard() {
     // Coverage-gap closer (engine side) for the resident row-index host-sort fix. The
     // sharded multi-column route iterates shards in order and, within each shard,
     // materializes one output row per entry of `match_i32_equal_row_indices_from_payload(..)` in
@@ -1657,6 +1653,9 @@ fn p8_batched_multi_column_projection_matches_per_query_for_more_than_one_warp_o
     // sort the batched scatter would emit a non-deterministic permutation (caught by the exact
     // comparison and the 25× loop), and it would differ from the per-query path.
     let mut e = Engine::new_local();
+    // THE FLIP: the retained-jobs API is the SINGLE-BUFFER lpb layer (sharded tables are served by
+    // the sharded batched gather in production) — pin the layer under test.
+    e.set_shard_residency_enabled(false);
     e.execute_text(1, "CREATE TABLE t (k INT, seq INT)")
         .unwrap();
     const NEEDLE: i32 = 7;
@@ -2001,9 +2000,7 @@ fn p8_sharded_resident_sum_reduces_matches_and_rejects_missing_layout() {
             )
             .unwrap();
     let mut missing_layout_shards = build_shards();
-    missing_layout_shards[2]
-        .resident_device_int4_columns
-        .pop();
+    missing_layout_shards[2].resident_device_int4_columns.pop();
     let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
         BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
@@ -2191,9 +2188,7 @@ fn p8_sharded_resident_between_avg_reduces_matches_and_rejects_missing_layout() 
             )
             .unwrap();
     let mut missing_layout_shards = build_shards();
-    missing_layout_shards[2]
-        .resident_device_int4_columns
-        .pop();
+    missing_layout_shards[2].resident_device_int4_columns.pop();
     let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
         BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
@@ -2374,9 +2369,7 @@ fn p8_sharded_resident_filtered_max_reduces_matches_and_rejects_missing_layout()
             )
             .unwrap();
     let mut missing_layout_shards = build_shards();
-    missing_layout_shards[2]
-        .resident_device_int4_columns
-        .pop();
+    missing_layout_shards[2].resident_device_int4_columns.pop();
     let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
         BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
@@ -2557,9 +2550,7 @@ fn p8_sharded_resident_filtered_min_reduces_matches_and_rejects_missing_layout()
             )
             .unwrap();
     let mut missing_layout_shards = build_shards();
-    missing_layout_shards[2]
-        .resident_device_int4_columns
-        .pop();
+    missing_layout_shards[2].resident_device_int4_columns.pop();
     let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
         BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
@@ -2745,9 +2736,7 @@ fn p8_sharded_resident_filtered_avg_reduces_matches_and_rejects_missing_layout()
             )
             .unwrap();
     let mut missing_layout_shards = build_shards();
-    missing_layout_shards[2]
-        .resident_device_int4_columns
-        .pop();
+    missing_layout_shards[2].resident_device_int4_columns.pop();
     let installed = missing_layout_engine.install_benchmark_relational_residency_owned_shards(
         BenchmarkRelationalResidencyOwnedShardInstall {
             table: "order_line",
@@ -3603,8 +3592,7 @@ fn s10c_2b_sharded_distinct_projection_matches_oracle() {
         "sharded_int4_filtered_distinct_projection",
     );
     // Independently pin the multi-shard DISTINCT key collapse.
-    let Command::Select(select) =
-        parse_command("SELECT DISTINCT k FROM pt ORDER BY k").unwrap()
+    let Command::Select(select) = parse_command("SELECT DISTINCT k FROM pt ORDER BY k").unwrap()
     else {
         unreachable!()
     };
@@ -3680,8 +3668,11 @@ fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
     let e = Engine::new_local();
     e.set_auto_admit_on_commit(true);
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)")
-        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)",
+    )
+    .unwrap();
 
     // Probe with a definitely-accepted shape; self-guard on a box without a usable GPU (the
     // device-memory upload returns None there, so the route is not accepted — the auto-admit code
@@ -3713,9 +3704,13 @@ fn s_b_auto_admit_on_commit_makes_committed_table_gpu_resident() {
 
     // Flag OFF (default): identical data is NOT auto-admitted -> host path -> byte-identical rows.
     let host = Engine::new_local();
-    host.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
-    host.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)")
+    host.execute_text(1, "CREATE TABLE t (id INT, v INT)")
         .unwrap();
+    host.execute_text(
+        2,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)",
+    )
+    .unwrap();
     assert!(
         !host.plan_relational_resident_route(&proj).accepted,
         "flag-off table must NOT be auto-admitted"
@@ -3741,8 +3736,11 @@ fn s_b_auto_admit_fires_on_the_concurrent_dml_commit_path() {
     e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
     // Drive the INSERT through the concurrent path that production uses for a no-sequence-default
     // INSERT (NOT `execute_text`), so the `commit_dml_concurrent` hook is the one under test.
-    e.execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)")
-        .unwrap();
+    e.execute_dml_concurrent(
+        2,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30)",
+    )
+    .unwrap();
 
     // Probe residency with a definitely-accepted shape (proving the concurrent hook admitted the
     // table); self-guard on a non-GPU box.
@@ -3799,7 +3797,8 @@ fn r1_wave_index_probe_matches_scan_differential() {
          (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
+    e.populate_relational_residency_snapshot("accounts")
+        .unwrap();
 
     let select_cmd = |sql: &str| -> Select {
         match parse_command(sql).unwrap() {
@@ -3833,7 +3832,9 @@ fn r1_wave_index_probe_matches_scan_differential() {
             .wave_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = cache.get("accounts").expect("wave index cached after a flag-on run");
+        let entry = cache
+            .get("accounts")
+            .expect("wave index cached after a flag-on run");
         (entry.column_idx, entry.index_memory.is_some())
     };
 
@@ -3874,7 +3875,11 @@ fn r1_wave_index_probe_matches_scan_differential() {
     // needle 0 hits the NULL-`id` row (NULL int4 == 0): the index returns it exactly as the scan does
     // (audit P1 #1). The differential `index_unique == scan_unique` already pins byte-identity; assert the
     // row is non-empty so the case is not vacuous (both routes genuinely match a NULL-as-0 key).
-    assert_eq!(index_unique[5].len(), 1, "needle 0 -> the NULL-id row, on both routes");
+    assert_eq!(
+        index_unique[5].len(),
+        1,
+        "needle 0 -> the NULL-id row, on both routes"
+    );
     // id=20 (NULL balance) is covered by the differential above — this fast path returns the raw stored
     // int4 for a NULL projection (no bitmap mask), identically on both routes.
 
@@ -3889,7 +3894,11 @@ fn r1_wave_index_probe_matches_scan_differential() {
         index_dup, scan_dup,
         "a non-unique key must fall back to the scan and stay identical"
     );
-    assert_eq!(index_dup[0].len(), 2, "bucket = 1 matches two rows (id 10 and 20)");
+    assert_eq!(
+        index_dup[0].len(),
+        2,
+        "bucket = 1 matches two rows (id 10 and 20)"
+    );
     assert_eq!(
         cached_index(&e),
         (1, false),
@@ -3903,7 +3912,8 @@ fn r1_wave_index_probe_matches_scan_differential() {
         "INSERT INTO accounts (id, bucket, balance, note) VALUES (50, 3, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
+    e.populate_relational_residency_snapshot("accounts")
+        .unwrap();
     let gen_needles = vec![10, 50, 40, 999];
     e.set_index_probe_enabled(false);
     let scan_gen = run(&e, &select_unique, &gen_needles);
@@ -3947,7 +3957,8 @@ fn r2_wave_engine_matches_lpb_differential() {
          (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
+    e.populate_relational_residency_snapshot("accounts")
+        .unwrap();
 
     let select_cmd = |sql: &str| -> Select {
         match parse_command(sql).unwrap() {
@@ -4009,7 +4020,9 @@ fn r2_wave_engine_matches_lpb_differential() {
     // from the template-submit path's Arc-SHARED schema would slip through. Assert the full result schema
     // on the index route once: projected columns = [id, balance], access_path = the equality-index route.
     {
-        let template = e.prepare_relational_retained_read_template(&select_unique).unwrap();
+        let template = e
+            .prepare_relational_retained_read_template(&select_unique)
+            .unwrap();
         let results = e
             .complete_relational_retained_read_submission(
                 e.submit_relational_retained_template_point_lookups(&template, &[10, 30])
@@ -4018,7 +4031,11 @@ fn r2_wave_engine_matches_lpb_differential() {
             .unwrap();
         for result in &results {
             assert_eq!(
-                result.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                result
+                    .columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["id", "balance"],
                 "index route stamps the shared projected schema [id, balance]"
             );
@@ -4032,7 +4049,11 @@ fn r2_wave_engine_matches_lpb_differential() {
             );
         }
     }
-    assert_eq!(lpb_u[5].len(), 1, "needle 0 -> the NULL-id row via the index");
+    assert_eq!(
+        lpb_u[5].len(),
+        1,
+        "needle 0 -> the NULL-id row via the index"
+    );
     assert_eq!(
         lpb_u[4],
         Vec::<Vec<SqlValue>>::new(),
@@ -4068,7 +4089,8 @@ fn r2_wave_engine_matches_lpb_differential() {
         "INSERT INTO accounts (id, bucket, balance, note) VALUES (50, 3, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
+    e.populate_relational_residency_snapshot("accounts")
+        .unwrap();
     let gen_needles = vec![10, 50, 40, 999];
     scan_cfg(&e);
     let scan_g = run(&e, &select_unique, &gen_needles);
@@ -4101,7 +4123,11 @@ fn r2_wave_engine_matches_lpb_differential() {
         lpb_d, scan_d,
         "a non-unique key falls back (no index buildable) and stays identical to the scan"
     );
-    assert_eq!(lpb_d[0].len(), 2, "bucket = 1 matches two rows (id 10 and 20)");
+    assert_eq!(
+        lpb_d[0].len(),
+        2,
+        "bucket = 1 matches two rows (id 10 and 20)"
+    );
 }
 
 // ADR-009 Result-path: the BATCHED completion (one flat RelationalRetainedBatchResult + per-needle ranges)
@@ -4112,15 +4138,19 @@ fn r2_wave_engine_matches_lpb_differential() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_batched_completion_matches_per_needle() {
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
+    )
+    .unwrap();
     e.execute_text(
         2,
         "INSERT INTO accounts (id, bucket, balance, note) VALUES \
          (10, 1, 100, 'a'), (20, 1, NULL, 'b'), (30, 2, 300, NULL), (40, 2, 400, 'd'), (NULL, 5, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
+    e.populate_relational_residency_snapshot("accounts")
+        .unwrap();
     let select = match parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap() {
         Command::Select(s) => s,
         _ => unreachable!(),
@@ -4130,7 +4160,9 @@ fn r2_batched_completion_matches_per_needle() {
     }
     // lpb INDEX route (unique key `id`): wave_engine on.
     e.set_index_probe_enabled(true);
-    let template = e.prepare_relational_retained_read_template(&select).unwrap();
+    let template = e
+        .prepare_relational_retained_read_template(&select)
+        .unwrap();
     // distinct needles incl an ABSENT one (25) and NULL-as-0 (0, the NULL-id row).
     let needles = vec![10, 20, 30, 40, 25, 0];
 
@@ -4158,8 +4190,11 @@ fn r2_batched_completion_matches_per_needle() {
     );
     for (i, result) in per_needle.iter().enumerate() {
         // batched is raw i32; map to SqlValue::Int4 to compare with the per-needle SqlValue rows.
-        let batched_vals: Vec<SqlValue> =
-            batched.needle_values(i).iter().map(|&v| SqlValue::Int4(v)).collect();
+        let batched_vals: Vec<SqlValue> = batched
+            .needle_values(i)
+            .iter()
+            .map(|&v| SqlValue::Int4(v))
+            .collect();
         let per_needle_vals: Vec<SqlValue> = result.rows.iter().flatten().cloned().collect();
         assert_eq!(
             batched_vals, per_needle_vals,
@@ -4172,7 +4207,10 @@ fn r2_batched_completion_matches_per_needle() {
         &[0, 500],
         "needle 0 -> the NULL-id row via the batched path"
     );
-    assert!(batched.needle_values(4).is_empty(), "absent needle 25 -> no rows");
+    assert!(
+        batched.needle_values(4).is_empty(),
+        "absent needle 25 -> no rows"
+    );
 }
 
 // Multi-row-needle companion to r2_batched_completion_matches_per_needle (audit P2): a NON-unique predicate
@@ -4184,15 +4222,19 @@ fn r2_batched_completion_matches_per_needle() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_batched_completion_matches_per_needle_multirow() {
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE accounts (id INT, bucket INT, balance INT, note TEXT)",
+    )
+    .unwrap();
     e.execute_text(
         2,
         "INSERT INTO accounts (id, bucket, balance, note) VALUES \
          (10, 1, 100, 'a'), (20, 1, 200, 'b'), (30, 2, 300, 'c'), (40, 2, 400, 'd'), (50, 3, 500, 'e')",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
+    e.populate_relational_residency_snapshot("accounts")
+        .unwrap();
     let select = match parse_command("SELECT id, balance FROM accounts WHERE bucket = 1").unwrap() {
         Command::Select(s) => s,
         _ => unreachable!(),
@@ -4202,7 +4244,9 @@ fn r2_batched_completion_matches_per_needle_multirow() {
     }
     // Non-unique `bucket` -> the index declines and the SCAN serves; wave_engine on exercises that fallback.
     e.set_index_probe_enabled(true);
-    let template = e.prepare_relational_retained_read_template(&select).unwrap();
+    let template = e
+        .prepare_relational_retained_read_template(&select)
+        .unwrap();
     // bucket 1 -> 2 rows, bucket 2 -> 2 rows, bucket 3 -> 1 row, bucket 9 -> absent.
     let needles = vec![1, 2, 3, 9];
 
@@ -4227,8 +4271,11 @@ fn r2_batched_completion_matches_per_needle_multirow() {
         "test is vacuous: no needle matched >1 row (predicate did not route as multi-row)"
     );
     for (i, result) in per_needle.iter().enumerate() {
-        let batched_vals: Vec<SqlValue> =
-            batched.needle_values(i).iter().map(|&v| SqlValue::Int4(v)).collect();
+        let batched_vals: Vec<SqlValue> = batched
+            .needle_values(i)
+            .iter()
+            .map(|&v| SqlValue::Int4(v))
+            .collect();
         let per_needle_vals: Vec<SqlValue> = result.rows.iter().flatten().cloned().collect();
         assert_eq!(
             batched_vals, per_needle_vals,
@@ -4242,7 +4289,10 @@ fn r2_batched_completion_matches_per_needle_multirow() {
         &[10, 100, 20, 200],
         "bucket=1 -> (10,100),(20,200) in ascending row order"
     );
-    assert!(batched.needle_values(3).is_empty(), "absent bucket 9 -> no rows");
+    assert!(
+        batched.needle_values(3).is_empty(),
+        "absent bucket 9 -> no rows"
+    );
 }
 
 // audit P3 (batched scatter): a GPU fixture's 2-row emit order coincidentally equals ascending row_index, so
@@ -4271,9 +4321,21 @@ fn r2_batched_assembly_sorts_multirow_needle_by_row_index() {
     });
     // needle 0: TWO rows, DESCENDING emit order (row_index 5 then 2); needle 1: one row; needle 2: ABSENT.
     let rows = vec![
-        CudaI32BatchProjectionRow { needle_index: 0, row_index: 5, values: vec![10, 105] },
-        CudaI32BatchProjectionRow { needle_index: 0, row_index: 2, values: vec![10, 102] },
-        CudaI32BatchProjectionRow { needle_index: 1, row_index: 9, values: vec![20, 209] },
+        CudaI32BatchProjectionRow {
+            needle_index: 0,
+            row_index: 5,
+            values: vec![10, 105],
+        },
+        CudaI32BatchProjectionRow {
+            needle_index: 0,
+            row_index: 2,
+            values: vec![10, 102],
+        },
+        CudaI32BatchProjectionRow {
+            needle_index: 1,
+            row_index: 9,
+            values: vec![20, 209],
+        },
     ];
     let projected = CudaI32BatchProjectionColumns::from_rows(rows);
     let batched = Engine::assemble_batched_rows(&projected, 3, 2, shared_cols, shared_access, 3);
@@ -4285,7 +4347,10 @@ fn r2_batched_assembly_sorts_multirow_needle_by_row_index() {
         "multi-row needle must be sorted ascending by row_index (the within-needle sort is NECESSARY)"
     );
     assert_eq!(batched.needle_values(1), &[20, 209]);
-    assert!(batched.needle_values(2).is_empty(), "absent needle -> no rows");
+    assert!(
+        batched.needle_values(2).is_empty(),
+        "absent needle -> no rows"
+    );
 }
 
 // The UNIQUE fast-path of assemble_batched_rows (<=1 row/needle, the dominant point read): each row is
@@ -4314,16 +4379,31 @@ fn r2_batched_assembly_unique_fastpath_scatters_by_needle() {
     // 4 needles, each <=1 row (unique -> fast-path). Emit order is ARBITRARY (needle 2, then 0, then 3);
     // needle 1 is ABSENT (count 0).
     let rows = vec![
-        CudaI32BatchProjectionRow { needle_index: 2, row_index: 7, values: vec![22, 202] },
-        CudaI32BatchProjectionRow { needle_index: 0, row_index: 3, values: vec![10, 100] },
-        CudaI32BatchProjectionRow { needle_index: 3, row_index: 1, values: vec![33, 303] },
+        CudaI32BatchProjectionRow {
+            needle_index: 2,
+            row_index: 7,
+            values: vec![22, 202],
+        },
+        CudaI32BatchProjectionRow {
+            needle_index: 0,
+            row_index: 3,
+            values: vec![10, 100],
+        },
+        CudaI32BatchProjectionRow {
+            needle_index: 3,
+            row_index: 1,
+            values: vec![33, 303],
+        },
     ];
     let projected = CudaI32BatchProjectionColumns::from_rows(rows);
     let batched = Engine::assemble_batched_rows(&projected, 4, 2, shared_cols, shared_access, 3);
     assert_eq!(batched.needle_count(), 4);
     // Output MUST be needle-ordered (0, [1 empty], 2, 3), NOT emit order (2, 0, 3).
     assert_eq!(batched.needle_values(0), &[10, 100]);
-    assert!(batched.needle_values(1).is_empty(), "absent needle 1 -> no rows");
+    assert!(
+        batched.needle_values(1).is_empty(),
+        "absent needle 1 -> no rows"
+    );
     assert_eq!(batched.needle_values(2), &[22, 202]);
     assert_eq!(batched.needle_values(3), &[33, 303]);
 }
@@ -4340,13 +4420,18 @@ fn r2_batched_assembly_unique_fastpath_scatters_by_needle() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn r2_dense_index_probe_matches_atomic() {
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer (a supported, settable configuration;
+    // sharded is the default) — pin the layout under test.
+    e.set_shard_residency_enabled(false);
+    e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO accounts (id, balance) VALUES (10, 100), (20, 200), (30, 300), (40, 400), (NULL, 500)",
     )
     .unwrap();
-    e.populate_relational_residency_snapshot("accounts").unwrap();
+    e.populate_relational_residency_snapshot("accounts")
+        .unwrap();
     let select = match parse_command("SELECT id, balance FROM accounts WHERE id = 1").unwrap() {
         Command::Select(s) => s,
         _ => unreachable!(),
@@ -4356,20 +4441,23 @@ fn r2_dense_index_probe_matches_atomic() {
     }
     // lpb INDEX route (not the persistent wave): wave_engine on, persistent off.
     e.set_index_probe_enabled(true);
-    let template = e.prepare_relational_retained_read_template(&select).unwrap();
+    let template = e
+        .prepare_relational_retained_read_template(&select)
+        .unwrap();
 
     let cases: Vec<Vec<i32>> = vec![
-        vec![10, 20, 30, 40],         // all match (dense fully populated)
-        vec![91, 92, 93],             // none match (every slot status=2)
-        vec![10, 25, 30, 99, 0],      // mix: present + absent gaps (25,99) + NULL-as-0 (0)
-        vec![25],                     // single absent (degenerate gap)
-        vec![0],                      // single NULL-as-0
+        vec![10, 20, 30, 40],    // all match (dense fully populated)
+        vec![91, 92, 93],        // none match (every slot status=2)
+        vec![10, 25, 30, 99, 0], // mix: present + absent gaps (25,99) + NULL-as-0 (0)
+        vec![25],                // single absent (degenerate gap)
+        vec![0],                 // single NULL-as-0
     ];
     for needles in cases {
         e.set_dense_index_probe_enabled(false);
         let atomic = e
             .complete_relational_retained_read_submission_batched(
-                e.submit_relational_retained_template_point_lookups(&template, &needles).unwrap(),
+                e.submit_relational_retained_template_point_lookups(&template, &needles)
+                    .unwrap(),
             )
             .unwrap();
 
@@ -4377,7 +4465,8 @@ fn r2_dense_index_probe_matches_atomic() {
         let before = e.dense_index_probe_hits();
         let dense = e
             .complete_relational_retained_read_submission_batched(
-                e.submit_relational_retained_template_point_lookups(&template, &needles).unwrap(),
+                e.submit_relational_retained_template_point_lookups(&template, &needles)
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(

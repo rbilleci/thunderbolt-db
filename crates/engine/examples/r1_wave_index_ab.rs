@@ -192,7 +192,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "# R1 wave-index A/B  sizes={sizes:?}  batch={batch}  batches={batches}  warmup={warmup}"
     );
-    println!("# OFF = full-scan equal_any (O(rows)/batch);  ON = GPU hash-index probe (O(1)/needle)\n");
+    println!(
+        "# OFF = full-scan equal_any (O(rows)/batch);  ON = GPU hash-index probe (O(1)/needle)\n"
+    );
 
     // (rows, off_ops, on_ops) for the closing O(rows)→O(1) summary.
     let mut headline: Vec<(i64, f64, f64)> = Vec::new();
@@ -269,7 +271,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             "rows", "OFF scan", "ON index", "speedup"
         );
         for (rows, off_ops, on_ops) in &headline {
-            let sp = if *off_ops > 0.0 { on_ops / off_ops } else { 0.0 };
+            let sp = if *off_ops > 0.0 {
+                on_ops / off_ops
+            } else {
+                0.0
+            };
             println!("  {rows:>12}  {off_ops:>14.0}  {on_ops:>14.0}  {sp:>9.2}x");
         }
         let (r0, off0, on0) = headline[0];

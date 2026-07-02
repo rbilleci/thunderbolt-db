@@ -210,7 +210,11 @@ fn a_payload_with_no_nulls_emits_no_bitmap_and_stays_byte_identical() {
         build_relational_device_payload(&names, &types, &rows).unwrap();
     assert!(null_cols.is_empty(), "no NULLs => no validity bitmap");
     // header(8) + int4(2*4=8) -> 16 (8-aligned, no text pad) + offsets(3*8=24) + bytes("x"+"yy"=3).
-    assert_eq!(payload.len(), 8 + 8 + 24 + 3, "no extra null-bitmap bytes were added");
+    assert_eq!(
+        payload.len(),
+        8 + 8 + 24 + 3,
+        "no extra null-bitmap bytes were added"
+    );
 }
 
 #[test]
@@ -308,7 +312,8 @@ fn only_columns_that_contain_a_null_get_a_bitmap_in_catalog_order() {
 #[test]
 fn insert_null_literal_stores_and_selects_back_a_null_cell() {
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
     e.execute_text(2, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, NULL)")
         .unwrap();
 
@@ -357,7 +362,8 @@ fn a_null_keyed_row_is_excluded_by_an_equality_filter_end_to_end() {
     // SQL three-valued logic through real SQL: a row whose filter column is NULL is excluded by
     // `col = x` (NULL = x is UNKNOWN, never TRUE).
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (id INT, tag TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (id INT, tag TEXT)")
+        .unwrap();
     e.execute_text(2, "INSERT INTO t (id, tag) VALUES (1, 'x'), (NULL, 'y')")
         .unwrap();
 

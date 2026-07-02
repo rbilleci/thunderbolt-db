@@ -180,58 +180,17 @@ impl Engine {
                 group_key_columns.push(resolve_column_name(column_ref, &qualifier)?.to_string());
             }
         }
-        // SLICE B: a SHARD-resident table has no single-buffer snapshot, so the `None`-src lookup below
-        // would fail ("relation has no resident snapshot") — previously every general-executor shape
-        // (`IS NULL`, expression predicates, GPU sorts, ...) ERRORED on sharded tables. Build the UNIFIED
-        // recompacted source instead (int4 + SV3b/SV6 version columns + M3 null bitmaps — the same builder
-        // the sharded shape bridge uses) and inject it, so the general executor serves sharded tables with
-        // the SAME on-device execution (device predicate VM incl. NULL 3VL + the visibility conjuncts).
-        // A single-buffer table keeps the unchanged `None` path, byte-identical.
-        let sharded_unified = if self
-            .read_state
-            .residency
-            .shards
-            .load()
-            .get(&table.name)
-            .is_some_and(|shards| !shards.is_empty())
-        {
-            let unified =
-                self.build_sharded_unified_exec_source(&table, predicate.as_ref(), copin_s)?;
-            // Mirror the sharded bridge's SV3b/SV6 scope guard: the DISTINCT / GROUP BY / ORDER BY
-            // execution paths do not yet thread the visibility conjuncts, so a VERSIONED (tombstoned /
-            // update-stamped) table reaching them would leak invisible versions. Clean error, never a
-            // wrong result. (An un-versioned sharded table — the majority — takes every shape.)
-            if unified.visibility.is_some()
-                && (select.distinct
-                    || select.group_by.is_some()
-                    || !select.order_by.is_empty()
-                    || !select.having_groups.is_empty()
-                    || !stmt.sort_clause.is_empty()
-                    || !stmt.group_clause.is_empty())
-            {
-                return Err(sql_pg_error(
-                    "resident visibility filter (SV3b/SV6) is not yet wired through the DISTINCT / \
-                     GROUP BY / ORDER BY paths for a versioned sharded table"
-                        .to_string(),
-                ));
-            }
-            Some(unified)
-        } else {
-            None
-        };
-        let (src, visibility) = match &sharded_unified {
-            Some(unified) => (Some(&unified.src), unified.visibility),
-            // SV3b visibility: the whole-table single-store PG path carries no version columns.
-            None => (None, None),
-        };
+        // A SHARD-resident table resolves to the unified exec source (visibility included) INSIDE
+        // `execute_resident_expr_select_with_binding` — the one resolution point for every `src: None`
+        // caller (THE FLIP). The whole-table single-store path carries no version columns.
         self.execute_resident_expr_select_with_binding(
             &select,
             &table,
-            src,
+            None,
             bound,
             copin_s,
             predicate.as_ref(),
-            visibility,
+            None,
             &order_by_exprs,
             &order_by_nulls_first,
             group_key_expr.as_ref(),
@@ -245,7 +204,8 @@ impl Engine {
 /// multi-statement string, or a non-`SELECT` command: the general GPU executor binds read queries
 /// only, and the bind/map layers above resolve the table, projection, and predicate from this tree.
 pub(crate) fn parse_single_select(sql: &str) -> Result<SelectStmt, ExecuteError> {
-    let parsed = pg_query::parse(sql).map_err(|err| sql_pg_error(format!("SQL parse error: {err}")))?;
+    let parsed =
+        pg_query::parse(sql).map_err(|err| sql_pg_error(format!("SQL parse error: {err}")))?;
     let mut stmts = parsed.protobuf.stmts;
     if stmts.len() != 1 {
         return Err(sql_pg_error(format!(
@@ -274,7 +234,8 @@ pub(crate) fn parse_single_select(sql: &str) -> Result<SelectStmt, ExecuteError>
 fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), ExecuteError> {
     let [from] = stmt.from_clause.as_slice() else {
         return Err(sql_pg_error(
-            "the general GPU executor supports exactly one FROM relation (no joins yet)".to_string(),
+            "the general GPU executor supports exactly one FROM relation (no joins yet)"
+                .to_string(),
         ));
     };
     let NodeEnum::RangeVar(range_var) = node_enum(from)? else {
@@ -300,9 +261,15 @@ fn build_select_from_select_stmt(stmt: &SelectStmt) -> Result<(Select, String), 
     let has_group_by = !stmt.group_clause.is_empty();
     let unsupported = [
         (!stmt.distinct_clause.is_empty(), "DISTINCT"),
-        (stmt.having_clause.is_some() && !has_group_by, "HAVING without GROUP BY"),
+        (
+            stmt.having_clause.is_some() && !has_group_by,
+            "HAVING without GROUP BY",
+        ),
         (!stmt.window_clause.is_empty(), "window functions"),
-        (!stmt.locking_clause.is_empty(), "row locking (FOR UPDATE/SHARE)"),
+        (
+            !stmt.locking_clause.is_empty(),
+            "row locking (FOR UPDATE/SHARE)",
+        ),
         (stmt.with_clause.is_some(), "WITH / CTEs"),
         // A plain SELECT is SETOP_NONE (= 1; proto enums prefix Undefined = 0). UNION/INTERSECT/EXCEPT
         // put their inputs in larg/rarg with an empty top-level from_clause, so the single-FROM check
@@ -410,7 +377,10 @@ fn parse_join_col_ref(node: &Node) -> Result<JoinColRef, ExecuteError> {
 fn parse_join_proj_item(node: &Node) -> Result<JoinProjItem, ExecuteError> {
     if let NodeEnum::ColumnRef(column_ref) = node_enum(node)? {
         let last_is_star = matches!(
-            column_ref.fields.last().and_then(|field| field.node.as_ref()),
+            column_ref
+                .fields
+                .last()
+                .and_then(|field| field.node.as_ref()),
             Some(NodeEnum::AStar(_))
         );
         if last_is_star {
@@ -420,9 +390,13 @@ fn parse_join_proj_item(node: &Node) -> Result<JoinProjItem, ExecuteError> {
                     Some(NodeEnum::String(string)) => {
                         Ok(JoinProjItem::Star(Some(string.sval.clone())))
                     }
-                    _ => Err(sql_pg_error("a qualified `*` must be `alias.*`".to_string())),
+                    _ => Err(sql_pg_error(
+                        "a qualified `*` must be `alias.*`".to_string(),
+                    )),
                 },
-                _ => Err(sql_pg_error("a schema-qualified `*` is not supported".to_string())),
+                _ => Err(sql_pg_error(
+                    "a schema-qualified `*` is not supported".to_string(),
+                )),
             };
         }
     }
@@ -575,13 +549,17 @@ fn flatten_join_chain(
 /// Parse a USING column list (`USING (a, b)`) into the column names. Each entry is a String node.
 fn parse_using_columns(using_clause: &[Node]) -> Result<Vec<String>, ExecuteError> {
     if using_clause.is_empty() {
-        return Err(sql_pg_error("USING requires at least one column".to_string()));
+        return Err(sql_pg_error(
+            "USING requires at least one column".to_string(),
+        ));
     }
     using_clause
         .iter()
         .map(|node| match node_enum(node)? {
             NodeEnum::String(string) => Ok(string.sval.clone()),
-            _ => Err(sql_pg_error("a USING column must be a plain column name".to_string())),
+            _ => Err(sql_pg_error(
+                "a USING column must be a plain column name".to_string(),
+            )),
         })
         .collect()
 }
@@ -636,10 +614,14 @@ fn parse_on_conjuncts(quals: &Node) -> Result<Vec<(JoinColRef, JoinColRef)>, Exe
 fn build_join_plan(stmt: &SelectStmt) -> Result<JoinPlan, ExecuteError> {
     reject_unsupported_join_clauses(stmt)?;
     let [from] = stmt.from_clause.as_slice() else {
-        return Err(sql_pg_error("expected a single JOIN in the FROM clause".to_string()));
+        return Err(sql_pg_error(
+            "expected a single JOIN in the FROM clause".to_string(),
+        ));
     };
     let NodeEnum::JoinExpr(join) = node_enum(from)? else {
-        return Err(sql_pg_error("expected a JOIN in the FROM clause".to_string()));
+        return Err(sql_pg_error(
+            "expected a JOIN in the FROM clause".to_string(),
+        ));
     };
     let mut relations: Vec<JoinRelationRef> = Vec::new();
     let mut steps: Vec<JoinStep> = Vec::new();
@@ -734,7 +716,9 @@ fn parse_join_order_by_limit(
 /// Shared by explicit + comma joins.
 fn parse_join_projection(stmt: &SelectStmt) -> Result<Vec<JoinProjItem>, ExecuteError> {
     if stmt.target_list.is_empty() {
-        return Err(sql_pg_error("a join SELECT must project at least one column".to_string()));
+        return Err(sql_pg_error(
+            "a join SELECT must project at least one column".to_string(),
+        ));
     }
     let mut projection = Vec::with_capacity(stmt.target_list.len());
     for target in &stmt.target_list {
@@ -787,7 +771,9 @@ fn which_relation(
             let i = relations
                 .iter()
                 .position(|r| &r.alias == q)
-                .ok_or_else(|| sql_pg_error(format!("missing FROM-clause entry for table \"{q}\"")))?;
+                .ok_or_else(|| {
+                    sql_pg_error(format!("missing FROM-clause entry for table \"{q}\""))
+                })?;
             relational_column_index(&tables[i], &c.column)?;
             Ok(i)
         }
@@ -834,13 +820,16 @@ fn plan_comma_join_where(
     for conjunct in conjuncts {
         // A conjunct that resolves wholly against one relation is that relation's filter (first match wins,
         // matching split_join_where).
-        if let Some((i, expr)) = tables
-            .iter()
-            .zip(aliases)
-            .enumerate()
-            .find_map(|(i, (table, alias))| {
-                map_predicate_node(conjunct, table, alias).ok().map(|expr| (i, expr))
-            })
+        if let Some((i, expr)) =
+            tables
+                .iter()
+                .zip(aliases)
+                .enumerate()
+                .find_map(|(i, (table, alias))| {
+                    map_predicate_node(conjunct, table, alias)
+                        .ok()
+                        .map(|expr| (i, expr))
+                })
         {
             filters[i].push(expr);
             continue;
@@ -886,11 +875,13 @@ fn plan_comma_join_where(
     let predicates = filters
         .into_iter()
         .map(|conjuncts| {
-            conjuncts.into_iter().reduce(|acc, expr| ResidentExpr::Binary {
-                op: ResidentBinaryOp::And,
-                lhs: Box::new(acc),
-                rhs: Box::new(expr),
-            })
+            conjuncts
+                .into_iter()
+                .reduce(|acc, expr| ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(expr),
+                })
         })
         .collect();
     Ok((steps, predicates))
@@ -921,7 +912,9 @@ fn split_join_where(
             .zip(aliases)
             .enumerate()
             .find_map(|(i, (table, alias))| {
-                map_predicate_node(conjunct, table, alias).ok().map(|expr| (i, expr))
+                map_predicate_node(conjunct, table, alias)
+                    .ok()
+                    .map(|expr| (i, expr))
             });
         match mapped {
             Some((i, expr)) => per_relation[i].push(expr),
@@ -937,11 +930,13 @@ fn split_join_where(
     Ok(per_relation
         .into_iter()
         .map(|conjuncts| {
-            conjuncts.into_iter().reduce(|acc, expr| ResidentExpr::Binary {
-                op: ResidentBinaryOp::And,
-                lhs: Box::new(acc),
-                rhs: Box::new(expr),
-            })
+            conjuncts
+                .into_iter()
+                .reduce(|acc, expr| ResidentExpr::Binary {
+                    op: ResidentBinaryOp::And,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(expr),
+                })
         })
         .collect())
 }
@@ -971,7 +966,9 @@ fn parse_group_by(group_clause: &[Node], qualifier: &str) -> Result<Option<Strin
             // derived int key column (via group_key_expr), and the SELECT projection of the SAME
             // expression reads the resulting group key.
             if let NodeEnum::ColumnRef(column_ref) = node_enum(one)? {
-                Ok(Some(resolve_column_name(column_ref, qualifier)?.to_string()))
+                Ok(Some(
+                    resolve_column_name(column_ref, qualifier)?.to_string(),
+                ))
             } else {
                 Ok(Some("(expr)".to_string()))
             }
@@ -1249,7 +1246,8 @@ fn try_parse_scalar_aggregate(
             }
         }
         return Err(sql_pg_error(
-            "only COUNT(DISTINCT col) is supported on the Expr path's aggregate DISTINCT".to_string(),
+            "only COUNT(DISTINCT col) is supported on the Expr path's aggregate DISTINCT"
+                .to_string(),
         ));
     }
     if name == "count" && func.agg_star && func.args.is_empty() {
@@ -1306,9 +1304,7 @@ fn map_predicate_node(
                 .ok_or_else(|| sql_pg_error(format!("malformed numeric literal: {}", float.fval))),
             // A quoted string literal -> a text comparison value (the type matrix, doc 19). Byte-wise
             // (deterministic-collation equality is byte identity).
-            Some(a_const::Val::Sval(string)) => {
-                Ok(ResidentExpr::TextLiteral(string.sval.clone()))
-            }
+            Some(a_const::Val::Sval(string)) => Ok(ResidentExpr::TextLiteral(string.sval.clone())),
             // A `true` / `false` literal -> the comparison value for `flag = true` / `flag = false`
             // (the type matrix, doc 19).
             Some(a_const::Val::Boolval(boolean)) => Ok(ResidentExpr::BoolLiteral(boolean.boolval)),
@@ -1429,10 +1425,9 @@ fn map_a_expr(
         ));
     }
     let op = map_operator(aexpr_op_token(a_expr)?)?;
-    let lexpr = a_expr
-        .lexpr
-        .as_deref()
-        .ok_or_else(|| sql_pg_error("operator expression is missing its left operand".to_string()))?;
+    let lexpr = a_expr.lexpr.as_deref().ok_or_else(|| {
+        sql_pg_error("operator expression is missing its left operand".to_string())
+    })?;
     let rexpr = a_expr.rexpr.as_deref().ok_or_else(|| {
         sql_pg_error(
             "operator expression is missing its right operand (unary operators unsupported)"
@@ -1570,7 +1565,9 @@ fn aexpr_op_token(a_expr: &AExpr) -> Result<&str, ExecuteError> {
     match a_expr.name.as_slice() {
         [name] => match name.node.as_ref() {
             Some(NodeEnum::String(string)) => Ok(&string.sval),
-            _ => Err(sql_pg_error("operator name is not a String node".to_string())),
+            _ => Err(sql_pg_error(
+                "operator name is not a String node".to_string(),
+            )),
         },
         _ => Err(sql_pg_error(
             "schema-qualified or multi-part operators are not supported".to_string(),
@@ -1584,7 +1581,9 @@ fn aexpr_op_token(a_expr: &AExpr) -> Result<&str, ExecuteError> {
 /// aggregate function makes that name ambiguous -- the first match wins; uncommon.)
 fn result_column_name(node: &Node, qualifier: &str) -> Result<String, ExecuteError> {
     match node_enum(node)? {
-        NodeEnum::ColumnRef(column_ref) => Ok(resolve_column_name(column_ref, qualifier)?.to_string()),
+        NodeEnum::ColumnRef(column_ref) => {
+            Ok(resolve_column_name(column_ref, qualifier)?.to_string())
+        }
         NodeEnum::FuncCall(func) => {
             let name = match func.funcname.last().map(node_enum).transpose()? {
                 Some(NodeEnum::String(string)) => string.sval.to_ascii_lowercase(),
@@ -1713,10 +1712,7 @@ fn parse_having(
 
 /// Parse a single-key `ORDER BY` (a group column or an aggregate, ASC/DESC). libpg_query `SortByDir`
 /// 3 == DESC.
-fn parse_order_by(
-    sort_clause: &[Node],
-    qualifier: &str,
-) -> Result<Vec<SelectOrder>, ExecuteError> {
+fn parse_order_by(sort_clause: &[Node], qualifier: &str) -> Result<Vec<SelectOrder>, ExecuteError> {
     // Parse EVERY sort key, in significance order (`ORDER BY a ASC, b DESC, c`). Multi-key sorts run on
     // the GPU bitonic-sort path (the general Expr executor); the CPU/enumerated sort sites reject
     // `len() > 1`. NULLS FIRST/LAST is ignored (data is non-null until M3).
@@ -1747,7 +1743,9 @@ fn parse_limit(limit: &Option<Box<Node>>) -> Result<Option<usize>, ExecuteError>
     };
     match node_enum(node)? {
         NodeEnum::AConst(constant) => match &constant.val {
-            Some(a_const::Val::Ival(integer)) if integer.ival >= 0 => Ok(Some(integer.ival as usize)),
+            Some(a_const::Val::Ival(integer)) if integer.ival >= 0 => {
+                Ok(Some(integer.ival as usize))
+            }
             _ => Err(sql_pg_error(
                 "LIMIT / OFFSET must be a non-negative integer literal".to_string(),
             )),

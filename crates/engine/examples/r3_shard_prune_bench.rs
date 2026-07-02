@@ -102,7 +102,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 vals.push_str(&format!("({}, {})", id, id * 10));
                 id += 1;
             }
-            engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+            engine.execute_text(
+                txn,
+                &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+            )?;
             txn += 1;
         }
 

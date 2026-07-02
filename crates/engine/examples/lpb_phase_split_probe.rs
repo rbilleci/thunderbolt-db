@@ -55,7 +55,10 @@ fn build_resident_engine(rows: i64) -> Result<Engine, Box<dyn Error>> {
             vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
             id += 1;
         }
-        e.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        e.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+        )?;
         txn += 1;
     }
     e.populate_relational_residency_snapshot("accounts")?;
@@ -128,17 +131,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let template = e.prepare_relational_retained_read_template(&select)?;
 
     println!("# TAIL-LOCALIZATION — lpb vs lpb-dense SUBMIT/COMPLETE distribution on the BATCHED path. rows={rows}");
-    println!("# Goal: find WHERE the lpb p99 tail lives (submit vs complete). us = microseconds.\n");
+    println!(
+        "# Goal: find WHERE the lpb p99 tail lives (submit vs complete). us = microseconds.\n"
+    );
     println!(
         "  {:>5} {:>6}  {:>26}  {:>26}",
         "mode", "batch", "submit p50/p99/p99.9/max", "complete p50/p99/p99.9/max"
     );
 
     for &batch in &batch_sizes {
-        for (label, wave_engine, dense) in [
-            ("lpb", true, false),
-            ("lpb-dense", true, true),
-        ] {
+        for (label, wave_engine, dense) in [("lpb", true, false), ("lpb-dense", true, true)] {
             e.set_index_probe_enabled(wave_engine);
             e.set_dense_index_probe_enabled(dense);
             // warmup (lpb builds the index)

@@ -60,7 +60,10 @@ fn load(rows: i64, shard_size: usize) -> Result<Engine, Box<dyn Error>> {
             vals.push_str(&format!("({}, {})", id, id * 10));
             id += 1;
         }
-        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        engine.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+        )?;
         txn += 1;
     }
     Ok(engine)
@@ -114,8 +117,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         for w in 0..8i64 {
             let k = (w * rrows / 8).clamp(0, rrows - 1) as i32;
             let _ = engine.bench_sharded_point_lookup_batch("accounts", "id", &proj, &[k]);
-            let _ = engine
-                .execute_relational_select_text(&format!("SELECT id, balance FROM accounts WHERE id = {k}"))?;
+            let _ = engine.execute_relational_select_text(&format!(
+                "SELECT id, balance FROM accounts WHERE id = {k}"
+            ))?;
         }
 
         // SINGLE-FLIGHT baseline (the 3b SQL route, one lookup per call).
@@ -125,8 +129,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         for _ in 0..sf_lookups {
             let k = (next_rand(&mut rng) % rrows as u64) as i32;
             let t = Instant::now();
-            let _ = engine
-                .execute_relational_select_text(&format!("SELECT id, balance FROM accounts WHERE id = {k}"))?;
+            let _ = engine.execute_relational_select_text(&format!(
+                "SELECT id, balance FROM accounts WHERE id = {k}"
+            ))?;
             sf_us.push(t.elapsed().as_secs_f64() * 1e6);
         }
         sf_us.sort_by(|a, b| a.partial_cmp(b).unwrap());

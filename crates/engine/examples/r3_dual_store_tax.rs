@@ -67,7 +67,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!();
     println!("Reading: with the open-shard append (Slices 1b-ii-c/d) the per-insert COMMIT cost is now flat");
-    println!("in table size (~the control + a small segment term). The whole-table re-upload is gone.");
+    println!(
+        "in table size (~the control + a small segment term). The whole-table re-upload is gone."
+    );
     println!();
 
     // The THIRD dual-store term (review-2 #1): with the GPU index probe ON, each commit INVALIDATES the
@@ -83,8 +85,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     println!("Reading (MEASURED 16k/64k/256k ~= 114/122/133us, NEARLY FLAT): the index rebuild is O(table)");
     println!("in principle but BANDWIDTH-BOUND + small (~tens of us even at 256k), masked by the ~100us fixed");
-    println!("point-read overhead -- NOT the O(table) blow-up review-2 #1 (term b) feared. So an INSERT");
-    println!("index-append (which needs an on-device insert kernel for true O(rows) -- the HtoD of a");
+    println!(
+        "point-read overhead -- NOT the O(table) blow-up review-2 #1 (term b) feared. So an INSERT"
+    );
+    println!(
+        "index-append (which needs an on-device insert kernel for true O(rows) -- the HtoD of a"
+    );
     println!("hash-scattered table is itself O(table)) is a modest ~tens-of-us win = LOW priority; the index");
     println!("probe is default-OFF anyway, and read-after-write here is not an extra scan cost. Measure-first");
     println!("(this probe) avoided a premature on-device-kernel optimization.");
@@ -93,13 +99,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     // same tax as the INSERT re-admit above); flag ON = the GPU-native in-place tombstone (locate + stamp one
     // `deleted_by` slot, O(rows touched)). The re-admit column grows with base; the tombstone column is flat.
     println!();
-    println!("## single-row DELETE on a shard-resident table (SV4b: re-admit vs in-place tombstone)");
+    println!(
+        "## single-row DELETE on a shard-resident table (SV4b: re-admit vs in-place tombstone)"
+    );
     println!("| base_rows | del_readmit_mean_us | del_readmit_max_us | del_tombstone_mean_us | del_tombstone_max_us | speedup |");
     println!("|---|---|---|---|---|---|");
     for &base in &bases {
         let (readmit_mean, readmit_max) = measure_resident_delete(base, timed, false)?;
         let (tomb_mean, tomb_max) = measure_resident_delete(base, timed, true)?;
-        let speedup = if tomb_mean > 0.0 { readmit_mean / tomb_mean } else { 0.0 };
+        let speedup = if tomb_mean > 0.0 {
+            readmit_mean / tomb_mean
+        } else {
+            0.0
+        };
         println!(
             "| {base} | {readmit_mean:.1} | {readmit_max:.1} | {tomb_mean:.1} | {tomb_max:.1} | {speedup:.1}x |"
         );
@@ -121,7 +133,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     for &base in &bases {
         let (readmit_mean, readmit_max) = measure_resident_update(base, timed, false)?;
         let (inc_mean, inc_max) = measure_resident_update(base, timed, true)?;
-        let speedup = if inc_mean > 0.0 { readmit_mean / inc_mean } else { 0.0 };
+        let speedup = if inc_mean > 0.0 {
+            readmit_mean / inc_mean
+        } else {
+            0.0
+        };
         println!(
             "| {base} | {readmit_mean:.1} | {readmit_max:.1} | {inc_mean:.1} | {inc_max:.1} | {speedup:.1}x |"
         );
@@ -153,7 +169,10 @@ fn measure_resident(base: i64, timed: usize) -> Result<(f64, f64, f64), Box<dyn 
             vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
             id += 1;
         }
-        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        engine.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+        )?;
         txn += 1;
     }
 
@@ -204,7 +223,10 @@ fn measure_resident_delete(
             vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
             id += 1;
         }
-        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        engine.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+        )?;
         txn += 1;
     }
     engine.populate_relational_residency_snapshot("accounts")?;
@@ -251,7 +273,10 @@ fn measure_resident_update(
             vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
             id += 1;
         }
-        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        engine.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+        )?;
         txn += 1;
     }
     engine.populate_relational_residency_snapshot("accounts")?;
@@ -261,7 +286,10 @@ fn measure_resident_update(
     let mut samples_us = Vec::with_capacity(n as usize);
     for k in 0..n {
         // Change the int4 `balance` column -> a value-changing single-row UPDATE by unique key.
-        let sql = format!("UPDATE accounts SET balance = {} WHERE id = {k}", 900_000 + k);
+        let sql = format!(
+            "UPDATE accounts SET balance = {} WHERE id = {k}",
+            900_000 + k
+        );
         let start = Instant::now();
         engine.execute_text(txn, &sql)?;
         txn += 1;
@@ -294,7 +322,10 @@ fn measure_read_after_write(base: i64, timed: usize) -> Result<(f64, f64), Box<d
             vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
             id += 1;
         }
-        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+        engine.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+        )?;
         txn += 1;
     }
     engine.populate_relational_residency_snapshot("accounts")?;
@@ -304,7 +335,10 @@ fn measure_read_after_write(base: i64, timed: usize) -> Result<(f64, f64), Box<d
     // Warm the CUDA index-buffer alloc path (the first index build is a cold-start outlier otherwise).
     {
         let warm = base + 1_000_000;
-        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES ({warm}, {warm})"))?;
+        engine.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES ({warm}, {warm})"),
+        )?;
         txn += 1;
         let _ = engine.execute_relational_select_text(&format!(
             "SELECT id, balance FROM accounts WHERE id = {}",
@@ -316,15 +350,17 @@ fn measure_read_after_write(base: i64, timed: usize) -> Result<(f64, f64), Box<d
     for i in 0..timed {
         let id = base + i as i64;
         // Commit (invalidates the index) ...
-        engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES ({id}, {id})"))?;
+        engine.execute_text(
+            txn,
+            &format!("INSERT INTO accounts (id, balance) VALUES ({id}, {id})"),
+        )?;
         txn += 1;
         // ... then a point lookup of an EXISTING unique key -> index rebuild (O(table)) + probe.
         let needle = id / 2;
         let start = Instant::now();
-        let _ = engine
-            .execute_relational_select_text(&format!(
-                "SELECT id, balance FROM accounts WHERE id = {needle}"
-            ))?;
+        let _ = engine.execute_relational_select_text(&format!(
+            "SELECT id, balance FROM accounts WHERE id = {needle}"
+        ))?;
         samples_us.push(start.elapsed().as_secs_f64() * 1e6);
     }
     let mean = samples_us.iter().sum::<f64>() / samples_us.len().max(1) as f64;

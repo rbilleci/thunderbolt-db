@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_engine::{
@@ -306,10 +306,7 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     report.push_str("- streaming_artifacts_created: pass\n");
     report.push_str("- chunked_retained_device_memory_upload_available: true\n");
     report.push_str("- benchmark_chunked_resident_cache_admission: pass\n");
-    report.push_str(&format!(
-        "- resident_rows_materialized: {}\n",
-        0usize
-    ));
+    report.push_str(&format!("- resident_rows_materialized: {}\n", 0usize));
     report.push_str(&format!("- route_accepted: {}\n", route.accepted));
     report.push_str(&format!(
         "- zero_h2d_route: {}\n",
@@ -474,10 +471,7 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
     ));
     markdown.push_str(&format!("- resident_bytes: {}\n", snapshot.resident_bytes));
     markdown.push_str(&format!("- allocated_bytes: {}\n", layout.allocated_bytes));
-    markdown.push_str(&format!(
-        "- resident_rows_materialized: {}\n",
-        0usize
-    ));
+    markdown.push_str(&format!("- resident_rows_materialized: {}\n", 0usize));
     markdown.push_str(&format!("- layout_elapsed_ms: {layout_elapsed_ms}\n"));
     markdown.push_str(&format!("- install_elapsed_ms: {install_elapsed_ms}\n"));
     markdown.push_str("- expected_results: deterministic formulas, no CPU MVCC mirror\n");

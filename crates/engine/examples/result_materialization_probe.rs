@@ -14,8 +14,8 @@
 //!
 //! Run: cargo run --release --example result_materialization_probe -p gpu_db_engine   (no GPU needed)
 
-use std::time::Instant;
 use gpu_db_sql::SqlValue;
+use std::time::Instant;
 
 /// HIGH-OUTPUT (the cross-kernel-result-path-transfer doc's target): the GENERAL non-unique route
 /// (`engine_resident_probe.rs:1367`+`:1519`) materializes `m` needles x `k` matched rows each. Mirrors the
@@ -29,9 +29,12 @@ fn high_output(m: usize, k: usize) {
     // Synthetic kernel output in schedule order: row i carries (needle_index, row_index, values). Interleave
     // needles (round-robin) and shuffle row_index within a needle via a hash permutation.
     let needle_indices: Vec<u32> = (0..n).map(|i| (i % m) as u32).collect();
-    let row_indices: Vec<u64> =
-        (0..n).map(|i| ((i / m) as u64).wrapping_mul(2_654_435_761) % k as u64).collect();
-    let row_values: Vec<i32> = (0..n).flat_map(|i| [i as i32, (i as i32).wrapping_mul(7)]).collect();
+    let row_indices: Vec<u64> = (0..n)
+        .map(|i| ((i / m) as u64).wrapping_mul(2_654_435_761) % k as u64)
+        .collect();
+    let row_values: Vec<i32> = (0..n)
+        .flat_map(|i| [i as i32, (i as i32).wrapping_mul(7)])
+        .collect();
     let rv = |i: usize| &row_values[i * ncols..i * ncols + ncols];
 
     let per = |total_ns: u128| total_ns as f64 / n as f64;
@@ -44,8 +47,10 @@ fn high_output(m: usize, k: usize) {
         let t = Instant::now();
         let mut rows_by_select: Vec<Vec<(u64, Vec<SqlValue>)>> = vec![Vec::new(); m];
         for i in 0..n {
-            rows_by_select[needle_indices[i] as usize]
-                .push((row_indices[i], rv(i).iter().copied().map(SqlValue::Int4).collect()));
+            rows_by_select[needle_indices[i] as usize].push((
+                row_indices[i],
+                rv(i).iter().copied().map(SqlValue::Int4).collect(),
+            ));
         }
         let assembled: Vec<Vec<Vec<SqlValue>>> = rows_by_select
             .into_iter()
@@ -96,10 +101,26 @@ fn high_output(m: usize, k: usize) {
     }
 
     println!("\n# HIGH-OUTPUT general non-unique route: m={m} needles x k={k} rows = {n} rows x {ncols} cols");
-    println!("  {:<14} {:>10} {:>14}", "variant", "ns/row", "implied rows/s");
-    println!("  {:<14} {:>10.1} {:>14.0}", "current(boxed)", per(current), lps(per(current)));
-    println!("  {:<14} {:>10.1} {:>14.0}", "flat-i32", per(flat), lps(per(flat)));
-    println!("  current/flat: {:.1}x   (sink {sink})", per(current) / per(flat).max(0.01));
+    println!(
+        "  {:<14} {:>10} {:>14}",
+        "variant", "ns/row", "implied rows/s"
+    );
+    println!(
+        "  {:<14} {:>10.1} {:>14.0}",
+        "current(boxed)",
+        per(current),
+        lps(per(current))
+    );
+    println!(
+        "  {:<14} {:>10.1} {:>14.0}",
+        "flat-i32",
+        per(flat),
+        lps(per(flat))
+    );
+    println!(
+        "  current/flat: {:.1}x   (sink {sink})",
+        per(current) / per(flat).max(0.01)
+    );
 }
 
 /// VM lever (atomic-vs-sort split): the predicate compaction does an atomic-append (unordered) then a HOST
@@ -124,15 +145,23 @@ fn sort_cost(n: usize) {
             best = best.min(t.elapsed().as_nanos());
             sink += v[0] as u64 + v[n - 1] as u64;
         }
-        println!("  sort {label:<22} {:>8.0}us  ({:>5.1} ns/elem)  sink={sink}", best as f64 / 1000.0, best as f64 / n as f64);
+        println!(
+            "  sort {label:<22} {:>8.0}us  ({:>5.1} ns/elem)  sink={sink}",
+            best as f64 / 1000.0,
+            best as f64 / n as f64
+        );
     };
     println!("\n# host sort_unstable of {n} u32 (the compaction's host sort -- the prefix-sum lever removes it):");
     bench("already-ascending", &|| (0..n as u32).collect());
     // grid-stride atomic-append order: matches in ~row order but warp-interleaved within small windows.
     bench("roughly-ascending(±64)", &|| {
-        (0..n).map(|i| (i as i64 + (lcg(i as u64) % 128) as i64 - 64).clamp(0, n as i64 - 1) as u32).collect()
+        (0..n)
+            .map(|i| (i as i64 + (lcg(i as u64) % 128) as i64 - 64).clamp(0, n as i64 - 1) as u32)
+            .collect()
     });
-    bench("fully-shuffled", &|| (0..n).map(|i| (lcg(i as u64) % n as u64) as u32).collect());
+    bench("fully-shuffled", &|| {
+        (0..n).map(|i| (lcg(i as u64) % n as u64) as u32).collect()
+    });
 }
 
 fn main() {
@@ -140,13 +169,17 @@ fn main() {
         sort_cost(n);
         return;
     }
-    let n: usize = std::env::var("N").ok().and_then(|v| v.parse().ok()).unwrap_or(65536);
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65536);
     let ncols = 2usize;
     let iters = 50usize;
     // Synthetic GPU output: N needles, ONE matched row each (the batched point-read shape); values [id,bal].
     // (needle_index, row_index, values)
-    let projected: Vec<(usize, u64, [i32; 2])> =
-        (0..n).map(|i| (i, i as u64, [i as i32, (i as i32) * 7])).collect();
+    let projected: Vec<(usize, u64, [i32; 2])> = (0..n)
+        .map(|i| (i, i as u64, [i as i32, (i as i32) * 7]))
+        .collect();
 
     let per = |total_ns: u128| total_ns as f64 / n as f64;
     let lps = |ns: f64| if ns > 0.0 { 1.0e9 / ns } else { 0.0 };
@@ -178,7 +211,7 @@ fn main() {
         let t = Instant::now();
         let mut values: Vec<SqlValue> = Vec::with_capacity(n * ncols);
         let mut ranges: Vec<(u32, u32)> = vec![(0, 0); n]; // (start_row, row_count) per needle
-        // single matched row per needle, in needle order (point-read fast path)
+                                                           // single matched row per needle, in needle order (point-read fast path)
         for (row, &(ni, _ri, vals)) in projected.iter().enumerate() {
             ranges[ni] = (row as u32, 1);
             for &v in &vals {
@@ -201,9 +234,14 @@ fn main() {
         sink += values.len() as i64;
     }
 
-    println!("# engine result-materialization residual, N={n} rows x {ncols} cols (point-read shape)");
+    println!(
+        "# engine result-materialization residual, N={n} rows x {ncols} cols (point-read shape)"
+    );
     println!("# end-to-end today ~127ns/row (7.8M); GPU drain ~33ns/row (30M). Which stage is the residual?\n");
-    println!("  {:<14} {:>10} {:>14}", "variant", "ns/row", "implied lookups/s");
+    println!(
+        "  {:<14} {:>10} {:>14}",
+        "variant", "ns/row", "implied lookups/s"
+    );
     let row = |label: &str, ns: u128| {
         println!("  {label:<14} {:>10.1} {:>14.0}", per(ns), lps(per(ns)));
     };
@@ -218,7 +256,13 @@ fn main() {
     println!("\n# current->flat-sqlvalue = the per-row Vec<SqlValue> boxing+group+sort cost (host-flat win,");
     println!("# wire path unchanged). flat-sqlvalue->flat-i32 = the SqlValue enum-wrap (needs GPU->wire to remove).");
 
-    let m: usize = std::env::var("NEEDLES").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-    let k: usize = std::env::var("ROWS_PER_NEEDLE").ok().and_then(|v| v.parse().ok()).unwrap_or(16384);
+    let m: usize = std::env::var("NEEDLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let k: usize = std::env::var("ROWS_PER_NEEDLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16384);
     high_output(m, k);
 }

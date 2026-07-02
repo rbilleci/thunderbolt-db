@@ -31,7 +31,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
-    println!("# R3 admit scaling (single-buffer residency) — accounts(id INT, balance INT), 2 int4 cols");
+    println!(
+        "# R3 admit scaling (single-buffer residency) — accounts(id INT, balance INT), 2 int4 cols"
+    );
     println!();
     println!("| rows | load_s | admit_ms | admit_us_per_row | resident_MB | bytes_per_row |");
     println!("|---|---|---|---|---|---|");
@@ -55,7 +57,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 vals.push_str(&format!("({}, {})", id, (id * 7) % 100_000));
                 id += 1;
             }
-            engine.execute_text(txn, &format!("INSERT INTO accounts (id, balance) VALUES {vals}"))?;
+            engine.execute_text(
+                txn,
+                &format!("INSERT INTO accounts (id, balance) VALUES {vals}"),
+            )?;
             txn += 1;
         }
         let load_s = load_start.elapsed().as_secs_f64();

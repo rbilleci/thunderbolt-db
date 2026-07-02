@@ -15,13 +15,19 @@ use pg_query::NodeEnum;
 /// The populated `NodeEnum` inside a parse `Node` (every node libpg_query emits in a valid tree is
 /// populated; an empty one is a parser bug we want to surface).
 fn node_enum(node: &Node) -> &NodeEnum {
-    node.node.as_ref().expect("libpg_query parse node is populated")
+    node.node
+        .as_ref()
+        .expect("libpg_query parse node is populated")
 }
 
 /// The (single) column name of a `ColumnRef` — `fields` is the dotted path; an unqualified `a` is a
 /// one-element list of a `String` node.
 fn column_ref_name(column_ref: &ColumnRef) -> &str {
-    match column_ref.fields.first().and_then(|node| node.node.as_ref()) {
+    match column_ref
+        .fields
+        .first()
+        .and_then(|node| node.node.as_ref())
+    {
         Some(NodeEnum::String(string)) => &string.sval,
         other => panic!("column ref field is not a String node: {other:?}"),
     }
@@ -58,7 +64,10 @@ fn libpg_query_parses_arithmetic_predicate_select_into_the_expected_tree() {
     let NodeEnum::ResTarget(res_target) = node_enum(&select.target_list[0]) else {
         panic!("target_list entry is not a ResTarget");
     };
-    let projected = res_target.val.as_deref().expect("ResTarget projects a value");
+    let projected = res_target
+        .val
+        .as_deref()
+        .expect("ResTarget projects a value");
     let NodeEnum::ColumnRef(projected_col) = node_enum(projected) else {
         panic!("projected value is not a ColumnRef");
     };
@@ -72,7 +81,10 @@ fn libpg_query_parses_arithmetic_predicate_select_into_the_expected_tree() {
     assert_eq!(range_var.relname, "t");
 
     // WHERE: A_Expr(AEXPR_OP `>`, lexpr = A_Expr(`+`, a, b), rexpr = A_Const 400).
-    let where_node = select.where_clause.as_deref().expect("WHERE clause present");
+    let where_node = select
+        .where_clause
+        .as_deref()
+        .expect("WHERE clause present");
     let NodeEnum::AExpr(comparison) = node_enum(where_node) else {
         panic!("WHERE is not an A_Expr");
     };
@@ -88,10 +100,12 @@ fn libpg_query_parses_arithmetic_predicate_select_into_the_expected_tree() {
         panic!("comparison lhs is not an A_Expr");
     };
     assert_eq!(aexpr_op(addition), "+");
-    let NodeEnum::ColumnRef(add_lhs) = node_enum(addition.lexpr.as_deref().expect("add lhs")) else {
+    let NodeEnum::ColumnRef(add_lhs) = node_enum(addition.lexpr.as_deref().expect("add lhs"))
+    else {
         panic!("addition lhs is not a ColumnRef");
     };
-    let NodeEnum::ColumnRef(add_rhs) = node_enum(addition.rexpr.as_deref().expect("add rhs")) else {
+    let NodeEnum::ColumnRef(add_rhs) = node_enum(addition.rexpr.as_deref().expect("add rhs"))
+    else {
         panic!("addition rhs is not a ColumnRef");
     };
     assert_eq!(column_ref_name(add_lhs), "a");
@@ -149,17 +163,25 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     // (covered by gpu_execute_resident_expr_select_sql_full_table_no_where).
     // A comma join WITH an equi-join condition is supported now (gpu_inner_join_comma_join_from_where);
     // a comma list with NO join condition between the relations is a cartesian product -> a clean reject.
-    assert_sql_err_contains(&e, "SELECT a FROM t x, t y WHERE a > 0", "equi-join condition");
+    assert_sql_err_contains(
+        &e,
+        "SELECT a FROM t x, t y WHERE a > 0",
+        "equi-join condition",
+    );
     // count(*) / sum / min / max / avg are supported now (operator axis, GPU-tested); count(col) and
     // other functions are follow-ons, still rejected at the parser.
-    assert_sql_err_contains(&e, "SELECT count(a) FROM t WHERE a > 0", "COUNT(*) / SUM / MIN / MAX");
+    assert_sql_err_contains(
+        &e,
+        "SELECT count(a) FROM t WHERE a > 0",
+        "COUNT(*) / SUM / MIN / MAX",
+    );
     // NB: a non-grouped ORDER BY over an int column is SUPPORTED now -- routed to the general GPU Expr
     // executor + the bitonic sort (covered by gpu_nongrouped_order_by_via_gpu_sort), no longer rejected.
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE a / b > 1", "/"); // unsupported operator
     assert_sql_err_contains(&e, "SELECT a FROM t WHERE NOT a > 1", "NOT"); // unary NOT (AND/OR are ok)
-    // int4 / numeric / text / bool literals all map now (bool literals + `flag = true` / `NOT flag`
-    // are GPU-tested in the bool slice); an unsupported expression NODE -- a function call, subquery,
-    // etc. -- is still rejected at the mapper.
+                                                                           // int4 / numeric / text / bool literals all map now (bool literals + `flag = true` / `NOT flag`
+                                                                           // are GPU-tested in the bool slice); an unsupported expression NODE -- a function call, subquery,
+                                                                           // etc. -- is still rejected at the mapper.
     assert_sql_err_contains(
         &e,
         "SELECT a FROM t WHERE a > abs(b)",
@@ -167,8 +189,16 @@ fn execute_resident_expr_select_sql_rejects_unsupported_shapes() {
     );
     // A column qualifier that does not name the FROM relation is PG's "missing FROM-clause entry",
     // never silently resolved to t.a (load-bearing once joins make same-named columns ambiguous).
-    assert_sql_err_contains(&e, "SELECT a FROM t WHERE wrong.a > 0", "missing FROM-clause");
-    assert_sql_err_contains(&e, "SELECT wrong.a FROM t WHERE a > 0", "missing FROM-clause");
+    assert_sql_err_contains(
+        &e,
+        "SELECT a FROM t WHERE wrong.a > 0",
+        "missing FROM-clause",
+    );
+    assert_sql_err_contains(
+        &e,
+        "SELECT wrong.a FROM t WHERE a > 0",
+        "missing FROM-clause",
+    );
     // An alias HIDES the relation name (PG): once `FROM t AS x`, `t.a` no longer names the relation.
     assert_sql_err_contains(&e, "SELECT a FROM t x WHERE t.a > 0", "missing FROM-clause");
 }
@@ -332,7 +362,10 @@ fn gpu_execute_resident_expr_select_sql_runs_boolean_predicates_from_sql_text() 
         .expect("SQL `a<100 OR b>500` -> GPU");
     let mut or_expected: Vec<Vec<SqlValue>> = (0..100).map(|i| vec![SqlValue::Int4(i)]).collect();
     or_expected.extend((501..N).map(|i| vec![SqlValue::Int4(i)]));
-    assert_eq!(or_rows.rows, or_expected, "a<100 OR b>500 => [0,100) U [501,600)");
+    assert_eq!(
+        or_rows.rows, or_expected,
+        "a<100 OR b>500 => [0,100) U [501,600)"
+    );
 
     // A 3-way chain: libpg_query flattens `a AND a AND b` into one BoolExpr with 3 args, so the
     // left-fold must handle N>2. a>100 AND a<500 AND b>300 => i in (300,500) = [301,500).
@@ -350,7 +383,8 @@ fn gpu_execute_resident_expr_select_sql_runs_boolean_predicates_from_sql_text() 
     let nested = e
         .execute_resident_expr_select_sql("SELECT a FROM t WHERE a < 50 OR a > 200 AND b < 400")
         .expect("SQL nested AND/OR -> GPU");
-    let mut nested_expected: Vec<Vec<SqlValue>> = (0..50).map(|i| vec![SqlValue::Int4(i)]).collect();
+    let mut nested_expected: Vec<Vec<SqlValue>> =
+        (0..50).map(|i| vec![SqlValue::Int4(i)]).collect();
     nested_expected.extend((201..400).map(|i| vec![SqlValue::Int4(i)]));
     assert_eq!(
         nested.rows, nested_expected,
@@ -449,8 +483,11 @@ fn select_text_non_resident_text_order_by_falls_through_to_existing_path() {
     // rather than hard-erroring. Guards the residency condition for the text leg of the GPU sort.
     let e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (s TEXT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (s) VALUES ('banana'), ('apple'), ('cherry')")
-        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (s) VALUES ('banana'), ('apple'), ('cherry')",
+    )
+    .unwrap();
     // Deliberately do NOT populate residency -> t is not GPU-resident.
     let result = e
         .execute_relational_select_text("SELECT s FROM t ORDER BY s")
@@ -567,8 +604,11 @@ fn gpu_inner_join_two_relations_int_key() {
         .unwrap();
     e.execute_text(2, "CREATE TABLE child (parent_id INT, label TEXT)")
         .unwrap();
-    e.execute_text(3, "INSERT INTO parent (id, name) VALUES (1,'a'),(2,'b'),(3,'c')")
-        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO parent (id, name) VALUES (1,'a'),(2,'b'),(3,'c')",
+    )
+    .unwrap();
     e.execute_text(
         4,
         "INSERT INTO child (parent_id, label) VALUES (1,'x'),(1,'y'),(2,'z'),(99,'orphan')",
@@ -611,28 +651,44 @@ fn gpu_inner_join_two_relations_int_key() {
     assert_eq!(direct.columns.len(), 2);
     assert!(direct.columns[0].name.eq_ignore_ascii_case("name"));
     assert!(direct.columns[1].name.eq_ignore_ascii_case("label"));
-    assert_eq!(pairs(&direct), expected, "1:N inner join, orphan + childless dropped");
+    assert_eq!(
+        pairs(&direct),
+        expected,
+        "1:N inner join, orphan + childless dropped"
+    );
     let wire = e
         .execute_relational_select_text(
             "SELECT name, label FROM parent JOIN child ON parent.id = child.parent_id",
         )
         .expect("inner join (text/wire dispatch)");
     assert_eq!(wire.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(pairs(&wire), expected, "the wire dispatch routes JOIN to the general path");
+    assert_eq!(
+        pairs(&wire),
+        expected,
+        "the wire dispatch routes JOIN to the general path"
+    );
     // Qualified projection (parent.name, child.label) resolves each column to its relation.
     let qualified = e
         .execute_resident_expr_select_sql(
             "SELECT parent.name, child.label FROM parent JOIN child ON parent.id = child.parent_id",
         )
         .expect("inner join, qualified projection");
-    assert_eq!(pairs(&qualified), expected, "qualified column refs resolve per-relation");
+    assert_eq!(
+        pairs(&qualified),
+        expected,
+        "qualified column refs resolve per-relation"
+    );
     // The ON written the other way around (child.parent_id = parent.id) is the same join.
     let swapped = e
         .execute_resident_expr_select_sql(
             "SELECT name, label FROM parent JOIN child ON child.parent_id = parent.id",
         )
         .expect("inner join, ON operands swapped");
-    assert_eq!(pairs(&swapped), expected, "ON operand order does not matter");
+    assert_eq!(
+        pairs(&swapped),
+        expected,
+        "ON operand order does not matter"
+    );
 }
 
 #[test]
@@ -659,13 +715,20 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
     };
 
     // --- INT key: without the gate, the two NULL ids share the 0 placeholder and spuriously pair. ---
-    e.execute_text(1, "CREATE TABLE p (id INT, name TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE p (id INT, name TEXT)")
+        .unwrap();
     e.execute_text(2, "CREATE TABLE c (pid INT, label TEXT)")
         .unwrap();
-    e.execute_text(3, "INSERT INTO p (id, name) VALUES (1,'a'),(2,'b'),(NULL,'pnull')")
-        .unwrap();
-    e.execute_text(4, "INSERT INTO c (pid, label) VALUES (1,'x'),(2,'z'),(NULL,'cnull')")
-        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO p (id, name) VALUES (1,'a'),(2,'b'),(NULL,'pnull')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO c (pid, label) VALUES (1,'x'),(2,'z'),(NULL,'cnull')",
+    )
+    .unwrap();
     let ps = e.populate_relational_residency_snapshot("p").unwrap();
     let cs = e.populate_relational_residency_snapshot("c").unwrap();
     if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
@@ -685,8 +748,10 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
     );
 
     // --- TEXT key: without the gate, the key-bytes gather would ERROR on a NULL cell. ---
-    e.execute_text(5, "CREATE TABLE s (k TEXT, x TEXT)").unwrap();
-    e.execute_text(6, "CREATE TABLE u (k TEXT, y TEXT)").unwrap();
+    e.execute_text(5, "CREATE TABLE s (k TEXT, x TEXT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE u (k TEXT, y TEXT)")
+        .unwrap();
     e.execute_text(7, "INSERT INTO s (k, x) VALUES ('m','sm'),(NULL,'snull')")
         .unwrap();
     e.execute_text(8, "INSERT INTO u (k, y) VALUES ('m','tm'),(NULL,'tnull')")
@@ -711,10 +776,16 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
         .unwrap();
     e.execute_text(10, "CREATE TABLE cb (k1 INT, k2 INT, y TEXT)")
         .unwrap();
-    e.execute_text(11, "INSERT INTO ca (k1, k2, x) VALUES (1,1,'ca1'),(2,NULL,'canull')")
-        .unwrap();
-    e.execute_text(12, "INSERT INTO cb (k1, k2, y) VALUES (1,1,'cb1'),(2,NULL,'cbnull')")
-        .unwrap();
+    e.execute_text(
+        11,
+        "INSERT INTO ca (k1, k2, x) VALUES (1,1,'ca1'),(2,NULL,'canull')",
+    )
+    .unwrap();
+    e.execute_text(
+        12,
+        "INSERT INTO cb (k1, k2, y) VALUES (1,1,'cb1'),(2,NULL,'cbnull')",
+    )
+    .unwrap();
     let cas = e.populate_relational_residency_snapshot("ca").unwrap();
     let cbs = e.populate_relational_residency_snapshot("cb").unwrap();
     if cas.device_memory_proof.is_none() || cbs.device_memory_proof.is_none() {
@@ -736,10 +807,16 @@ fn gpu_inner_join_excludes_null_keys_three_valued_logic() {
         .unwrap();
     e.execute_text(14, "CREATE TABLE nb (k NUMERIC(10,2), y TEXT)")
         .unwrap();
-    e.execute_text(15, "INSERT INTO na (k, x) VALUES (1.50,'na1'),(NULL,'nanull')")
-        .unwrap();
-    e.execute_text(16, "INSERT INTO nb (k, y) VALUES (1.50,'nb1'),(NULL,'nbnull')")
-        .unwrap();
+    e.execute_text(
+        15,
+        "INSERT INTO na (k, x) VALUES (1.50,'na1'),(NULL,'nanull')",
+    )
+    .unwrap();
+    e.execute_text(
+        16,
+        "INSERT INTO nb (k, y) VALUES (1.50,'nb1'),(NULL,'nbnull')",
+    )
+    .unwrap();
     let nas = e.populate_relational_residency_snapshot("na").unwrap();
     let nbs = e.populate_relational_residency_snapshot("nb").unwrap();
     if nas.device_memory_proof.is_none() || nbs.device_memory_proof.is_none() {
@@ -786,17 +863,23 @@ fn gpu_join_null_keys_at_scale_grid_stride_v1b() {
             cv.push_str(&format!("({i},'c{i}')"));
         }
     }
-    e.execute_text(1, "CREATE TABLE bigp (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE bigc (pid INT, label TEXT)").unwrap();
-    e.execute_text(3, &format!("INSERT INTO bigp (id, name) VALUES {pv}")).unwrap();
-    e.execute_text(4, &format!("INSERT INTO bigc (pid, label) VALUES {cv}")).unwrap();
+    e.execute_text(1, "CREATE TABLE bigp (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE bigc (pid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, &format!("INSERT INTO bigp (id, name) VALUES {pv}"))
+        .unwrap();
+    e.execute_text(4, &format!("INSERT INTO bigc (pid, label) VALUES {cv}"))
+        .unwrap();
     let ps = e.populate_relational_residency_snapshot("bigp").unwrap();
     let cs = e.populate_relational_residency_snapshot("bigc").unwrap();
     if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
         return;
     }
     let res = e
-        .execute_resident_expr_select_sql("SELECT name, label FROM bigp JOIN bigc ON bigp.id = bigc.pid")
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM bigp JOIN bigc ON bigp.id = bigc.pid",
+        )
         .expect("scale int join with NULL keys");
     assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
     let mut got: Vec<(String, String)> = res
@@ -831,22 +914,56 @@ fn gpu_join_null_keys_int2_int8_uuid_v1b() {
     // (a NULL int8 cell stores 0, NOT i64::MIN, so the launcher's i64::MIN reject is not tripped) must not
     // collide with it.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE i2a (k INT2, x TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE i2b (k INT2, y TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO i2a (k,x) VALUES (0,'a0'),(7,'a7'),(NULL,'anull')").unwrap();
-    e.execute_text(4, "INSERT INTO i2b (k,y) VALUES (0,'b0'),(7,'b7'),(NULL,'bnull')").unwrap();
-    e.execute_text(5, "CREATE TABLE i8a (k INT8, x TEXT)").unwrap();
-    e.execute_text(6, "CREATE TABLE i8b (k INT8, y TEXT)").unwrap();
-    e.execute_text(7, "INSERT INTO i8a (k,x) VALUES (0,'a0'),(9000000000,'abig'),(NULL,'anull')").unwrap();
-    e.execute_text(8, "INSERT INTO i8b (k,y) VALUES (0,'b0'),(9000000000,'bbig'),(NULL,'bnull')").unwrap();
+    e.execute_text(1, "CREATE TABLE i2a (k INT2, x TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE i2b (k INT2, y TEXT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO i2a (k,x) VALUES (0,'a0'),(7,'a7'),(NULL,'anull')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO i2b (k,y) VALUES (0,'b0'),(7,'b7'),(NULL,'bnull')",
+    )
+    .unwrap();
+    e.execute_text(5, "CREATE TABLE i8a (k INT8, x TEXT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE i8b (k INT8, y TEXT)")
+        .unwrap();
+    e.execute_text(
+        7,
+        "INSERT INTO i8a (k,x) VALUES (0,'a0'),(9000000000,'abig'),(NULL,'anull')",
+    )
+    .unwrap();
+    e.execute_text(
+        8,
+        "INSERT INTO i8b (k,y) VALUES (0,'b0'),(9000000000,'bbig'),(NULL,'bnull')",
+    )
+    .unwrap();
     let u1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    e.execute_text(9, "CREATE TABLE uxa (k UUID, x TEXT)").unwrap();
-    e.execute_text(10, "CREATE TABLE uxb (k UUID, y TEXT)").unwrap();
-    e.execute_text(11, &format!("INSERT INTO uxa (k,x) VALUES ('{u1}','a1'),(NULL,'anull')")).unwrap();
-    e.execute_text(12, &format!("INSERT INTO uxb (k,y) VALUES ('{u1}','b1'),(NULL,'bnull')")).unwrap();
+    e.execute_text(9, "CREATE TABLE uxa (k UUID, x TEXT)")
+        .unwrap();
+    e.execute_text(10, "CREATE TABLE uxb (k UUID, y TEXT)")
+        .unwrap();
+    e.execute_text(
+        11,
+        &format!("INSERT INTO uxa (k,x) VALUES ('{u1}','a1'),(NULL,'anull')"),
+    )
+    .unwrap();
+    e.execute_text(
+        12,
+        &format!("INSERT INTO uxb (k,y) VALUES ('{u1}','b1'),(NULL,'bnull')"),
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["i2a", "i2b", "i8a", "i8b", "uxa", "uxb"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -865,7 +982,10 @@ fn gpu_join_null_keys_int2_int8_uuid_v1b() {
         .expect("int2 NULL-key join");
     assert_eq!(
         pairs(&i2),
-        vec![("a0".to_string(), "b0".to_string()), ("a7".to_string(), "b7".to_string())],
+        vec![
+            ("a0".to_string(), "b0".to_string()),
+            ("a7".to_string(), "b7".to_string())
+        ],
         "int2 NULL key skipped; key 0 still matches"
     );
     let i8 = e
@@ -873,7 +993,10 @@ fn gpu_join_null_keys_int2_int8_uuid_v1b() {
         .expect("int8 NULL-key join");
     assert_eq!(
         pairs(&i8),
-        vec![("a0".to_string(), "b0".to_string()), ("abig".to_string(), "bbig".to_string())],
+        vec![
+            ("a0".to_string(), "b0".to_string()),
+            ("abig".to_string(), "bbig".to_string())
+        ],
         "int8 NULL key skipped; real key 0 + the big key match (placeholder 0 != i64::MIN)"
     );
     let ux = e
@@ -894,17 +1017,41 @@ fn gpu_join_null_keys_n_to_n_int_and_text_v1b() {
     // key 0 (int) / 'm' (text) is a real DUPLICATED key, so a broken skip would chain the placeholder-0 /
     // empty-string NULL rows into that key's cross-product and emit spurious pairs.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE nna (k INT, x TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE nnb (k INT, y TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO nna (k,x) VALUES (0,'a0a'),(0,'a0b'),(1,'a1'),(NULL,'anull')").unwrap();
-    e.execute_text(4, "INSERT INTO nnb (k,y) VALUES (0,'b0a'),(0,'b0b'),(1,'b1'),(NULL,'bnull')").unwrap();
-    e.execute_text(5, "CREATE TABLE tta (k TEXT, x TEXT)").unwrap();
-    e.execute_text(6, "CREATE TABLE ttb (k TEXT, y TEXT)").unwrap();
-    e.execute_text(7, "INSERT INTO tta (k,x) VALUES ('m','a1'),('m','a2'),(NULL,'anull')").unwrap();
-    e.execute_text(8, "INSERT INTO ttb (k,y) VALUES ('m','b1'),('m','b2'),(NULL,'bnull')").unwrap();
+    e.execute_text(1, "CREATE TABLE nna (k INT, x TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE nnb (k INT, y TEXT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO nna (k,x) VALUES (0,'a0a'),(0,'a0b'),(1,'a1'),(NULL,'anull')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO nnb (k,y) VALUES (0,'b0a'),(0,'b0b'),(1,'b1'),(NULL,'bnull')",
+    )
+    .unwrap();
+    e.execute_text(5, "CREATE TABLE tta (k TEXT, x TEXT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE ttb (k TEXT, y TEXT)")
+        .unwrap();
+    e.execute_text(
+        7,
+        "INSERT INTO tta (k,x) VALUES ('m','a1'),('m','a2'),(NULL,'anull')",
+    )
+    .unwrap();
+    e.execute_text(
+        8,
+        "INSERT INTO ttb (k,y) VALUES ('m','b1'),('m','b2'),(NULL,'bnull')",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["nna", "nnb", "tta", "ttb"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -955,10 +1102,17 @@ fn gpu_join_null_keys_right_and_full_outer_padded_v1b() {
     // every right row (its NULL-key row left-padded; the left NULL-key row is left-only -> dropped); FULL
     // keeps both sides' unmatched rows (incl. both NULL-key rows).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE ol (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE orr (rid INT, label TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO ol (id, name) VALUES (1,'a'),(NULL,'lnull')").unwrap();
-    e.execute_text(4, "INSERT INTO orr (rid, label) VALUES (1,'x'),(NULL,'rnull')").unwrap();
+    e.execute_text(1, "CREATE TABLE ol (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE orr (rid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO ol (id, name) VALUES (1,'a'),(NULL,'lnull')")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO orr (rid, label) VALUES (1,'x'),(NULL,'rnull')",
+    )
+    .unwrap();
     let ls = e.populate_relational_residency_snapshot("ol").unwrap();
     let rs = e.populate_relational_residency_snapshot("orr").unwrap();
     if ls.device_memory_proof.is_none() || rs.device_memory_proof.is_none() {
@@ -976,7 +1130,9 @@ fn gpu_join_null_keys_right_and_full_outer_padded_v1b() {
         v
     };
     let right = e
-        .execute_resident_expr_select_sql("SELECT name, label FROM ol RIGHT JOIN orr ON ol.id = orr.rid")
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM ol RIGHT JOIN orr ON ol.id = orr.rid",
+        )
         .expect("right outer join with NULL keys");
     assert_eq!(right.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(
@@ -988,14 +1144,16 @@ fn gpu_join_null_keys_right_and_full_outer_padded_v1b() {
         "RIGHT: the right NULL-key row is left-padded; the left NULL-key row is dropped (left-only)"
     );
     let full = e
-        .execute_resident_expr_select_sql("SELECT name, label FROM ol FULL JOIN orr ON ol.id = orr.rid")
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM ol FULL JOIN orr ON ol.id = orr.rid",
+        )
         .expect("full outer join with NULL keys");
     assert_eq!(
         opt_pairs(&full),
         vec![
-            (None, Some("rnull".to_string())),              // right-only NULL-key row
+            (None, Some("rnull".to_string())), // right-only NULL-key row
             (Some("a".to_string()), Some("x".to_string())), // the lone match
-            (Some("lnull".to_string()), None),              // left-only NULL-key row
+            (Some("lnull".to_string()), None), // left-only NULL-key row
         ],
         "FULL: both NULL-key rows are kept and padded; they do NOT match each other"
     );
@@ -1015,10 +1173,14 @@ fn audit_v1b_all_null_build_column_empty_effective_build() {
     // a NULL row. Skip-disabled: the two NULL build rows (placeholder key 0) collide => DuplicateBuildKey =>
     // N:N => both spuriously match the probe's real key 0.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE ba (k INT, x TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE bb (k INT, y TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO ba (k,x) VALUES (NULL,'a0'),(NULL,'a1')").unwrap();
-    e.execute_text(4, "INSERT INTO bb (k,y) VALUES (0,'b0'),(5,'b5')").unwrap();
+    e.execute_text(1, "CREATE TABLE ba (k INT, x TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE bb (k INT, y TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO ba (k,x) VALUES (NULL,'a0'),(NULL,'a1')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO bb (k,y) VALUES (0,'b0'),(5,'b5')")
+        .unwrap();
     let bas = e.populate_relational_residency_snapshot("ba").unwrap();
     let bbs = e.populate_relational_residency_snapshot("bb").unwrap();
     if bas.device_memory_proof.is_none() || bbs.device_memory_proof.is_none() {
@@ -1044,10 +1206,17 @@ fn audit_v1b_null_on_build_side_when_smaller_side_swaps() {
     let mut e = Engine::new_local();
     // acc (left) = 3 rows incl a NULL; new (right) = 2 rows incl a NULL => smaller_is_left = false => the
     // build swaps to the right side.
-    e.execute_text(1, "CREATE TABLE sa (k INT, x TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE sb (k INT, y TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO sa (k,x) VALUES (1,'a1'),(2,'a2'),(NULL,'anull')").unwrap();
-    e.execute_text(4, "INSERT INTO sb (k,y) VALUES (1,'b1'),(NULL,'bnull')").unwrap();
+    e.execute_text(1, "CREATE TABLE sa (k INT, x TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE sb (k INT, y TEXT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO sa (k,x) VALUES (1,'a1'),(2,'a2'),(NULL,'anull')",
+    )
+    .unwrap();
+    e.execute_text(4, "INSERT INTO sb (k,y) VALUES (1,'b1'),(NULL,'bnull')")
+        .unwrap();
     let sas = e.populate_relational_residency_snapshot("sa").unwrap();
     let sbs = e.populate_relational_residency_snapshot("sb").unwrap();
     if sas.device_memory_proof.is_none() || sbs.device_memory_proof.is_none() {
@@ -1080,10 +1249,17 @@ fn audit_v1b_composite_one_member_null_other_equals_real_row() {
     // pack identically to a real `(5,0)` row on the other side -- if validity were checked on member0 only,
     // `(5,NULL)` would spuriously match `(5,0)`.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE ca (k1 INT, k2 INT, x TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE cb (k1 INT, k2 INT, y TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO ca (k1,k2,x) VALUES (5,7,'match'),(5,NULL,'pnull')").unwrap();
-    e.execute_text(4, "INSERT INTO cb (k1,k2,y) VALUES (5,7,'cb7'),(5,0,'cb0')").unwrap();
+    e.execute_text(1, "CREATE TABLE ca (k1 INT, k2 INT, x TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE cb (k1 INT, k2 INT, y TEXT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO ca (k1,k2,x) VALUES (5,7,'match'),(5,NULL,'pnull')",
+    )
+    .unwrap();
+    e.execute_text(4, "INSERT INTO cb (k1,k2,y) VALUES (5,7,'cb7'),(5,0,'cb0')")
+        .unwrap();
     let cas = e.populate_relational_residency_snapshot("ca").unwrap();
     let cbs = e.populate_relational_residency_snapshot("cb").unwrap();
     if cas.device_memory_proof.is_none() || cbs.device_memory_proof.is_none() {
@@ -1117,10 +1293,17 @@ fn audit_v1b_anti_join_left_where_inner_is_null_with_null_keys() {
     // matches nothing => it is NULL-padded => WHERE inner IS NULL KEEPS it. If the two NULL rows spuriously
     // matched, the left NULL-key row would be a MATCH (inner not NULL) and silently DROPPED -- data loss.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE la (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE lb (rid INT, label TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO la (id,name) VALUES (1,'a'),(NULL,'lnull')").unwrap();
-    e.execute_text(4, "INSERT INTO lb (rid,label) VALUES (1,'x'),(NULL,'rnull')").unwrap();
+    e.execute_text(1, "CREATE TABLE la (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE lb (rid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO la (id,name) VALUES (1,'a'),(NULL,'lnull')")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO lb (rid,label) VALUES (1,'x'),(NULL,'rnull')",
+    )
+    .unwrap();
     let las = e.populate_relational_residency_snapshot("la").unwrap();
     let lbs = e.populate_relational_residency_snapshot("lb").unwrap();
     if las.device_memory_proof.is_none() || lbs.device_memory_proof.is_none() {
@@ -1168,10 +1351,14 @@ fn audit_v1b_null_at_word_boundary_index_32() {
         }
         wb.push_str(&format!("({i},'b{i}')"));
     }
-    e.execute_text(1, "CREATE TABLE wa (k INT, x TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE wb (k INT, y TEXT)").unwrap();
-    e.execute_text(3, &format!("INSERT INTO wa (k,x) VALUES {wa}")).unwrap();
-    e.execute_text(4, &format!("INSERT INTO wb (k,y) VALUES {wb}")).unwrap();
+    e.execute_text(1, "CREATE TABLE wa (k INT, x TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE wb (k INT, y TEXT)")
+        .unwrap();
+    e.execute_text(3, &format!("INSERT INTO wa (k,x) VALUES {wa}"))
+        .unwrap();
+    e.execute_text(4, &format!("INSERT INTO wb (k,y) VALUES {wb}"))
+        .unwrap();
     let was = e.populate_relational_residency_snapshot("wa").unwrap();
     let wbs = e.populate_relational_residency_snapshot("wb").unwrap();
     if was.device_memory_proof.is_none() || wbs.device_memory_proof.is_none() {
@@ -1194,7 +1381,10 @@ fn audit_v1b_null_at_word_boundary_index_32() {
         .map(|i| (format!("a{i}"), format!("b{i}")))
         .collect();
     expected.sort();
-    assert_eq!(got, expected, "exactly row 32 (word 1, bit 0) is skipped; all others match 1:1");
+    assert_eq!(
+        got, expected,
+        "exactly row 32 (word 1, bit 0) is skipped; all others match 1:1"
+    );
 }
 
 #[test]
@@ -1208,17 +1398,25 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
         .unwrap();
     e.execute_text(2, "CREATE TABLE lc (pid INT, label TEXT)")
         .unwrap();
-    e.execute_text(3, "INSERT INTO lp (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(NULL,'nokey')")
-        .unwrap();
-    e.execute_text(4, "INSERT INTO lc (pid, label) VALUES (1,'x'),(1,'y'),(2,'z')")
-        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO lp (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(NULL,'nokey')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO lc (pid, label) VALUES (1,'x'),(1,'y'),(2,'z')",
+    )
+    .unwrap();
     let ps = e.populate_relational_residency_snapshot("lp").unwrap();
     let cs = e.populate_relational_residency_snapshot("lc").unwrap();
     if ps.device_memory_proof.is_none() || cs.device_memory_proof.is_none() {
         return;
     }
     let res = e
-        .execute_resident_expr_select_sql("SELECT name, label FROM lp LEFT JOIN lc ON lp.id = lc.pid")
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM lp LEFT JOIN lc ON lp.id = lc.pid",
+        )
         .expect("left outer join");
     assert_eq!(res.executed_target, DeviceTarget::Gpu(0));
     let mut got: Vec<(String, Option<String>)> = res
@@ -1244,7 +1442,7 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
             ("a".to_string(), Some("x".to_string())),
             ("a".to_string(), Some("y".to_string())),
             ("b".to_string(), Some("z".to_string())),
-            ("c".to_string(), None),     // childless parent 3 -> NULL-padded right columns
+            ("c".to_string(), None), // childless parent 3 -> NULL-padded right columns
             ("nokey".to_string(), None), // NULL-key left row matches nothing -> NULL-padded
         ],
         "LEFT JOIN keeps every left row; unmatched (incl. NULL-key) rows are NULL-padded"
@@ -1256,8 +1454,11 @@ fn gpu_left_outer_join_null_pads_unmatched_left_rows() {
         .unwrap();
     e.execute_text(6, "CREATE TABLE tc (k TEXT, label TEXT)")
         .unwrap();
-    e.execute_text(7, "INSERT INTO tp (k, name) VALUES ('a','pa'),('b','pb'),('z','pz')")
-        .unwrap();
+    e.execute_text(
+        7,
+        "INSERT INTO tp (k, name) VALUES ('a','pa'),('b','pb'),('z','pz')",
+    )
+    .unwrap();
     e.execute_text(8, "INSERT INTO tc (k, label) VALUES ('a','ca'),('b','cb')")
         .unwrap();
     let tps = e.populate_relational_residency_snapshot("tp").unwrap();
@@ -1360,7 +1561,9 @@ fn gpu_right_and_full_outer_join_null_pad_the_correct_side() {
 
     // RIGHT: every rr row appears; (3,'z') is right-only -> name NULL. rl's left-only 'b' is DROPPED.
     let right = e
-        .execute_resident_expr_select_sql("SELECT name, label FROM rl RIGHT JOIN rr ON rl.id = rr.rid")
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM rl RIGHT JOIN rr ON rl.id = rr.rid",
+        )
         .expect("right outer join");
     assert_eq!(right.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(
@@ -1374,7 +1577,9 @@ fn gpu_right_and_full_outer_join_null_pad_the_correct_side() {
 
     // FULL: the match + BOTH unmatched sides.
     let full = e
-        .execute_resident_expr_select_sql("SELECT name, label FROM rl FULL JOIN rr ON rl.id = rr.rid")
+        .execute_resident_expr_select_sql(
+            "SELECT name, label FROM rl FULL JOIN rr ON rl.id = rr.rid",
+        )
         .expect("full outer join");
     assert_eq!(
         opt_pairs(&full),
@@ -1397,14 +1602,24 @@ fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
     // re-padded). All on the GPU join pipeline.
     let mut e = Engine::new_local();
     // Case 1: A LEFT JOIN B (on A.id) LEFT JOIN C (on A.id). A=3 has no B (B NULL-padded) but matches C=3.
-    e.execute_text(1, "CREATE TABLE a3 (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE b3 (aid INT, bl TEXT)").unwrap();
-    e.execute_text(3, "CREATE TABLE c3 (aid INT, cl TEXT)").unwrap();
-    e.execute_text(4, "INSERT INTO a3 (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(5, "INSERT INTO b3 (aid,bl) VALUES (1,'b1'),(2,'b2')").unwrap();
-    e.execute_text(6, "INSERT INTO c3 (aid,cl) VALUES (1,'c1'),(3,'c3')").unwrap();
+    e.execute_text(1, "CREATE TABLE a3 (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE b3 (aid INT, bl TEXT)")
+        .unwrap();
+    e.execute_text(3, "CREATE TABLE c3 (aid INT, cl TEXT)")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO a3 (id,name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(5, "INSERT INTO b3 (aid,bl) VALUES (1,'b1'),(2,'b2')")
+        .unwrap();
+    e.execute_text(6, "INSERT INTO c3 (aid,cl) VALUES (1,'c1'),(3,'c3')")
+        .unwrap();
     for t in ["a3", "b3", "c3"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -1437,14 +1652,33 @@ fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
 
     // Case 2: A LEFT JOIN B (on A.id) LEFT JOIN C (on B.cid). A=3's B is NULL-padded, so B.cid is a carried
     // NULL key at step 2 -> A=3 matches no C -> C re-padded (would OOB-read host_rows without the fix).
-    e.execute_text(7, "CREATE TABLE a4 (id INT, name TEXT)").unwrap();
-    e.execute_text(8, "CREATE TABLE b4 (aid INT, cid INT, bl TEXT)").unwrap();
-    e.execute_text(9, "CREATE TABLE c4 (id INT, cl TEXT)").unwrap();
-    e.execute_text(10, "INSERT INTO a4 (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(11, "INSERT INTO b4 (aid,cid,bl) VALUES (1,100,'b1'),(2,200,'b2')").unwrap();
-    e.execute_text(12, "INSERT INTO c4 (id,cl) VALUES (100,'c1'),(200,'c2'),(300,'c3')").unwrap();
+    e.execute_text(7, "CREATE TABLE a4 (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(8, "CREATE TABLE b4 (aid INT, cid INT, bl TEXT)")
+        .unwrap();
+    e.execute_text(9, "CREATE TABLE c4 (id INT, cl TEXT)")
+        .unwrap();
+    e.execute_text(
+        10,
+        "INSERT INTO a4 (id,name) VALUES (1,'a'),(2,'b'),(3,'c')",
+    )
+    .unwrap();
+    e.execute_text(
+        11,
+        "INSERT INTO b4 (aid,cid,bl) VALUES (1,100,'b1'),(2,200,'b2')",
+    )
+    .unwrap();
+    e.execute_text(
+        12,
+        "INSERT INTO c4 (id,cl) VALUES (100,'c1'),(200,'c2'),(300,'c3')",
+    )
+    .unwrap();
     for t in ["a4", "b4", "c4"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -1472,14 +1706,24 @@ fn gpu_nway_outer_join_null_pads_through_the_pipeline() {
     // Case 3: a RIGHT step over a MULTI-relation accumulated side -- A JOIN B (inner) RIGHT JOIN C. An
     // unmatched C row pads the ENTIRE accumulated side (BOTH A and B), exercising the RIGHT pad's
     // `take(new_rel)` over >1 accumulated relations.
-    e.execute_text(13, "CREATE TABLE a5 (id INT, an TEXT)").unwrap();
-    e.execute_text(14, "CREATE TABLE b5 (aid INT, bn TEXT)").unwrap();
-    e.execute_text(15, "CREATE TABLE c5 (cx INT, cn TEXT)").unwrap();
-    e.execute_text(16, "INSERT INTO a5 (id,an) VALUES (1,'a1'),(2,'a2')").unwrap();
-    e.execute_text(17, "INSERT INTO b5 (aid,bn) VALUES (1,'b1'),(2,'b2')").unwrap();
-    e.execute_text(18, "INSERT INTO c5 (cx,cn) VALUES (1,'c1'),(3,'c3')").unwrap();
+    e.execute_text(13, "CREATE TABLE a5 (id INT, an TEXT)")
+        .unwrap();
+    e.execute_text(14, "CREATE TABLE b5 (aid INT, bn TEXT)")
+        .unwrap();
+    e.execute_text(15, "CREATE TABLE c5 (cx INT, cn TEXT)")
+        .unwrap();
+    e.execute_text(16, "INSERT INTO a5 (id,an) VALUES (1,'a1'),(2,'a2')")
+        .unwrap();
+    e.execute_text(17, "INSERT INTO b5 (aid,bn) VALUES (1,'b1'),(2,'b2')")
+        .unwrap();
+    e.execute_text(18, "INSERT INTO c5 (cx,cn) VALUES (1,'c1'),(3,'c3')")
+        .unwrap();
     for t in ["a5", "b5", "c5"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -1512,9 +1756,16 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
     // override ASC = NULLS LAST and DESC = NULLS FIRST (the default, covered elsewhere).
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a,b) VALUES (3,100),(NULL,100),(1,100),(NULL,100),(2,100)")
-        .unwrap();
-    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES (3,100),(NULL,100),(1,100),(NULL,100),(2,100)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("t")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let ints = |rows: &RowBlock| -> Vec<Option<i32>> {
@@ -1530,17 +1781,29 @@ fn gpu_order_by_explicit_nulls_first_last_honored_on_device() {
     let r = e
         .execute_resident_expr_select_sql("SELECT a FROM t WHERE b >= 0 ORDER BY a ASC NULLS FIRST")
         .unwrap();
-    assert_eq!(ints(&r.rows), vec![None, None, Some(1), Some(2), Some(3)], "ASC NULLS FIRST");
+    assert_eq!(
+        ints(&r.rows),
+        vec![None, None, Some(1), Some(2), Some(3)],
+        "ASC NULLS FIRST"
+    );
     // DESC NULLS LAST: descending, then NULLs last (overrides the DESC default of NULLS FIRST).
     let r = e
         .execute_resident_expr_select_sql("SELECT a FROM t WHERE b >= 0 ORDER BY a DESC NULLS LAST")
         .unwrap();
-    assert_eq!(ints(&r.rows), vec![Some(3), Some(2), Some(1), None, None], "DESC NULLS LAST");
+    assert_eq!(
+        ints(&r.rows),
+        vec![Some(3), Some(2), Some(1), None, None],
+        "DESC NULLS LAST"
+    );
     // Sanity: the default is unchanged (ASC => NULLS LAST) when no override is given.
     let r = e
         .execute_resident_expr_select_sql("SELECT a FROM t WHERE b >= 0 ORDER BY a")
         .unwrap();
-    assert_eq!(ints(&r.rows), vec![Some(1), Some(2), Some(3), None, None], "ASC default = NULLS LAST");
+    assert_eq!(
+        ints(&r.rows),
+        vec![Some(1), Some(2), Some(3), None, None],
+        "ASC default = NULLS LAST"
+    );
     // Explicit NULLS FIRST/LAST is now ALSO honored on the GROUP BY result path. a=[3,NULL,1,NULL,2] ->
     // groups {1,2,3,NULL}; ORDER BY a NULLS FIRST -> NULL first, then ascending.
     let r = e
@@ -1570,7 +1833,11 @@ fn gpu_group_by_nullable_composite_key_per_member_null_on_device() {
         "INSERT INTO t (a,b) VALUES (1,5),(NULL,5),(1,5),(NULL,6),(NULL,NULL),(1,NULL)",
     )
     .unwrap();
-    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+    if e.populate_relational_residency_snapshot("t")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let groups = |rows: &RowBlock| -> Vec<(Option<i32>, Option<i32>, i64)> {
@@ -1624,8 +1891,16 @@ fn gpu_count_distinct_over_a_nullable_value_clean_errors() {
     // silently mis-count. (A non-null COUNT(DISTINCT) is unaffected -- covered by the count_distinct suite.)
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (g,v) VALUES (1,10),(1,NULL),(1,10),(2,20)").unwrap();
-    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES (1,10),(1,NULL),(1,10),(2,20)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("t")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     assert!(
@@ -1634,7 +1909,8 @@ fn gpu_count_distinct_over_a_nullable_value_clean_errors() {
         "grouped COUNT(DISTINCT) over a nullable value clean-errors (no silent over-count)"
     );
     assert!(
-        e.execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t").is_err(),
+        e.execute_resident_expr_select_sql("SELECT COUNT(DISTINCT v) FROM t")
+            .is_err(),
         "scalar COUNT(DISTINCT) over a nullable value clean-errors (no silent over-count)"
     );
 }
@@ -1647,9 +1923,16 @@ fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
     // reserved slot via the one nullable operand's validity bitmap (ZERO kernel change).
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a,b) VALUES (1,10),(NULL,10),(1,10),(2,10),(NULL,10)")
-        .unwrap();
-    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+    e.execute_text(
+        2,
+        "INSERT INTO t (a,b) VALUES (1,10),(NULL,10),(1,10),(2,10),(NULL,10)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("t")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let groups = |rows: &RowBlock| -> Vec<(Option<i32>, i64)> {
@@ -1683,8 +1966,13 @@ fn gpu_group_by_nullable_expression_key_forms_a_null_group_on_device() {
     );
     // GROUP BY over an expression with TWO nullable operands clean-errors (needs a derived validity AND).
     e.execute_text(3, "CREATE TABLE t2 (a INT, b INT)").unwrap();
-    e.execute_text(4, "INSERT INTO t2 (a,b) VALUES (1,2),(NULL,NULL)").unwrap();
-    if e.populate_relational_residency_snapshot("t2").unwrap().device_memory_proof.is_some() {
+    e.execute_text(4, "INSERT INTO t2 (a,b) VALUES (1,2),(NULL,NULL)")
+        .unwrap();
+    if e.populate_relational_residency_snapshot("t2")
+        .unwrap()
+        .device_memory_proof
+        .is_some()
+    {
         assert!(
             e.execute_resident_expr_select_sql("SELECT a + b, COUNT(*) FROM t2 GROUP BY a + b")
                 .is_err(),
@@ -1700,10 +1988,18 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
     // the i64::MAX default-end sentinel, blended ON-DEVICE (a validity-mask VM run + the blend kernel), so
     // NULL-expression rows sort to PG's default end. No host NULL decision.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (id INT, a INT, b INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (id,a,b) VALUES (1,5,1),(2,NULL,1),(3,2,1),(4,NULL,1)")
+    e.execute_text(1, "CREATE TABLE t (id INT, a INT, b INT)")
         .unwrap();
-    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+    e.execute_text(
+        2,
+        "INSERT INTO t (id,a,b) VALUES (1,5,1),(2,NULL,1),(3,2,1),(4,NULL,1)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("t")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let ids = |rows: &RowBlock| -> Vec<i32> {
@@ -1725,17 +2021,25 @@ fn gpu_order_by_nullable_expression_places_null_results_on_device() {
         "nullable a+b: non-NULL ascending, then NULL results last (PG default), on-device"
     );
     // A nullable int8 expression clean-errors (the i64::MAX NULL sentinel could collide with a real bigint).
-    e.execute_text(3, "CREATE TABLE t8 (id INT, a BIGINT, b BIGINT)").unwrap();
-    e.execute_text(4, "INSERT INTO t8 (id,a,b) VALUES (1,5,1),(2,NULL,1)").unwrap();
-    if e.populate_relational_residency_snapshot("t8").unwrap().device_memory_proof.is_some() {
+    e.execute_text(3, "CREATE TABLE t8 (id INT, a BIGINT, b BIGINT)")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO t8 (id,a,b) VALUES (1,5,1),(2,NULL,1)")
+        .unwrap();
+    if e.populate_relational_residency_snapshot("t8")
+        .unwrap()
+        .device_memory_proof
+        .is_some()
+    {
         assert!(
-            e.execute_resident_expr_select_sql("SELECT id FROM t8 ORDER BY a + b").is_err(),
+            e.execute_resident_expr_select_sql("SELECT id FROM t8 ORDER BY a + b")
+                .is_err(),
             "nullable int8 expression ORDER BY clean-errors (sentinel collision)"
         );
     }
     // Explicit NULLS FIRST/LAST on a nullable expression clean-errors (value-sentinel only does default).
     assert!(
-        e.execute_resident_expr_select_sql("SELECT id FROM t ORDER BY a + b NULLS FIRST").is_err(),
+        e.execute_resident_expr_select_sql("SELECT id FROM t ORDER BY a + b NULLS FIRST")
+            .is_err(),
         "explicit NULLS FIRST on a nullable expression clean-errors"
     );
 }
@@ -1748,8 +2052,16 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
     // group's key renders SqlValue::Null and places per the override.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (g,v) VALUES (1,10),(NULL,10),(2,10),(NULL,10)").unwrap();
-    if e.populate_relational_residency_snapshot("t").unwrap().device_memory_proof.is_none() {
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES (1,10),(NULL,10),(2,10),(NULL,10)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("t")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let keys = |rows: &RowBlock| -> Vec<Option<i32>> {
@@ -1763,26 +2075,46 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
     };
     // groups {1, 2, NULL}. ORDER BY g NULLS FIRST overrides the ASC default (NULLS LAST) -> NULL first.
     let r = e
-        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g NULLS FIRST")
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g NULLS FIRST",
+        )
         .expect("grouped ORDER BY NULLS FIRST");
-    assert_eq!(keys(&r.rows), vec![None, Some(1), Some(2)], "grouped ORDER BY g NULLS FIRST");
+    assert_eq!(
+        keys(&r.rows),
+        vec![None, Some(1), Some(2)],
+        "grouped ORDER BY g NULLS FIRST"
+    );
     // Default ASC = NULLS LAST.
     let r = e
         .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g")
         .expect("grouped ORDER BY default");
-    assert_eq!(keys(&r.rows), vec![Some(1), Some(2), None], "grouped ORDER BY g default = NULLS LAST");
+    assert_eq!(
+        keys(&r.rows),
+        vec![Some(1), Some(2), None],
+        "grouped ORDER BY g default = NULLS LAST"
+    );
     // DESC NULLS LAST overrides the DESC default (NULLS FIRST) -> descending then NULL last.
     let r = e
         .execute_resident_expr_select_sql(
             "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC NULLS LAST",
         )
         .expect("grouped ORDER BY DESC NULLS LAST");
-    assert_eq!(keys(&r.rows), vec![Some(2), Some(1), None], "grouped ORDER BY g DESC NULLS LAST");
+    assert_eq!(
+        keys(&r.rows),
+        vec![Some(2), Some(1), None],
+        "grouped ORDER BY g DESC NULLS LAST"
+    );
     // A BIGINT result key is now exact too: its NULL is marked by an on-device validity bitmap (not a
     // value sentinel), so explicit NULLS FIRST is honored with no collision risk. g8=[1,NULL] -> NULL first.
-    e.execute_text(3, "CREATE TABLE t8 (g BIGINT, v INT)").unwrap();
-    e.execute_text(4, "INSERT INTO t8 (g,v) VALUES (1,10),(NULL,10)").unwrap();
-    if e.populate_relational_residency_snapshot("t8").unwrap().device_memory_proof.is_some() {
+    e.execute_text(3, "CREATE TABLE t8 (g BIGINT, v INT)")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO t8 (g,v) VALUES (1,10),(NULL,10)")
+        .unwrap();
+    if e.populate_relational_residency_snapshot("t8")
+        .unwrap()
+        .device_memory_proof
+        .is_some()
+    {
         let r8 = e
             .execute_resident_expr_select_sql(
                 "SELECT g, COUNT(*) FROM t8 GROUP BY g ORDER BY g NULLS FIRST",
@@ -1797,7 +2129,11 @@ fn gpu_group_by_result_order_by_explicit_nulls_first_last_on_device() {
                 ref o => panic!("unexpected {o:?}"),
             })
             .collect();
-        assert_eq!(g8, vec![None, Some(1)], "bigint grouped ORDER BY g NULLS FIRST: NULL group first");
+        assert_eq!(
+            g8,
+            vec![None, Some(1)],
+            "bigint grouped ORDER BY g NULLS FIRST: NULL group first"
+        );
     }
 }
 
@@ -1808,12 +2144,20 @@ fn gpu_join_order_by_explicit_nulls_first_last_on_device() {
     // gpu_sort_result_rows (the override is threaded through JoinPlan.order_by_nulls_first). A LEFT join
     // pads the unmatched row's x to NULL; the override places it.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, n TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id,n) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid,x) VALUES (1,5),(2,7)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, n TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (id,n) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,x) VALUES (1,5),(2,7)")
+        .unwrap();
     for t in ["l", "r"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -1842,16 +2186,26 @@ fn gpu_join_order_by_explicit_nulls_first_last_on_device() {
         .expect("join ORDER BY x NULLS FIRST");
     assert_eq!(
         rows(&res),
-        vec![("c".into(), None), ("a".into(), Some(5)), ("b".into(), Some(7))],
+        vec![
+            ("c".into(), None),
+            ("a".into(), Some(5)),
+            ("b".into(), Some(7))
+        ],
         "join ORDER BY x NULLS FIRST places the NULL-padded row first"
     );
     // Default ASC = NULLS LAST.
     let res = e
-        .execute_resident_expr_select_sql("SELECT n, x FROM l LEFT JOIN r ON l.id = r.rid ORDER BY x")
+        .execute_resident_expr_select_sql(
+            "SELECT n, x FROM l LEFT JOIN r ON l.id = r.rid ORDER BY x",
+        )
         .expect("join ORDER BY x default");
     assert_eq!(
         rows(&res),
-        vec![("a".into(), Some(5)), ("b".into(), Some(7)), ("c".into(), None)],
+        vec![
+            ("a".into(), Some(5)),
+            ("b".into(), Some(7)),
+            ("c".into(), None)
+        ],
         "join ORDER BY x default = NULLS LAST"
     );
 }
@@ -1864,12 +2218,20 @@ fn gpu_outer_join_with_where_filters_the_result_not_the_inputs() {
     // (lower_resident_predicate); its survivor set post-filters the padded result: a JOIN_NULL_ROW pad
     // means the relation's columns are NULL -> the predicate is UNKNOWN -> the tuple is dropped.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid,x) VALUES (1,5),(2,7)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,x) VALUES (1,5),(2,7)")
+        .unwrap();
     for t in ["l", "r"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -1944,12 +2306,20 @@ fn gpu_outer_join_pad_where_3vl_on_device_v2() {
     // pad-DROPS (IS NOT NULL, comparison compound) across the SAME query so a wrong pad decision shows up as
     // a missing/extra row. l=3 ('c') is the unmatched (padded) left row; r1.x small, r2.x large.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, x INT, y INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid,x,y) VALUES (1,5,5),(2,200,50)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT, y INT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO r (rid,x,y) VALUES (1,5,5),(2,200,50)")
+        .unwrap();
     for t in ["l", "r"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -1974,7 +2344,11 @@ fn gpu_outer_join_pad_where_3vl_on_device_v2() {
         )
     };
     // pad SURVIVES: `r.x IS NULL` is TRUE on the all-NULL pad -> keep 'c'; matched rows (x non-null) drop.
-    assert_eq!(q(&mut e, "r.x IS NULL"), vec!["c".to_string()], "IS NULL: pad survives, matched drop");
+    assert_eq!(
+        q(&mut e, "r.x IS NULL"),
+        vec!["c".to_string()],
+        "IS NULL: pad survives, matched drop"
+    );
     // pad SURVIVES via the OR's IS NULL branch; matched r2 (x=200>100) also survives, r1 (x=5) drops.
     assert_eq!(
         q(&mut e, "r.x IS NULL OR r.x > 100"),
@@ -2008,12 +2382,23 @@ fn gpu_outer_join_pad_where_3vl_types_and_full_join_v2() {
     // join (both sides can be padded). A numeric/text `IS NULL` on the all-NULL pad must read the validity
     // bit on-device (0 -> NULL -> IS NULL TRUE), not depend on a host Kleene.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, amt NUMERIC(10,2), tag TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid,amt,tag) VALUES (1,10.50,'p'),(2,20.00,'q')").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, amt NUMERIC(10,2), tag TEXT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid,amt,tag) VALUES (1,10.50,'p'),(2,20.00,'q')",
+    )
+    .unwrap();
     for t in ["l", "r"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -2032,20 +2417,38 @@ fn gpu_outer_join_pad_where_3vl_types_and_full_join_v2() {
     };
     // numeric pad column IS NULL -> pad 'c' survives (the device reads the numeric column's 0 validity bit).
     let num = e
-        .execute_resident_expr_select_sql("SELECT name FROM l LEFT JOIN r ON l.id = r.rid WHERE r.amt IS NULL")
+        .execute_resident_expr_select_sql(
+            "SELECT name FROM l LEFT JOIN r ON l.id = r.rid WHERE r.amt IS NULL",
+        )
         .expect("numeric IS NULL anti-join");
-    assert_eq!(names(&num), vec![Some("c".to_string())], "numeric pad column IS NULL: pad survives");
+    assert_eq!(
+        names(&num),
+        vec![Some("c".to_string())],
+        "numeric pad column IS NULL: pad survives"
+    );
     // text pad column IS NULL -> pad 'c' survives.
     let txt = e
-        .execute_resident_expr_select_sql("SELECT name FROM l LEFT JOIN r ON l.id = r.rid WHERE r.tag IS NULL")
+        .execute_resident_expr_select_sql(
+            "SELECT name FROM l LEFT JOIN r ON l.id = r.rid WHERE r.tag IS NULL",
+        )
         .expect("text IS NULL anti-join");
-    assert_eq!(names(&txt), vec![Some("c".to_string())], "text pad column IS NULL: pad survives");
+    assert_eq!(
+        names(&txt),
+        vec![Some("c".to_string())],
+        "text pad column IS NULL: pad survives"
+    );
     // FULL join: the LEFT-only pad ('c', r columns NULL) survives `r.amt IS NULL`; matched rows drop; no
     // right-only row exists (every r matched). The pad decision is the same on-device path.
     let full = e
-        .execute_resident_expr_select_sql("SELECT name FROM l FULL JOIN r ON l.id = r.rid WHERE r.amt IS NULL")
+        .execute_resident_expr_select_sql(
+            "SELECT name FROM l FULL JOIN r ON l.id = r.rid WHERE r.amt IS NULL",
+        )
         .expect("full join with IS NULL");
-    assert_eq!(names(&full), vec![Some("c".to_string())], "FULL join: the left-only pad survives IS NULL");
+    assert_eq!(
+        names(&full),
+        vec![Some("c".to_string())],
+        "FULL join: the left-only pad survives IS NULL"
+    );
 }
 
 // ── S6/V2 adversarial regression net (adopted from the independent audit of `76315706`) ──────────────
@@ -2061,14 +2464,24 @@ fn audit_s6_outer_where_real_null_mixed_with_pad() {
     // real NULL on-device; the pad eval evaluates the synthetic NULL on-device -- both must agree). An N-way
     // OUTER then carries a JOIN_NULL_ROW into a SECOND pad.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)").unwrap();
-    e.execute_text(3, "CREATE TABLE s (sid INT, w INT, lbl TEXT)").unwrap();
-    e.execute_text(4, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(5, "INSERT INTO r (rid,x) VALUES (1,5),(2,NULL)").unwrap(); // r.x real NULL
-    e.execute_text(6, "INSERT INTO s (sid,w,lbl) VALUES (1,9,'x'),(2,9,'y')").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, x INT)")
+        .unwrap();
+    e.execute_text(3, "CREATE TABLE s (sid INT, w INT, lbl TEXT)")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(5, "INSERT INTO r (rid,x) VALUES (1,5),(2,NULL)")
+        .unwrap(); // r.x real NULL
+    e.execute_text(6, "INSERT INTO s (sid,w,lbl) VALUES (1,9,'x'),(2,9,'y')")
+        .unwrap();
     for t in ["l", "r", "s"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -2087,17 +2500,26 @@ fn audit_s6_outer_where_real_null_mixed_with_pad() {
     let q = |e: &mut Engine, sql: &str| names(&e.execute_resident_expr_select_sql(sql).unwrap());
     // real-NULL matched row (b) AND pad (c) both satisfy IS NULL.
     assert_eq!(
-        q(&mut e, "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NULL"),
+        q(
+            &mut e,
+            "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NULL"
+        ),
         vec!["b".to_string(), "c".to_string()]
     );
     // only the real non-null matched row (a) survives IS NOT NULL; real-null b and pad c drop.
     assert_eq!(
-        q(&mut e, "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NOT NULL"),
+        q(
+            &mut e,
+            "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NOT NULL"
+        ),
         vec!["a".to_string()]
     );
     // IS NULL OR cmp: a via 5>3, b via IS NULL, c via IS NULL -> all three.
     assert_eq!(
-        q(&mut e, "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NULL OR r.x > 3"),
+        q(
+            &mut e,
+            "SELECT name FROM l LEFT JOIN r ON l.id=r.rid WHERE r.x IS NULL OR r.x > 3"
+        ),
         vec!["a".to_string(), "b".to_string(), "c".to_string()]
     );
     // N-way: c's r-pad carries a JOIN_NULL_ROW into s -> s.lbl NULL only for c.
@@ -2123,13 +2545,26 @@ fn audit_s6_pad_where_kleene_corners() {
     // Kleene corners on the all-NULL pad (real data fully non-null so the survivor pass uses the
     // non-nullable peephole -> the pad eval is the only 3VL difference). Each fold is checked against PG.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, xi INT, yi INT, fl BOOL, tag TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid,xi,yi,fl,tag) VALUES (1,5,5,true,'p'),(2,200,50,false,'q')")
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
         .unwrap();
+    e.execute_text(
+        2,
+        "CREATE TABLE r (rid INT, xi INT, yi INT, fl BOOL, tag TEXT)",
+    )
+    .unwrap();
+    e.execute_text(3, "INSERT INTO l (id,name) VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid,xi,yi,fl,tag) VALUES (1,5,5,true,'p'),(2,200,50,false,'q')",
+    )
+    .unwrap();
     for t in ["l", "r"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -2153,7 +2588,10 @@ fn audit_s6_pad_where_kleene_corners() {
     // IS NULL(T) AND cmp(U) -> U -> pad drops; matched rows fail the cmp -> none.
     assert!(q(&mut e, "r.xi IS NULL AND r.xi > 5").is_empty());
     // IS NULL(T) OR cmp -> T -> pad survives (c); matched b via 200>5.
-    assert_eq!(q(&mut e, "r.xi IS NULL OR r.xi > 5"), vec!["b".to_string(), "c".to_string()]);
+    assert_eq!(
+        q(&mut e, "r.xi IS NULL OR r.xi > 5"),
+        vec!["b".to_string(), "c".to_string()]
+    );
     // IS NOT NULL(F) OR IS NULL(T) -> T -> all (a,b matched non-null; c pad).
     assert_eq!(
         q(&mut e, "r.xi IS NOT NULL OR r.yi IS NULL"),
@@ -2162,7 +2600,10 @@ fn audit_s6_pad_where_kleene_corners() {
     // IS NOT NULL(F) AND IS NULL(T) -> F -> none.
     assert!(q(&mut e, "r.xi IS NOT NULL AND r.yi IS NULL").is_empty());
     // bool col on pad is UNKNOWN; `r.fl = false OR r.xi IS NULL` -> matched b (fl=false), pad c (IS NULL).
-    assert_eq!(q(&mut e, "r.fl = false OR r.xi IS NULL"), vec!["b".to_string(), "c".to_string()]);
+    assert_eq!(
+        q(&mut e, "r.fl = false OR r.xi IS NULL"),
+        vec!["b".to_string(), "c".to_string()]
+    );
     // (IS NOT NULL AND cmp) OR IS NULL -> (F)OR(T) on pad -> survive c; b via (T AND 200>5).
     assert_eq!(
         q(&mut e, "(r.xi IS NOT NULL AND r.xi > 5) OR r.yi IS NULL"),
@@ -2180,8 +2621,10 @@ fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     //   s: (1,'p'),(1,'q')  [smaller, key 1 duplicated]   l: (1,'A'),(2,'B'),(3,'C')  [larger, unique]
     //   s JOIN l ON s.k = l.k -> (p,A),(q,A).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE s (k INT, sv TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE l (k INT, lv TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE s (k INT, sv TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE l (k INT, lv TEXT)")
+        .unwrap();
     e.execute_text(3, "INSERT INTO s (k, sv) VALUES (1,'p'),(1,'q')")
         .unwrap();
     e.execute_text(4, "INSERT INTO l (k, lv) VALUES (1,'A'),(2,'B'),(3,'C')")
@@ -2206,7 +2649,10 @@ fn gpu_inner_join_build_fallback_when_smaller_side_not_unique() {
     got.sort();
     assert_eq!(
         got,
-        vec![("p".to_string(), "A".to_string()), ("q".to_string(), "A".to_string())],
+        vec![
+            ("p".to_string(), "A".to_string()),
+            ("q".to_string(), "A".to_string())
+        ],
         "fallback build-on-larger keeps left(sv)/right(lv) rows correctly paired"
     );
 }
@@ -2224,8 +2670,11 @@ fn gpu_inner_join_with_where_pushed_per_side() {
         .unwrap();
     e.execute_text(2, "CREATE TABLE child (parent_id INT, v INT, label TEXT)")
         .unwrap();
-    e.execute_text(3, "INSERT INTO parent (id, name) VALUES (1,'a'),(2,'b'),(3,'c')")
-        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO parent (id, name) VALUES (1,'a'),(2,'b'),(3,'c')",
+    )
+    .unwrap();
     e.execute_text(
         4,
         "INSERT INTO child (parent_id, v, label) VALUES (1,10,'x'),(1,20,'y'),(2,30,'z'),(3,40,'w')",
@@ -2264,7 +2713,10 @@ fn gpu_inner_join_with_where_pushed_per_side() {
              WHERE parent.id > 100",
         )
         .expect("inner join with an all-filtering WHERE");
-    assert!(empty.rows.is_empty(), "a WHERE that drops all left rows -> no join output");
+    assert!(
+        empty.rows.is_empty(),
+        "a WHERE that drops all left rows -> no join output"
+    );
 }
 
 #[test]
@@ -2278,23 +2730,33 @@ fn gpu_inner_join_int8_and_mixed_int_keys() {
         .unwrap();
     e.execute_text(2, "CREATE TABLE rref (big_id BIGINT, label TEXT)")
         .unwrap();
-    e.execute_text(3, "INSERT INTO big (id, name) VALUES (9000000000,'a'),(2,'b'),(3,'c')")
-        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO big (id, name) VALUES (9000000000,'a'),(2,'b'),(3,'c')",
+    )
+    .unwrap();
     e.execute_text(
         4,
         "INSERT INTO rref (big_id, label) VALUES (9000000000,'x'),(2,'y'),(2,'z'),(99,'w')",
     )
     .unwrap();
     // (b) mixed: INT key joined to a BIGINT key.
-    e.execute_text(5, "CREATE TABLE p4 (id INT, name TEXT)").unwrap();
+    e.execute_text(5, "CREATE TABLE p4 (id INT, name TEXT)")
+        .unwrap();
     e.execute_text(6, "CREATE TABLE c8 (pid BIGINT, label TEXT)")
         .unwrap();
     // Include a NEGATIVE key so the int4 sign-extension to i64 (-3 -> i64 -3) is checked against the
     // int8 -3 in the mixed join.
-    e.execute_text(7, "INSERT INTO p4 (id, name) VALUES (5,'a'),(6,'b'),(-3,'n')")
-        .unwrap();
-    e.execute_text(8, "INSERT INTO c8 (pid, label) VALUES (5,'x'),(6,'y'),(6,'z'),(-3,'m')")
-        .unwrap();
+    e.execute_text(
+        7,
+        "INSERT INTO p4 (id, name) VALUES (5,'a'),(6,'b'),(-3,'n')",
+    )
+    .unwrap();
+    e.execute_text(
+        8,
+        "INSERT INTO c8 (pid, label) VALUES (5,'x'),(6,'y'),(6,'z'),(-3,'m')",
+    )
+    .unwrap();
     for t in ["big", "rref", "p4", "c8"] {
         if e.populate_relational_residency_snapshot(t)
             .unwrap()
@@ -2327,7 +2789,11 @@ fn gpu_inner_join_int8_and_mixed_int_keys() {
         )
         .expect("int8 join");
     assert_eq!(r1.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(pairs(&r1), expected, "int8 keys incl. a value beyond int4 range");
+    assert_eq!(
+        pairs(&r1),
+        expected,
+        "int8 keys incl. a value beyond int4 range"
+    );
     let r2 = e
         .execute_resident_expr_select_sql("SELECT name, label FROM p4 JOIN c8 ON p4.id = c8.pid")
         .expect("mixed int4=int8 join");
@@ -2371,10 +2837,15 @@ fn gpu_inner_join_star_projection() {
     }
     // SELECT * -> 4 columns (id, name, pid, label), in left-then-right order.
     let star = e
-        .execute_resident_expr_select_sql("SELECT * FROM parent JOIN child ON parent.id = child.pid")
+        .execute_resident_expr_select_sql(
+            "SELECT * FROM parent JOIN child ON parent.id = child.pid",
+        )
         .expect("SELECT * join");
     assert_eq!(
-        star.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        star.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["id", "name", "pid", "label"],
         "bare * = all left columns then all right"
     );
@@ -2403,7 +2874,10 @@ fn gpu_inner_join_star_projection() {
         )
         .expect("SELECT alias.* join");
     assert_eq!(
-        qual.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        qual.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["id", "name"],
         "alias.* = only that relation's columns"
     );
@@ -2415,7 +2889,11 @@ fn gpu_inner_join_star_projection() {
         )
         .expect("right alias.* join");
     assert_eq!(
-        qual_r.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        qual_r
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["pid", "label"],
         "right alias.* = only the right relation's columns"
     );
@@ -2426,7 +2904,11 @@ fn gpu_inner_join_star_projection() {
         )
         .expect("mixed explicit + star join");
     assert_eq!(
-        mixed.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        mixed
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["name", "id", "name", "pid", "label"],
         "an explicit column then bare * (left then right)"
     );
@@ -2510,7 +2992,9 @@ fn gpu_inner_join_rejects_unsupported_shapes() {
     // A `*` is invalid as an ON operand (the ON path must not accept a star).
     let star_in_on = reject("SELECT x, y FROM a JOIN b ON a.k = b.*");
     assert!(
-        star_in_on.contains("`*`") || star_in_on.contains("non-name") || star_in_on.contains("name"),
+        star_in_on.contains("`*`")
+            || star_in_on.contains("non-name")
+            || star_in_on.contains("name"),
         "star in ON rejected, got: {star_in_on}"
     );
 }
@@ -2525,7 +3009,8 @@ fn gpu_inner_join_catalog_relations_transient_payload() {
     // of pg_class in the public namespace, so `pg_class JOIN pg_namespace ON n.oid = c.relnamespace`
     // filtered to public/'r' is identity over their names -> {(alpha,public),(beta,public)}.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE alpha (id INT, name TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE alpha (id INT, name TEXT)")
+        .unwrap();
     e.execute_text(2, "CREATE TABLE beta (id INT)").unwrap();
     // Gate on GPU availability via ANY resident snapshot (the catalog relations are not resident -- they
     // are synthesized + transiently uploaded inside the join; this just detects a usable driver/GPU).
@@ -2566,14 +3051,22 @@ fn gpu_inner_join_catalog_relations_transient_payload() {
     assert_eq!(direct.columns.len(), 2);
     assert!(direct.columns[0].name.eq_ignore_ascii_case("relname"));
     assert!(direct.columns[1].name.eq_ignore_ascii_case("nspname"));
-    assert_eq!(names(&direct), expected, "both user tables join to the public namespace");
+    assert_eq!(
+        names(&direct),
+        expected,
+        "both user tables join to the public namespace"
+    );
     // Same query through the production wire/text dispatch (the hand-rolled parser rejects JOIN -> the
     // Err arm routes to the general path).
     let wire = e
         .execute_relational_select_text(q)
         .expect("catalog inner join (text/wire dispatch)");
     assert_eq!(wire.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(names(&wire), expected, "the wire dispatch routes the catalog JOIN to the general path");
+    assert_eq!(
+        names(&wire),
+        expected,
+        "the wire dispatch routes the catalog JOIN to the general path"
+    );
     // Reversed FROM order (pg_namespace is now the LEFT/build side -- its `oid` key is UNIQUE, so the
     // build-on-smaller path succeeds here too); same result.
     let reversed = e
@@ -2583,7 +3076,11 @@ fn gpu_inner_join_catalog_relations_transient_payload() {
              WHERE c.relkind = 'r' AND n.nspname = 'public'",
         )
         .expect("catalog inner join, reversed FROM order");
-    assert_eq!(names(&reversed), expected, "join is symmetric in FROM order");
+    assert_eq!(
+        names(&reversed),
+        expected,
+        "join is symmetric in FROM order"
+    );
     // No-WHERE variant: the join key itself (relnamespace = oid) selects only the public namespace
     // (pg_catalog/information_schema oids match no relnamespace), so the result is the same WITHOUT any
     // per-side filter -- exercising the all-rows survivor path over the transient payloads.
@@ -2593,7 +3090,11 @@ fn gpu_inner_join_catalog_relations_transient_payload() {
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
         )
         .expect("catalog inner join, no WHERE");
-    assert_eq!(names(&no_where), expected, "the join key alone selects the public namespace");
+    assert_eq!(
+        names(&no_where),
+        expected,
+        "the join key alone selects the public namespace"
+    );
 }
 
 #[test]
@@ -2605,16 +3106,34 @@ fn gpu_inner_join_three_way_user_tables() {
     // accumulated-set resolution.
     //   ord JOIN cust ON cust.cid = ord.cid JOIN region ON region.rid = cust.rid
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)").unwrap();
-    e.execute_text(3, "CREATE TABLE ord (oid INT, cid INT, label TEXT)").unwrap();
-    e.execute_text(4, "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')").unwrap();
-    e.execute_text(5, "INSERT INTO cust (cid, rid, cname) VALUES (10,1,'alice'),(20,2,'bob')").unwrap();
-    e.execute_text(6, "INSERT INTO ord (oid, cid, label) VALUES (100,10,'x'),(101,10,'y'),(102,20,'z')").unwrap();
+    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)")
+        .unwrap();
+    e.execute_text(3, "CREATE TABLE ord (oid INT, cid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')",
+    )
+    .unwrap();
+    e.execute_text(
+        5,
+        "INSERT INTO cust (cid, rid, cname) VALUES (10,1,'alice'),(20,2,'bob')",
+    )
+    .unwrap();
+    e.execute_text(
+        6,
+        "INSERT INTO ord (oid, cid, label) VALUES (100,10,'x'),(101,10,'y'),(102,20,'z')",
+    )
+    .unwrap();
     let rs = e.populate_relational_residency_snapshot("region").unwrap();
     let cs = e.populate_relational_residency_snapshot("cust").unwrap();
     let os = e.populate_relational_residency_snapshot("ord").unwrap();
-    if rs.device_memory_proof.is_none() || cs.device_memory_proof.is_none() || os.device_memory_proof.is_none() {
+    if rs.device_memory_proof.is_none()
+        || cs.device_memory_proof.is_none()
+        || os.device_memory_proof.is_none()
+    {
         return;
     }
     let triples = |res: &RelationalSelectResult| -> Vec<(String, String, String)> {
@@ -2622,8 +3141,11 @@ fn gpu_inner_join_three_way_user_tables() {
             SqlValue::Text(t) => t.clone(),
             other => panic!("expected text, got {other:?}"),
         };
-        let mut v: Vec<(String, String, String)> =
-            res.rows.iter().map(|r| (s(&r[0]), s(&r[1]), s(&r[2]))).collect();
+        let mut v: Vec<(String, String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (s(&r[0]), s(&r[1]), s(&r[2])))
+            .collect();
         v.sort();
         v
     };
@@ -2653,7 +3175,10 @@ fn gpu_inner_join_three_way_user_tables() {
         )
         .unwrap_err()
         .to_string();
-    assert!(bushy.contains("base table"), "right-nested join rejected, got: {bushy}");
+    assert!(
+        bushy.contains("base table"),
+        "right-nested join rejected, got: {bushy}"
+    );
 }
 
 #[test]
@@ -2665,7 +3190,8 @@ fn gpu_inner_join_three_way_catalog_describe_shape() {
     // Construction oracle: `people` has exactly columns (id, name); filtering c.relname='people' selects
     // them out of multiple tables -> the people columns, each tagged public.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+        .unwrap();
     e.execute_text(2, "CREATE TABLE teams (tid INT)").unwrap();
     let snapshot = e.populate_relational_residency_snapshot("people").unwrap();
     if snapshot.device_memory_proof.is_none() {
@@ -2697,7 +3223,11 @@ fn gpu_inner_join_three_way_catalog_describe_shape() {
         got,
         vec![
             ("id".to_string(), "people".to_string(), "public".to_string()),
-            ("name".to_string(), "people".to_string(), "public".to_string()),
+            (
+                "name".to_string(),
+                "people".to_string(),
+                "public".to_string()
+            ),
         ],
         "people's columns join to its pg_class row and the public namespace; teams is filtered out"
     );
@@ -2713,17 +3243,29 @@ fn gpu_inner_join_four_way_back_reference_to_first_relation() {
     // prior relation -- the very distinction the index-vector pipeline exists for.
     //   a JOIN b ON b.aid=a.aid JOIN c ON c.bid=b.bid JOIN d ON d.aid=a.aid
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE a (aid INT, label TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE b (bid INT, aid INT)").unwrap();
-    e.execute_text(3, "CREATE TABLE c (cid INT, bid INT)").unwrap();
-    e.execute_text(4, "CREATE TABLE d (did INT, aid INT, dlabel TEXT)").unwrap();
-    e.execute_text(5, "INSERT INTO a (aid, label) VALUES (1,'x'),(2,'y')").unwrap();
-    e.execute_text(6, "INSERT INTO b (bid, aid) VALUES (10,1)").unwrap();
-    e.execute_text(7, "INSERT INTO c (cid, bid) VALUES (100,10),(101,10)").unwrap();
-    e.execute_text(8, "INSERT INTO d (did, aid, dlabel) VALUES (1000,1,'d1')").unwrap();
+    e.execute_text(1, "CREATE TABLE a (aid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE b (bid INT, aid INT)")
+        .unwrap();
+    e.execute_text(3, "CREATE TABLE c (cid INT, bid INT)")
+        .unwrap();
+    e.execute_text(4, "CREATE TABLE d (did INT, aid INT, dlabel TEXT)")
+        .unwrap();
+    e.execute_text(5, "INSERT INTO a (aid, label) VALUES (1,'x'),(2,'y')")
+        .unwrap();
+    e.execute_text(6, "INSERT INTO b (bid, aid) VALUES (10,1)")
+        .unwrap();
+    e.execute_text(7, "INSERT INTO c (cid, bid) VALUES (100,10),(101,10)")
+        .unwrap();
+    e.execute_text(8, "INSERT INTO d (did, aid, dlabel) VALUES (1000,1,'d1')")
+        .unwrap();
     let mut ok = true;
     for t in ["a", "b", "c", "d"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -2751,7 +3293,10 @@ fn gpu_inner_join_four_way_back_reference_to_first_relation() {
     // both carrying a(1)'s label 'x' and d(1000)'s 'd1'. a(2) never joins (no b row), so it is absent.
     assert_eq!(
         pairs(&res),
-        vec![("x".to_string(), "d1".to_string()), ("x".to_string(), "d1".to_string())],
+        vec![
+            ("x".to_string(), "d1".to_string()),
+            ("x".to_string(), "d1".to_string())
+        ],
         "the c-fan-out duplicates the (a,d) pairing; the back-join reads a's carried rows, not c's"
     );
 }
@@ -2764,8 +3309,10 @@ fn gpu_inner_join_composite_on_two_column_key() {
     // is constructed so a SINGLE-column join would mis-match: child(1,20) shares pa=1 with parent(1,10)
     // but must map to parent(1,20) -- proving BOTH members are compared.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE parent (pa INT, pb INT, pname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE child (ca INT, cb INT, label TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE parent (pa INT, pb INT, pname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE child (ca INT, cb INT, label TEXT)")
+        .unwrap();
     // Negative members (-1,-2)/(-1,5) also exercise the pack on sign-extended values: -1's low 32 bits
     // are all-ones, so an incorrect mask/shift would corrupt the other member and cross-match.
     e.execute_text(3, "INSERT INTO parent (pa, pb, pname) VALUES (1,10,'p1'),(1,20,'p2'),(2,10,'p3'),(-1,-2,'pneg'),(-1,5,'pneg2')").unwrap();
@@ -2815,7 +3362,10 @@ fn gpu_inner_join_composite_on_two_column_key() {
         )
         .unwrap_err()
         .to_string();
-    assert!(three.contains("more than 2"), "3-conjunct ON rejected, got: {three}");
+    assert!(
+        three.contains("more than 2"),
+        "3-conjunct ON rejected, got: {three}"
+    );
 }
 
 #[test]
@@ -2824,8 +3374,10 @@ fn gpu_inner_join_composite_on_int8_member_rejected() {
     // int8/timestamp composite member would overflow -> a clean reject (the `narrow_key` gate). This runs
     // BEFORE residency (the key-type precompute), so it needs no GPU. A SINGLE int8 key is still allowed.
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE pp (pa BIGINT, pb INT)").unwrap();
-    e.execute_text(2, "CREATE TABLE cc (ca BIGINT, cb INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE pp (pa BIGINT, pb INT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE cc (ca BIGINT, cb INT)")
+        .unwrap();
     let err = e
         .execute_resident_expr_select_sql(
             "SELECT pp.pb FROM pp JOIN cc ON pp.pa = cc.ca AND pp.pb = cc.cb",
@@ -2845,15 +3397,34 @@ fn gpu_inner_join_comma_join_from_where() {
     // are lifted into the SAME left-deep `JoinStep` pipeline as an explicit JOIN. A single-relation WHERE
     // conjunct stays a per-relation GPU filter; a cross-relation `=` becomes a join edge.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)").unwrap();
-    e.execute_text(3, "CREATE TABLE ord (oid INT, cid INT, label TEXT)").unwrap();
-    e.execute_text(4, "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')").unwrap();
-    e.execute_text(5, "INSERT INTO cust (cid, rid, cname) VALUES (10,1,'alice'),(20,2,'bob')").unwrap();
-    e.execute_text(6, "INSERT INTO ord (oid, cid, label) VALUES (100,10,'x'),(101,10,'y'),(102,20,'z')").unwrap();
+    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, cname TEXT)")
+        .unwrap();
+    e.execute_text(3, "CREATE TABLE ord (oid INT, cid INT, label TEXT)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')",
+    )
+    .unwrap();
+    e.execute_text(
+        5,
+        "INSERT INTO cust (cid, rid, cname) VALUES (10,1,'alice'),(20,2,'bob')",
+    )
+    .unwrap();
+    e.execute_text(
+        6,
+        "INSERT INTO ord (oid, cid, label) VALUES (100,10,'x'),(101,10,'y'),(102,20,'z')",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["region", "cust", "ord"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -2863,8 +3434,11 @@ fn gpu_inner_join_comma_join_from_where() {
             SqlValue::Text(t) => t.clone(),
             other => panic!("expected text, got {other:?}"),
         };
-        let mut v: Vec<(String, String, String)> =
-            res.rows.iter().map(|r| (s(&r[0]), s(&r[1]), s(&r[2]))).collect();
+        let mut v: Vec<(String, String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (s(&r[0]), s(&r[1]), s(&r[2])))
+            .collect();
         v.sort();
         v
     };
@@ -2915,10 +3489,20 @@ fn gpu_inner_join_text_key() {
     // 64-bit hash collision between distinct names can never mis-join). users.name is UNIQUE (the build
     // side); logins.name is the FK (1:N + a userless 'dave' + a loginless 'carol').
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE users (uid INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE logins (name TEXT, ts INT)").unwrap();
-    e.execute_text(3, "INSERT INTO users (uid, name) VALUES (1,'alice'),(2,'bob'),(3,'carol')").unwrap();
-    e.execute_text(4, "INSERT INTO logins (name, ts) VALUES ('alice',100),('alice',101),('bob',200),('dave',300)").unwrap();
+    e.execute_text(1, "CREATE TABLE users (uid INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE logins (name TEXT, ts INT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO users (uid, name) VALUES (1,'alice'),(2,'bob'),(3,'carol')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO logins (name, ts) VALUES ('alice',100),('alice',101),('bob',200),('dave',300)",
+    )
+    .unwrap();
     let us = e.populate_relational_residency_snapshot("users").unwrap();
     let ls = e.populate_relational_residency_snapshot("logins").unwrap();
     if us.device_memory_proof.is_none() || ls.device_memory_proof.is_none() {
@@ -2963,15 +3547,30 @@ fn gpu_inner_join_text_key_step_in_multi_way() {
     // M5 J4b: a TEXT-key step (cust.email = ord.email) followed by an INT-key step (region.rid = cust.rid)
     // in the carried-index multi-way pipeline -- the text join's matched indices feed the next step.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, email TEXT)").unwrap();
-    e.execute_text(3, "CREATE TABLE ord (oid INT, email TEXT, label TEXT)").unwrap();
-    e.execute_text(4, "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')").unwrap();
-    e.execute_text(5, "INSERT INTO cust (cid, rid, email) VALUES (10,1,'a@x'),(20,2,'b@x')").unwrap();
+    e.execute_text(1, "CREATE TABLE region (rid INT, rname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE cust (cid INT, rid INT, email TEXT)")
+        .unwrap();
+    e.execute_text(3, "CREATE TABLE ord (oid INT, email TEXT, label TEXT)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO region (rid, rname) VALUES (1,'west'),(2,'east')",
+    )
+    .unwrap();
+    e.execute_text(
+        5,
+        "INSERT INTO cust (cid, rid, email) VALUES (10,1,'a@x'),(20,2,'b@x')",
+    )
+    .unwrap();
     e.execute_text(6, "INSERT INTO ord (oid, email, label) VALUES (100,'a@x','o1'),(101,'a@x','o2'),(102,'b@x','o3')").unwrap();
     let mut ok = true;
     for t in ["region", "cust", "ord"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -2988,8 +3587,7 @@ fn gpu_inner_join_text_key_step_in_multi_way() {
         SqlValue::Text(t) => t.clone(),
         other => panic!("expected text, got {other:?}"),
     };
-    let mut got: Vec<(String, String)> =
-        res.rows.iter().map(|r| (s(&r[0]), s(&r[1]))).collect();
+    let mut got: Vec<(String, String)> = res.rows.iter().map(|r| (s(&r[0]), s(&r[1]))).collect();
     got.sort();
     assert_eq!(
         got,
@@ -3009,21 +3607,45 @@ fn gpu_inner_join_uuid_and_numeric_keys() {
     // canonical form (uuid = raw bytes; numeric = i128 mantissa, both columns the same scale).
     let mut e = Engine::new_local();
     // --- UUID key: users.gid -> groups.gid (groups.gid unique build side) ---
-    e.execute_text(1, "CREATE TABLE groups (gid UUID, gname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE users (uid INT, gid UUID)").unwrap();
+    e.execute_text(1, "CREATE TABLE groups (gid UUID, gname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE users (uid INT, gid UUID)")
+        .unwrap();
     let g1 = "11111111-1111-1111-1111-111111111111";
     let g2 = "22222222-2222-2222-2222-222222222222";
     let g3 = "33333333-3333-3333-3333-333333333333";
-    e.execute_text(3, &format!("INSERT INTO groups (gid, gname) VALUES ('{g1}','admins'),('{g2}','members')")).unwrap();
-    e.execute_text(4, &format!("INSERT INTO users (uid, gid) VALUES (1,'{g1}'),(2,'{g1}'),(3,'{g2}'),(4,'{g3}')")).unwrap();
+    e.execute_text(
+        3,
+        &format!("INSERT INTO groups (gid, gname) VALUES ('{g1}','admins'),('{g2}','members')"),
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        &format!("INSERT INTO users (uid, gid) VALUES (1,'{g1}'),(2,'{g1}'),(3,'{g2}'),(4,'{g3}')"),
+    )
+    .unwrap();
     // --- NUMERIC key: accounts.bal -> targets.bal (same scale (10,2); targets.bal unique) ---
-    e.execute_text(5, "CREATE TABLE targets (bal NUMERIC(10,2), tname TEXT)").unwrap();
-    e.execute_text(6, "CREATE TABLE accounts (aid INT, bal NUMERIC(10,2))").unwrap();
-    e.execute_text(7, "INSERT INTO targets (bal, tname) VALUES (100.00,'hundred'),(200.50,'two-fifty')").unwrap();
-    e.execute_text(8, "INSERT INTO accounts (aid, bal) VALUES (1,100.00),(2,100.00),(3,200.50),(4,999.99)").unwrap();
+    e.execute_text(5, "CREATE TABLE targets (bal NUMERIC(10,2), tname TEXT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE accounts (aid INT, bal NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(
+        7,
+        "INSERT INTO targets (bal, tname) VALUES (100.00,'hundred'),(200.50,'two-fifty')",
+    )
+    .unwrap();
+    e.execute_text(
+        8,
+        "INSERT INTO accounts (aid, bal) VALUES (1,100.00),(2,100.00),(3,200.50),(4,999.99)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["groups", "users", "targets", "accounts"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -3055,7 +3677,11 @@ fn gpu_inner_join_uuid_and_numeric_keys() {
     assert_eq!(uuid_res.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(
         int_text(&uuid_res),
-        vec![(1, "admins".to_string()), (2, "admins".to_string()), (3, "members".to_string())],
+        vec![
+            (1, "admins".to_string()),
+            (2, "admins".to_string()),
+            (3, "members".to_string())
+        ],
         "uuid FK 1:N; the g3 user (no group) is dropped"
     );
     let num_res = e
@@ -3066,12 +3692,18 @@ fn gpu_inner_join_uuid_and_numeric_keys() {
     assert_eq!(num_res.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(
         int_text(&num_res),
-        vec![(1, "hundred".to_string()), (2, "hundred".to_string()), (3, "two-fifty".to_string())],
+        vec![
+            (1, "hundred".to_string()),
+            (2, "hundred".to_string()),
+            (3, "two-fifty".to_string())
+        ],
         "numeric (same scale) FK 1:N; the 999.99 account is dropped"
     );
     // Different-scale numeric on the two sides -> a clean reject (the mantissas are not comparable).
-    e.execute_text(9, "CREATE TABLE precise (bal NUMERIC(10,4), pname TEXT)").unwrap();
-    e.execute_text(10, "INSERT INTO precise (bal, pname) VALUES (100.0000,'p')").unwrap();
+    e.execute_text(9, "CREATE TABLE precise (bal NUMERIC(10,4), pname TEXT)")
+        .unwrap();
+    e.execute_text(10, "INSERT INTO precise (bal, pname) VALUES (100.0000,'p')")
+        .unwrap();
     let _ = e.populate_relational_residency_snapshot("precise");
     let scale_err = e
         .execute_resident_expr_select_sql(
@@ -3092,10 +3724,17 @@ fn gpu_inner_join_n_to_n_cross_product() {
     // (left rows x right rows). On k=100, left {lid 1,2} x right {rid 10,11} = 4 pairs; k=200 (left-only)
     // and k=300 (right-only) drop. (Previously a hard "N:N is a follow-up" reject.)
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE lhs (lid INT, k INT)").unwrap();
-    e.execute_text(2, "CREATE TABLE rhs (rid INT, k INT)").unwrap();
-    e.execute_text(3, "INSERT INTO lhs (lid, k) VALUES (1,100),(2,100),(3,200)").unwrap();
-    e.execute_text(4, "INSERT INTO rhs (rid, k) VALUES (10,100),(11,100),(12,300)").unwrap();
+    e.execute_text(1, "CREATE TABLE lhs (lid INT, k INT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE rhs (rid INT, k INT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO lhs (lid, k) VALUES (1,100),(2,100),(3,200)")
+        .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO rhs (rid, k) VALUES (10,100),(11,100),(12,300)",
+    )
+    .unwrap();
     let ls = e.populate_relational_residency_snapshot("lhs").unwrap();
     let rs = e.populate_relational_residency_snapshot("rhs").unwrap();
     if ls.device_memory_proof.is_none() || rs.device_memory_proof.is_none() {
@@ -3140,17 +3779,41 @@ fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
     // M5: N:N many-to-many over NON-int keys (text + numeric/uuid reuse the chaining text/byte kernel).
     // Both sides duplicate the key -> each key's (left x right) cross product.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE lt (lid INT, tag TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE rt (rid INT, tag TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO lt (lid, tag) VALUES (1,'x'),(2,'x'),(3,'y')").unwrap();
-    e.execute_text(4, "INSERT INTO rt (rid, tag) VALUES (10,'x'),(11,'x'),(12,'z')").unwrap();
-    e.execute_text(5, "CREATE TABLE la (laid INT, amt NUMERIC(10,2))").unwrap();
-    e.execute_text(6, "CREATE TABLE ra (raid INT, amt NUMERIC(10,2))").unwrap();
-    e.execute_text(7, "INSERT INTO la (laid, amt) VALUES (1,5.00),(2,5.00),(3,9.00)").unwrap();
-    e.execute_text(8, "INSERT INTO ra (raid, amt) VALUES (10,5.00),(11,5.00),(12,1.00)").unwrap();
+    e.execute_text(1, "CREATE TABLE lt (lid INT, tag TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE rt (rid INT, tag TEXT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO lt (lid, tag) VALUES (1,'x'),(2,'x'),(3,'y')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO rt (rid, tag) VALUES (10,'x'),(11,'x'),(12,'z')",
+    )
+    .unwrap();
+    e.execute_text(5, "CREATE TABLE la (laid INT, amt NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE ra (raid INT, amt NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(
+        7,
+        "INSERT INTO la (laid, amt) VALUES (1,5.00),(2,5.00),(3,9.00)",
+    )
+    .unwrap();
+    e.execute_text(
+        8,
+        "INSERT INTO ra (raid, amt) VALUES (10,5.00),(11,5.00),(12,1.00)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["lt", "rt", "la", "ra"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -3166,7 +3829,9 @@ fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
     };
     // text N:N: tag 'x' -> lt {1,2} x rt {10,11} = 4 pairs; 'y'/'z' drop.
     let text_nn = e
-        .execute_resident_expr_select_sql("SELECT lt.lid, rt.rid FROM lt JOIN rt ON lt.tag = rt.tag")
+        .execute_resident_expr_select_sql(
+            "SELECT lt.lid, rt.rid FROM lt JOIN rt ON lt.tag = rt.tag",
+        )
         .expect("text N:N join");
     assert_eq!(text_nn.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(
@@ -3176,7 +3841,9 @@ fn gpu_inner_join_n_to_n_text_and_numeric_keys() {
     );
     // numeric N:N: amt 5.00 -> la {1,2} x ra {10,11} = 4 pairs (reuses the same chaining kernel).
     let num_nn = e
-        .execute_resident_expr_select_sql("SELECT la.laid, ra.raid FROM la JOIN ra ON la.amt = ra.amt")
+        .execute_resident_expr_select_sql(
+            "SELECT la.laid, ra.raid FROM la JOIN ra ON la.amt = ra.amt",
+        )
         .expect("numeric N:N join");
     assert_eq!(
         pairs(&num_nn),
@@ -3191,9 +3858,18 @@ fn gpu_where_in_and_not_in() {
     // IN / NOT IN lower to an OR-chain of `=` / AND-chain of `<>` on the general GPU executor (no new
     // kernel) -- INT keys here (text IN awaits text AND/OR on the executor; see gpu-type-matrix).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE inq (id INT, tag INT)").unwrap();
-    e.execute_text(2, "INSERT INTO inq (id, tag) VALUES (1,10),(2,20),(3,30),(4,40)").unwrap();
-    if e.populate_relational_residency_snapshot("inq").unwrap().device_memory_proof.is_none() {
+    e.execute_text(1, "CREATE TABLE inq (id INT, tag INT)")
+        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO inq (id, tag) VALUES (1,10),(2,20),(3,30),(4,40)",
+    )
+    .unwrap();
+    if e.populate_relational_residency_snapshot("inq")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let ids = |res: &RelationalSelectResult| -> Vec<i32> {
@@ -3229,7 +3905,9 @@ fn gpu_where_in_and_not_in() {
     );
     // IN composes with AND under the general boolean executor.
     assert_eq!(
-        ids(&run("SELECT id FROM inq WHERE id IN (1, 2, 3) AND tag <> 20")),
+        ids(&run(
+            "SELECT id FROM inq WHERE id IN (1, 2, 3) AND tag <> 20"
+        )),
         vec![1, 3],
         "IN AND <> composes"
     );
@@ -3241,13 +3919,18 @@ fn gpu_where_text_and_or_and_in() {
     // Text AND/OR on the general executor: each text `=`/`<>` becomes a TextEqMask the mask VM combines
     // with AND/OR (and with int4) -- so text IN / NOT IN / multi-text WHERE run on the GPU.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tq (id INT, tag TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE tq (id INT, tag TEXT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO tq (id, tag) VALUES (1,'apple'),(2,'banana'),(3,'cherry'),(4,'apple')",
     )
     .unwrap();
-    if e.populate_relational_residency_snapshot("tq").unwrap().device_memory_proof.is_none() {
+    if e.populate_relational_residency_snapshot("tq")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let ids = |res: &RelationalSelectResult| -> Vec<i32> {
@@ -3265,7 +3948,11 @@ fn gpu_where_text_and_or_and_in() {
     let run = |sql: &str| e.execute_resident_expr_select_sql(sql).expect(sql);
     let or = run("SELECT id FROM tq WHERE tag = 'apple' OR tag = 'cherry'");
     assert_eq!(or.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(ids(&or), vec![1, 3, 4], "text OR (apple, cherry) runs on the GPU");
+    assert_eq!(
+        ids(&or),
+        vec![1, 3, 4],
+        "text OR (apple, cherry) runs on the GPU"
+    );
     assert_eq!(
         ids(&run("SELECT id FROM tq WHERE tag = 'apple' AND id > 1")),
         vec![4],
@@ -3282,12 +3969,16 @@ fn gpu_where_text_and_or_and_in() {
         "text NOT IN -> AND-chain of text <>"
     );
     assert_eq!(
-        ids(&run("SELECT id FROM tq WHERE tag <> 'apple' AND tag <> 'banana'")),
+        ids(&run(
+            "SELECT id FROM tq WHERE tag <> 'apple' AND tag <> 'banana'"
+        )),
         vec![3],
         "text <> AND text <>"
     );
     assert_eq!(
-        ids(&run("SELECT id FROM tq WHERE tag IN ('apple', 'banana') AND id <> 2")),
+        ids(&run(
+            "SELECT id FROM tq WHERE tag IN ('apple', 'banana') AND id <> 2"
+        )),
         vec![1, 4],
         "text IN AND an int4 <> compose"
     );
@@ -3301,9 +3992,11 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
     // query on the GPU join + GPU sort path. BOTH sides are SYNTHESIZED catalog relations (transient
     // device payloads), schema-qualified `pg_catalog.<rel>`.
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE dz_people (id INT, name TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE dz_people (id INT, name TEXT)")
+        .unwrap();
     e.execute_text(2, "CREATE TABLE dz_teams (id INT)").unwrap();
-    e.execute_text(3, "CREATE TABLE dz_ignored (id INT)").unwrap();
+    e.execute_text(3, "CREATE TABLE dz_ignored (id INT)")
+        .unwrap();
     // Probe: the transient catalog payload needs a GPU; skip cleanly if unavailable.
     let probe = e.execute_resident_expr_select_sql(
         "SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
@@ -3325,10 +4018,24 @@ fn gpu_catalog_pg_class_join_pg_namespace_d_metadata() {
             })
             .collect()
     };
-    let people = ("public".to_string(), "dz_people".to_string(), "r".to_string(), "p".to_string());
-    let teams = ("public".to_string(), "dz_teams".to_string(), "r".to_string(), "p".to_string());
-    let ignored =
-        ("public".to_string(), "dz_ignored".to_string(), "r".to_string(), "p".to_string());
+    let people = (
+        "public".to_string(),
+        "dz_people".to_string(),
+        "r".to_string(),
+        "p".to_string(),
+    );
+    let teams = (
+        "public".to_string(),
+        "dz_teams".to_string(),
+        "r".to_string(),
+        "p".to_string(),
+    );
+    let ignored = (
+        "public".to_string(),
+        "dz_ignored".to_string(),
+        "r".to_string(),
+        "p".to_string(),
+    );
     // Golden 23 form: every public relkind='r' relation, ordered by name (dz_ignored < dz_people < dz_teams).
     // The whole query -- the join, the per-side text filters, the ORDER BY, and relpersistence -- is on GPU.
     let all = e
@@ -3367,13 +4074,18 @@ fn gpu_where_bool_and_or() {
     // Bool column in AND/OR on the general executor: a bool bitmap -> i32 mask the VM combines with
     // AND/OR (and int4). `NOT flag` is `flag = false`. Reuses gpu_db_resident_bool_to_mask (no new kernel).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE bq (id INT, active BOOL, qty INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE bq (id INT, active BOOL, qty INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO bq (id, active, qty) VALUES (1,true,5),(2,false,3),(3,true,10),(4,false,8)",
     )
     .unwrap();
-    if e.populate_relational_residency_snapshot("bq").unwrap().device_memory_proof.is_none() {
+    if e.populate_relational_residency_snapshot("bq")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
     let ids = |res: &RelationalSelectResult| -> Vec<i32> {
@@ -3416,7 +4128,8 @@ fn gpu_catalog_pg_attribute_d_table_columns() {
     // pg_class JOIN pg_namespace, the per-side `attnum > 0 AND NOT attisdropped` (int4 AND bool, now on
     // the GPU mask VM), ORDER BY attnum, projecting the newly-synthesized atttypmod/attisdropped.
     let e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE dt_widget (id INT, label TEXT, qty INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE dt_widget (id INT, label TEXT, qty INT)")
+        .unwrap();
     let probe = e.execute_resident_expr_select_sql(
         "SELECT a.attname FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid WHERE c.relname = 'dt_widget'",
@@ -3475,9 +4188,15 @@ fn gpu_inner_join_order_by_limit_offset() {
     // M5 (catalog \d prerequisite): ORDER BY / LIMIT / OFFSET on a join. ORDER BY is a GPU sort over the
     // join result (int key via the matrix path, text+int multi-key via the hetero payload path).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, lid INT, score INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'charlie'),(2,'alice'),(3,'bob')").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, lid INT, score INT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO l (id, name) VALUES (1,'charlie'),(2,'alice'),(3,'bob')",
+    )
+    .unwrap();
     e.execute_text(
         4,
         "INSERT INTO r (rid, lid, score) VALUES (10,1,50),(11,2,90),(12,3,70),(13,1,30)",
@@ -3485,7 +4204,11 @@ fn gpu_inner_join_order_by_limit_offset() {
     .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -3584,18 +4307,25 @@ fn gpu_join_result_nullable_value_columns_from_device() {
     // KEY is non-null and the NULLs live in projected value columns of MATCHED rows (int, text, numeric).
     // Plus a LEFT-outer variant where a pad-NULL (JOIN_NULL_ROW) and a value-NULL coexist.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, v INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, v INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))")
+        .unwrap();
     // id=1: l.v NULL, matched to r.w NULL. id=2: l.name NULL, matched to r.w=2.50. id=3: unmatched (pad).
     e.execute_text(
         3,
         "INSERT INTO l (id, v, name) VALUES (1, NULL, 'a'), (2, 20, NULL), (3, 30, 'c')",
     )
     .unwrap();
-    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (1, NULL), (2, 2.50)").unwrap();
+    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (1, NULL), (2, 2.50)")
+        .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -3665,13 +4395,27 @@ fn gpu_join_limit_offset_window_edges() {
     // gathering only the kept window -- no host drain/truncate on result data. Edge cases vs the old
     // drain/truncate: OFFSET past the end -> empty, LIMIT 0 -> empty, OFFSET+LIMIT past the end -> clamped.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, score INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid, score) VALUES (1,10),(2,20),(3,30),(4,40)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, score INT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid, score) VALUES (1,10),(2,20),(3,30),(4,40)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -3720,10 +4464,20 @@ fn gpu_inner_join_using_and_natural() {
     // M5: USING / NATURAL joins -- the join column is COALESCED (appears once in `*`, PG order: join cols,
     // then left's rest, then right's; an unqualified ref resolves to the left copy).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE emp (eid INT, dept INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE dept (dept INT, dname TEXT)").unwrap();
-    e.execute_text(3, "INSERT INTO emp (eid, dept, name) VALUES (1,10,'alice'),(2,10,'bob'),(3,20,'carol')").unwrap();
-    e.execute_text(4, "INSERT INTO dept (dept, dname) VALUES (10,'eng'),(20,'sales'),(30,'hr')").unwrap();
+    e.execute_text(1, "CREATE TABLE emp (eid INT, dept INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE dept (dept INT, dname TEXT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO emp (eid, dept, name) VALUES (1,10,'alice'),(2,10,'bob'),(3,20,'carol')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO dept (dept, dname) VALUES (10,'eng'),(20,'sales'),(30,'hr')",
+    )
+    .unwrap();
     let es = e.populate_relational_residency_snapshot("emp").unwrap();
     let ds = e.populate_relational_residency_snapshot("dept").unwrap();
     if es.device_memory_proof.is_none() || ds.device_memory_proof.is_none() {
@@ -3739,8 +4493,11 @@ fn gpu_inner_join_using_and_natural() {
             SqlValue::Text(t) => t.clone(),
             other => panic!("expected text, got {other:?}"),
         };
-        let mut v: Vec<(i32, i32, String, String)> =
-            res.rows.iter().map(|r| (i(&r[0]), i(&r[1]), s(&r[2]), s(&r[3]))).collect();
+        let mut v: Vec<(i32, i32, String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (i(&r[0]), i(&r[1]), s(&r[2]), s(&r[3])))
+            .collect();
         v.sort();
         v
     };
@@ -3749,7 +4506,11 @@ fn gpu_inner_join_using_and_natural() {
         .expect("USING join with `*`");
     assert_eq!(star.executed_target, DeviceTarget::Gpu(0));
     let names: Vec<String> = star.columns.iter().map(|c| c.name.clone()).collect();
-    assert_eq!(names, vec!["dept", "eid", "name", "dname"], "USING coalesces `dept` once, PG `*` order");
+    assert_eq!(
+        names,
+        vec!["dept", "eid", "name", "dname"],
+        "USING coalesces `dept` once, PG `*` order"
+    );
     assert_eq!(
         rows4(&star),
         vec![
@@ -3764,14 +4525,19 @@ fn gpu_inner_join_using_and_natural() {
         .execute_resident_expr_select_sql("SELECT * FROM emp NATURAL JOIN dept")
         .expect("NATURAL join");
     assert_eq!(
-        nat.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        nat.columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>(),
         vec!["dept", "eid", "name", "dname"],
         "NATURAL joins on (and coalesces) the common column `dept`"
     );
     assert_eq!(rows4(&nat), rows4(&star), "NATURAL == USING(dept) here");
     // An UNQUALIFIED reference to the coalesced join column resolves (not ambiguous).
     let explicit = e
-        .execute_resident_expr_select_sql("SELECT name, dept, dname FROM emp JOIN dept USING (dept)")
+        .execute_resident_expr_select_sql(
+            "SELECT name, dept, dname FROM emp JOIN dept USING (dept)",
+        )
         .expect("USING join, unqualified coalesced column");
     let mut got: Vec<(String, i32, String)> = explicit
         .rows
@@ -3799,14 +4565,18 @@ fn gpu_inner_join_using_and_natural() {
         "unqualified `dept` is the coalesced column"
     );
     // NATURAL/USING in a MULTI-WAY join is a clean follow-up reject.
-    e.execute_text(5, "CREATE TABLE loc (dept INT, city TEXT)").unwrap();
+    e.execute_text(5, "CREATE TABLE loc (dept INT, city TEXT)")
+        .unwrap();
     let multi = e
         .execute_resident_expr_select_sql(
             "SELECT * FROM emp JOIN dept USING (dept) JOIN loc ON loc.dept = emp.dept",
         )
         .unwrap_err()
         .to_string();
-    assert!(multi.contains("multi-way"), "multi-way USING rejected, got: {multi}");
+    assert!(
+        multi.contains("multi-way"),
+        "multi-way USING rejected, got: {multi}"
+    );
 }
 
 #[test]
@@ -3816,7 +4586,8 @@ fn grouped_order_by_text_key_sorts_on_the_gpu() {
     // payload (offsets + bytes) from the host result + sorts on-device -- the trickiest payload path.
     // Multi-aggregate forces the general path.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (name TEXT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (name TEXT, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (name, v) VALUES ('cara', 1), ('amy', 2), ('bob', 3), ('amy', 4)",
@@ -3840,7 +4611,11 @@ fn grouped_order_by_text_key_sorts_on_the_gpu() {
             other => panic!("expected text, got {other:?}"),
         })
         .collect();
-    assert_eq!(names, vec!["cara", "bob", "amy"], "name DESC -> cara, bob, amy");
+    assert_eq!(
+        names,
+        vec!["cara", "bob", "amy"],
+        "name DESC -> cara, bob, amy"
+    );
 }
 
 #[test]
@@ -3893,7 +4668,9 @@ fn grouped_order_by_expression_is_rejected() {
     e.execute_text(2, "INSERT INTO g (a) VALUES (1), (1), (2)")
         .unwrap();
     let err = e
-        .execute_relational_select_text("SELECT a, COUNT(*), SUM(a) FROM g GROUP BY a ORDER BY a + a")
+        .execute_relational_select_text(
+            "SELECT a, COUNT(*), SUM(a) FROM g GROUP BY a ORDER BY a + a",
+        )
         .expect_err("grouped ORDER BY expression must be rejected");
     let msg = format!("{err:?}").to_lowercase();
     assert!(
@@ -3983,8 +4760,14 @@ fn gpu_select_text_routes_arithmetic_predicate_to_general_expr_path() {
 // already-audited resident materialization path (S1), used as the expected value for the join gather.
 #[cfg(test)]
 fn audit_one_val(e: &Engine, sql: &str) -> SqlValue {
-    let r = e.execute_resident_expr_select_sql(sql).expect("reference select");
-    assert_eq!(r.rows.len(), 1, "reference select must return exactly one row: {sql}");
+    let r = e
+        .execute_resident_expr_select_sql(sql)
+        .expect("reference select");
+    assert_eq!(
+        r.rows.len(),
+        1,
+        "reference select must return exactly one row: {sql}"
+    );
     r.rows[0][0].clone()
 }
 
@@ -4002,7 +4785,8 @@ fn audit_join_matched_row_value_null_every_type() {
         "CREATE TABLE r (rid INT, s2 SMALLINT, s8 BIGINT, d DATE, ts TIMESTAMP, u UUID, b BOOLEAN, n4 NUMERIC(12,4))",
     )
     .unwrap();
-    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2)")
+        .unwrap();
     // rid=1: every value column NULL. rid=2: every value column a distinctive NON-null value.
     e.execute_text(
         4,
@@ -4014,7 +4798,11 @@ fn audit_join_matched_row_value_null_every_type() {
     .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4074,7 +4862,8 @@ fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
     )
     .unwrap();
     // l has id 1,2,3. r has rid=1 (ROW 0, distinctive) and rid=2. id=3 is UNMATCHED -> a pad over r.
-    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2),(3)").unwrap();
+    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2),(3)")
+        .unwrap();
     e.execute_text(
         4,
         "INSERT INTO r (rid, s2, s8, d, ts, u, b, n, name) VALUES \
@@ -4086,7 +4875,11 @@ fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
     .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4109,8 +4902,16 @@ fn audit_join_outer_pad_on_nonnullable_columns_all_types() {
         );
     }
     // And the matched id=1 row really carries row-0's distinctive values (proves the gather isn't dead).
-    assert_eq!(res.rows[0][1], SqlValue::Int2(777), "matched id=1 gets row-0 s2");
-    assert_eq!(res.rows[0][8], SqlValue::Text("ROW0".to_string()), "matched id=1 gets row-0 name");
+    assert_eq!(
+        res.rows[0][1],
+        SqlValue::Int2(777),
+        "matched id=1 gets row-0 s2"
+    );
+    assert_eq!(
+        res.rows[0][8],
+        SqlValue::Text("ROW0".to_string()),
+        "matched id=1 gets row-0 name"
+    );
 }
 
 #[test]
@@ -4119,13 +4920,20 @@ fn audit_join_empty_padded_side_right_full() {
     // HUNT #3: a relation whose row_count==0 appears as a PADDED side (RIGHT/FULL with an empty side).
     // gather_col must early-return all-NULL (no device read at index 0 into an empty payload) -- no panic.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, w INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b')").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w INT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b')")
+        .unwrap();
     // r is EMPTY.
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4139,8 +4947,16 @@ fn audit_join_empty_padded_side_right_full() {
     assert_eq!(
         left.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Text("a".to_string()), SqlValue::Null],
-            vec![SqlValue::Int4(2), SqlValue::Text("b".to_string()), SqlValue::Null],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("a".to_string()),
+                SqlValue::Null
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Text("b".to_string()),
+                SqlValue::Null
+            ],
         ],
         "empty padded side -> r.w all NULL, no panic/OOB"
     );
@@ -4153,13 +4969,27 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
     // exactly as the old drain/truncate did. We make the join order deterministic (unique 1:1 keys, build
     // on the unique side) and verify the windowed slice is a contiguous slice of the full result.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, score INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid, score) VALUES (1,10),(2,20),(3,30),(4,40),(5,50)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, score INT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid, score) VALUES (1,10),(2,20),(3,30),(4,40),(5,50)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4171,7 +5001,9 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
     assert_eq!(full_names.len(), 5);
     // OFFSET 1 LIMIT 2 (no ORDER BY) -> the contiguous slice [1..3) of the join order.
     let win = e
-        .execute_resident_expr_select_sql("SELECT l.name FROM l JOIN r ON l.id = r.rid LIMIT 2 OFFSET 1")
+        .execute_resident_expr_select_sql(
+            "SELECT l.name FROM l JOIN r ON l.id = r.rid LIMIT 2 OFFSET 1",
+        )
         .expect("windowed join, no order by");
     let win_names: Vec<SqlValue> = win.rows.iter().map(|r| r[0].clone()).collect();
     assert_eq!(
@@ -4184,7 +5016,11 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
         .execute_resident_expr_select_sql("SELECT l.name FROM l JOIN r ON l.id = r.rid OFFSET 2")
         .expect("offset-only join");
     let tail_names: Vec<SqlValue> = tail.rows.iter().map(|r| r[0].clone()).collect();
-    assert_eq!(tail_names, full_names[2..].to_vec(), "OFFSET 2, no LIMIT -> tail in join order");
+    assert_eq!(
+        tail_names,
+        full_names[2..].to_vec(),
+        "OFFSET 2, no LIMIT -> tail in join order"
+    );
 }
 
 #[test]
@@ -4192,13 +5028,21 @@ fn audit_join_limit_offset_no_orderby_matches_join_order() {
 fn audit_join_empty_result_no_matches() {
     // HUNT #9: no matches -> work_n == 0 -> the gather returns empty, transpose -> 0 rows, no panic.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))").unwrap();
-    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b')").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (100, 1.00),(200, 2.00)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (id, name) VALUES (1,'a'),(2,'b')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (100, 1.00),(200, 2.00)")
+        .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4225,13 +5069,21 @@ fn audit_join_nn_and_multiway_gather_right_rows() {
     // from each side's device payload (text + numeric + null values), not misaligned values.
     let mut e = Engine::new_local();
     // N:N on an int key: l has key 1 twice, r has key 1 twice -> 4 result rows, each a distinct (l,r) pair.
-    e.execute_text(1, "CREATE TABLE l (k INT, lv TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (k INT, rv NUMERIC(10,2))").unwrap();
-    e.execute_text(3, "INSERT INTO l (k, lv) VALUES (1,'x'),(1,'y')").unwrap();
-    e.execute_text(4, "INSERT INTO r (k, rv) VALUES (1, 1.10),(1, NULL)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (k INT, lv TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (k INT, rv NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (k, lv) VALUES (1,'x'),(1,'y')")
+        .unwrap();
+    e.execute_text(4, "INSERT INTO r (k, rv) VALUES (1, 1.10),(1, NULL)")
+        .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4246,22 +5098,41 @@ fn audit_join_nn_and_multiway_gather_right_rows() {
     assert_eq!(
         nn.rows,
         vec![
-            vec![SqlValue::Text("x".to_string()), SqlValue::Numeric(Decimal128::new(110, 2))],
+            vec![
+                SqlValue::Text("x".to_string()),
+                SqlValue::Numeric(Decimal128::new(110, 2))
+            ],
             vec![SqlValue::Text("x".to_string()), SqlValue::Null],
-            vec![SqlValue::Text("y".to_string()), SqlValue::Numeric(Decimal128::new(110, 2))],
+            vec![
+                SqlValue::Text("y".to_string()),
+                SqlValue::Numeric(Decimal128::new(110, 2))
+            ],
             vec![SqlValue::Text("y".to_string()), SqlValue::Null],
         ],
         "N:N gather: each (l,r) pair's text+numeric (incl. a NULL numeric value) is correct"
     );
     // 3-way chain a JOIN b JOIN c. Carried indices into 3 payloads.
-    e.execute_text(10, "CREATE TABLE a (aid INT, an TEXT)").unwrap();
-    e.execute_text(11, "CREATE TABLE b (bid INT, bref INT, bn TEXT)").unwrap();
-    e.execute_text(12, "CREATE TABLE c (cid INT, cn TEXT)").unwrap();
-    e.execute_text(13, "INSERT INTO a (aid, an) VALUES (1,'a1'),(2,'a2')").unwrap();
-    e.execute_text(14, "INSERT INTO b (bid, bref, bn) VALUES (1,1,'b1'),(2,2,'b2')").unwrap();
-    e.execute_text(15, "INSERT INTO c (cid, cn) VALUES (1,'c1'),(2,'c2')").unwrap();
+    e.execute_text(10, "CREATE TABLE a (aid INT, an TEXT)")
+        .unwrap();
+    e.execute_text(11, "CREATE TABLE b (bid INT, bref INT, bn TEXT)")
+        .unwrap();
+    e.execute_text(12, "CREATE TABLE c (cid INT, cn TEXT)")
+        .unwrap();
+    e.execute_text(13, "INSERT INTO a (aid, an) VALUES (1,'a1'),(2,'a2')")
+        .unwrap();
+    e.execute_text(
+        14,
+        "INSERT INTO b (bid, bref, bn) VALUES (1,1,'b1'),(2,2,'b2')",
+    )
+    .unwrap();
+    e.execute_text(15, "INSERT INTO c (cid, cn) VALUES (1,'c1'),(2,'c2')")
+        .unwrap();
     for t in ["a", "b", "c"] {
-        if e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_none() {
+        if e.populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_none()
+        {
             return;
         }
     }
@@ -4293,13 +5164,24 @@ fn audit_join_nn_and_multiway_gather_right_rows() {
 fn audit_join_using_natural_and_star_gather() {
     // HUNT #7: USING coalesced column (mapped to rel 0) + bare `*` gather correctly.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE l (id INT, lname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (id INT, rscore INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id, lname) VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-    e.execute_text(4, "INSERT INTO r (id, rscore) VALUES (1,10),(2,20)").unwrap();
+    e.execute_text(1, "CREATE TABLE l (id INT, lname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r (id INT, rscore INT)")
+        .unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO l (id, lname) VALUES (1,'a'),(2,'b'),(3,'c')",
+    )
+    .unwrap();
+    e.execute_text(4, "INSERT INTO r (id, rscore) VALUES (1,10),(2,20)")
+        .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4311,14 +5193,24 @@ fn audit_join_using_natural_and_star_gather() {
     assert_eq!(
         star.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Text("a".to_string()), SqlValue::Int4(10)],
-            vec![SqlValue::Int4(2), SqlValue::Text("b".to_string()), SqlValue::Int4(20)],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("a".to_string()),
+                SqlValue::Int4(10)
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Text("b".to_string()),
+                SqlValue::Int4(20)
+            ],
         ],
         "USING star: coalesced id (rel0) + l.lname + r.rscore gathered from device"
     );
     // unqualified id reference resolves to the left copy.
     let bare = e
-        .execute_resident_expr_select_sql("SELECT id, lname, rscore FROM l JOIN r USING (id) ORDER BY id")
+        .execute_resident_expr_select_sql(
+            "SELECT id, lname, rscore FROM l JOIN r USING (id) ORDER BY id",
+        )
         .expect("USING explicit columns");
     assert_eq!(bare.rows, star.rows, "explicit list equals star for USING");
 }
@@ -4332,12 +5224,24 @@ fn audit_nonvacuity_placeholder_would_leak_without_override() {
     // device happens to be empty/absent). If this test ever PASSES, the placeholder is leaking == bug.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, b BOOLEAN, name TEXT, s2 SMALLINT)").unwrap();
+    e.execute_text(
+        2,
+        "CREATE TABLE r (rid INT, b BOOLEAN, name TEXT, s2 SMALLINT)",
+    )
+    .unwrap();
     e.execute_text(3, "INSERT INTO l (id) VALUES (1)").unwrap();
-    e.execute_text(4, "INSERT INTO r (rid, b, name, s2) VALUES (1, NULL, NULL, NULL)").unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid, b, name, s2) VALUES (1, NULL, NULL, NULL)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4347,7 +5251,11 @@ fn audit_nonvacuity_placeholder_would_leak_without_override() {
         .expect("join");
     let row = &res.rows[0];
     // The CORRECT result is all-Null. The placeholder (the WRONG result) would be Bool(false)/Text("")/Int2(0).
-    let placeholder = vec![SqlValue::Bool(false), SqlValue::Text(String::new()), SqlValue::Int2(0)];
+    let placeholder = vec![
+        SqlValue::Bool(false),
+        SqlValue::Text(String::new()),
+        SqlValue::Int2(0),
+    ];
     let result = std::panic::catch_unwind(|| {
         assert_eq!(*row, placeholder, "if this matched, the placeholder LEAKED");
     });
@@ -4368,13 +5276,23 @@ fn audit_join_order_by_nullable_value_with_window() {
     // must slice the SORTED order (not join order). A divergence would silently reorder/mis-window.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE l (id INT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r (rid INT, w INT)").unwrap();
-    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2),(3),(4)").unwrap();
+    e.execute_text(2, "CREATE TABLE r (rid INT, w INT)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO l (id) VALUES (1),(2),(3),(4)")
+        .unwrap();
     // w values: 30, NULL, 10, 20 -> sorted ASC: 10(id3),20(id4),30(id1),NULL(id2).
-    e.execute_text(4, "INSERT INTO r (rid, w) VALUES (1,30),(2,NULL),(3,10),(4,20)").unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r (rid, w) VALUES (1,30),(2,NULL),(3,10),(4,20)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["l", "r"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4437,19 +5355,35 @@ fn audit_join_order_by_nullable_value_with_window() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_uuid_byteorder_value_exactness() {
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE gd (gid UUID, gname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE ud (uid INT, gid UUID)").unwrap();
+    e.execute_text(1, "CREATE TABLE gd (gid UUID, gname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE ud (uid INT, gid UUID)")
+        .unwrap();
     // Deliberately asymmetric byte patterns: a byte-swap would change the value AND break matching.
     let a = "0102030405060708090a0b0c0d0e0f10"; // bare 32-hex form
     let b = "fffefdfc-fbfa-f9f8-f7f6-f5f4f3f2f1f0"; // descending, high bit set in byte 0
     let c = "00112233-4455-6677-8899-aabbccddeeff";
     let unmatched = "deadbeef-0000-1111-2222-333344445555";
     let a_canon = gpu_db_sql::uuid::format_uuid(&gpu_db_sql::uuid::parse_uuid(a).unwrap());
-    e.execute_text(3, &format!("INSERT INTO gd (gid, gname) VALUES ('{a}','A'),('{b}','B'),('{c}','C')")).unwrap();
-    e.execute_text(4, &format!("INSERT INTO ud (uid, gid) VALUES (1,'{a}'),(2,'{b}'),(3,'{c}'),(4,'{unmatched}')")).unwrap();
+    e.execute_text(
+        3,
+        &format!("INSERT INTO gd (gid, gname) VALUES ('{a}','A'),('{b}','B'),('{c}','C')"),
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        &format!(
+            "INSERT INTO ud (uid, gid) VALUES (1,'{a}'),(2,'{b}'),(3,'{c}'),(4,'{unmatched}')"
+        ),
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["gd", "ud"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4486,7 +5420,11 @@ fn audit_s5_uuid_byteorder_value_exactness() {
             (uid, u_gid, g_gid, gname)
         })
         .collect();
-    assert_eq!(rows.len(), 3, "exactly the 3 matched uuids (deadbeef drops)");
+    assert_eq!(
+        rows.len(),
+        3,
+        "exactly the 3 matched uuids (deadbeef drops)"
+    );
     // Row 1: uuid `a` -> both projected uuids equal `a`'s canonical form (NOT byte-swapped).
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, a_canon, "ud.gid value exact (no byte swap)");
@@ -4514,19 +5452,43 @@ fn audit_s5_numeric_mantissa_exactness_negatives_and_large() {
     // scale 0. NEGATIVES are the high-limb probe: a -1 mantissa is 0xFF..FF across ALL 16 bytes
     // (including the HIGH 64-bit limb); a dropped/zeroed high limb in project_i128 would turn it into a
     // large POSITIVE value and break the match. Also a beyond-i32 positive (3e9) crosses the 32-bit line.
-    e.execute_text(1, "CREATE TABLE t0 (k NUMERIC(30,0), name TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE a0 (aid INT, k NUMERIC(30,0))").unwrap();
+    e.execute_text(1, "CREATE TABLE t0 (k NUMERIC(30,0), name TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE a0 (aid INT, k NUMERIC(30,0))")
+        .unwrap();
     let big = "3000000000"; // > i32::MAX (2.1e9): a 32-bit-limb bug would corrupt it
-    e.execute_text(3, &format!("INSERT INTO t0 (k, name) VALUES (-1,'neg1'),({big},'big'),(-999999999,'negbil')")).unwrap();
-    e.execute_text(4, &format!("INSERT INTO a0 (aid, k) VALUES (1,-1),(2,{big}),(3,-999999999),(4,777)")).unwrap();
+    e.execute_text(
+        3,
+        &format!("INSERT INTO t0 (k, name) VALUES (-1,'neg1'),({big},'big'),(-999999999,'negbil')"),
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        &format!("INSERT INTO a0 (aid, k) VALUES (1,-1),(2,{big}),(3,-999999999),(4,777)"),
+    )
+    .unwrap();
     // high scale + negative fraction
-    e.execute_text(5, "CREATE TABLE th (k NUMERIC(20,6), name TEXT)").unwrap();
-    e.execute_text(6, "CREATE TABLE ah (aid INT, k NUMERIC(20,6))").unwrap();
-    e.execute_text(7, "INSERT INTO th (k, name) VALUES (-12.345678,'negfrac'),(0.000001,'tiny')").unwrap();
-    e.execute_text(8, "INSERT INTO ah (aid, k) VALUES (1,-12.345678),(2,0.000001),(3,5.000000)").unwrap();
+    e.execute_text(5, "CREATE TABLE th (k NUMERIC(20,6), name TEXT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE ah (aid INT, k NUMERIC(20,6))")
+        .unwrap();
+    e.execute_text(
+        7,
+        "INSERT INTO th (k, name) VALUES (-12.345678,'negfrac'),(0.000001,'tiny')",
+    )
+    .unwrap();
+    e.execute_text(
+        8,
+        "INSERT INTO ah (aid, k) VALUES (1,-12.345678),(2,0.000001),(3,5.000000)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["t0", "a0", "th", "ah"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4593,19 +5555,38 @@ fn audit_s5_b128_key_in_later_multiway_step() {
     let mut e = Engine::new_local();
     // r0 (int pk) -> r1 (int fk to r0, uuid u) -> r2 (uuid u). The uuid join is the SECOND step, joining
     // the ACCUMULATED (r0,r1) on r1.u against r2.u. r1.u is gathered at carried r1 indices.
-    e.execute_text(1, "CREATE TABLE r0 (id INT, tag TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE r1 (id INT, u UUID)").unwrap();
-    e.execute_text(3, "CREATE TABLE r2 (u UUID, label TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE r0 (id INT, tag TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE r1 (id INT, u UUID)")
+        .unwrap();
+    e.execute_text(3, "CREATE TABLE r2 (u UUID, label TEXT)")
+        .unwrap();
     let ux = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     let uy = "12345678-9abc-def0-1234-567890abcdef";
     let uz = "00000000-0000-0000-0000-000000000001";
     // r0 rows 1..3; r1 maps id->uuid (id1->ux, id2->uy, id3->uz); r2 has ux,uy only.
-    e.execute_text(4, "INSERT INTO r0 (id, tag) VALUES (1,'one'),(2,'two'),(3,'three')").unwrap();
-    e.execute_text(5, &format!("INSERT INTO r1 (id, u) VALUES (1,'{ux}'),(2,'{uy}'),(3,'{uz}')")).unwrap();
-    e.execute_text(6, &format!("INSERT INTO r2 (u, label) VALUES ('{ux}','X'),('{uy}','Y')")).unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO r0 (id, tag) VALUES (1,'one'),(2,'two'),(3,'three')",
+    )
+    .unwrap();
+    e.execute_text(
+        5,
+        &format!("INSERT INTO r1 (id, u) VALUES (1,'{ux}'),(2,'{uy}'),(3,'{uz}')"),
+    )
+    .unwrap();
+    e.execute_text(
+        6,
+        &format!("INSERT INTO r2 (u, label) VALUES ('{ux}','X'),('{uy}','Y')"),
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["r0", "r1", "r2"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4651,18 +5632,36 @@ fn audit_s5_b128_key_in_later_multiway_step() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_empty_side_before_b128_and_text_step() {
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE gu (gid UUID, gname TEXT)").unwrap();
-    e.execute_text(2, "CREATE TABLE uu (uid INT, gid UUID)").unwrap();
+    e.execute_text(1, "CREATE TABLE gu (gid UUID, gname TEXT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE uu (uid INT, gid UUID)")
+        .unwrap();
     let g = "11112222-3333-4444-5555-666677778888";
-    e.execute_text(3, &format!("INSERT INTO gu (gid, gname) VALUES ('{g}','g')")).unwrap();
-    e.execute_text(4, &format!("INSERT INTO uu (uid, gid) VALUES (1,'{g}'),(2,'{g}')")).unwrap();
-    e.execute_text(5, "CREATE TABLE ls (lid INT, t TEXT)").unwrap();
-    e.execute_text(6, "CREATE TABLE rs (rid INT, t TEXT)").unwrap();
-    e.execute_text(7, "INSERT INTO ls (lid, t) VALUES (1,'x'),(2,'y')").unwrap();
-    e.execute_text(8, "INSERT INTO rs (rid, t) VALUES (10,'x')").unwrap();
+    e.execute_text(
+        3,
+        &format!("INSERT INTO gu (gid, gname) VALUES ('{g}','g')"),
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        &format!("INSERT INTO uu (uid, gid) VALUES (1,'{g}'),(2,'{g}')"),
+    )
+    .unwrap();
+    e.execute_text(5, "CREATE TABLE ls (lid INT, t TEXT)")
+        .unwrap();
+    e.execute_text(6, "CREATE TABLE rs (rid INT, t TEXT)")
+        .unwrap();
+    e.execute_text(7, "INSERT INTO ls (lid, t) VALUES (1,'x'),(2,'y')")
+        .unwrap();
+    e.execute_text(8, "INSERT INTO rs (rid, t) VALUES (10,'x')")
+        .unwrap();
     let mut ok = true;
     for t in ["gu", "uu", "ls", "rs"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4673,14 +5672,20 @@ fn audit_s5_empty_side_before_b128_and_text_step() {
             "SELECT uu.uid, gu.gname FROM uu JOIN gu ON uu.gid = gu.gid WHERE uu.uid > 100",
         )
         .expect("empty uuid side must not panic");
-    assert!(uuid_empty.rows.is_empty(), "filtered-to-empty uuid side -> empty result");
+    assert!(
+        uuid_empty.rows.is_empty(),
+        "filtered-to-empty uuid side -> empty result"
+    );
     // WHERE filters rs to empty before the text join.
     let text_empty = e
         .execute_resident_expr_select_sql(
             "SELECT ls.lid, rs.rid FROM ls JOIN rs ON ls.t = rs.t WHERE rs.rid > 100",
         )
         .expect("empty text side must not panic");
-    assert!(text_empty.rows.is_empty(), "filtered-to-empty text side -> empty result");
+    assert!(
+        text_empty.rows.is_empty(),
+        "filtered-to-empty text side -> empty result"
+    );
     // A NON-empty text match through the device gather (so this test also covers the text-key gather
     // correctness, not just the empty path): 'x' matches lid 1 -> rid 10.
     let text_match = e
@@ -4694,7 +5699,11 @@ fn audit_s5_empty_side_before_b128_and_text_step() {
             o => panic!("{o:?}"),
         })
         .collect();
-    assert_eq!(pairs, vec![(1, 10)], "text key 'x' matches lid 1 -> rid 10 (device-gathered keys)");
+    assert_eq!(
+        pairs,
+        vec![(1, 10)],
+        "text key 'x' matches lid 1 -> rid 10 (device-gathered keys)"
+    );
 }
 
 /// HUNT #4 + #6: N:N numeric/uuid AND the NULL gate together. Both sides duplicate the numeric key; one
@@ -4705,14 +5714,28 @@ fn audit_s5_empty_side_before_b128_and_text_step() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_nn_numeric_with_null_key_gate() {
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE ln (lid INT, amt NUMERIC(10,2))").unwrap();
-    e.execute_text(2, "CREATE TABLE rn (rid INT, amt NUMERIC(10,2))").unwrap();
+    e.execute_text(1, "CREATE TABLE ln (lid INT, amt NUMERIC(10,2))")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE rn (rid INT, amt NUMERIC(10,2))")
+        .unwrap();
     // key 5.00 duplicated on both sides; a NULL-key row on each side must drop, NOT spuriously match.
-    e.execute_text(3, "INSERT INTO ln (lid, amt) VALUES (1,5.00),(2,5.00),(3,NULL)").unwrap();
-    e.execute_text(4, "INSERT INTO rn (rid, amt) VALUES (10,5.00),(11,5.00),(12,NULL)").unwrap();
+    e.execute_text(
+        3,
+        "INSERT INTO ln (lid, amt) VALUES (1,5.00),(2,5.00),(3,NULL)",
+    )
+    .unwrap();
+    e.execute_text(
+        4,
+        "INSERT INTO rn (rid, amt) VALUES (10,5.00),(11,5.00),(12,NULL)",
+    )
+    .unwrap();
     let mut ok = true;
     for t in ["ln", "rn"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
@@ -4754,20 +5777,32 @@ fn audit_s5_nn_numeric_with_null_key_gate() {
 #[ignore = "requires a local NVIDIA driver and GPU"]
 fn audit_s5_mixed_uuid_numeric_end_to_end() {
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE k (gid UUID, amt NUMERIC(12,3))").unwrap();
-    e.execute_text(2, "CREATE TABLE p (gid UUID, tag TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE k (gid UUID, amt NUMERIC(12,3))")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE p (gid UUID, tag TEXT)")
+        .unwrap();
     let u = "80706050-4030-2010-0fef-dfcfbfaf9f8f"; // high bit set, asymmetric
-    e.execute_text(3, &format!("INSERT INTO k (gid, amt) VALUES ('{u}',-42.500)")).unwrap();
+    e.execute_text(
+        3,
+        &format!("INSERT INTO k (gid, amt) VALUES ('{u}',-42.500)"),
+    )
+    .unwrap();
     e.execute_text(4, &format!("INSERT INTO p (gid, tag) VALUES ('{u}','hit'),('deadbeef-0000-0000-0000-000000000000','miss')")).unwrap();
     let mut ok = true;
     for t in ["k", "p"] {
-        ok &= e.populate_relational_residency_snapshot(t).unwrap().device_memory_proof.is_some();
+        ok &= e
+            .populate_relational_residency_snapshot(t)
+            .unwrap()
+            .device_memory_proof
+            .is_some();
     }
     if !ok {
         return;
     }
     let res = e
-        .execute_resident_expr_select_sql("SELECT k.gid, k.amt, p.tag FROM k JOIN p ON k.gid = p.gid")
+        .execute_resident_expr_select_sql(
+            "SELECT k.gid, k.amt, p.tag FROM k JOIN p ON k.gid = p.gid",
+        )
         .expect("uuid join projecting uuid + negative numeric");
     assert_eq!(res.rows.len(), 1, "only the matching uuid pair");
     let row = &res.rows[0];

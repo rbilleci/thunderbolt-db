@@ -181,7 +181,8 @@ fn relational_copy_ingests_null_marker_and_selects_back_null() {
     // M3 (doc 21) Slice G: the COPY NULL marker ingests as a SQL NULL. TEXT format: the unquoted `\N`.
     // CSV format: an UNQUOTED empty field (a QUOTED empty field is the empty STRING, not NULL).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
 
     // TEXT format: row 1's name is `\N` (NULL); row 2's name is a real value.
     let copy = gpu_db_sql::parse_copy_from_stdin("COPY t (id, name) FROM STDIN").unwrap();
@@ -202,11 +203,14 @@ fn relational_copy_ingests_null_marker_and_selects_back_null() {
         text_rows[1],
         vec![SqlValue::Int4(2), SqlValue::Text("Ada".to_string())]
     );
-    assert_eq!(e.execute_relational_copy_rows(2, &copy, text_rows).unwrap(), 2);
+    assert_eq!(
+        e.execute_relational_copy_rows(2, &copy, text_rows).unwrap(),
+        2
+    );
 
     // CSV format: `3,` -> unquoted empty name -> NULL; `4,""` -> quoted empty name -> the empty string.
-    let csv =
-        gpu_db_sql::parse_copy_from_stdin("COPY t (id, name) FROM STDIN WITH (FORMAT csv)").unwrap();
+    let csv = gpu_db_sql::parse_copy_from_stdin("COPY t (id, name) FROM STDIN WITH (FORMAT csv)")
+        .unwrap();
     // `3,` unquoted empty -> NULL; `4,""` quoted empty -> empty string; `"5",` a QUOTED first field then
     // an UNQUOTED empty -> NULL (regression: the per-field `quoted` flag must reset across the delimiter,
     // else the empty field after a quoted one is mis-read as a quoted empty string).
@@ -232,7 +236,10 @@ fn relational_copy_ingests_null_marker_and_selects_back_null() {
         vec![SqlValue::Int4(5), SqlValue::Null],
         "an UNQUOTED empty field after a QUOTED field is still NULL (per-field quoted reset)"
     );
-    assert_eq!(e.execute_relational_copy_rows(3, &csv, csv_rows).unwrap(), 3);
+    assert_eq!(
+        e.execute_relational_copy_rows(3, &csv, csv_rows).unwrap(),
+        3
+    );
 
     // The \N-ingested row selects back as NULL (the store round-trips it).
     let Command::Select(select) = parse_command("SELECT name FROM t WHERE id = 1").unwrap() else {
@@ -258,7 +265,8 @@ fn relational_copy_round_trips_all_column_types_and_null() {
     )
     .unwrap();
     let copy =
-        gpu_db_sql::parse_copy_from_stdin("COPY tt (id, big, amt, flag, d, ts, u) FROM STDIN").unwrap();
+        gpu_db_sql::parse_copy_from_stdin("COPY tt (id, big, amt, flag, d, ts, u) FROM STDIN")
+            .unwrap();
     let cols = e.relational_copy_columns(&copy.table).unwrap();
     // Row 1: real values for every type (big > i32 to prove the int8 round-trip; numeric scale 2;
     // timestamp with sub-second precision). Row 2: `\N` (NULL) for every typed column.
@@ -275,7 +283,11 @@ fn relational_copy_round_trips_all_column_types_and_null() {
         .collect::<Vec<_>>();
     // The COPY parse produced the expected typed values (row 1) and a NULL per typed column (row 2).
     let parsed_row1 = rows[0].clone();
-    assert_eq!(parsed_row1[1], SqlValue::Int8(5_000_000_000), "big parses as int8 (> i32)");
+    assert_eq!(
+        parsed_row1[1],
+        SqlValue::Int8(5_000_000_000),
+        "big parses as int8 (> i32)"
+    );
     assert_eq!(
         parsed_row1[2],
         SqlValue::Numeric(Decimal128::new(123_456, 2)),
@@ -291,7 +303,10 @@ fn relational_copy_round_trips_all_column_types_and_null() {
         SqlValue::Null,
         SqlValue::Null,
     ];
-    assert_eq!(rows[1], all_null_row2, "row 2 \\N -> NULL for every typed column");
+    assert_eq!(
+        rows[1], all_null_row2,
+        "row 2 \\N -> NULL for every typed column"
+    );
 
     // Ingest through the engine (render_relational_insert -> render_sql_value_literal per cell).
     assert_eq!(e.execute_relational_copy_rows(3, &copy, rows).unwrap(), 2);

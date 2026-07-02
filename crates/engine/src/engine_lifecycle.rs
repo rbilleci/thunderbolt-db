@@ -175,16 +175,18 @@ impl Engine {
             // strict win at >=b4096, neutral at b256, byte-identical + audit SHIP. (The index route itself is
             // `index_probe_enabled`, also default ON.)
             dense_index_probe_enabled: std::sync::atomic::AtomicBool::new(true),
-            // Billions-of-rows segmented layout (S-d1): default OFF — production stays on the single buffer.
-            shard_residency_enabled: std::sync::atomic::AtomicBool::new(false),
-            // SV4b: GPU-native incremental DELETE (tombstone instead of re-admit) default OFF (nested A/B lever).
-            resident_delete_tombstone_enabled: std::sync::atomic::AtomicBool::new(false),
-            // SV5: GPU-native incremental UPDATE (tombstone old + append new) default OFF (nested A/B lever).
-            resident_update_tombstone_enabled: std::sync::atomic::AtomicBool::new(false),
-            // Sub-slice 3b: cross-shard PK-index point-lookup route default OFF (nested under shard residency).
-            shard_index_probe_enabled: std::sync::atomic::AtomicBool::new(false),
-            // lpb-for-shards wiring: batched shard point-read routing default OFF (nested A/B lever).
-            shard_batched_point_read_enabled: std::sync::atomic::AtomicBool::new(false),
+            // THE FLIP (2026-07-02, autonomous-completion mandate): the GPU-native sharded data plane is
+            // the DEFAULT. Both correctness flip-gates are closed (SV6 created_by SI + SLICE B predicate
+            // NULL 3VL); point reads are index-routed (3b/batched); scans are zero-copy at one surviving
+            // shard, metadata-served for version-free COUNT(*), and recompaction-served otherwise (the
+            // multi-shard aggregate kernel is the ledgered #4 endgame). Incremental DELETE/UPDATE
+            // (tombstone + stamped append, O(rows touched)) replace the O(table) re-admit. Each flag
+            // remains individually settable — the A/B levers and kill switches are unchanged.
+            shard_residency_enabled: std::sync::atomic::AtomicBool::new(true),
+            resident_delete_tombstone_enabled: std::sync::atomic::AtomicBool::new(true),
+            resident_update_tombstone_enabled: std::sync::atomic::AtomicBool::new(true),
+            shard_index_probe_enabled: std::sync::atomic::AtomicBool::new(true),
+            shard_batched_point_read_enabled: std::sync::atomic::AtomicBool::new(true),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }
@@ -423,6 +425,7 @@ impl Engine {
             .relational_resident_cache
             .budget_bytes_by_gpu
             .insert(gpu_id, budget_bytes);
+        self.mirror_admission_budgets();
     }
 
     pub fn clear_relational_residency_budget_bytes(&mut self, gpu_id: u16) {
@@ -430,12 +433,31 @@ impl Engine {
             .relational_resident_cache
             .budget_bytes_by_gpu
             .remove(&gpu_id);
+        self.mirror_admission_budgets();
     }
 
-    pub fn relational_residency_budget_bytes(&self, gpu_id: u16) -> Option<u64> {
-        self.ddl_catalog()
+    /// Republish the LOCK-FREE budget mirror from the (authoritative) catalog copy. Called by the
+    /// `&mut self` budget setters — exclusive access, so the mirror can never lag a concurrent reader.
+    fn mirror_admission_budgets(&mut self) {
+        let budgets = self
+            .ddl_catalog()
             .relational_resident_cache
             .budget_bytes_by_gpu
+            .clone();
+        self.read_state
+            .residency
+            .admission_budget_bytes_by_gpu
+            .store(std::sync::Arc::new(budgets));
+    }
+
+    /// Reads the LOCK-FREE mirror, NOT the latched catalog — safe from inside the commit critical
+    /// section (the resident-route planner runs there for a materialized-view create/refresh internal
+    /// read; the latched read self-deadlocked — THE FLIP burn-in caught it).
+    pub fn relational_residency_budget_bytes(&self, gpu_id: u16) -> Option<u64> {
+        self.read_state
+            .residency
+            .admission_budget_bytes_by_gpu
+            .load()
             .get(&gpu_id)
             .copied()
     }

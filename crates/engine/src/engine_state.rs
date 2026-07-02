@@ -584,6 +584,13 @@ pub(crate) struct ResidencyReadState {
     // memory-pressure.
     pub(crate) snapshots: ArcSwap<BTreeMap<String, RelationalResidencyEntry>>,
     pub(crate) shards: ArcSwap<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    /// THE FLIP (deadlock fix, caught by the burn-in): a LOCK-FREE mirror of the catalog's
+    /// `relational_resident_cache.budget_bytes_by_gpu`, updated by the (rare, `&mut self`) budget
+    /// setters. The resident-route PLANNER reads budgets from HERE — reading them through
+    /// `ddl_catalog()` self-deadlocked when a route was planned INSIDE the commit critical section
+    /// (a materialized-view create/refresh internal read on a shard-resident table holds the catalog
+    /// latch). The catalog copy stays authoritative for ADMISSION (which already holds the latch).
+    pub(crate) admission_budget_bytes_by_gpu: ArcSwap<BTreeMap<u16, u64>>,
 }
 
 impl ResidencyReadState {

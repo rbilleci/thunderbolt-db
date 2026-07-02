@@ -316,9 +316,10 @@ pub(crate) fn render_sql_value_literal(value: &SqlValue) -> Result<String, Engin
         SqlValue::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),
         SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
         SqlValue::Date(value) => Ok(format!("'{}'", gpu_db_sql::datetime::format_date(*value))),
-        SqlValue::Timestamp(value) => {
-            Ok(format!("'{}'", gpu_db_sql::datetime::format_timestamp(*value)))
-        }
+        SqlValue::Timestamp(value) => Ok(format!(
+            "'{}'",
+            gpu_db_sql::datetime::format_timestamp(*value)
+        )),
         SqlValue::Uuid(value) => Ok(format!("'{}'", gpu_db_sql::uuid::format_uuid(value))),
         // M3 (doc 21): a NULL cell (e.g. a COPY `\N` field) renders as the SQL NULL keyword; the
         // re-parsed INSERT recognizes the unquoted `NULL` literal and stores a SqlValue::Null.
@@ -1808,16 +1809,18 @@ pub(crate) fn select_is_aggregate_result_column(select: &Select, column: &str) -
         // The Expr path's grouped projection: ORDER BY may reference any aggregate by its result
         // column name (count/sum/avg/min/max); the executor resolves it against the result columns,
         // so the binding only needs to recognize the name and skip the table-column lookup.
-        SelectProjection::GroupedAggregates { ref aggregates, .. } => aggregates.iter().any(|agg| {
-            let name = match agg.kind {
-                GroupedAggKind::Count | GroupedAggKind::CountDistinct => "count",
-                GroupedAggKind::Sum => "sum",
-                GroupedAggKind::Avg => "avg",
-                GroupedAggKind::Min => "min",
-                GroupedAggKind::Max => "max",
-            };
-            column.eq_ignore_ascii_case(name)
-        }),
+        SelectProjection::GroupedAggregates { ref aggregates, .. } => {
+            aggregates.iter().any(|agg| {
+                let name = match agg.kind {
+                    GroupedAggKind::Count | GroupedAggKind::CountDistinct => "count",
+                    GroupedAggKind::Sum => "sum",
+                    GroupedAggKind::Avg => "avg",
+                    GroupedAggKind::Min => "min",
+                    GroupedAggKind::Max => "max",
+                };
+                column.eq_ignore_ascii_case(name)
+            })
+        }
         // A bare/scalar COUNT(DISTINCT v) projects a "count" result column (rejected at binding, but
         // recognize the name for completeness).
         SelectProjection::CountDistinct { .. } => column.eq_ignore_ascii_case("count"),
@@ -1983,11 +1986,9 @@ pub(crate) fn int4_aggregate_value(
         | SqlValue::Text(_)
         | SqlValue::Date(_)
         | SqlValue::Timestamp(_)
-        | SqlValue::Uuid(_) => {
-            Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                aggregate_int4_error_message(aggregate).to_string(),
-            )))
-        }
+        | SqlValue::Uuid(_) => Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            aggregate_int4_error_message(aggregate).to_string(),
+        ))),
     }
 }
 
@@ -2067,7 +2068,11 @@ fn pg_div_result_scale(abs_sum: i128, count: i128, dividend_scale: u8) -> i32 {
 /// [`pg_div_result_scale`] and rounds half-away-from-zero. Long-divides `|sum| * 10^(rscale-S) /
 /// count` (rscale >= S so the exponent is >= 0), interleaved to avoid an `abs_sum * 10^rscale`
 /// overflow (the mantissa stays near 10^16..10^19 as the quotient grows).
-pub(crate) fn avg_numeric_sql_value(sum_mantissa: i128, count: usize, column_scale: u8) -> SqlValue {
+pub(crate) fn avg_numeric_sql_value(
+    sum_mantissa: i128,
+    count: usize,
+    column_scale: u8,
+) -> SqlValue {
     if count == 0 {
         return SqlValue::Numeric(Decimal128::new(0, column_scale));
     }

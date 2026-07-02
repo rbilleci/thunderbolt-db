@@ -10,15 +10,11 @@ use arc_swap::ArcSwap;
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32BatchProjectionColumns,
-    CudaI32Comparison,
-    CudaI32EqualAnyProjectSubmission, CudaI32IndexProbeDenseSubmission,
-    CudaI32Stats, CudaMvccRowBatch,
-    CudaOwnedDeviceMemoryChunk,
-    CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
-    ExprStep, FilterOperator, LimitOperator,
-    ResidentElemType,
-    MockGpuRuntime, Operator,
-    PlannedOp, ProjectOperator, RouteDecision, ScanOperator, SortOperator,
+    CudaI32Comparison, CudaI32EqualAnyProjectSubmission, CudaI32IndexProbeDenseSubmission,
+    CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
+    CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, ExprStep, FilterOperator,
+    LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator, ResidentElemType,
+    RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -37,13 +33,13 @@ use gpu_db_sql::{
     CreateSubscription, CreateTable, CreateTablespace, CreateView, DatabasePrivilege, Decimal128,
     Delete, DropConstraint, DropDatabase, DropDomain, DropExtension, DropIndex,
     DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
-    DropTable, DropTablespace, DropView, FunctionPrivilege, GroupedAggKind, GroupedAggregate, Insert,
-    ParseError, PublicationTarget,
-    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
-    RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace,
-    RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectProjection,
-    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege,
-    TruncateTable, Update, NUMERIC_DEFAULT_PRECISION,
+    DropTable, DropTablespace, DropView, FunctionPrivilege, GroupedAggKind, GroupedAggregate,
+    Insert, ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
+    RenameDatabase, RenameFunction, RenameIndex, RenameMaterializedView, RenameRole,
+    RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
+    SelectFilterOp, SelectFunction, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType,
+    SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
+    NUMERIC_DEFAULT_PRECISION,
 };
 use gpu_db_storage::{
     InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore, TupleVersion,
@@ -63,10 +59,10 @@ use gpu_db_wal::{
     read_wal_segment, recover_wal_segment, register_wal_archive_timeline,
     restore_wal_archive_object_backup, select_wal_archive_timeline, write_wal_archive_timeline,
     write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
-    WalArchiveManifest, WalArchiveObjectBackup, WalArchiveRecordTimestamp,
-    WalArchiveRetentionPlan, WalArchiveTimeline, WalArchiveTimelineBranch,
-    WalArchiveTimelinePrunePlan, WalArchiveTimelineRegistry, WalArchiveTimelineSelection,
-    WalBuffer, WalCheckpointMeta, WalControlFile, WalGroupCommitStats, WalRecord,
+    WalArchiveManifest, WalArchiveObjectBackup, WalArchiveRecordTimestamp, WalArchiveRetentionPlan,
+    WalArchiveTimeline, WalArchiveTimelineBranch, WalArchiveTimelinePrunePlan,
+    WalArchiveTimelineRegistry, WalArchiveTimelineSelection, WalBuffer, WalCheckpointMeta,
+    WalControlFile, WalGroupCommitStats, WalRecord,
 };
 
 mod rel_exec_helpers;
@@ -94,10 +90,10 @@ mod engine_ddl_pubsub_role;
 mod engine_ddl_table;
 mod engine_dml_concurrent;
 mod engine_dml_prepare;
+mod engine_expr;
 mod engine_introspection;
 mod engine_lifecycle;
 mod engine_mvcc_dispatch;
-mod engine_expr;
 mod engine_residency;
 mod engine_resident_probe;
 mod engine_retained_read;

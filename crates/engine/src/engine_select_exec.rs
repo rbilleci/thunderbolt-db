@@ -102,17 +102,18 @@ impl Engine {
                     // pinned path previously returned rows (audit P2: `mt (id INT, name TEXT)` sharded +
                     // `ORDER BY id`). Mixed-type sharded tables keep the CPU pinned path until the
                     // unified source gathers every section.
-                    let shard_resident_int4_only = || {
-                        table.columns.iter().all(|c| {
-                            matches!(c.ty, SqlType::Int4 | SqlType::Int2 | SqlType::Date)
-                        }) && self
-                            .read_state
-                            .residency
-                            .shards
-                            .load()
-                            .get(&table.name)
-                            .is_some_and(|shards| !shards.is_empty())
-                    };
+                    let shard_resident_int4_only =
+                        || {
+                            table.columns.iter().all(|c| {
+                                matches!(c.ty, SqlType::Int4 | SqlType::Int2 | SqlType::Date)
+                            }) && self
+                                .read_state
+                                .residency
+                                .shards
+                                .load()
+                                .get(&table.name)
+                                .is_some_and(|shards| !shards.is_empty())
+                        };
                     if select_is_gpu_sortable_projection(&select, &table)
                         && (self.relational_residency_snapshot(&select.table).is_some()
                             || shard_resident_int4_only())
@@ -430,6 +431,15 @@ impl Engine {
             // the per-shard combine (slice 2a). Byte-identical to the probes on non-NULL data; the
             // empty-set aggregates take the same placeholders via a COUNT precheck.
             "sharded_count_all"
+            | "sharded_int4_scalar_aggregate"
+            // THE FLIP audit F1: filtered/range shapes the sharded bridge serves via the general
+            // executor (pre-fix they fell to the CPU host scan on the now-default sharded layout).
+            | "sharded_int4_equality_count"
+            | "sharded_int4_range_count"
+            | "sharded_int4_filtered_scalar_aggregate"
+            | "sharded_int4_between_scalar_aggregate"
+            | "sharded_int4_projection"
+            | "sharded_int4_composite_equality_multi_column_projection"
             | "sharded_int4_equality_projection"
             | "sharded_int4_equality_multi_column_projection"
             | "sharded_int4_equality_sum"

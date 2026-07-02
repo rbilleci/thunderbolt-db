@@ -141,7 +141,10 @@ fn gpu_resident_expr_simple_int4_predicate_uses_ordered_index_route() {
         eq_expected.len() > 32,
         "must be multi-warp/multi-block to exercise cross-block ordering"
     );
-    assert_eq!(got_eq.rows, eq_expected, "a = 3 -> ascending ids with i%7==3");
+    assert_eq!(
+        got_eq.rows, eq_expected,
+        "a = 3 -> ascending ids with i%7==3"
+    );
     assert_eq!(got_eq.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(got_eq.fallback_reason, None);
 
@@ -158,7 +161,10 @@ fn gpu_resident_expr_simple_int4_predicate_uses_ordered_index_route() {
         .filter(|i| i % 7 < 3)
         .map(|i| vec![SqlValue::Int4(i)])
         .collect();
-    assert_eq!(got_lt.rows, lt_expected, "a < 3 -> ascending ids with i%7<3");
+    assert_eq!(
+        got_lt.rows, lt_expected,
+        "a < 3 -> ascending ids with i%7<3"
+    );
 
     // (3) FLIPPED operand order (literal <cmp> column): 3 > a == a < 3 (comparison flipped). Must equal
     // the a < 3 result exactly (proves the flip path maps the code correctly).
@@ -218,7 +224,11 @@ fn gpu_resident_expr_where_excludes_null_operands_and_projection_carries_null() 
     let r = e.execute_resident_expr_select(&select, &a_lt_5).unwrap();
     assert_eq!(
         r.rows,
-        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]],
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(2)],
+            vec![SqlValue::Int4(3)]
+        ],
         "WHERE a < 5 must exclude NULL rows (3VL), not fold their placeholder 0"
     );
     assert_eq!(r.fallback_reason, None);
@@ -288,7 +298,8 @@ fn gpu_resident_expr_projection_carries_null_past_word_boundary() {
             values.push_str(&format!("({i}, 100)"));
         }
     }
-    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}")).unwrap();
+    e.execute_text(2, &format!("INSERT INTO t (a, b) VALUES {values}"))
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -305,7 +316,13 @@ fn gpu_resident_expr_projection_carries_null_past_word_boundary() {
     };
     let r = e.execute_resident_expr_select(&select, &b_ge_0).unwrap();
     let expected: Vec<Vec<SqlValue>> = (0..N)
-        .map(|i| vec![if is_null(i) { SqlValue::Null } else { SqlValue::Int4(i) }])
+        .map(|i| {
+            vec![if is_null(i) {
+                SqlValue::Null
+            } else {
+                SqlValue::Int4(i)
+            }]
+        })
         .collect();
     assert_eq!(
         r.rows, expected,
@@ -324,7 +341,8 @@ fn gpu_resident_expr_where_3vl_over_nullable_bigint() {
     // non-null int8 AND/OR path uses, with each comparison leaf AND'd with the column's validity bitmap.
     // No kernel change: the validity AND is a type-independent i32 BoolMask. v is nullable; w is non-null.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tb (id INT, v BIGINT, w BIGINT)").unwrap();
+    e.execute_text(1, "CREATE TABLE tb (id INT, v BIGINT, w BIGINT)")
+        .unwrap();
     // v = [100, NULL, 300, NULL, 5000000000, 250]; w = 1000 (non-null). v=5e9 exceeds i32 -> proves the
     // i64 read is not truncated to i32. The NULL placeholder is 0, which passes `0 < 300` WITHOUT the
     // validity AND, so the NULL exclusions below are load-bearing.
@@ -358,7 +376,11 @@ fn gpu_resident_expr_where_3vl_over_nullable_bigint() {
         .expect("compound AND over a nullable bigint runs on the GPU");
     assert_eq!(
         r.rows,
-        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(6)]],
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(6)]
+        ],
         "compound AND over a nullable bigint must exclude NULL rows"
     );
 
@@ -368,7 +390,11 @@ fn gpu_resident_expr_where_3vl_over_nullable_bigint() {
         .expect("col-vs-col over a nullable bigint runs on the GPU");
     assert_eq!(
         r.rows,
-        vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(3)], vec![SqlValue::Int4(6)]],
+        vec![
+            vec![SqlValue::Int4(1)],
+            vec![SqlValue::Int4(3)],
+            vec![SqlValue::Int4(6)]
+        ],
         "col-vs-col v < w must exclude NULL-v rows (3VL)"
     );
 
@@ -391,7 +417,8 @@ fn gpu_resident_expr_where_nullable_mixed_type_clean_errors() {
     // timestamp/numeric/uuid), so the remaining clean-errors are MIXED-type predicates the mono-typed VM
     // can't lower — never a silent mis-answer.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tm (a INT, big BIGINT, n NUMERIC(10,2))").unwrap();
+    e.execute_text(1, "CREATE TABLE tm (a INT, big BIGINT, n NUMERIC(10,2))")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO tm (a,big,n) VALUES (1,10,1.50),(2,NULL,NULL),(3,30,3.50)",
@@ -429,7 +456,8 @@ fn gpu_resident_expr_where_3vl_over_nullable_date() {
     // days literal) with the column's validity AND'd in. The NULL placeholder is day 0 (< any real date),
     // so it would pass `d < '2024-01-20'` WITHOUT the validity AND -> the exclusions below are load-bearing.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE td (id INT, d DATE)").unwrap();
+    e.execute_text(1, "CREATE TABLE td (id INT, d DATE)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO td (id,d) VALUES \
@@ -469,7 +497,8 @@ fn gpu_resident_expr_where_3vl_over_nullable_timestamp() {
     // the new CompareScalarI64 step (scalar) or CompareBuffers (col-vs-col), with the validity AND'd in.
     // The NULL placeholder is micros 0 (< any 2024 timestamp), so the exclusions are load-bearing.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tts (id INT, ts TIMESTAMP, ts2 TIMESTAMP)").unwrap();
+    e.execute_text(1, "CREATE TABLE tts (id INT, ts TIMESTAMP, ts2 TIMESTAMP)")
+        .unwrap();
     // ts nullable; ts2 = noon (non-null) for the col-vs-col case.
     e.execute_text(
         2,
@@ -527,7 +556,11 @@ fn gpu_resident_expr_where_3vl_over_nullable_numeric() {
     // with the validity AND'd in. The NULL placeholder is mantissa 0 (= 0.00, < 100.00), so the
     // exclusions are load-bearing.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tn2 (id INT, amt NUMERIC(10,2), amt2 NUMERIC(10,2))").unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE tn2 (id INT, amt NUMERIC(10,2), amt2 NUMERIC(10,2))",
+    )
+    .unwrap();
     // amt nullable = [10.50, NULL, 30.25, NULL, 250.75]; amt2 = 100.00 (non-null) for col-vs-col.
     e.execute_text(
         2,
@@ -587,7 +620,8 @@ fn gpu_resident_expr_where_3vl_over_nullable_uuid() {
     // zero bytes (= uuid ...00), so `u = ...00` and `u < ...0a` would WRONGLY include NULL rows without
     // the validity AND -> the assertions are load-bearing.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tu (id INT, u UUID, u2 UUID)").unwrap();
+    e.execute_text(1, "CREATE TABLE tu (id INT, u UUID, u2 UUID)")
+        .unwrap();
     let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
     let peer = uuid_for(10);
     // u nullable = [..05, NULL, ..0f, NULL, ..14]; u2 = ..0a (non-null) for col-vs-col.
@@ -608,7 +642,10 @@ fn gpu_resident_expr_where_3vl_over_nullable_uuid() {
     }
     // `u < ..0a` -> u in {..05} -> id 1. NULLs (placeholder ..00 < ..0a) excluded.
     let r = e
-        .execute_resident_expr_select_sql(&format!("SELECT id FROM tu WHERE u < '{}'", uuid_for(10)))
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT id FROM tu WHERE u < '{}'",
+            uuid_for(10)
+        ))
         .expect("WHERE over a nullable uuid runs on the GPU");
     assert_eq!(
         r.rows,
@@ -628,7 +665,10 @@ fn gpu_resident_expr_where_3vl_over_nullable_uuid() {
     );
     // `u > ..0a` -> u in {..0f, ..14} -> id 3, 5. NULLs excluded.
     let r = e
-        .execute_resident_expr_select_sql(&format!("SELECT id FROM tu WHERE u > '{}'", uuid_for(10)))
+        .execute_resident_expr_select_sql(&format!(
+            "SELECT id FROM tu WHERE u > '{}'",
+            uuid_for(10)
+        ))
         .expect("uuid > over a nullable uuid runs on the GPU");
     assert_eq!(
         r.rows,
@@ -653,9 +693,13 @@ fn gpu_resident_expr_where_3vl_over_nullable_int2() {
     // stored widened to i32 in the int4 section, so it routes on the I32 mask VM exactly like int4 (incl.
     // AND/OR). The NULL placeholder is 0 (< 20), so the exclusions are load-bearing.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE ti (id INT, s SMALLINT)").unwrap();
-    e.execute_text(2, "INSERT INTO ti (id,s) VALUES (1,5),(2,NULL),(3,15),(4,NULL),(5,25)")
+    e.execute_text(1, "CREATE TABLE ti (id INT, s SMALLINT)")
         .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO ti (id,s) VALUES (1,5),(2,NULL),(3,15),(4,NULL),(5,25)",
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("ti").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -687,7 +731,8 @@ fn gpu_resident_expr_where_3vl_over_nullable_numeric_compound_and_cross_scale() 
     // M3 (doc 21): a nullable NUMERIC WHERE also runs for AND/OR and a FINER cross-scale literal — these
     // route through the validity-aware compile_numeric_compare VM path (push_leaf_validity_and per leaf).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tnc (id INT, amt NUMERIC(10,2))").unwrap();
+    e.execute_text(1, "CREATE TABLE tnc (id INT, amt NUMERIC(10,2))")
+        .unwrap();
     // amt nullable = [10.50, NULL, 30.25, NULL, 250.75].
     e.execute_text(
         2,
@@ -795,7 +840,8 @@ fn gpu_resident_expr_order_by_multikey_nullable_placement_on_device() {
     // placed entirely ON-DEVICE — the hetero sort comparator reads each key's validity bitmap per row and
     // orders NULL as greatest (PG default: last ASC / first DESC), per key. No host partition / overwrite.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tmk (na INT, t TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE tmk (na INT, t TEXT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO tmk (na,t) VALUES (1,'b'),(NULL,'a'),(1,NULL),(NULL,NULL),(2,'a')",
@@ -832,7 +878,8 @@ fn gpu_resident_expr_order_by_nullable_text_numeric_uuid_keys_place_nulls() {
     // orders the rest, then NULLs are placed. Without it the hetero comparator would mis-place NULLs (it
     // reads the placeholder, not the validity bitmap).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tonull (k TEXT, n NUMERIC(10,2), u UUID)").unwrap();
+    e.execute_text(1, "CREATE TABLE tonull (k TEXT, n NUMERIC(10,2), u UUID)")
+        .unwrap();
     let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
     e.execute_text(
         2,
@@ -1121,7 +1168,10 @@ fn gpu_resident_expr_select_evaluates_boolean_and_or_ne_predicates() {
         .expect("a<100 OR a>500 on GPU");
     let mut or_expected: Vec<Vec<SqlValue>> = (0..100).map(|i| vec![SqlValue::Int4(i)]).collect();
     or_expected.extend((501..N).map(|i| vec![SqlValue::Int4(i)]));
-    assert_eq!(got_or.rows, or_expected, "a<100 OR a>500 <=> [0,100) U [501,600)");
+    assert_eq!(
+        got_or.rows, or_expected,
+        "a<100 OR a>500 <=> [0,100) U [501,600)"
+    );
 
     // a != 300  ->  everything except 300.
     let ne_pred = cmp(ResidentBinaryOp::Ne, 300);
@@ -1205,7 +1255,10 @@ fn eval_single_col_predicate(
 
 /// Assert a select result is the `integer out of range` error (not rows). Matches on the error rather
 /// than `expect_err` so it does not require `RelationalSelectResult: Debug`.
-fn assert_integer_out_of_range(result: Result<RelationalSelectResult, ExecuteError>, context: &str) {
+fn assert_integer_out_of_range(
+    result: Result<RelationalSelectResult, ExecuteError>,
+    context: &str,
+) {
     match result {
         Ok(_) => panic!("{context}: must raise integer out of range, not return rows"),
         Err(err) => assert!(
@@ -1311,8 +1364,11 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_predicates() {
     // scalar comparison, column-vs-column with values ABOVE i32::MAX (proving genuine 64-bit), the Ne
     // operator, and both int8 + int4 projection. Plus the unsupported-int8-shape hard errors.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a INT, big BIGINT, big2 BIGINT, small BIGINT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (a INT, big BIGINT, big2 BIGINT, small BIGINT)",
+    )
+    .unwrap();
 
     const N: i64 = 600;
     const BASE: i64 = 4_000_000_000; // > i32::MAX (2_147_483_647)
@@ -1323,8 +1379,11 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_predicates() {
         }
         values.push_str(&format!("({i}, {}, {}, {i})", BASE + i, BASE + (N - 1 - i)));
     }
-    e.execute_text(2, &format!("INSERT INTO t (a, big, big2, small) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (a, big, big2, small) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -1359,8 +1418,7 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_predicates() {
     let ne = e
         .execute_resident_expr_select_sql("SELECT a FROM t WHERE small <> 300")
         .expect("int8 Ne on GPU");
-    let mut ne_expected: Vec<Vec<SqlValue>> =
-        (0..300).map(|i| vec![SqlValue::Int4(i)]).collect();
+    let mut ne_expected: Vec<Vec<SqlValue>> = (0..300).map(|i| vec![SqlValue::Int4(i)]).collect();
     ne_expected.extend((301..N as i32).map(|i| vec![SqlValue::Int4(i)]));
     assert_eq!(
         ne.rows, ne_expected,
@@ -1383,8 +1441,11 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_arithmetic() {
     // VM evaluates int8 arith trees (add/sub/mul, col-vs-col + scalar) with values ABOVE i32::MAX.
     // Closed-form oracle: a[i]=BASE+i, b[i]=BASE, c[i]=2*BASE+300, small[i]=i.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, small BIGINT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, small BIGINT)",
+    )
+    .unwrap();
 
     const N: i64 = 600;
     const BASE: i64 = 4_000_000_000; // > i32::MAX
@@ -1395,8 +1456,11 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_arithmetic() {
         }
         values.push_str(&format!("({}, {BASE}, {}, {i})", BASE + i, 2 * BASE + 300));
     }
-    e.execute_text(2, &format!("INSERT INTO t (a, b, c, small) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (a, b, c, small) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -1409,7 +1473,10 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_arithmetic() {
         .expect("int8 a+b>c on GPU");
     let added_expected: Vec<Vec<SqlValue>> =
         (301..N).map(|i| vec![SqlValue::Int8(BASE + i)]).collect();
-    assert_eq!(added.rows, added_expected, "a+b>c => a=BASE+i for i in [301, 600)");
+    assert_eq!(
+        added.rows, added_expected,
+        "a+b>c => a=BASE+i for i in [301, 600)"
+    );
     assert_eq!(added.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(added.fallback_reason, None);
 
@@ -1418,14 +1485,20 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_arithmetic() {
         .execute_resident_expr_select_sql("SELECT small FROM t WHERE a - b > 200")
         .expect("int8 a-b>200 on GPU");
     let subbed_expected: Vec<Vec<SqlValue>> = (201..N).map(|i| vec![SqlValue::Int8(i)]).collect();
-    assert_eq!(subbed.rows, subbed_expected, "a-b>200 => small=i for i in [201, 600)");
+    assert_eq!(
+        subbed.rows, subbed_expected,
+        "a-b>200 => small=i for i in [201, 600)"
+    );
 
     // scalar MUL: small * 2 > 800 <=> i > 400 => [401, 600). Projects small = i.
     let scaled = e
         .execute_resident_expr_select_sql("SELECT small FROM t WHERE small * 2 > 800")
         .expect("int8 small*2>800 on GPU");
     let scaled_expected: Vec<Vec<SqlValue>> = (401..N).map(|i| vec![SqlValue::Int8(i)]).collect();
-    assert_eq!(scaled.rows, scaled_expected, "small*2>800 => small=i for i in [401, 600)");
+    assert_eq!(
+        scaled.rows, scaled_expected,
+        "small*2>800 => small=i for i in [401, 600)"
+    );
 }
 
 #[test]
@@ -1438,7 +1511,9 @@ fn gpu_execute_resident_expr_select_sql_raises_int8_integer_out_of_range_on_over
     let overflow = run_int8_square_gt_zero(3_037_000_500);
     if let Some(result) = overflow {
         match result {
-            Ok(_) => panic!("a*a over a=3037000500 overflows int64 -> must raise bigint out of range"),
+            Ok(_) => {
+                panic!("a*a over a=3037000500 overflows int64 -> must raise bigint out of range")
+            }
             Err(err) => assert!(
                 err.to_string().contains("bigint out of range"),
                 "int8 overflow must be PG's `bigint out of range` (not `integer`), got: {err}"
@@ -1448,7 +1523,8 @@ fn gpu_execute_resident_expr_select_sql_raises_int8_integer_out_of_range_on_over
 
     // The largest in-range square does NOT error and returns the rows (a*a > 0 for both rows).
     if let Some(result) = run_int8_square_gt_zero(3_037_000_499) {
-        let rows = result.expect("a*a at the int64 boundary 3037000499 is in range, must not error");
+        let rows =
+            result.expect("a*a at the int64 boundary 3037000499 is in range, must not error");
         assert_eq!(
             rows.rows,
             vec![vec![SqlValue::Int8(2)], vec![SqlValue::Int8(3_037_000_499)]],
@@ -1459,9 +1535,7 @@ fn gpu_execute_resident_expr_select_sql_raises_int8_integer_out_of_range_on_over
 
 /// Build a single-BIGINT-column table `t(a) = [2, boundary]`, push a GPU snapshot, and run
 /// `SELECT a FROM t WHERE a * a > 0` on the general executor. Returns `None` off-GPU.
-fn run_int8_square_gt_zero(
-    boundary: i64,
-) -> Option<Result<RelationalSelectResult, ExecuteError>> {
+fn run_int8_square_gt_zero(boundary: i64) -> Option<Result<RelationalSelectResult, ExecuteError>> {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a BIGINT)").unwrap();
     e.execute_text(2, &format!("INSERT INTO t (a) VALUES (2), ({boundary})"))
@@ -1478,8 +1552,11 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
     // to the i32 VM (which read int8 columns at the wrong 4-byte stride -> garbage rows). The same
     // routing gap also bypassed the mixed-int4/int8 guard, so a mixed AND must still hard-error.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a INT, small BIGINT, big BIGINT, big2 BIGINT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (a INT, small BIGINT, big BIGINT, big2 BIGINT)",
+    )
+    .unwrap();
 
     const N: i64 = 600;
     const BASE: i64 = 4_000_000_000; // > i32::MAX
@@ -1490,8 +1567,11 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
         }
         values.push_str(&format!("({i}, {i}, {}, {})", BASE + i, BASE + (N - 1 - i)));
     }
-    e.execute_text(2, &format!("INSERT INTO t (a, small, big, big2) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (a, small, big, big2) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -1503,7 +1583,10 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
         .execute_resident_expr_select_sql("SELECT small FROM t WHERE small > 200 AND small < 400")
         .expect("int8 AND on GPU");
     let and_expected: Vec<Vec<SqlValue>> = (201..400).map(|i| vec![SqlValue::Int8(i)]).collect();
-    assert_eq!(and_rows.rows, and_expected, "small>200 AND small<400 => [201, 400)");
+    assert_eq!(
+        and_rows.rows, and_expected,
+        "small>200 AND small<400 => [201, 400)"
+    );
     assert_eq!(and_rows.executed_target, DeviceTarget::Gpu(0));
 
     // int8 OR: small < 100 OR small > 500 => [0,100) U [501,600).
@@ -1512,7 +1595,10 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
         .expect("int8 OR on GPU");
     let mut or_expected: Vec<Vec<SqlValue>> = (0..100).map(|i| vec![SqlValue::Int8(i)]).collect();
     or_expected.extend((501..N).map(|i| vec![SqlValue::Int8(i)]));
-    assert_eq!(or_rows.rows, or_expected, "small<100 OR small>500 => [0,100) U [501,600)");
+    assert_eq!(
+        or_rows.rows, or_expected,
+        "small<100 OR small>500 => [0,100) U [501,600)"
+    );
 
     // 64-bit AND over two int8 columns (values above i32::MAX): big > 100 AND big2 > 100 => all rows.
     // An i32-stride read of big/big2 would NOT yield all rows, so this pins the genuine 64-bit read.
@@ -1521,7 +1607,10 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_boolean_predicates() {
         .expect("int8 64-bit AND on GPU");
     let big_and_expected: Vec<Vec<SqlValue>> =
         (0..N).map(|i| vec![SqlValue::Int8(BASE + i)]).collect();
-    assert_eq!(big_and.rows, big_and_expected, "big>100 AND big2>100 => all rows (64-bit)");
+    assert_eq!(
+        big_and.rows, big_and_expected,
+        "big>100 AND big2>100 => all rows (64-bit)"
+    );
 
     // MIXED int4/int8 inside AND must hard-error (the routing gap bypassed the mixed-type guard).
     assert!(
@@ -1553,8 +1642,11 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
         // price = i.50, cost = (N-1-i).50, label = i
         values.push_str(&format!("({i}.50, {}.50, {i})", N - 1 - i));
     }
-    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (price, cost, label) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -1567,7 +1659,10 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
         .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.50")
         .expect("price > 10.50 on GPU");
     let gt_expected: Vec<Vec<SqlValue>> = (11..N).map(|i| vec![num(i)]).collect();
-    assert_eq!(gt.rows, gt_expected, "price > 10.50 => i.50 for i in [11, 600)");
+    assert_eq!(
+        gt.rows, gt_expected,
+        "price > 10.50 => i.50 for i in [11, 600)"
+    );
     assert_eq!(gt.executed_target, DeviceTarget::Gpu(0));
 
     // integer literal coerced to numeric: price < 5 => i+0.50 < 5 => i <= 4 => [0, 5).
@@ -1575,13 +1670,19 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
         .execute_resident_expr_select_sql("SELECT price FROM t WHERE price < 5")
         .expect("price < 5 on GPU");
     let lt_int_expected: Vec<Vec<SqlValue>> = (0..5).map(|i| vec![num(i)]).collect();
-    assert_eq!(lt_int.rows, lt_int_expected, "price < 5 (int coerced) => [0, 5)");
+    assert_eq!(
+        lt_int.rows, lt_int_expected,
+        "price < 5 (int coerced) => [0, 5)"
+    );
 
     // lower-scale literal rescales UP exactly: price > 10.5 (scale 1) == price > 10.50 => [11, N).
     let gt_low = e
         .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 10.5")
         .expect("price > 10.5 on GPU");
-    assert_eq!(gt_low.rows, gt_expected, "price > 10.5 (scale 1) == price > 10.50");
+    assert_eq!(
+        gt_low.rows, gt_expected,
+        "price > 10.5 (scale 1) == price > 10.50"
+    );
 
     // trailing zeros are insignificant: price > 10.500 (written scale 3) == price > 10.50 => [11, N).
     let gt_trailing = e
@@ -1619,7 +1720,9 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_comparisons() {
     // numeric AND/OR now lowers via the i128 mask VM: price > 1.00 AND price < 100.00 (price = i.50)
     // <=> 0 < i < 100 => [1, 100). Project price.
     let and = e
-        .execute_resident_expr_select_sql("SELECT price FROM t WHERE price > 1.00 AND price < 100.00")
+        .execute_resident_expr_select_sql(
+            "SELECT price FROM t WHERE price > 1.00 AND price < 100.00",
+        )
         .expect("price>1.00 AND price<100.00 on GPU");
     let and_expected: Vec<Vec<SqlValue>> = (1..100).map(|i| vec![num(i)]).collect();
     assert_eq!(
@@ -1648,8 +1751,11 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_arithmetic() {
         }
         values.push_str(&format!("({i}.50, {i}.25, {i})"));
     }
-    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (price, cost, label) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -1659,8 +1765,12 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_arithmetic() {
     let added = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE price + cost > 100")
         .expect("price+cost>100 on GPU");
-    let added_expected: Vec<Vec<SqlValue>> = (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(added.rows, added_expected, "price+cost>100 => label in [50, 600)");
+    let added_expected: Vec<Vec<SqlValue>> =
+        (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        added.rows, added_expected,
+        "price+cost>100 => label in [50, 600)"
+    );
     assert_eq!(added.executed_target, DeviceTarget::Gpu(0));
 
     // scalar sub then compare: price-5 = (i-5)+0.50; > 100 => 100i-450 > 10000 => i >= 105.
@@ -1669,14 +1779,20 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_arithmetic() {
         .expect("price-5>100 on GPU");
     let subbed_expected: Vec<Vec<SqlValue>> =
         (105..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(subbed.rows, subbed_expected, "price-5>100 => label in [105, 600)");
+    assert_eq!(
+        subbed.rows, subbed_expected,
+        "price-5>100 => label in [105, 600)"
+    );
 
     // buffer-vs-buffer (arith on the left, column on the right): price+cost > price <=> cost > 0 => all.
     let cmp_buffers = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE price + cost > price")
         .expect("price+cost>price on GPU");
     let all_expected: Vec<Vec<SqlValue>> = (0..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(cmp_buffers.rows, all_expected, "price+cost>price <=> cost>0 => all rows");
+    assert_eq!(
+        cmp_buffers.rows, all_expected,
+        "price+cost>price <=> cost>0 => all rows"
+    );
 
     // REJECTION — a mixed numeric + int4 column in arithmetic is a hard error, never wrong rows.
     // (integer-literal multiply is now supported — see ..._runs_numeric_multiply.)
@@ -1708,8 +1824,11 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
         }
         values.push_str(&format!("({i}.50, {i}.25, {i})"));
     }
-    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (price, cost, label) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -1719,7 +1838,8 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
     let mul = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 2 > 100")
         .expect("price*2>100 on GPU");
-    let mul_expected: Vec<Vec<SqlValue>> = (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    let mul_expected: Vec<Vec<SqlValue>> =
+        (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
     assert_eq!(mul.rows, mul_expected, "price*2>100 => label in [50, 600)");
     assert_eq!(mul.executed_target, DeviceTarget::Gpu(0));
 
@@ -1727,29 +1847,44 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_multiply() {
     let mul_left = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE 2 * price > 100")
         .expect("2*price>100 on GPU");
-    assert_eq!(mul_left.rows, mul_expected, "2*price>100 == price*2>100 (commutative)");
+    assert_eq!(
+        mul_left.rows, mul_expected,
+        "2*price>100 == price*2>100 (commutative)"
+    );
 
     // fractional-literal multiply: price*1.5 (result scale 2+1=3): (1500i+750) > 100000 => i >= 67.
     let frac = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * 1.5 > 100")
         .expect("price*1.5>100 on GPU");
-    let frac_expected: Vec<Vec<SqlValue>> = (67..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(frac.rows, frac_expected, "price*1.5>100 => label in [67, 600)");
+    let frac_expected: Vec<Vec<SqlValue>> =
+        (67..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        frac.rows, frac_expected,
+        "price*1.5>100 => label in [67, 600)"
+    );
 
     // column*column multiply: price*cost (result scale 2+2=4): (100i+50)(100i+25) > 1000000 => i >= 10.
     let cols = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > 100")
         .expect("price*cost>100 on GPU");
-    let cols_expected: Vec<Vec<SqlValue>> = (10..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(cols.rows, cols_expected, "price*cost>100 => label in [10, 600)");
+    let cols_expected: Vec<Vec<SqlValue>> =
+        (10..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        cols.rows, cols_expected,
+        "price*cost>100 => label in [10, 600)"
+    );
 
     // cross-scale arith-vs-arith: price*cost (scale 4) > price (scale 2): rescale price up, then
     // (100i+25) > 100 <=> i >= 1 => [1, N).
     let cross = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE price * cost > price")
         .expect("price*cost>price (cross-scale) on GPU");
-    let cross_expected: Vec<Vec<SqlValue>> = (1..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(cross.rows, cross_expected, "price*cost > price (cross-scale) => [1, 600)");
+    let cross_expected: Vec<Vec<SqlValue>> =
+        (1..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        cross.rows, cross_expected,
+        "price*cost > price (cross-scale) => [1, 600)"
+    );
 
     // REJECTION — a mixed numeric * int4 column is a hard error, never wrong rows.
     assert!(
@@ -1766,8 +1901,11 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_comparisons() {
     // rescaled UP to the common (max) scale on-device (mantissa * 10^k) before comparing.
     // p2 = i.50 (NUMERIC(10,2)), p4 = (2i).0000 (NUMERIC(10,4)), label = i.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)",
+    )
+    .unwrap();
 
     const N: i64 = 600;
     let mut values = String::new();
@@ -1800,7 +1938,10 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_comparisons() {
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 > 1.555")
         .expect("p2>1.555 on GPU");
     let lit_expected: Vec<Vec<SqlValue>> = (2..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(lit.rows, lit_expected, "p2>1.555 (finer literal) => [2, 600)");
+    assert_eq!(
+        lit.rows, lit_expected,
+        "p2>1.555 (finer literal) => [2, 600)"
+    );
 
     // literal on the left: 1.555 < p2 is the same set.
     let lit_left = e
@@ -1812,8 +1953,12 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_comparisons() {
     let same = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 > 10.50")
         .expect("p2>10.50 on GPU");
-    let same_expected: Vec<Vec<SqlValue>> = (11..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(same.rows, same_expected, "p2>10.50 (same scale) => [11, 600)");
+    let same_expected: Vec<Vec<SqlValue>> =
+        (11..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        same.rows, same_expected,
+        "p2>10.50 (same scale) => [11, 600)"
+    );
 }
 
 #[test]
@@ -1823,8 +1968,11 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_add_sub() {
     // UP to the common (max) scale before the buffer add/sub. p2 = i.50 (NUMERIC(10,2)), p4 = (2i).2500
     // (NUMERIC(10,4)), label = i.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (p2 NUMERIC(10,2), p4 NUMERIC(10,4), label INT)",
+    )
+    .unwrap();
 
     const N: i64 = 600;
     let mut values = String::new();
@@ -1845,23 +1993,35 @@ fn gpu_execute_resident_expr_select_sql_runs_cross_scale_numeric_add_sub() {
     let add = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 + p4 > 100")
         .expect("p2+p4>100 on GPU");
-    let add_expected: Vec<Vec<SqlValue>> = (34..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(add.rows, add_expected, "p2+p4>100 (cross-scale add) => [34, 600)");
+    let add_expected: Vec<Vec<SqlValue>> =
+        (34..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        add.rows, add_expected,
+        "p2+p4>100 (cross-scale add) => [34, 600)"
+    );
     assert_eq!(add.executed_target, DeviceTarget::Gpu(0));
 
     // cross-scale SUB (col-col): p4 - p2 = i - 0.25 (scale 4); > 100 => i >= 101.
     let sub = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE p4 - p2 > 100")
         .expect("p4-p2>100 on GPU");
-    let sub_expected: Vec<Vec<SqlValue>> = (101..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(sub.rows, sub_expected, "p4-p2>100 (cross-scale sub) => [101, 600)");
+    let sub_expected: Vec<Vec<SqlValue>> =
+        (101..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        sub.rows, sub_expected,
+        "p4-p2>100 (cross-scale sub) => [101, 600)"
+    );
 
     // cross-scale add with a FINER literal: p2 + 0.0001 = i.5001 (scale 4); > 50.5 => i >= 50.
     let lit = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE p2 + 0.0001 > 50.5")
         .expect("p2+0.0001>50.5 on GPU");
-    let lit_expected: Vec<Vec<SqlValue>> = (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(lit.rows, lit_expected, "p2 + 0.0001 (finer literal) > 50.5 => [50, 600)");
+    let lit_expected: Vec<Vec<SqlValue>> =
+        (50..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    assert_eq!(
+        lit.rows, lit_expected,
+        "p2 + 0.0001 (finer literal) > 50.5 => [50, 600)"
+    );
 }
 
 #[test]
@@ -1884,8 +2044,11 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
         }
         values.push_str(&format!("({i}.50, {i}.2500, {i})"));
     }
-    e.execute_text(2, &format!("INSERT INTO t (price, cost, label) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (price, cost, label) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -1897,9 +2060,13 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
             "SELECT label FROM t WHERE price > 10.50 AND price < 100.50",
         )
         .expect("AND on GPU");
-    let and_expected: Vec<Vec<SqlValue>> =
-        (11i64..100).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
-    assert_eq!(and.rows, and_expected, "price>10.50 AND price<100.50 => [11, 100)");
+    let and_expected: Vec<Vec<SqlValue>> = (11i64..100)
+        .map(|i| vec![SqlValue::Int4(i as i32)])
+        .collect();
+    assert_eq!(
+        and.rows, and_expected,
+        "price>10.50 AND price<100.50 => [11, 100)"
+    );
     assert_eq!(and.executed_target, DeviceTarget::Gpu(0));
 
     // OR: price < 5.50 OR price > 595.50 => [0,5) U [596, N).
@@ -1912,7 +2079,10 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
         .chain(596..N)
         .map(|i| vec![SqlValue::Int4(i as i32)])
         .collect();
-    assert_eq!(or.rows, or_expected, "price<5.50 OR price>595.50 => [0,5) U [596,600)");
+    assert_eq!(
+        or.rows, or_expected,
+        "price<5.50 OR price>595.50 => [0,5) U [596,600)"
+    );
 
     // CROSS-SCALE AND (price scale 2, cost scale 4 -- each comparison rescales independently):
     // price > 10.50 AND cost > 50.2500 <=> i>10 AND i>50 => [51, N).
@@ -1921,7 +2091,8 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_and_or() {
             "SELECT label FROM t WHERE price > 10.50 AND cost > 50.2500",
         )
         .expect("cross-scale AND on GPU");
-    let cross_expected: Vec<Vec<SqlValue>> = (51..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
+    let cross_expected: Vec<Vec<SqlValue>> =
+        (51..N).map(|i| vec![SqlValue::Int4(i as i32)]).collect();
     assert_eq!(
         cross.rows, cross_expected,
         "price>10.50 AND cost>50.2500 (cross-scale) => [51, 600)"
@@ -1950,7 +2121,8 @@ fn gpu_execute_resident_expr_select_sql_runs_text_equality() {
     // (ODD) count places the text offsets section at a 4-mod-8 byte offset (8 header + 7*4 int4 = 36),
     // exercising the 2x 4-byte offset loads end to end through the real residency builder.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)")
+        .unwrap();
     let names = ["alice", "bob", "alice", "carol", "bob", "alice", "dave"];
     let mut values = String::new();
     for (i, n) in names.iter().enumerate() {
@@ -2031,7 +2203,8 @@ fn gpu_execute_resident_expr_select_sql_runs_text_like() {
     // Text LIKE on the general GPU executor (the type matrix, doc 19): general %/_ backtracking match.
     // 7 rows (ODD) -> text offsets at a 4-mod-8 byte offset. Includes the `\_` escape vs a bare `_`.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (name TEXT, label INT)")
+        .unwrap();
     // "a_b" stores a literal underscore; "axb" distinguishes the `_` wildcard from the `\_` escape.
     let names = ["alice", "alicia", "bob", "alfred", "carol", "a_b", "axb"];
     let mut values = String::new();
@@ -2056,7 +2229,11 @@ fn gpu_execute_resident_expr_select_sql_runs_text_like() {
     let prefix = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE 'al%'")
         .expect("LIKE 'al%' on GPU");
-    assert_eq!(prefix.rows, labels(&[0, 1, 3]), "LIKE 'al%' => alice/alicia/alfred");
+    assert_eq!(
+        prefix.rows,
+        labels(&[0, 1, 3]),
+        "LIKE 'al%' => alice/alicia/alfred"
+    );
     assert_eq!(prefix.executed_target, DeviceTarget::Gpu(0));
 
     // contains: '%i%' -> alice, alicia
@@ -2075,7 +2252,11 @@ fn gpu_execute_resident_expr_select_sql_runs_text_like() {
     let escaped = e
         .execute_resident_expr_select_sql(r"SELECT label FROM t WHERE name LIKE 'a\_b'")
         .expect("LIKE 'a\\_b' on GPU");
-    assert_eq!(escaped.rows, labels(&[5]), "LIKE 'a\\_b' => only the literal a_b");
+    assert_eq!(
+        escaped.rows,
+        labels(&[5]),
+        "LIKE 'a\\_b' => only the literal a_b"
+    );
 
     // exact (no wildcards) behaves like equality
     let exact = e
@@ -2087,7 +2268,11 @@ fn gpu_execute_resident_expr_select_sql_runs_text_like() {
     let all = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE name LIKE '%'")
         .expect("LIKE '%' on GPU");
-    assert_eq!(all.rows, labels(&[0, 1, 2, 3, 4, 5, 6]), "LIKE '%' => all rows");
+    assert_eq!(
+        all.rows,
+        labels(&[0, 1, 2, 3, 4, 5, 6]),
+        "LIKE '%' => all rows"
+    );
 }
 
 #[test]
@@ -2107,8 +2292,11 @@ fn gpu_execute_resident_expr_select_sql_runs_date_comparisons() {
         }
         values.push_str(&format!("('2024-01-{:02}', {i})", i + 1));
     }
-    e.execute_text(2, &format!("INSERT INTO t (hire_date, label) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (hire_date, label) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -2122,7 +2310,11 @@ fn gpu_execute_resident_expr_select_sql_runs_date_comparisons() {
     let eq = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE hire_date = '2024-01-15'")
         .expect("hire_date = date on GPU");
-    assert_eq!(eq.rows, vec![vec![SqlValue::Int4(14)]], "= '2024-01-15' => row 14");
+    assert_eq!(
+        eq.rows,
+        vec![vec![SqlValue::Int4(14)]],
+        "= '2024-01-15' => row 14"
+    );
     assert_eq!(eq.executed_target, DeviceTarget::Gpu(0));
 
     // > '2024-01-15' -> [15, 30)
@@ -2141,7 +2333,11 @@ fn gpu_execute_resident_expr_select_sql_runs_date_comparisons() {
     let lit_left = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE '2024-01-15' < hire_date")
         .expect("date < hire_date on GPU");
-    assert_eq!(lit_left.rows, labels(15..N), "'2024-01-15' < hire_date => [15, 30)");
+    assert_eq!(
+        lit_left.rows,
+        labels(15..N),
+        "'2024-01-15' < hire_date => [15, 30)"
+    );
 
     // projecting the DATE column yields SqlValue::Date(days)
     let proj = e
@@ -2210,7 +2406,11 @@ fn gpu_execute_resident_expr_select_sql_runs_timestamp_comparisons() {
             "SELECT label FROM t WHERE event_at = '2024-01-15 10:00:00'",
         )
         .expect("event_at = ts on GPU");
-    assert_eq!(eq.rows, vec![vec![SqlValue::Int4(10)]], "= 10:00:00 => row 10");
+    assert_eq!(
+        eq.rows,
+        vec![vec![SqlValue::Int4(10)]],
+        "= 10:00:00 => row 10"
+    );
     assert_eq!(eq.executed_target, DeviceTarget::Gpu(0));
 
     // > '2024-01-15 10:00:00' -> [11, 24)
@@ -2235,13 +2435,21 @@ fn gpu_execute_resident_expr_select_sql_runs_timestamp_comparisons() {
             "SELECT label FROM t WHERE '2024-01-15 10:00:00' < event_at",
         )
         .expect("ts < event_at on GPU");
-    assert_eq!(lit_left.rows, labels(11..N), "10:00:00 < event_at => [11, 24)");
+    assert_eq!(
+        lit_left.rows,
+        labels(11..N),
+        "10:00:00 < event_at => [11, 24)"
+    );
 
     // col-vs-col: event_at > created_at (noon) -> hours > 12 -> [13, 24)
     let col_col = e
         .execute_resident_expr_select_sql("SELECT label FROM t WHERE event_at > created_at")
         .expect("event_at > created_at on GPU");
-    assert_eq!(col_col.rows, labels(13..N), "event_at > created_at (noon) => [13, 24)");
+    assert_eq!(
+        col_col.rows,
+        labels(13..N),
+        "event_at > created_at (noon) => [13, 24)"
+    );
 
     // projecting the TIMESTAMP column yields SqlValue::Timestamp(micros)
     let proj = e
@@ -2289,8 +2497,11 @@ fn gpu_execute_resident_expr_select_sql_runs_uuid_comparisons() {
         }
         values.push_str(&format!("('{}', '{peer}', {i})", uuid_for(i)));
     }
-    e.execute_text(2, &format!("INSERT INTO t (id, peer, label) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (id, peer, label) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -2398,8 +2609,11 @@ fn gpu_execute_resident_expr_select_sql_runs_int2_comparisons() {
         }
         values.push_str(&format!("({}, 0, {i})", i - 10));
     }
-    e.execute_text(2, &format!("INSERT INTO t (sz, peer, label) VALUES {values}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (sz, peer, label) VALUES {values}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -2477,7 +2691,8 @@ fn gpu_execute_resident_expr_select_sql_runs_bool_predicate() {
     // 1-bit-per-row BITMAP, so `WHERE flag` expands the bitmap straight to the row mask -- no compare.
     // flag[i] = (i even), label = i.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (flag BOOL, label INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, label INT)")
+        .unwrap();
     const N: i64 = 20;
     let mut values = String::new();
     for i in 0..N {
@@ -2516,13 +2731,37 @@ fn gpu_execute_resident_expr_select_sql_runs_bool_predicate() {
 
     // flag = true / = false / <> (bool literal compares lower to the bitmap->mask kernel via negate).
     for (sql, expected, label) in [
-        ("SELECT label FROM t WHERE flag = true", &even, "= true => even"),
-        ("SELECT label FROM t WHERE flag = false", &odd, "= false => odd"),
-        ("SELECT label FROM t WHERE true = flag", &even, "true = flag => even"),
-        ("SELECT label FROM t WHERE flag <> true", &odd, "<> true => odd"),
-        ("SELECT label FROM t WHERE flag <> false", &even, "<> false => even"),
+        (
+            "SELECT label FROM t WHERE flag = true",
+            &even,
+            "= true => even",
+        ),
+        (
+            "SELECT label FROM t WHERE flag = false",
+            &odd,
+            "= false => odd",
+        ),
+        (
+            "SELECT label FROM t WHERE true = flag",
+            &even,
+            "true = flag => even",
+        ),
+        (
+            "SELECT label FROM t WHERE flag <> true",
+            &odd,
+            "<> true => odd",
+        ),
+        (
+            "SELECT label FROM t WHERE flag <> false",
+            &even,
+            "<> false => even",
+        ),
         // NOT flag === flag = false (the mapper rewrites it).
-        ("SELECT label FROM t WHERE NOT flag", &odd, "NOT flag => odd"),
+        (
+            "SELECT label FROM t WHERE NOT flag",
+            &odd,
+            "NOT flag => odd",
+        ),
     ] {
         let got = e.execute_resident_expr_select_sql(sql).expect(label);
         assert_eq!(&got.rows, expected, "{label}");
@@ -2565,7 +2804,8 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     // the GPU filter's surviving-row count (the compaction result); PG returns bigint. a[i] = i,
     // flag[i] = (i % 3 == 0).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a INT, flag BOOL)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a INT, flag BOOL)")
+        .unwrap();
     const N: i64 = 50;
     let mut values = String::new();
     for i in 0..N {
@@ -2586,7 +2826,11 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     let r = e
         .execute_resident_expr_select_sql("SELECT COUNT(*) FROM t WHERE a > 10")
         .expect("count on GPU");
-    assert_eq!(r.rows, vec![vec![SqlValue::Int8(39)]], "COUNT(*) WHERE a > 10 => 39");
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Int8(39)]],
+        "COUNT(*) WHERE a > 10 => 39"
+    );
     assert_eq!(r.executed_target, DeviceTarget::Gpu(0));
 
     // COUNT(*) WHERE flag -- a popcount over the bool bitmap. i%3==0 in [0,50) = 17 rows.
@@ -2594,35 +2838,59 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     let r2 = e
         .execute_resident_expr_select_sql("SELECT COUNT(*) FROM t WHERE flag")
         .expect("count flag on GPU");
-    assert_eq!(r2.rows, vec![vec![SqlValue::Int8(flag_count)]], "COUNT(*) WHERE flag");
+    assert_eq!(
+        r2.rows,
+        vec![vec![SqlValue::Int8(flag_count)]],
+        "COUNT(*) WHERE flag"
+    );
 
     // COUNT(*) of an empty result -> 0 (not an error / not NULL).
     let r3 = e
         .execute_resident_expr_select_sql("SELECT COUNT(*) FROM t WHERE a > 1000")
         .expect("count empty on GPU");
-    assert_eq!(r3.rows, vec![vec![SqlValue::Int8(0)]], "COUNT(*) empty => 0");
+    assert_eq!(
+        r3.rows,
+        vec![vec![SqlValue::Int8(0)]],
+        "COUNT(*) empty => 0"
+    );
 
     // count(*) is case-insensitive.
     let r4 = e
         .execute_resident_expr_select_sql("SELECT count(*) FROM t WHERE a >= 0")
         .expect("lowercase count on GPU");
-    assert_eq!(r4.rows, vec![vec![SqlValue::Int8(N)]], "count(*) WHERE a >= 0 => all");
+    assert_eq!(
+        r4.rows,
+        vec![vec![SqlValue::Int8(N)]],
+        "count(*) WHERE a >= 0 => all"
+    );
 
     // SUM(int4) over a filtered set -- a GPU reduction over the gathered column; PG returns bigint.
     let sum_of = |keep: &dyn Fn(i64) -> bool| -> i64 { (0..N).filter(|&i| keep(i)).sum() };
     let s1 = e
         .execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a > 10")
         .expect("sum on GPU");
-    assert_eq!(s1.rows, vec![vec![SqlValue::Int8(sum_of(&|a| a > 10))]], "SUM(a) WHERE a > 10");
+    assert_eq!(
+        s1.rows,
+        vec![vec![SqlValue::Int8(sum_of(&|a| a > 10))]],
+        "SUM(a) WHERE a > 10"
+    );
     assert_eq!(s1.executed_target, DeviceTarget::Gpu(0));
     let s2 = e
         .execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE flag")
         .expect("sum where flag on GPU");
-    assert_eq!(s2.rows, vec![vec![SqlValue::Int8(sum_of(&|a| a % 3 == 0))]], "SUM(a) WHERE flag");
+    assert_eq!(
+        s2.rows,
+        vec![vec![SqlValue::Int8(sum_of(&|a| a % 3 == 0))]],
+        "SUM(a) WHERE flag"
+    );
     let s3 = e
         .execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a >= 0")
         .expect("sum all on GPU");
-    assert_eq!(s3.rows, vec![vec![SqlValue::Int8(sum_of(&|_| true))]], "SUM(a) WHERE a >= 0 => total");
+    assert_eq!(
+        s3.rows,
+        vec![vec![SqlValue::Int8(sum_of(&|_| true))]],
+        "SUM(a) WHERE a >= 0 => total"
+    );
     // SUM over an EMPTY set is SQL NULL (PG) -- one row, NULL (was the M3 hard error).
     assert_eq!(
         e.execute_resident_expr_select_sql("SELECT SUM(a) FROM t WHERE a > 1000")
@@ -2638,19 +2906,35 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     let mn = e
         .execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a > 10")
         .expect("min on GPU");
-    assert_eq!(mn.rows, vec![vec![SqlValue::Int4(min_of(&|a| a > 10))]], "MIN(a) WHERE a > 10 => 11");
+    assert_eq!(
+        mn.rows,
+        vec![vec![SqlValue::Int4(min_of(&|a| a > 10))]],
+        "MIN(a) WHERE a > 10 => 11"
+    );
     let mx = e
         .execute_resident_expr_select_sql("SELECT MAX(a) FROM t WHERE flag")
         .expect("max where flag on GPU");
-    assert_eq!(mx.rows, vec![vec![SqlValue::Int4(max_of(&|a| a % 3 == 0))]], "MAX(a) WHERE flag");
+    assert_eq!(
+        mx.rows,
+        vec![vec![SqlValue::Int4(max_of(&|a| a % 3 == 0))]],
+        "MAX(a) WHERE flag"
+    );
     let mx2 = e
         .execute_resident_expr_select_sql("SELECT MAX(a) FROM t WHERE a >= 0")
         .expect("max all on GPU");
-    assert_eq!(mx2.rows, vec![vec![SqlValue::Int4((N - 1) as i32)]], "MAX(a) WHERE a >= 0 => N-1");
+    assert_eq!(
+        mx2.rows,
+        vec![vec![SqlValue::Int4((N - 1) as i32)]],
+        "MAX(a) WHERE a >= 0 => N-1"
+    );
     let mn2 = e
         .execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a >= 0")
         .expect("min all on GPU");
-    assert_eq!(mn2.rows, vec![vec![SqlValue::Int4(0)]], "MIN(a) WHERE a >= 0 => 0");
+    assert_eq!(
+        mn2.rows,
+        vec![vec![SqlValue::Int4(0)]],
+        "MIN(a) WHERE a >= 0 => 0"
+    );
     // MIN/MAX over an EMPTY set is SQL NULL (PG).
     assert_eq!(
         e.execute_resident_expr_select_sql("SELECT MIN(a) FROM t WHERE a > 1000")
@@ -2696,12 +2980,19 @@ fn gpu_execute_resident_expr_select_sql_runs_count_star() {
     let a1 = e
         .execute_resident_expr_select_sql("SELECT AVG(a) FROM t WHERE a > 10")
         .expect("avg on GPU");
-    assert_eq!(a1.rows, avg_expected(&|a| a > 10), "AVG(a) WHERE a > 10 => 30");
+    assert_eq!(
+        a1.rows,
+        avg_expected(&|a| a > 10),
+        "AVG(a) WHERE a > 10 => 30"
+    );
     assert_eq!(a1.executed_target, DeviceTarget::Gpu(0));
     // 30 exactly, at scale 16.
     assert_eq!(
         a1.rows,
-        vec![vec![SqlValue::Numeric(Decimal128::new(30 * 10_i128.pow(16), 16))]],
+        vec![vec![SqlValue::Numeric(Decimal128::new(
+            30 * 10_i128.pow(16),
+            16
+        ))]],
         "AVG = 30.0000000000000000"
     );
     let a2 = e
@@ -2735,10 +3026,18 @@ fn average_sql_value_matches_postgres_dynamic_scale_and_rounding() {
         }
     };
     // 1-4 integer digits -> scale 16.
-    assert_eq!(avg_str(3, 1), "3.0000000000000000", "exact integer, scale 16");
+    assert_eq!(
+        avg_str(3, 1),
+        "3.0000000000000000",
+        "exact integer, scale 16"
+    );
     assert_eq!(avg_str(7, 2), "3.5000000000000000", "3.5, scale 16");
     // sub-1 quotient -> scale 20; repeating, ROUNDS the last digit up.
-    assert_eq!(avg_str(2, 3), "0.66666666666666666667", "2/3 rounds, scale 20");
+    assert_eq!(
+        avg_str(2, 3),
+        "0.66666666666666666667",
+        "2/3 rounds, scale 20"
+    );
     assert_eq!(avg_str(1, 2), "0.50000000000000000000", "1/2, scale 20");
     // 5-digit integer part -> scale 12 (even exact integers carry the dynamic scale).
     assert_eq!(avg_str(234_000, 4), "58500.000000000000", "58500, scale 12");
@@ -2749,16 +3048,40 @@ fn average_sql_value_matches_postgres_dynamic_scale_and_rounding() {
         "5-digit-group scale 8"
     );
     // Negative: magnitude + sign both correct (round away from zero).
-    assert_eq!(avg_str(-2, 3), "-0.66666666666666666667", "negative rounds away");
+    assert_eq!(
+        avg_str(-2, 3),
+        "-0.66666666666666666667",
+        "negative rounds away"
+    );
     // PG select_div_scale decrements the quotient weight when the dividend's leading base-10000 digit
     // <= the divisor's -- so an exact 1.0 from sum==count renders at scale 20, NOT 16. The naive
     // "quotient decimal weight" formula shipped scale 16 here; these lock the fix (verified vs PG 18).
-    assert_eq!(avg_str(3, 3), "1.00000000000000000000", "sum==count -> scale 20 (firstdigit decr)");
-    assert_eq!(avg_str(5, 5), "1.00000000000000000000", "leading-digit-equal -> scale 20");
-    assert_eq!(avg_str(9, 3), "3.0000000000000000", "fd1(9) > fd2(3) -> no decr, scale 16");
+    assert_eq!(
+        avg_str(3, 3),
+        "1.00000000000000000000",
+        "sum==count -> scale 20 (firstdigit decr)"
+    );
+    assert_eq!(
+        avg_str(5, 5),
+        "1.00000000000000000000",
+        "leading-digit-equal -> scale 20"
+    );
+    assert_eq!(
+        avg_str(9, 3),
+        "3.0000000000000000",
+        "fd1(9) > fd2(3) -> no decr, scale 16"
+    );
     // Zero sum (e.g. AVG over cancelling rows): PG renders 0 at scale max(S, 20), not 16.
-    assert_eq!(avg_str(0, 2), "0.00000000000000000000", "zero sum -> scale 20");
-    assert_eq!(avg_str(0, 5), "0.00000000000000000000", "zero sum, count 5 -> scale 20");
+    assert_eq!(
+        avg_str(0, 2),
+        "0.00000000000000000000",
+        "zero sum -> scale 20"
+    );
+    assert_eq!(
+        avg_str(0, 5),
+        "0.00000000000000000000",
+        "zero sum, count 5 -> scale 20"
+    );
 }
 
 #[test]
@@ -2768,7 +3091,8 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     // reduces to i128 via the two-atomic carry kernel). Values span > i32::MAX, negatives, and a
     // subset (rows 0,1) whose SUM EXCEEDS i64::MAX. label = row index (the int4 filter column).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (b BIGINT, label INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (b BIGINT, label INT)")
+        .unwrap();
     let vals: [i64; 6] = [
         9_000_000_000_000_000_000,
         8_000_000_000_000_000_000,
@@ -2799,15 +3123,25 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     let sum_all: i128 = 7_999_999_998_000_000_000; // 9e18 + 8e18 + 0 + 5e9 - 7e9 - 9e18
 
     // MIN/MAX(int8) -> int8.
-    let mn = e.execute_resident_expr_select_sql("SELECT MIN(b) FROM t WHERE label >= 0").expect("min");
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT MIN(b) FROM t WHERE label >= 0")
+        .expect("min");
     assert_eq!(mn.rows, vec![vec![SqlValue::Int8(min_all)]], "MIN(b) all");
     assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
-    let mx = e.execute_resident_expr_select_sql("SELECT MAX(b) FROM t WHERE label < 2").expect("max subset");
-    assert_eq!(mx.rows, vec![vec![SqlValue::Int8(max_lt2)]], "MAX(b) subset => 9e18");
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT MAX(b) FROM t WHERE label < 2")
+        .expect("max subset");
+    assert_eq!(
+        mx.rows,
+        vec![vec![SqlValue::Int8(max_lt2)]],
+        "MAX(b) subset => 9e18"
+    );
 
     // SUM(int8) -> numeric (scale 0). The subset {9e18, 8e18} sums to 17e18 -- EXCEEDS i64::MAX, so
     // the i128 two-atomic carry must be correct.
-    let s_sub = e.execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label < 2").expect("sum subset");
+    let s_sub = e
+        .execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label < 2")
+        .expect("sum subset");
     assert_eq!(
         s_sub.rows,
         vec![vec![SqlValue::Numeric(Decimal128::new(sum_lt2, 0))]],
@@ -2821,8 +3155,13 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
         "SUM(int8) result column must be numeric, got {:?}",
         s_sub.columns[0].ty
     );
-    assert_eq!(s_sub.columns[0].type_oid, 1700, "SUM(int8) wire oid = numeric 1700");
-    let s_all = e.execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label >= 0").expect("sum all");
+    assert_eq!(
+        s_sub.columns[0].type_oid, 1700,
+        "SUM(int8) wire oid = numeric 1700"
+    );
+    let s_all = e
+        .execute_resident_expr_select_sql("SELECT SUM(b) FROM t WHERE label >= 0")
+        .expect("sum all");
     assert_eq!(
         s_all.rows,
         vec![vec![SqlValue::Numeric(Decimal128::new(sum_all, 0))]],
@@ -2830,14 +3169,18 @@ fn gpu_execute_resident_expr_select_sql_runs_int8_aggregates() {
     );
 
     // AVG(int8) -> numeric. 17e18 / 2 = 8.5e18 (scale 0 at this magnitude).
-    let av = e.execute_resident_expr_select_sql("SELECT AVG(b) FROM t WHERE label < 2").expect("avg subset");
+    let av = e
+        .execute_resident_expr_select_sql("SELECT AVG(b) FROM t WHERE label < 2")
+        .expect("avg subset");
     assert_eq!(
         av.rows,
         vec![vec![average_sql_value(sum_lt2, 2)]],
         "AVG subset"
     );
     match &av.rows[0][0] {
-        SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "8500000000000000000", "AVG = 8.5e18"),
+        SqlValue::Numeric(d) => {
+            assert_eq!(d.to_decimal_string(), "8500000000000000000", "AVG = 8.5e18")
+        }
         other => panic!("AVG must be numeric, got {other:?}"),
     }
 
@@ -2861,7 +3204,8 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_minmax() {
     // MIN/MAX(numeric) over a filtered set -> numeric (PG preserves the type). Reduces the i128
     // mantissas via the partials + host-combine reduction. label = row index (int4 filter col).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)")
+        .unwrap();
     let prices = ["12.50", "-3.75", "100.00", "0.01", "-99.99", "42.42"];
     let mut values = String::new();
     for (i, p) in prices.iter().enumerate() {
@@ -2880,16 +3224,24 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_minmax() {
     let num = |m: i128| SqlValue::Numeric(Decimal128::new(m, 2));
 
     // All rows: MIN = -99.99, MAX = 100.00.
-    let mn = e.execute_resident_expr_select_sql("SELECT MIN(p) FROM t WHERE label >= 0").expect("min num");
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT MIN(p) FROM t WHERE label >= 0")
+        .expect("min num");
     assert_eq!(mn.rows, vec![vec![num(-9999)]], "MIN(p) all => -99.99");
     assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
-    let mx = e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label >= 0").expect("max num");
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label >= 0")
+        .expect("max num");
     assert_eq!(mx.rows, vec![vec![num(10000)]], "MAX(p) all => 100.00");
 
     // Subset (label < 3 -> 12.50, -3.75, 100.00): MIN = -3.75, MAX = 100.00.
-    let mn2 = e.execute_resident_expr_select_sql("SELECT MIN(p) FROM t WHERE label < 3").expect("min subset");
+    let mn2 = e
+        .execute_resident_expr_select_sql("SELECT MIN(p) FROM t WHERE label < 3")
+        .expect("min subset");
     assert_eq!(mn2.rows, vec![vec![num(-375)]], "MIN subset => -3.75");
-    let mx2 = e.execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label < 3").expect("max subset");
+    let mx2 = e
+        .execute_resident_expr_select_sql("SELECT MAX(p) FROM t WHERE label < 3")
+        .expect("max subset");
     assert_eq!(mx2.rows, vec![vec![num(10000)]], "MAX subset => 100.00");
 
     // Empty -> SQL NULL (PG).
@@ -2909,7 +3261,8 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_sum_avg() {
     // division scale. Expected values derived from PG's numeric semantics (SUM keeps scale 2; AVG of a
     // weight-0 quotient over a scale-2 dividend has rscale max(2, 16) = 16).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (p NUMERIC(10,2), label INT)")
+        .unwrap();
     let prices = ["12.50", "-3.75", "100.00", "0.01", "-99.99", "42.42"];
     let mut values = String::new();
     for (i, p) in prices.iter().enumerate() {
@@ -2926,26 +3279,50 @@ fn gpu_execute_resident_expr_select_sql_runs_numeric_sum_avg() {
     }
 
     // SUM all = 12.50 - 3.75 + 100.00 + 0.01 - 99.99 + 42.42 = 51.19 (mantissa 5119, scale 2).
-    let s_all = e.execute_resident_expr_select_sql("SELECT SUM(p) FROM t WHERE label >= 0").expect("sum all");
-    assert_eq!(s_all.rows, vec![vec![SqlValue::Numeric(Decimal128::new(5119, 2))]], "SUM all = 51.19");
+    let s_all = e
+        .execute_resident_expr_select_sql("SELECT SUM(p) FROM t WHERE label >= 0")
+        .expect("sum all");
+    assert_eq!(
+        s_all.rows,
+        vec![vec![SqlValue::Numeric(Decimal128::new(5119, 2))]],
+        "SUM all = 51.19"
+    );
     assert_eq!(s_all.executed_target, DeviceTarget::Gpu(0));
-    assert!(matches!(s_all.columns[0].ty, SqlType::Numeric { .. }), "SUM(numeric) col numeric");
+    assert!(
+        matches!(s_all.columns[0].ty, SqlType::Numeric { .. }),
+        "SUM(numeric) col numeric"
+    );
     assert_eq!(s_all.columns[0].type_oid, 1700, "SUM(numeric) oid 1700");
     // SUM subset (12.50, -3.75) = 8.75.
-    let s_sub = e.execute_resident_expr_select_sql("SELECT SUM(p) FROM t WHERE label < 2").expect("sum subset");
-    assert_eq!(s_sub.rows, vec![vec![SqlValue::Numeric(Decimal128::new(875, 2))]], "SUM subset = 8.75");
+    let s_sub = e
+        .execute_resident_expr_select_sql("SELECT SUM(p) FROM t WHERE label < 2")
+        .expect("sum subset");
+    assert_eq!(
+        s_sub.rows,
+        vec![vec![SqlValue::Numeric(Decimal128::new(875, 2))]],
+        "SUM subset = 8.75"
+    );
 
     // AVG all = 51.19 / 6 = 8.5316666... -> scale 16, round half-away.
-    let a_all = e.execute_resident_expr_select_sql("SELECT AVG(p) FROM t WHERE label >= 0").expect("avg all");
+    let a_all = e
+        .execute_resident_expr_select_sql("SELECT AVG(p) FROM t WHERE label >= 0")
+        .expect("avg all");
     match &a_all.rows[0][0] {
         SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "8.5316666666666667", "AVG all"),
         other => panic!("AVG numeric, got {other:?}"),
     }
-    assert!(matches!(a_all.columns[0].ty, SqlType::Numeric { .. }), "AVG(numeric) col numeric");
+    assert!(
+        matches!(a_all.columns[0].ty, SqlType::Numeric { .. }),
+        "AVG(numeric) col numeric"
+    );
     // AVG subset = 8.75 / 2 = 4.375 -> scale 16.
-    let a_sub = e.execute_resident_expr_select_sql("SELECT AVG(p) FROM t WHERE label < 2").expect("avg subset");
+    let a_sub = e
+        .execute_resident_expr_select_sql("SELECT AVG(p) FROM t WHERE label < 2")
+        .expect("avg subset");
     match &a_sub.rows[0][0] {
-        SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "4.3750000000000000", "AVG subset"),
+        SqlValue::Numeric(d) => {
+            assert_eq!(d.to_decimal_string(), "4.3750000000000000", "AVG subset")
+        }
         other => panic!("AVG numeric, got {other:?}"),
     }
 
@@ -2969,10 +3346,14 @@ fn gpu_execute_resident_expr_select_sql_numeric_sum_overflow_errors() {
     // silent wrap. Each mantissa is 9e18 * 10^19 = 9e37 (column NUMERIC(38,19), integer part 9e18 fits
     // the legacy parser's i64 literal range); two sum to 1.8e38 > i128::MAX (~1.7e38).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE big (v NUMERIC(38,19), label INT)").unwrap();
-    let big = "9000000000000000000"; // 9e18, fits i64
-    e.execute_text(2, &format!("INSERT INTO big (v, label) VALUES ({big}, 0), ({big}, 1)"))
+    e.execute_text(1, "CREATE TABLE big (v NUMERIC(38,19), label INT)")
         .unwrap();
+    let big = "9000000000000000000"; // 9e18, fits i64
+    e.execute_text(
+        2,
+        &format!("INSERT INTO big (v, label) VALUES ({big}, 0), ({big}, 1)"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("big").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -3007,8 +3388,11 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
     // projection materializes every row, all on the general GPU executor.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT, b INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a, b) VALUES (5,10),(3,20),(8,30),(1,40),(9,50)")
-        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (a, b) VALUES (5,10),(3,20),(8,30),(1,40),(9,50)",
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -3016,29 +3400,47 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
     let a = [5_i32, 3, 8, 1, 9];
 
     // COUNT(*) over the whole table.
-    let c = e.execute_resident_expr_select_sql("SELECT COUNT(*) FROM t").expect("count *");
-    assert_eq!(c.rows, vec![vec![SqlValue::Int8(a.len() as i64)]], "COUNT(*) no WHERE = 5");
+    let c = e
+        .execute_resident_expr_select_sql("SELECT COUNT(*) FROM t")
+        .expect("count *");
+    assert_eq!(
+        c.rows,
+        vec![vec![SqlValue::Int8(a.len() as i64)]],
+        "COUNT(*) no WHERE = 5"
+    );
     assert_eq!(c.executed_target, DeviceTarget::Gpu(0));
 
     // SUM/MIN/MAX over the whole column.
     // Closed-form oracles (a = [5,3,8,1,9]): SUM=26, MIN=1, MAX=9 -- explicit constants, not a host
     // .iter() re-implementation of the aggregate (GPU-native-oracle charter, S9).
-    let s = e.execute_resident_expr_select_sql("SELECT SUM(a) FROM t").expect("sum");
+    let s = e
+        .execute_resident_expr_select_sql("SELECT SUM(a) FROM t")
+        .expect("sum");
     assert_eq!(s.rows, vec![vec![SqlValue::Int8(26)]], "SUM(a)=26");
-    let mn = e.execute_resident_expr_select_sql("SELECT MIN(a) FROM t").expect("min");
+    let mn = e
+        .execute_resident_expr_select_sql("SELECT MIN(a) FROM t")
+        .expect("min");
     assert_eq!(mn.rows, vec![vec![SqlValue::Int4(1)]], "MIN(a)=1");
-    let mx = e.execute_resident_expr_select_sql("SELECT MAX(a) FROM t").expect("max");
+    let mx = e
+        .execute_resident_expr_select_sql("SELECT MAX(a) FROM t")
+        .expect("max");
     assert_eq!(mx.rows, vec![vec![SqlValue::Int4(9)]], "MAX(a)=9");
 
     // AVG(a) = 26/5 = 5.2 -> numeric scale 16 (fd1=26 > fd2=5, no leading-digit decrement).
-    let av = e.execute_resident_expr_select_sql("SELECT AVG(a) FROM t").expect("avg");
+    let av = e
+        .execute_resident_expr_select_sql("SELECT AVG(a) FROM t")
+        .expect("avg");
     match &av.rows[0][0] {
-        SqlValue::Numeric(d) => assert_eq!(d.to_decimal_string(), "5.2000000000000000", "AVG no WHERE"),
+        SqlValue::Numeric(d) => {
+            assert_eq!(d.to_decimal_string(), "5.2000000000000000", "AVG no WHERE")
+        }
         other => panic!("AVG numeric, got {other:?}"),
     }
 
     // Full-table projection: every row, in residency (insertion) order.
-    let p = e.execute_resident_expr_select_sql("SELECT a FROM t").expect("project a");
+    let p = e
+        .execute_resident_expr_select_sql("SELECT a FROM t")
+        .expect("project a");
     let got: Vec<i32> = p
         .rows
         .iter()
@@ -3047,7 +3449,11 @@ fn gpu_execute_resident_expr_select_sql_full_table_no_where() {
             ref other => panic!("expected int4, got {other:?}"),
         })
         .collect();
-    assert_eq!(got, a.to_vec(), "SELECT a FROM t projects all rows in order");
+    assert_eq!(
+        got,
+        a.to_vec(),
+        "SELECT a FROM t projects all rows in order"
+    );
 }
 
 #[test]
@@ -3058,7 +3464,8 @@ fn gpu_group_by_skips_null_values_and_groups_null_keys() {
     // pass), an all-NULL group's aggregate is SQL NULL, AND a NULL group KEY forms its OWN group (the
     // kernel's reserved NULL-key slot) rendered SqlValue::Null. A NULL-free nullable column is unchanged.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v INT, h INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v INT, h INT)")
+        .unwrap();
     // g has a NULL (row 2); v has a NULL (rows 4 and 6); h has none.
     // h=7 -> v{10, 20}; h=8 -> v{30, NULL}; h=9 -> v{NULL} (an all-NULL group).
     e.execute_text(
@@ -3219,7 +3626,8 @@ fn gpu_group_by_skips_null_int8_values() {
     // a nullable BIGINT value also skips NULLs on the GPU (the i64 value / i128-carry sum path). MIN(v)
     // returns int8; an all-NULL group is NULL.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t8 (g INT, v BIGINT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t8 (g INT, v BIGINT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t8 (g,v) VALUES (1,100),(1,NULL),(2,9999999999),(3,NULL)",
@@ -3266,7 +3674,8 @@ fn gpu_group_by_nullable_key_with_count_distinct_clean_errors() {
     // Reject cleanly rather than panic / mis-answer. (Pre-existing for int keys; this guard fixes that
     // too.) A NON-nullable key with COUNT(DISTINCT) is unaffected.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tcd (g INT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE tcd (g INT, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO tcd (g,v) VALUES (1,10),(NULL,20),(0,30),(NULL,20),(1,10),(0,40)",
@@ -3293,7 +3702,8 @@ fn gpu_group_by_nullable_text_key_forms_null_group() {
     // sorts first), distinct from real keys, via the kernel's hoisted NULL-key check routing to the
     // reserved slot BEFORE the text claim. A NULL text key is NOT folded into the empty-string group.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tgt (k TEXT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE tgt (k TEXT, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO tgt (k,v) VALUES ('a',10),(NULL,20),('b',30),(NULL,40),('a',50)",
@@ -3325,7 +3735,8 @@ fn gpu_group_by_nullable_numeric_key_forms_null_group() {
     // M3 (doc 21): GROUP BY a nullable NUMERIC key — a NULL key forms its own group (the i128 claim path
     // now sees only non-NULL keys; NULLs route to the reserved slot). A NULL is NOT folded into 0.00.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tgn (k NUMERIC(10,2), v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE tgn (k NUMERIC(10,2), v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO tgn (k,v) VALUES (1.50,10),(NULL,20),(2.50,30),(NULL,40),(1.50,50)",
@@ -3343,8 +3754,16 @@ fn gpu_group_by_nullable_numeric_key_forms_null_group() {
         r.rows,
         vec![
             vec![SqlValue::Null, SqlValue::Int8(2), SqlValue::Int8(60)],
-            vec![SqlValue::Numeric(Decimal128::new(150, 2)), SqlValue::Int8(2), SqlValue::Int8(60)],
-            vec![SqlValue::Numeric(Decimal128::new(250, 2)), SqlValue::Int8(1), SqlValue::Int8(30)],
+            vec![
+                SqlValue::Numeric(Decimal128::new(150, 2)),
+                SqlValue::Int8(2),
+                SqlValue::Int8(60)
+            ],
+            vec![
+                SqlValue::Numeric(Decimal128::new(250, 2)),
+                SqlValue::Int8(1),
+                SqlValue::Int8(30)
+            ],
         ],
         "NULL numeric key forms its own group (sorts first), not folded into 0.00"
     );
@@ -3357,7 +3776,8 @@ fn gpu_group_by_nullable_uuid_key_forms_null_group() {
     // M3 (doc 21): GROUP BY a nullable UUID key — a NULL key forms its own group (the i128/b128 claim sees
     // only non-NULL keys). A NULL is NOT folded into the all-zero uuid.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tgu (k UUID, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE tgu (k UUID, v INT)")
+        .unwrap();
     let uuid_for = |i: i64| format!("00000000-0000-0000-0000-0000000000{i:02x}");
     e.execute_text(
         2,
@@ -3377,7 +3797,8 @@ fn gpu_group_by_nullable_uuid_key_forms_null_group() {
     let r = e
         .execute_resident_expr_select_sql("SELECT k, COUNT(*), SUM(v) FROM tgu GROUP BY k")
         .expect("GROUP BY a nullable uuid key runs on the GPU");
-    let uuid = |i: i64| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(&uuid_for(i)).expect("valid uuid"));
+    let uuid =
+        |i: i64| SqlValue::Uuid(gpu_db_sql::uuid::parse_uuid(&uuid_for(i)).expect("valid uuid"));
     assert_eq!(
         r.rows,
         vec![
@@ -3400,7 +3821,11 @@ fn gpu_group_by_nullable_numeric_value_skips_nulls() {
     // STALE pooled row_slots slot is never folded (the prior 700/OOB hazard). SUM/MIN/MAX skip NULLs;
     // COUNT(*) counts every row; an all-NULL group's aggregate is SQL NULL.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE tn (g INT, v NUMERIC(10,2), w NUMERIC(10,2))").unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE tn (g INT, v NUMERIC(10,2), w NUMERIC(10,2))",
+    )
+    .unwrap();
     // g=1 -> v{10.50, 30.25, NULL}: real MIN/MAX distinction (10.50 vs 30.25) + a NULL skip, SUM 40.75.
     // g=2 -> v{5.00, NULL}: one non-NULL + a NULL skip. g=3 -> v{NULL}: an all-NULL group -> NULL. w: none.
     e.execute_text(
@@ -3426,8 +3851,14 @@ fn gpu_group_by_nullable_numeric_value_skips_nulls() {
     assert_eq!(
         s.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Numeric(Decimal128::new(4075, 2))],
-            vec![SqlValue::Int4(2), SqlValue::Numeric(Decimal128::new(500, 2))],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Numeric(Decimal128::new(4075, 2))
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Numeric(Decimal128::new(500, 2))
+            ],
             vec![SqlValue::Int4(3), SqlValue::Null],
         ],
         "SUM(numeric) skips NULLs; an all-NULL group is NULL"
@@ -3465,8 +3896,16 @@ fn gpu_group_by_nullable_numeric_value_skips_nulls() {
     assert_eq!(
         cm.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Int8(3), SqlValue::Numeric(Decimal128::new(1050, 2))],
-            vec![SqlValue::Int4(2), SqlValue::Int8(2), SqlValue::Numeric(Decimal128::new(500, 2))],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Int8(3),
+                SqlValue::Numeric(Decimal128::new(1050, 2))
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Int8(2),
+                SqlValue::Numeric(Decimal128::new(500, 2))
+            ],
             vec![SqlValue::Int4(3), SqlValue::Int8(1), SqlValue::Null],
         ],
         "COUNT(*) counts NULL-valued numeric rows; MIN skips them"
@@ -3479,9 +3918,18 @@ fn gpu_group_by_nullable_numeric_value_skips_nulls() {
     assert_eq!(
         ok.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Numeric(Decimal128::new(600, 2))],
-            vec![SqlValue::Int4(2), SqlValue::Numeric(Decimal128::new(900, 2))],
-            vec![SqlValue::Int4(3), SqlValue::Numeric(Decimal128::new(600, 2))],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Numeric(Decimal128::new(600, 2))
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Numeric(Decimal128::new(900, 2))
+            ],
+            vec![
+                SqlValue::Int4(3),
+                SqlValue::Numeric(Decimal128::new(600, 2))
+            ],
         ],
         "non-nullable numeric SUM is unchanged"
     );
@@ -3494,8 +3942,11 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
     // results sorted by key for determinism. Groups: g=1 -> v{10,20,30}, g=2 -> v{5,15}, g=3 -> v{100}.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (g,v) VALUES (1,10),(2,5),(1,20),(3,100),(2,15),(1,30)")
-        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (g,v) VALUES (1,10),(2,5),(1,20),(3,100),(2,15),(1,30)",
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -3504,7 +3955,9 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
     let i8 = SqlValue::Int8;
 
     // GROUP BY g, COUNT(*): g=1->3, g=2->2, g=3->1.
-    let c = e.execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g").expect("grouped count");
+    let c = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .expect("grouped count");
     assert_eq!(
         c.rows,
         vec![vec![i4(1), i8(3)], vec![i4(2), i8(2)], vec![i4(3), i8(1)]],
@@ -3513,15 +3966,23 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
     assert_eq!(c.executed_target, DeviceTarget::Gpu(0));
 
     // GROUP BY g, SUM(v): g=1->60, g=2->20, g=3->100.
-    let s = e.execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g").expect("grouped sum");
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g")
+        .expect("grouped sum");
     assert_eq!(
         s.rows,
-        vec![vec![i4(1), i8(60)], vec![i4(2), i8(20)], vec![i4(3), i8(100)]],
+        vec![
+            vec![i4(1), i8(60)],
+            vec![i4(2), i8(20)],
+            vec![i4(3), i8(100)]
+        ],
         "GROUP BY sum"
     );
 
     // GROUP BY g, AVG(v): 60/3=20, 20/2=10, 100/1=100 -> numeric scale 16 (PG select_div_scale).
-    let a = e.execute_resident_expr_select_sql("SELECT g, AVG(v) FROM t GROUP BY g").expect("grouped avg");
+    let a = e
+        .execute_resident_expr_select_sql("SELECT g, AVG(v) FROM t GROUP BY g")
+        .expect("grouped avg");
     let avg_strs: Vec<String> = a
         .rows
         .iter()
@@ -3530,10 +3991,18 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
             other => panic!("AVG must be numeric, got {other:?}"),
         })
         .collect();
-    assert_eq!(a.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), vec![i4(1), i4(2), i4(3)], "AVG keys");
+    assert_eq!(
+        a.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec![i4(1), i4(2), i4(3)],
+        "AVG keys"
+    );
     assert_eq!(
         avg_strs,
-        vec!["20.0000000000000000", "10.0000000000000000", "100.0000000000000000"],
+        vec![
+            "20.0000000000000000",
+            "10.0000000000000000",
+            "100.0000000000000000"
+        ],
         "GROUP BY avg"
     );
 
@@ -3549,8 +4018,15 @@ fn gpu_execute_resident_expr_select_sql_runs_group_by() {
     );
 
     // The result schema is [group key, aggregate]: 2 columns named g + the aggregate.
-    assert_eq!(c.columns.len(), 2, "grouped result has key + aggregate columns");
-    assert_eq!(c.columns[0].name, "g", "first result column is the group key");
+    assert_eq!(
+        c.columns.len(),
+        2,
+        "grouped result has key + aggregate columns"
+    );
+    assert_eq!(
+        c.columns[0].name, "g",
+        "first result column is the group key"
+    );
 }
 
 #[test]
@@ -3560,7 +4036,8 @@ fn gpu_group_by_expression() {
     // groups by (key_base_override); the result group VALUE is the distinct a+b (not raw a/b), and the
     // SELECT projection of the same expression reads it. Result is key-sorted.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
+        .unwrap();
     // a+b: (1,2)=3,(2,1)=3,(5,5)=10,(4,4)=8,(3,0)=3,(6,4)=10. groups 3{c:10,20,30}/8{c:40}/10{c:100,200}.
     e.execute_text(
         2,
@@ -3701,7 +4178,11 @@ fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
         .expect("grouped min");
     assert_eq!(
         mn.rows,
-        vec![vec![i4(1), i4(10)], vec![i4(2), i4(-7)], vec![i4(3), i4(100)]],
+        vec![
+            vec![i4(1), i4(10)],
+            vec![i4(2), i4(-7)],
+            vec![i4(3), i4(100)]
+        ],
         "GROUP BY min"
     );
     assert_eq!(mn.executed_target, DeviceTarget::Gpu(0));
@@ -3712,7 +4193,11 @@ fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
         .expect("grouped max");
     assert_eq!(
         mx.rows,
-        vec![vec![i4(1), i4(30)], vec![i4(2), i4(15)], vec![i4(3), i4(100)]],
+        vec![
+            vec![i4(1), i4(30)],
+            vec![i4(2), i4(15)],
+            vec![i4(3), i4(100)]
+        ],
         "GROUP BY max"
     );
 
@@ -3723,7 +4208,11 @@ fn gpu_execute_resident_expr_select_sql_runs_grouped_min_max() {
         .expect("grouped min + where");
     assert_eq!(
         mw.rows,
-        vec![vec![i4(1), i4(10)], vec![i4(2), i4(5)], vec![i4(3), i4(100)]],
+        vec![
+            vec![i4(1), i4(10)],
+            vec![i4(2), i4(5)],
+            vec![i4(3), i4(100)]
+        ],
         "GROUP BY min + WHERE"
     );
 }
@@ -3839,7 +4328,8 @@ fn gpu_grouped_by_numeric_key() {
     // (non-zero HIGH limb), and reconstructs the mantissa @ the column scale. EMPTY128 = i128::MIN is
     // outside the +/-10^38 numeric range, so no real numeric key ever collides with the sentinel.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g NUMERIC(30,4), v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g NUMERIC(30,4), v INT)")
+        .unwrap();
     let rows: &[(&str, i32)] = &[
         ("12.5000", 10),
         ("12.5000", 5),
@@ -3897,7 +4387,8 @@ fn gpu_group_by_bool_key() {
     // GROUP BY a BOOL column -- 2 groups (false<true) via the bool->int4 materialize + key_base_override
     // (the audited int4 path; NO bool GROUP BY kernel -> no concurrency hazard).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (flag BOOL, i INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, i INT)")
+        .unwrap();
     // false: i={10,30} (count 2, sum 40); true: i={20,40,50} (count 3, sum 110).
     e.execute_text(
         2,
@@ -3939,7 +4430,8 @@ fn gpu_group_by_bool_minmax_value() {
     // MIN/MAX over a BOOL VALUE (int key): group all-false -> min=max=false; all-true -> true; mixed ->
     // min=false, max=true. Via bool->int4 materialize + value_base_override.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (k INT, flag BOOL)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (k INT, flag BOOL)")
+        .unwrap();
     // k=1: {false,false}; k=2: {true,true}; k=3: {false,true}.
     e.execute_text(
         2,
@@ -3957,9 +4449,21 @@ fn gpu_group_by_bool_minmax_value() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Bool(false), SqlValue::Bool(false)],
-            vec![SqlValue::Int4(2), SqlValue::Bool(true), SqlValue::Bool(true)],
-            vec![SqlValue::Int4(3), SqlValue::Bool(false), SqlValue::Bool(true)],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Bool(false),
+                SqlValue::Bool(false)
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Bool(true),
+                SqlValue::Bool(true)
+            ],
+            vec![
+                SqlValue::Int4(3),
+                SqlValue::Bool(false),
+                SqlValue::Bool(true)
+            ],
         ],
         "MIN/MAX(bool) per int group"
     );
@@ -3991,16 +4495,35 @@ fn gpu_group_by_composite_two_columns() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int8(2), SqlValue::Int8(30)],
-            vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int8(1), SqlValue::Int8(5)],
-            vec![SqlValue::Int4(2), SqlValue::Int4(1), SqlValue::Int8(1), SqlValue::Int8(7)],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Int4(1),
+                SqlValue::Int8(2),
+                SqlValue::Int8(30)
+            ],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Int4(2),
+                SqlValue::Int8(1),
+                SqlValue::Int8(5)
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Int4(1),
+                SqlValue::Int8(1),
+                SqlValue::Int8(7)
+            ],
         ],
         "composite (a,b) groups + count + sum, unpacked"
     );
     // Guard the result-SCHEMA patch (insert b's column + renumber attnums): a rows-only assertion lets
     // a dropped `insert(1, b_col)` slip past (the audit's Fault B). The columns must be [a, b, ...] with
     // the right group-column names/types.
-    assert_eq!(g.columns.len(), 4, "composite result columns: a, b, count, sum");
+    assert_eq!(
+        g.columns.len(),
+        4,
+        "composite result columns: a, b, count, sum"
+    );
     assert_eq!(g.columns[0].name, "a");
     assert_eq!(g.columns[0].ty, SqlType::Int4);
     assert_eq!(g.columns[1].name, "b");
@@ -4022,7 +4545,9 @@ fn gpu_group_by_composite_negatives_ordered() {
         return;
     }
     let g = e
-        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b ORDER BY a, b")
+        .execute_resident_expr_select_sql(
+            "SELECT a, b, COUNT(*) FROM t GROUP BY a, b ORDER BY a, b",
+        )
         .expect("composite GROUP BY with negatives + ORDER BY");
     assert_eq!(g.executed_target, DeviceTarget::Gpu(0));
     assert_eq!(
@@ -4043,7 +4568,8 @@ fn gpu_group_by_composite_int8_member_bare() {
     // (col0 high 64, col1 low 64) + the b128 claim, UNPACKED back to (a:int8, b:int4). Bare GROUP BY:
     // default order is by a (distinct here). a holds a value beyond the int4 range.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a BIGINT, b INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b INT)")
+        .unwrap();
     // (a,b): (100,1)x2, (200,2)x1, (9000000000,3)x1 -> 3 groups, distinct a.
     e.execute_text(
         2,
@@ -4063,7 +4589,11 @@ fn gpu_group_by_composite_int8_member_bare() {
         vec![
             vec![SqlValue::Int8(100), SqlValue::Int4(1), SqlValue::Int8(2)],
             vec![SqlValue::Int8(200), SqlValue::Int4(2), SqlValue::Int8(1)],
-            vec![SqlValue::Int8(9000000000), SqlValue::Int4(3), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Int8(9000000000),
+                SqlValue::Int4(3),
+                SqlValue::Int8(1)
+            ],
         ],
         "int8+int4 composite unpacks to (int8, int4); value beyond int4 range survives"
     );
@@ -4079,7 +4609,8 @@ fn gpu_group_by_single_bigint_key_i64_min_dedicated_slot() {
     // (Audit follow-up to the stream-compaction commit -- closes the i64::MIN-bare-key coverage gap.)
     use std::collections::BTreeMap;
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a BIGINT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         &format!(
@@ -4107,8 +4638,16 @@ fn gpu_group_by_single_bigint_key_i64_min_dedicated_slot() {
             (*k, (*c, *s))
         })
         .collect();
-    assert_eq!(got.len(), 3, "exactly 3 groups (incl the i64::MIN dedicated slot)");
-    assert_eq!(got.get(&i64::MIN), Some(&(2, 30)), "i64::MIN key (dedicated slot) => count 2, sum 30");
+    assert_eq!(
+        got.len(),
+        3,
+        "exactly 3 groups (incl the i64::MIN dedicated slot)"
+    );
+    assert_eq!(
+        got.get(&i64::MIN),
+        Some(&(2, 30)),
+        "i64::MIN key (dedicated slot) => count 2, sum 30"
+    );
     assert_eq!(got.get(&100), Some(&(1, 1)), "100 => count 1, sum 1");
     assert_eq!(got.get(&200), Some(&(2, 5)), "200 => count 2, sum 5");
 }
@@ -4234,9 +4773,21 @@ fn gpu_group_by_composite_int_and_text() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Text("x".into()), SqlValue::Int8(2)],
-            vec![SqlValue::Int4(1), SqlValue::Text("y".into()), SqlValue::Int8(1)],
-            vec![SqlValue::Int4(2), SqlValue::Text("x".into()), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("x".into()),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("y".into()),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Text("x".into()),
+                SqlValue::Int8(1)
+            ],
         ],
         "same text under different fixed members are distinct groups (default order by a,b)"
     );
@@ -4267,9 +4818,21 @@ fn gpu_group_by_composite_text_first_with_sum() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Text("apple".into()), SqlValue::Int4(1), SqlValue::Int8(30)],
-            vec![SqlValue::Text("apple".into()), SqlValue::Int4(2), SqlValue::Int8(5)],
-            vec![SqlValue::Text("banana".into()), SqlValue::Int4(1), SqlValue::Int8(7)],
+            vec![
+                SqlValue::Text("apple".into()),
+                SqlValue::Int4(1),
+                SqlValue::Int8(30)
+            ],
+            vec![
+                SqlValue::Text("apple".into()),
+                SqlValue::Int4(2),
+                SqlValue::Int8(5)
+            ],
+            vec![
+                SqlValue::Text("banana".into()),
+                SqlValue::Int4(1),
+                SqlValue::Int8(7)
+            ],
         ],
         "text-first composite, SUM per (name,k), default order by name,k"
     );
@@ -4281,7 +4844,8 @@ fn gpu_group_by_composite_int8_and_text() {
     // Composite GROUP BY a, b where a is BIGINT (width-8 widen) + b is TEXT, with a value beyond the
     // int4 range. Exercises the width-8 fixed-member widen folded into the text-key hash/verify.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a BIGINT, b TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a BIGINT, b TEXT)")
+        .unwrap();
     // (9e9,"x")x2, (9e9,"y")x1, (5,"x")x1.
     e.execute_text(
         2,
@@ -4299,9 +4863,21 @@ fn gpu_group_by_composite_int8_and_text() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Int8(5), SqlValue::Text("x".into()), SqlValue::Int8(1)],
-            vec![SqlValue::Int8(9000000000), SqlValue::Text("x".into()), SqlValue::Int8(2)],
-            vec![SqlValue::Int8(9000000000), SqlValue::Text("y".into()), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Int8(5),
+                SqlValue::Text("x".into()),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Int8(9000000000),
+                SqlValue::Text("x".into()),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Int8(9000000000),
+                SqlValue::Text("y".into()),
+                SqlValue::Int8(1)
+            ],
         ],
         "int8 fixed member (width-8 widen) + text, value beyond int4 range"
     );
@@ -4356,10 +4932,30 @@ fn gpu_group_by_composite_three_int_columns() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int8(2)],
-            vec![SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int8(1)],
-            vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int4(1), SqlValue::Int8(1)],
-            vec![SqlValue::Int4(2), SqlValue::Int4(1), SqlValue::Int4(1), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Int4(1),
+                SqlValue::Int4(1),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Int4(1),
+                SqlValue::Int4(2),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Int4(2),
+                SqlValue::Int4(1),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Int4(1),
+                SqlValue::Int4(1),
+                SqlValue::Int8(1)
+            ],
         ],
         "distinct (a,b,c) tuples, default order by the full tuple"
     );
@@ -4372,7 +4968,8 @@ fn gpu_group_by_composite_two_text() {
     // members (comp_w = 0) + TWO text descriptors (n_text = 2): the claim folds + byte-verifies each
     // text member. The SAME first text under different second texts must be distinct groups.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)")
+        .unwrap();
     // (x,p)x2, (x,q)x1, (y,p)x1.
     e.execute_text(
         2,
@@ -4390,9 +4987,21 @@ fn gpu_group_by_composite_two_text() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Text("x".into()), SqlValue::Text("p".into()), SqlValue::Int8(2)],
-            vec![SqlValue::Text("x".into()), SqlValue::Text("q".into()), SqlValue::Int8(1)],
-            vec![SqlValue::Text("y".into()), SqlValue::Text("p".into()), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Text("x".into()),
+                SqlValue::Text("p".into()),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Text("x".into()),
+                SqlValue::Text("q".into()),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Text("y".into()),
+                SqlValue::Text("p".into()),
+                SqlValue::Int8(1)
+            ],
         ],
         "two text members, distinct (a,b) groups, default order by (a,b)"
     );
@@ -4405,7 +5014,8 @@ fn gpu_group_by_composite_two_text_concat_ambiguity() {
     // concatenated hash of the member bytes ("abc") collides -- the PER-MEMBER byte-verify distinguishes
     // them (member 0 "ab" != "a"). ('a','c') is a third distinct group sharing member 0 with ('a','bc').
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (a,b) VALUES ('ab','c'),('a','bc'),('a','c')",
@@ -4422,9 +5032,21 @@ fn gpu_group_by_composite_two_text_concat_ambiguity() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Text("a".into()), SqlValue::Text("bc".into()), SqlValue::Int8(1)],
-            vec![SqlValue::Text("a".into()), SqlValue::Text("c".into()), SqlValue::Int8(1)],
-            vec![SqlValue::Text("ab".into()), SqlValue::Text("c".into()), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Text("a".into()),
+                SqlValue::Text("bc".into()),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Text("a".into()),
+                SqlValue::Text("c".into()),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Text("ab".into()),
+                SqlValue::Text("c".into()),
+                SqlValue::Int8(1)
+            ],
         ],
         "concatenation-ambiguous member splits stay distinct (the per-member verify, not the hash)"
     );
@@ -4436,7 +5058,8 @@ fn gpu_group_by_composite_two_text_empty_member() {
     // Empty-string text members: a zero-length member (offsets[i]==offsets[i+1]) hashes to nothing and
     // verifies as a 0-byte compare. ('','x'), ('x',''), and ('','') are three distinct groups.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a TEXT, b TEXT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (a,b) VALUES ('','x'),('','x'),('x',''),('','')",
@@ -4453,9 +5076,21 @@ fn gpu_group_by_composite_two_text_empty_member() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Text("".into()), SqlValue::Text("".into()), SqlValue::Int8(1)],
-            vec![SqlValue::Text("".into()), SqlValue::Text("x".into()), SqlValue::Int8(2)],
-            vec![SqlValue::Text("x".into()), SqlValue::Text("".into()), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Text("".into()),
+                SqlValue::Text("".into()),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Text("".into()),
+                SqlValue::Text("x".into()),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Text("x".into()),
+                SqlValue::Text("".into()),
+                SqlValue::Int8(1)
+            ],
         ],
         "empty-string text members group correctly (order by (a,b): '' < 'x')"
     );
@@ -4487,10 +5122,30 @@ fn gpu_group_by_composite_int_text_int() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Int4(1), SqlValue::Text("x".into()), SqlValue::Int4(1), SqlValue::Int8(2)],
-            vec![SqlValue::Int4(1), SqlValue::Text("x".into()), SqlValue::Int4(2), SqlValue::Int8(1)],
-            vec![SqlValue::Int4(1), SqlValue::Text("y".into()), SqlValue::Int4(1), SqlValue::Int8(1)],
-            vec![SqlValue::Int4(2), SqlValue::Text("x".into()), SqlValue::Int4(1), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("x".into()),
+                SqlValue::Int4(1),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("x".into()),
+                SqlValue::Int4(2),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Int4(1),
+                SqlValue::Text("y".into()),
+                SqlValue::Int4(1),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Int4(2),
+                SqlValue::Text("x".into()),
+                SqlValue::Int4(1),
+                SqlValue::Int8(1)
+            ],
         ],
         "text member among fixed members, distinct (a,b,c), order by the full tuple"
     );
@@ -4549,7 +5204,8 @@ fn gpu_group_by_composite_bool_member() {
     // A BOOL composite member (1-byte resident, widened 0/1 -> i64 by build kind 3) -> the wide-key
     // path. (bool, int): (true,1)x2,(true,2)x1,(false,1)x1. Default order by (flag,k): false(0)<true(1).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (flag BOOL, k INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, k INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (flag, k) VALUES (true,1),(true,1),(true,2),(false,1)",
@@ -4581,7 +5237,8 @@ fn gpu_group_by_composite_bool_member_word_boundary() {
     // exercised ACROSS the word boundary (the prior gap: 4-row tests stay in word 0). flag = row >= 20
     // (the true group crosses row 32); k = row % 2. 4 groups x 10 rows each.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (flag BOOL, k INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, k INT)")
+        .unwrap();
     let values = (0..40)
         .map(|r| format!("({}, {})", if r >= 20 { "true" } else { "false" }, r % 2))
         .collect::<Vec<_>>()
@@ -4632,9 +5289,21 @@ fn gpu_group_by_composite_bool_and_text_member() {
     assert_eq!(
         g.rows,
         vec![
-            vec![SqlValue::Bool(false), SqlValue::Text("a".into()), SqlValue::Int8(1)],
-            vec![SqlValue::Bool(true), SqlValue::Text("a".into()), SqlValue::Int8(2)],
-            vec![SqlValue::Bool(true), SqlValue::Text("b".into()), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Bool(false),
+                SqlValue::Text("a".into()),
+                SqlValue::Int8(1)
+            ],
+            vec![
+                SqlValue::Bool(true),
+                SqlValue::Text("a".into()),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Bool(true),
+                SqlValue::Text("b".into()),
+                SqlValue::Int8(1)
+            ],
         ],
         "bool fixed member + text member, distinct (flag,name), order by (flag,name)"
     );
@@ -4716,7 +5385,8 @@ fn gpu_group_by_composite_uuid_member() {
     let a = "11111111-1111-1111-1111-111111111111";
     let b = "22222222-2222-2222-2222-222222222222";
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (id UUID, k INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (id UUID, k INT)")
+        .unwrap();
     // (a,1)x2, (a,2)x1, (b,1)x1.
     e.execute_text(
         2,
@@ -4757,7 +5427,9 @@ fn gpu_group_by_composite_widekey_multi_aggregate_rejected() {
         return;
     }
     let err = e
-        .execute_resident_expr_select_sql("SELECT a, b, c, COUNT(*), SUM(d) FROM t GROUP BY a, b, c")
+        .execute_resident_expr_select_sql(
+            "SELECT a, b, c, COUNT(*), SUM(d) FROM t GROUP BY a, b, c",
+        )
         .expect_err("multi-aggregate wide-key composite rejected");
     let msg = format!("{err:?}").to_lowercase();
     assert!(
@@ -4845,7 +5517,7 @@ fn gpu_grouped_min_max_over_text_value() {
     e.execute_text(1, "CREATE TABLE t (g INT, s TEXT)").unwrap();
     let rows: &[(i32, &str)] = &[
         (1, "apple"),
-        (1, "app"), // prefix of "apple" -> "app" < "apple"
+        (1, "app"),     // prefix of "apple" -> "app" < "apple"
         (1, "apricot"), // "apple" < "apricot"
         (2, "z"),
         (2, ""), // empty string is the MIN of group 2
@@ -4915,7 +5587,8 @@ fn gpu_grouped_text_value_after_text_key_offset_alignment() {
     // key bytes here sum to 11 ('app'x2 + 'be'x2 + 'c' -- a non-4-multiple), which previously misaligned
     // the value offsets. GROUP BY a text key with MIN/MAX over a text value must now run cleanly.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE w (k TEXT, v TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE w (k TEXT, v TEXT)")
+        .unwrap();
     let rows: &[(&str, &str)] = &[
         ("app", "banana"),
         ("app", "apple"),
@@ -5134,7 +5807,8 @@ fn gpu_grouped_count_distinct_int8_negative_and_large() {
     //   g=1: v in {-5, -5, 9000000000} -> 2 distinct
     //   g=2: v in {0}                  -> 1 distinct
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g, v) VALUES (1, -5),(1, -5),(1, 9000000000),(2, 0)",
@@ -5388,8 +6062,11 @@ fn gpu_scalar_count_distinct_int() {
     // {10,10,20,20,20,30,30} -> 3 distinct values across the whole table.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (v) VALUES (10),(10),(20),(20),(20),(30),(30)")
-        .unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO t (v) VALUES (10),(10),(20),(20),(20),(30),(30)",
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -5462,7 +6139,8 @@ fn gpu_grouped_count_distinct_text_group_key() {
     // COUNT(DISTINCT v) over a TEXT group key (the GROUP-BY-(g,v) reduction: distinct (cat, uid) pairs
     // per cat). cat=a: uid in {1,1,2} -> 2 distinct; cat=b: {5,5} -> 1 distinct.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (cat, uid) VALUES ('a',1),('a',1),('a',2),('b',5),('b',5)",
@@ -5492,7 +6170,8 @@ fn gpu_grouped_count_distinct_text_group_and_text_value() {
     // COUNT(DISTINCT v) where BOTH the group key AND the value are TEXT -> the (g, v) reduction's step 1
     // is a two-text composite. cat=a: tag in {x,x,y} -> 2; cat=b: {z} -> 1.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (cat TEXT, tag TEXT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, tag TEXT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (cat, tag) VALUES ('a','x'),('a','x'),('a','y'),('b','z')",
@@ -5522,7 +6201,8 @@ fn gpu_grouped_count_distinct_text_group_combined_with_count_star() {
     // A TEXT group key (not composite) supports COUNT(*) (direct pass) + COUNT(DISTINCT) (reduction)
     // merged by the group key. cat=a: count 3, distinct{1,2}=2; cat=b: count 1, distinct{5}=1.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (cat, uid) VALUES ('a',1),('a',1),('a',2),('b',5)",
@@ -5541,8 +6221,16 @@ fn gpu_grouped_count_distinct_text_group_combined_with_count_star() {
     assert_eq!(
         res.rows,
         vec![
-            vec![SqlValue::Text("a".into()), SqlValue::Int8(3), SqlValue::Int8(2)],
-            vec![SqlValue::Text("b".into()), SqlValue::Int8(1), SqlValue::Int8(1)],
+            vec![
+                SqlValue::Text("a".into()),
+                SqlValue::Int8(3),
+                SqlValue::Int8(2)
+            ],
+            vec![
+                SqlValue::Text("b".into()),
+                SqlValue::Int8(1),
+                SqlValue::Int8(1)
+            ],
         ],
         "count >= distinct, aligned by the text group key"
     );
@@ -5617,7 +6305,8 @@ fn gpu_grouped_count_distinct_composite_group_key() {
 fn gpu_grouped_count_distinct_text_group_key_empty() {
     // A WHERE that drops every row -> no groups (the reduction handles empty survivors / empty reps).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (cat TEXT, uid INT)")
+        .unwrap();
     e.execute_text(2, "INSERT INTO t (cat, uid) VALUES ('a',1),('b',2)")
         .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
@@ -5755,7 +6444,9 @@ fn gpu_grouped_mixed_int_width_expr_key_rejected() {
             .execute_resident_expr_select_sql(sql)
             .expect_err("mixed int4/int8 expression GROUP BY rejected");
         assert!(
-            format!("{err:?}").to_lowercase().contains("mixed int4/int8"),
+            format!("{err:?}")
+                .to_lowercase()
+                .contains("mixed int4/int8"),
             "clean reject for {sql}, got: {err:?}"
         );
     }
@@ -5767,7 +6458,8 @@ fn gpu_grouped_count_distinct_bool_group_key() {
     // COUNT(DISTINCT v) over a BOOL group key: the (bool, v) reduction (step 1 uses build kind 3 for the
     // bool member; step 2 reuses the bool->int4 key buffer). flag=true: v{1,1,2}->2; flag=false: {5}->1.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (flag BOOL, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (flag BOOL, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (flag, v) VALUES (true,1),(true,1),(true,2),(false,5)",
@@ -5799,7 +6491,13 @@ fn gpu_grouped_multiple_aggregates_different_value_columns() {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT, w BIGINT)")
         .unwrap();
-    let rows: &[(i32, i32, i64)] = &[(1, 10, 100), (1, 20, 50), (1, 30, 200), (2, 5, 1000), (2, 15, 999)];
+    let rows: &[(i32, i32, i64)] = &[
+        (1, 10, 100),
+        (1, 20, 50),
+        (1, 30, 200),
+        (2, 5, 1000),
+        (2, 15, 999),
+    ];
     let values = rows
         .iter()
         .map(|(g, v, w)| format!("({g}, {v}, {w})"))
@@ -5843,7 +6541,13 @@ fn gpu_grouped_count_with_text_value_min() {
     // pass yields both the group count and the lexicographic-min winner's row index).
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, s TEXT)").unwrap();
-    let rows: &[(i32, &str)] = &[(1, "banana"), (1, "apple"), (1, "cherry"), (2, "zebra"), (2, "ant")];
+    let rows: &[(i32, &str)] = &[
+        (1, "banana"),
+        (1, "apple"),
+        (1, "cherry"),
+        (2, "zebra"),
+        (2, "ant"),
+    ];
     let values = rows
         .iter()
         .map(|(g, s)| format!("({g}, '{s}')"))
@@ -5949,8 +6653,11 @@ fn gpu_grouped_multi_aggregate_cross_pass_merge_alignment() {
         tuples.push(format!("({g}, {g}, {})", 10000 - g));
         tuples.push(format!("({g}, {}, {})", g + 1000, 20000 + g));
     }
-    e.execute_text(2, &format!("INSERT INTO t (g, v, w) VALUES {}", tuples.join(",")))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (g, v, w) VALUES {}", tuples.join(",")),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -5997,8 +6704,11 @@ fn gpu_grouped_multi_aggregate_text_key_merge_alignment() {
         tuples.push(format!("('grp_{i:04}', {i}, {})", 50000 - i));
         tuples.push(format!("('grp_{i:04}', {}, {})", i + 2000, 60000 + i));
     }
-    e.execute_text(2, &format!("INSERT INTO t (k, v, w) VALUES {}", tuples.join(",")))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (k, v, w) VALUES {}", tuples.join(",")),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -6037,8 +6747,11 @@ fn gpu_grouped_order_by_and_limit() {
     // gpu_sort_permutation index vector, gathering only the kept window) on the Expr path.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -6086,8 +6799,11 @@ fn gpu_grouped_limit_offset_window_edges() {
     // group counts (GROUPED_CLAUSE_ROWS): g1=3, g2=1, g3=2, g4=4, g5=1 -> default key order is g ASC.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -6138,8 +6854,11 @@ fn gpu_grouped_having_and_combined() {
     // HAVING filters groups by an aggregate (or key) predicate; combined HAVING + ORDER BY + LIMIT.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"))
-        .unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -6147,7 +6866,9 @@ fn gpu_grouped_having_and_combined() {
     let r = |g: i32, c: i64| vec![SqlValue::Int4(g), SqlValue::Int8(c)];
 
     let c = e
-        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 2")
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 2",
+        )
         .unwrap();
     assert_eq!(c.rows, vec![r(1, 3), r(4, 4)], "HAVING COUNT(*) > 2");
 
@@ -6165,7 +6886,11 @@ fn gpu_grouped_having_and_combined() {
     let k = e
         .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g HAVING g >= 4")
         .unwrap();
-    assert_eq!(k.rows, vec![r(4, 4), r(5, 1)], "HAVING on the group key column");
+    assert_eq!(
+        k.rows,
+        vec![r(4, 4), r(5, 1)],
+        "HAVING on the group key column"
+    );
 }
 
 #[test]
@@ -6193,7 +6918,11 @@ fn gpu_grouped_having_sum_and_dnf_runs_on_gpu() {
     let a = e
         .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) > 15")
         .unwrap();
-    assert_eq!(a.rows, vec![rv(1, 60), rv(4, 99), rv(5, 99)], "HAVING SUM(int4) > 15");
+    assert_eq!(
+        a.rows,
+        vec![rv(1, 60), rv(4, 99), rv(5, 99)],
+        "HAVING SUM(int4) > 15"
+    );
 
     // DNF mixing an int4 key AND an int8 COUNT (the mixed-width case) -> g3, g4.
     let b = e
@@ -6201,7 +6930,11 @@ fn gpu_grouped_having_sum_and_dnf_runs_on_gpu() {
             "SELECT g, COUNT(*) FROM t GROUP BY g HAVING g >= 2 AND COUNT(*) > 1",
         )
         .unwrap();
-    assert_eq!(b.rows, vec![rv(3, 2), rv(4, 4)], "HAVING int4-key AND int8-count");
+    assert_eq!(
+        b.rows,
+        vec![rv(3, 2), rv(4, 4)],
+        "HAVING int4-key AND int8-count"
+    );
 
     // DNF mixing an int4 key OR an int8 COUNT -> g1, g4.
     let c = e
@@ -6209,7 +6942,11 @@ fn gpu_grouped_having_sum_and_dnf_runs_on_gpu() {
             "SELECT g, COUNT(*) FROM t GROUP BY g HAVING g = 1 OR COUNT(*) >= 3",
         )
         .unwrap();
-    assert_eq!(c.rows, vec![rv(1, 3), rv(4, 4)], "HAVING int4-key OR int8-count");
+    assert_eq!(
+        c.rows,
+        vec![rv(1, 3), rv(4, 4)],
+        "HAVING int4-key OR int8-count"
+    );
 }
 
 #[test]
@@ -6219,7 +6956,8 @@ fn gpu_grouped_having_numeric_int_mixed_dnf_runs_on_gpu() {
     // RUN on the GPU -- the integers are promoted to Numeric so the predicate is a single i128 width --
     // rather than clean-error.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (k INT, n NUMERIC(10,2))").unwrap();
+    e.execute_text(1, "CREATE TABLE t (k INT, n NUMERIC(10,2))")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (k, n) VALUES (1,2.00),(1,2.00), (2,10.00), (3,1.00),(3,1.00),(3,1.00)",
@@ -6380,7 +7118,11 @@ fn gpu_nongrouped_order_by_expression() {
     let s = e
         .execute_relational_select_text("SELECT a, b FROM t ORDER BY a + b")
         .unwrap();
-    assert_eq!(s.executed_target, DeviceTarget::Gpu(0), "ORDER BY a+b on GPU");
+    assert_eq!(
+        s.executed_target,
+        DeviceTarget::Gpu(0),
+        "ORDER BY a+b on GPU"
+    );
     let sums: Vec<i32> = i4(&s, 0)
         .iter()
         .zip(i4(&s, 1))
@@ -6407,7 +7149,11 @@ fn gpu_nongrouped_order_by_expression() {
         .execute_relational_select_text("SELECT c FROM t ORDER BY name, a + b")
         .unwrap();
     assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(i4(&s, 0), vec![5, 2, 1, 6, 3, 4], "ORDER BY name, a+b (hetero)");
+    assert_eq!(
+        i4(&s, 0),
+        vec![5, 2, 1, 6, 3, 4],
+        "ORDER BY name, a+b (hetero)"
+    );
 
     // (e) WHERE + expr ORDER BY + LIMIT. a>2: c1(sum6),c3(sum8),c5(sum8),c6(sum7) -> sorted 6,7,8,8;
     // LIMIT 2 -> c1, c6.
@@ -6487,7 +7233,10 @@ fn gpu_order_by_numeric_b128_width() {
         .expect("numeric DESC on the GPU");
     assert_eq!(
         desc.rows,
-        (0..6).rev().map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        (0..6)
+            .rev()
+            .map(|i| vec![SqlValue::Int4(i)])
+            .collect::<Vec<_>>(),
         "numeric DESC"
     );
     // WHERE v>0 -> ranks 3,4,5 ; LIMIT 2 -> 3,4.
@@ -6539,7 +7288,8 @@ fn gpu_order_by_uuid_big_endian_unsigned() {
     // ORDER BY a UUID column: 16 raw bytes, UNSIGNED BIG-ENDIAN (byte 0 most significant). Bytes >= 0x80
     // sort ABOVE 0x7f (unsigned). byte-15 breaks a byte-0 tie. 7 rows -> npot 8 exercises padding.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (id UUID, label INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (id UUID, label INT)")
+        .unwrap();
     let uuid_b0 = |b: u32| format!("{b:02x}000000-0000-0000-0000-000000000000");
     // sorted order: 00/00, 00/ff, 10, 40, 7f, 80, ff -> labels = rank, inserted shuffled.
     let rows: [(String, i32); 7] = [
@@ -6578,7 +7328,10 @@ fn gpu_order_by_uuid_big_endian_unsigned() {
         .expect("uuid DESC on the GPU");
     assert_eq!(
         desc.rows,
-        (0..7).rev().map(|i| vec![SqlValue::Int4(i)]).collect::<Vec<_>>(),
+        (0..7)
+            .rev()
+            .map(|i| vec![SqlValue::Int4(i)])
+            .collect::<Vec<_>>(),
         "uuid DESC"
     );
 }
@@ -6720,7 +7473,11 @@ fn gpu_nongrouped_order_by_via_gpu_sort() {
         .execute_relational_select_text("SELECT a, b FROM t ORDER BY a DESC")
         .unwrap();
     assert_eq!(desc.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(int4_col(&desc, 0), vec![9, 8, 5, 3, 2, 1], "ORDER BY a DESC");
+    assert_eq!(
+        int4_col(&desc, 0),
+        vec![9, 8, 5, 3, 2, 1],
+        "ORDER BY a DESC"
+    );
 
     // (c) WHERE b > 25 ORDER BY a -> a in {3,5,8,9} (their b are 30/50/80/90).
     let filtered = e
@@ -6749,7 +7506,11 @@ fn gpu_nongrouped_order_by_via_gpu_sort() {
         .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 3 OFFSET 1")
         .unwrap();
     assert_eq!(limited.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(int4_col(&limited, 0), vec![2, 3, 5], "ORDER BY a LIMIT 3 OFFSET 1");
+    assert_eq!(
+        int4_col(&limited, 0),
+        vec![2, 3, 5],
+        "ORDER BY a LIMIT 3 OFFSET 1"
+    );
 }
 
 #[test]
@@ -6796,7 +7557,11 @@ fn gpu_resident_select_limit_offset_window_edges() {
     let tail = e
         .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 100 OFFSET 4")
         .unwrap();
-    assert_eq!(col(&tail), vec![8, 9], "LIMIT past the end clamps to the tail");
+    assert_eq!(
+        col(&tail),
+        vec![8, 9],
+        "LIMIT past the end clamps to the tail"
+    );
 
     // OFFSET only (no LIMIT) -> drop the first four, keep [8,9].
     let off = e
@@ -6840,7 +7605,11 @@ fn gpu_nongrouped_order_by_500_rows() {
             ref other => panic!("expected Int4, got {other:?}"),
         })
         .collect();
-    assert_eq!(a_col, (0..500).collect::<Vec<i32>>(), "500-row GPU ORDER BY a");
+    assert_eq!(
+        a_col,
+        (0..500).collect::<Vec<i32>>(),
+        "500-row GPU ORDER BY a"
+    );
 }
 
 #[test]
@@ -6892,7 +7661,8 @@ fn gpu_nongrouped_order_by_text() {
     // text bitonic comparator (lexicographic, UNSIGNED bytes, a prefix sorts smaller) -- NOT a CPU sort.
     // executed_target==Gpu proves the general GPU path. Covers prefixes, the empty string, duplicates, DESC.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (s TEXT, id INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (s TEXT, id INT)")
+        .unwrap();
     // Deliberate corner cases: prefixes ('a' < 'ab'), empty string (sorts first), duplicates, mixed length.
     let rows: &[(&str, i32)] = &[
         ("banana", 1),
@@ -6938,7 +7708,11 @@ fn gpu_nongrouped_order_by_text() {
         DeviceTarget::Gpu(0),
         "text ORDER BY must run on the general GPU path"
     );
-    assert_eq!(text_col(&asc), oracle, "ORDER BY s ASC (prefixes, empty, dups)");
+    assert_eq!(
+        text_col(&asc),
+        oracle,
+        "ORDER BY s ASC (prefixes, empty, dups)"
+    );
 
     // (b) ORDER BY s DESC -- the reverse key order (ties are identical strings, so order among them is moot).
     let desc = e
@@ -6965,7 +7739,11 @@ fn gpu_nongrouped_order_by_text() {
         .execute_relational_select_text("SELECT s FROM t ORDER BY s LIMIT 3")
         .unwrap();
     assert_eq!(limited.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(text_col(&limited), vec!["", "a", "ab"], "text ORDER BY LIMIT 3");
+    assert_eq!(
+        text_col(&limited),
+        vec!["", "a", "ab"],
+        "text ORDER BY LIMIT 3"
+    );
 }
 
 #[test]
@@ -7023,7 +7801,8 @@ fn gpu_nongrouped_order_by_multikey() {
         "INSERT INTO t3 (a, b, c) VALUES (1, 5, 100), (1, 5, 50), (1, 8, 10), (2, 3, 7), (2, 3, 9)",
     )
     .unwrap();
-    e.execute_text(5, "CREATE TABLE td (d DATE, x INT)").unwrap();
+    e.execute_text(5, "CREATE TABLE td (d DATE, x INT)")
+        .unwrap();
     e.execute_text(
         6,
         "INSERT INTO td (d, x) VALUES ('2024-01-02', 5), ('2024-01-01', 9), \
@@ -7150,7 +7929,11 @@ fn gpu_nongrouped_order_by_mixed_int_text() {
         DeviceTarget::Gpu(0),
         "mixed int+text ORDER BY must run on the general GPU path"
     );
-    assert_eq!(id_col(&abc), vec![4, 2, 3, 1, 5, 6], "name ASC / age DESC / id ASC");
+    assert_eq!(
+        id_col(&abc),
+        vec![4, 2, 3, 1, 5, 6],
+        "name ASC / age DESC / id ASC"
+    );
 
     // (b) int primary, text secondary: age ASC, name ASC, id ASC. ages group; name (degenerate tie
     // within each age here) then id ASC. Proves age is primary (not name).
@@ -7158,7 +7941,11 @@ fn gpu_nongrouped_order_by_mixed_int_text() {
         .execute_relational_select_text("SELECT id FROM people ORDER BY age ASC, name ASC, id ASC")
         .unwrap();
     assert_eq!(ba.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(id_col(&ba), vec![6, 2, 3, 1, 5, 4], "age ASC / name ASC / id ASC");
+    assert_eq!(
+        id_col(&ba),
+        vec![6, 2, 3, 1, 5, 4],
+        "age ASC / name ASC / id ASC"
+    );
 
     // (c) DESC on the TEXT key: name DESC, id ASC. bob before alice; within a name, id ASC. (The text
     // key must sort DESC via the comparator direction, not a key sentinel.)
@@ -7174,7 +7961,11 @@ fn gpu_nongrouped_order_by_mixed_int_text() {
         .execute_relational_select_text("SELECT id FROM names ORDER BY last ASC, first ASC")
         .unwrap();
     assert_eq!(lf.executed_target, DeviceTarget::Gpu(0));
-    assert_eq!(id_col(&lf), vec![2, 4, 3, 1], "last ASC / first ASC (two text keys)");
+    assert_eq!(
+        id_col(&lf),
+        vec![2, 4, 3, 1],
+        "last ASC / first ASC (two text keys)"
+    );
 }
 
 #[test]
@@ -7184,7 +7975,8 @@ fn gpu_grouped_by_uuid_key() {
     // early-byte AND late-byte differences (exercises the sort + the full 128-bit key equality), and
     // INCLUDES the uuid whose LE i128 == EMPTY128 (i128::MIN) -> the DEDICATED slot path for i128 keys.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE u (id UUID, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE u (id UUID, v INT)")
+        .unwrap();
     let rows: &[(&str, i32)] = &[
         ("00000000-0000-0000-0000-000000000001", 10),
         ("00000000-0000-0000-0000-000000000001", 20),
@@ -7227,7 +8019,8 @@ fn gpu_grouped_uuid_key_and_uuid_value_min() {
     // Compose both b128 paths in one query: GROUP BY a uuid KEY (atom.cas.b128 claim) while taking MIN
     // of a uuid VALUE (the b128 CAS loop).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE w (k UUID, val UUID)").unwrap();
+    e.execute_text(1, "CREATE TABLE w (k UUID, val UUID)")
+        .unwrap();
     let rows: &[(&str, &str)] = &[
         (
             "aaaaaaaa-0000-0000-0000-000000000000",
@@ -7284,7 +8077,8 @@ fn gpu_grouped_min_max_over_int8_value() {
     // The i64::MAX value also probes that the min-identity (i64::MAX) collision is benign (the slot
     // is occupied, so the real value is read even when it equals the fill identity).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES \
@@ -7331,7 +8125,8 @@ fn gpu_grouped_sum_avg_over_int8_value() {
     //   g=2 -> {-6e18, -6e18}   sum -1.2e19  (< i64::MIN)
     //   g=3 -> {100, 200, 300}  sum  600     (fits i64)
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES \
@@ -7401,7 +8196,8 @@ fn gpu_grouped_int8_sum_survives_many_low_limb_wraps() {
     // of N x i64::MIN stresses the negative path. Oracle = N * value as i128 (computed, not hardcoded).
     const N: usize = 1000;
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v BIGINT)")
+        .unwrap();
     let pos = vec!["(1,9223372036854775807)"; N].join(",");
     let neg = vec!["(2,-9223372036854775808)"; N].join(",");
     e.execute_text(2, &format!("INSERT INTO t (g,v) VALUES {pos},{neg}"))
@@ -7442,7 +8238,8 @@ fn gpu_grouped_by_int8_key() {
     //   g=-8e9     -> v{5,15}      (count 2, sum 20, min 5)
     //   g=i64::MIN -> v{100,200}   (count 2, sum 300, min 100)  [dedicated-slot edge]
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g BIGINT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g BIGINT, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES \
@@ -7513,7 +8310,8 @@ fn gpu_grouped_by_int8_key_i64min_heavy_contention_and_misaligned() {
     //     would fault). We assert the offset is genuinely 4-mod-8 before trusting the result.
     const N: usize = 500;
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (b INT, g BIGINT)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (b INT, g BIGINT)")
+        .unwrap();
     // N i64::MIN-key rows + 1 normal-key row => N+1 (odd) rows => one int4 col (b) * odd rows is odd
     // => the int8 `g` section lands at 4-mod-8.
     let sentinel = vec!["(7,-9223372036854775808)"; N].join(",");
@@ -7529,7 +8327,11 @@ fn gpu_grouped_by_int8_key_i64min_heavy_contention_and_misaligned() {
     let snap = e.relational_residency_snapshot_ref("t").unwrap();
     let g_off =
         crate::relational_model::resident_device_int8_column_offset(&snap, &table, g_idx).unwrap();
-    assert_eq!(g_off % 8, 4, "int8 key column must be 4-mod-8 to exercise the misaligned read");
+    assert_eq!(
+        g_off % 8,
+        4,
+        "int8 key column must be 4-mod-8 to exercise the misaligned read"
+    );
 
     let c = e
         .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g")
@@ -7553,7 +8355,8 @@ fn gpu_grouped_sum_avg_over_numeric_value() {
     //   g=1 -> {10.50, 20.25, -3.75}  sum 27.00
     //   g=2 -> {100.00, -50.50}        sum 49.50
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(20,2))").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(20,2))")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES (1,10.50),(1,20.25),(1,-3.75),(2,100.00),(2,-50.50)",
@@ -7583,10 +8386,7 @@ fn gpu_grouped_sum_avg_over_numeric_value() {
         .collect();
     assert_eq!(
         sum_strs,
-        vec![
-            (i4(1), "27.00".to_string()),
-            (i4(2), "49.50".to_string()),
-        ],
+        vec![(i4(1), "27.00".to_string()), (i4(2), "49.50".to_string()),],
         "numeric GROUP BY sum (scale preserved)"
     );
     assert_eq!(s.executed_target, DeviceTarget::Gpu(0));
@@ -7613,10 +8413,14 @@ fn gpu_grouped_numeric_sum_overflow_errors() {
     let mut e = Engine::new_local();
     // NUMERIC(38,19) value 9e18 -> mantissa 9e18 * 10^19 = 9e37 (the literal 9e18 fits the parser's
     // i64 range; the scale lifts the mantissa to 9e37). Two in one group sum to 1.8e38 > i128::MAX.
-    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
-    let big = "9000000000000000000"; // 9e18
-    e.execute_text(2, &format!("INSERT INTO t (g,v) VALUES (1,{big}),(1,{big})"))
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
         .unwrap();
+    let big = "9000000000000000000"; // 9e18
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (g,v) VALUES (1,{big}),(1,{big})"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -7643,7 +8447,8 @@ fn gpu_grouped_numeric_sum_large_high_limb_no_overflow() {
     // result). NUMERIC(38,19) value 5.0 has mantissa 5*10^19 > i64::MAX, so val_hi != 0; the per-group
     // sums stay within i128. A wrong high-limb carry would corrupt the result by multiples of 2^64.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES (1,5.0),(1,5.0),(1,5.0),(2,-5.0),(2,-5.0)",
@@ -7677,8 +8482,14 @@ fn gpu_grouped_numeric_sum_large_high_limb_no_overflow() {
     assert_eq!(
         strs,
         vec![
-            (SqlValue::Int4(1), Decimal128::new(15 * unit, 19).to_decimal_string()), // 3 * 5.0
-            (SqlValue::Int4(2), Decimal128::new(-10 * unit, 19).to_decimal_string()), // 2 * -5.0
+            (
+                SqlValue::Int4(1),
+                Decimal128::new(15 * unit, 19).to_decimal_string()
+            ), // 3 * 5.0
+            (
+                SqlValue::Int4(2),
+                Decimal128::new(-10 * unit, 19).to_decimal_string()
+            ), // 2 * -5.0
         ],
         "numeric SUM with a non-zero i128 high limb (no overflow)"
     );
@@ -7693,7 +8504,8 @@ fn gpu_grouped_numeric_min_max() {
     //   g=1 -> {10.50, -3.25, 7.00}        min -3.25   max 10.50
     //   g=2 -> {100.00, -50.50, 100.00}    min -50.50  max 100.00 (duplicate max)
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(10,2))")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES (1,10.50),(1,-3.25),(1,7.00),(2,100.00),(2,-50.50),(2,100.00)",
@@ -7748,7 +8560,8 @@ fn gpu_grouped_numeric_min_max_large_high_limb() {
     //   g=2 -> {-2.0, -8.0, -1.0}     min -8.0  max -1.0  (ordering among negatives)
     //   g=3 -> {0.0}                  min  0.0  max 0.0   (single row -> identity overwritten)
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES \
@@ -7798,11 +8611,7 @@ fn gpu_grouped_numeric_min_max_large_high_limb() {
         .expect("numeric max hi");
     assert_eq!(
         numeric_strs(&mx.rows),
-        vec![
-            (i4(1), dec(5 * unit)),
-            (i4(2), dec(-unit)),
-            (i4(3), dec(0)),
-        ],
+        vec![(i4(1), dec(5 * unit)), (i4(2), dec(-unit)), (i4(3), dec(0)),],
         "numeric MAX with non-zero high limb"
     );
 }
@@ -7817,12 +8626,25 @@ fn gpu_grouped_numeric_min_max_same_high_limb_tie() {
     // (4e19 / 2^64 ~ 2.17); 13.0 has high limb 7. g=2 ties on a NEGATIVE high limb.
     let unit = 10_i128.pow(19);
     // sanity: the ties genuinely share a high limb (else this doesn't test pass 2).
-    assert_eq!((4 * unit + 10) >> 64, (4 * unit + 200) >> 64, "positive ties must share high limb");
-    assert_eq!((-(4 * unit + 10)) >> 64, (-(4 * unit + 200)) >> 64, "negative ties must share high limb");
-    assert_ne!((4 * unit + 10) >> 64, (13 * unit) >> 64, "the decoy must have a DIFFERENT high limb");
+    assert_eq!(
+        (4 * unit + 10) >> 64,
+        (4 * unit + 200) >> 64,
+        "positive ties must share high limb"
+    );
+    assert_eq!(
+        (-(4 * unit + 10)) >> 64,
+        (-(4 * unit + 200)) >> 64,
+        "negative ties must share high limb"
+    );
+    assert_ne!(
+        (4 * unit + 10) >> 64,
+        (13 * unit) >> 64,
+        "the decoy must have a DIFFERENT high limb"
+    );
 
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))").unwrap();
+    e.execute_text(1, "CREATE TABLE t (g INT, v NUMERIC(38,19))")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,v) VALUES \
@@ -7869,8 +8691,11 @@ fn gpu_grouped_reuse_types_int2_date_timestamp() {
     // type-recognition only, no kernel change. Verify GROUP BY keys + MIN/MAX narrow back to the right
     // SqlType, and int2 SUM (PG SUM(int2) -> int8).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (g INT, d DATE, ts TIMESTAMP, s SMALLINT)")
-        .unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (g INT, d DATE, ts TIMESTAMP, s SMALLINT)",
+    )
+    .unwrap();
     e.execute_text(
         2,
         "INSERT INTO t (g,d,ts,s) VALUES \
@@ -7887,30 +8712,53 @@ fn gpu_grouped_reuse_types_int2_date_timestamp() {
 
     // int2 MIN/MAX -> Int2; SUM -> Int8 (PG widening).
     assert_eq!(
-        e.execute_resident_expr_select_sql("SELECT g, MIN(s) FROM t GROUP BY g").unwrap().rows,
-        vec![vec![i4(1), SqlValue::Int2(5)], vec![i4(2), SqlValue::Int2(-7)]],
+        e.execute_resident_expr_select_sql("SELECT g, MIN(s) FROM t GROUP BY g")
+            .unwrap()
+            .rows,
+        vec![
+            vec![i4(1), SqlValue::Int2(5)],
+            vec![i4(2), SqlValue::Int2(-7)]
+        ],
         "MIN(int2) -> Int2"
     );
     assert_eq!(
-        e.execute_resident_expr_select_sql("SELECT g, MAX(s) FROM t GROUP BY g").unwrap().rows,
-        vec![vec![i4(1), SqlValue::Int2(15)], vec![i4(2), SqlValue::Int2(-7)]],
+        e.execute_resident_expr_select_sql("SELECT g, MAX(s) FROM t GROUP BY g")
+            .unwrap()
+            .rows,
+        vec![
+            vec![i4(1), SqlValue::Int2(15)],
+            vec![i4(2), SqlValue::Int2(-7)]
+        ],
         "MAX(int2) -> Int2"
     );
     assert_eq!(
-        e.execute_resident_expr_select_sql("SELECT g, SUM(s) FROM t GROUP BY g").unwrap().rows,
-        vec![vec![i4(1), SqlValue::Int8(20)], vec![i4(2), SqlValue::Int8(-7)]],
+        e.execute_resident_expr_select_sql("SELECT g, SUM(s) FROM t GROUP BY g")
+            .unwrap()
+            .rows,
+        vec![
+            vec![i4(1), SqlValue::Int8(20)],
+            vec![i4(2), SqlValue::Int8(-7)]
+        ],
         "SUM(int2) -> Int8"
     );
 
     // date/timestamp MIN/MAX -> the right variant, correctly ordered (g=1 has two rows).
-    let md = e.execute_resident_expr_select_sql("SELECT g, MIN(d) FROM t GROUP BY g").unwrap();
-    let xd = e.execute_resident_expr_select_sql("SELECT g, MAX(d) FROM t GROUP BY g").unwrap();
+    let md = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(d) FROM t GROUP BY g")
+        .unwrap();
+    let xd = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(d) FROM t GROUP BY g")
+        .unwrap();
     match (&md.rows[0][1], &xd.rows[0][1]) {
         (SqlValue::Date(a), SqlValue::Date(b)) => assert!(a < b, "g=1 MIN(date) < MAX(date)"),
         o => panic!("MIN/MAX(date) must be Date, got {o:?}"),
     }
-    let mt = e.execute_resident_expr_select_sql("SELECT g, MIN(ts) FROM t GROUP BY g").unwrap();
-    let xt = e.execute_resident_expr_select_sql("SELECT g, MAX(ts) FROM t GROUP BY g").unwrap();
+    let mt = e
+        .execute_resident_expr_select_sql("SELECT g, MIN(ts) FROM t GROUP BY g")
+        .unwrap();
+    let xt = e
+        .execute_resident_expr_select_sql("SELECT g, MAX(ts) FROM t GROUP BY g")
+        .unwrap();
     match (&mt.rows[0][1], &xt.rows[0][1]) {
         (SqlValue::Timestamp(a), SqlValue::Timestamp(b)) => {
             assert!(a < b, "g=1 MIN(ts) < MAX(ts)")
@@ -7919,7 +8767,9 @@ fn gpu_grouped_reuse_types_int2_date_timestamp() {
     }
 
     // GROUP BY a DATE key -> Date key variant.
-    let cd = e.execute_resident_expr_select_sql("SELECT d, COUNT(*) FROM t GROUP BY d").unwrap();
+    let cd = e
+        .execute_resident_expr_select_sql("SELECT d, COUNT(*) FROM t GROUP BY d")
+        .unwrap();
     assert_eq!(cd.rows.len(), 3, "3 distinct dates");
     assert!(
         cd.rows.iter().all(|r| matches!(r[0], SqlValue::Date(_))),
@@ -7950,17 +8800,22 @@ fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
         counts[g] += 1;
         sums[g] += v;
     }
-    e.execute_text(2, &format!("INSERT INTO lo (g,v) VALUES {values}")).unwrap();
+    e.execute_text(2, &format!("INSERT INTO lo (g,v) VALUES {values}"))
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("lo").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    let c = e.execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM lo GROUP BY g").expect("lo count");
+    let c = e
+        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM lo GROUP BY g")
+        .expect("lo count");
     let exp_c: Vec<Vec<SqlValue>> = (0..ngroups)
         .map(|g| vec![SqlValue::Int4(g as i32), SqlValue::Int8(counts[g])])
         .collect();
     assert_eq!(c.rows, exp_c, "low-card COUNT at scale (two-level merge)");
-    let s = e.execute_resident_expr_select_sql("SELECT g, SUM(v) FROM lo GROUP BY g").expect("lo sum");
+    let s = e
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM lo GROUP BY g")
+        .expect("lo sum");
     let exp_s: Vec<Vec<SqlValue>> = (0..ngroups)
         .map(|g| vec![SqlValue::Int4(g as i32), SqlValue::Int8(sums[g])])
         .collect();
@@ -7968,7 +8823,8 @@ fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
 
     // HIGH cardinality: every key distinct -> one group per row, merged across many blocks.
     let mut e2 = Engine::new_local();
-    e2.execute_text(1, "CREATE TABLE hi (g INT, v INT)").unwrap();
+    e2.execute_text(1, "CREATE TABLE hi (g INT, v INT)")
+        .unwrap();
     let h = 3000usize;
     let mut hv = String::with_capacity(h * 10);
     for i in 0..h {
@@ -7977,11 +8833,19 @@ fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
         }
         hv.push_str(&format!("({},{})", i as i64, (i * 2) as i64));
     }
-    e2.execute_text(2, &format!("INSERT INTO hi (g,v) VALUES {hv}")).unwrap();
-    if e2.populate_relational_residency_snapshot("hi").unwrap().device_memory_proof.is_none() {
+    e2.execute_text(2, &format!("INSERT INTO hi (g,v) VALUES {hv}"))
+        .unwrap();
+    if e2
+        .populate_relational_residency_snapshot("hi")
+        .unwrap()
+        .device_memory_proof
+        .is_none()
+    {
         return;
     }
-    let hc = e2.execute_resident_expr_select_sql("SELECT g, SUM(v) FROM hi GROUP BY g").expect("hi sum");
+    let hc = e2
+        .execute_resident_expr_select_sql("SELECT g, SUM(v) FROM hi GROUP BY g")
+        .expect("hi sum");
     assert_eq!(hc.rows.len(), h, "high-card: one group per distinct key");
     // Each key i -> single row, sum = 2*i; sorted by key.
     let exp_hi: Vec<Vec<SqlValue>> = (0..h)
@@ -7995,9 +8859,16 @@ fn gpu_execute_resident_expr_select_sql_group_by_two_level_at_scale() {
 fn gpu_group_by_two_level_vs_single_level_bench() {
     use std::time::Instant;
     let mut e = Engine::new_local();
+    // THE FLIP: this test exercises the SINGLE-BUFFER layer (a supported, settable configuration;
+    // sharded is the default) — pin the layout under test.
+    e.set_shard_residency_enabled(false);
     // One table, four key columns of different cardinality over the same rows -> one residency, four
     // GROUP BY cardinalities. g4/g64/g4k cycle; gall is all-distinct (high cardinality).
-    e.execute_text(1, "CREATE TABLE t (g4 INT, g64 INT, g4k INT, gall INT, v INT)").unwrap();
+    e.execute_text(
+        1,
+        "CREATE TABLE t (g4 INT, g64 INT, g4k INT, gall INT, v INT)",
+    )
+    .unwrap();
     let n = 200_000usize;
     let chunk = 20_000usize;
     let mut txid = 2u64;
@@ -8009,9 +8880,20 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
             if j > i {
                 vals.push(',');
             }
-            vals.push_str(&format!("({},{},{},{},{})", j % 4, j % 64, j % 4096, j, j % 100));
+            vals.push_str(&format!(
+                "({},{},{},{},{})",
+                j % 4,
+                j % 64,
+                j % 4096,
+                j,
+                j % 100
+            ));
         }
-        e.execute_text(txid, &format!("INSERT INTO t (g4,g64,g4k,gall,v) VALUES {vals}")).unwrap();
+        e.execute_text(
+            txid,
+            &format!("INSERT INTO t (g4,g64,g4k,gall,v) VALUES {vals}"),
+        )
+        .unwrap();
         txid += 1;
         i = end;
     }
@@ -8027,7 +8909,10 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
          {n} rows; KERNEL-only time (CUDA events, min of 200 launches), the alloc/H2D/D2H/compact\n\
          overhead excluded; speedup = single-level / two-level kernel time"
     );
-    eprintln!("{:>8}  {:>13}  {:>13}  {:>9}", "groups", "single ms", "two-lvl ms", "speedup");
+    eprintln!(
+        "{:>8}  {:>13}  {:>13}  {:>9}",
+        "groups", "single ms", "two-lvl ms", "speedup"
+    );
     for key in ["g4", "g64", "g4k", "gall"] {
         // Correctness: both kernels must agree on (key, count, sum) before we trust the timings.
         // (min/max intentionally differ: the single-level kernel computes them, the two-level does
@@ -8037,13 +8922,29 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
         a.sort_by_key(|r| r.key);
         b.sort_by_key(|r| r.key);
         let proj = |rows: &[gpu_db_execution::GroupByI32Row]| {
-            rows.iter().map(|r| (r.key, r.count, r.sum)).collect::<Vec<_>>()
+            rows.iter()
+                .map(|r| (r.key, r.count, r.sum))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(proj(&a), proj(&b), "single-level and two-level disagree for {key}");
+        assert_eq!(
+            proj(&a),
+            proj(&b),
+            "single-level and two-level disagree for {key}"
+        );
         let all = gpu_db_execution::grouped_agg_mask::ALL;
-        let single = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, all).unwrap();
-        let two = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, all).unwrap();
-        eprintln!("{:>8}  {:>13.4}  {:>13.4}  {:>8.2}x", a.len(), single, two, single / two);
+        let single = e
+            .group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, all)
+            .unwrap();
+        let two = e
+            .group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, all)
+            .unwrap();
+        eprintln!(
+            "{:>8}  {:>13.4}  {:>13.4}  {:>8.2}x",
+            a.len(),
+            single,
+            two,
+            single / two
+        );
     }
 
     // QUERY-AWARE AGGREGATE PRUNING (this slice): COUNT-only mask vs ALL mask, on BOTH the single-level
@@ -8062,13 +8963,27 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
     );
     for key in ["g4", "g64", "g4k", "gall"] {
         let groups = e.group_by_i32_bench("t", key, "v", false).unwrap().len();
-        let s_all = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, all).unwrap();
-        let s_cnt = e.group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, count).unwrap();
-        let t_all = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, all).unwrap();
-        let t_cnt = e.group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, count).unwrap();
+        let s_all = e
+            .group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, all)
+            .unwrap();
+        let s_cnt = e
+            .group_by_i32_bench_kernel_ms("t", key, "v", false, 200, 0, count)
+            .unwrap();
+        let t_all = e
+            .group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, all)
+            .unwrap();
+        let t_cnt = e
+            .group_by_i32_bench_kernel_ms("t", key, "v", true, 200, 0, count)
+            .unwrap();
         eprintln!(
             "{:>8}  {:>12.4}  {:>12.4}  {:>7.2}x   {:>12.4}  {:>12.4}  {:>7.2}x",
-            groups, s_all, s_cnt, s_all / s_cnt, t_all, t_cnt, t_all / t_cnt
+            groups,
+            s_all,
+            s_cnt,
+            s_all / s_cnt,
+            t_all,
+            t_cnt,
+            t_all / t_cnt
         );
     }
 
@@ -8078,12 +8993,25 @@ fn gpu_group_by_two_level_vs_single_level_bench() {
     eprintln!(
         "\n=== SCALE: GROUP BY g4 (4 groups fixed), growing rows (kernel-only, min of 200) ==="
     );
-    eprintln!("{:>9}  {:>13}  {:>13}  {:>9}", "rows", "single ms", "two-lvl ms", "speedup");
+    eprintln!(
+        "{:>9}  {:>13}  {:>13}  {:>9}",
+        "rows", "single ms", "two-lvl ms", "speedup"
+    );
     for rows in [25_000usize, 50_000, 100_000, 200_000] {
         let all = gpu_db_execution::grouped_agg_mask::ALL;
-        let single = e.group_by_i32_bench_kernel_ms("t", "g4", "v", false, 200, rows, all).unwrap();
-        let two = e.group_by_i32_bench_kernel_ms("t", "g4", "v", true, 200, rows, all).unwrap();
-        eprintln!("{:>9}  {:>13.4}  {:>13.4}  {:>8.2}x", rows, single, two, single / two);
+        let single = e
+            .group_by_i32_bench_kernel_ms("t", "g4", "v", false, 200, rows, all)
+            .unwrap();
+        let two = e
+            .group_by_i32_bench_kernel_ms("t", "g4", "v", true, 200, rows, all)
+            .unwrap();
+        eprintln!(
+            "{:>9}  {:>13.4}  {:>13.4}  {:>8.2}x",
+            rows,
+            single,
+            two,
+            single / two
+        );
     }
     eprintln!();
 }
@@ -8285,7 +9213,8 @@ fn audit_s4_grouped_single_group_default_limit() {
     // 1-row payload (which must return identity, not error). Verify the single group still comes back.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (g, v) VALUES (7,1),(7,2),(7,3)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g, v) VALUES (7,1),(7,2),(7,3)")
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -8296,7 +9225,11 @@ fn audit_s4_grouped_single_group_default_limit() {
     let lim = e
         .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 1")
         .expect("single-group default-order LIMIT 1 must run");
-    assert_eq!(lim.rows, vec![r(7, 3)], "single group, default order, LIMIT 1");
+    assert_eq!(
+        lim.rows,
+        vec![r(7, 3)],
+        "single group, default order, LIMIT 1"
+    );
 
     // default order + OFFSET 1 over a single group -> empty.
     let off = e
@@ -8306,9 +9239,15 @@ fn audit_s4_grouped_single_group_default_limit() {
 
     // explicit ORDER BY + LIMIT 1 over a single group (forces gpu_sort_permutation on 1 row).
     let ord = e
-        .execute_resident_expr_select_sql("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC LIMIT 1")
+        .execute_resident_expr_select_sql(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC LIMIT 1",
+        )
         .expect("single-group ORDER BY LIMIT 1 must run");
-    assert_eq!(ord.rows, vec![r(7, 3)], "single group, ORDER BY DESC, LIMIT 1");
+    assert_eq!(
+        ord.rows,
+        vec![r(7, 3)],
+        "single group, ORDER BY DESC, LIMIT 1"
+    );
 }
 
 #[test]
@@ -8319,7 +9258,8 @@ fn audit_s4_grouped_single_text_group_order_limit() {
     // identity BEFORE building any payload, so this must NOT error and must return the one group.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g TEXT, v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (g, v) VALUES ('apple',10),('apple',20)").unwrap();
+    e.execute_text(2, "INSERT INTO t (g, v) VALUES ('apple',10),('apple',20)")
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -8344,19 +9284,30 @@ fn audit_s4_grouped_composite_single_group_limit() {
     // branch computes n_group_cols=2 for the composite key; gpu_sort_permutation identity-short-circuits
     // at 1 row so the 2-col order is never evaluated. Verify the group survives.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (1,2,10),(1,2,20),(1,2,30)").unwrap();
+    e.execute_text(1, "CREATE TABLE t (a INT, b INT, v INT)")
+        .unwrap();
+    e.execute_text(2, "INSERT INTO t (a,b,v) VALUES (1,2,10),(1,2,20),(1,2,30)")
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
     }
-    let want = vec![vec![SqlValue::Int4(1), SqlValue::Int4(2), SqlValue::Int8(3)]];
+    let want = vec![vec![
+        SqlValue::Int4(1),
+        SqlValue::Int4(2),
+        SqlValue::Int8(3),
+    ]];
     let lim = e
         .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b LIMIT 1")
         .expect("single composite group LIMIT 1");
-    assert_eq!(lim.rows, want, "single composite group, default order, LIMIT 1");
+    assert_eq!(
+        lim.rows, want,
+        "single composite group, default order, LIMIT 1"
+    );
     let off0 = e
-        .execute_resident_expr_select_sql("SELECT a, b, COUNT(*) FROM t GROUP BY a, b OFFSET 0 LIMIT 1")
+        .execute_resident_expr_select_sql(
+            "SELECT a, b, COUNT(*) FROM t GROUP BY a, b OFFSET 0 LIMIT 1",
+        )
         .expect("OFFSET 0 LIMIT 1");
     assert_eq!(off0.rows, want, "OFFSET 0 LIMIT 1 over 1 composite group");
 }
@@ -8369,7 +9320,11 @@ fn audit_s4_grouped_having_empties_then_limit() {
     // empty. Then a HAVING that leaves exactly ONE group + LIMIT (the 1-row windowing path post-HAVING).
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}")).unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -8380,7 +9335,10 @@ fn audit_s4_grouped_having_empties_then_limit() {
             "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 100 ORDER BY g LIMIT 3",
         )
         .expect("HAVING-empty + LIMIT must not panic");
-    assert!(empty.rows.is_empty(), "HAVING removed all groups -> empty, no panic");
+    assert!(
+        empty.rows.is_empty(),
+        "HAVING removed all groups -> empty, no panic"
+    );
 
     // HAVING leaves exactly ONE group (g4 has COUNT 4) -> single-row windowing post-HAVING.
     let one = e
@@ -8411,7 +9369,11 @@ fn audit_s4_grouped_multi_aggregate_order_limit_offset() {
     // the windowed rows are exactly the right groups with the right (cross-pass-aligned) aggregate values.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (g INT, v INT)").unwrap();
-    e.execute_text(2, &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}")).unwrap();
+    e.execute_text(
+        2,
+        &format!("INSERT INTO t (g, v) VALUES {GROUPED_CLAUSE_ROWS}"),
+    )
+    .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -8449,7 +9411,8 @@ fn audit_s4_resident_limit_no_order_index_order_preserved() {
     // any accidental sort. Insert order = stored order on a fresh table.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)")
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -8468,7 +9431,11 @@ fn audit_s4_resident_limit_no_order_index_order_preserved() {
     let lim3 = e
         .execute_relational_select_text("SELECT a FROM t LIMIT 3")
         .expect("LIMIT 3 no ORDER BY");
-    assert_eq!(col(&lim3), vec![50, 20, 80], "LIMIT 3 keeps the first 3 in stored order");
+    assert_eq!(
+        col(&lim3),
+        vec![50, 20, 80],
+        "LIMIT 3 keeps the first 3 in stored order"
+    );
     // OFFSET 2 LIMIT 2 -> [80,10].
     let win = e
         .execute_relational_select_text("SELECT a FROM t LIMIT 2 OFFSET 2")
@@ -8489,7 +9456,8 @@ fn audit_s4_resident_with_where_limit_window() {
     // (stored order). LIMIT 2 OFFSET 1 -> [80,90].
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (50),(20),(80),(10),(90),(30)")
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -8506,7 +9474,11 @@ fn audit_s4_resident_with_where_limit_window() {
     let win = e
         .execute_relational_select_text("SELECT a FROM t WHERE a > 25 LIMIT 2 OFFSET 1")
         .expect("WHERE + LIMIT window");
-    assert_eq!(col(&win), vec![80, 90], "WHERE survivors windowed, not raw rows");
+    assert_eq!(
+        col(&win),
+        vec![80, 90],
+        "WHERE survivors windowed, not raw rows"
+    );
     // OFFSET past the survivor count -> empty (4 survivors, OFFSET 4).
     let beyond = e
         .execute_relational_select_text("SELECT a FROM t WHERE a > 25 OFFSET 4")
@@ -8526,7 +9498,8 @@ fn audit_s4_resident_limit_zero_and_huge() {
     // exactly == len -> empty. saturating_add must keep a huge LIMIT from overflowing start+l.
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (a INT)").unwrap();
-    e.execute_text(2, "INSERT INTO t (a) VALUES (5),(2),(8),(1)").unwrap();
+    e.execute_text(2, "INSERT INTO t (a) VALUES (5),(2),(8),(1)")
+        .unwrap();
     let snapshot = e.populate_relational_residency_snapshot("t").unwrap();
     if snapshot.device_memory_proof.is_none() {
         return;
@@ -8556,7 +9529,9 @@ fn audit_s4_resident_limit_zero_and_huge() {
     assert!(at_end.rows.is_empty(), "OFFSET == len -> empty");
     // OFFSET huge + LIMIT huge -> empty (saturating_add must not overflow-panic; start clamps to len).
     let huge_off = e
-        .execute_relational_select_text("SELECT a FROM t ORDER BY a LIMIT 999999999 OFFSET 999999999")
+        .execute_relational_select_text(
+            "SELECT a FROM t ORDER BY a LIMIT 999999999 OFFSET 999999999",
+        )
         .expect("huge OFFSET + huge LIMIT must not panic");
     assert!(huge_off.rows.is_empty(), "huge OFFSET -> empty");
 }
@@ -8650,7 +9625,7 @@ fn audit_s4_windowing_math_equals_drain_truncate() {
         Some(0),
         Some(1),
         Some(3),
-        Some(usize::MAX),       // overflow probe for start+limit
+        Some(usize::MAX), // overflow probe for start+limit
         Some(usize::MAX - 1),
     ];
     for &len in &lens {
@@ -8663,7 +9638,10 @@ fn audit_s4_windowing_math_equals_drain_truncate() {
                     "windowing != drain/truncate at len={len} offset={offset:?} limit={limit:?}"
                 );
                 // sanity: the window is a valid slice of [0, len].
-                assert!(w.0 <= w.1 && w.1 <= len, "invalid window {w:?} for len={len}");
+                assert!(
+                    w.0 <= w.1 && w.1 <= len,
+                    "invalid window {w:?} for len={len}"
+                );
             }
         }
     }
@@ -8714,14 +9692,24 @@ fn gpu_s8_bridge_matches_general_grouped_differential() {
         shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k"));
         shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k DESC"));
         shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY {name}"));
-        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY {name} DESC"));
-        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k HAVING {name} >= 3 ORDER BY k"));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g GROUP BY k ORDER BY {name} DESC"
+        ));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g GROUP BY k HAVING {name} >= 3 ORDER BY k"
+        ));
         shapes.push(format!(
             "SELECT k, {agg} FROM g GROUP BY k HAVING {name} > 100000 ORDER BY k"
         ));
-        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k LIMIT 2"));
-        shapes.push(format!("SELECT k, {agg} FROM g GROUP BY k ORDER BY k LIMIT 0"));
-        shapes.push(format!("SELECT k, {agg} FROM g WHERE v >= 0 GROUP BY k ORDER BY k"));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g GROUP BY k ORDER BY k LIMIT 2"
+        ));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g GROUP BY k ORDER BY k LIMIT 0"
+        ));
+        shapes.push(format!(
+            "SELECT k, {agg} FROM g WHERE v >= 0 GROUP BY k ORDER BY k"
+        ));
         shapes.push(format!(
             "SELECT k, {agg} FROM g WHERE v > 0 GROUP BY k ORDER BY k DESC"
         ));
@@ -8766,7 +9754,8 @@ fn gpu_s8_bridge_matches_general_grouped_differential() {
         );
     }
     assert_eq!(
-        divergences, 0,
+        divergences,
+        0,
         "{divergences} bridge-vs-general divergences across {} grouped shapes",
         shapes.len()
     );
@@ -8877,7 +9866,9 @@ fn audit_s8_where_and_or_dnf_matches_general() {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
-        let bridge = e.execute_resident_grouped_via_general(&select, None).unwrap();
+        let bridge = e
+            .execute_resident_grouped_via_general(&select, None)
+            .unwrap();
         let general = e.execute_resident_expr_select_sql(sql).unwrap();
         assert_eq!(bridge.columns, general.columns, "{sql}");
         assert_eq!(bridge.rows, general.rows, "{sql}");
@@ -8955,7 +9946,8 @@ fn audit_s8_grouped_materialized_view_via_bridge() {
     // -> the bridge AT CREATE TIME (no raw SQL text), so this proves a grouped view/CTAS materializes
     // correctly on the GPU. The auditor confirmed these rows are byte-identical to the parent (probe).
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE base (k INT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE base (k INT, v INT)")
+        .unwrap();
     // k=1 {10,20} sum30 cnt2 ; k=2 {5,5,5} sum15 cnt3 ; k=3 {-7,100} sum93 cnt2 (v>=5 drops -7 -> cnt1).
     e.execute_text(
         2,
@@ -8970,7 +9962,10 @@ fn audit_s8_grouped_materialized_view_via_bridge() {
         let Command::Select(select) = parse_command(sql).unwrap() else {
             unreachable!()
         };
-        e.execute_relational_select(&select).unwrap().rows.into_boxed()
+        e.execute_relational_select(&select)
+            .unwrap()
+            .rows
+            .into_boxed()
     };
 
     // Grouped matview: the SELECT runs through the bridge at create time; readback returns stored rows.
