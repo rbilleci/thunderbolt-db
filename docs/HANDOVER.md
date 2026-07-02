@@ -34,20 +34,23 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: (B) sharded predicate NULL 3VL — the LAST shards-default gate <<<
+## >>> THE ONE NEXT ACTION: the FLIP slice — measure the 1-shard tax, zero-copy it, flip shards-default <<<
 
-The **READ path is SETTLED** at its architectural ceiling. The **WRITE CRUD data plane is GPU-native** and,
-with SV6 (the `created_by` gate) DONE, **the SV5 P2 double-read flip-gate is CLOSED** — the last
-shards-default correctness gate is option B. The user-set sequence: **B → C → D**.
-
-### (B) Finish sharded NULL correctness — predicate three-valued logic on shards  ★ NOW
-Projection NULL is DONE (M3-for-shards, `3958e847`). TWO follow-ups: (1) `WHERE col IS NULL` / `IS NOT NULL` on
-a sharded-ONLY table currently **ERRORS** ("relation has no resident snapshot" — the IS NULL shape isn't
-sharded-router-eligible, so it falls to a single-buffer path with no snapshot); route it to the sharded scan
-(the unified descriptor now carries the null bitmaps and the executor already reads them). (2) `col = x`
-NULL-EXCLUSION (SQL 3VL: `NULL = 0` is UNKNOWN → excluded) is UNTESTED on the sharded path — verify the
-executor's equality predicate ANDs the validity bitmap on the sharded scan == single-buffer. **Charter:** all on
-the device predicate VM.
+**BOTH shards-default correctness gates are CLOSED** (SV6 `created_by` + SLICE B predicate NULL 3VL). The
+mandate (memory `autonomous-completion-mandate`) is to proceed autonomously through completion: FLIP next,
+then C, then D. The FLIP slice, data-driven:
+1. **MEASURE** single-buffer vs sharded on the report card (lpb point reads + scans/aggregates, in/out-of-L2,
+   latency + throughput). The known tax: a 1-shard table's scan RECOMPACTS (full DtoD copy per read, ledger
+   #4) where single-buffer reads zero-copy.
+2. **Zero-copy the 1-shard case**: `build_sharded_unified_exec_source` with ONE shard and no version regions
+   can serve the shard's own buffer + `resident_snapshot_for_shard` descriptor directly (no recompaction) —
+   erases the flip's scan regression for the single-shard majority.
+3. **FLIP the defaults**: `shard_residency_enabled`, `shard_index_probe_enabled`,
+   `shard_batched_point_read_enabled`, `resident_delete_tombstone_enabled`,
+   `resident_update_tombstone_enabled` → ON. Full differential burn-in (flag-ON sweeps), opus audit
+   (charter vector: relational code on-device; deletion vector), push.
+RESIDUALS (ledgered, not flip-blockers): mixed-type sharded tables keep the CPU pinned path for declined
+shapes; versioned + DISTINCT/GROUP/ORDER clean-errors pending visibility threading through those paths.
 
 ### (C) VACUUM/GC (#5) + host-store retirement (#2) — attack the O(table) residuals directly
 The biggest cut toward DELETING the CPU engine. (1) Tombstone/undo GC (ledger #5): reclaim `deleted_by`
@@ -69,7 +72,13 @@ charter cut. D proves the SLO. Sequence: **B → C → D**.
 
 ---
 
-## Where we are (DONE + on origin/main; HEAD `01936144` = SV6)
+## Where we are (DONE + on origin/main; HEAD `edf60ad0` = SLICE B)
+
+**SLICE B — sharded predicate NULL 3VL DONE (`edf60ad0`, opus SHIP after P2 adopted).** The SQL->Expr PG
+path serves SHARD-resident tables via the shared `build_sharded_unified_exec_source` (IS NULL + every
+general shape on-device, visibility threaded); equality 3VL measured-correct; the CPU host sort removed
+from int4-only sharded sortable projections (mixed-type stays CPU-pinned, regression-gated); deletion
+sweep #1 removed the FirstCudaFilterGap fossil (~120 lines) + stale dead_code annotations.
 
 **SV6 `created_by` SI gate — DONE, opus SHIP (`01936144`, 2026-07-02).** The SV5 P2 double-read is FIXED and
 was REPRODUCED first (stamp disabled = HEAD → a C-1 reader saw the key TWICE). Per-shard on-demand
