@@ -85,10 +85,17 @@ Protocol layer → Management/observability. Cross-cutting (logging, config, err
   shards; `CREATE INDEX CONCURRENTLY` two-pass; plan-cache invalidation.
 
 ## 7. GPU residency — STRATA (DECISIONS ADR-010)
-- A relation is laid down as **1..N shards** (`RelationalResidentShard`: `shard_id`, `row_start`, `row_count`, per-shard L3
-  layout, `gpu_id`, `device_memory_proof`, invalidation flags). Stored in `residency.shards` (ArcSwap COW) +
-  `shard_device_memory` keyed `(table, shard_id)`; ordered by `(row_start, shard_id)`. Each shard lives on exactly
-  one GPU.
+
+> **The shard storage layer has a dedicated design document: [SHARD_STORAGE.md](SHARD_STORAGE.md)**
+> (payload layout, open/sealed lifecycle + append/rollover ordering, version/identity regions +
+> the D3 stamp/high-water visibility model, the D4 generation-atomic publication protocol,
+> read routes, per-shard indexes, limits). This section keeps only the system-level position.
+
+- A relation is laid down as **1..N shards** (`RelationalResidentShard`: metadata + — since ADR-013 —
+  the shard's device RESOURCES (`Arc`s to its buffer and version/identity regions) and its
+  `max_created_by` visibility high-water). Stored in `residency.shards` (ArcSwap COW); one
+  `shards.load()` is a generation-consistent snapshot; ordered by `(row_start, shard_id)`. Each shard
+  lives on exactly one GPU. Sharding is the DEFAULT layout for purely-int4 tables since THE FLIP.
 - **Cache-manager state machine** (`RelationalResidentCache`): Absent → Admitting → Valid → Invalidated → Refreshing
   → Evicting. **Admission** (`admit_relational_residency_snapshot`): per-GPU **byte budget**; fits → admit; needs
   room → deterministic eviction by oldest `valid_through_index`. **A working set larger than the byte budget is served
