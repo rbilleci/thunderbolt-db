@@ -330,10 +330,16 @@ impl Engine {
                         row_ids,
                         ..
                     }) => {
-                        // Plain INSERT appends are unstamped/born-visible (SV6 `created_by = None`).
-                        // RETIREMENT A1: identities ride the mutation (parsed from the delta's
-                        // installed keys — INSERT write-sets carry no row keys by design).
-                        self.try_append_resident_int4_open_shard(table, rows, None, Some(row_ids))
+                        // D3 (ADR-013 pre1): INSERT appends are STAMPED `created_by = commit_seq`
+                        // like every other append — a reader pinned at an older snapshot no longer
+                        // sees a decided-but-unpublished insert. RETIREMENT A1: identities ride the
+                        // mutation (parsed from the delta's installed keys).
+                        self.try_append_resident_int4_open_shard(
+                            table,
+                            rows,
+                            crate::engine_residency::AppendCreatedBy::InsertUniform(publish_index),
+                            Some(row_ids),
+                        )
                     }
                     Some(AppliedRowMutation::Delete { table, rows, .. })
                         if self.resident_delete_tombstone_enabled() =>

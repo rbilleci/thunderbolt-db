@@ -1105,6 +1105,9 @@ impl Engine {
     /// `committed_seq()` (matches the single-flight route's pin when no writes interleave).
     pub(crate) fn gather_sharded_int4_point_lookups_batched(
         &self,
+        // SC5 rider (ADR-013 adjunct): the READER'S pinned boundary — previously this fn re-read
+        // `committed_seq()` internally, breaking the statement's catalog<->data co-pinning.
+        read_boundary: Index,
         table: &RelationalTable,
         filter_idx: usize,
         selected_indexes: &[usize],
@@ -1150,10 +1153,11 @@ impl Engine {
             filter_idx,
             selected_indexes,
             needles,
+            read_boundary,
         ) {
             return Some(gpu);
         }
-        let read_txn_id = self.committed_seq() as i64;
+        let read_txn_id = read_boundary as i64;
         let groups = self.locate_sharded_pk_batch(table, filter_idx, needles)?;
         let ncols = selected_indexes.len();
         // per needle: the projected row (Some) or absent/hidden (None). Unique-PK -> <=1 row/needle.
@@ -1335,6 +1339,9 @@ impl Engine {
         filter_idx: usize,
         selected_indexes: &[usize],
         needles: &[i32],
+        // D3 hwm gate: the reader's boundary — created_by-only shards with hwm <= it are
+        // effectively version-free for the ungated dense kernel.
+        read_boundary: Index,
     ) -> Option<BatchedShardProjection> {
         let ncols = selected_indexes.len();
         // The dense kernel gathers 1..=4 projection columns.
@@ -1376,7 +1383,13 @@ impl Engine {
             // reclaimed independently (VACUUM/GC, scalability-ledger #5) — do NOT remove it then.
             // D4: read the version-freeness from the SAME loaded descriptor the batch will probe —
             // a concurrent re-admit purging the side maps can no longer fake version-freeness here.
-            if shard.deleted_by_region.is_some() || shard.created_by_region.is_some() {
+            // D3 hwm gate: a created_by-only shard whose stamps are ALL <= the reader's boundary is
+            // effectively version-free — the ungated dense kernel is exact for this reader. Only a
+            // reader pinned inside an append window (s < hwm) falls back to the gated host gather.
+            // The deleted_by arm stays unconditional (LOAD-BEARING under VACUUM, ledger #5).
+            if shard.deleted_by_region.is_some()
+                || (shard.created_by_region.is_some() && read_boundary < shard.max_created_by)
+            {
                 return None;
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
@@ -1502,6 +1515,7 @@ impl Engine {
                 .push(crate::rel_exec_helpers::relational_column_index(&table, c).ok()?);
         }
         let proj = self.gather_sharded_int4_point_lookups_batched(
+            self.committed_seq(),
             &table,
             filter_idx,
             &selected_indexes,
@@ -1528,12 +1542,15 @@ impl Engine {
         if !self.shard_batched_point_read_enabled() {
             return None;
         }
-        let (table, bound, _copin_s) = self.bind_relational_select_for_execution(select).ok()?;
+        let (table, bound, copin_s) = self.bind_relational_select_for_execution(select).ok()?;
         if self.resident_shard_count(&table.name) == 0 {
             return None; // not shard-resident -> the batcher's single-buffer / per-query path
         }
         let (filter_idx, _needle) = crate::engine_expr::shard_point_lookup_int4_eq(&bound, &table)?;
+        // SC5 rider: the gather reads at the STATEMENT'S pinned boundary (was: an internal
+        // committed_seq re-read that broke catalog<->data co-pinning).
         let proj = self.gather_sharded_int4_point_lookups_batched(
+            copin_s,
             &table,
             filter_idx,
             &bound.selected_indexes,

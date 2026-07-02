@@ -314,6 +314,31 @@ pub(crate) const DELETED_BY_LIVE_FILL_BYTE: u8 = 0x7F;
 /// row without a stamp (admission-built rows, plain INSERT appends, un-versioned shards in the recompaction
 /// fill) is visible to every reader. Memset-friendly (uniform `0x00`) for both the on-demand region and the
 /// recompaction fill, mirroring [`DELETED_BY_LIVE_FILL_BYTE`].
+/// D3 (ADR-013 pre1): the birth stamp(s) an append carries. Every append is stamped on the sharded
+/// (default) layout; the variants distinguish WHY, because the single-buffer kill-switch layout —
+/// which has no region machinery and sits outside the A5 gate — may append an INSERT unstamped
+/// (documented born-visible semantics) but MUST decline an UPDATE's new version (SV5 P2).
+pub(crate) enum AppendCreatedBy<'a> {
+    /// A plain INSERT whose rows are all born at one commit seq.
+    InsertUniform(Index),
+    /// The wave-batched INSERT flush: one birth seq PER ROW (the batch spans multiple commits).
+    InsertPerRow(&'a [Index]),
+    /// An incremental UPDATE's appended new version (SV5/SV6): must stamp or decline.
+    UpdateNewVersion(Index),
+}
+
+impl AppendCreatedBy<'_> {
+    /// One stamp per appended row; `None` = a malformed per-row slice (caller bug -> decline).
+    fn stamps_for(&self, rows: usize) -> Option<Vec<Index>> {
+        match self {
+            AppendCreatedBy::InsertUniform(seq) | AppendCreatedBy::UpdateNewVersion(seq) => {
+                Some(vec![*seq; rows])
+            }
+            AppendCreatedBy::InsertPerRow(seqs) => (seqs.len() == rows).then(|| seqs.to_vec()),
+        }
+    }
+}
+
 pub(crate) const CREATED_BY_VISIBLE_FILL_BYTE: u8 = 0x00;
 
 /// RETIREMENT A1: the row-identity region's UNSTAMPED sentinel — every byte 0xFF makes the u64
@@ -2442,7 +2467,12 @@ mod capacity_payload_tests {
             (shard.shard_id, shard.capacity, shard.gpu_id)
         };
         assert!(e.stamp_created_by_resident_shard_slots(
-            "accounts", shard_id, 1, 1, capacity, gpu_id, 777
+            "accounts",
+            shard_id,
+            1,
+            capacity,
+            gpu_id,
+            &[777]
         ));
         assert!(
             table_has_any_created_by_cell(&e, "accounts"),
@@ -2603,7 +2633,7 @@ mod capacity_payload_tests {
         // needle 999 -> 0 rows; needle 130 -> the old image.
         let batch_hits_before = e.sharded_point_batch_hits();
         let batch = e
-            .gather_sharded_int4_point_lookups_batched(&table, 0, &[0, 1], &[999, 130])
+            .gather_sharded_int4_point_lookups_batched(e.committed_seq(), &table, 0, &[0, 1], &[999, 130])
             .expect("the batched sharded gather must serve (gated host path)");
         assert_eq!(batch.ncols, 2);
         assert_eq!(
@@ -2632,7 +2662,7 @@ mod capacity_payload_tests {
             "post-publish: the old key is gone"
         );
         let batch = e
-            .gather_sharded_int4_point_lookups_batched(&table, 0, &[0, 1], &[999, 130])
+            .gather_sharded_int4_point_lookups_batched(e.committed_seq(), &table, 0, &[0, 1], &[999, 130])
             .expect("batched gather post-publish");
         assert_eq!(
             batch.needle_ranges[0].1, 1,
@@ -4798,7 +4828,7 @@ mod capacity_payload_tests {
         let gpu_hb = e.sharded_point_gpu_probe_hits();
         let bin_hb = e.sharded_point_binary_route_hits();
         let proj = e
-            .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
+            .gather_sharded_int4_point_lookups_batched(e.committed_seq(), &table, id_col, &[id_col, bal_col], &needles)
             .expect("batched path served this shape");
         assert!(
             e.sharded_point_batch_hits() > hb,
@@ -4873,7 +4903,7 @@ mod capacity_payload_tests {
         let did = crate::rel_exec_helpers::relational_column_index(&dt, "id").unwrap();
         let dbal = crate::rel_exec_helpers::relational_column_index(&dt, "balance").unwrap();
         assert!(
-            d.gather_sharded_int4_point_lookups_batched(&dt, did, &[did, dbal], &[1, 2])
+            d.gather_sharded_int4_point_lookups_batched(d.committed_seq(), &dt, did, &[did, dbal], &[1, 2])
                 .is_none(),
             "duplicate key -> batched path declines -> None (caller falls back to the scan)"
         );
@@ -4905,7 +4935,7 @@ mod capacity_payload_tests {
         let xid = crate::rel_exec_helpers::relational_column_index(&xt, "id").unwrap();
         let xbal = crate::rel_exec_helpers::relational_column_index(&xt, "balance").unwrap();
         assert!(
-            x.gather_sharded_int4_point_lookups_batched(&xt, xid, &[xid, xbal], &[5])
+            x.gather_sharded_int4_point_lookups_batched(x.committed_seq(), &xt, xid, &[xid, xbal], &[5])
                 .is_none(),
             "cross-shard duplicate key -> batched declines -> None (scan returns BOTH rows)"
         );
@@ -4945,7 +4975,7 @@ mod capacity_payload_tests {
         let idf = crate::rel_exec_helpers::relational_column_index(&tf, "id").unwrap();
         let balf = crate::rel_exec_helpers::relational_column_index(&tf, "balance").unwrap();
         assert!(
-            f.gather_sharded_int4_point_lookups_batched(&tf, idf, &[idf, balf], &[5])
+            f.gather_sharded_int4_point_lookups_batched(f.committed_seq(), &tf, idf, &[idf, balf], &[5])
                 .is_some(),
             "NULL-free table: batched gather SERVES (the decline is null-specific, not always-None)"
         );
@@ -4965,7 +4995,7 @@ mod capacity_payload_tests {
         let id = crate::rel_exec_helpers::relational_column_index(&t, "id").unwrap();
         let bal = crate::rel_exec_helpers::relational_column_index(&t, "balance").unwrap();
         assert!(
-            k.gather_sharded_int4_point_lookups_batched(&t, id, &[id, bal], &[5])
+            k.gather_sharded_int4_point_lookups_batched(k.committed_seq(), &t, id, &[id, bal], &[5])
                 .is_none(),
             "null-bearing table: batched gather DECLINES (-> the facade per-query fallback runs the NULL-aware scan)"
         );
@@ -5012,7 +5042,7 @@ mod capacity_payload_tests {
         let bin_hb = k.sharded_point_binary_route_hits();
         let gpu_hb = k.sharded_point_gpu_probe_hits();
         let proj = k
-            .gather_sharded_int4_point_lookups_batched(&t, id, &[id, bal], &needles)
+            .gather_sharded_int4_point_lookups_batched(k.committed_seq(), &t, id, &[id, bal], &needles)
             .expect("batched served (delete-free)");
         assert!(
             k.sharded_point_gpu_probe_hits() > gpu_hb,
@@ -5089,7 +5119,7 @@ mod capacity_payload_tests {
         let needles: Vec<i32> = vec![129, 130, 131];
         let gpu_hb = t.sharded_point_gpu_probe_hits();
         let proj = t
-            .gather_sharded_int4_point_lookups_batched(&table, id_col, &[id_col, bal_col], &needles)
+            .gather_sharded_int4_point_lookups_batched(t.committed_seq(), &table, id_col, &[id_col, bal_col], &needles)
             .expect("batched served");
         // Sub-slice 8: the shard is VERSIONED (has a deleted_by region), so the un-gated GPU dense-emit path
         // must DECLINE -> the host-probe path (which applies the SV3b gate) serves it. Prove the GPU path did
@@ -6034,12 +6064,12 @@ impl Engine {
         // write-set keys; an UPDATE append passes the ORIGINAL row's id). `None` = unknown (the
         // benchmark/synthetic paths): existing regions stay sentinel at those slots and no region
         // is created on rollover — identity-unknown, the device resolve declines.
-        // SV6: `Some(commit_seq)` = the appended rows are a NEW VERSION an incremental UPDATE commit (SV5)
-        // publishes BEFORE `publish_committed_seq`, so they MUST be stamped `created_by = commit_seq` (and
-        // hidden from readers bound to an older snapshot) — the SV5 P2 double-read flip-gate. `None` = a
-        // plain INSERT append: unstamped, born-visible (today's semantics; the milder premature-insert
-        // form is an as-if-later read of a decided commit, not a mixed-state anomaly).
-        created_by: Option<Index>,
+        // D3 (ADR-013 pre1, STAMP-ALL-APPENDS): every append carries its birth commit seq(s) — the
+        // sharded (default) layout stamps `created_by` for INSERT and UPDATE alike, so a reader
+        // pinned at `s < commit_seq` no longer sees a decided-but-unpublished append (the former
+        // "born-visible" premature-insert anomaly). See [`AppendCreatedBy`] for the variants
+        // (uniform / per-row / update-new-version) and the single-buffer kill-switch scoping.
+        created_by: AppendCreatedBy<'_>,
         row_ids: Option<&[u64]>,
     ) -> bool {
         if new_rows.is_empty() {
@@ -6076,11 +6106,13 @@ impl Engine {
         {
             return self.try_append_to_resident_open_shard(table, new_rows, created_by, row_ids);
         }
-        // SV6 defensive: a versioned (created_by-stamped) append is a SHARD-path concept — the single
-        // unified buffer carries no per-row version regions, so decline and let the caller re-admit
-        // (always correct). Unreachable today: the SV5 UPDATE route requires shard residency (its
-        // tombstone step already declined a single-buffer table before the append runs).
-        if created_by.is_some() {
+        // SV6 defensive: an UPDATE-appended NEW VERSION must be stamped + hidden from older readers,
+        // and the single unified buffer carries no per-row version regions — decline and let the
+        // caller re-admit (always correct). Unreachable today: the SV5 UPDATE route requires shard
+        // residency. An INSERT append proceeds UNSTAMPED here: the single-buffer layout is the
+        // kill-switch configuration outside the ADR-013/A5 gate (no region machinery); its
+        // born-visible INSERT semantics are documented pre-D3 behavior.
+        if matches!(created_by, AppendCreatedBy::UpdateNewVersion(_)) {
             return false;
         }
         let (capacity, row_start, column_count) = {
@@ -6177,9 +6209,16 @@ impl Engine {
         &self,
         table: &str,
         new_rows: &[Vec<SqlValue>],
-        created_by: Option<Index>,
+        created_by: AppendCreatedBy<'_>,
         row_ids: Option<&[u64]>,
     ) -> bool {
+        // D3: materialize one birth stamp per appended row (validated len) — the in-place branch
+        // stamps them into the open shard's created_by region and the rollover branch bakes them
+        // into the new shard's region; both bump the descriptor's max_created_by high-water.
+        let Some(stamps) = created_by.stamps_for(new_rows.len()) else {
+            return false;
+        };
+        let stamps_max = stamps.iter().copied().max().unwrap_or(0);
         let pressured_gpus = self
             .router
             .runtime()
@@ -6258,12 +6297,10 @@ impl Engine {
             // an older snapshot observe the new version born-visible (created_by = fill 0) — exactly the
             // SV5 P2 double-read window this gate closes. A stamp failure -> false -> the caller re-admits
             // (the re-admit purge releases any partial region; rebuild-all-live is always correct).
-            if let Some(commit_seq) = created_by {
-                if !self.stamp_created_by_resident_shard_slots(
-                    table, shard_id, row_count, k, capacity, gpu_id, commit_seq,
-                ) {
-                    return false;
-                }
+            if !self.stamp_created_by_resident_shard_slots(
+                table, shard_id, row_count, capacity, gpu_id, &stamps,
+            ) {
+                return false;
             }
             // RETIREMENT A1: stamp the appended slots' host identities (get-or-skip: a region-less
             // benchmark lineage skips; an identity-bearing shard gets exact stamps). Same
@@ -6288,6 +6325,9 @@ impl Engine {
                 if let Some(table_shards) = shards.get_mut(table) {
                     if let Some(open) = table_shards.last_mut() {
                         open.row_count += k;
+                        // D3: the high-water publishes WITH the row_count that exposes the slots —
+                        // a reader at s >= hwm treats the shard as effectively version-free.
+                        open.max_created_by = open.max_created_by.max(stamps_max);
                         open.resident_bytes = open.resident_bytes.saturating_add(appended_bytes);
                         for (stat, (lo, hi)) in open
                             .resident_device_int4_column_stats
@@ -6339,11 +6379,15 @@ impl Engine {
         // published descriptor — the map inserts below keep the same Arcs for write-side bookkeeping.
         // SV6: a version-stamped (UPDATE-appended) rollover's created_by region must be observable
         // with the shard itself; carrying it IN the descriptor makes that atomic by construction.
-        let rolled_created_by_region = if let Some(commit_seq) = created_by {
+        // D3: every rolled shard's first `k` slots carry their birth stamps; the headroom keeps the
+        // born-visible fill (0) and later appends stamp into it. The region costs 8B/slot on the
+        // OPEN shard lineage only (bulk-admitted shards stay region-free, hwm 0); reclaiming sealed
+        // shards' regions once hwm falls below every active reader is VACUUM's job (ledger #5).
+        let rolled_created_by_region = {
             let mut created_payload =
                 vec![CREATED_BY_VISIBLE_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
-            for slot in 0..k {
-                created_payload[slot * 8..slot * 8 + 8].copy_from_slice(&commit_seq.to_le_bytes());
+            for (slot, stamp) in stamps.iter().enumerate() {
+                created_payload[slot * 8..slot * 8 + 8].copy_from_slice(&stamp.to_le_bytes());
             }
             let Some(created_region) =
                 self.relational_residency_device_memory(gpu_id, &created_payload)
@@ -6351,8 +6395,6 @@ impl Engine {
                 return false;
             };
             Some(Arc::new(created_region))
-        } else {
-            None
         };
         let rolled_row_id_region = if let Some(ids) = &row_ids {
             let mut payload =
@@ -6393,7 +6435,7 @@ impl Engine {
             deleted_by_region: None,
             created_by_region: rolled_created_by_region.clone(),
             row_id_region: rolled_row_id_region.clone(),
-            max_created_by: created_by.unwrap_or(0),
+            max_created_by: stamps_max,
         };
         // Write-side bookkeeping mirrors of the SAME Arcs (alloc/stamp/purge choreography unchanged);
         // readers take them from the published descriptor above.
@@ -6596,11 +6638,12 @@ impl Engine {
         table: &str,
         shard_id: u32,
         first_slot: usize,
-        k: usize,
         capacity: usize,
         gpu_id: u16,
-        commit_seq: Index,
+        // D3: one birth stamp per appended slot (the wave-batched flush spans commit seqs).
+        stamps: &[Index],
     ) -> bool {
+        let k = stamps.len();
         if k == 0 {
             return true;
         }
@@ -6643,8 +6686,8 @@ impl Engine {
             }
         };
         let mut bytes = Vec::with_capacity(k * std::mem::size_of::<u64>());
-        for _ in 0..k {
-            bytes.extend_from_slice(&commit_seq.to_le_bytes());
+        for stamp in stamps {
+            bytes.extend_from_slice(&stamp.to_le_bytes());
         }
         region
             .append_owned_chunks(vec![CudaOwnedDeviceMemoryChunk {

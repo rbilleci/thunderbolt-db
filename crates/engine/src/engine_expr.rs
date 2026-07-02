@@ -2430,7 +2430,7 @@ impl Engine {
         if !self.try_append_resident_int4_open_shard(
             table_name,
             new_rows,
-            Some(commit_seq),
+            crate::engine_residency::AppendCreatedBy::UpdateNewVersion(commit_seq),
             row_ids,
         ) {
             return false;
@@ -2573,8 +2573,12 @@ impl Engine {
             // D4: the version-free check reads the SAME loaded descriptor the buffer came from — a
             // concurrent re-admit purging the side maps can no longer fake version-freeness for a
             // reader still holding the old (tombstone-bearing) generation (the resurrection race).
-            let version_free =
-                shard.deleted_by_region.is_none() && shard.created_by_region.is_none();
+            // D3 hwm gate: a created_by-only shard whose stamps are ALL <= the reader's boundary
+            // (s >= max_created_by) is EFFECTIVELY VERSION-FREE for this reader — every row is
+            // born-visible at s, so serving the raw buffer is exact. Only a reader pinned inside
+            // an append window (s < hwm) falls through to the gated recompaction.
+            let version_free = shard.deleted_by_region.is_none()
+                && (shard.created_by_region.is_none() || copin_s >= shard.max_created_by);
             if version_free {
                 let src = source_for(shard)?;
                 return Ok(ShardedUnifiedExecSource {
@@ -2668,21 +2672,33 @@ impl Engine {
         // published order the int4 gather used, so the version rows line up 1:1 with the int4 rows.
         // D4: regions come from the SAME loaded descriptors as the buffers/metadata — one snapshot.
         type RegionOf = fn(&RelationalResidentShard) -> Option<&Arc<CudaResidentDeviceMemory>>;
-        let region_axes: [(RegionOf, u8, &mut Option<u64>); 2] = [
+        // D3 hwm gate: the created_by AXIS is needed only when SOME surviving shard carries a
+        // stamp ABOVE the reader's boundary (s < hwm — a reader pinned inside an append window).
+        // When every stamp is <= s the conjunct `created_by <= s` is identically true — skipping
+        // the axis is exact, keeps `visibility: None` for insert-only tables at the newest
+        // boundary, and thereby keeps the reshaping (DISTINCT/GROUP BY/ORDER BY/JOIN) shapes
+        // served (their guards fire on `visibility.is_some()`). The deleted_by axis has no such
+        // shortcut (a tombstone hides rows at ANY later boundary).
+        let created_axis_needed = shards
+            .iter()
+            .any(|shard| shard.created_by_region.is_some() && copin_s < shard.max_created_by);
+        let region_axes: [(RegionOf, u8, &mut Option<u64>, bool); 2] = [
             (
                 |shard| shard.deleted_by_region.as_ref(),
                 crate::engine_residency::DELETED_BY_LIVE_FILL_BYTE,
                 &mut deleted_by_offset,
+                true,
             ),
             (
                 |shard| shard.created_by_region.as_ref(),
                 crate::engine_residency::CREATED_BY_VISIBLE_FILL_BYTE,
                 &mut created_by_offset,
+                created_axis_needed,
             ),
         ];
-        for (region_of, fill_byte, offset_out) in region_axes {
+        for (region_of, fill_byte, offset_out, axis_needed) in region_axes {
             let has_region = shards.iter().any(|shard| region_of(shard).is_some());
-            if !has_region {
+            if !has_region || !axis_needed {
                 continue;
             }
             let region_offset = allocated_bytes;
@@ -2898,8 +2914,13 @@ impl Engine {
             if let Some(shards) = shards_guard.get(&table.name) {
                 // D4: read the version-freeness from the SAME loaded descriptors being summed —
                 // the metadata COUNT can no longer pair an old shard list with freshly-purged maps.
+                // D3 hwm gate: created_by-only shards whose stamps are all <= the reader's boundary
+                // count every row (effectively version-free); a reader pinned inside an append
+                // window (copin_s < hwm) falls through to the gated device path.
                 let version_free = shards.iter().all(|shard| {
-                    shard.deleted_by_region.is_none() && shard.created_by_region.is_none()
+                    shard.deleted_by_region.is_none()
+                        && (shard.created_by_region.is_none()
+                            || copin_s >= shard.max_created_by)
                 });
                 if version_free && !shards.is_empty() {
                     let total: i64 = shards.iter().map(|s| s.row_count as i64).sum();
@@ -3372,6 +3393,7 @@ impl Engine {
         name: &str,
         table: &RelationalTable,
         rows: Option<Vec<Vec<SqlValue>>>,
+        copin_s: Index,
     ) -> Result<(RelationalResidencyEntry, JoinDeviceMemory, usize), ExecuteError> {
         match rows {
             None => {
@@ -3390,7 +3412,7 @@ impl Engine {
                         .is_some_and(|shards| !shards.is_empty())
                 {
                     let unified = self
-                        .build_sharded_unified_exec_source(table, None, { self.committed_seq() })?;
+                        .build_sharded_unified_exec_source(table, None, copin_s)?;
                     if unified.visibility.is_some() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                             "relation \"{name}\" is a VERSIONED sharded table: the join path does \
@@ -3481,6 +3503,10 @@ impl Engine {
         tables: Vec<RelationalTable>,
         rows: Vec<Option<Vec<Vec<SqlValue>>>>,
         predicates: Vec<Option<ResidentExpr>>,
+        // SC5 rider (ADR-013 adjunct): the STATEMENT'S bound boundary — the same `s` the caller
+        // bound the catalog at, so every relation's device state resolves at ONE snapshot
+        // (previously each sharded side re-read `committed_seq()`, seeding cross-relation skew).
+        copin_s: Index,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let map_err = |err: gpu_db_execution::CudaRuntimeProbeError| {
             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
@@ -3741,7 +3767,7 @@ impl Engine {
             Vec::with_capacity(n_rel);
         for (row_opt, (relation, table)) in rows.into_iter().zip(plan.relations.iter().zip(&tables))
         {
-            sides.push(self.resolve_join_side(&relation.table, table, row_opt)?);
+            sides.push(self.resolve_join_side(&relation.table, table, row_opt, copin_s)?);
         }
         // The `JOIN_NULL_ROW` sentinel (LEFT-pad) must be distinguishable from every real absolute row
         // index -- it is, because residency never holds anywhere near u32::MAX rows. Make it explicit.

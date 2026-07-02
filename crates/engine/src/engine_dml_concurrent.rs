@@ -519,29 +519,30 @@ impl Engine {
         // ~items/wave fewer launch sets. Flush points: before any NON-insert item's processing
         // (its device locate must see prior rows), and at the wave tail before publish (the
         // residency-before-publish invariant is per WAVE, not per item — rows become reader-
-        // visible only at the tail publish either way). D3-COMPOSE NOTE (ADR-013): plain INSERT
-        // appends are born-visible today (created_by: None); when stamp-all-appends lands, this
-        // batch spans MULTIPLE commit seqs, so the append primitive will need a per-row
-        // created_by slice rather than one value.
+        // visible only at the tail publish either way). D3 (ADR-013 pre1, LANDED): each buffered
+        // row carries its own birth stamp (`InsertPerRow`) since the batch spans multiple commit
+        // seqs; the stamps + the hwm publish with the row_count bump at flush.
         let mut pending_appends: BTreeMap<
             String,
-            (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>),
+            (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>, Vec<Index>),
         > = BTreeMap::new();
         let flush_appends =
             |pending: &mut BTreeMap<
                 String,
-                (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>),
+                (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>, Vec<Index>),
             >,
              committed: &mut Vec<(usize, Index, bool)>| {
                 if pending.is_empty() {
                     return;
                 }
-                for (table, (rows, row_ids, items)) in std::mem::take(pending) {
+                for (table, (rows, row_ids, items, stamps)) in std::mem::take(pending) {
+                    // D3 (ADR-013 pre1): the batched flush spans MULTIPLE commit seqs — each row
+                    // carries its own birth stamp (the per-row slice the D3-COMPOSE note called for).
                     let appended = self.auto_admit_on_commit_enabled()
                         && self.try_append_resident_int4_open_shard(
                             &table,
                             &rows,
-                            None,
+                            crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
                             Some(&row_ids),
                         );
                     if appended {
@@ -749,6 +750,8 @@ impl Engine {
             match insert_append {
                 Some((table, rows, row_ids)) if self.auto_admit_on_commit_enabled() => {
                     let entry = pending_appends.entry(table).or_default();
+                    // D3: one birth stamp per row of THIS item (the flush spans commit seqs).
+                    entry.3.extend(std::iter::repeat(commit_seq).take(rows.len()));
                     entry.0.extend(rows);
                     entry.1.extend(row_ids);
                     entry.2.push((position, commit_seq));

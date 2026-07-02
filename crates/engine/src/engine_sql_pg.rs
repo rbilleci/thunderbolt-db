@@ -74,7 +74,7 @@ impl Engine {
                 Some(where_node) => split_join_where(where_node, &tables, &aliases)?,
                 None => (0..plan.relations.len()).map(|_| None).collect(),
             };
-            return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates);
+            return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates, s);
         }
         // A comma join (`FROM a, b[, c] WHERE a.k = b.k ...`) is an INNER join whose conditions live in
         // the WHERE: bind the relations, then derive the left-deep steps + per-relation filters from the
@@ -114,7 +114,7 @@ impl Engine {
                 limit,
                 offset,
             };
-            return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates);
+            return self.execute_resident_expr_inner_join(&plan, tables, rows, predicates, s);
         }
         let (select, qualifier) = build_select_from_select_stmt(&stmt)?;
         // Bind once; map the predicate (if any) against that SAME bound table; execute against that
