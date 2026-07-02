@@ -1999,3 +1999,180 @@ fn status_and_telemetry_surface_relational_residency_state() {
     );
     assert!(aux.resident_bytes > 0);
 }
+
+#[test]
+fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
+    // D3 (ADR-013 pre1) GATE — the pinned double-read differential. An in-place INSERT append lands
+    // on the device (stamps + row_count) BEFORE `publish_committed_seq`; pre-D3 the appended slots
+    // were BORN-VISIBLE, so a reader pinned at the pre-commit boundary saw a decided-but-unpublished
+    // insert (a phantom between two reads of one pinned statement). This test freezes exactly that
+    // mid-commit state by driving the append primitive directly (no publish), then asserts every
+    // sharded read route hides the slot from the pre-append boundary and serves it at the append's
+    // own seq. SABOTAGE: skip the created_by stamp in the append (or drop the hwm/created_by gate on
+    // any route below) and the phantom reappears -> this test FAILS.
+    let mut e = Engine::new_local();
+    e.execute_text(1, "CREATE TABLE d3t (id INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO d3t (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("d3t").unwrap();
+    if e.resident_shard_count("d3t") == 0 {
+        return; // no GPU
+    }
+    let s0 = e.committed_seq();
+
+    // Freeze the mid-commit window: append (id=99) stamped at s0+1; committed_seq stays s0.
+    assert!(
+        e.try_append_resident_int4_open_shard(
+            "d3t",
+            &[vec![SqlValue::Int4(99), SqlValue::Int4(990)]],
+            crate::engine_residency::AppendCreatedBy::InsertUniform(s0 + 1),
+            None,
+        ),
+        "the open shard must take the in-place append (headroom exists)"
+    );
+    {
+        let shards = e.read_state.residency.shards.load();
+        let shard = &shards.get("d3t").unwrap()[0];
+        assert_eq!(shard.row_count, 4, "the appended slot IS published on-device");
+        assert_eq!(
+            shard.max_created_by,
+            s0 + 1,
+            "the high-water publishes WITH the row_count bump"
+        );
+        assert!(
+            shard.created_by_region.is_some(),
+            "the append allocated + republished the created_by region in the descriptor"
+        );
+    }
+
+    // (a) Metadata COUNT at the pinned boundary: version_free FAILS (s0 < hwm) -> the gated device
+    //     path counts only the 3 visible rows. (Pre-D3: 4 — the phantom.)
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM d3t").unwrap() else {
+        unreachable!()
+    };
+    let counted = e.execute_relational_select(&count).unwrap();
+    assert_eq!(
+        counted.rows,
+        vec![vec![SqlValue::Int8(3)]],
+        "a reader pinned at s0 must NOT count the unpublished append"
+    );
+    assert_eq!(counted.executed_target, DeviceTarget::Gpu(0));
+
+    // (b) The sharded scan at the pinned boundary: the appended id must be invisible.
+    let Command::Select(scan) = parse_command("SELECT id FROM d3t WHERE id >= 0").unwrap() else {
+        unreachable!()
+    };
+    let scanned = e.execute_relational_select(&scan).unwrap();
+    assert_eq!(scanned.rows.len(), 3, "scan at s0 must hide the appended slot");
+
+    // (c) The batched point route, explicitly at BOTH boundaries: hidden at s0, visible at s0+1.
+    let table = e.relational_catalog_table("d3t").unwrap();
+    let hidden = e
+        .gather_sharded_int4_point_lookups_batched(s0, &table, 0, &[0, 1], &[99])
+        .expect("the batched gather must answer (unique key, valid shard)");
+    let (h_start, h_end) = hidden.needle_ranges[0];
+    assert_eq!(
+        h_end - h_start,
+        0,
+        "the appended key is HIDDEN from the pre-append boundary"
+    );
+    let visible = e
+        .gather_sharded_int4_point_lookups_batched(s0 + 1, &table, 0, &[0, 1], &[99])
+        .expect("the batched gather must answer at the append's own seq");
+    let (v_start, v_end) = visible.needle_ranges[0];
+    assert_eq!(
+        v_end - v_start,
+        1,
+        "the appended key is VISIBLE at its birth boundary"
+    );
+}
+
+#[test]
+fn gpu_d4_captured_generation_survives_a_readmit_purge() {
+    // D4 (ADR-013 pre2) GATE — the tombstone-resurrection race. Pre-D4, a reader captured the shard
+    // LIST from one load but resolved buffer + version regions through LATER side-map `.get()`s; a
+    // concurrent re-admit purged the region maps and reinstalled the same shard_id, so the reader's
+    // version-free check passed against the PURGED maps while it still held the OLD (tombstone-
+    // bearing) buffer -> the deleted row resurfaced. D4 makes the descriptor itself carry the
+    // resources: whatever generation a reader loads, it holds THAT generation's buffer AND regions,
+    // pinned. SABOTAGE: revert any consumer to a side-map `.get()` after `shards.load()` and this
+    // gate's held-generation assertions become unenforceable (the resurrection window reopens).
+    let mut e = Engine::new_local();
+    // The incremental DELETE tombstone path is nested under auto-admit (the commit-path lever).
+    e.set_auto_admit_on_commit(true);
+    e.execute_text(1, "CREATE TABLE d4t (id INT, v INT)").unwrap();
+    e.execute_text(
+        2,
+        "INSERT INTO d4t (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .unwrap();
+    e.populate_relational_residency_snapshot("d4t").unwrap();
+    if e.resident_shard_count("d4t") == 0 {
+        return; // no GPU
+    }
+    // Tombstone id=2 (incremental DELETE, default-ON) -> the shard carries a deleted_by region.
+    e.execute_text(3, "DELETE FROM d4t WHERE id = 2").unwrap();
+    let held = e
+        .read_state
+        .residency
+        .shards
+        .load()
+        .get("d4t")
+        .unwrap()
+        .clone();
+    assert!(
+        held[0].deleted_by_region.is_some(),
+        "precondition: the tombstoned generation carries its deleted_by region in the descriptor"
+    );
+
+    // The racing re-admit: rebuilds all-live from visible rows and PURGES the side maps.
+    e.populate_relational_residency_snapshot("d4t").unwrap();
+    assert!(
+        e.read_state
+            .residency
+            .shard_deleted_by_memory
+            .get(&("d4t".to_string(), held[0].shard_id))
+            .is_none(),
+        "precondition: the re-admit purged the side-map region (the pre-D4 race ingredient)"
+    );
+
+    // The HELD generation is self-contained: its regions + buffer are still pinned by the
+    // descriptor — a consumer of the held snapshot still gates the tombstone (no resurrection).
+    assert!(
+        held[0].deleted_by_region.is_some(),
+        "the held descriptor still carries ITS generation's deleted_by region"
+    );
+    let fresh = e
+        .read_state
+        .residency
+        .shards
+        .load()
+        .get("d4t")
+        .unwrap()
+        .clone();
+    assert!(
+        fresh[0].deleted_by_region.is_none(),
+        "the fresh generation is all-live (rebuilt from visible rows)"
+    );
+    let (Some(held_buf), Some(fresh_buf)) = (&held[0].device_memory, &fresh[0].device_memory)
+    else {
+        panic!("both generations carry their buffers in the descriptor");
+    };
+    assert!(
+        !Arc::ptr_eq(held_buf, fresh_buf),
+        "the generations are distinct buffers — pairing the held metadata with the fresh buffer \
+         is impossible by construction (one load yields matched pairs)"
+    );
+
+    // And the fresh read is correct: the deleted row stays deleted after the rebuild.
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM d4t").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        e.execute_relational_select(&count).unwrap().rows,
+        vec![vec![SqlValue::Int8(2)]]
+    );
+}
