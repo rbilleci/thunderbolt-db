@@ -34,23 +34,24 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: the FLIP slice — measure the 1-shard tax, zero-copy it, flip shards-default <<<
+## >>> THE ONE NEXT ACTION: PHASE C — index-driven DELETE/UPDATE resolution (ledger #1) <<<
 
-**BOTH shards-default correctness gates are CLOSED** (SV6 `created_by` + SLICE B predicate NULL 3VL). The
-mandate (memory `autonomous-completion-mandate`) is to proceed autonomously through completion: FLIP next,
-then C, then D. The FLIP slice, data-driven:
-1. **MEASURE** single-buffer vs sharded on the report card (lpb point reads + scans/aggregates, in/out-of-L2,
-   latency + throughput). The known tax: a 1-shard table's scan RECOMPACTS (full DtoD copy per read, ledger
-   #4) where single-buffer reads zero-copy.
-2. **Zero-copy the 1-shard case**: `build_sharded_unified_exec_source` with ONE shard and no version regions
-   can serve the shard's own buffer + `resident_snapshot_for_shard` descriptor directly (no recompaction) —
-   erases the flip's scan regression for the single-shard majority.
-3. **FLIP the defaults**: `shard_residency_enabled`, `shard_index_probe_enabled`,
-   `shard_batched_point_read_enabled`, `resident_delete_tombstone_enabled`,
-   `resident_update_tombstone_enabled` → ON. Full differential burn-in (flag-ON sweeps), opus audit
-   (charter vector: relational code on-device; deletion vector), push.
-RESIDUALS (ledgered, not flip-blockers): mixed-type sharded tables keep the CPU pinned path for declined
-shapes; versioned + DISTINCT/GROUP/ORDER clean-errors pending visibility threading through those paths.
+**THE FLIP IS DONE (`689ab73f`): the GPU-native sharded data plane is the DEFAULT** (five flags ON;
+sharded admission scoped to purely-int4 tables; every flag remains a kill switch). Composed with the other
+agent's WAL work (D1-D4 append-only writer + checkpoint truncation + deployment config + D3a/b GROUP COMMIT
+— ledger #7 is DONE). Full tree green: engine CPU 459/0, facade 34/0 + 13/0, complete GPU sweep 341/0 @82s.
+MEASURED @524k p50: COUNT(*) 4-7us (metadata), eq point 22-33us (index route), unfiltered SUM 855us (was a
+496ms CPU cliff — 580x); pruned-to-one-shard scans zero-copy. Residuals ledgered: multi-shard recompaction
+(#12, endgame = multi-shard aggregate kernel), Eq-filtered SUM host gap (#13, both layouts), type coverage
+(#14, mixed-type stays single-buffer).
+
+**Phase C, first slice — drive DELETE/UPDATE resolution from the RESIDENT INDEX (cross-shard sub-slice
+[7]):** the host `prepare_delete`/`prepare_update` seq_scan (resolve tuple_ids) is the MEASURED O(table)
+write residual (caps the tombstone win at 2.2x) and a charter violation in the hot path. The per-shard
+hash+bloom index already resolves key->(shard,slot) at O(1); wire it into the prepare path so single-row
+DELETE/UPDATE become O(rows touched) end to end. MEASURE the prepare seq_scan share first
+(r3_insert_profile / a prepare-phase split); differential vs the host-store oracle; audit; then VACUUM #5
+(NOTE: the SV6 dense-decline arm becomes LOAD-BEARING there), then host-store retirement #2.
 
 ### (C) VACUUM/GC (#5) + host-store retirement (#2) — attack the O(table) residuals directly
 The biggest cut toward DELETING the CPU engine. (1) Tombstone/undo GC (ledger #5): reclaim `deleted_by`
@@ -72,7 +73,13 @@ charter cut. D proves the SLO. Sequence: **B → C → D**.
 
 ---
 
-## Where we are (DONE + on origin/main; HEAD `edf60ad0` = SLICE B)
+## Where we are (DONE + on origin/main; HEAD `689ab73f` = THE FLIP; WAL/group-commit merged from the second agent)
+
+**THE FLIP (`689ab73f`).** Defaults ON; burn-in fixed 4 product defects (CPU-cliff shape mappings incl.
+audit-F1's six, the MATVIEW LATCH DEADLOCK — the route planner now reads budgets from a lock-free mirror,
+NEVER `ddl_catalog()` on a read path — joins/expr-wrapper sharded resolution via the with_binding
+chokepoint, int4-scoped admission). ~15 single-buffer-layer tests pin their configuration (kill-switch
+surface). The `[f1]` oracle gate asserts rows == single-buffer AND no NEW cpu demotion.
 
 **SLICE B — sharded predicate NULL 3VL DONE (`edf60ad0`, opus SHIP after P2 adopted).** The SQL->Expr PG
 path serves SHARD-resident tables via the shared `build_sharded_unified_exec_source` (IS NULL + every
