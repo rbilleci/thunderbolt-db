@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 
 use gpu_db_types::{EngineError, TxnId};
 
@@ -139,13 +140,20 @@ pub struct WalArchiveObjectBackup {
     pub objects: Vec<WalArchiveObject>,
 }
 
-/// The durable backing for a [`WalBuffer`]: an **append-only** segment writer.
+/// The durable backing for a [`WalBuffer`]: an **append-only** segment writer whose mutable
+/// state sits behind its OWN small lock, separate from whatever outer lock guards the buffer
+/// (in the engine: the commit_mutex).
 ///
-/// The segment file is opened (or created) once; every `flush_all` serializes ONLY the
-/// currently-unflushed record tail, appends it with a single `write_all`, and `fdatasync`s it —
-/// O(new records) per commit, not O(all records ever written). The parent directory is fsynced
-/// once, when the file is first created (the directory entry never changes afterward), so
-/// steady-state commits pay exactly one file fsync.
+/// The segment file is opened (or created) once; every flush serializes ONLY the currently-
+/// unflushed record tail, appends it with a single `write_all`, and `fdatasync`s it — O(new
+/// records) per commit. The parent directory is fsynced once, when the file is first created.
+///
+/// The split lock is what makes GROUP COMMIT real: [`WalBuffer::begin_group_flush`] snapshots
+/// the unflushed tail under the outer lock and hands back a [`WalGroupFlushJob`]; the job's
+/// `write_all` + fsync then run with NO lock held at all, so other committers keep appending
+/// (forming the next group) while the disk works; [`WalGroupFlushJob::commit`] finishes by
+/// taking only THIS core's lock — never the outer one — so completion cannot deadlock against
+/// an outer-lock holder waiting for the in-flight IO to drain.
 ///
 /// Because appends are not atomic, a crash mid-append can leave a torn record tail. Recovery
 /// ([`recover_wal_segment`]) distinguishes a torn tail from bit rot of acknowledged data via the
@@ -154,149 +162,262 @@ pub struct WalArchiveObjectBackup {
 /// sidecar is advisory (a lower bound) and is written only at cheap points — segment creation,
 /// recovery install, prefix truncation, and clean shutdown — never on the per-commit path.
 #[derive(Debug)]
-struct WalDurableSegment {
+struct WalDurableCore {
     segment_path: PathBuf,
-    /// Open append handle; `None` until the first durable flush (or recovery install).
-    file: Option<File>,
+    state: Mutex<WalDurableState>,
+    /// Signals `io_in_flight` clearing (a group job completed or was abandoned), so an inline
+    /// `flush_all` / prefix truncation waiting for the disk can proceed.
+    cv: Condvar,
+}
+
+#[derive(Debug)]
+struct WalDurableState {
+    /// Open `O_APPEND` handle (every write lands at the true EOF even after a defensive
+    /// `set_len` rewind); `None` until the first durable flush. Behind an `Arc` so a
+    /// [`WalGroupFlushJob`] can perform its IO after the lock is released.
+    file: Option<Arc<File>>,
     /// Valid, fsynced byte length of the live segment (magic + serialized flushed records).
     durable_bytes: u64,
+    /// Durable watermark: how many of the owning buffer's records are fsynced. Lives HERE (not
+    /// in the buffer) so a group flush can advance it without the buffer's outer lock.
+    flushed_records: usize,
     /// Records `[0, segment_base_records)` of the owning buffer are durable in an external
     /// checkpoint segment, not in this file (set by [`WalBuffer::truncate_durable_segment_prefix`]).
     segment_base_records: usize,
     /// Last tail offset written to the sidecar, to skip redundant rewrites.
     tail_offset_recorded: u64,
+    /// A group flush job's IO is running WITHOUT the lock; nothing else may touch the file (or
+    /// start a second write) until it completes and clears this.
+    io_in_flight: bool,
     /// A failed append or fsync left the on-disk tail state unknown — fail closed on later
     /// flushes rather than append past a possibly-torn region (restart recovery repairs it).
     poisoned: Option<String>,
+    /// Group-commit accounting (one group per real fsync, inline or via a job).
+    stats: WalGroupCommitStats,
 }
 
-impl WalDurableSegment {
+impl WalDurableCore {
     fn fresh(segment_path: PathBuf) -> Self {
         Self {
             segment_path,
-            file: None,
-            durable_bytes: 0,
-            segment_base_records: 0,
-            tail_offset_recorded: 0,
-            poisoned: None,
+            state: Mutex::new(WalDurableState {
+                file: None,
+                durable_bytes: 0,
+                flushed_records: 0,
+                segment_base_records: 0,
+                tail_offset_recorded: 0,
+                io_in_flight: false,
+                poisoned: None,
+                stats: WalGroupCommitStats::default(),
+            }),
+            cv: Condvar::new(),
         }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, WalDurableState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Lock the state and wait out any in-flight group IO (used by the inline flush and the
+    /// admin ops, which must not overlap a running `write_all`/fsync on the same file).
+    fn lock_state_idle(&self) -> std::sync::MutexGuard<'_, WalDurableState> {
+        let mut state = self.lock_state();
+        while state.io_in_flight {
+            state = self
+                .cv
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state
+    }
+
+    fn poisoned_error(&self, reason: &str) -> EngineError {
+        EngineError::Durability(format!(
+            "WAL segment {} is poisoned by an earlier flush failure ({reason}); restart to \
+             recover from the durable prefix",
+            self.segment_path.display()
+        ))
     }
 
     /// Best-effort sidecar update; errors are reported but tolerable (the sidecar is a lower
     /// bound — a stale value only widens the tolerated torn-tail window, never loses data).
-    fn record_tail_offset(&mut self) -> Result<(), EngineError> {
-        if self.tail_offset_recorded == self.durable_bytes {
+    fn record_tail_offset(&self, state: &mut WalDurableState) -> Result<(), EngineError> {
+        if state.tail_offset_recorded == state.durable_bytes {
             return Ok(());
         }
-        write_wal_tail_offset(&self.segment_path, self.durable_bytes)?;
-        self.tail_offset_recorded = self.durable_bytes;
+        write_wal_tail_offset(&self.segment_path, state.durable_bytes)?;
+        state.tail_offset_recorded = state.durable_bytes;
         Ok(())
     }
 
-    /// Append `records` durably: one buffered serialization, one `write_all`, one fsync.
-    fn append_records(&mut self, records: &[WalRecord]) -> Result<(), EngineError> {
-        if let Some(reason) = &self.poisoned {
-            return Err(EngineError::Durability(format!(
-                "WAL segment {} is poisoned by an earlier append failure ({reason}); restart to \
-                 recover from the durable prefix",
-                self.segment_path.display()
-            )));
-        }
-        let mut tail = Vec::new();
-        for record in records {
-            encode_record_into(&mut tail, record)?;
-        }
-        if self.file.is_none() {
-            // First durable flush of a fresh buffer: create (or clobber — the fresh-database
-            // constructor semantic) the segment with magic + tail in one write, fsync the file,
-            // then fsync the parent directory so the file's existence is itself crash-durable.
-            // Any stale tail-offset sidecar from a previous database at this path is removed
-            // FIRST so a crash mid-clobber cannot pair the new (short) file with the old (large)
-            // recorded tail and read as loud corruption of a database that no longer exists.
-            let _ = fs::remove_file(wal_tail_offset_path(&self.segment_path));
-            let mut bytes = Vec::with_capacity(WAL_SEGMENT_MAGIC.len() + tail.len());
-            bytes.extend_from_slice(WAL_SEGMENT_MAGIC);
-            bytes.extend_from_slice(&tail);
-            if let Some(parent) = self
-                .segment_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-            {
-                fs::create_dir_all(parent).map_err(|err| {
-                    EngineError::Durability(format!(
-                        "failed to create WAL segment directory {}: {err}",
-                        parent.display()
-                    ))
-                })?;
-            }
-            {
-                let mut file = File::create(&self.segment_path).map_err(|err| {
-                    EngineError::Durability(format!(
-                        "failed to create WAL segment {}: {err}",
-                        self.segment_path.display()
-                    ))
-                })?;
-                file.write_all(&bytes)
-                    .and_then(|_| file.sync_all())
-                    .map_err(|err| {
-                        EngineError::Durability(format!(
-                            "failed to write WAL segment {}: {err}",
-                            self.segment_path.display()
-                        ))
-                    })?;
-            }
-            sync_segment_parent_dir(&self.segment_path)?;
-            // Keep an O_APPEND handle: every later write lands at the true EOF even after a
-            // defensive `set_len` rewind (a plain cursor would point past EOF and punch a hole).
-            let file = fs::OpenOptions::new()
-                .append(true)
-                .open(&self.segment_path)
-                .map_err(|err| {
-                    EngineError::Durability(format!(
-                        "failed to reopen WAL segment for append {}: {err}",
-                        self.segment_path.display()
-                    ))
-                })?;
-            self.file = Some(file);
-            self.durable_bytes = bytes.len() as u64;
-            self.record_tail_offset()?;
+    /// First durable use: create (or clobber — the fresh-database constructor semantic) the
+    /// segment with the magic header, fsync it, fsync the parent directory so the file's
+    /// existence is itself crash-durable, and keep an `O_APPEND` handle. Any stale tail-offset
+    /// sidecar from a previous database at this path is removed FIRST so a crash mid-clobber
+    /// cannot pair the new (short) file with the old (large) recorded tail and read as loud
+    /// corruption of a database that no longer exists.
+    fn ensure_created(&self, state: &mut WalDurableState) -> Result<(), EngineError> {
+        if state.file.is_some() {
             return Ok(());
         }
-
-        let file = self.file.as_mut().expect("append handle present");
-        if let Err(err) = file.write_all(&tail) {
-            // The tail may be partially on disk beyond `durable_bytes`. Try to rewind; if the
-            // rewind itself fails, poison the backing so no later flush appends past garbage.
-            if let Err(rewind_err) = file.set_len(self.durable_bytes) {
-                self.poisoned = Some(format!(
-                    "append write failed ({err}); rewind failed ({rewind_err})"
-                ));
-            }
-            return Err(EngineError::Durability(format!(
-                "failed to append WAL segment {}: {err}",
-                self.segment_path.display()
-            )));
+        let _ = fs::remove_file(wal_tail_offset_path(&self.segment_path));
+        if let Some(parent) = self
+            .segment_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to create WAL segment directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
         }
-        if let Err(err) = file.sync_data() {
-            // After a failed fsync the page-cache state is unknowable (fsyncgate): the kernel may
-            // have marked dirty pages clean without persisting them, so neither a retry nor a
-            // rewind can be trusted. Fail closed; restart recovery truncates the torn tail.
-            self.poisoned = Some(format!("fsync failed ({err})"));
-            return Err(EngineError::Durability(format!(
-                "failed to fsync WAL segment {}: {err}",
-                self.segment_path.display()
-            )));
+        {
+            let mut file = File::create(&self.segment_path).map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to create WAL segment {}: {err}",
+                    self.segment_path.display()
+                ))
+            })?;
+            file.write_all(WAL_SEGMENT_MAGIC)
+                .and_then(|_| file.sync_all())
+                .map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to write WAL segment {}: {err}",
+                        self.segment_path.display()
+                    ))
+                })?;
         }
-        self.durable_bytes += tail.len() as u64;
+        sync_segment_parent_dir(&self.segment_path)?;
+        let file = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.segment_path)
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to reopen WAL segment for append {}: {err}",
+                    self.segment_path.display()
+                ))
+            })?;
+        state.file = Some(Arc::new(file));
+        state.durable_bytes = WAL_SEGMENT_MAGIC.len() as u64;
+        self.record_tail_offset(state)?;
         Ok(())
+    }
+
+    /// Record a successful fsync of `group_size` records ending at `target_records`.
+    fn note_group(state: &mut WalDurableState, group_size: usize, target_records: usize) {
+        state.flushed_records = target_records;
+        state.stats.flush_groups += 1;
+        state.stats.durable_records += group_size as u64;
+        state.stats.max_group_size = state.stats.max_group_size.max(group_size);
     }
 }
 
-impl Drop for WalDurableSegment {
+impl Drop for WalDurableCore {
     fn drop(&mut self) {
         // Clean-shutdown tail-offset record: after this, ANY invalid byte in the segment is
         // detected loudly at recovery (nothing beyond the recorded offset remains tolerable).
-        let _ = self.record_tail_offset();
+        let mut state = std::mem::replace(
+            self.state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            WalDurableState {
+                file: None,
+                durable_bytes: 0,
+                flushed_records: 0,
+                segment_base_records: 0,
+                tail_offset_recorded: 0,
+                io_in_flight: false,
+                poisoned: None,
+                stats: WalGroupCommitStats::default(),
+            },
+        );
+        if state.tail_offset_recorded != state.durable_bytes {
+            let _ = write_wal_tail_offset(&self.segment_path, state.durable_bytes);
+            state.tail_offset_recorded = state.durable_bytes;
+        }
+    }
+}
+
+/// The outcome of [`WalBuffer::begin_group_flush`]: either an IO job to run lock-free, or the
+/// news that nothing was unflushed (with the current durable watermark).
+pub enum WalGroupFlushBegin {
+    /// Unflushed records were snapshotted; run [`WalGroupFlushJob::commit`] to make them durable.
+    Job(WalGroupFlushJob),
+    /// Nothing to flush — every appended record is already durable up to `flushed_records`.
+    Clean { flushed_records: usize },
+}
+
+/// A snapshotted group flush: the serialized unflushed tail plus the open segment handle. The
+/// expensive part — `write_all` + fsync — runs in [`WalGroupFlushJob::commit`] with NO lock
+/// held, so appenders keep working (and the next group keeps forming) while the disk syncs.
+/// While a job is outstanding the core's `io_in_flight` excludes every other writer of the file
+/// (inline flushes and admin ops wait on the condvar).
+pub struct WalGroupFlushJob {
+    core: Arc<WalDurableCore>,
+    file: Arc<File>,
+    bytes: Vec<u8>,
+    target_records: usize,
+    group_size: usize,
+    /// Disarmed by `commit`; a dropped-in-flight job (caller panicked between begin and commit)
+    /// poisons the backing so no later flush appends past a possibly-torn region.
+    completed: bool,
+}
+
+impl WalGroupFlushJob {
+    /// Perform the group's IO (one `write_all`, one `fdatasync`) — call with NO locks held —
+    /// then complete under the durable core's own lock: advance the watermark + stats and wake
+    /// waiters. Returns the new durable watermark (record count). On IO failure the backing is
+    /// POISONED fail-closed (the group's members may already have applied their deltas; see the
+    /// engine's group-commit wedge semantics) and waiters are still woken.
+    pub fn commit(mut self) -> Result<usize, EngineError> {
+        self.completed = true;
+        let io_result = (&*self.file)
+            .write_all(&self.bytes)
+            .and_then(|_| self.file.sync_data());
+        let mut state = self.core.lock_state();
+        state.io_in_flight = false;
+        let outcome = match io_result {
+            Ok(()) => {
+                state.durable_bytes += self.bytes.len() as u64;
+                WalDurableCore::note_group(&mut state, self.group_size, self.target_records);
+                Ok(self.target_records)
+            }
+            Err(err) => {
+                // The tail may be partially on disk (or, after a failed fsync, in an unknowable
+                // page-cache state — fsyncgate). Attempt a rewind for tidiness, but poison the
+                // backing REGARDLESS: the group's records may back already-applied deltas, so
+                // nothing may ever append past this point until restart recovery truncates the
+                // torn tail.
+                let _ = self.file.set_len(state.durable_bytes);
+                state.poisoned = Some(format!("group flush failed ({err})"));
+                Err(EngineError::Durability(format!(
+                    "failed to flush WAL segment group {}: {err}",
+                    self.core.segment_path.display()
+                )))
+            }
+        };
+        drop(state);
+        self.core.cv.notify_all();
+        outcome
+    }
+}
+
+impl Drop for WalGroupFlushJob {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // The flusher died between begin and commit: the file may hold a partial write. Fail
+        // closed and wake anyone waiting for the IO to drain.
+        let mut state = self.core.lock_state();
+        state.io_in_flight = false;
+        state.poisoned = Some("group flush abandoned mid-IO".to_string());
+        drop(state);
+        self.core.cv.notify_all();
     }
 }
 
@@ -327,11 +448,12 @@ impl WalSegmentRecovery {
 /// Group-commit accounting for a [`WalBuffer`].
 ///
 /// Each `flush_all` that performs a real fsync batches **all** currently-unflushed records into a
-/// single segment write / single fsync — that batch is one *group*. While the writer is serialized
-/// (Stage 1), commits arrive one at a time, so the common case is a size-1 group; the same code
-/// path amortizes automatically once Stage 4 lets multiple committers enqueue records before a
-/// designated flusher drives one `flush_all`. These counters let a microbenchmark observe the
-/// fsync-per-commit cost now and the batching ratio (`durable_records / flush_groups`) later.
+/// single segment write / single fsync — that batch is one *group*. The serialized commit path
+/// flushes one record at a time (size-1 groups); the engine's concurrent DML path elects a
+/// designated flusher whose [`WalGroupFlushJob`] IO runs lock-free, so committers that append
+/// while a group's fsync is in flight coalesce into the NEXT group (`mean_group_size` grows with
+/// write concurrency). These counters expose that batching ratio
+/// (`durable_records / flush_groups`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalGroupCommitStats {
     /// Number of `flush_all` calls that performed a real durable fsync (one group each).
@@ -356,10 +478,12 @@ impl WalGroupCommitStats {
 #[derive(Debug, Default)]
 pub struct WalBuffer {
     records: Vec<WalRecord>,
-    flushed: usize,
+    /// Durable watermark for the IN-MEMORY mode only (`durable: None`). The durable mode's
+    /// watermark lives in [`WalDurableState::flushed_records`] so a group flush can advance it
+    /// under the core's own lock, without the buffer's outer lock (the engine commit_mutex).
+    flushed_memory: usize,
     fail_next_flush: bool,
-    durable: Option<WalDurableSegment>,
-    group_commit: WalGroupCommitStats,
+    durable: Option<Arc<WalDurableCore>>,
 }
 
 impl WalBuffer {
@@ -376,7 +500,7 @@ impl WalBuffer {
     /// the durable watermark. Recovery reads the segment back with [`recover_wal_segment`].
     pub fn with_durable_segment(segment_path: impl Into<PathBuf>) -> Self {
         Self {
-            durable: Some(WalDurableSegment::fresh(segment_path.into())),
+            durable: Some(Arc::new(WalDurableCore::fresh(segment_path.into()))),
             ..Self::default()
         }
     }
@@ -398,44 +522,48 @@ impl WalBuffer {
         debug_assert!(records.len() >= recovery.records.len());
         debug_assert!(records.ends_with(&recovery.records));
         let segment_base_records = records.len() - recovery.records.len();
-        let mut durable = WalDurableSegment::fresh(segment_path);
-        if recovery.valid_bytes > 0 {
-            let file = fs::OpenOptions::new()
-                .append(true)
-                .open(&durable.segment_path)
-                .map_err(|err| {
-                    EngineError::Durability(format!(
-                        "failed to open WAL segment for append {}: {err}",
-                        durable.segment_path.display()
-                    ))
-                })?;
-            // Durably drop the torn tail (if any) so appends resume at the valid boundary.
-            file.set_len(recovery.valid_bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|err| {
-                    EngineError::Durability(format!(
-                        "failed to truncate torn WAL segment tail {}: {err}",
-                        durable.segment_path.display()
-                    ))
-                })?;
-            durable.file = Some(file);
-            durable.durable_bytes = recovery.valid_bytes;
-            durable.record_tail_offset()?;
+        let core = WalDurableCore::fresh(segment_path);
+        {
+            let mut state = core.lock_state();
+            if recovery.valid_bytes > 0 {
+                let file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&core.segment_path)
+                    .map_err(|err| {
+                        EngineError::Durability(format!(
+                            "failed to open WAL segment for append {}: {err}",
+                            core.segment_path.display()
+                        ))
+                    })?;
+                // Durably drop the torn tail (if any) so appends resume at the valid boundary.
+                file.set_len(recovery.valid_bytes)
+                    .and_then(|_| file.sync_all())
+                    .map_err(|err| {
+                        EngineError::Durability(format!(
+                            "failed to truncate torn WAL segment tail {}: {err}",
+                            core.segment_path.display()
+                        ))
+                    })?;
+                state.file = Some(Arc::new(file));
+                state.durable_bytes = recovery.valid_bytes;
+                core.record_tail_offset(&mut state)?;
+            }
+            state.segment_base_records = segment_base_records;
+            state.flushed_records = records.len();
         }
-        durable.segment_base_records = segment_base_records;
-        let flushed = records.len();
         Ok(Self {
             records,
-            flushed,
+            flushed_memory: 0,
             fail_next_flush: false,
-            durable: Some(durable),
-            group_commit: WalGroupCommitStats::default(),
+            durable: Some(Arc::new(core)),
         })
     }
 
     /// The durable segment path, if this buffer is backed by one.
     pub fn durable_segment_path(&self) -> Option<&Path> {
-        self.durable.as_ref().map(|d| d.segment_path.as_path())
+        self.durable
+            .as_ref()
+            .map(|core| core.segment_path.as_path())
     }
 
     /// Whether `flush_all` performs a real fsync (vs. in-memory watermark advance only).
@@ -461,7 +589,7 @@ impl WalBuffer {
             self.durable.is_none(),
             "durable buffers are recovered via with_recovered_durable_segment"
         );
-        self.flushed = records.len();
+        self.flushed_memory = records.len();
         self.records = records;
     }
 
@@ -478,32 +606,49 @@ impl WalBuffer {
             return;
         }
         // Commit-path rollback only ever truncates the just-appended UNFLUSHED tail (the callers
-        // capture `wal.len()` before appending), so the durable file is normally untouched. If a
-        // future caller cuts below the flushed watermark, physically rewind the segment too so
-        // the file never replays records the buffer disowned.
-        if len < self.flushed {
-            if let Some(durable) = self.durable.as_mut() {
-                let disowned_bytes: u64 = self.records
-                    [len.max(durable.segment_base_records)..self.flushed]
-                    .iter()
-                    .map(encoded_record_len)
-                    .sum();
-                if disowned_bytes > 0 {
-                    if let Some(file) = durable.file.as_mut() {
-                        let target = durable.durable_bytes.saturating_sub(disowned_bytes);
-                        if let Err(err) = file.set_len(target).and_then(|_| file.sync_all()) {
-                            durable.poisoned =
-                                Some(format!("durable-prefix truncate rewind failed ({err})"));
-                        } else {
-                            durable.durable_bytes = target;
-                        }
-                    }
+        // capture `wal.len()` before appending, and any group flush that could cover the region
+        // being cut would have had to `begin` inside this holder's outer critical section — it
+        // cannot have). If a future caller cuts below the flushed watermark, physically rewind
+        // the segment too so the file never replays records the buffer disowned.
+        match self.durable.as_ref() {
+            None => {
+                self.records.truncate(len);
+                if self.flushed_memory > self.records.len() {
+                    self.flushed_memory = self.records.len();
                 }
             }
-        }
-        self.records.truncate(len);
-        if self.flushed > self.records.len() {
-            self.flushed = self.records.len();
+            Some(core) => {
+                let mut state = core.lock_state();
+                if len < state.flushed_records {
+                    // Never reached by the commit-path rollbacks; wait out any in-flight group
+                    // IO before touching the file (defensive path only).
+                    while state.io_in_flight {
+                        state = core
+                            .cv
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    let disowned_bytes: u64 = self.records
+                        [len.max(state.segment_base_records)..state.flushed_records]
+                        .iter()
+                        .map(encoded_record_len)
+                        .sum();
+                    if disowned_bytes > 0 {
+                        if let Some(file) = state.file.clone() {
+                            let target = state.durable_bytes.saturating_sub(disowned_bytes);
+                            if let Err(err) = file.set_len(target).and_then(|_| file.sync_all()) {
+                                state.poisoned =
+                                    Some(format!("durable-prefix truncate rewind failed ({err})"));
+                            } else {
+                                state.durable_bytes = target;
+                            }
+                        }
+                    }
+                    state.flushed_records = len;
+                }
+                drop(state);
+                self.records.truncate(len);
+            }
         }
     }
 
@@ -530,30 +675,127 @@ impl WalBuffer {
             ));
         }
         let target = self.records.len();
-        let group_size = target.saturating_sub(self.flushed);
-        if let Some(durable) = self.durable.as_mut() {
-            if group_size > 0 {
-                durable.append_records(&self.records[self.flushed..target])?;
-                self.group_commit.flush_groups += 1;
-                self.group_commit.durable_records += group_size as u64;
-                self.group_commit.max_group_size = self.group_commit.max_group_size.max(group_size);
-            }
+        let Some(core) = self.durable.clone() else {
+            self.flushed_memory = target;
+            return Ok(());
+        };
+        // Inline (serialized-path) flush: wait out any in-flight group IO, then write + fsync
+        // while holding the core lock (the caller already holds the outer lock and expects a
+        // synchronous durable-or-error answer with clean rollback semantics).
+        let mut state = core.lock_state_idle();
+        if let Some(reason) = state.poisoned.clone() {
+            return Err(core.poisoned_error(&reason));
         }
-        // Watermark advances only after the fsync has succeeded (or in in-memory mode).
-        self.flushed = target;
+        let group_size = target.saturating_sub(state.flushed_records);
+        if group_size == 0 {
+            return Ok(());
+        }
+        core.ensure_created(&mut state)?;
+        let mut tail = Vec::new();
+        for record in &self.records[state.flushed_records..target] {
+            encode_record_into(&mut tail, record)?;
+        }
+        let file = state.file.clone().expect("append handle present");
+        if let Err(err) = (&*file).write_all(&tail) {
+            // The tail may be partially on disk beyond `durable_bytes`. Try to rewind; if the
+            // rewind itself fails, poison the backing so no later flush appends past garbage.
+            if let Err(rewind_err) = file.set_len(state.durable_bytes) {
+                state.poisoned = Some(format!(
+                    "append write failed ({err}); rewind failed ({rewind_err})"
+                ));
+            }
+            return Err(EngineError::Durability(format!(
+                "failed to append WAL segment {}: {err}",
+                core.segment_path.display()
+            )));
+        }
+        if let Err(err) = file.sync_data() {
+            // After a failed fsync the page-cache state is unknowable (fsyncgate): the kernel may
+            // have marked dirty pages clean without persisting them, so neither a retry nor a
+            // rewind can be trusted. Fail closed; restart recovery truncates the torn tail.
+            state.poisoned = Some(format!("fsync failed ({err})"));
+            return Err(EngineError::Durability(format!(
+                "failed to fsync WAL segment {}: {err}",
+                core.segment_path.display()
+            )));
+        }
+        state.durable_bytes += tail.len() as u64;
+        // Watermark advances only after the fsync has succeeded.
+        WalDurableCore::note_group(&mut state, group_size, target);
         Ok(())
+    }
+
+    /// Begin a GROUP flush (the concurrent commit path's designated-flusher protocol): snapshot
+    /// the unflushed record tail and hand back a [`WalGroupFlushJob`] whose `write_all` + fsync
+    /// run with NO lock held — the caller drops the buffer's outer lock (the engine commit_mutex)
+    /// before [`WalGroupFlushJob::commit`], so other committers keep appending (forming the next
+    /// group) while this group's disk IO is in flight. Returns
+    /// [`WalGroupFlushBegin::Clean`] when everything appended is already durable.
+    ///
+    /// In-memory mode: advances the watermark (no IO exists to defer) and reports `Clean`.
+    ///
+    /// The caller must serialize group flushes (at most one outstanding job — the engine's
+    /// flusher-election does this); the job's `io_in_flight` mark excludes the INLINE
+    /// [`WalBuffer::flush_all`] path in the meantime.
+    pub fn begin_group_flush(&mut self) -> Result<WalGroupFlushBegin, EngineError> {
+        if self.fail_next_flush {
+            self.fail_next_flush = false;
+            return Err(EngineError::Durability(
+                "simulated wal flush failure".to_string(),
+            ));
+        }
+        let target = self.records.len();
+        let Some(core) = self.durable.as_ref() else {
+            self.flushed_memory = target;
+            return Ok(WalGroupFlushBegin::Clean {
+                flushed_records: target,
+            });
+        };
+        let mut state = core.lock_state();
+        debug_assert!(
+            !state.io_in_flight,
+            "at most one outstanding group flush job (the caller elects a single flusher)"
+        );
+        if let Some(reason) = state.poisoned.clone() {
+            return Err(core.poisoned_error(&reason));
+        }
+        let group_size = target.saturating_sub(state.flushed_records);
+        if group_size == 0 {
+            return Ok(WalGroupFlushBegin::Clean {
+                flushed_records: state.flushed_records,
+            });
+        }
+        core.ensure_created(&mut state)?;
+        let mut tail = Vec::new();
+        for record in &self.records[state.flushed_records..target] {
+            encode_record_into(&mut tail, record)?;
+        }
+        let file = state.file.clone().expect("append handle present");
+        state.io_in_flight = true;
+        Ok(WalGroupFlushBegin::Job(WalGroupFlushJob {
+            core: Arc::clone(core),
+            file,
+            bytes: tail,
+            target_records: target,
+            group_size,
+            completed: false,
+        }))
     }
 
     /// Valid, fsynced byte length of the live durable segment (0 for an in-memory buffer or
     /// before the first durable flush). The size-bound input for checkpoint/rotation policy.
     pub fn durable_segment_bytes(&self) -> u64 {
-        self.durable.as_ref().map_or(0, |d| d.durable_bytes)
+        self.durable
+            .as_ref()
+            .map_or(0, |core| core.lock_state().durable_bytes)
     }
 
     /// How many of the buffer's records are durable in an external checkpoint segment rather than
     /// the live segment file (see [`WalBuffer::truncate_durable_segment_prefix`]).
     pub fn durable_segment_base_records(&self) -> usize {
-        self.durable.as_ref().map_or(0, |d| d.segment_base_records)
+        self.durable
+            .as_ref()
+            .map_or(0, |core| core.lock_state().segment_base_records)
     }
 
     /// Discard the live segment's prefix up to `base` (a record index into this buffer) — the
@@ -564,70 +806,80 @@ impl WalBuffer {
     /// logical counters are unchanged — only the FILE is trimmed, so a long-lived database's live
     /// segment stays bounded by the checkpoint cadence instead of growing forever.
     pub fn truncate_durable_segment_prefix(&mut self, base: usize) -> Result<(), EngineError> {
-        let flushed = self.flushed;
-        let durable = self.durable.as_mut().ok_or_else(|| {
+        let core = self.durable.as_ref().ok_or_else(|| {
             EngineError::Durability(
                 "cannot truncate the segment prefix of an in-memory WAL buffer".to_string(),
             )
         })?;
+        // Wait out any in-flight group IO: the rewrite below replaces the file wholesale.
+        let mut state = core.lock_state_idle();
+        let flushed = state.flushed_records;
         if base > flushed {
             return Err(EngineError::Durability(format!(
                 "WAL segment prefix truncation boundary {base} exceeds the durable watermark \
                  {flushed}"
             )));
         }
-        if base < durable.segment_base_records {
+        if base < state.segment_base_records {
             return Err(EngineError::Durability(format!(
                 "WAL segment prefix truncation boundary {base} precedes the existing checkpoint \
                  base {}",
-                durable.segment_base_records
+                state.segment_base_records
             )));
         }
         // Close the old handle first: the rename below unlinks the inode it points at.
-        durable.file = None;
+        state.file = None;
         let retained = &self.records[base..flushed];
-        write_wal_segment(&durable.segment_path, retained)?;
-        sync_segment_parent_dir(&durable.segment_path)?;
+        write_wal_segment(&core.segment_path, retained)?;
+        sync_segment_parent_dir(&core.segment_path)?;
         let file = fs::OpenOptions::new()
             .append(true)
-            .open(&durable.segment_path)
+            .open(&core.segment_path)
             .map_err(|err| {
                 EngineError::Durability(format!(
                     "failed to reopen WAL segment after prefix truncation {}: {err}",
-                    durable.segment_path.display()
+                    core.segment_path.display()
                 ))
             })?;
-        durable.file = Some(file);
-        durable.durable_bytes =
+        state.file = Some(Arc::new(file));
+        state.durable_bytes =
             WAL_SEGMENT_MAGIC.len() as u64 + retained.iter().map(encoded_record_len).sum::<u64>();
-        durable.segment_base_records = base;
-        durable.poisoned = None;
-        durable.record_tail_offset()?;
+        state.segment_base_records = base;
+        state.poisoned = None;
+        core.record_tail_offset(&mut state)?;
         Ok(())
     }
 
     pub fn flushed_count(&self) -> usize {
-        self.flushed
+        match self.durable.as_ref() {
+            Some(core) => core.lock_state().flushed_records,
+            None => self.flushed_memory,
+        }
     }
 
     pub fn flushed_records(&self) -> &[WalRecord] {
-        &self.records[..self.flushed]
+        &self.records[..self.flushed_count()]
     }
 
     pub fn unflushed_count(&self) -> usize {
-        self.records.len().saturating_sub(self.flushed)
+        self.records.len().saturating_sub(self.flushed_count())
     }
 
     /// Group-commit accounting (fsync groups, durable records, largest group). See
     /// [`WalGroupCommitStats`].
     pub fn group_commit_stats(&self) -> WalGroupCommitStats {
-        self.group_commit
+        self.durable
+            .as_ref()
+            .map_or(WalGroupCommitStats::default(), |core| {
+                core.lock_state().stats
+            })
     }
 
     pub fn checkpoint_meta(&self) -> WalCheckpointMeta {
+        let flushed = self.flushed_count();
         WalCheckpointMeta {
-            durable_record_count: self.flushed,
-            last_durable_txn_id: self.flushed_records().last().map(|record| record.txn_id),
+            durable_record_count: flushed,
+            last_durable_txn_id: self.records[..flushed].last().map(|record| record.txn_id),
         }
     }
 

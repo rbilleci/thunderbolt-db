@@ -138,6 +138,7 @@ impl Engine {
                 txn_manager: TxnManager::default(),
             }),
             active_snapshots: Mutex::new(ActiveSnapshots::default()),
+            group_flush: GroupFlushState::default(),
             read_state: Arc::new(ReadState::new()),
             catalog_latch: Mutex::new(DdlCatalogState {
                 relational_catalog: BTreeMap::new(),

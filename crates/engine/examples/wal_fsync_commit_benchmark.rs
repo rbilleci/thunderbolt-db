@@ -9,9 +9,10 @@
 //!   2. **Durable, size-1 groups (Stage 1 today)** — commits through an `Engine::with_durable_wal_segment`.
 //!      The writer is serialized, so every commit drives its own `flush_all` => one fsync per commit
 //!      (group size 1). The delta vs. the baseline is the per-commit durability cost.
-//!   3. **Group-commit amortization (the Stage-4 shape)** — drives the `WalBuffer` directly: N records
-//!      appended, then ONE `flush_all` => a single fsync for N records (group size N). This is what a
-//!      designated flusher will achieve once Stage 4 lets multiple committers enqueue before a flush.
+//!   3. **Group-commit amortization** — drives the `WalBuffer` directly: N records appended, then
+//!      ONE `flush_all` => a single fsync for N records (group size N). The concurrent DML path's
+//!      designated flusher achieves this shape under real concurrency (see
+//!      `wal_group_commit_benchmark` for the end-to-end concurrent measurement).
 //!      Reported as the records-per-fsync ratio and the amortized per-record fsync cost.
 //!
 //! Run:  cargo run -p gpu_db_engine --example wal_fsync_commit_benchmark
