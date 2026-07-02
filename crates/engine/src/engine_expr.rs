@@ -2392,6 +2392,7 @@ impl Engine {
         old_rows: &[Vec<SqlValue>],
         new_rows: &[Vec<SqlValue>],
         commit_seq: Index,
+        row_id: Option<u64>,
     ) -> bool {
         // First slice: exactly one updated row (the OLTP update-by-key case); multi-row -> re-admit.
         if old_rows.len() != 1 || new_rows.len() != 1 {
@@ -2408,7 +2409,13 @@ impl Engine {
         //    reader (it sees exactly the OLD version, still live at its snapshot). If this fails AFTER the
         //    tombstone, the caller's re-admit rebuilds all-live from the host store (which already applied
         //    the version rewrite), superseding.
-        if !self.try_append_resident_int4_open_shard(table_name, new_rows, Some(commit_seq)) {
+        let row_ids: Option<Vec<u64>> = row_id.map(|id| vec![id]);
+        if !self.try_append_resident_int4_open_shard(
+            table_name,
+            new_rows,
+            Some(commit_seq),
+            row_ids.as_deref(),
+        ) {
             return false;
         }
         true

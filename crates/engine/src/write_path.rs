@@ -125,6 +125,10 @@ pub(crate) enum AppliedRowMutation {
         table: String,
         rows: Vec<Vec<SqlValue>>,
         write_set: WriteSet,
+        /// RETIREMENT A1: the installed rows' host identities (parsed from the delta's
+        /// `inserted_rows` keys — INSERT write-sets deliberately carry no row keys, so the delta is
+        /// the identity source). Parallel to `rows`.
+        row_ids: Vec<u64>,
     },
     Delete {
         table: String,

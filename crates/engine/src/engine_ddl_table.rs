@@ -1180,6 +1180,10 @@ impl Engine {
                 .residency
                 .shard_created_by_memory
                 .remove_table(name);
+            self.read_state
+                .residency
+                .shard_row_id_memory
+                .remove_table(name);
             // Sub-slice 3b: a DROPped table's cached per-shard PK indexes are gone for good -> purge them.
             self.read_state
                 .residency

@@ -316,6 +316,19 @@ pub(crate) const DELETED_BY_LIVE_FILL_BYTE: u8 = 0x7F;
 /// recompaction fill, mirroring [`DELETED_BY_LIVE_FILL_BYTE`].
 pub(crate) const CREATED_BY_VISIBLE_FILL_BYTE: u8 = 0x00;
 
+/// RETIREMENT A1: the row-identity region's UNSTAMPED sentinel — every byte 0xFF makes the u64
+/// `u64::MAX`, which no real `row_id` reaches (ids allocate monotonically from 1). A live slot
+/// reading the sentinel (or a shard with NO region — benchmark/synthetic installs) means "identity
+/// unknown": the device resolve declines to the host path. Headroom is born-sentinel so a skipped
+/// append stamp is DETECTABLE, never a wrong identity.
+pub(crate) const ROW_ID_UNSTAMPED_FILL_BYTE: u8 = 0xFF;
+
+/// RETIREMENT A1: parse the `row_id` out of a relational row key (`rel/{table}/{row_id:020}`).
+/// `None` on any malformed key -> the caller stamps the sentinel (identity unknown, never wrong).
+pub(crate) fn parse_relational_row_id(key: &str, prefix: &str) -> Option<u64> {
+    key.strip_prefix(prefix)?.parse::<u64>().ok()
+}
+
 /// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
 /// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
 /// slots. Each chunk lands EXACTLY where the capacity-aware read offsets expect it (column `c` at
@@ -2247,6 +2260,7 @@ mod capacity_payload_tests {
                     &[vec![SqlValue::Int4(130), SqlValue::Int4(1300)]],
                     &[vec![SqlValue::Int4(130), SqlValue::Int4(9999)]],
                     c0 + 1,
+                    None,
                 );
                 assert!(
                     ok,
@@ -2534,6 +2548,7 @@ mod capacity_payload_tests {
                 &[vec![SqlValue::Int4(130), SqlValue::Int4(1300)]],
                 &[vec![SqlValue::Int4(999), SqlValue::Int4(1300)]],
                 c0 + 1,
+                None,
             );
             assert!(ok, "the incremental key-moving UPDATE must fire");
         }
@@ -3334,6 +3349,126 @@ mod capacity_payload_tests {
         assert_eq!(got.len(), 2, "k=2 and k=3 match");
     }
 
+    /// RETIREMENT A1 — the DEVICE ROW-IDENTITY differential: for EVERY (shard, live slot) of a
+    /// resident table, the device `row_id` region's value derives the host key
+    /// (`rel/{table}/{row_id:020}`), and the host row FETCHED BY THAT KEY matches the device row's
+    /// values (per-slot DtoH of the int4 columns — the 3b gather pattern). Exercised across
+    /// ADMISSION (re-admit parse), IN-PLACE INSERT append, ROLLOVER, and the SV5 UPDATE append (the
+    /// appended slot must carry the ORIGINAL row's id — same key). NON-VACUITY: a sentinel at any
+    /// LIVE slot of a region-bearing shard FAILS (headroom is born-sentinel, so a skipped stamp is
+    /// detectable); a mis-stamped id fetches the WRONG host row -> value mismatch -> FAIL.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a1_device_row_identity_matches_host_store() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        // Admission + rollover lineage: 200 rows -> shards.
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        // SV5 UPDATE append: the new version must carry id-130's ORIGINAL row identity.
+        e.execute_text(300, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
+        // More in-place appends after the update.
+        e.execute_text(301, "INSERT INTO accounts (id, balance) VALUES (500, 5000), (501, 5010)")
+            .unwrap();
+        // Audit finding 1: the CONCURRENT insert stamp site (the production wave path) — identities
+        // parse from the re-validated delta at the append site.
+        e.execute_dml_concurrent(302, "INSERT INTO accounts (id, balance) VALUES (600, 6000), (601, 6010)")
+            .unwrap();
+        // Audit finding 2: a MULTI-ROW UPDATE bails the SV5 gate -> invalidate + RE-ADMIT -> the
+        // ADMISSION parse rebuilds every shard's region over the full row set.
+        e.execute_text(303, "UPDATE accounts SET balance = 1 WHERE id = 10 OR id = 11").unwrap();
+
+        let visibility = crate::StorageVisibility {
+            read_txn_id: e.committed_seq(),
+        };
+        let prefix = relational_key_prefix("accounts");
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let table_rows = e.read_state.mvcc.table_rows("accounts");
+        let shards = e.read_state.residency.shards.load().get("accounts").cloned().unwrap();
+        let mut checked = 0usize;
+        for shard in &shards {
+            let region = e
+                .read_state
+                .residency
+                .shard_row_id_memory
+                .get(&("accounts".to_string(), shard.shard_id))
+                .unwrap_or_else(|| {
+                    panic!("shard {} must carry a row-identity region", shard.shard_id)
+                });
+            let device_memory = e
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&("accounts".to_string(), shard.shard_id))
+                .unwrap();
+            let descriptor = e.resident_snapshot_for_shard(shard, &table);
+            for slot in 0..shard.row_count {
+                // Device row_id (two i32 halves, LE).
+                let halves = region.read_resident_i32_column(slot as u64 * 8, 2).unwrap();
+                let row_id =
+                    (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
+                assert_ne!(
+                    row_id,
+                    u64::MAX,
+                    "live slot {slot} of shard {} must be STAMPED (sentinel found)",
+                    shard.shard_id
+                );
+                // Device row values (per-slot DtoH, the 3b gather pattern).
+                let mut device_row = Vec::new();
+                for (idx, _col) in table.columns.iter().enumerate() {
+                    let base =
+                        crate::relational_model::resident_device_int4_column_offset(
+                            &descriptor,
+                            &table,
+                            idx,
+                        )
+                        .unwrap();
+                    let v = device_memory
+                        .read_resident_i32_column(base + slot as u64 * 4, 1)
+                        .unwrap();
+                    device_row.push(v[0]);
+                }
+                // Host row by the DERIVED key.
+                let key = relational_row_key("accounts", row_id);
+                assert!(key.starts_with(&prefix));
+                let tuple = table_rows
+                    .store()
+                    .tuple_fetch_by_key(&key, visibility)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!("derived key {key} (shard {} slot {slot}) must fetch a visible host row", shard.shard_id)
+                    });
+                let host_row = decode_relational_row(&tuple.value, &table.columns).unwrap();
+                for (idx, host_v) in host_row.iter().enumerate() {
+                    let host_i32 = match host_v {
+                        SqlValue::Int4(v) => *v,
+                        other => panic!("int4 table expected, got {other:?}"),
+                    };
+                    // The SV5-tombstoned OLD slot for id=130 still carries the ORIGINAL identity;
+                    // its host fetch returns the CURRENT version (balance 9999) while the device
+                    // slot holds the old bytes — identity equality is on the KEY, value equality
+                    // applies to the id column always and to balance only for non-superseded slots.
+                    if idx == 0 {
+                        assert_eq!(
+                            device_row[idx], host_i32,
+                            "shard {} slot {slot}: device id column must match the host row at the derived key",
+                            shard.shard_id
+                        );
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 202, "checked {checked} slots (admission + appends + update)");
+    }
+
     /// SLICE B (audit P2 regression gate): a MIXED-TYPE shard-resident table (text column) keeps the CPU
     /// pinned path for sortable projections — the sortable gate's shard arm requires a PURELY
     /// int4-section table because the unified exec source gathers only int4 sections; routing a text
@@ -3943,6 +4078,7 @@ impl Engine {
         let mut row_count = 0usize;
         let mut resident_bytes = 0u64;
         let mut resident_rows = Vec::new();
+        let mut resident_row_ids: Vec<u64> = Vec::new();
         let mut raw_device_tail = Vec::new();
         {
             let table_rows = self.read_state.mvcc.table_rows(table);
@@ -3954,6 +4090,13 @@ impl Engine {
                 raw_device_tail.extend_from_slice(tuple.key.as_bytes());
                 raw_device_tail.extend_from_slice(tuple.value.as_bytes());
                 let decoded = decode_relational_row(&tuple.value, &catalog_table.columns)?;
+                // RETIREMENT A1: the row's host identity, parsed from its key (sentinel on any
+                // malformed key — identity unknown is safe, wrong identity is not). Collected only
+                // when the sharded branch (the sole consumer) is reachable (audit finding 3).
+                if self.shard_residency_enabled() {
+                    resident_row_ids
+                        .push(parse_relational_row_id(&tuple.key, &prefix).unwrap_or(u64::MAX));
+                }
                 row_count += 1;
                 resident_bytes = resident_bytes
                     .saturating_add(tuple.key.len() as u64)
@@ -4149,6 +4292,24 @@ impl Engine {
                 .residency
                 .shard_created_by_memory
                 .remove_table(table);
+            // RETIREMENT A1: replace the row-identity regions with this rebuild's (parsed from the
+            // scanned tuple keys; capacity-sized, sentinel-filled headroom). Installed BEFORE the
+            // shard metadata publishes, mirroring the device-memory ordering. Allocation failure ->
+            // no region -> identity-unknown (device resolves decline; never a wrong identity).
+            read_state.residency.shard_row_id_memory.remove_table(table);
+            {
+                let mut payload =
+                    vec![ROW_ID_UNSTAMPED_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+                for (slot, row_id) in resident_row_ids.iter().enumerate() {
+                    payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
+                }
+                if let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) {
+                    read_state
+                        .residency
+                        .shard_row_id_memory
+                        .insert_shard(table, 0, region);
+                }
+            }
             // Sub-slice 3b: this sharded re-admit replaces the table's shards -> purge stale cached indexes.
             read_state.residency.purge_shard_pk_index_for_table(table);
             let dm = device_memory.expect("device_memory.is_some() checked");
@@ -4219,6 +4380,8 @@ impl Engine {
             .residency
             .shard_created_by_memory
             .remove_table(table);
+        // RETIREMENT A1: the row-identity regions follow the shards they annotate.
+        read_state.residency.shard_row_id_memory.remove_table(table);
         // Sub-slice 3b: the single-buffer path replaces the table's shards -> purge stale cached indexes.
         read_state.residency.purge_shard_pk_index_for_table(table);
         cat.relational_resident_cache.install_snapshot(
@@ -4605,16 +4768,25 @@ impl Engine {
         &self,
         table: &str,
         new_rows: &[Vec<SqlValue>],
+        // RETIREMENT A1: `row_ids` = the appended rows' host identities (parsed from the commit's
+        // write-set keys; an UPDATE append passes the ORIGINAL row's id). `None` = unknown (the
+        // benchmark/synthetic paths): existing regions stay sentinel at those slots and no region
+        // is created on rollover — identity-unknown, the device resolve declines.
         // SV6: `Some(commit_seq)` = the appended rows are a NEW VERSION an incremental UPDATE commit (SV5)
         // publishes BEFORE `publish_committed_seq`, so they MUST be stamped `created_by = commit_seq` (and
         // hidden from readers bound to an older snapshot) — the SV5 P2 double-read flip-gate. `None` = a
         // plain INSERT append: unstamped, born-visible (today's semantics; the milder premature-insert
         // form is an as-if-later read of a decided commit, not a mixed-state anomaly).
         created_by: Option<Index>,
+        row_ids: Option<&[u64]>,
     ) -> bool {
         if new_rows.is_empty() {
             return false;
         }
+        debug_assert!(
+            row_ids.is_none_or(|ids| ids.len() == new_rows.len()),
+            "row_ids must parallel new_rows"
+        );
         // Audit DO-NOT-SHIP fix: a NULL in an appended row would need a validity bitmap, but the open
         // shard this path appends into is bitmap-free by construction (the eligibility check below
         // requires `resident_device_null_columns.is_empty()`) and this append writes a NULL int4 as a
@@ -4640,7 +4812,7 @@ impl Engine {
             .get(table)
             .is_some_and(|shards| !shards.is_empty())
         {
-            return self.try_append_to_resident_open_shard(table, new_rows, created_by);
+            return self.try_append_to_resident_open_shard(table, new_rows, created_by, row_ids);
         }
         // SV6 defensive: a versioned (created_by-stamped) append is a SHARD-path concept — the single
         // unified buffer carries no per-row version regions, so decline and let the caller re-admit
@@ -4744,6 +4916,7 @@ impl Engine {
         table: &str,
         new_rows: &[Vec<SqlValue>],
         created_by: Option<Index>,
+        row_ids: Option<&[u64]>,
     ) -> bool {
         let pressured_gpus = self
             .router
@@ -4827,6 +5000,14 @@ impl Engine {
                 if !self.stamp_created_by_resident_shard_slots(
                     table, shard_id, row_count, k, capacity, gpu_id, commit_seq,
                 ) {
+                    return false;
+                }
+            }
+            // RETIREMENT A1: stamp the appended slots' host identities (get-or-skip: a region-less
+            // benchmark lineage skips; an identity-bearing shard gets exact stamps). Same
+            // before-the-bump ordering as the version stamps.
+            if let Some(ids) = row_ids {
+                if !self.stamp_row_id_resident_shard_slots(table, shard_id, row_count, ids) {
                     return false;
                 }
             }
@@ -4933,6 +5114,22 @@ impl Engine {
                 .residency
                 .shard_created_by_memory
                 .insert_shard(table, new_shard_id, created_region);
+        }
+        // RETIREMENT A1: the rolled shard's row-identity region (ids known -> exact stamps +
+        // sentinel headroom; unknown -> no region = identity-unknown), installed BEFORE the shard
+        // publishes, mirroring the version-region ordering.
+        if let Some(ids) = row_ids {
+            let mut payload =
+                vec![ROW_ID_UNSTAMPED_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
+            for (slot, row_id) in ids.iter().enumerate() {
+                payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
+            }
+            if let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) {
+                self.read_state
+                    .residency
+                    .shard_row_id_memory
+                    .insert_shard(table, new_shard_id, region);
+            }
         }
         // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard
         // in the shards list always finds its device memory (the recompaction loads the list then the memory).
@@ -5057,6 +5254,42 @@ impl Engine {
             })
             .collect();
         region.append_owned_chunks(chunks).is_ok()
+    }
+
+    /// RETIREMENT A1: stamp the row-identity region for `k` just-appended contiguous slots
+    /// `[first_slot, first_slot+k)` with the rows' `row_id`s. GET-OR-SKIP (not get-or-allocate):
+    /// a shard WITHOUT a region (benchmark/synthetic install — no host identity exists) skips
+    /// silently, keeping the absent-region = identity-unknown contract; a shard WITH one (admission
+    /// or rollover created it, sentinel-filled headroom) gets exact stamps. Runs BEFORE the
+    /// row_count bump (the slots are invisible headroom), same ordering as the version stamps.
+    fn stamp_row_id_resident_shard_slots(
+        &self,
+        table: &str,
+        shard_id: u32,
+        first_slot: usize,
+        row_ids: &[u64],
+    ) -> bool {
+        if row_ids.is_empty() {
+            return true;
+        }
+        let Some(region) = self
+            .read_state
+            .residency
+            .shard_row_id_memory
+            .get(&(table.to_string(), shard_id))
+        else {
+            return true; // no identity region on this shard lineage: nothing to keep consistent
+        };
+        let mut bytes = Vec::with_capacity(row_ids.len() * 8);
+        for row_id in row_ids {
+            bytes.extend_from_slice(&row_id.to_le_bytes());
+        }
+        region
+            .append_owned_chunks(vec![CudaOwnedDeviceMemoryChunk {
+                byte_offset: (first_slot as u64) * 8,
+                bytes,
+            }])
+            .is_ok()
     }
 
     /// SV6 (the SV5 `created_by` flip-gate): stamp `created_by[slot] = commit_seq` for the `k` just-appended

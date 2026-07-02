@@ -520,6 +520,17 @@ pub(crate) struct ResidencyReadState {
     /// bound to an OLDER snapshot cannot see the appended version (the SV5 P2 double-read window). Plain
     /// INSERT appends stay unstamped (born-visible, today's semantics).
     pub(crate) shard_created_by_memory: ShardResidentDeviceMemoryMap,
+    /// RETIREMENT A1 (ledger #2, option A — device-authoritative): the per-shard u64 ROW-IDENTITY
+    /// region, keyed `(table, shard_id)`, same lifecycle discipline as the version regions. Slot `s`
+    /// holds the row's host `row_id` (the key is derivable: `rel/{table}/{row_id:020}`), stamped at
+    /// admission (parsed from the scanned tuple keys) and on every append (parsed from the commit's
+    /// write-set keys; an UPDATE-appended version carries the ORIGINAL row's id — same key). The
+    /// UNSTAMPED sentinel is `u64::MAX` (a benchmark/synthetic install has no host identity; a
+    /// device resolve finding the sentinel declines to the host path). 8 B/row device cost —
+    /// ledgered; range-compression is a later optimization. This is what lets the device locate
+    /// yield the WriteDelta's `(tuple_id, key)` without the host store (A2), and becomes the row
+    /// identity the SI ledger keys on once the host store is deleted (A4/A5).
+    pub(crate) shard_row_id_memory: ShardResidentDeviceMemoryMap,
     /// ADR-009 R1: per-table GPU hash-index reuse cache for the index-probe point-lookup route (built
     /// lazily, behind the default-OFF `index_probe_enabled` flag). A plain `Mutex` (not the lock-free
     /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the

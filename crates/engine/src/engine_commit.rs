@@ -299,9 +299,16 @@ impl Engine {
             let handled = self.auto_admit_on_commit_enabled()
                 && to_apply.len() == 1
                 && match applied.as_ref() {
-                    Some(AppliedRowMutation::Insert { table, rows, .. }) => {
+                    Some(AppliedRowMutation::Insert {
+                        table,
+                        rows,
+                        row_ids,
+                        ..
+                    }) => {
                         // Plain INSERT appends are unstamped/born-visible (SV6 `created_by = None`).
-                        self.try_append_resident_int4_open_shard(table, rows, None)
+                        // RETIREMENT A1: identities ride the mutation (parsed from the delta's
+                        // installed keys — INSERT write-sets carry no row keys by design).
+                        self.try_append_resident_int4_open_shard(table, rows, None, Some(row_ids))
                     }
                     Some(AppliedRowMutation::Delete { table, rows, .. })
                         if self.resident_delete_tombstone_enabled() =>
@@ -312,9 +319,23 @@ impl Engine {
                         table,
                         old_rows,
                         new_rows,
-                        ..
-                    }) if self.resident_update_tombstone_enabled() => self
-                        .try_update_resident_commit(cat, table, old_rows, new_rows, publish_index),
+                        write_set,
+                    }) if self.resident_update_tombstone_enabled() => {
+                        // RETIREMENT A1: the appended new version keeps the ORIGINAL row's identity
+                        // (same key) — parsed from the single-row write-set.
+                        let prefix = relational_key_prefix(table);
+                        let row_id = write_set.rows.first().and_then(|row| {
+                            crate::engine_residency::parse_relational_row_id(&row.row_key, &prefix)
+                        });
+                        self.try_update_resident_commit(
+                            cat,
+                            table,
+                            old_rows,
+                            new_rows,
+                            publish_index,
+                            row_id,
+                        )
+                    }
                     _ => false,
                 };
             if !handled {
@@ -508,6 +529,11 @@ impl Engine {
             .residency
             .shard_created_by_memory
             .invalidate_table(table);
+            // RETIREMENT A1: the row-identity region follows the buffer it annotates.
+            self.read_state
+                .residency
+                .shard_row_id_memory
+                .invalidate_table(table);
         // Sub-slice 3b: drop the table's cached per-shard PK indexes (they pin stale buffers).
         self.read_state
             .residency
@@ -548,6 +574,11 @@ impl Engine {
             self.read_state
                 .residency
                 .shard_created_by_memory
+                .invalidate_table(table);
+            // RETIREMENT A1: the row-identity region follows the buffer it annotates.
+            self.read_state
+                .residency
+                .shard_row_id_memory
                 .invalidate_table(table);
             // Sub-slice 3b: drop the table's cached per-shard PK indexes.
             self.read_state
@@ -680,6 +711,11 @@ impl Engine {
             self.read_state
                 .residency
                 .shard_created_by_memory
+                .invalidate_table(table);
+            // RETIREMENT A1: the row-identity region follows the buffer it annotates.
+            self.read_state
+                .residency
+                .shard_row_id_memory
                 .invalidate_table(table);
             // Sub-slice 3b: drop the pressured table's cached per-shard PK indexes.
             self.read_state
@@ -900,13 +936,14 @@ impl Engine {
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(cat, alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(cat, comment)?,
             Command::Insert(insert) => {
-                applied =
-                    self.apply_insert(cat, insert, commit_seq)?
-                        .map(|(table, rows, write_set)| AppliedRowMutation::Insert {
-                            table,
-                            rows,
-                            write_set,
-                        });
+                applied = self.apply_insert(cat, insert, commit_seq)?.map(
+                    |(table, rows, write_set, row_ids)| AppliedRowMutation::Insert {
+                        table,
+                        rows,
+                        write_set,
+                        row_ids,
+                    },
+                );
             }
             Command::Delete(delete) => {
                 applied =

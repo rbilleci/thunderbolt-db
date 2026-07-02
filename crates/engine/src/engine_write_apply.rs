@@ -213,7 +213,7 @@ impl Engine {
         insert: Insert,
         txn_id: TxnId,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet)>, EngineError> {
+    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, WriteSet, Vec<u64>)>, EngineError> {
         // Stage 2 split: PURE prepare (preflight + encode + write-set) then a `&mut self` install,
         // both under the existing commit lock so the result is byte-identical to the old direct
         // apply. `txn_id` is the commit-seq (== `entry.index`), used as BOTH the read boundary and
@@ -232,14 +232,26 @@ impl Engine {
                 table,
                 inserted_rows,
                 ..
-            } => Some((
-                table.clone(),
-                inserted_rows
-                    .iter()
-                    .map(|(_key, values)| values.clone())
-                    .collect(),
-                delta.write_set.clone(),
-            )),
+            } => {
+                let prefix = relational_key_prefix(table);
+                Some((
+                    table.clone(),
+                    inserted_rows
+                        .iter()
+                        .map(|(_key, values)| values.clone())
+                        .collect(),
+                    delta.write_set.clone(),
+                    // RETIREMENT A1: identities from the DELTA's keys (the installed keys — the
+                    // serialized prepare runs under the commit lock, so predicted == installed).
+                    inserted_rows
+                        .iter()
+                        .map(|(key, _)| {
+                            crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                .unwrap_or(u64::MAX)
+                        })
+                        .collect(),
+                ))
+            }
             _ => None,
         };
         self.apply_delta_serialized(cat, delta, txn_id, profile)?;
