@@ -75,6 +75,16 @@ apply-skip, plus preflight validators. tuple_ids for elided tables are never mat
 artifact; WAL replay re-derives — fine). Implementation order: (i) elided set + apply-skip + A2/A3
 materializer switch + rehydration ladder, ONE flag; (ii) re-admit via A4c gather; (iii) SLO measure.
 
+A4e STATUS (2026-07-02, LOCAL commits c7942b50+, NOT pushed): serialized-path lifecycle DONE + twin
+differential green; GAP-1 CLOSED (concurrent DML delegates elided tables to the serialized path — safe
+but serializing). REMAINING before audit+push: (1) HONEST SLO A/B (auto_admit ON in BOTH arms; verify
+zero de-elisions in steady state — the first A/B was confounded AND thrashed through the pre-guard
+GAP-1: 13.9k vs 40.3k baseline); (2) the real SLO lever = CONCURRENT-NATIVE elision hooks (elide-entry +
+rehydrate-on-unhandled in the wave commit arm) — without them elided tables serialize and the >100k
+target is unreachable; (3) full GPU sweep + opus audit (angles: rehydration reconciliation correctness,
+the decline-seam coverage (empty value-index = wrong-empties), synthetic tuple_id containment, the
+elide-entry eligibility, GAP-1 guard) + rebase + push. THEN THE USER-GATED A5 PAUSE.
+
 START: A4e — the ELISION. For ELIGIBLE tables (strictly-Int4, null-free, shard-resident,
 identity-complete): commits SKIP the host value_index insert + tuple install; the A2 resolve + A3
 validator fetches switch from `tuple_fetch_by_key` to the A4a materializer; re-admit + the NULL/de-elision
