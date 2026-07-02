@@ -115,23 +115,40 @@ pub(crate) enum PreparedMutation {
 
 /// The row-level mutation a single committed log entry applied, surfaced by `apply_mvcc_entry` so the
 /// commit path can maintain GPU residency INCREMENTALLY for a single-entry commit (INSERT=append,
-/// DELETE=tombstone, UPDATE=tombstone old + append new) instead of the O(table) invalidate + re-admit.
-/// `None` for every other command.
+/// DELETE=tombstone, UPDATE=tombstone old + append new) instead of the O(table) invalidate + re-admit,
+/// and record the applied [`WriteSet`] into the SI recent-commits ledger (C2, write-path assessment:
+/// the ledger must see SERIALIZED-path writes too, or a concurrent committer validating against an
+/// older snapshot silently misses them — a lost update). `None` for every other command.
 #[derive(Debug, Clone)]
 pub(crate) enum AppliedRowMutation {
     Insert {
         table: String,
         rows: Vec<Vec<SqlValue>>,
+        write_set: WriteSet,
     },
     Delete {
         table: String,
         rows: Vec<Vec<SqlValue>>,
+        write_set: WriteSet,
     },
     Update {
         table: String,
         old_rows: Vec<Vec<SqlValue>>,
         new_rows: Vec<Vec<SqlValue>>,
+        write_set: WriteSet,
     },
+}
+
+impl AppliedRowMutation {
+    /// The `(table, row-key)` + unique-slot conflict footprint the apply installed — exactly the
+    /// prepare-computed [`WriteSet`] of the underlying delta, for SI ledger recording.
+    pub(crate) fn write_set(&self) -> &WriteSet {
+        match self {
+            Self::Insert { write_set, .. }
+            | Self::Delete { write_set, .. }
+            | Self::Update { write_set, .. } => write_set,
+        }
+    }
 }
 
 /// A prepared (but not yet installed) write: the [`WriteSet`] for conflict detection plus the
