@@ -342,11 +342,15 @@ pub(crate) struct ColumnValueKey {
 pub(crate) struct TableVersionData {
     pub(crate) rows: InMemoryTupleStore,
     // Persistent immutable ordered map (`imbl::OrdMap`): O(1) clone (so `with_table_mut`'s per-commit
-    // `TableVersionData::clone` no longer deep-copies every `Vec<String>`) and O(log n)
-    // structurally-shared update. Each slot's row-key list is `Arc`-wrapped, so a clone shares lists
-    // until one is mutated, at which point `Arc::make_mut` copies ONLY that list (copy-on-write).
-    // Iteration stays in `ColumnValueKey` order, matching the old `BTreeMap`.
-    pub(crate) value_index: imbl::OrdMap<ColumnValueKey, std::sync::Arc<Vec<String>>>,
+    // `TableVersionData::clone` no longer deep-copies every slot) and O(log n) structurally-shared
+    // update. Each slot is itself a PERSISTENT `imbl::Vector` (phase-D ledger #6 root-cause fix):
+    // the previous `Arc<Vec<String>>` slots copy-on-wrote WHOLESALE — a single-row INSERT into a
+    // low-cardinality column (every row sharing one value, e.g. a status flag) cloned that value's
+    // ENTIRE row-key list under the commit_mutex, making the commit critical section O(rows with
+    // that value) — measured 47µs→4ms/commit as a table grew 2k→100k rows. A `Vector` append is
+    // O(log n) with structural sharing, so the per-commit cost is O(k·log n) REGARDLESS of slot
+    // fan-in. Iteration order (OrdMap by key, Vector by insertion) is unchanged.
+    pub(crate) value_index: imbl::OrdMap<ColumnValueKey, imbl::Vector<String>>,
 }
 
 impl TableVersionData {
@@ -359,7 +363,7 @@ impl TableVersionData {
                 column: column.to_string(),
                 value: value.to_string(),
             })
-            .map(|keys| keys.as_ref().clone())
+            .map(|keys| keys.iter().cloned().collect())
             .unwrap_or_default()
     }
 }
@@ -548,7 +552,7 @@ impl MvccData {
                         column: key.column.clone(),
                         value: key.value.clone(),
                     },
-                    row_keys.as_ref().clone(),
+                    row_keys.iter().cloned().collect(),
                 );
             }
         }
