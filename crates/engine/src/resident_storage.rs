@@ -234,7 +234,7 @@ impl ShardResidentDeviceMemoryMap {
     pub(crate) fn install_table_shards(
         &self,
         table: &str,
-        device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
+        device_memory: BTreeMap<u32, Arc<CudaResidentDeviceMemory>>,
     ) {
         let snapshot = self.cells.load();
         let prior_ids: Vec<u32> = snapshot
@@ -251,7 +251,7 @@ impl ShardResidentDeviceMemoryMap {
         }
         let mut new_cells: BTreeMap<(String, u32), ResidentDeviceMemoryCell> = BTreeMap::new();
         for (shard_id, memory) in device_memory {
-            let owner = Some(Arc::new(memory));
+            let owner = Some(memory);
             let key = (table.to_string(), shard_id);
             if let Some(cell) = snapshot.get(&key) {
                 cell.publish(owner);
@@ -273,9 +273,9 @@ impl ShardResidentDeviceMemoryMap {
         &self,
         table: &str,
         shard_id: u32,
-        memory: CudaResidentDeviceMemory,
+        memory: Arc<CudaResidentDeviceMemory>,
     ) {
-        let owner = Some(Arc::new(memory));
+        let owner = Some(memory);
         let key = (table.to_string(), shard_id);
         if let Some(cell) = self.cells.load().get(&key) {
             cell.publish(owner);
@@ -714,7 +714,7 @@ pub(crate) struct RelationalResidentRouteExecutionObservation {
     pub(crate) wall_micros: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct RelationalResidentShard {
     pub(crate) shard_id: u32,
     pub(crate) row_start: usize,
@@ -757,7 +757,71 @@ pub(crate) struct RelationalResidentShard {
     pub(crate) invalidated_at_index: Option<Index>,
     pub(crate) invalidated_by_memory_pressure: bool,
     pub(crate) memory_pressure_active: bool,
+    /// ADR-013 pre2 (D4, generation-atomic publication): the shard's device RESOURCES travel WITH the
+    /// published descriptor — ONE `shards.load()` yields (metadata, buffer, version/identity regions)
+    /// as a generation-consistent, `Arc`-pinned snapshot. Readers must take resources from THESE
+    /// fields, never from a later side-map `.get()` (the load pairing a stale descriptor with a
+    /// republished buffer — or a version-free check with purged regions — is the D4 wrong-results
+    /// class). The side maps remain the WRITE-side bookkeeping (alloc/stamp/purge); every structural
+    /// resource change republishes the descriptor with the new `Arc` under the commit lock. In-place
+    /// CONTENT mutations (stamping slots inside an existing region) need no republish — the published
+    /// `Arc` aliases the same device buffer.
+    pub(crate) device_memory: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(crate) deleted_by_region: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(crate) created_by_region: Option<Arc<CudaResidentDeviceMemory>>,
+    pub(crate) row_id_region: Option<Arc<CudaResidentDeviceMemory>>,
+    /// ADR-013 pre1 (D3, stamp-all-appends): monotone per-shard HIGH-WATER of `created_by` stamps
+    /// (0 = no stamped slot). A reader at `s >= max_created_by` sees every row of this shard as
+    /// born-visible — a created_by-only shard is then EFFECTIVELY VERSION-FREE for that reader (the
+    /// fast paths and reshaping shapes stay served at the newest boundary); only a reader pinned
+    /// inside an append window takes the gated path. Bumped stamp-first, published with the same
+    /// `with_shards_mut` store that publishes the appended `row_count`.
+    pub(crate) max_created_by: u64,
 }
+
+impl PartialEq for RelationalResidentShard {
+    fn eq(&self, other: &Self) -> bool {
+        // Resources compare by GENERATION IDENTITY (Arc pointer), not content: two descriptors are
+        // equal iff they describe the same metadata over the same published device objects.
+        fn arc_ident(
+            a: &Option<Arc<CudaResidentDeviceMemory>>,
+            b: &Option<Arc<CudaResidentDeviceMemory>>,
+        ) -> bool {
+            match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+        }
+        self.shard_id == other.shard_id
+            && self.row_start == other.row_start
+            && self.row_count == other.row_count
+            && self.capacity == other.capacity
+            && self.int4_appendable == other.int4_appendable
+            && self.resident_device_int4_column_stats == other.resident_device_int4_column_stats
+            && self.resident_bytes == other.resident_bytes
+            && self.allocated_bytes == other.allocated_bytes
+            && self.count_header_byte_offset == other.count_header_byte_offset
+            && self.resident_device_int4_columns == other.resident_device_int4_columns
+            && self.resident_device_text_columns == other.resident_device_text_columns
+            && self.resident_device_null_columns == other.resident_device_null_columns
+            && self.gpu_id == other.gpu_id
+            && self.schema == other.schema
+            && self.table == other.table
+            && self.device_memory_proof == other.device_memory_proof
+            && self.invalidated_by_txn_id == other.invalidated_by_txn_id
+            && self.invalidated_at_index == other.invalidated_at_index
+            && self.invalidated_by_memory_pressure == other.invalidated_by_memory_pressure
+            && self.memory_pressure_active == other.memory_pressure_active
+            && arc_ident(&self.device_memory, &other.device_memory)
+            && arc_ident(&self.deleted_by_region, &other.deleted_by_region)
+            && arc_ident(&self.created_by_region, &other.created_by_region)
+            && arc_ident(&self.row_id_region, &other.row_id_region)
+            && self.max_created_by == other.max_created_by
+    }
+}
+
+impl Eq for RelationalResidentShard {}
 
 impl RelationalResidentShard {
     pub(crate) fn is_valid(&self, memory_pressure_active: bool) -> bool {
@@ -836,9 +900,17 @@ impl RelationalResidentCache {
         &self,
         table: String,
         shards: Vec<RelationalResidentShard>,
-        device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
+        device_memory: BTreeMap<u32, Arc<CudaResidentDeviceMemory>>,
         residency: &ResidencyReadState,
     ) {
+        // D4 (ADR-013 pre2): this is the ENFORCEMENT POINT — every published descriptor carries the
+        // SAME `Arc` the side map publishes, so one `shards.load()` is a generation-consistent
+        // snapshot of (metadata, buffer). A descriptor whose shard_id is missing from the map keeps
+        // `None` (never published half-armed).
+        let mut shards = shards;
+        for shard in &mut shards {
+            shard.device_memory = device_memory.get(&shard.shard_id).cloned();
+        }
         residency
             .shard_device_memory
             .install_table_shards(&table, device_memory);

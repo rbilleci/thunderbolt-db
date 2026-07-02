@@ -794,11 +794,9 @@ impl Engine {
             let descriptor = self.resident_snapshot_for_shard(shard, table);
             let filter_offset =
                 resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
-            let device_memory = self
-                .read_state
-                .residency
-                .shard_device_memory
-                .get(&(table.name.clone(), shard.shard_id))?;
+            // D4 (ADR-013 pre2): the buffer rides the loaded descriptor — the SAME generation as
+            // the metadata/zone-map this loop already read (no second map load to race a re-admit).
+            let device_memory = shard.device_memory.clone()?;
             // Sub-slice 3: probe the CACHED per-shard hash+bloom index (built once per shard generation,
             // ptr-validated) instead of a per-lookup DtoH + rebuild. Bloom-prunes then hash-probes.
             match self.probe_shard_pk_index_cached(
@@ -811,24 +809,13 @@ impl Engine {
                 key,
             ) {
                 ShardPkProbe::Hit(row) => {
-                    // Capture the deleted_by + created_by regions (if versioned) from the SAME snapshot ->
-                    // the visibility gates read `deleted_by[slot]`/`created_by[slot]` aligned to the SAME
-                    // generation as the slot + buffer.
-                    let deleted_by = self
-                        .read_state
-                        .residency
-                        .shard_deleted_by_memory
-                        .get(&(table.name.clone(), shard.shard_id));
-                    let created_by = self
-                        .read_state
-                        .residency
-                        .shard_created_by_memory
-                        .get(&(table.name.clone(), shard.shard_id));
-                    let row_id = self
-                        .read_state
-                        .residency
-                        .shard_row_id_memory
-                        .get(&(table.name.clone(), shard.shard_id));
+                    // D4: the regions ride the SAME loaded descriptor as the buffer — the
+                    // visibility gates read `deleted_by[slot]`/`created_by[slot]` aligned to the
+                    // SAME generation as the slot + buffer, by construction (previously three
+                    // separate map loads could straddle a republish).
+                    let deleted_by = shard.deleted_by_region.clone();
+                    let created_by = shard.created_by_region.clone();
+                    let row_id = shard.row_id_region.clone();
                     out.push(ShardPkHit {
                         shard_id: shard.shard_id,
                         slot: row,
@@ -1066,11 +1053,8 @@ impl Engine {
             let descriptor = self.resident_snapshot_for_shard(shard, table);
             let filter_offset =
                 resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
-            let device_memory = self
-                .read_state
-                .residency
-                .shard_device_memory
-                .get(&(table.name.clone(), shard.shard_id))?;
+            // D4: the buffer rides the loaded descriptor (one-snapshot capture).
+            let device_memory = shard.device_memory.clone()?;
             let mut hits: Vec<(u32, u32)> = Vec::new();
             let ok = self.probe_shard_pk_index_cached_batch(
                 &table.name,
@@ -1091,16 +1075,9 @@ impl Engine {
             for &(ni, _) in &hits {
                 hit_shard_count[ni as usize] += 1;
             }
-            let deleted_by = self
-                .read_state
-                .residency
-                .shard_deleted_by_memory
-                .get(&(table.name.clone(), shard.shard_id));
-            let created_by = self
-                .read_state
-                .residency
-                .shard_created_by_memory
-                .get(&(table.name.clone(), shard.shard_id));
+            // D4: regions from the SAME loaded descriptor as the buffer.
+            let deleted_by = shard.deleted_by_region.clone();
+            let created_by = shard.created_by_region.clone();
             groups.push(BatchShardGroup {
                 descriptor,
                 device_memory,
@@ -1397,29 +1374,16 @@ impl Engine {
             // in this published-order scan, so the `deleted_by` arm always declines the batch no later
             // than this one could). It becomes LOAD-BEARING the moment `deleted_by` regions can be
             // reclaimed independently (VACUUM/GC, scalability-ledger #5) — do NOT remove it then.
-            if self
-                .read_state
-                .residency
-                .shard_deleted_by_memory
-                .get(&(table.name.clone(), shard.shard_id))
-                .is_some()
-                || self
-                    .read_state
-                    .residency
-                    .shard_created_by_memory
-                    .get(&(table.name.clone(), shard.shard_id))
-                    .is_some()
-            {
+            // D4: read the version-freeness from the SAME loaded descriptor the batch will probe —
+            // a concurrent re-admit purging the side maps can no longer fake version-freeness here.
+            if shard.deleted_by_region.is_some() || shard.created_by_region.is_some() {
                 return None;
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
             let filter_offset =
                 resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
-            let device_memory = self
-                .read_state
-                .residency
-                .shard_device_memory
-                .get(&(table.name.clone(), shard.shard_id))?;
+            // D4: the buffer rides the loaded descriptor (one-snapshot capture).
+            let device_memory = shard.device_memory.clone()?;
             let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
                 &table.name,
                 shard.shard_id,

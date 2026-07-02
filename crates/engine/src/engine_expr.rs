@@ -2242,11 +2242,8 @@ impl Engine {
             if !shard.is_valid(memory_pressure_active) {
                 return None;
             }
-            let device_memory = self
-                .read_state
-                .residency
-                .shard_device_memory
-                .get(&(table.name.clone(), shard.shard_id))?;
+            // D4: the buffer rides the loaded descriptor (generation-consistent by construction).
+            let device_memory = shard.device_memory.clone()?;
             // The per-shard descriptor is capacity-strided + row_count-sized to THIS shard's buffer
             // (`resident_snapshot_for_shard`), so the predicate reads the shard's int4 columns at the right
             // offsets and returns slots LOCAL to `[0, row_count)`.
@@ -2547,17 +2544,15 @@ impl Engine {
                         shard.shard_id
                     ))));
                 }
-                let device_memory = self
-                    .read_state
-                    .residency
-                    .shard_device_memory
-                    .get(&(table.name.clone(), shard.shard_id))
-                    .ok_or_else(|| {
-                        ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "resident shard {} has no retained device memory",
-                            shard.shard_id
-                        )))
-                    })?;
+                // D4 (ADR-013 pre2): the buffer rides the loaded descriptor — the SAME generation
+                // as the metadata by construction (no second map load to pair a stale descriptor
+                // with a republished buffer).
+                let device_memory = shard.device_memory.clone().ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident shard {} has no retained device memory",
+                        shard.shard_id
+                    )))
+                })?;
                 Ok(ResidentExecSource {
                     descriptor: Arc::new(self.resident_snapshot_for_shard(shard, table)),
                     device_memory,
@@ -2575,19 +2570,11 @@ impl Engine {
         // allocation. A versioned or multi-shard survivor set takes the recompaction below unchanged.
         if shards.len() == 1 {
             let shard = &shards[0];
-            let key = (table.name.clone(), shard.shard_id);
-            let version_free = self
-                .read_state
-                .residency
-                .shard_deleted_by_memory
-                .get(&key)
-                .is_none()
-                && self
-                    .read_state
-                    .residency
-                    .shard_created_by_memory
-                    .get(&key)
-                    .is_none();
+            // D4: the version-free check reads the SAME loaded descriptor the buffer came from — a
+            // concurrent re-admit purging the side maps can no longer fake version-freeness for a
+            // reader still holding the old (tombstone-bearing) generation (the resurrection race).
+            let version_free =
+                shard.deleted_by_region.is_none() && shard.created_by_region.is_none();
             if version_free {
                 let src = source_for(shard)?;
                 return Ok(ShardedUnifiedExecSource {
@@ -2679,23 +2666,22 @@ impl Engine {
         // "visible" sentinel (covers un-versioned shards' rows + any tail), then one DtoD segment per
         // region-bearing shard overwrites its own live rows. `rows_before` walks shards in the SAME
         // published order the int4 gather used, so the version rows line up 1:1 with the int4 rows.
-        for (region_map, fill_byte, offset_out) in [
+        // D4: regions come from the SAME loaded descriptors as the buffers/metadata — one snapshot.
+        type RegionOf = fn(&RelationalResidentShard) -> Option<&Arc<CudaResidentDeviceMemory>>;
+        let region_axes: [(RegionOf, u8, &mut Option<u64>); 2] = [
             (
-                &self.read_state.residency.shard_deleted_by_memory,
+                |shard| shard.deleted_by_region.as_ref(),
                 crate::engine_residency::DELETED_BY_LIVE_FILL_BYTE,
                 &mut deleted_by_offset,
             ),
             (
-                &self.read_state.residency.shard_created_by_memory,
+                |shard| shard.created_by_region.as_ref(),
                 crate::engine_residency::CREATED_BY_VISIBLE_FILL_BYTE,
                 &mut created_by_offset,
             ),
-        ] {
-            let has_region = shards.iter().any(|shard| {
-                region_map
-                    .get(&(table.name.clone(), shard.shard_id))
-                    .is_some()
-            });
+        ];
+        for (region_of, fill_byte, offset_out) in region_axes {
+            let has_region = shards.iter().any(|shard| region_of(shard).is_some());
             if !has_region {
                 continue;
             }
@@ -2709,7 +2695,7 @@ impl Engine {
             let mut rows_before = 0_u64;
             for shard in &shards {
                 let row_count = shard.row_count as u64;
-                if let Some(region) = region_map.get(&(table.name.clone(), shard.shard_id)) {
+                if let Some(region) = region_of(shard) {
                     segments.push(gpu_db_execution::RecompactSegment {
                         src_device_ptr: region.device_ptr(),
                         src_byte_offset: 0,
@@ -2910,19 +2896,10 @@ impl Engine {
         if matches!(select.projection, SelectProjection::CountAll) && predicate.is_none() {
             let shards_guard = self.read_state.residency.shards.load();
             if let Some(shards) = shards_guard.get(&table.name) {
+                // D4: read the version-freeness from the SAME loaded descriptors being summed —
+                // the metadata COUNT can no longer pair an old shard list with freshly-purged maps.
                 let version_free = shards.iter().all(|shard| {
-                    let key = (table.name.clone(), shard.shard_id);
-                    self.read_state
-                        .residency
-                        .shard_deleted_by_memory
-                        .get(&key)
-                        .is_none()
-                        && self
-                            .read_state
-                            .residency
-                            .shard_created_by_memory
-                            .get(&key)
-                            .is_none()
+                    shard.deleted_by_region.is_none() && shard.created_by_region.is_none()
                 });
                 if version_free && !shards.is_empty() {
                     let total: i64 = shards.iter().map(|s| s.row_count as i64).sum();

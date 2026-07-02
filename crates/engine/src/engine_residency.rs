@@ -5427,22 +5427,27 @@ impl Engine {
             // shard metadata publishes, mirroring the device-memory ordering. Allocation failure ->
             // no region -> identity-unknown (device resolves decline; never a wrong identity).
             read_state.residency.shard_row_id_memory.remove_table(table);
-            {
+            // D4: keep the region Arc so the published descriptor carries it (one-load snapshot).
+            let admitted_row_id_region = {
                 let mut payload =
                     vec![ROW_ID_UNSTAMPED_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
                 for (slot, row_id) in resident_row_ids.iter().enumerate() {
                     payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
                 }
-                if let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) {
+                let region = self
+                    .relational_residency_device_memory(gpu_id, &payload)
+                    .map(Arc::new);
+                if let Some(region) = &region {
                     read_state
                         .residency
                         .shard_row_id_memory
-                        .insert_shard(table, 0, region);
+                        .insert_shard(table, 0, Arc::clone(region));
                 }
-            }
+                region
+            };
             // Sub-slice 3b: this sharded re-admit replaces the table's shards -> purge stale cached indexes.
             read_state.residency.purge_shard_pk_index_for_table(table);
-            let dm = device_memory.expect("device_memory.is_some() checked");
+            let dm = Arc::new(device_memory.expect("device_memory.is_some() checked"));
             let shard = RelationalResidentShard {
                 shard_id: 0,
                 row_start: 0,
@@ -5482,6 +5487,13 @@ impl Engine {
                 invalidated_at_index: None,
                 invalidated_by_memory_pressure: memory_pressure_active,
                 memory_pressure_active,
+                // D4 (ADR-013 pre2): resources ride the descriptor. A (re-)admission rebuilds from
+                // VISIBLE rows only -> all-live, no version regions, hwm 0.
+                device_memory: Some(Arc::clone(&dm)),
+                deleted_by_region: None,
+                created_by_region: None,
+                row_id_region: admitted_row_id_region,
+                max_created_by: 0,
             };
             let mut shard_memory = BTreeMap::new();
             shard_memory.insert(0_u32, dm);
@@ -6315,12 +6327,43 @@ impl Engine {
         // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
         // `deleted_by` is on-demand (allocated in `shard_deleted_by_memory` on the shard's first delete).
         let Some(new_device_memory) =
-            self.relational_residency_device_memory(gpu_id, &device_payload)
+            self
+                .relational_residency_device_memory(gpu_id, &device_payload)
+                .map(Arc::new)
         else {
             return false;
         };
         let new_shard_id = max_shard_id.saturating_add(1);
         let pressured = pressured_gpus.contains(&gpu_id);
+        // D4 (ADR-013 pre2): build the regions BEFORE the descriptor literal so their Arcs ride the
+        // published descriptor — the map inserts below keep the same Arcs for write-side bookkeeping.
+        // SV6: a version-stamped (UPDATE-appended) rollover's created_by region must be observable
+        // with the shard itself; carrying it IN the descriptor makes that atomic by construction.
+        let rolled_created_by_region = if let Some(commit_seq) = created_by {
+            let mut created_payload =
+                vec![CREATED_BY_VISIBLE_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
+            for slot in 0..k {
+                created_payload[slot * 8..slot * 8 + 8].copy_from_slice(&commit_seq.to_le_bytes());
+            }
+            let Some(created_region) =
+                self.relational_residency_device_memory(gpu_id, &created_payload)
+            else {
+                return false;
+            };
+            Some(Arc::new(created_region))
+        } else {
+            None
+        };
+        let rolled_row_id_region = if let Some(ids) = &row_ids {
+            let mut payload =
+                vec![ROW_ID_UNSTAMPED_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
+            for (slot, row_id) in ids.iter().enumerate() {
+                payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
+            }
+            self.relational_residency_device_memory(gpu_id, &payload).map(Arc::new)
+        } else {
+            None
+        };
         let new_shard = RelationalResidentShard {
             shard_id: new_shard_id,
             row_start: row_start.saturating_add(row_count),
@@ -6343,44 +6386,30 @@ impl Engine {
             invalidated_at_index: None,
             invalidated_by_memory_pressure: pressured,
             memory_pressure_active: pressured,
+            // D4: the descriptor IS the one-load snapshot — buffer + regions ride it. First `k`
+            // created_by slots = `commit_seq`; the headroom keeps the born-visible fill for now
+            // (D3 stamps later appends into it via stamp_created_by_resident_shard_slots).
+            device_memory: Some(Arc::clone(&new_device_memory)),
+            deleted_by_region: None,
+            created_by_region: rolled_created_by_region.clone(),
+            row_id_region: rolled_row_id_region.clone(),
+            max_created_by: created_by.unwrap_or(0),
         };
-        // SV6: a version-stamped (UPDATE-appended) rollover installs the NEW shard's `created_by` region
-        // BEFORE the shard's device memory + metadata publish — a reader that observes the new shard in the
-        // shards list must also observe its created_by region, else the appended version would read
-        // born-visible at an older snapshot (the double-read window). First `k` slots = `commit_seq`;
-        // the headroom stays the born-visible fill (0) so later plain INSERT appends keep today's semantics.
-        if let Some(commit_seq) = created_by {
-            let mut created_payload =
-                vec![CREATED_BY_VISIBLE_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
-            for slot in 0..k {
-                created_payload[slot * 8..slot * 8 + 8].copy_from_slice(&commit_seq.to_le_bytes());
-            }
-            let Some(created_region) =
-                self.relational_residency_device_memory(gpu_id, &created_payload)
-            else {
-                return false;
-            };
-            self.read_state
-                .residency
-                .shard_created_by_memory
-                .insert_shard(table, new_shard_id, created_region);
+        // Write-side bookkeeping mirrors of the SAME Arcs (alloc/stamp/purge choreography unchanged);
+        // readers take them from the published descriptor above.
+        if let Some(created_region) = rolled_created_by_region {
+            self.read_state.residency.shard_created_by_memory.insert_shard(
+                table,
+                new_shard_id,
+                created_region,
+            );
         }
-        // RETIREMENT A1: the rolled shard's row-identity region (ids known -> exact stamps +
-        // sentinel headroom; unknown -> no region = identity-unknown), installed BEFORE the shard
-        // publishes, mirroring the version-region ordering.
-        if let Some(ids) = row_ids {
-            let mut payload =
-                vec![ROW_ID_UNSTAMPED_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
-            for (slot, row_id) in ids.iter().enumerate() {
-                payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
-            }
-            if let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) {
-                self.read_state.residency.shard_row_id_memory.insert_shard(
-                    table,
-                    new_shard_id,
-                    region,
-                );
-            }
+        if let Some(region) = rolled_row_id_region {
+            self.read_state.residency.shard_row_id_memory.insert_shard(
+                table,
+                new_shard_id,
+                region,
+            );
         }
         // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard
         // in the shards list always finds its device memory (the recompaction loads the list then the memory).
@@ -6481,19 +6510,26 @@ impl Engine {
                 else {
                     return false;
                 };
+                let region = Arc::new(region);
                 self.read_state
                     .residency
                     .shard_deleted_by_memory
-                    .insert_shard(table, shard_id, region);
-                match self
-                    .read_state
-                    .residency
-                    .shard_deleted_by_memory
-                    .get(&(table.to_string(), shard_id))
-                {
-                    Some(region) => region,
-                    None => return false,
-                }
+                    .insert_shard(table, shard_id, Arc::clone(&region));
+                // D4 (ADR-013 pre2): REPUBLISH the descriptor with the new region — readers take
+                // resources from the ONE `shards.load()` snapshot; a region living only in the side
+                // map is invisible to them. Born all-live, so a reader observing the republished
+                // descriptor mid-commit reads every row live (correct until the stamps land + the
+                // commit publishes). Runs under the commit lock like the alloc itself.
+                self.read_state.residency.with_shards_mut(|shards| {
+                    if let Some(table_shards) = shards.get_mut(table) {
+                        if let Some(shard) =
+                            table_shards.iter_mut().find(|s| s.shard_id == shard_id)
+                        {
+                            shard.deleted_by_region = Some(Arc::clone(&region));
+                        }
+                    }
+                });
+                region
             }
         };
         let chunks: Vec<CudaOwnedDeviceMemoryChunk> = slots
@@ -6586,19 +6622,24 @@ impl Engine {
                 let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) else {
                     return false;
                 };
+                let region = Arc::new(region);
                 self.read_state
                     .residency
                     .shard_created_by_memory
-                    .insert_shard(table, shard_id, region);
-                match self
-                    .read_state
-                    .residency
-                    .shard_created_by_memory
-                    .get(&(table.to_string(), shard_id))
-                {
-                    Some(region) => region,
-                    None => return false,
-                }
+                    .insert_shard(table, shard_id, Arc::clone(&region));
+                // D4 (ADR-013 pre2): REPUBLISH the descriptor with the new region (see the
+                // deleted_by twin above). Born all-visible (fill 0), so a reader observing the
+                // republished descriptor mid-commit is unchanged until the stamps + row_count land.
+                self.read_state.residency.with_shards_mut(|shards| {
+                    if let Some(table_shards) = shards.get_mut(table) {
+                        if let Some(shard) =
+                            table_shards.iter_mut().find(|s| s.shard_id == shard_id)
+                        {
+                            shard.created_by_region = Some(Arc::clone(&region));
+                        }
+                    }
+                });
+                region
             }
         };
         let mut bytes = Vec::with_capacity(k * std::mem::size_of::<u64>());
@@ -7136,8 +7177,15 @@ impl Engine {
                 invalidated_at_index: None,
                 invalidated_by_memory_pressure: memory_pressure_active,
                 memory_pressure_active,
+                // D4: `install_shards` attaches `device_memory` from the map (the one enforcement
+                // point); benchmark shards carry no version/identity regions (all-live, read-only).
+                device_memory: None,
+                deleted_by_region: None,
+                created_by_region: None,
+                row_id_region: None,
+                max_created_by: 0,
             });
-            device_memory.insert(shard.shard_id, retained);
+            device_memory.insert(shard.shard_id, Arc::new(retained));
         }
         shards.sort_by_key(|shard| (shard.row_start, shard.shard_id));
         let read_state = Arc::clone(&self.read_state);
@@ -7343,21 +7391,19 @@ impl Engine {
                 continue;
             }
             let descriptor = self.resident_snapshot_for_shard(shard, table);
-            let device_memory = self
-                .read_state
-                .residency
-                .shard_device_memory
-                .get(&(table.name.clone(), shard.shard_id))?;
-            let key = (table.name.clone(), shard.shard_id);
-            let row_id_region = self.read_state.residency.shard_row_id_memory.get(&key)?;
+            // D4 (ADR-013 pre2): buffer + identity + version regions all ride the loaded descriptor
+            // — the gather's freshness seam (audit A4c F2) now holds by construction instead of by
+            // four separate map loads racing a republish.
+            let device_memory = shard.device_memory.clone()?;
+            let row_id_region = shard.row_id_region.clone()?;
             let rows = shard.row_count;
             // Bulk DtoH: identities (2 i32 halves LE per slot), then each column's live prefix.
             let id_halves = row_id_region.read_resident_i32_column(0, rows * 2).ok()?;
-            let deleted = match self.read_state.residency.shard_deleted_by_memory.get(&key) {
+            let deleted = match &shard.deleted_by_region {
                 Some(region) => Some(region.read_resident_i32_column(0, rows * 2).ok()?),
                 None => None,
             };
-            let created = match self.read_state.residency.shard_created_by_memory.get(&key) {
+            let created = match &shard.created_by_region {
                 Some(region) => Some(region.read_resident_i32_column(0, rows * 2).ok()?),
                 None => None,
             };
@@ -8542,12 +8588,9 @@ impl Engine {
                     "resident shard no longer matches catalog table identity".to_string();
                 return decision;
             }
-            if !self
-                .read_state
-                .residency
-                .shard_device_memory
-                .contains_key(&(table.name.clone(), shard.shard_id))
-            {
+            // D4: the planner's device check reads the loaded descriptor (advisory — execution
+            // re-validates from its own snapshot).
+            if shard.device_memory.is_none() {
                 has_all_device_memory = false;
             }
             if !required_int4_columns.is_empty()
