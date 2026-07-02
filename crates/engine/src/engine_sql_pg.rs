@@ -180,14 +180,58 @@ impl Engine {
                 group_key_columns.push(resolve_column_name(column_ref, &qualifier)?.to_string());
             }
         }
+        // SLICE B: a SHARD-resident table has no single-buffer snapshot, so the `None`-src lookup below
+        // would fail ("relation has no resident snapshot") — previously every general-executor shape
+        // (`IS NULL`, expression predicates, GPU sorts, ...) ERRORED on sharded tables. Build the UNIFIED
+        // recompacted source instead (int4 + SV3b/SV6 version columns + M3 null bitmaps — the same builder
+        // the sharded shape bridge uses) and inject it, so the general executor serves sharded tables with
+        // the SAME on-device execution (device predicate VM incl. NULL 3VL + the visibility conjuncts).
+        // A single-buffer table keeps the unchanged `None` path, byte-identical.
+        let sharded_unified = if self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(&table.name)
+            .is_some_and(|shards| !shards.is_empty())
+        {
+            let unified =
+                self.build_sharded_unified_exec_source(&table, predicate.as_ref(), copin_s)?;
+            // Mirror the sharded bridge's SV3b/SV6 scope guard: the DISTINCT / GROUP BY / ORDER BY
+            // execution paths do not yet thread the visibility conjuncts, so a VERSIONED (tombstoned /
+            // update-stamped) table reaching them would leak invisible versions. Clean error, never a
+            // wrong result. (An un-versioned sharded table — the majority — takes every shape.)
+            if unified.visibility.is_some()
+                && (select.distinct
+                    || select.group_by.is_some()
+                    || !select.order_by.is_empty()
+                    || !select.having_groups.is_empty()
+                    || !stmt.sort_clause.is_empty()
+                    || !stmt.group_clause.is_empty())
+            {
+                return Err(sql_pg_error(
+                    "resident visibility filter (SV3b/SV6) is not yet wired through the DISTINCT / \
+                     GROUP BY / ORDER BY paths for a versioned sharded table"
+                        .to_string(),
+                ));
+            }
+            Some(unified)
+        } else {
+            None
+        };
+        let (src, visibility) = match &sharded_unified {
+            Some(unified) => (Some(&unified.src), unified.visibility),
+            // SV3b visibility: the whole-table single-store PG path carries no version columns.
+            None => (None, None),
+        };
         self.execute_resident_expr_select_with_binding(
             &select,
             &table,
-            None,
+            src,
             bound,
             copin_s,
             predicate.as_ref(),
-            None, // SV3b visibility: the whole-table single-store PG path carries no deleted_by column
+            visibility,
             &order_by_exprs,
             &order_by_nulls_first,
             group_key_expr.as_ref(),

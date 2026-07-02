@@ -1957,6 +1957,16 @@ pub(crate) struct ResidentExecSource {
     pub(crate) row_count: u64,
 }
 
+/// SLICE B: a shard-resident table's UNIFIED exec source — the recompacted whole-table device buffer
+/// (int4 + version columns + null bitmaps) as an injectable [`ResidentExecSource`], its SV3b/SV6 MVCC
+/// visibility, and the GPU it lives on. Built by `Engine::build_sharded_unified_exec_source`; consumed by
+/// the sharded shape bridge AND the SQL->Expr PG path (so every general shape serves sharded tables).
+pub(crate) struct ShardedUnifiedExecSource {
+    pub(crate) src: ResidentExecSource,
+    pub(crate) visibility: Option<ResidentVisibility>,
+    pub(crate) gpu_id: u16,
+}
+
 /// SV3b/SV6: the on-device MVCC visibility descriptor for a VERSIONED (unified) buffer. A row is visible
 /// iff `deleted_by > read_txn_id` (SV3b upper bound — tombstoned-at-or-before-my-snapshot rows are hidden)
 /// AND `created_by <= read_txn_id` (SV6 lower bound — versions appended by a commit newer than my snapshot
@@ -2126,9 +2136,8 @@ impl Engine {
     /// shard is invalid or missing device memory / the predicate cannot lower on a shard (caller falls back to
     /// the O(table) invalidate + re-admit). Visibility = `None`: locate addresses PHYSICAL positions (a DELETE
     /// stamps a row by WHERE IT SITS, independent of read-time visibility; the raw buffer's rows are present),
-    /// and only reads that already-committed shard buffer. UNWIRED (`#[allow(dead_code)]`) until the DELETE
-    /// commit path routes through it (SV4b).
-    #[allow(dead_code)]
+    /// and only reads that already-committed shard buffer. WIRED by SV4b (the DELETE commit path routes
+    /// through `try_tombstone_resident_delete_commit`).
     pub(crate) fn locate_resident_delete_slots(
         &self,
         table: &RelationalTable,
@@ -2204,8 +2213,7 @@ impl Engine {
     /// locate could not run / a tombstone write failed). A PARTIAL stamp before a `None` is harmless: the
     /// fallback re-admit rebuilds every shard all-live from the host store (which already applied the DELETE)
     /// AND SV4-prereq-#1 releases any partial `deleted_by` region. MUST run under the commit lock so the
-    /// per-shard `deleted_by` get-or-allocate is atomic (SV2 prereq #2). UNWIRED until SV4b.
-    #[allow(dead_code)]
+    /// per-shard `deleted_by` get-or-allocate is atomic (SV2 prereq #2). WIRED by SV4b.
     pub(crate) fn try_tombstone_resident_delete(
         &self,
         table: &RelationalTable,
@@ -2344,43 +2352,24 @@ impl Engine {
         true
     }
 
-    /// S10c slice 2a: `&Select`->general BRIDGE for the MULTI-PARTITION resident shapes (single-GPU,
-    /// int4-only). Supersedes the slice-1 per-shard host-combine: instead of running the executor once
-    /// per shard and folding the results on the HOST, it RECOMPACTS the table's shard buffers into
-    /// ONE unified int4-only `CudaResidentDeviceMemory` via device-to-device copies (the host stays fully
-    /// out — only the 8-byte row-count header crosses HtoD), then runs the SAME on-device general
-    /// resident-Expr executor ONCE over the unified buffer. The unified SoA is laid out exactly as a
-    /// whole-table single store (8-byte header, then each int4 column contiguous over `total_row_count`
-    /// rows in catalog order), so the single-store offset helpers address it byte-identically; a per-shard
-    /// segment copies column `c`'s slice from shard `p` (`8 + c*p.row_count*4`, len `p.row_count*4`)
-    /// to its unified slot (`8 + c*total_row_count*4 + rows_before_p*4`). The WHERE predicate + per-shard
-    /// identity/validity prechecks mirror the retired probes (each shard is still validated, to gather
-    /// its `device_ptr`).
-    ///
-    /// All-empty handling: the general SUM/MIN/MAX/AVG HARD-ERROR on an empty filtered set (NULL-on-empty
-    /// is an unfinished M3 feature for the general path). So we first run a `COUNT(*)` over the unified
-    /// buffer; if it is 0 AND the projection is an aggregate, we return the PG-correct empty value WITHOUT
-    /// the hard error: SUM/AVG/MIN/MAX -> `SqlValue::Null` (an aggregate of no rows is NULL), COUNT(*) ->
-    /// `Int8(0)`. (Was the legacy empty-text/zero sentinel; PG-correctness wins -- `sql-spec-over-cpu-parity`.)
-    /// Otherwise the executor runs ONCE over the unified buffer with the real
-    /// projection and its result is returned directly (it handles COUNT/SUM/MIN/MAX/AVG/projection
-    /// on-device). Text columns are DEFERRED in this slice (the unified buffer is int4-only).
-    pub(crate) fn execute_resident_sharded_via_general(
+    /// SLICE B: build the SHARDED UNIFIED EXEC SOURCE — recompact a shard-resident table's shards into ONE
+    /// unified device buffer (8-byte header + int4 columns in catalog order + SV3b/SV6 version columns +
+    /// M3 null-validity bitmaps) and return it as an injectable [`ResidentExecSource`] plus its MVCC
+    /// [`ResidentVisibility`], so ANY general-executor caller runs the SAME on-device execution over
+    /// sharded tables: the sharded shape BRIDGE below AND the SQL->Expr PG path (which serves `IS NULL` /
+    /// `IS NOT NULL` and every other general shape — previously those ERRORED on a sharded-only table
+    /// because the PG path only knew the single-buffer store). `predicate` drives the S-d3 zone-map prune
+    /// (mandatory int4 equalities only; `None` / non-equality predicates gather every shard — sound, the
+    /// device predicate filters). The unified SoA is laid out exactly as a whole-table single store, so
+    /// the single-store offset helpers address it byte-identically; per-shard identity/validity prechecks
+    /// mirror the retired probes. Extracted VERBATIM from `execute_resident_sharded_via_general` (which
+    /// now calls it) — the recompaction logic exists ONCE.
+    pub(crate) fn build_sharded_unified_exec_source(
         &self,
-        select: &Select,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
-        let (table, mut bound, copin_s) = self.bind_relational_select_for_execution(select)?;
-        // Sub-slice 3b: detect a single top-level int4 `Eq` POINT-lookup shape from the (still-populated)
-        // bound BEFORE the filters are cleared below — the precondition for the cross-shard PK-index route.
-        // Mirrors the retained-read (lpb) route's shape gate: exactly one equality group of one, `Eq`, an
-        // int4 filter column + an int4 needle. `None` = not a point lookup -> the scan path runs unchanged.
-        let point_lookup_eq: Option<(usize, i32)> = shard_point_lookup_int4_eq(&bound, &table);
-        // Rebuild the WHERE predicate from the bound filters, then clear them so the executor filters
-        // SOLELY via the predicate (the SQL->Expr contract), exactly as the grouped bridge does.
-        let predicate = resident_predicate_from_bound_filters(&bound)?;
-        bound.filter = None;
-        bound.filters.clear();
-        bound.filter_groups.clear();
+        table: &RelationalTable,
+        predicate: Option<&ResidentExpr>,
+        copin_s: Index,
+    ) -> Result<ShardedUnifiedExecSource, ExecuteError> {
         // Load the table's resident shards in published order (sorted by (row_start, shard_id)).
         // Error text mirrors the retired probes.
         let mut shards = self
@@ -2402,28 +2391,6 @@ impl Engine {
                 table.name
             ))));
         }
-        // Sub-slice 3b: try the CROSS-SHARD PK-INDEX point-lookup route (flag-gated, DEFAULT OFF). On a hit
-        // it uses the cached hash+bloom `locate` to jump straight to the (shard, slot) and gather ONLY that
-        // row (a few tiny DtoH reads), skipping the zone-map scan + recompaction below; on ANY shape or
-        // soundness guard it returns None and we fall through to the scan (byte-identical). Placed before the
-        // zone-map prune so it also wins when zone maps DEGRADE under UPDATE key-scatter (membership pruning,
-        // scalability-ledger #4/#8) — locate finds the exact shard even when [min,max] can't exclude any.
-        // M3-for-shards: the point-index route gathers RAW i32 slots (no validity bitmap), so it would read a
-        // NULL-stored-0 as 0 while the scan below is now NULL-aware -> SKIP it for a null-bearing table so the
-        // NULL-aware scan serves it (null-bearing => single-shard, so this never costs the many-shard win).
-        // The `..._null_blind_matches_scan` differential is the tripwire that this decline keeps route == scan.
-        let any_shard_has_nulls = shards
-            .iter()
-            .any(|s| !s.resident_device_null_columns.is_empty());
-        if !any_shard_has_nulls {
-            if let Some((filter_idx, needle)) = point_lookup_eq {
-                if let Some(result) = self
-                    .try_shard_index_point_route(select, &table, &bound, filter_idx, needle, copin_s)
-                {
-                    return Ok(result);
-                }
-            }
-        }
         // S-d3 zone-map pruning: for a point-lookup shape (`col = needle`, ANDed at top level) drop every
         // shard whose min/max zone map for that column excludes the needle — it cannot hold a matching row,
         // so the recompaction never gathers it. This turns the sharded read from O(num_shards) toward O(1).
@@ -2437,7 +2404,7 @@ impl Engine {
         // before the filter column) and could wrongly prune a matching shard. If pruning would drop EVERY
         // shard (needle in no range), keep the first shard so the recompaction machinery stays well-formed
         // and the device predicate returns the correct empty set.
-        if let Some(pred) = predicate.as_ref() {
+        if let Some(pred) = predicate {
             let mut constraints: Vec<(usize, i32)> = Vec::new();
             mandatory_int4_equalities(pred, &mut constraints);
             if !constraints.is_empty() {
@@ -2473,8 +2440,8 @@ impl Engine {
         let gpu_id = shards[0].gpu_id;
         let runtime_snapshot = self.router.runtime().snapshot();
 
-        // Build a `ResidentExecSource` for one shard (the per-shard identity + validity prechecks
-        // mirror the probe's at engine_resident_probe.rs ~873), or return the same error a probe did.
+        // Validate each shard + resolve its pinned device memory (the per-shard identity + validity
+        // prechecks mirror the probe's at engine_resident_probe.rs ~873), or return the error a probe did.
         let source_for = |shard: &RelationalResidentShard| -> Result<ResidentExecSource, ExecuteError> {
             if shard.schema != table.schema || shard.table != table.name {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
@@ -2502,53 +2469,10 @@ impl Engine {
                     )))
                 })?;
             Ok(ResidentExecSource {
-                descriptor: Arc::new(self.resident_snapshot_for_shard(shard, &table)),
+                descriptor: Arc::new(self.resident_snapshot_for_shard(shard, table)),
                 device_memory,
                 row_count: shard.row_count as u64,
             })
-        };
-
-        // Run one (already-bound) select against an injected source via the general executor. `vis` is the
-        // SV3b/SV6 MVCC visibility descriptor for the unified buffer (`Some` when any surviving shard is
-        // versioned, else `None`) -- forwarded so the on-device predicate ANDs the visibility bound(s)
-        // (`deleted_by > read_txn_id`, `created_by <= read_txn_id`) and hides invisible versions. BOTH the
-        // COUNT precheck and the real run pass the SAME `vis` so the count and the projection agree on
-        // which rows are visible.
-        let run = |select_ref: &Select,
-                   bound_for_select: BoundRelationalSelect,
-                   src: &ResidentExecSource,
-                   vis: Option<ResidentVisibility>|
-         -> Result<RelationalSelectResult, ExecuteError> {
-            self.execute_resident_expr_select_with_binding(
-                select_ref,
-                &table,
-                Some(src),
-                bound_for_select,
-                copin_s,
-                predicate.as_ref(),
-                vis,
-                &[],
-                &[],
-                None,
-                &[],
-            )
-        };
-
-        // The access path is shape/table-level metadata (it does not depend on the shard data), so
-        // compute it once from the (filter-cleared) bound exactly as a probe did (engine_resident_probe.rs
-        // ~846). bound was filter-cleared above; the sharded shapes carry no ORDER BY / LIMIT.
-        let (_query, access_path) =
-            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
-
-        let finalize = |rows: Vec<Vec<SqlValue>>| -> RelationalSelectResult {
-            RelationalSelectResult {
-                columns: Arc::new(bound.selected_columns.clone()),
-                rows: rows.into(),
-                planned_target: DeviceTarget::Gpu(gpu_id),
-                executed_target: DeviceTarget::Gpu(gpu_id),
-                fallback_reason: None,
-                access_path: Arc::new(access_path.clone()),
-            }
         };
 
         // The unified int4-only buffer lays the table's int4 columns out in catalog order, each contiguous
@@ -2683,7 +2607,7 @@ impl Engine {
         // M3-for-shards: recompact each column's NULL VALIDITY BITMAP into the unified buffer (mirrors the
         // deleted_by region: FILL all-valid, then DtoD-copy each null-bearing shard's bitmap). A column gets a
         // unified bitmap iff SOME surviving shard carries one; the region is 1 bit/row (u32 words, LSB-first,
-        // 1 = valid / 0 = NULL), placed 4-aligned after the int4 (+ deleted_by) sections. The executor reads it
+        // 1 = valid / 0 = NULL), placed 4-aligned after the int4 (+ version) sections. The executor reads it
         // by ABSOLUTE offset (`resident_device_null_column_offset`) and materializes `SqlValue::Null` for a
         // 0 bit, so the sharded scan stops reading a NULL-stored-0 placeholder as `0`. A null-bearing shard's
         // live-row prefix MUST start on a 32-row (word) boundary to byte-copy; multi-shard tables are NULL-FREE
@@ -2767,7 +2691,7 @@ impl Engine {
             })?;
         let proof = unified_mem.metadata().clone();
         let snapshot = self.resident_snapshot_for_unified(
-            &table,
+            table,
             total_row_count,
             gpu_id,
             allocated_bytes,
@@ -2775,10 +2699,128 @@ impl Engine {
             int4_columns,
             unified_null_columns,
         );
-        let unified_src = ResidentExecSource {
-            descriptor: Arc::new(snapshot),
-            device_memory: Arc::new(unified_mem),
-            row_count: total_row_count as u64,
+        Ok(ShardedUnifiedExecSource {
+            src: ResidentExecSource {
+                descriptor: Arc::new(snapshot),
+                device_memory: Arc::new(unified_mem),
+                row_count: total_row_count as u64,
+            },
+            visibility,
+            gpu_id,
+        })
+    }
+
+    /// S10c slice 2a: `&Select`->general BRIDGE for the MULTI-PARTITION resident shapes (single-GPU,
+    /// int4-only). RECOMPACTS the table's shard buffers into ONE unified int4-only
+    /// `CudaResidentDeviceMemory` via `build_sharded_unified_exec_source` (device-to-device copies — the
+    /// host stays fully out; only the 8-byte row-count header crosses HtoD), then runs the SAME on-device
+    /// general resident-Expr executor ONCE over the unified buffer.
+    ///
+    /// All-empty handling: the general SUM/MIN/MAX/AVG HARD-ERROR on an empty filtered set (NULL-on-empty
+    /// is an unfinished M3 feature for the general path). So we first run a `COUNT(*)` over the unified
+    /// buffer; if it is 0 AND the projection is an aggregate, we return the PG-correct empty value WITHOUT
+    /// the hard error: SUM/AVG/MIN/MAX -> `SqlValue::Null` (an aggregate of no rows is NULL), COUNT(*) ->
+    /// `Int8(0)`. (Was the legacy empty-text/zero sentinel; PG-correctness wins -- `sql-spec-over-cpu-parity`.)
+    /// Otherwise the executor runs ONCE over the unified buffer with the real
+    /// projection and its result is returned directly (it handles COUNT/SUM/MIN/MAX/AVG/projection
+    /// on-device). Text columns are DEFERRED in this slice (the unified buffer is int4-only).
+    pub(crate) fn execute_resident_sharded_via_general(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, mut bound, copin_s) = self.bind_relational_select_for_execution(select)?;
+        // Sub-slice 3b: detect a single top-level int4 `Eq` POINT-lookup shape from the (still-populated)
+        // bound BEFORE the filters are cleared below — the precondition for the cross-shard PK-index route.
+        // Mirrors the retained-read (lpb) route's shape gate: exactly one equality group of one, `Eq`, an
+        // int4 filter column + an int4 needle. `None` = not a point lookup -> the scan path runs unchanged.
+        let point_lookup_eq: Option<(usize, i32)> = shard_point_lookup_int4_eq(&bound, &table);
+        // Rebuild the WHERE predicate from the bound filters, then clear them so the executor filters
+        // SOLELY via the predicate (the SQL->Expr contract), exactly as the grouped bridge does.
+        let predicate = resident_predicate_from_bound_filters(&bound)?;
+        bound.filter = None;
+        bound.filters.clear();
+        bound.filter_groups.clear();
+        // Sub-slice 3b: try the CROSS-SHARD PK-INDEX point-lookup route (flag-gated, DEFAULT OFF). On a hit
+        // it uses the cached hash+bloom `locate` to jump straight to the (shard, slot) and gather ONLY that
+        // row (a few tiny DtoH reads), skipping the zone-map scan + recompaction below; on ANY shape or
+        // soundness guard it returns None and we fall through to the scan (byte-identical). Placed before the
+        // zone-map prune so it also wins when zone maps DEGRADE under UPDATE key-scatter (membership pruning,
+        // scalability-ledger #4/#8) — locate finds the exact shard even when [min,max] can't exclude any.
+        // M3-for-shards: the point-index route gathers RAW i32 slots (no validity bitmap), so it would read a
+        // NULL-stored-0 as 0 while the scan below is now NULL-aware -> SKIP it for a null-bearing table so the
+        // NULL-aware scan serves it (null-bearing => single-shard, so this never costs the many-shard win).
+        // The `..._null_blind_matches_scan` differential is the tripwire that this decline keeps route == scan.
+        // (The null check runs on its own lightweight shards load; the route re-validates internally against
+        // its own generation-consistent capture, and the unified gather below is NULL-aware regardless.)
+        if let Some((filter_idx, needle)) = point_lookup_eq {
+            let any_shard_has_nulls = self
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get(&table.name)
+                .is_some_and(|shards| {
+                    shards
+                        .iter()
+                        .any(|s| !s.resident_device_null_columns.is_empty())
+                });
+            if !any_shard_has_nulls {
+                if let Some(result) = self
+                    .try_shard_index_point_route(select, &table, &bound, filter_idx, needle, copin_s)
+                {
+                    return Ok(result);
+                }
+            }
+        }
+        // SLICE B: the shard load + zone-map prune + int4/version/null-bitmap recompaction live in
+        // `build_sharded_unified_exec_source`, SHARED with the SQL->Expr PG path so IS NULL and every
+        // other general-executor shape run over sharded tables through the SAME on-device execution.
+        let unified = self.build_sharded_unified_exec_source(&table, predicate.as_ref(), copin_s)?;
+        let gpu_id = unified.gpu_id;
+        let visibility = unified.visibility;
+        let unified_src = unified.src;
+
+        // Run one (already-bound) select against an injected source via the general executor. `vis` is the
+        // SV3b/SV6 MVCC visibility descriptor for the unified buffer (`Some` when any surviving shard is
+        // versioned, else `None`) -- forwarded so the on-device predicate ANDs the visibility bound(s)
+        // (`deleted_by > read_txn_id`, `created_by <= read_txn_id`) and hides invisible versions. BOTH the
+        // COUNT precheck and the real run pass the SAME `vis` so the count and the projection agree on
+        // which rows are visible.
+        let run = |select_ref: &Select,
+                   bound_for_select: BoundRelationalSelect,
+                   src: &ResidentExecSource,
+                   vis: Option<ResidentVisibility>|
+         -> Result<RelationalSelectResult, ExecuteError> {
+            self.execute_resident_expr_select_with_binding(
+                select_ref,
+                &table,
+                Some(src),
+                bound_for_select,
+                copin_s,
+                predicate.as_ref(),
+                vis,
+                &[],
+                &[],
+                None,
+                &[],
+            )
+        };
+
+        // The access path is shape/table-level metadata (it does not depend on the shard data), so
+        // compute it once from the (filter-cleared) bound exactly as a probe did (engine_resident_probe.rs
+        // ~846). bound was filter-cleared above; the sharded shapes carry no ORDER BY / LIMIT.
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound, copin_s)?;
+
+        let finalize = |rows: Vec<Vec<SqlValue>>| -> RelationalSelectResult {
+            RelationalSelectResult {
+                columns: Arc::new(bound.selected_columns.clone()),
+                rows: rows.into(),
+                planned_target: DeviceTarget::Gpu(gpu_id),
+                executed_target: DeviceTarget::Gpu(gpu_id),
+                fallback_reason: None,
+                access_path: Arc::new(access_path.clone()),
+            }
         };
 
         // S10c slice 2b: DISTINCT / GROUP BY / ORDER-BY-projection are CORRECT over the unified buffer (it

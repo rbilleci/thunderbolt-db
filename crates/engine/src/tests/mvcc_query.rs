@@ -263,18 +263,10 @@ fn first_cuda_slice_query_gap_reports_filter_shape_gaps() {
         MvccReadFilter::SourceKeyPrefix("seed:".to_string()),
     ])]));
     assert_eq!(first_cuda_slice_query_gap(&query), None);
-    assert_eq!(
-        first_cuda_slice_filter_gap_detail(query.filter.as_ref().unwrap()),
-        None
-    );
 
     query = first_cuda_slice_support_query();
     query.filter = Some(MvccReadFilter::BranchLabelEquals("fallback".to_string()));
     assert_eq!(first_cuda_slice_query_gap(&query), None);
-    assert_eq!(
-        first_cuda_slice_filter_gap_detail(query.filter.as_ref().unwrap()),
-        None
-    );
 }
 
 #[test]

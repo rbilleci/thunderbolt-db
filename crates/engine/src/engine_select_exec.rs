@@ -91,9 +91,31 @@ impl Engine {
                     // no CPU fallback, so for a non-resident table it would hard-error -- whereas the
                     // strict/CPU-pinned path below serves non-resident tables correctly. (The general
                     // path is the GPU-native one; this gate just preserves the entry's contract for
-                    // tables not yet resident.)
+                    // tables not yet resident.) SLICE B: SHARD-resident tables qualify too — the general
+                    // path now recompacts them into the unified exec source, so a sortable projection
+                    // gets the SAME NULL-correct on-device sort instead of falling through the rejected
+                    // shape route to the CPU engine's host sort (whose NULL placement diverges from PG —
+                    // caught by the sharded-vs-single-buffer ORDER BY differential). The shard arm
+                    // requires a PURELY int4-section table (int4/int2/date): the unified exec source
+                    // gathers only the int4 sections (+ null bitmaps), so a text/int8/numeric/bool
+                    // column reference would hard-error on the no-fallback general path where the CPU
+                    // pinned path previously returned rows (audit P2: `mt (id INT, name TEXT)` sharded +
+                    // `ORDER BY id`). Mixed-type sharded tables keep the CPU pinned path until the
+                    // unified source gathers every section.
+                    let shard_resident_int4_only = || {
+                        table.columns.iter().all(|c| {
+                            matches!(c.ty, SqlType::Int4 | SqlType::Int2 | SqlType::Date)
+                        }) && self
+                            .read_state
+                            .residency
+                            .shards
+                            .load()
+                            .get(&table.name)
+                            .is_some_and(|shards| !shards.is_empty())
+                    };
                     if select_is_gpu_sortable_projection(&select, &table)
-                        && self.relational_residency_snapshot(&select.table).is_some()
+                        && (self.relational_residency_snapshot(&select.table).is_some()
+                            || shard_resident_int4_only())
                     {
                         return self.execute_resident_expr_select_sql(text);
                     }

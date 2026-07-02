@@ -2629,6 +2629,157 @@ mod capacity_payload_tests {
         assert_eq!(fired0, 0, "route DECLINED on the null-bearing (NULL-id) table");
     }
 
+    /// SLICE B (sharded predicate NULL 3VL — the LAST shards-default gate): every NULL-semantics
+    /// predicate shape on a SHARDED-ONLY table matches the single-buffer M3 oracle (an INDEPENDENT
+    /// engine instance with shard residency OFF — the proven 3VL path). Covers: `IS NULL` /
+    /// `IS NOT NULL` (previously ERRORED on shards — the shape rides the SQL->Expr PG path, which only
+    /// knew the single-buffer store), equality against a NULL-stored-0 (`col = 0` must EXCLUDE the NULL
+    /// row per SQL 3VL: NULL = 0 is UNKNOWN), a plain equality on a nullable column, and a range
+    /// predicate over NULLs. All predicates evaluate ON THE DEVICE (the unified recompacted buffer
+    /// carries the validity bitmaps; the mask VM ANDs them — the charter's device-side 3VL).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_predicate_null_3vl_matches_single_buffer_oracle() {
+        let load = |e: &Engine| {
+            e.set_auto_admit_on_commit(true);
+            e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
+            e.execute_text(
+                2,
+                "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30),(NULL,99)",
+            )
+            .unwrap();
+        };
+        let o = Engine::new_local(); // single-buffer ORACLE (M3 3VL-proven path)
+        load(&o);
+        let e = Engine::new_local(); // sharded-only table (null-bearing => single shard by construction)
+        e.set_shard_residency_enabled(true);
+        load(&e);
+        // Non-vacuity: the sharded engine really has NO single-buffer snapshot (shards serve it).
+        assert!(
+            e.read_state.residency.snapshots.load().get("nn").is_none()
+                && e.read_state.residency.shards.load().get("nn").is_some(),
+            "precondition: the table is SHARD-resident only (else this oracle differential is vacuous)"
+        );
+        let run = |e: &Engine, sql: &str| {
+            e.execute_relational_select_text(sql)
+                .map(|r| r.rows.into_boxed())
+        };
+        for sql in [
+            "SELECT id, balance FROM nn WHERE balance = 0",
+            "SELECT id, balance FROM nn WHERE id = 0",
+            "SELECT id, balance FROM nn WHERE balance = 10",
+            "SELECT id FROM nn WHERE balance <= 30",
+            "SELECT id FROM nn WHERE balance IS NULL",
+            "SELECT id FROM nn WHERE balance IS NOT NULL",
+            // Newly-unlocked general shapes over the sharded unified source (previously all ERRORED):
+            "SELECT id FROM nn WHERE balance IS NULL OR balance = 10", // IsNull as a mask-VM leaf in OR
+            "SELECT COUNT(*) FROM nn WHERE balance IS NOT NULL",
+            "SELECT id, balance FROM nn ORDER BY id DESC", // GPU sort over the unified buffer (+ NULL key)
+        ] {
+            let want = run(&o, sql).unwrap_or_else(|err| panic!("oracle must serve {sql}: {err}"));
+            let got = run(&e, sql)
+                .unwrap_or_else(|err| panic!("the sharded path must serve {sql}: {err}"));
+            assert_eq!(got, want, "sharded == single-buffer oracle for: {sql}");
+        }
+    }
+
+    /// SLICE B (audit P2 regression gate): a MIXED-TYPE shard-resident table (text column) keeps the CPU
+    /// pinned path for sortable projections — the sortable gate's shard arm requires a PURELY
+    /// int4-section table because the unified exec source gathers only int4 sections; routing a text
+    /// reference to the no-fallback general path hard-errored where rows were previously returned. Both
+    /// the ORDER BY shape (the regressed one) and the plain projection must return rows == the
+    /// single-buffer oracle.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_mixed_type_sortable_projection_keeps_cpu_path() {
+        let load = |e: &Engine| {
+            e.set_auto_admit_on_commit(true);
+            e.execute_text(1, "CREATE TABLE mt (id INT, name TEXT)").unwrap();
+            e.execute_text(2, "INSERT INTO mt (id, name) VALUES (3,'c'),(1,'a'),(2,'b')").unwrap();
+        };
+        let o = Engine::new_local(); // single-buffer oracle
+        load(&o);
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        load(&e);
+        assert!(
+            e.read_state.residency.snapshots.load().get("mt").is_none()
+                && e.read_state.residency.shards.load().get("mt").is_some(),
+            "precondition: mt is SHARD-resident only"
+        );
+        for sql in [
+            "SELECT id, name FROM mt ORDER BY id",
+            "SELECT id, name FROM mt ORDER BY id DESC",
+            "SELECT id, name FROM mt",
+        ] {
+            let want = o.execute_relational_select_text(sql).unwrap().rows.into_boxed();
+            let got = e
+                .execute_relational_select_text(sql)
+                .unwrap_or_else(|err| panic!("mixed-type sharded must serve {sql}: {err}"))
+                .rows
+                .into_boxed();
+            assert_eq!(got, want, "mixed-type sharded == oracle for: {sql}");
+        }
+    }
+
+    /// SLICE B — the VERSIONED interplay: predicate NULL 3VL composes with the SV3b/SV6 visibility
+    /// conjuncts ON THE DEVICE (one mask-VM program: validity-bitmap 3VL leaf AND `deleted_by >
+    /// read_txn`). With incremental DELETE ON, tombstoning a non-NULL row of a null-bearing sharded
+    /// table hides EXACTLY that row from IS NULL / IS NOT NULL / equality / COUNT — no tombstone leak,
+    /// no NULL mis-match. NON-VACUITY: the deleted_by region existing proves the tombstone route ran
+    /// (fallback re-admit leaves none and would trivially pass).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sharded_predicate_null_3vl_on_versioned_shard() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_resident_delete_tombstone_enabled(true);
+        e.execute_text(1, "CREATE TABLE nn (id INT, balance INT)").unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO nn (id, balance) VALUES (1,10),(2,NULL),(3,30),(4,NULL)",
+        )
+        .unwrap();
+        // Tombstone the non-NULL row (3,30) IN PLACE (a NULL-bearing deleted row would decline to
+        // re-admit and vacuously pass — hence the region-exists route proof below).
+        e.execute_text(3, "DELETE FROM nn WHERE id = 3").unwrap();
+        assert!(
+            table_has_any_deleted_by_cell(&e, "nn"),
+            "route proof: the incremental tombstone fired (re-admit would leave no region)"
+        );
+        let run = |sql: &str| -> Vec<Vec<SqlValue>> {
+            e.execute_relational_select_text(sql).unwrap().rows.into_boxed()
+        };
+        assert_eq!(
+            run("SELECT id FROM nn WHERE balance IS NULL"),
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(4)]],
+            "IS NULL over a versioned shard: NULL rows visible, tombstoned row hidden"
+        );
+        assert_eq!(
+            run("SELECT id FROM nn WHERE balance IS NOT NULL"),
+            vec![vec![SqlValue::Int4(1)]],
+            "IS NOT NULL: only the live non-NULL row (the tombstoned (3,30) is hidden)"
+        );
+        assert_eq!(
+            run("SELECT id, balance FROM nn WHERE balance = 30"),
+            Vec::<Vec<SqlValue>>::new(),
+            "equality on the tombstoned row's value: hidden by the visibility conjunct"
+        );
+        assert_eq!(
+            run("SELECT COUNT(*) FROM nn"),
+            vec![vec![SqlValue::Int8(3)]],
+            "COUNT drops by exactly the tombstoned row (visibility-only program over the unified buffer)"
+        );
+        // The DISTINCT / GROUP BY / ORDER BY paths do not yet thread the visibility conjuncts, so a
+        // VERSIONED sharded table must CLEAN-ERROR there (never silently leak the tombstoned row into a
+        // sorted result). Flip this assertion deliberately when visibility is wired through those paths.
+        assert!(
+            e.execute_relational_select_text("SELECT id, balance FROM nn ORDER BY id DESC").is_err(),
+            "versioned sharded + ORDER BY must clean-error until visibility threads through the sort path"
+        );
+    }
+
     /// M3-for-shards: the sharded read path's PROJECTION is now NULL-AWARE — a NULL materializes as
     /// `SqlValue::Null`, not the raw-0 placeholder the ledger flagged as SQL-WRONG. The sharded scan's
     /// recompaction rebuilds each column's validity bitmap into the unified buffer + labels the unified
@@ -4026,9 +4177,8 @@ impl Engine {
     /// Returns `false` (caller must fall back to invalidate + re-admit) if the shard is missing / any slot is
     /// out of `[0, row_count)` / the region allocation or device write fails. `slots` are LOCAL indices.
     ///
-    /// UNWIRED (`#[allow(dead_code)]`) — wired into the DELETE-only commit path in SV4 (slot-finding via the
-    /// pruned-shard predicate). **SV4 PREREQUISITES (audit-flagged, out of scope until wired — the primitive
-    /// creates NO region in production today, so they are inert now):**
+    /// WIRED into the DELETE commit path by SV4b (slot-finding via the pruned-shard predicate).
+    /// **SV4 PREREQUISITES (audit-flagged):**
     ///  1. **Lifecycle/leak — DONE (SV4 prereq #1):** `shard_deleted_by_memory` cleanup is now wired at every
     ///     site the resident buffer it annotates is retired. Two categories, distinguished by whether an
     ///     invalidate precedes the retire:
@@ -4047,7 +4197,6 @@ impl Engine {
     ///  2. **Concurrency:** hold the COMMIT LOCK across the get-or-allocate below, else two concurrent
     ///     first-deletes to the same shard both allocate + the losing region's `Arc` leaks (writes still land
     ///     safely; only the buffer leaks). SV4 runs this under the serialized commit lock, which is the fix.
-    #[allow(dead_code)]
     pub(crate) fn tombstone_resident_shard_slots(
         &self,
         table: &str,

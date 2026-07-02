@@ -732,7 +732,7 @@ impl Engine {
     /// method for the semantics (returns the IDENTICAL physical `(shard, slot)` a scan finds; `None` to fall
     /// back on any decline / invalid shard / missing offset). Used by the scan-locate differential tests +
     /// the (future) DELETE/UPDATE resolution; the 3b read route calls the `_detailed` variant directly.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))] // the GPU differentials' oracle-facing wrapper
     pub(crate) fn locate_resident_pk_via_shard_index(
         &self,
         table: &RelationalTable,
@@ -2121,9 +2121,8 @@ struct BatchShardGroup {
 /// Step 1 (lpb-for-shards): the batched point-lookup projection. `values` is row-major int4, `ncols` wide, in
 /// NEEDLE ORDER; `needle_ranges[i] = (start_row, row_count)` slices needle i's rows (unique-PK -> count 0 or
 /// 1). The schema (columns / access_path) is shape metadata the caller wraps around this raw projection.
-/// `values`/`ncols` are consumed by the differential tests now + the production batch-result wiring next
-/// (the coalescer/facade slice); the bench reads only `needle_ranges`, hence the allow.
-#[allow(dead_code)]
+/// Consumed by the production batch-result wiring (`submit_sharded_point_lookups_batched`), the
+/// differential tests, and the benches.
 pub(crate) struct BatchedShardProjection {
     pub(crate) ncols: usize,
     pub(crate) values: Vec<i32>,
