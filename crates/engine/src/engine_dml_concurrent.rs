@@ -236,6 +236,19 @@ impl Engine {
         // materialization per statement. The prepare below is the authoritative off-lock
         // validation; the serialized `execute_text` path keeps its preflight, where it is the gate
         // that stops a constraint-violating statement from ever reaching the WAL.
+        // RETIREMENT A4e GAP-1 guard: ELIDED (device-authoritative) tables take the SERIALIZED
+        // path — its commit arm carries the elision lifecycle hooks (elide-entry, rehydrate-on-
+        // unhandled). The concurrent arm has none yet: an unhandled concurrent commit would
+        // invalidate + re-admit from the EMPTY host store. Concurrent-native elision hooks are
+        // the ledgered follow-up (they are what the SLO target ultimately needs).
+        if self.host_install_elision_enabled()
+            && Self::dml_mutated_tables(&cmd)
+                .iter()
+                .any(|table| self.table_install_elided(table))
+        {
+            drop(_snapshot_guard);
+            return self.execute_text(txn_id, text).map(|_| ());
+        }
         let snapshot = self.dml_read_snapshot(read_snapshot);
         let prepared = self.prepare_dml(&cmd, snapshot)?;
         let residency_tables = Self::dml_mutated_tables(&cmd);
