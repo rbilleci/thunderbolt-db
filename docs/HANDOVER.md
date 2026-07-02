@@ -48,6 +48,33 @@ cache, version-split dedup) + A3 (`c5b2a147`, device-index validators via the pr
 UNWIRED primitive + differential) audited/pushing now. Baseline SLO: 40,273 sustained TPS @8 writers,
 23.0us/item install (`oltp_commit_slo_benchmark`) — THE NUMBER A4e MUST MOVE (>100k target).
 
+**ADR-013 (read-path agent) BINDS A4e — read it first (docs/DECISIONS.md):** (pre1) STAMP-ALL-APPENDS
++ per-shard max_created_by high-water (INSERT loses the created_by:None arm; hwm keeps COUNT/zero-copy/
+reshaping served for s >= hwm readers) -> (pre2) GENERATION-ATOMIC shard publication (embed region Arcs in
+the shard metadata, ONE ArcSwap load; migrate the 3b locate + A4c gather + batched consumers off
+shards.load()+.get()) -> THEN the elision below.
+
+A4e REFINED DESIGN (2026-07-02, after code recon): (1) IDENTITY IS ALREADY DECOUPLED — prepare_insert
+derives row keys from the `relational_next_row_id` snapshot, NOT the host install; elision does not
+break identity. (2) THE SCAN-FALLBACK HOLE: on an elided (empty-host-store) table, any DML shape the
+device resolve declines (range/OR-groups today) would fall to the value-index/seq-scan = EMPTY = WRONG
+RESULTS. THE LADDER: any resolve decline on an elided table triggers REHYDRATION (de-elision) — the A4c
+gather at current seq repopulates the host store + value indexes, the table goes STICKY-de-elided, the
+host path proceeds (always correct; O(table) once; re-elision = later optimization). (3) RE-ADMIT on an
+elided table must rebuild from the A4c gather, NOT the empty host store; gather-decline (NULL) triggers
+the same rehydration. (4) apply-layer skip: elided tables skip tuple-store install + value_index insert;
+delta/write_set/WAL unchanged (durability = WAL). (5) SLO measure with the flag ON in the bench.
+
+A4e V1 DECISIONS: elide AFTER first admission (initial populate parses host rows; first commit
+installs+admits, later commits elide → host store holds a STALE PREFIX — rehydration must CLEAR it
+before repopulating). apply_delta skip: Insert arm still advance_row_id (identity allocator!) but skips
+with_table_mut; Update/Delete arms skip entirely. CRITICAL: on an elided table `tuple_fetch_by_key`
+returns None = "not visible" (NOT a decline) → the A2 resolve / A3 probe would return WRONG empty
+matches — the materializer (A4a) switch is CORRECTNESS-critical and must land in the SAME slice as the
+apply-skip, plus preflight validators. tuple_ids for elided tables are never materialized (host-only
+artifact; WAL replay re-derives — fine). Implementation order: (i) elided set + apply-skip + A2/A3
+materializer switch + rehydration ladder, ONE flag; (ii) re-admit via A4c gather; (iii) SLO measure.
+
 START: A4e — the ELISION. For ELIGIBLE tables (strictly-Int4, null-free, shard-resident,
 identity-complete): commits SKIP the host value_index insert + tuple install; the A2 resolve + A3
 validator fetches switch from `tuple_fetch_by_key` to the A4a materializer; re-admit + the NULL/de-elision
