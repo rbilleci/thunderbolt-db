@@ -682,6 +682,64 @@ fn failed_admin_flush_does_not_increment_flush_metrics_or_drop_pending_queue() {
 }
 
 #[test]
+fn batch_flush_is_one_wal_fsync_group_for_all_items() {
+    // D3 (write-path assessment / ledger #7): a k-item batch commits as ONE WAL flush group —
+    // k appended records made durable by a single fsync — observed via the durable WAL's
+    // group-commit accounting. Previously each item drove its own commit_mutation => k fsyncs.
+    let path = test_wal_path("batch-one-fsync");
+    let mut e = Engine::with_batching(8, Duration::from_secs(60));
+    e.commit_state_mut().wal = WalBuffer::with_durable_segment(&path);
+    let t0 = Instant::now();
+
+    e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+    e.enqueue_set_text(2, "SET b=2", t0).unwrap();
+    e.enqueue_set_text(3, "SET c=3", t0).unwrap();
+    e.flush_admin().unwrap();
+
+    let stats = e.wal_group_commit_stats();
+    assert_eq!(stats.flush_groups, 1, "one fsync for the whole batch");
+    assert_eq!(stats.durable_records, 3);
+    assert_eq!(stats.max_group_size, 3);
+    assert_eq!(e.get("a").as_deref(), Some("1"));
+    assert_eq!(e.get("b").as_deref(), Some("2"));
+    assert_eq!(e.get("c").as_deref(), Some("3"));
+    assert_eq!(e.metrics().snapshot().commits_total, 3);
+
+    // The group's records are real durable WAL records: a restart replays all three.
+    drop(e);
+    let recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    assert_eq!(recovered.wal_flushed_count(), 3);
+    assert_eq!(recovered.get("a").as_deref(), Some("1"));
+    assert_eq!(recovered.get("c").as_deref(), Some("3"));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn batch_commit_timestamps_stay_strictly_monotonic_per_item() {
+    // The batched commit inlines the next_commit_timestamp_micros formula per item; the
+    // recorded commit timestamps must stay strictly monotonic in batch order (PITR ordering).
+    let mut e = Engine::with_batching(8, Duration::from_secs(60));
+    let t0 = Instant::now();
+    e.enqueue_set_text(11, "SET a=1", t0).unwrap();
+    e.enqueue_set_text(12, "SET b=2", t0).unwrap();
+    e.enqueue_set_text(13, "SET c=3", t0).unwrap();
+    e.flush_admin().unwrap();
+
+    let timestamps = e.durable_wal_record_timestamps();
+    assert_eq!(
+        timestamps.iter().map(|t| t.txn_id).collect::<Vec<_>>(),
+        vec![11, 12, 13]
+    );
+    assert!(
+        timestamps
+            .windows(2)
+            .all(|w| w[0].timestamp_micros < w[1].timestamp_micros),
+        "batch commit timestamps must be strictly monotonic: {timestamps:?}"
+    );
+}
+
+#[test]
 fn batch_flush_wal_failure_requeues_items_for_retry() {
     let mut e = Engine::with_batching(2, Duration::from_secs(60));
     let t0 = Instant::now();

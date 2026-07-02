@@ -233,7 +233,10 @@ impl Engine {
             } => Some((
                 table.clone(),
                 updated_old_rows.clone(),
-                installs.iter().map(|(_id, _key, row)| row.clone()).collect(),
+                installs
+                    .iter()
+                    .map(|(_id, _key, row)| row.clone())
+                    .collect(),
             )),
             _ => None,
         };
@@ -1647,34 +1650,42 @@ impl Engine {
             FlushReason::Admin => BatchFlushReason::Admin,
         };
 
-        let mut remaining = items.peekable();
-        while let Some(p) = remaining.next() {
-            let wait = flushed_at
-                .saturating_duration_since(p.enqueued_at)
-                .as_millis() as u64;
-            let txn_id = p.item.txn_id;
-            let payload = p.item.payload.clone();
-
+        let items: Vec<BatchItem<PendingMutation>> = items.collect();
+        for p in &items {
             // In no-GPU bootstrap mode, batched mutations represent the simulated
             // GPU-eligible write path. Track transfer and kernel timing envelopes
             // so telemetry contracts are stable before CUDA is wired in.
-            self.metrics.observe_h2d_bytes(payload.len() as u64);
-            let simulated_kernel_ms = ((payload.len() as u64) / 1024).max(1);
+            let payload_len = p.item.payload.len();
+            self.metrics.observe_h2d_bytes(payload_len as u64);
+            let simulated_kernel_ms = ((payload_len as u64) / 1024).max(1);
             self.metrics.observe_kernel_exec_ms(simulated_kernel_ms);
-            let simulated_occupancy = Self::simulate_kernel_occupancy_permyriad(payload.len());
+            let simulated_occupancy = Self::simulate_kernel_occupancy_permyriad(payload_len);
             self.metrics
                 .observe_kernel_occupancy_permyriad(simulated_occupancy);
-
-            if let Err(err) = self.commit_mutation(txn_id, payload) {
-                let tail: Vec<_> = std::iter::once(p).chain(remaining).collect();
-                self.batcher().requeue_front(tail);
-                self.metrics.observe_pending_batch_len(self.batcher().len());
-                return Err(err);
-            }
-
-            self.metrics.observe_batch_wait_ms(wait);
         }
 
+        // ONE WAL flush group for the whole batch (assessment D3 / ledger #7): k items = k WAL
+        // appends + ONE fsync, not k fsyncs. On a clean pre-durable failure the whole batch is
+        // requeued for retry (nothing committed); a post-durable failure must NOT be requeued —
+        // the records are already in the durable log and a retry would duplicate them.
+        let batch: Vec<(TxnId, Vec<u8>)> = items
+            .iter()
+            .map(|p| (p.item.txn_id, p.item.payload.clone()))
+            .collect();
+        if let Err(failure) = self.commit_mutation_batch(&batch) {
+            if failure.rolled_back {
+                self.batcher().requeue_front(items);
+                self.metrics.observe_pending_batch_len(self.batcher().len());
+            }
+            return Err(failure.error);
+        }
+
+        for p in &items {
+            let wait = flushed_at
+                .saturating_duration_since(p.enqueued_at)
+                .as_millis() as u64;
+            self.metrics.observe_batch_wait_ms(wait);
+        }
         self.metrics.observe_pending_batch_len(self.batcher().len());
         self.metrics.inc_batch_flush(metric_reason);
         Ok(())
