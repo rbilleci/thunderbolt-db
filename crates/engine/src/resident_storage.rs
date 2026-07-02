@@ -205,14 +205,6 @@ impl ShardResidentDeviceMemoryMap {
             .and_then(|cell| cell.load().get().clone())
     }
 
-    /// Whether this shard currently has a published owner (tombstones excluded).
-    pub(crate) fn contains_key(&self, key: &(String, u32)) -> bool {
-        self.cells
-            .load()
-            .get(key)
-            .is_some_and(|cell| cell.load().get().is_some())
-    }
-
     /// Published owners for every shard of `table` (tombstones excluded), owned `Arc`s.
     pub(crate) fn published_owners_for_table(
         &self,

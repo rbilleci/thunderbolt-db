@@ -129,7 +129,11 @@ disqualified, reshaping shapes hard-erroring). The **high-water** prevents that 
 | dense GPU probe route | decline iff deleted_by present OR (created_by present AND `s < hwm`) — the ungated kernel stays exact |
 
 Only a reader pinned INSIDE an append window (`s < hwm`) takes the gated path — the newest-boundary
-common case keeps every fast path. `deleted_by` has no high-water shortcut: a tombstone hides rows at
+common case keeps every fast path. One deliberate edge (audit-noted): a reshaping/JOIN statement that
+binds its boundary in the sub-microsecond window between an append's descriptor publish and
+`publish_committed_seq` sees `s < hwm` and clean-errors ("VERSIONED sharded table") rather than
+serving — pre-D3 the same window served WITH the phantom insert; error > silent wrong result. Scans,
+counts, and point routes gate correctly in that window instead of erroring. `deleted_by` has no high-water shortcut: a tombstone hides rows at
 every later boundary. Reclaiming regions (and re-clustering) is VACUUM — ledgered #5, the open
 follow-up; the dense route's deleted_by decline is load-bearing under any future independent region
 reclaim (do not remove it).
