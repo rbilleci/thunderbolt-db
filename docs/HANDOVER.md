@@ -36,10 +36,6 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ## >>> THE ONE NEXT ACTION: (B) sharded predicate NULL 3VL — the LAST shards-default gate <<<
 
-**FIRST: `git push origin main` is PENDING USER APPROVAL** — SV6 (`01936144`) is committed locally on `main`,
-opus-audited SHIP, but the auto-mode classifier blocks push-to-default-branch. Push it (or authorize the push)
-before starting the next slice.
-
 The **READ path is SETTLED** at its architectural ceiling. The **WRITE CRUD data plane is GPU-native** and,
 with SV6 (the `created_by` gate) DONE, **the SV5 P2 double-read flip-gate is CLOSED** — the last
 shards-default correctness gate is option B. The user-set sequence: **B → C → D**.
@@ -73,7 +69,7 @@ charter cut. D proves the SLO. Sequence: **B → C → D**.
 
 ---
 
-## Where we are (HEAD = local `01936144` — SV6, push pending; origin/main at `3958e847`)
+## Where we are (DONE + on origin/main; HEAD `01936144` = SV6)
 
 **SV6 `created_by` SI gate — DONE, opus SHIP (`01936144`, 2026-07-02).** The SV5 P2 double-read is FIXED and
 was REPRODUCED first (stamp disabled = HEAD → a C-1 reader saw the key TWICE). Per-shard on-demand
