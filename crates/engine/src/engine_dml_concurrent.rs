@@ -7,6 +7,123 @@
 
 use super::*;
 
+/// Upper bound on items per wave drain (keeps a single wave's worst-case commit latency bounded;
+/// under saturation the NEXT wave picks the rest up immediately).
+const COMMIT_WAVE_MAX: usize = 1024;
+
+/// Commit-wave telemetry (waves sequenced / items committed through waves / total sequencing
+/// nanos including each wave's group-durability tail). Three relaxed adds PER WAVE — not per
+/// item — so it stays on permanently; the phase-D SLO benchmark reads it to report wave
+/// amortization (`items/waves`) alongside TPS.
+pub static WAVE_STATS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// One enqueued concurrent commit: everything the sequencer needs to conflict-check, re-resolve,
+/// append, apply, and publish it — plus the shared slot its owner blocks on.
+pub(crate) struct CommitWaveItem {
+    txn_id: u64,
+    cmd: Command,
+    payload: Vec<u8>,
+    write_set: WriteSet,
+    read_snapshot: Index,
+    residency_tables: BTreeSet<String>,
+    outcome: CommitWaveOutcome,
+}
+
+pub(crate) type CommitWaveOutcome = Arc<CommitWaveDone>;
+
+/// A wave item's completion slot: the payload behind a mutex, the `done` flag an ATOMIC so
+/// waiters can SPIN on completion (a few µs) instead of paying a futex sleep+wake round-trip
+/// per commit — the wakeup latency, not the mutex, dominated the first wave measurement.
+#[derive(Default)]
+pub(crate) struct CommitWaveDone {
+    done: std::sync::atomic::AtomicBool,
+    result: Mutex<Option<Result<(), ExecuteError>>>,
+}
+
+impl CommitWaveDone {
+    fn take_if_done(&self) -> Option<Result<(), ExecuteError>> {
+        if !self.done.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+        self.result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+impl CommitWaveItem {
+    fn set_outcome(&self, result: Result<(), ExecuteError>) {
+        *self
+            .outcome
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+        self.outcome.done.store(true, AtomicOrdering::Release);
+    }
+}
+
+/// The deterministic commit-wave state (ledger #6): the arrival-ordered item queue, the
+/// single-sequencer election flag, and the sticky wedge. The condvar doubles as the completion
+/// signal for waiters and the promotion signal for the next sequencer.
+pub(crate) struct CommitWaveState {
+    pub(crate) queue: Mutex<CommitWaveQueue>,
+    pub(crate) cv: std::sync::Condvar,
+}
+
+impl Default for CommitWaveState {
+    fn default() -> Self {
+        Self {
+            queue: Mutex::new(CommitWaveQueue::default()),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CommitWaveQueue {
+    items: std::collections::VecDeque<CommitWaveItem>,
+    sequencer_active: bool,
+    /// Sticky: a wave failed after its deltas were applied (durability failure mid-wave). No
+    /// further concurrent commits may run until restart recovery.
+    wedged: Option<String>,
+}
+
+/// Fails every still-unset outcome in a wave batch if the sequencer dies mid-wave (the
+/// apply-invariant panic path), and wedges the queue so waiters and future committers error out
+/// instead of hanging. Forgotten (`std::mem::forget`) on the successful path.
+struct CommitWaveBatchGuard<'a> {
+    engine: &'a Engine,
+    items: &'a [CommitWaveItem],
+}
+
+impl Drop for CommitWaveBatchGuard<'_> {
+    fn drop(&mut self) {
+        let mut queue = self.engine.lock_commit_wave_queue();
+        let reason = queue
+            .wedged
+            .clone()
+            .unwrap_or_else(|| "commit-wave sequencer died mid-wave".to_string());
+        queue.wedged = Some(reason.clone());
+        queue.sequencer_active = false;
+        // Fail everything still queued too — no sequencer will ever run it.
+        let stranded: Vec<CommitWaveItem> = queue.items.drain(..).collect();
+        drop(queue);
+        for item in self.items.iter().chain(stranded.iter()) {
+            if !item.outcome.done.load(AtomicOrdering::Acquire) {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(format!(
+                    "the concurrent commit path is wedged pending restart recovery: {reason}"
+                )))));
+            }
+        }
+        self.engine.commit_wave.cv.notify_all();
+    }
+}
+
 impl Engine {
     /// Whether `text` is a DML statement (`INSERT`/`UPDATE`/`DELETE` on an existing base table whose
     /// columns carry no `nextval` sequence default) that the **concurrent** commit path can execute
@@ -127,10 +244,11 @@ impl Engine {
         // (Tests barrier here to align two writers' snapshots before their commits race.)
         on_prepared();
 
-        // (3) Commit critical section under the commit_mutex.
+        // (3) Commit: enqueue into the deterministic commit WAVE (ledger #6) and wait for the
+        // sequencer to durably commit + publish it (or abort it with a retryable conflict).
         self.commit_dml_concurrent(
             txn_id,
-            &cmd,
+            cmd,
             text,
             prepared.write_set,
             read_snapshot,
@@ -175,192 +293,404 @@ impl Engine {
         tables
     }
 
-    /// The short commit critical section (write-half MVCC, Stage 4). Holds the commit_mutex for:
-    /// SI conflict validation → RE-RESOLVE/re-validate the delta at the peeked `commit_seq` → WAL
-    /// append+fsync (`commit_seq` assignment) → delta install + table publish → ledger record →
-    /// `committed_seq` release-store. Returns the retryable [`ExecuteError::Serialization`] on a
-    /// first-committer-wins conflict OR on a re-resolve/constraint failure under a legal concurrent
-    /// interleaving (a phantom absorbed since the snapshot, or a read-only FK parent a concurrent
-    /// committer deleted) — in BOTH cases nothing was proposed/published/made durable and no
-    /// commit-seq hole is left. The re-resolve runs the same `prepare_*` the serialized path uses
-    /// (and `apply_delta` installs it), so the live apply is byte-identical to a WAL replay of the
-    /// recorded SQL (the kill-mid-commit-under-concurrency invariant). The re-resolve happens BEFORE
-    /// the WAL append/`propose`, so an abort never has anything durable to roll back.
+    /// Enqueue one prepared concurrent DML commit into the deterministic commit WAVE and block
+    /// until a sequencer completes it (ledger #6 / ADR-009 host spine — "the order IS the log").
+    ///
+    /// Committers no longer take the commit_mutex per statement. They push a fully-prepared wave
+    /// item and either (a) become the SEQUENCER — the one thread that drains everything queued as
+    /// a WAVE and commits it under a single commit_mutex hold — or (b) wait on the shared condvar
+    /// until a sequencer completes their item. Any waiter can be PROMOTED to sequencer when the
+    /// active one steps down (after its own item completes), so queued items are never
+    /// leaderless. Wave order = queue arrival order = WAL/log order = apply order; within a wave
+    /// there are NO ordering aborts (each item's re-resolve sees every earlier item's applied
+    /// delta) — aborts remain only for genuine SI conflicts against state committed after an
+    /// item's read snapshot, and for constraint phantoms at its commit seq (both retryable,
+    /// pre-durable, side-effect-free).
+    ///
+    /// vs. the previous per-commit critical section: one mutex hand-off + one group-fsync wait +
+    /// one publish PER WAVE instead of per commit, and the apply loop runs back-to-back on one
+    /// core (the sequencer) instead of bouncing the MVCC structures across every writer's cache.
     fn commit_dml_concurrent(
         &self,
         txn_id: u64,
-        cmd: &Command,
+        cmd: Command,
         text: &str,
         write_set: WriteSet,
         read_snapshot: Index,
         residency_tables: BTreeSet<String>,
     ) -> Result<(), ExecuteError> {
-        let timestamp_micros = self.next_commit_timestamp_micros();
-        let payload = text.as_bytes().to_vec();
-
-        // === enter the commit critical section ===
-        let mut commit = self.commit_state();
-
-        // (3a) Validate the prepared write-set against commits since the read snapshot. Any overlap
-        // means a concurrent transaction committed a write to one of our keys after we snapshotted —
-        // first-committer-wins aborts us (retryable). Nothing has been proposed/written yet, so the
-        // abort is side-effect-free.
-        if commit.ledger.conflicts(&write_set, read_snapshot) {
-            return Err(ExecuteError::Serialization(format!(
-                "write-write conflict on a key committed after read snapshot {read_snapshot}"
-            )));
+        let outcome: CommitWaveOutcome = Arc::new(CommitWaveDone::default());
+        let mut queue = self.lock_commit_wave_queue();
+        if let Some(reason) = &queue.wedged {
+            return Err(ExecuteError::Engine(EngineError::Durability(format!(
+                "the concurrent commit path is wedged pending restart recovery: {reason}"
+            ))));
         }
-
-        // (3b) PEEK the commit_seq this txn WILL be assigned, then RE-RESOLVE + re-validate the delta
-        // at it — BEFORE anything durable (WAL/propose) happens. We hold the commit_mutex, so no other
-        // committer can `propose` between this peek and ours, and our own delta is not installed yet;
-        // therefore re-resolving at `committed_seq = next_index` now sees EXACTLY the state it would
-        // see after `propose` but before `apply` (the highest existing version stamp is < commit_seq,
-        // so resolving at `commit_seq` admits all currently-committed versions and none of our own).
-        //
-        // The re-prepare re-runs the FULL unique/CHECK/FK preflight + UPDATE/DELETE predicate
-        // resolution against `commit_seq`. The off-lock prepare validated only against an OLDER
-        // snapshot and the SI conflict check (3a) only covers keys in our WRITE-set; a phantom
-        // committed in (snapshot, commit_seq] — e.g. an FK PARENT we merely READ then a concurrent
-        // DELETE removed, or a row a re-resolve now absorbs into a unique/CHECK violation — can break
-        // a constraint at commit_seq even though (3a) passed. That is a LEGAL concurrent interleaving,
-        // not an invariant violation, so it is a RETRYABLE serialization abort: because we have not
-        // proposed or appended to the WAL yet, the abort leaves NOTHING durable and NO commit-seq hole
-        // (we never consumed the index). The caller retries against a fresh snapshot.
-        let commit_seq = commit.repl.peek_next_index();
-        let install_snapshot = self.dml_read_snapshot(commit_seq);
-        let delta = self.prepare_dml(cmd, install_snapshot).map_err(|err| {
-            // A re-prepare failure under a legal concurrent interleaving (phantom absorbed by the
-            // re-resolve, or a read-only FK parent deleted by a concurrent committer). Surface as a
-            // retryable Serialization abort rather than a panic — nothing was made durable.
-            match err {
-                ExecuteError::Serialization(_) => err,
-                other => ExecuteError::Serialization(format!(
-                    "re-resolve at commit_seq {commit_seq} failed on a concurrent interleaving \
-                     (retryable): {other}"
-                )),
-            }
-        })?;
-
-        // (3c) Only NOW assign commit_seq for real (WAL append + propose). The `propose` MUST
-        // return the index we peeked, since we hold the commit_mutex (single proposer). The fsync
-        // is deliberately NOT here (D3b group commit): it runs AFTER this critical section via
-        // `wait_group_durable`, so concurrent committers share one fsync per group instead of
-        // serializing fsync-per-commit under the commit_mutex. WAL-before-visibility still holds —
-        // `committed_seq` is published only after the group fsync covers this record; until then
-        // the applied delta below is stamped ABOVE every reader's pinned snapshot and is invisible.
-        let wal_len_before = commit.wal.len();
-        commit.wal.append(WalRecord {
+        queue.items.push_back(CommitWaveItem {
             txn_id,
-            payload: payload.clone(),
+            cmd,
+            payload: text.as_bytes().to_vec(),
+            write_set,
+            read_snapshot,
+            residency_tables,
+            outcome: Arc::clone(&outcome),
         });
-        let wal_position = commit.wal.len();
-        let token = match commit.repl.propose(payload) {
-            Ok(token) => token,
-            Err(err) => {
-                commit.wal.truncate(wal_len_before);
-                return Err(ExecuteError::Engine(err));
+        if !queue.sequencer_active {
+            queue.sequencer_active = true;
+            drop(queue);
+            self.run_commit_wave_sequencer(&outcome);
+            if let Some(result) = outcome.take_if_done() {
+                return result;
             }
-        };
-        debug_assert_eq!(
-            token.index, commit_seq,
-            "commit_mutex is the single proposer: the proposed index must equal the peeked one"
-        );
-        let commit_seq = token.index;
-        commit
-            .repl
-            .wait_committed(token, Duration::from_millis(0))?;
-        commit.record_commit_timestamp(txn_id, timestamp_micros);
+        } else {
+            drop(queue);
+        }
+        loop {
+            // Spin first: under load a wave completes within tens of µs, far cheaper to poll than
+            // to pay a futex sleep + wake per commit. The periodic promotion probe keeps queued
+            // items from ever being leaderless (the previous sequencer may have stepped down
+            // between our enqueue and our first probe).
+            for spin in 0..4096_u32 {
+                if let Some(result) = outcome.take_if_done() {
+                    return result;
+                }
+                if spin % 64 == 63 {
+                    if let Ok(mut queue) = self.commit_wave.queue.try_lock() {
+                        if !queue.sequencer_active && !queue.items.is_empty() {
+                            queue.sequencer_active = true;
+                            drop(queue);
+                            self.run_commit_wave_sequencer(&outcome);
+                        }
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            // Fall back to the condvar (arrival lulls / oversubscribed cores).
+            let mut queue = self.lock_commit_wave_queue();
+            loop {
+                if let Some(result) = outcome.take_if_done() {
+                    return result;
+                }
+                if !queue.sequencer_active {
+                    if queue.items.is_empty() {
+                        break;
+                    }
+                    queue.sequencer_active = true;
+                    drop(queue);
+                    self.run_commit_wave_sequencer(&outcome);
+                    break;
+                }
+                queue = self
+                    .commit_wave
+                    .cv
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+    }
 
-        // (3d) Install the already-validated delta + publish the table generation. The delta was
-        // re-resolved at exactly this `commit_seq` above, so this is a PURE install (reserve fresh
-        // tuple ids, advance the row-id allocator, mutate the per-table version chains + value index
-        // under the commit_mutex). The MvccData publish + the atomic allocators are `&self`; the
-        // commit_mutex (held here) serializes installs so row-id assignment + the per-table publish
-        // are atomic w.r.t. other committers. D3b note: the apply now runs BEFORE the (group) fsync —
-        // that is what lets the NEXT committer's re-resolve at `commit_seq + 1` see this delta while
-        // our fsync is still in flight; visibility is unaffected because `committed_seq` is published
-        // only after the fsync covers this record. A failure HERE is unreachable on any legal
-        // interleaving (the validation already succeeded at this seq and we hold the lock) and would
-        // leave the version chains TORN mid-install — a true unrecoverable invariant violation — so
-        // we PANIC, which poisons the commit_mutex; the façade's re-homed poison-on-panic policy then
-        // refuses further service rather than serve torn state (a restart replays the durable WAL,
-        // the source of truth). Mark the entry applied so the replicator's applied_index tracks
-        // the directly-applied commit (no later re-drain / re-apply).
-        //
-        // Slice 1b-ii: capture the APPLIED insert rows (post-coercion / post-default, the actual stored
-        // images) BEFORE apply_delta consumes the delta, so an INSERT-only commit can append them in
-        // place to the resident open shard instead of a full re-admit (residency step below).
-        let insert_append: Option<(String, Vec<Vec<SqlValue>>)> = match &delta.mutation {
-            crate::write_path::PreparedMutation::Insert {
-                table,
-                inserted_rows,
-                ..
-            } => Some((
-                table.clone(),
-                inserted_rows
-                    .iter()
-                    .map(|(_key, values)| values.clone())
-                    .collect(),
-            )),
-            _ => None,
-        };
-        self.apply_delta(delta, commit_seq, None).unwrap_or_else(|err| {
-            panic!(
-                "commit-path invariant violation: apply at commit_seq {commit_seq} failed after the \
-                 WAL was made durable, although re-validation at this seq succeeded: {err}"
-            )
-        });
-        commit.repl.mark_applied(commit_seq);
-
-        // (3e) Record OUR write-set in the ledger for future conflict detection, then prune entries
-        // below the oldest active snapshot (the safe GC/ledger boundary).
-        commit.ledger.record(&write_set, commit_seq);
-        let prune_boundary = self
-            .active_snapshots
+    fn lock_commit_wave_queue(&self) -> std::sync::MutexGuard<'_, CommitWaveQueue> {
+        self.commit_wave
+            .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .oldest()
-            .map(|oldest| oldest.saturating_sub(1))
-            .unwrap_or(commit_seq);
-        commit.ledger.prune_below(prune_boundary);
+    }
 
-        // Residency, INSIDE the critical section + BEFORE publish (residency↔data consistency, design
-        // Risk #3). Slice 1b-ii: for an INSERT-only commit, try to APPEND the applied rows in place to
-        // the resident OPEN shard (advancing row_count) — O(rows), not a whole-table re-upload. On
-        // success skip the invalidation it replaces; otherwise invalidate (and the re-admit below
-        // rebuilds, with fresh headroom).
-        let appended = self.auto_admit_on_commit_enabled()
-            && insert_append.as_ref().is_some_and(|(table, rows)| {
-                // Plain INSERT appends are unstamped/born-visible (SV6 `created_by = None`).
-                self.try_append_resident_int4_open_shard(table, rows, None)
-            });
-        if !appended {
-            self.invalidate_relational_residency_tables_concurrent(
-                &residency_tables,
-                txn_id,
-                commit_seq,
+    /// The promoted sequencer: drain-and-commit WAVES until this thread's own item is done (then
+    /// hand leadership off) or the queue is empty. Wave size self-tunes to the arrival rate —
+    /// everything queued while the previous wave was committing forms the next wave (bounded by
+    /// `COMMIT_WAVE_MAX` per drain to keep worst-case wave latency bounded).
+    fn run_commit_wave_sequencer(&self, own_outcome: &CommitWaveOutcome) {
+        loop {
+            let batch: Vec<CommitWaveItem> = {
+                let mut queue = self.lock_commit_wave_queue();
+                let n = queue.items.len().min(COMMIT_WAVE_MAX);
+                if n == 0 {
+                    queue.sequencer_active = false;
+                    drop(queue);
+                    self.commit_wave.cv.notify_all();
+                    return;
+                }
+                queue.items.drain(..n).collect()
+            };
+            let wave_started = std::time::Instant::now();
+            let wave_len = batch.len() as u64;
+            self.sequence_commit_wave(batch);
+            WAVE_STATS[0].fetch_add(1, AtomicOrdering::Relaxed);
+            WAVE_STATS[1].fetch_add(wave_len, AtomicOrdering::Relaxed);
+            WAVE_STATS[2].fetch_add(
+                wave_started.elapsed().as_nanos() as u64,
+                AtomicOrdering::Relaxed,
             );
+            {
+                let _queue = self.lock_commit_wave_queue();
+                self.commit_wave.cv.notify_all();
+            }
+            if own_outcome.done.load(AtomicOrdering::Acquire) {
+                // Step down so this client thread can return; a waiter with a still-queued item
+                // (or the next arrival) promotes itself.
+                let mut queue = self.lock_commit_wave_queue();
+                queue.sequencer_active = false;
+                drop(queue);
+                self.commit_wave.cv.notify_all();
+                return;
+            }
         }
+    }
 
+    /// Commit one WAVE: the per-item (3a)-(3e) steps of the old per-commit critical section, run
+    /// back-to-back under ONE commit_mutex hold in wave order, then one group-durability wait +
+    /// one `committed_seq` publish for the whole wave. Every item's outcome slot is set exactly
+    /// once; the `CommitWaveBatchGuard` fails any still-unset outcome (and wedges the queue) if
+    /// this thread panics mid-wave (e.g. the apply-invariant panic, which also poisons the
+    /// commit_mutex — the established wedge-don't-serve-torn-state policy).
+    fn sequence_commit_wave(&self, batch: Vec<CommitWaveItem>) {
+        let guard = CommitWaveBatchGuard {
+            engine: self,
+            items: &batch,
+        };
+        let wall_clock = current_timestamp_micros();
+        let mut wave_tail: Option<(Index, usize)> = None;
+        let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(batch.len());
+        // Homogeneous fast-INSERT run accumulator (ADR-009's homogeneous-wave shape): consecutive
+        // constraint-free INSERTs are installed together by ONE `with_table_mut` per table at run
+        // flush. Their re-resolves never read table rows (constraint-free) and their row keys come
+        // from the VIRTUAL row-id cursor below, so deferring the install is invisible; any
+        // non-fast item flushes the run first so its re-resolve sees every prior wave write.
+        let mut fast_run: Vec<(usize, Index, String, WriteDelta)> = Vec::new();
+        let auto_admit = self.auto_admit_on_commit_enabled();
+        let mut fast_table_cache: BTreeMap<String, bool> = BTreeMap::new();
+        // The virtual row-id cursor: fast-run deltas are prepared against this cursor (their
+        // installs — which advance the real allocator — are deferred to the run flush).
+        let mut next_row_id = self.read_state.mvcc.current_row_id();
+
+        let mut commit = self.commit_state();
+        let mut flush_fast_run =
+            |commit: &mut CommitState,
+             fast_run: &mut Vec<(usize, Index, String, WriteDelta)>,
+             committed: &mut Vec<(usize, Index, bool)>| {
+                if fast_run.is_empty() {
+                    return;
+                }
+                let _ = commit; // the commit_mutex guard is held by the caller for the whole wave
+                let mut by_table: BTreeMap<String, Vec<(WriteDelta, Index)>> = BTreeMap::new();
+                let mut run_meta: Vec<(usize, Index, String)> = Vec::with_capacity(fast_run.len());
+                for (position, seq, table, delta) in fast_run.drain(..) {
+                    run_meta.push((position, seq, table.clone()));
+                    by_table.entry(table).or_default().push((delta, seq));
+                }
+                for (table, deltas) in by_table {
+                    self.apply_insert_deltas_batched(&table, deltas)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "commit-path invariant violation: batched wave apply on {table} \
+                             failed after re-validation succeeded: {err}"
+                            )
+                        });
+                }
+                for (position, seq, _table) in run_meta {
+                    commit.repl.mark_applied(seq);
+                    self.invalidate_relational_residency_tables_concurrent(
+                        &batch[position].residency_tables,
+                        batch[position].txn_id,
+                        seq,
+                    );
+                    committed.push((position, seq, false));
+                }
+            };
+        for (position, item) in batch.iter().enumerate() {
+            // (3a) SI first-committer-wins: any key in the write-set committed after this item's
+            // read snapshot aborts it (retryable). Earlier items in THIS wave recorded into the
+            // ledger below, so intra-wave conflicts are caught here exactly like cross-wave ones.
+            if commit.ledger.conflicts(&item.write_set, item.read_snapshot) {
+                item.set_outcome(Err(ExecuteError::Serialization(format!(
+                    "write-write conflict on a key committed after read snapshot {}",
+                    item.read_snapshot
+                ))));
+                continue;
+            }
+
+            // (3b) Re-resolve at the peeked commit seq — sees every PRIOR wave item's applied
+            // delta (they are installed already), so wave order is the only order there is. A
+            // failure is a legal concurrent interleaving (constraint phantom): retryable,
+            // pre-durable, side-effect-free.
+            let commit_seq = commit.repl.peek_next_index();
+            let install_snapshot = DmlReadSnapshot {
+                commit_seq,
+                next_row_id,
+            };
+            let delta = match self.prepare_dml(&item.cmd, install_snapshot) {
+                Ok(delta) => delta,
+                Err(err) => {
+                    item.set_outcome(Err(match err {
+                        ExecuteError::Serialization(_) => err,
+                        other => ExecuteError::Serialization(format!(
+                            "re-resolve at commit_seq {commit_seq} failed on a concurrent \
+                             interleaving (retryable): {other}"
+                        )),
+                    }));
+                    continue;
+                }
+            };
+
+            // (3c) Assign the seq for real: WAL append + propose (the sequencer is the single
+            // proposer under the commit_mutex). The fsync is deferred to the wave tail.
+            let wal_len_before = commit.wal.len();
+            commit.wal.append(WalRecord {
+                txn_id: item.txn_id,
+                payload: item.payload.clone(),
+            });
+            let wal_position = commit.wal.len();
+            let token = match commit.repl.propose(item.payload.clone()) {
+                Ok(token) => token,
+                Err(err) => {
+                    commit.wal.truncate(wal_len_before);
+                    item.set_outcome(Err(ExecuteError::Engine(err)));
+                    continue;
+                }
+            };
+            debug_assert_eq!(
+                token.index, commit_seq,
+                "the sequencer is the single proposer: the proposed index must equal the peek"
+            );
+            if let Err(err) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
+                commit.repl.rollback_unapplied_from(commit_seq);
+                commit.wal.truncate(wal_len_before);
+                item.set_outcome(Err(ExecuteError::Engine(err)));
+                continue;
+            }
+            let timestamp_micros =
+                wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
+            commit.record_commit_timestamp(item.txn_id, timestamp_micros);
+
+            // (3e) Record the write-set for future conflict detection (also read by LATER items
+            // in this same wave — the intra-wave conflict path above).
+            commit.ledger.record(&item.write_set, commit_seq);
+
+            // Fast-run eligibility: a plain INSERT into a table with no unique index, no CHECK,
+            // and no FK (its re-resolve read no rows and claimed no unique slots), with auto-admit
+            // off (the in-place resident append is a per-item protocol). Everything else is a
+            // SLOW item: flush the pending run first so this item's apply-order matches seq order
+            // and later re-resolves see it.
+            let fast_table = matches!(item.cmd, Command::Insert(_))
+                && !auto_admit
+                && delta.write_set.unique_slots.is_empty()
+                && match &delta.mutation {
+                    crate::write_path::PreparedMutation::Insert { table, .. } => {
+                        *fast_table_cache.entry(table.clone()).or_insert_with(|| {
+                            self.catalog_snapshot()
+                                .relational_catalog
+                                .get(table)
+                                .is_some_and(|t| {
+                                    !t.indexes.iter().any(|index| index.unique)
+                                        && t.check_constraints.is_empty()
+                                        && t.foreign_keys.is_empty()
+                                })
+                        })
+                    }
+                    _ => false,
+                };
+            if fast_table {
+                let crate::write_path::PreparedMutation::Insert { table, .. } = &delta.mutation
+                else {
+                    unreachable!("fast_table guarantees an insert delta");
+                };
+                next_row_id += delta.rows_consumed;
+                fast_run.push((position, commit_seq, table.clone(), delta));
+                wave_tail = Some((commit_seq, wal_position));
+                continue;
+            }
+            flush_fast_run(&mut commit, &mut fast_run, &mut committed);
+
+            // (3d) SLOW item: install the re-validated delta now (apply-before-durable, D3b). A
+            // failure here is a true invariant violation — PANIC, poisoning the commit_mutex; the
+            // batch guard fails the wave's remaining outcomes and wedges the queue.
+            let insert_append: Option<(String, Vec<Vec<SqlValue>>)> = match &delta.mutation {
+                crate::write_path::PreparedMutation::Insert {
+                    table,
+                    inserted_rows,
+                    ..
+                } => Some((
+                    table.clone(),
+                    inserted_rows
+                        .iter()
+                        .map(|(_key, values)| values.clone())
+                        .collect(),
+                )),
+                _ => None,
+            };
+            self.apply_delta(delta, commit_seq, None)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "commit-path invariant violation: apply at commit_seq {commit_seq} failed \
+                     after re-validation at this seq succeeded: {err}"
+                    )
+                });
+            commit.repl.mark_applied(commit_seq);
+            next_row_id = self.read_state.mvcc.current_row_id();
+
+            // Residency, before publish (residency-data consistency). Slice 1b-ii in-place append
+            // when auto-admit is on; conservative invalidation otherwise.
+            let appended = self.auto_admit_on_commit_enabled()
+                && insert_append.as_ref().is_some_and(|(table, rows)| {
+                    self.try_append_resident_int4_open_shard(table, rows, None)
+                });
+            if !appended {
+                self.invalidate_relational_residency_tables_concurrent(
+                    &item.residency_tables,
+                    item.txn_id,
+                    commit_seq,
+                );
+            }
+
+            wave_tail = Some((commit_seq, wal_position));
+            committed.push((position, commit_seq, appended));
+        }
+        flush_fast_run(&mut commit, &mut fast_run, &mut committed);
+        // Prune the ledger once per wave (was per commit) below the oldest active snapshot.
+        if let Some((last_seq, _)) = wave_tail {
+            let prune_boundary = self
+                .active_snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .oldest()
+                .map(|oldest| oldest.saturating_sub(1))
+                .unwrap_or(last_seq);
+            commit.ledger.prune_below(prune_boundary);
+        }
         // === leave the commit critical section BEFORE the fsync (D3b group commit) ===
         drop(commit);
 
-        // (3f) Group durability: make this record fsync-durable OUTSIDE the commit_mutex, sharing
-        // one fsync with every other committer whose record is already appended (the group). Only
-        // then publish: bump committed_seq LAST (release-store, monotonic CAS max — safe out of
-        // publish order), strictly after the WAL fsync and the data/value-index publish, so an
-        // acquire-load by a reader observes a fully durable, fully published commit.
-        self.wait_group_durable(wal_position)
-            .map_err(ExecuteError::Engine)?;
-        self.publish_committed_seq(commit_seq);
-        // STRATA S-B: best-effort GPU-residency admission for the mutated tables (flag-gated). Skipped
-        // when we appended in place above — that table is already resident + current (Slice 1b-ii).
-        if self.auto_admit_on_commit_enabled() && !appended {
-            self.auto_admit_resident_tables(&residency_tables);
+        let Some((last_seq, last_position)) = wave_tail else {
+            // Every item aborted pre-durable; outcomes are already set.
+            std::mem::forget(guard);
+            return;
+        };
+
+        // Wave tail: ONE group-durability wait covering every record this wave appended, then ONE
+        // publish at the wave's last seq (CAS max). WAL-before-visibility holds wave-wide: nothing
+        // in this wave is visible until its highest record is fsync-covered.
+        if let Err(err) = self.wait_group_durable(last_position) {
+            // The wave's deltas are applied-but-unpublishable; the flush protocol has recorded its
+            // sticky failure (and the flusher wedge-panicked if we were the flusher — in that case
+            // this line is unreachable). Fail the wave's outcomes and wedge the queue.
+            let mut queue = self.lock_commit_wave_queue();
+            queue.wedged = Some(err.to_string());
+            drop(queue);
+            drop(guard); // fails every still-unset outcome with the wedge error
+            return;
         }
-        self.metrics.inc_commit();
-        Ok(())
+        self.publish_committed_seq(last_seq);
+
+        for (position, _seq, appended) in &committed {
+            let item = &batch[*position];
+            if self.auto_admit_on_commit_enabled() && !appended {
+                self.auto_admit_resident_tables(&item.residency_tables);
+            }
+            self.metrics.inc_commit();
+            item.set_outcome(Ok(()));
+        }
+        std::mem::forget(guard);
     }
 
     /// D3b — the group-commit flush protocol. Blocks until the WAL's durable frontier covers
