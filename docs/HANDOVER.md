@@ -34,7 +34,18 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: PHASE C — index-driven DELETE/UPDATE resolution (ledger #1) <<<
+## >>> THE ONE NEXT ACTION: PHASE C slice 1b — index-driven constraint VALIDATORS <<<
+
+**Slice 1 is DONE (`9876d297`, opus SHIP): the O(table) prepare seq-scan is dead** for Eq-bearing
+predicates on constraint-free tables — the value-index resolve measures 108-184us p50 FLAT vs the scan's
+80-88ms at 262k rows (~700x; kill switch `dml_value_index_resolve_enabled`; twin-engine oracle gates in
+tests/write_half.rs). **1b extends it to CONSTRAINED tables**: unique validation = value_index lookups on
+the new images' unique values (excluding the updated keys); inbound-FK validation = the REFERENCING
+tables' value_index lookups for the deleted/updated referenced values + this table's index for surviving
+providers — both O(touched x constraints), replacing the validators' candidate_rows scans. Then VACUUM #5
+(also compacts the append-only value_index churn the audit flagged), then host-store retirement #2.
+The SECOND AGENT owns phase D (det-CC #6 + the SLO bench) — lanes + shared-file watch-list in memory
+`concurrent-agent-worktree`.
 
 **THE FLIP IS DONE (`689ab73f`): the GPU-native sharded data plane is the DEFAULT** (five flags ON;
 sharded admission scoped to purely-int4 tables; every flag remains a kill switch). Composed with the other
