@@ -529,11 +529,11 @@ impl Engine {
             .residency
             .shard_created_by_memory
             .invalidate_table(table);
-            // RETIREMENT A1: the row-identity region follows the buffer it annotates.
-            self.read_state
-                .residency
-                .shard_row_id_memory
-                .invalidate_table(table);
+        // RETIREMENT A1: the row-identity region follows the buffer it annotates.
+        self.read_state
+            .residency
+            .shard_row_id_memory
+            .invalidate_table(table);
         // Sub-slice 3b: drop the table's cached per-shard PK indexes (they pin stale buffers).
         self.read_state
             .residency

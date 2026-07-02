@@ -3349,6 +3349,180 @@ mod capacity_payload_tests {
         assert_eq!(got.len(), 2, "k=2 and k=3 match");
     }
 
+    /// RETIREMENT A2 — the THREE-WAY resolve differential: the DEVICE resolve (locate -> row_id ->
+    /// derived key -> keyed fetch -> recheck) == the VALUE-INDEX resolve == the SCAN, over identical
+    /// statement sequences on triple engines. Covers: point DELETE/UPDATE (the locate's unique-key
+    /// shape), DML after an SV5 UPDATE (the appended version's A1 identity must resolve the SAME
+    /// key), delete-by-tombstoned-value (the PHYSICAL locate hits the tombstoned slot; the keyed
+    /// fetch at visibility must yield no match), duplicate-key decline (locate refuses ->
+    /// value-index serves), OR-group + range fallbacks, and post-rollover appends. NON-VACUITY:
+    /// `dml_device_resolve_hits` must ADVANCE on the device engine for the point shapes (output
+    /// equality alone cannot prove which resolver served).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a2_device_resolve_matches_value_index_and_scan() {
+        let scenarios: Vec<Vec<String>> = vec![
+            vec![
+                "DELETE FROM t WHERE id = 40".into(),
+                "UPDATE t SET v = 999 WHERE id = 40".into(),
+            ],
+            vec![
+                "UPDATE t SET v = 777 WHERE id = 50".into(), // SV5 append: new version, same identity
+                "DELETE FROM t WHERE id = 50".into(),        // resolve THROUGH the appended version
+            ],
+            vec![
+                "DELETE FROM t WHERE id = 60".into(),
+                "DELETE FROM t WHERE id = 60".into(), // second delete: tombstoned -> no match
+            ],
+            vec!["DELETE FROM t WHERE v = 100".into()], // v = (id%37)*10 -> duplicates -> locate declines
+            vec!["UPDATE t SET v = -1 WHERE id = 70 OR id = 71".into()], // OR-group -> fallback
+            vec!["DELETE FROM t WHERE id < 5".into()],  // range -> fallback
+        ];
+        let build = |scenario: usize,
+                     device: bool,
+                     value_index: bool,
+                     statements: &[String]|
+         -> Vec<Vec<SqlValue>> {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_dml_device_resolve_enabled(device);
+            e.set_dml_value_index_resolve_enabled(value_index);
+            e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", (k % 37) * 10))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let hits_before = e.dml_device_resolve_hits();
+            for sql in statements {
+                e.execute_text(seq, sql).unwrap();
+                seq += 1;
+            }
+            // Non-vacuity only for the SINGLE-Eq point scenarios (0-2); the dup/OR/range
+            // scenarios (3-5) are DESIGNED to decline to the fallback chain.
+            if device && scenario <= 2 {
+                assert!(
+                    e.dml_device_resolve_hits() > hits_before,
+                    "scenario {scenario}: non-vacuity — the device resolve must have served a point statement"
+                );
+            }
+            // Plain projection (no ORDER BY): a VERSIONED sharded table clean-errors on reshaping
+            // clauses (the documented SV3b/SV6 guard); identical lineages give identical row order.
+            e.execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .into_boxed()
+        };
+        for (i, statements) in scenarios.iter().enumerate() {
+            let via_device = build(i, true, true, statements);
+            let via_index = build(i, false, true, statements);
+            let via_scan = build(i, false, false, statements);
+            assert_eq!(via_device, via_index, "scenario {i}: device == value-index");
+            assert_eq!(via_index, via_scan, "scenario {i}: value-index == scan");
+        }
+    }
+
+    /// RETIREMENT A2 regression (the SV6-hammer bug): after an SV5 update-append, one LOGICAL row
+    /// occupies slots in TWO shards (tombstoned old slot in its sealed shard, new version in the
+    /// open shard) — the visibility-blind locate hits BOTH, and both derive the SAME key. The
+    /// resolve must DEDUP them to one match: emitting two made prepare hand the SV5 gate 2 matches
+    /// for 1 slot, so every same-key re-UPDATE fell back to INVALIDATE+RE-ADMIT (O(table), plus the
+    /// reader-visible invalid window the hammer tripped). Output differentials CANNOT see that
+    /// fallback (re-admit is correctness-preserving) — this pins the INCREMENTAL path directly:
+    /// the pre-update shard buffers must SURVIVE the update chain (a re-admit replaces every ptr).
+    /// Sabotage: remove the `dedup_by_key` in `resolve_dml_matches_via_device` and this FAILS.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a2_same_key_update_chain_stays_on_incremental_path() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
+            )
+            .unwrap();
+        }
+        // First update: splits id=130 across shards (old tombstoned slot + appended new version).
+        e.execute_text(300, "UPDATE accounts SET balance = 111 WHERE id = 130")
+            .unwrap();
+        let before: Vec<(u32, u64)> = {
+            let shards = e
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get("accounts")
+                .cloned()
+                .unwrap();
+            shards
+                .iter()
+                .map(|shard| {
+                    let memory = e
+                        .read_state
+                        .residency
+                        .shard_device_memory
+                        .get(&("accounts".to_string(), shard.shard_id))
+                        .unwrap();
+                    (shard.shard_id, memory.device_ptr())
+                })
+                .collect()
+        };
+        // The chain: each re-update's resolve sees the cross-shard version split.
+        for t in 0..8_u64 {
+            e.execute_text(
+                301 + t,
+                &format!("UPDATE accounts SET balance = {} WHERE id = 130", 200 + t),
+            )
+            .unwrap();
+        }
+        // Every pre-chain buffer survives: appends/rollovers only ADD shards; an invalidate+
+        // re-admit (the bug's fallback) replaces EVERY device ptr.
+        let after = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .cloned()
+            .unwrap();
+        for (shard_id, ptr) in &before {
+            let survived = e
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&("accounts".to_string(), *shard_id))
+                .is_some_and(|memory| memory.device_ptr() == *ptr);
+            assert!(
+                survived,
+                "shard {shard_id} was REBUILT during the same-key update chain: the resolve must \
+                 dedup the version-split multi-hit so the SV5 incremental path handles the commit"
+            );
+        }
+        assert!(after.len() >= before.len(), "appends only ever ADD shards");
+        // End-state correctness on top of the mechanism pin.
+        let rows = e
+            .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(207)]);
+    }
+
     /// RETIREMENT A1 — the DEVICE ROW-IDENTITY differential: for EVERY (shard, live slot) of a
     /// resident table, the device `row_id` region's value derives the host key
     /// (`rel/{table}/{row_id:020}`), and the host row FETCHED BY THAT KEY matches the device row's
@@ -3363,27 +3537,42 @@ mod capacity_payload_tests {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
-        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
         // Admission + rollover lineage: 200 rows -> shards.
         for i in 0..200_i64 {
             e.execute_text(
                 (i as u64) + 2,
-                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
             )
             .unwrap();
         }
         // SV5 UPDATE append: the new version must carry id-130's ORIGINAL row identity.
-        e.execute_text(300, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
-        // More in-place appends after the update.
-        e.execute_text(301, "INSERT INTO accounts (id, balance) VALUES (500, 5000), (501, 5010)")
+        e.execute_text(300, "UPDATE accounts SET balance = 9999 WHERE id = 130")
             .unwrap();
+        // More in-place appends after the update.
+        e.execute_text(
+            301,
+            "INSERT INTO accounts (id, balance) VALUES (500, 5000), (501, 5010)",
+        )
+        .unwrap();
         // Audit finding 1: the CONCURRENT insert stamp site (the production wave path) — identities
         // parse from the re-validated delta at the append site.
-        e.execute_dml_concurrent(302, "INSERT INTO accounts (id, balance) VALUES (600, 6000), (601, 6010)")
-            .unwrap();
+        e.execute_dml_concurrent(
+            302,
+            "INSERT INTO accounts (id, balance) VALUES (600, 6000), (601, 6010)",
+        )
+        .unwrap();
         // Audit finding 2: a MULTI-ROW UPDATE bails the SV5 gate -> invalidate + RE-ADMIT -> the
         // ADMISSION parse rebuilds every shard's region over the full row set.
-        e.execute_text(303, "UPDATE accounts SET balance = 1 WHERE id = 10 OR id = 11").unwrap();
+        e.execute_text(
+            303,
+            "UPDATE accounts SET balance = 1 WHERE id = 10 OR id = 11",
+        )
+        .unwrap();
 
         let visibility = crate::StorageVisibility {
             read_txn_id: e.committed_seq(),
@@ -3391,7 +3580,14 @@ mod capacity_payload_tests {
         let prefix = relational_key_prefix("accounts");
         let table = e.relational_catalog_table("accounts").unwrap();
         let table_rows = e.read_state.mvcc.table_rows("accounts");
-        let shards = e.read_state.residency.shards.load().get("accounts").cloned().unwrap();
+        let shards = e
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get("accounts")
+            .cloned()
+            .unwrap();
         let mut checked = 0usize;
         for shard in &shards {
             let region = e
@@ -3412,8 +3608,7 @@ mod capacity_payload_tests {
             for slot in 0..shard.row_count {
                 // Device row_id (two i32 halves, LE).
                 let halves = region.read_resident_i32_column(slot as u64 * 8, 2).unwrap();
-                let row_id =
-                    (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
+                let row_id = (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
                 assert_ne!(
                     row_id,
                     u64::MAX,
@@ -3423,13 +3618,12 @@ mod capacity_payload_tests {
                 // Device row values (per-slot DtoH, the 3b gather pattern).
                 let mut device_row = Vec::new();
                 for (idx, _col) in table.columns.iter().enumerate() {
-                    let base =
-                        crate::relational_model::resident_device_int4_column_offset(
-                            &descriptor,
-                            &table,
-                            idx,
-                        )
-                        .unwrap();
+                    let base = crate::relational_model::resident_device_int4_column_offset(
+                        &descriptor,
+                        &table,
+                        idx,
+                    )
+                    .unwrap();
                     let v = device_memory
                         .read_resident_i32_column(base + slot as u64 * 4, 1)
                         .unwrap();
@@ -3466,7 +3660,10 @@ mod capacity_payload_tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 202, "checked {checked} slots (admission + appends + update)");
+        assert!(
+            checked >= 202,
+            "checked {checked} slots (admission + appends + update)"
+        );
     }
 
     /// SLICE B (audit P2 regression gate): a MIXED-TYPE shard-resident table (text column) keeps the CPU
@@ -4691,6 +4888,14 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// RETIREMENT A2: count of DML statements served by the DEVICE resolve (non-vacuity signal).
+    pub fn dml_device_resolve_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .dml_device_resolve_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// PHASE C slice 1: enable/disable the VALUE-INDEX resolve for DELETE/UPDATE prepare (default
     /// ON). OFF = the O(table) seq_scan (the oracle path) — the A/B lever the differentials use.
     pub fn set_dml_value_index_resolve_enabled(&self, on: bool) {
@@ -4700,6 +4905,18 @@ impl Engine {
 
     pub(crate) fn dml_value_index_resolve_enabled(&self) -> bool {
         self.dml_value_index_resolve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// RETIREMENT A2: enable/disable the DEVICE DML resolve (default ON). OFF -> the value-index
+    /// resolve (slice 1), then the scan — the differential ladder.
+    pub fn set_dml_device_resolve_enabled(&self, on: bool) {
+        self.dml_device_resolve_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn dml_device_resolve_enabled(&self) -> bool {
+        self.dml_device_resolve_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -5125,10 +5342,11 @@ impl Engine {
                 payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
             }
             if let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) {
-                self.read_state
-                    .residency
-                    .shard_row_id_memory
-                    .insert_shard(table, new_shard_id, region);
+                self.read_state.residency.shard_row_id_memory.insert_shard(
+                    table,
+                    new_shard_id,
+                    region,
+                );
             }
         }
         // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard

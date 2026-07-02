@@ -559,18 +559,30 @@ fn dml_value_index_resolve_matches_seq_scan_oracle() {
         //    NOTHING (the index still carries the (id,7)->key entry; the fetched current version is
         //    id=70 and the predicate RECHECK excludes it). The scenario ENDS here so a wrongly
         //    deleted row diverges the final state (a follow-up delete-by-70 would mask it).
-        vec!["UPDATE t SET id = 70 WHERE id = 7", "DELETE FROM t WHERE id = 7"],
+        vec![
+            "UPDATE t SET id = 70 WHERE id = 7",
+            "DELETE FROM t WHERE id = 7",
+        ],
         // 2b. STALE-ENTRY (UPDATE): same window, an UPDATE by the OLD value must update nothing.
-        vec!["UPDATE t SET id = 70 WHERE id = 7", "UPDATE t SET v = 111 WHERE id = 7"],
+        vec![
+            "UPDATE t SET id = 70 WHERE id = 7",
+            "UPDATE t SET v = 111 WHERE id = 7",
+        ],
         // 2c. The NEW value resolves through its own (appended) entry.
-        vec!["UPDATE t SET id = 70 WHERE id = 7", "DELETE FROM t WHERE id = 70"],
+        vec![
+            "UPDATE t SET id = 70 WHERE id = 7",
+            "DELETE FROM t WHERE id = 70",
+        ],
         // 3. OR groups + duplicate matches (v carries duplicates by construction).
         vec![
             "DELETE FROM t WHERE id = 1 OR id = 4",
             "UPDATE t SET v = -1 WHERE v = 20",
         ],
         // 4. Range-only predicate -> ineligible -> the scan arm under the flag (still correct).
-        vec!["DELETE FROM t WHERE id < 3", "UPDATE t SET v = 0 WHERE id > 8"],
+        vec![
+            "DELETE FROM t WHERE id < 3",
+            "UPDATE t SET v = 0 WHERE id > 8",
+        ],
         // 5. DELETE then re-insert the same value, then UPDATE by it (key/entry reuse).
         vec![
             "DELETE FROM t WHERE id = 6",
@@ -584,10 +596,14 @@ fn dml_value_index_resolve_matches_seq_scan_oracle() {
             e.set_dml_value_index_resolve_enabled(index_on);
             e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
             // v = (id % 5) * 10 -> deliberate duplicates in v.
-            let values: Vec<String> =
-                (0..10_i64).map(|k| format!("({k},{})", (k % 5) * 10)).collect();
-            e.execute_text(2, &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))
-                .unwrap();
+            let values: Vec<String> = (0..10_i64)
+                .map(|k| format!("({k},{})", (k % 5) * 10))
+                .collect();
+            e.execute_text(
+                2,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )
+            .unwrap();
             for (j, sql) in statements.iter().enumerate() {
                 e.execute_text(10 + j as u64, sql).unwrap();
             }
@@ -613,17 +629,21 @@ fn dml_value_index_resolve_constrained_tables_fall_back_correctly() {
     let build = |index_on: bool| -> (Vec<Vec<SqlValue>>, String) {
         let e = Engine::new_local();
         e.set_dml_value_index_resolve_enabled(index_on);
-        e.execute_text(1, "CREATE TABLE p (id INT UNIQUE, v INT)").unwrap();
-        e.execute_text(2, "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)").unwrap();
+        e.execute_text(1, "CREATE TABLE p (id INT UNIQUE, v INT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
         e.execute_text(3, "DELETE FROM p WHERE id = 2").unwrap();
-        e.execute_text(4, "UPDATE p SET v = 99 WHERE id = 3").unwrap();
+        e.execute_text(4, "UPDATE p SET v = 99 WHERE id = 3")
+            .unwrap();
         // A unique violation must still fire through the (scan-backed) validator.
         let err = e
             .execute_text(5, "UPDATE p SET id = 1 WHERE id = 3")
             .unwrap_err()
             .to_string();
         // Range-only predicate: index-ineligible -> the scan arm serves (fallback coverage).
-        e.execute_text(6, "UPDATE p SET v = 7 WHERE v > -100").unwrap();
+        e.execute_text(6, "UPDATE p SET v = 7 WHERE v > -100")
+            .unwrap();
         let rows = e
             .execute_relational_select_text("SELECT id, v FROM p ORDER BY id")
             .unwrap()
@@ -634,7 +654,10 @@ fn dml_value_index_resolve_constrained_tables_fall_back_correctly() {
     let (rows_on, err_on) = build(true);
     let (rows_off, err_off) = build(false);
     assert_eq!(rows_on, rows_off, "constrained-table DML == oracle");
-    assert_eq!(err_on, err_off, "constraint error identical through both paths");
+    assert_eq!(
+        err_on, err_off,
+        "constraint error identical through both paths"
+    );
 }
 
 #[test]
@@ -872,7 +895,10 @@ fn dml_index_validators_match_scan_validators_oracle() {
     for (i, (setup, stmt)) in scenarios.iter().enumerate() {
         let (out_on, p_on, c_on) = run(true, setup, stmt);
         let (out_off, p_off, c_off) = run(false, setup, stmt);
-        assert_eq!(out_on, out_off, "scenario {i}: outcome (ok/error text) must match the oracle");
+        assert_eq!(
+            out_on, out_off,
+            "scenario {i}: outcome (ok/error text) must match the oracle"
+        );
         assert_eq!(p_on, p_off, "scenario {i}: parent state == oracle");
         assert_eq!(c_on, c_off, "scenario {i}: child state == oracle");
     }

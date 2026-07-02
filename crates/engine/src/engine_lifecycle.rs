@@ -194,6 +194,9 @@ impl Engine {
             // VALUE INDEX (O(matches)) instead of the O(table) prepare seq_scan. DEFAULT ON; the
             // kill switch reverts to the scan (the oracle path) — the A/B lever the differentials use.
             dml_value_index_resolve_enabled: std::sync::atomic::AtomicBool::new(true),
+            // RETIREMENT A2: the device resolve is DEFAULT ON (measured: see the A2 bench line);
+            // the fallback chain (value-index resolve -> scan) remains complete behind it.
+            dml_device_resolve_enabled: std::sync::atomic::AtomicBool::new(true),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }

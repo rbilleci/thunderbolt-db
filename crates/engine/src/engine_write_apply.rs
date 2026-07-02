@@ -1408,19 +1408,27 @@ impl Engine {
                     .foreign_keys
                     .iter()
                     .any(|foreign_key| foreign_key.referenced_table == table.name);
-                let index_resolved = if self_referencing_fk
-                    || !self.dml_value_index_resolve_enabled()
-                {
-                    None
-                } else {
-                    Self::resolve_dml_matches_via_value_index(
-                        table,
-                        &table_rows,
-                        &filter_groups,
-                        visibility,
-                        &prefix,
-                    )?
-                };
+                let index_resolved =
+                    if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+                        None
+                    } else {
+                        // RETIREMENT A2: device resolve first; declines fall to the value index.
+                        match self.resolve_dml_matches_via_device(
+                            table,
+                            &filter_groups,
+                            visibility,
+                            &table_rows,
+                        )? {
+                            Some(matches) => Some(matches),
+                            None => Self::resolve_dml_matches_via_value_index(
+                                table,
+                                &table_rows,
+                                &filter_groups,
+                                visibility,
+                                &prefix,
+                            )?,
+                        }
+                    };
                 if let Some(matches) = index_resolved {
                     let touched_keys: BTreeSet<String> =
                         matches.iter().map(|(_, key, _)| key.clone()).collect();
@@ -1455,11 +1463,9 @@ impl Engine {
                         let mut row = decode_relational_row(&tuple.value, &table.columns)
                             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                         if filter_groups.iter().any(|filters| {
-                            filters
-                                .iter()
-                                .all(|(idx, op, value)| {
-                                    select_filter_matches(&row[*idx], *op, value)
-                                })
+                            filters.iter().all(|(idx, op, value)| {
+                                select_filter_matches(&row[*idx], *op, value)
+                            })
                         }) {
                             for (idx, value) in &assignments {
                                 row[*idx] = value.clone();
@@ -1510,19 +1516,27 @@ impl Engine {
                     .foreign_keys
                     .iter()
                     .any(|foreign_key| foreign_key.referenced_table == table.name);
-                let index_resolved = if self_referencing_fk
-                    || !self.dml_value_index_resolve_enabled()
-                {
-                    None
-                } else {
-                    Self::resolve_dml_matches_via_value_index(
-                        table,
-                        &table_rows,
-                        &filter_groups,
-                        visibility,
-                        &prefix,
-                    )?
-                };
+                let index_resolved =
+                    if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+                        None
+                    } else {
+                        // RETIREMENT A2: device resolve first; declines fall to the value index.
+                        match self.resolve_dml_matches_via_device(
+                            table,
+                            &filter_groups,
+                            visibility,
+                            &table_rows,
+                        )? {
+                            Some(matches) => Some(matches),
+                            None => Self::resolve_dml_matches_via_value_index(
+                                table,
+                                &table_rows,
+                                &filter_groups,
+                                visibility,
+                                &prefix,
+                            )?,
+                        }
+                    };
                 if let Some(matches) = index_resolved {
                     let touched_keys: BTreeSet<String> =
                         matches.iter().map(|(_, key, _)| key.clone()).collect();
@@ -1550,11 +1564,9 @@ impl Engine {
                         let row = decode_relational_row(&tuple.value, &table.columns)
                             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                         if !filter_groups.iter().any(|filters| {
-                            filters
-                                .iter()
-                                .all(|(idx, op, value)| {
-                                    select_filter_matches(&row[*idx], *op, value)
-                                })
+                            filters.iter().all(|(idx, op, value)| {
+                                select_filter_matches(&row[*idx], *op, value)
+                            })
                         }) {
                             candidate_rows.push(row);
                         }

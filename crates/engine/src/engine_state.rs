@@ -589,6 +589,10 @@ pub(crate) struct ResidencyReadState {
     /// shard in O(log shards) instead of the O(shards) linear scan). The non-vacuity signal that binary routing
     /// (vs the linear fallback) actually fired. `Relaxed` monotonic counter.
     pub(crate) sharded_point_binary_route_hits: std::sync::atomic::AtomicU64,
+    /// RETIREMENT A2: count of DML statements whose matches the DEVICE resolve served (locate ->
+    /// row-identity -> keyed fetch). The non-vacuity signal — output equality cannot prove which
+    /// resolver ran. `Relaxed` monotonic counter.
+    pub(crate) dml_device_resolve_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /

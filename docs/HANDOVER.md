@@ -34,17 +34,31 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: RETIREMENT A1 — the per-shard device row-identity region <<<
+## >>> THE ONE NEXT ACTION: RETIREMENT A3 — device-index validators <<<
 
 **THE FORK IS DECIDED (user, 2026-07-02): OPTION A — DEVICE-AUTHORITATIVE.** The measured install split
 (value_index 48% / COW publish 32% / tuple 18% / payload 2%) killed the drop-payloads idea; A deletes the
 host value_index + tuple store for resident tables and makes the per-shard DEVICE indexes the resolve
 surface. Program + dependency chain in memory `retirement-program-option-a` (A1 row-identity -> A2 resolve
 -> A3 validators -> A4 install elision = the SLO win, HARD-DEPENDS on multi-row incremental CRUD + device
-re-admit -> A5 deletion). A1 is DONE (`1875441c`, opus SHIP — identity foundation verified A2-ready). START: A2 — the device
-resolve: prepare_delete/update + the preflight resolve via the 3b/SV4a locate machinery -> row_id region
--> derived key (tuple_id via one keyed fetch until A4); decline to the host value-index resolve on
-sentinel/absent-region/ineligible shapes. The value-index resolve (slices 1/1b) becomes the FALLBACK.
+re-admit -> A5 deletion). A1 is DONE (`1875441c`, opus SHIP). **A2 is DONE (opus PUSH/SHIP-WITH-FIX
+adopted): `resolve_dml_matches_via_device` — locate -> row_id region -> derived key -> keyed fetch at
+visibility -> recheck -> sort+DEDUP by tuple_id — device-first at all 4 resolve sites behind default-ON
+`dml_device_resolve_enabled`; DELETE 120/127us UPDATE 177/193us @64k/262k FLAT.** Two burn-in bugs the
+differentials MISSED (fallbacks are correctness-preserving, so output equality is blind to them — pin
+MECHANISMS too): (1) update-churned shards thrashed O(shard) rebuild-to-decline per statement -> the
+decline cache is now MONOTONE under appends at the same pinned ptr; (2) an SV5 update-append splits one
+logical row across TWO shards -> the visibility-blind locate returned it twice -> the SV5 gate failed ->
+silent invalidate+re-admit per update + a reader-visible invalid window (SV6 hammer caught it) -> fixed
+by tuple_id dedup, pinned by `a2_same_key_update_chain_stays_on_incremental_path` (device-ptr survival,
+sabotage-verified). START: A3 — migrate the 1b index-driven validators (unique/FK) onto the device
+indexes (the value_index's last consumer besides the resolve fallback), then A4 install elision (the SLO
+win: multi-row incremental CRUD + device-sourced re-admit, re-measure `oltp_commit_slo_benchmark`
+targeting >100k TPS), then A5 deletion.
+
+**MULTI-AGENT (2026-07-02): a READ-PATH agent is active.** ALWAYS `git fetch && git rebase origin/main`
+before pushing; contact surfaces: engine_retained_read.rs (ShardPkHit + the shared PK-index cache),
+engine_residency.rs tests, lib.rs flags, this file. No workspace-wide cargo fmt (scope: -p gpu_db_engine).
 
 **Slices 1+1b are DONE (`9876d297`, `7b48fda8`): ledger #1 is CLOSED** — DML resolve AND validation are
 index-driven in both layers; constrained single-row DML measures 124-195us FLAT (~500x). **Phase D is

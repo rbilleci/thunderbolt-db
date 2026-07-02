@@ -60,7 +60,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         while i < rows {
             let end = (i + 1000).min(rows);
             let values: Vec<String> = (i..end).map(|k| format!("({k},{})", k * 10)).collect();
-            e.execute_text(seq, &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))?;
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )?;
             seq += 1;
             i = end;
         }

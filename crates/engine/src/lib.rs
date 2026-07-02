@@ -409,6 +409,10 @@ pub struct Engine {
     /// PHASE C slice 1: DELETE/UPDATE prepare resolves matches via the per-table equality value
     /// index (O(matches)). Kill switch -> the O(table) seq_scan (the differential oracle).
     dml_value_index_resolve_enabled: std::sync::atomic::AtomicBool,
+    /// RETIREMENT A2: single-Eq DML resolves via the DEVICE (locate -> row-identity region ->
+    /// derived key), not the host value index — the dependency A4 deletes. Kill switch -> the
+    /// value-index resolve (slice 1), then the scan.
+    dml_device_resolve_enabled: std::sync::atomic::AtomicBool,
     /// S-d2c: the target row count per shard (the rollover/seal threshold; default 4M). Settable
     /// small in tests. Interior-mutable.
     shard_size_target: std::sync::atomic::AtomicUsize,

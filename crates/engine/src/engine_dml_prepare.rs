@@ -261,19 +261,28 @@ impl Engine {
             .foreign_keys
             .iter()
             .any(|foreign_key| foreign_key.referenced_table == table.name);
-        let index_resolved: Option<Vec<DmlResolvedMatch>> = if self_referencing_fk
-            || !self.dml_value_index_resolve_enabled()
-        {
-            None
-        } else {
-            Self::resolve_dml_matches_via_value_index(
-                &table,
-                &table_rows,
-                &filter_groups,
-                visibility,
-                &prefix,
-            )?
-        };
+        let index_resolved: Option<Vec<DmlResolvedMatch>> =
+            if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+                None
+            } else {
+                // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
+                // any decline falls to the value-index resolve (slice 1), then the scan below.
+                match self.resolve_dml_matches_via_device(
+                    &table,
+                    &filter_groups,
+                    visibility,
+                    &table_rows,
+                )? {
+                    Some(matches) => Some(matches),
+                    None => Self::resolve_dml_matches_via_value_index(
+                        &table,
+                        &table_rows,
+                        &filter_groups,
+                        visibility,
+                        &prefix,
+                    )?,
+                }
+            };
         let index_arm = index_resolved.is_some();
         let deletes: Vec<DmlResolvedMatch> = match index_resolved {
             Some(matches) => matches,
@@ -340,7 +349,11 @@ impl Engine {
                     }
                 }
                 drop(cursor);
-                self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
+                self.validate_foreign_keys_with_table_rows(
+                    &table.name,
+                    &candidate_rows,
+                    visibility,
+                )?;
             }
         }
 
@@ -370,6 +383,103 @@ impl Engine {
                 deleted_rows,
             },
         })
+    }
+
+    /// RETIREMENT A2: resolve a single-Eq DML statement's matches via the DEVICE — the cross-shard
+    /// PK locate (hash+bloom over the resident shards, generation-consistent capture) -> the A1
+    /// row-identity region (`row_id[slot]`) -> the derived host key -> ONE keyed fetch at the pinned
+    /// visibility (tuple_id + the authoritative current version, until A4 retires the host chains)
+    /// -> the FULL filter-group recheck. The host VALUE INDEX is not consulted — this is what lets
+    /// A4 delete it. ELIGIBILITY (`None` -> the caller's fallback chain: value-index resolve, then
+    /// the scan): flag ON; exactly ONE filter group with exactly one usable Int4 `Eq` (the locate is
+    /// a single-needle unique-key probe); the locate must not decline (dup/oversize/invalid/absent
+    /// shards); every hit must carry a STAMPED identity (sentinel/absent region = unknown lineage).
+    /// The locate is PHYSICAL (a tombstoned row still hits): the keyed fetch at `visibility` is the
+    /// authoritative filter — a host-invisible row resolves to no match, exactly as the scan would.
+    pub(crate) fn resolve_dml_matches_via_device(
+        &self,
+        table: &RelationalTable,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        visibility: StorageVisibility,
+        table_rows: &crate::resident_storage::TableRowsView,
+    ) -> Result<Option<Vec<DmlResolvedMatch>>, EngineError> {
+        if !self.dml_device_resolve_enabled() {
+            return Ok(None);
+        }
+        // Single-needle shape: one group, one Eq on an Int4 column (the locate probes one key).
+        let [group] = filter_groups else {
+            return Ok(None);
+        };
+        let mut eq: Option<(usize, i32)> = None;
+        for (idx, op, value) in group {
+            if *op == SelectFilterOp::Eq {
+                if let SqlValue::Int4(needle) = value {
+                    eq = Some((*idx, *needle));
+                    break;
+                }
+            }
+        }
+        let Some((filter_idx, needle)) = eq else {
+            return Ok(None);
+        };
+        let Some(hits) =
+            self.locate_resident_pk_via_shard_index_detailed(table, filter_idx, needle)
+        else {
+            return Ok(None); // locate declined (dup / oversize / invalid / not resident)
+        };
+        let mut matches: Vec<DmlResolvedMatch> = Vec::new();
+        let prefix = relational_key_prefix(&table.name);
+        for hit in &hits {
+            let Some(region) = &hit.row_id else {
+                return Ok(None); // identity-unknown lineage -> host path
+            };
+            // A device-read failure DECLINES to the host fallback (audit A2 finding 2) — the
+            // value-index resolve never touches the device, so a transient CUDA error must not
+            // fail a statement the fallback would serve; every sibling exit in this loop declines.
+            let Ok(halves) = region.read_resident_i32_column(u64::from(hit.slot) * 8, 2) else {
+                return Ok(None);
+            };
+            let (Some(lo), Some(hi)) = (halves.first(), halves.get(1)) else {
+                return Ok(None);
+            };
+            let row_id = (*lo as u32 as u64) | ((*hi as u32 as u64) << 32);
+            if row_id == u64::MAX {
+                return Ok(None);
+            }
+            let key = relational_row_key(&table.name, row_id);
+            debug_assert!(key.starts_with(&prefix));
+            let fetched = table_rows
+                .store()
+                .tuple_fetch_by_key(&key, visibility)
+                .map_err(|err: gpu_db_storage::StorageError| {
+                    EngineError::ApplyFailed(err.to_string())
+                })?;
+            let Some(tuple) = fetched else {
+                continue; // not visible at this snapshot (e.g. tombstoned): no match, like the scan
+            };
+            let row = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            if filter_groups.iter().any(|filters| {
+                filters
+                    .iter()
+                    .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+            }) {
+                matches.push((tuple.tuple_id, key, row));
+            }
+        }
+        matches.sort_by_key(|(tuple_id, _, _)| *tuple_id);
+        // A LOGICAL row can hit in MULTIPLE shards: an SV5 update-append lands the new version in
+        // the OPEN shard while the tombstoned old slot stays in its sealed shard — each shard's
+        // hash is dup-free, so the visibility-blind locate returns BOTH slots. They carry the SAME
+        // row_id -> same key -> same visible tuple; emitting it twice made prepare_update hand the
+        // SV5 gate 2 matches for 1 slot -> commit fell back to invalidate+re-admit (caught by the
+        // SV6 concurrent hammer). Version slots of one logical row are ONE match.
+        matches.dedup_by_key(|(tuple_id, _, _)| *tuple_id);
+        self.read_state
+            .residency
+            .dml_device_resolve_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(matches))
     }
 
     /// PHASE C slice 1b: does ANY VISIBLE row (optionally excluding `exclude_keys` — the rows this
@@ -581,9 +691,7 @@ impl Engine {
         }
         let mut candidate_keys: Vec<String> = Vec::new();
         for group in filter_groups {
-            let Some((idx, _, value)) = group
-                .iter()
-                .find(|(_, op, _)| *op == SelectFilterOp::Eq)
+            let Some((idx, _, value)) = group.iter().find(|(_, op, _)| *op == SelectFilterOp::Eq)
             else {
                 return Ok(None); // a range-only group: the index cannot bound it -> scan
             };
@@ -694,19 +802,28 @@ impl Engine {
             .foreign_keys
             .iter()
             .any(|foreign_key| foreign_key.referenced_table == table.name);
-        let index_resolved: Option<Vec<DmlResolvedMatch>> = if self_referencing_fk
-            || !self.dml_value_index_resolve_enabled()
-        {
-            None
-        } else {
-            Self::resolve_dml_matches_via_value_index(
-                &table,
-                &table_rows,
-                &filter_groups,
-                visibility,
-                &prefix,
-            )?
-        };
+        let index_resolved: Option<Vec<DmlResolvedMatch>> =
+            if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+                None
+            } else {
+                // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
+                // any decline falls to the value-index resolve (slice 1), then the scan below.
+                match self.resolve_dml_matches_via_device(
+                    &table,
+                    &filter_groups,
+                    visibility,
+                    &table_rows,
+                )? {
+                    Some(matches) => Some(matches),
+                    None => Self::resolve_dml_matches_via_value_index(
+                        &table,
+                        &table_rows,
+                        &filter_groups,
+                        visibility,
+                        &prefix,
+                    )?,
+                }
+            };
         let index_arm = index_resolved.is_some();
         match index_resolved {
             Some(matches) => {

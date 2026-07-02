@@ -607,31 +607,31 @@ impl Engine {
             // batch guard fails the wave's remaining outcomes and wedges the queue.
             // RETIREMENT A1: carry the inserted rows' host identities (parsed from their keys) so
             // the residency append can stamp the row-identity region.
-            let insert_append: Option<(String, Vec<Vec<SqlValue>>, Vec<u64>)> = match &delta.mutation
-            {
-                crate::write_path::PreparedMutation::Insert {
-                    table,
-                    inserted_rows,
-                    ..
-                } => {
-                    let prefix = relational_key_prefix(table);
-                    Some((
-                        table.clone(),
-                        inserted_rows
-                            .iter()
-                            .map(|(_key, values)| values.clone())
-                            .collect(),
-                        inserted_rows
-                            .iter()
-                            .map(|(key, _)| {
-                                crate::engine_residency::parse_relational_row_id(key, &prefix)
-                                    .unwrap_or(u64::MAX)
-                            })
-                            .collect(),
-                    ))
-                }
-                _ => None,
-            };
+            let insert_append: Option<(String, Vec<Vec<SqlValue>>, Vec<u64>)> =
+                match &delta.mutation {
+                    crate::write_path::PreparedMutation::Insert {
+                        table,
+                        inserted_rows,
+                        ..
+                    } => {
+                        let prefix = relational_key_prefix(table);
+                        Some((
+                            table.clone(),
+                            inserted_rows
+                                .iter()
+                                .map(|(_key, values)| values.clone())
+                                .collect(),
+                            inserted_rows
+                                .iter()
+                                .map(|(key, _)| {
+                                    crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .collect(),
+                        ))
+                    }
+                    _ => None,
+                };
             self.apply_delta(delta, commit_seq, None)
                 .unwrap_or_else(|err| {
                     panic!(
@@ -645,9 +645,11 @@ impl Engine {
             // Residency, before publish (residency-data consistency). Slice 1b-ii in-place append
             // when auto-admit is on; conservative invalidation otherwise.
             let appended = self.auto_admit_on_commit_enabled()
-                && insert_append.as_ref().is_some_and(|(table, rows, row_ids)| {
-                    self.try_append_resident_int4_open_shard(table, rows, None, Some(row_ids))
-                });
+                && insert_append
+                    .as_ref()
+                    .is_some_and(|(table, rows, row_ids)| {
+                        self.try_append_resident_int4_open_shard(table, rows, None, Some(row_ids))
+                    });
             if !appended {
                 self.invalidate_relational_residency_tables_concurrent(
                     &item.residency_tables,

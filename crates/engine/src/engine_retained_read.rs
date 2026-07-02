@@ -784,7 +784,7 @@ impl Engine {
                 return None;
             }
             // An empty shard contributes no keys (the scan matches 0 rows there): SKIP it -- both to match the
-            // scan (which continues to other shards) and to avoid the 0-row hash-build decline that would
+            // scan (which continues to other rows) and to avoid the 0-row hash-build decline that would
             // otherwise drop hits from OTHER shards (audit P2).
             if shard.row_count == 0 {
                 continue;
@@ -824,6 +824,11 @@ impl Engine {
                         .residency
                         .shard_created_by_memory
                         .get(&(table.name.clone(), shard.shard_id));
+                    let row_id = self
+                        .read_state
+                        .residency
+                        .shard_row_id_memory
+                        .get(&(table.name.clone(), shard.shard_id));
                     out.push(ShardPkHit {
                         shard_id: shard.shard_id,
                         slot: row,
@@ -831,12 +836,15 @@ impl Engine {
                         device_memory,
                         deleted_by,
                         created_by,
+                        row_id,
                     });
                 }
                 ShardPkProbe::Miss => {}
                 // A duplicate key in ANY shard declines the whole locate (the scan returns every match; a
                 // hash holds one row/key) -> the caller scans.
-                ShardPkProbe::Declined => return None,
+                ShardPkProbe::Declined => {
+                    return None;
+                }
             }
         }
         Some(out)
@@ -874,6 +882,19 @@ impl Engine {
                 // APPEND grows row_count with the SAME ptr -> either mismatch rebuilds against the live shard.
                 if entry.resident_device_ptr == device_ptr && entry.row_count == row_count {
                     return probe_cached_shard_pk(entry, key);
+                }
+                // RETIREMENT A2 (measured cliff): a DECLINED entry (`index: None` — the shard holds
+                // duplicate keys, e.g. an SV5 update-append duplicating its key across the old+new
+                // slots) stays declined under FURTHER APPENDS on the same buffer: dup-ness is
+                // MONOTONE under appends, so rebuilding O(shard) per statement only re-discovers the
+                // same dup (MEASURED: single-row UPDATE p50 went linear, 358->887us at 64k->262k,
+                // rebuild-to-decline each statement). Only a ptr change (re-admit / compaction /
+                // VACUUM re-clustering) can clear a dup -> revalidate then.
+                if entry.resident_device_ptr == device_ptr
+                    && entry.index.is_none()
+                    && row_count >= entry.row_count
+                {
+                    return ShardPkProbe::Declined;
                 }
             }
         }
@@ -2134,6 +2155,10 @@ pub(crate) struct ShardPkHit {
     /// `created_by[slot] <= read_txn_id` lower-bound gate hides an UPDATE-appended version from a reader
     /// bound to an older snapshot. `None` = un-stamped shard, born-visible.
     pub(crate) created_by: Option<Arc<CudaResidentDeviceMemory>>,
+    /// RETIREMENT A2: the shard's ROW-IDENTITY region (A1), captured in the SAME snapshot — the
+    /// device DML resolve reads `row_id[slot]` to derive the host key. `None` = identity-unknown
+    /// lineage (benchmark/synthetic) -> the resolve declines to the host path.
+    pub(crate) row_id: Option<Arc<CudaResidentDeviceMemory>>,
 }
 
 /// Step 1 (lpb-for-shards): a shard's BATCHED hits — the generation-consistent captured handles (descriptor,
