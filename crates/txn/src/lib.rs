@@ -1,6 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use gpu_db_types::TxnId;
+
+/// How many TERMINAL (committed/aborted) transactions keep their exact state queryable (R1,
+/// write-path assessment): `states` used to retain one entry per BEGIN forever, an unbounded
+/// leak for any explicit-transaction workload. Terminal entries beyond this window are evicted
+/// oldest-first; an evicted id then reads as unknown (`state` → `None`, `commit`/`rollback` →
+/// `NotFound`, `begin_with_id` → reusable). Active transactions are NEVER evicted. The durable
+/// record of a transaction's outcome is the WAL, not this in-memory map.
+const MAX_RETAINED_TERMINAL: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
@@ -41,6 +49,10 @@ pub struct TxnManager {
     next_id: TxnId,
     states: BTreeMap<TxnId, TxnState>,
     active_count: usize,
+    /// Terminal ids in transition order, for oldest-first eviction once the retention window
+    /// ([`MAX_RETAINED_TERMINAL`]) fills. Entries are only evicted while still terminal (a
+    /// re-begun id is left alone; its stale queue slot is skipped).
+    terminal_order: VecDeque<TxnId>,
 }
 
 impl TxnManager {
@@ -115,7 +127,27 @@ impl TxnManager {
         }
         *state = to;
         self.active_count = self.active_count.saturating_sub(1);
+        self.terminal_order.push_back(id);
+        self.evict_stale_terminal();
         Ok(Txn { id, state: to })
+    }
+
+    /// R1 (write-path assessment): bound the terminal-state retention window. Pops the oldest
+    /// terminal ids beyond [`MAX_RETAINED_TERMINAL`] and drops their `states` entries — but only
+    /// while they are STILL terminal, so an evicted-then-reused id that is active again is never
+    /// touched (its stale queue slot is simply skipped).
+    fn evict_stale_terminal(&mut self) {
+        while self.terminal_order.len() > MAX_RETAINED_TERMINAL {
+            let Some(id) = self.terminal_order.pop_front() else {
+                return;
+            };
+            if matches!(
+                self.states.get(&id),
+                Some(TxnState::Committed) | Some(TxnState::Aborted)
+            ) {
+                self.states.remove(&id);
+            }
+        }
     }
 }
 
@@ -229,6 +261,38 @@ mod tests {
 
         assert_eq!(tm.begin_with_id(t.id), Err(TxnError::AlreadyExists(t.id)));
         assert_eq!(tm.active_count(), 0);
+    }
+
+    #[test]
+    fn terminal_states_are_bounded_and_recent_ones_stay_queryable() {
+        // R1 (write-path assessment): `states` used to grow by one entry per BEGIN forever. The
+        // retention window keeps memory bounded while the most recent terminal txns (and every
+        // ACTIVE txn) stay exactly queryable.
+        let mut tm = TxnManager::default();
+        let long_lived = tm.begin().unwrap();
+
+        let total = MAX_RETAINED_TERMINAL * 3;
+        for _ in 0..total {
+            let t = tm.begin().unwrap();
+            tm.commit(t.id).unwrap();
+        }
+
+        // Bounded: active + at most the retention window of terminal entries.
+        assert!(tm.states.len() <= MAX_RETAINED_TERMINAL + 1);
+        assert_eq!(tm.active_count(), 1);
+        assert_eq!(tm.state(long_lived.id), Some(TxnState::Active));
+        assert_eq!(tm.oldest_active_txn_id(), Some(long_lived.id));
+
+        // The most recent terminal txn is still exactly queryable; the oldest evicted one now
+        // reads as unknown (the WAL, not this map, is the durable record of its outcome).
+        let newest_terminal = tm.next_id;
+        assert_eq!(tm.state(newest_terminal), Some(TxnState::Committed));
+        let oldest_terminal = long_lived.id + 1;
+        assert_eq!(tm.state(oldest_terminal), None);
+        assert_eq!(
+            tm.commit(oldest_terminal),
+            Err(TxnError::NotFound(oldest_terminal))
+        );
     }
 
     #[test]
