@@ -34,7 +34,7 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: RETIREMENT A4e — the INSTALL ELISION (the SLO slice) <<<
+## >>> THE ONE NEXT ACTION: A5 IS USER-GATED — WAIT FOR THE GO-AHEAD (A4 IS DONE, `08f24256`) <<<
 
 **THE FORK IS DECIDED (user, 2026-07-02): OPTION A — DEVICE-AUTHORITATIVE.** The measured install split
 (value_index 48% / COW publish 32% / tuple 18% / payload 2%) killed the drop-payloads idea; A deletes the
