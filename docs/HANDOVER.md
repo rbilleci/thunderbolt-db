@@ -34,7 +34,27 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: PHASE C slice 1b — index-driven constraint VALIDATORS <<<
+## >>> THE ONE NEXT ACTION: HOST-STORE RETIREMENT (#2) — the SLO critical path; DESIGN FORK first <<<
+
+**Slices 1+1b are DONE (`9876d297`, `7b48fda8`): ledger #1 is CLOSED** — DML resolve AND validation are
+index-driven in both layers; constrained single-row DML measures 124-195us FLAT (~500x). **Phase D is
+MERGED by the second agent** (det-CC waves #6 + `oltp_commit_slo_benchmark` + the imbl value-index fix):
+the composed SLO gate shows off-lock prepare at 5.3-7.8us/commit and a ~35-38k sustained TPS plateau
+that is PURELY the host tuple store's ~25us/item wave install — **ledger #2 is the last SLO blocker**
+(target >100k sustained; p99 already <1ms).
+
+**Retirement design fork (surface to the user before building — mandate):** the tuple store serves
+(a) the per-row install (the plateau), (b) WAL replay/recovery rebuild, (c) re-admit fallback source,
+(d) the value_index + tuple_fetch_by_key surface slices 1/1b resolve through, (e) non-eligible-shape
+reads. Candidate architectures: (A) DEVICE-AUTHORITATIVE — per-shard tuple-identity columns + GPU
+row-payload store; host keeps only the value INDEX (no row payloads); recovery replays WAL into device
+state; (B) INDEX-ONLY HOST — keep the host key/value indexes but drop row PAYLOADS (install becomes
+index-append only, ~O(columns) cheaper), device holds the only full rows; (C) STAGED — (B) first
+(cheap, measurable via the SLO gate), then (A). Investigate + measure the install split
+(index-maintenance vs payload-encode share of the ~25us), then present the fork.
+
+Then VACUUM/GC (#5) — tombstone/version/value-index compaction (the SV6 dense-decline arm goes
+LOAD-BEARING there).
 
 **Slice 1 is DONE (`9876d297`, opus SHIP): the O(table) prepare seq-scan is dead** for Eq-bearing
 predicates on constraint-free tables — the value-index resolve measures 108-184us p50 FLAT vs the scan's
