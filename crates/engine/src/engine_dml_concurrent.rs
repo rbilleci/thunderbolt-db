@@ -237,15 +237,19 @@ impl Engine {
             }
         })?;
 
-        // (3c) Only NOW assign commit_seq for real (WAL append + propose + group-commit fsync). The
-        // `propose` MUST return the index we peeked, since we hold the commit_mutex (single proposer).
-        // The WAL-before-visibility invariant: the fsync completes before we publish or bump
-        // committed_seq.
+        // (3c) Only NOW assign commit_seq for real (WAL append + propose). The `propose` MUST
+        // return the index we peeked, since we hold the commit_mutex (single proposer). The fsync
+        // is deliberately NOT here (D3b group commit): it runs AFTER this critical section via
+        // `wait_group_durable`, so concurrent committers share one fsync per group instead of
+        // serializing fsync-per-commit under the commit_mutex. WAL-before-visibility still holds —
+        // `committed_seq` is published only after the group fsync covers this record; until then
+        // the applied delta below is stamped ABOVE every reader's pinned snapshot and is invisible.
         let wal_len_before = commit.wal.len();
         commit.wal.append(WalRecord {
             txn_id,
             payload: payload.clone(),
         });
+        let wal_position = commit.wal.len();
         let token = match commit.repl.propose(payload) {
             Ok(token) => token,
             Err(err) => {
@@ -258,11 +262,6 @@ impl Engine {
             "commit_mutex is the single proposer: the proposed index must equal the peeked one"
         );
         let commit_seq = token.index;
-        if let Err(err) = commit.wal.flush_all() {
-            commit.repl.rollback_unapplied_from(commit_seq);
-            commit.wal.truncate(wal_len_before);
-            return Err(ExecuteError::Engine(err));
-        }
         commit
             .repl
             .wait_committed(token, Duration::from_millis(0))?;
@@ -273,12 +272,15 @@ impl Engine {
         // tuple ids, advance the row-id allocator, mutate the per-table version chains + value index
         // under the commit_mutex). The MvccData publish + the atomic allocators are `&self`; the
         // commit_mutex (held here) serializes installs so row-id assignment + the per-table publish
-        // are atomic w.r.t. other committers. A failure HERE is unreachable on any legal interleaving
-        // (the validation already succeeded at this seq and we hold the lock) AND the WAL record is
-        // already durable, so it would be a true unrecoverable invariant violation — we PANIC, which
-        // poisons the commit_mutex; the façade's re-homed poison-on-panic policy then refuses further
-        // service rather than serve state inconsistent with the durable WAL (a restart replays the
-        // WAL, the source of truth). Mark the entry applied so the replicator's applied_index tracks
+        // are atomic w.r.t. other committers. D3b note: the apply now runs BEFORE the (group) fsync —
+        // that is what lets the NEXT committer's re-resolve at `commit_seq + 1` see this delta while
+        // our fsync is still in flight; visibility is unaffected because `committed_seq` is published
+        // only after the fsync covers this record. A failure HERE is unreachable on any legal
+        // interleaving (the validation already succeeded at this seq and we hold the lock) and would
+        // leave the version chains TORN mid-install — a true unrecoverable invariant violation — so
+        // we PANIC, which poisons the commit_mutex; the façade's re-homed poison-on-panic policy then
+        // refuses further service rather than serve torn state (a restart replays the durable WAL,
+        // the source of truth). Mark the entry applied so the replicator's applied_index tracks
         // the directly-applied commit (no later re-drain / re-apply).
         //
         // Slice 1b-ii: capture the APPLIED insert rows (post-coercion / post-default, the actual stored
@@ -336,9 +338,16 @@ impl Engine {
             );
         }
 
-        // (3f) Publish point: bump committed_seq LAST (release-store). Strictly after the WAL fsync
-        // and the data/value-index publish, so an acquire-load by a reader observes a fully durable,
-        // fully published commit.
+        // === leave the commit critical section BEFORE the fsync (D3b group commit) ===
+        drop(commit);
+
+        // (3f) Group durability: make this record fsync-durable OUTSIDE the commit_mutex, sharing
+        // one fsync with every other committer whose record is already appended (the group). Only
+        // then publish: bump committed_seq LAST (release-store, monotonic CAS max — safe out of
+        // publish order), strictly after the WAL fsync and the data/value-index publish, so an
+        // acquire-load by a reader observes a fully durable, fully published commit.
+        self.wait_group_durable(wal_position)
+            .map_err(ExecuteError::Engine)?;
         self.publish_committed_seq(commit_seq);
         // STRATA S-B: best-effort GPU-residency admission for the mutated tables (flag-gated). Skipped
         // when we appended in place above — that table is already resident + current (Slice 1b-ii).
@@ -346,9 +355,115 @@ impl Engine {
             self.auto_admit_resident_tables(&residency_tables);
         }
         self.metrics.inc_commit();
-        drop(commit);
-        // === leave the commit critical section ===
         Ok(())
+    }
+
+    /// D3b — the group-commit flush protocol. Blocks until the WAL's durable frontier covers
+    /// `wal_position` (this committer's appended record). The first committer to arrive while no
+    /// flush is in flight becomes the FLUSHER: one `flush_all` (one fsync) covers every record
+    /// appended up to that moment — its own and every waiter's — after which all covered waiters
+    /// proceed. Committers arriving mid-flush wait and (if the in-flight fsync started before
+    /// their append) run/join the NEXT flush, so an fsync is never wasted on a stale frontier.
+    ///
+    /// Failure semantics (deliberate, documented): the caller's delta is ALREADY APPLIED (that is
+    /// what lets later committers validate against it while this fsync is in flight), so a failed
+    /// group fsync cannot be rolled back into a clean per-statement abort — the applied-but-
+    /// unpublishable deltas must never become visible. The flusher therefore records a STICKY
+    /// failure (every current and future concurrent committer errors out) and PANICS while
+    /// holding the commit_mutex, poisoning it — the façade's poison-on-panic policy refuses
+    /// further service and a restart recovers from the durable WAL prefix (the un-fsynced records
+    /// were never acknowledged nor visible). This mirrors the concurrent path's existing
+    /// panic-on-post-durable-apply-failure wedge philosophy, and matches the D1 append-only
+    /// writer's fail-closed poisoning of the segment backing on real I/O errors. The SERIALIZED
+    /// commit path (`commit_mutation_at`) keeps its inline flush and clean per-statement abort.
+    fn wait_group_durable(&self, wal_position: usize) -> Result<(), EngineError> {
+        loop {
+            if self
+                .group_flush
+                .durable_records
+                .load(AtomicOrdering::Acquire)
+                >= wal_position
+            {
+                return Ok(());
+            }
+            let mut coord = self
+                .group_flush
+                .coord
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(msg) = &coord.failed {
+                return Err(EngineError::Durability(format!(
+                    "group-commit durability failed; the commit path is wedged pending restart \
+                     recovery: {msg}"
+                )));
+            }
+            // Re-check under the coordination lock (a flusher may have finished in between).
+            if self
+                .group_flush
+                .durable_records
+                .load(AtomicOrdering::Acquire)
+                >= wal_position
+            {
+                return Ok(());
+            }
+            if coord.flusher_active {
+                // A flush is in flight; wait for its result and re-evaluate.
+                let _coord = self
+                    .group_flush
+                    .cv
+                    .wait(coord)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            }
+            // Become the flusher. Lock order: coord is RELEASED before the commit_mutex is taken
+            // (a flusher marks itself active first so no second fsync stacks up behind it).
+            coord.flusher_active = true;
+            drop(coord);
+            // Two-phase group flush: snapshot the unflushed tail under a BRIEF commit_mutex hold,
+            // then run the write + fsync with NO lock held — this is what lets other committers
+            // validate/append/apply (and queue into the NEXT group) while this group's disk IO is
+            // in flight. Completion takes only the WAL core's own lock, never the commit_mutex.
+            let begun = {
+                let mut commit = self.commit_state();
+                commit.wal.begin_group_flush()
+            };
+            let flush_result = match begun {
+                Ok(gpu_db_wal::WalGroupFlushBegin::Clean { flushed_records }) => {
+                    Ok(flushed_records)
+                }
+                Ok(gpu_db_wal::WalGroupFlushBegin::Job(job)) => job.commit(),
+                Err(err) => Err(err),
+            };
+            let mut coord = self
+                .group_flush
+                .coord
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            coord.flusher_active = false;
+            match flush_result {
+                Ok(flushed_records) => {
+                    self.group_flush
+                        .durable_records
+                        .store(flushed_records, AtomicOrdering::Release);
+                    self.group_flush.cv.notify_all();
+                    // Loop: our own record was appended before this flush began, so the frontier
+                    // now covers it (or a concurrent truncate shrank nothing below it — see the
+                    // rollback paths, which only ever drop UNFLUSHED records they own).
+                }
+                Err(err) => {
+                    coord.failed = Some(err.to_string());
+                    self.group_flush.cv.notify_all();
+                    drop(coord);
+                    // Wedge-don't-serve-torn-state: poison the commit_mutex so the façade refuses
+                    // further statements (see the doc comment above for why no clean abort exists).
+                    let _commit = self.commit_state();
+                    panic!(
+                        "group-commit fsync failed after member deltas were applied: {err} — \
+                         wedging the commit path; restart recovery replays the durable WAL prefix"
+                    );
+                }
+            }
+        }
     }
 
     pub fn execute_text(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {

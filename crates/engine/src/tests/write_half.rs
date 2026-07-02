@@ -394,3 +394,145 @@ fn stage0_read_boundary_equals_stamp_sequence() {
         "row hidden at the live boundary after delete"
     );
 }
+
+#[test]
+fn concurrent_commits_share_group_fsyncs_and_recover_durably() {
+    // D3b (group commit): concurrent committers append + apply under the commit_mutex but fsync
+    // through the shared group-flush protocol. Under real concurrency the durable WAL's flush
+    // groups may combine many commits into one fsync (never more fsyncs than commits); every
+    // acknowledged commit must be visible AND must survive a restart from the segment.
+    const WRITERS: usize = 8;
+    const COMMITS_PER_WRITER: usize = 25;
+
+    let path = test_wal_path("group-commit-concurrent");
+    let e = Engine::with_durable_wal_segment(&path);
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+
+    let engine = std::sync::Arc::new(e);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let engine = std::sync::Arc::clone(&engine);
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..COMMITS_PER_WRITER {
+                    let id = (w * COMMITS_PER_WRITER + i) as u64;
+                    let txn_id = 2 + id;
+                    engine
+                        .execute_dml_concurrent(
+                            txn_id,
+                            &format!("INSERT INTO t (id, v) VALUES ({id}, {id})"),
+                        )
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let total = WRITERS * COMMITS_PER_WRITER;
+    let Command::Select(select) = parse_command("SELECT id FROM t ORDER BY id").unwrap() else {
+        panic!("expected SELECT plan");
+    };
+    assert_eq!(
+        engine
+            .execute_relational_select(&select)
+            .unwrap()
+            .rows
+            .len(),
+        total,
+        "every acknowledged concurrent commit is visible"
+    );
+
+    // Group accounting: all records durable; a group NEVER exceeds one fsync per commit, and the
+    // whole history is flushed (no unflushed tail left behind by the protocol).
+    let stats = engine.wal_group_commit_stats();
+    assert_eq!(stats.durable_records, (total + 1) as u64);
+    assert!(stats.flush_groups <= stats.durable_records);
+    assert_eq!(engine.wal_unflushed_count(), 0);
+    eprintln!(
+        "group commit: {} commits in {} fsync groups (mean group size {:.2}, max {})",
+        stats.durable_records,
+        stats.flush_groups,
+        stats.mean_group_size(),
+        stats.max_group_size
+    );
+
+    // Restart-replay: every acknowledged commit is in the durable segment.
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    assert_eq!(
+        recovered
+            .execute_relational_select(&select)
+            .unwrap()
+            .rows
+            .len(),
+        total,
+        "every acknowledged concurrent commit survives restart recovery"
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn group_fsync_failure_wedges_the_concurrent_commit_path_without_exposing_the_delta() {
+    // D3b failure semantics: the group fsync runs AFTER the committer's delta is applied, so a
+    // flush failure cannot roll back into a clean per-statement abort — instead the flusher
+    // panics (poisoning the commit_mutex, the engine's wedge-don't-serve-torn-state policy) and
+    // the sticky group failure makes later concurrent commits error out. Crucially the failed
+    // commit's delta must NEVER become visible (committed_seq was not published), and a restart
+    // recovers exactly the durable prefix (the un-fsynced record was never acknowledged).
+    let path = test_wal_path("group-commit-wedge");
+    let mut e = Engine::with_durable_wal_segment(&path);
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    e.simulate_next_wal_flush_failure();
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (7, 70)")
+    }));
+    assert!(
+        panicked.is_err(),
+        "the group flusher must wedge (panic) on a post-apply fsync failure"
+    );
+    assert!(
+        e.is_commit_path_poisoned(),
+        "the wedge poisons the commit_mutex so the façade refuses further service"
+    );
+
+    // The applied-but-unpublished delta is invisible (committed_seq never advanced past it).
+    let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
+        panic!("expected SELECT plan");
+    };
+    assert!(
+        e.execute_relational_select(&select)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "a commit whose group fsync failed must never become visible"
+    );
+
+    // The sticky group failure turns later concurrent commits into errors, not panics.
+    let later = e.execute_dml_concurrent(3, "INSERT INTO t (id, v) VALUES (8, 80)");
+    assert!(
+        matches!(later, Err(ExecuteError::Engine(EngineError::Durability(_)))),
+        "later concurrent commits fail closed while wedged, got {later:?}"
+    );
+
+    // Restart-replay recovers exactly the durable prefix: the CREATE, neither INSERT.
+    drop(e);
+    let recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    assert_eq!(recovered.wal_flushed_count(), 1);
+    assert!(
+        recovered
+            .execute_relational_select(&select)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "un-fsynced commits are absent after restart recovery"
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}

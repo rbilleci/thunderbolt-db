@@ -266,6 +266,45 @@ struct PendingMutation {
     payload: Vec<u8>,
 }
 
+/// D3b (write-path assessment / scalability ledger #7) — group-commit flush coordination for the
+/// concurrent DML path. Committers validate, append, propose, and APPLY under the commit_mutex,
+/// then LEAVE the critical section and make their record durable here: the first arrival becomes
+/// the FLUSHER (one `flush_all` = one fsync covering every record appended so far — the group),
+/// later arrivals wait on the condvar and share that fsync. `committed_seq` is published only
+/// after a committer's record is covered by the durable frontier, so WAL-before-visibility is
+/// unchanged — the fsync just moved OFF the validate/apply critical path, so concurrent
+/// committers overlap their WAL waits instead of serializing fsync-per-commit.
+struct GroupFlushState {
+    coord: Mutex<GroupFlushCoord>,
+    cv: std::sync::Condvar,
+    /// Mirror of the WAL's flushed record count (the durable frontier), maintained by group
+    /// flushers so waiters can check durability without re-taking the commit_mutex. A stale
+    /// (low) value is safe: the waiter becomes a flusher and `flush_all` with nothing unflushed
+    /// is a no-op that refreshes the mirror.
+    durable_records: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for GroupFlushState {
+    fn default() -> Self {
+        Self {
+            coord: Mutex::new(GroupFlushCoord::default()),
+            cv: std::sync::Condvar::new(),
+            durable_records: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Default)]
+struct GroupFlushCoord {
+    /// A flusher currently owns the fsync; arrivals wait for its result instead of stacking a
+    /// second concurrent fsync on the same segment.
+    flusher_active: bool,
+    /// Sticky wedge: a group fsync failed AFTER its members' deltas were applied (they can never
+    /// be published, and nothing later may publish over them). See
+    /// [`Engine::wait_group_durable`] for the failure-semantics rationale.
+    failed: Option<String>,
+}
+
 pub struct Engine {
     /// The commit-critical mutable substate — the replicator (commit-`Index` oracle), the WAL, the
     /// per-txn commit timestamps, and the recent-commits conflict ledger — bundled behind ONE mutex
@@ -279,6 +318,11 @@ pub struct Engine {
     /// boundary. Separate from `commit` so a transaction can register its snapshot at prepare-begin
     /// WITHOUT serializing on the commit_mutex (prepare is off-lock).
     active_snapshots: Mutex<ActiveSnapshots>,
+    /// Group-commit flush coordination for the concurrent DML path (D3b): the commit fsync runs
+    /// OUTSIDE the commit_mutex so concurrent committers share one fsync per group. Lock order:
+    /// `group_flush.coord` may be taken only when the commit_mutex is NOT held; a flusher takes
+    /// the commit_mutex briefly INSIDE (coord → commit), never the reverse.
+    group_flush: GroupFlushState,
     /// The lock-free read-path state, shared by value-`Arc` with the concurrent-dispatch façade so
     /// reads and the concurrent-DML path reach `mvcc` / `committed_seq` / resident device-memory /
     /// route telemetry WITHOUT the engine `RwLock` (lock-free read path, write-half MVCC). A holder
