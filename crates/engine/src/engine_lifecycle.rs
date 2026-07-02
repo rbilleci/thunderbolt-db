@@ -139,6 +139,9 @@ impl Engine {
             }),
             active_snapshots: Mutex::new(ActiveSnapshots::default()),
             group_flush: GroupFlushState::default(),
+            // Mirrors LocalReplicator::leader() below.
+            repl_role_mirror: std::sync::atomic::AtomicU8::new(0),
+            commit_wave: engine_dml_concurrent::CommitWaveState::default(),
             read_state: Arc::new(ReadState::new()),
             catalog_latch: Mutex::new(DdlCatalogState {
                 relational_catalog: BTreeMap::new(),
@@ -262,7 +265,17 @@ impl Engine {
     // queries that used to read `self.repl`/`self.wal` directly. Each takes the commit lock only
     // briefly (a cheap field read) — never across a read body.
     pub(crate) fn repl_role(&self) -> Role {
-        self.commit_state().repl.role()
+        // Lock-free (ledger #6): reading through the commit_mutex made every statement's leader
+        // check convoy behind the wave sequencer's mutex hold. The mirror is updated by the rare
+        // `become_*` transitions (which require `&mut Engine`, so no statement races them).
+        match self
+            .repl_role_mirror
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            0 => Role::Leader,
+            1 => Role::Follower,
+            _ => Role::Candidate,
+        }
     }
 
     /// Lock the pending-mutation batcher, recovering from poison. Held only briefly (a field read or a

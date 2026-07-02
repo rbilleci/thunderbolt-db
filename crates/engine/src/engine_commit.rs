@@ -19,14 +19,31 @@ pub(crate) struct BatchCommitFailure {
 impl Engine {
     pub fn become_follower(&mut self, term: Term) {
         self.commit_state_mut().repl.become_follower(term);
+        self.publish_repl_role_mirror();
     }
 
     pub fn become_leader(&mut self, term: Term) {
         self.commit_state_mut().repl.become_leader(term);
+        self.publish_repl_role_mirror();
     }
 
     pub fn become_candidate(&mut self, term: Term) {
         self.commit_state_mut().repl.become_candidate(term);
+        self.publish_repl_role_mirror();
+    }
+
+    /// Refresh the lock-free role mirror from the replicator after a role transition (the only
+    /// mutation points route through the three `become_*` wrappers above).
+    fn publish_repl_role_mirror(&mut self) {
+        let role = self.commit_state_mut().repl.role();
+        self.repl_role_mirror.store(
+            match role {
+                Role::Leader => 0,
+                Role::Follower => 1,
+                Role::Candidate => 2,
+            },
+            AtomicOrdering::Release,
+        );
     }
 
     pub fn commit_mutation(

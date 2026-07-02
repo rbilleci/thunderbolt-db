@@ -636,3 +636,98 @@ fn dml_value_index_resolve_constrained_tables_fall_back_correctly() {
     assert_eq!(rows_on, rows_off, "constrained-table DML == oracle");
     assert_eq!(err_on, err_off, "constraint error identical through both paths");
 }
+
+#[test]
+fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
+    // Ledger #6 (deterministic commit wave): concurrent commits are sequenced in waves; plain
+    // INSERTs into constraint-free tables take the batched fast-run install while unique-indexed
+    // inserts and UPDATEs are per-item SLOW items that flush the pending run first. Mixed
+    // concurrent traffic across both classes must produce exactly the per-key expected state,
+    // acknowledge only real commits, and replay identically from the durable segment.
+    const WRITERS: usize = 8;
+    const OPS_PER_WRITER: usize = 30;
+
+    let path = test_wal_path("wave-mixed");
+    let e = Engine::with_durable_wal_segment(&path);
+    e.execute_text(1, "CREATE TABLE plain (id INT, v INT)")
+        .unwrap();
+    e.execute_text(2, "CREATE TABLE uniq (id INT, v INT)")
+        .unwrap();
+    e.execute_text(3, "CREATE UNIQUE INDEX uniq_id ON uniq (id)")
+        .unwrap();
+
+    let engine = std::sync::Arc::new(e);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let engine = std::sync::Arc::clone(&engine);
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..OPS_PER_WRITER {
+                    let id = (w * OPS_PER_WRITER + i) as u64;
+                    let txn = 10 + id * 3;
+                    // Fast-run candidate: plain INSERT.
+                    engine
+                        .execute_dml_concurrent(
+                            txn,
+                            &format!("INSERT INTO plain (id, v) VALUES ({id}, 0)"),
+                        )
+                        .unwrap();
+                    // Slow item: unique-indexed INSERT (disjoint ids per writer => must succeed).
+                    engine
+                        .execute_dml_concurrent(
+                            txn + 1,
+                            &format!("INSERT INTO uniq (id, v) VALUES ({id}, {id})"),
+                        )
+                        .unwrap();
+                    // Slow item: UPDATE the plain row just inserted (flushes the fast run first,
+                    // so its predicate resolution must see the earlier same-thread insert).
+                    engine
+                        .execute_dml_concurrent(
+                            txn + 2,
+                            &format!("UPDATE plain SET v = 1 WHERE id = {id}"),
+                        )
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let total = (WRITERS * OPS_PER_WRITER) as i64;
+    let count = |e: &Engine, sql: &str| -> usize {
+        let Command::Select(select) = parse_command(sql).unwrap() else {
+            panic!("expected SELECT");
+        };
+        e.execute_relational_select(&select).unwrap().rows.len()
+    };
+    assert_eq!(count(&engine, "SELECT id FROM plain") as i64, total);
+    assert_eq!(count(&engine, "SELECT id FROM uniq") as i64, total);
+    assert_eq!(
+        count(&engine, "SELECT id FROM plain WHERE v = 1") as i64,
+        total,
+        "every UPDATE saw its own thread's earlier fast-run insert"
+    );
+    // A duplicate unique insert through the wave still fails with the REAL constraint error.
+    let dup = engine.execute_dml_concurrent(9_000_000, "INSERT INTO uniq (id, v) VALUES (0, 0)");
+    assert!(
+        matches!(&dup, Err(ExecuteError::Engine(EngineError::ApplyFailed(msg))) if msg.contains("duplicate key"))
+            || matches!(&dup, Err(ExecuteError::Serialization(msg)) if msg.contains("duplicate key")),
+        "expected a duplicate-key failure, got {dup:?}"
+    );
+
+    // Restart-replay: the durable segment reproduces the exact same state.
+    drop(engine);
+    let recovered = Engine::open_durable_wal_segment(&path).unwrap();
+    assert_eq!(count(&recovered, "SELECT id FROM plain") as i64, total);
+    assert_eq!(count(&recovered, "SELECT id FROM uniq") as i64, total);
+    assert_eq!(
+        count(&recovered, "SELECT id FROM plain WHERE v = 1") as i64,
+        total
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(&path);
+}

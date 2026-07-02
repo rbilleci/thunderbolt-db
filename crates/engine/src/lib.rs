@@ -314,6 +314,15 @@ pub struct Engine {
     /// boundary. Separate from `commit` so a transaction can register its snapshot at prepare-begin
     /// WITHOUT serializing on the commit_mutex (prepare is off-lock).
     active_snapshots: Mutex<ActiveSnapshots>,
+    /// Lock-free mirror of the replicator role (0=Leader, 1=Follower, 2=Candidate), updated only
+    /// by the rare `become_*` transitions. The per-statement leader check (`repl_role`) used to
+    /// lock the commit_mutex for this one field read — measured to CONVOY every "off-lock"
+    /// prepare behind the wave sequencer's mutex hold (3µs → 1.4ms per prepare at 32 writers).
+    repl_role_mirror: std::sync::atomic::AtomicU8,
+    /// The deterministic commit-wave queue (ledger #6 / ADR-009 host spine): concurrent DML
+    /// commits are sequenced in WAVES by one promoted sequencer per wave — one commit_mutex hold,
+    /// one group fsync, one publish per wave — instead of a per-commit critical section.
+    commit_wave: engine_dml_concurrent::CommitWaveState,
     /// Group-commit flush coordination for the concurrent DML path (D3b): the commit fsync runs
     /// OUTSIDE the commit_mutex so concurrent committers share one fsync per group. Lock order:
     /// `group_flush.coord` may be taken only when the commit_mutex is NOT held; a flusher takes
@@ -551,3 +560,9 @@ pub struct DurableWalArchiveMaintenancePlan {
 
 #[cfg(test)]
 mod tests;
+
+/// Commit-wave telemetry accessor: `[waves, items, sequencing_nanos]` (see
+/// `engine_dml_concurrent::WAVE_STATS`). Read by the phase-D SLO benchmark.
+pub fn engine_dml_concurrent_wave_stats() -> &'static [std::sync::atomic::AtomicU64; 3] {
+    &engine_dml_concurrent::WAVE_STATS
+}

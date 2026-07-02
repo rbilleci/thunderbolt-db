@@ -32,6 +32,8 @@ pg_query = "6"
 probe-timing = ["gpu_db_execution/probe-timing"]
 
 [dev-dependencies]
+# Phase-D SLO benchmark: jemalloc arm (the engine library itself never chooses an allocator).
+tikv-jemallocator.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-postgres = "0.7"
 # Examples route serving paths through the protocol-neutral façade. This is a
