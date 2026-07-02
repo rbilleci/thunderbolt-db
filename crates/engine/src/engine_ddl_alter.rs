@@ -394,7 +394,7 @@ impl Engine {
                     .get(&index_key)
                     .cloned()
                     .unwrap_or_default();
-                std::sync::Arc::make_mut(&mut slot).push(row_key.clone());
+                slot.push_back(row_key.clone());
                 data.value_index.insert(index_key, slot);
             }
             Ok::<(), EngineError>(())
@@ -467,7 +467,7 @@ impl Engine {
                 } else {
                     key.clone()
                 };
-                rebuilt.insert(new_key, std::sync::Arc::clone(row_keys));
+                rebuilt.insert(new_key, row_keys.clone());
             }
             data.value_index = rebuilt;
         });
@@ -623,7 +623,7 @@ impl Engine {
                     .value_index
                     .iter()
                     .filter(|(key, _)| key.column != dropped_column_name)
-                    .map(|(key, row_keys)| (key.clone(), std::sync::Arc::clone(row_keys)))
+                    .map(|(key, row_keys)| (key.clone(), row_keys.clone()))
                     .collect();
                 Ok::<(), EngineError>(())
             })?;

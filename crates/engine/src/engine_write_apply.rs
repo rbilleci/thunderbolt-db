@@ -67,9 +67,9 @@ impl Engine {
                     // reader that loads it sees rows + value-index mutually consistent. `Arc::make_mut`
                     // copies a slot's row-key list ONLY if a live snapshot still shares it (COW),
                     // keeping the per-commit cost O(k·log n) for the k touched slots.
-                    for (key, mut row_keys) in value_index_entries {
+                    for (key, row_keys) in value_index_entries {
                         let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
-                        std::sync::Arc::make_mut(&mut slot).append(&mut row_keys);
+                        slot.extend(row_keys);
                         data.value_index.insert(key, slot);
                     }
                     Ok::<(), EngineError>(())
@@ -94,9 +94,9 @@ impl Engine {
                             .tuple_update(*tuple_id, encode_relational_row(values), commit_seq)
                             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                     }
-                    for (key, mut row_keys) in value_index_entries {
+                    for (key, row_keys) in value_index_entries {
                         let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
-                        std::sync::Arc::make_mut(&mut slot).append(&mut row_keys);
+                        slot.extend(row_keys);
                         data.value_index.insert(key, slot);
                     }
                     Ok::<(), EngineError>(())
@@ -145,6 +145,66 @@ impl Engine {
             }
         }
         self.apply_delta(delta, commit_seq, profile)
+    }
+
+    /// Wave-batched INSERT install (ledger #6): install a RUN of constraint-free insert deltas
+    /// for ONE table under a SINGLE `with_table_mut` — one `TableVersionData` clone and one
+    /// generation publish for the whole run instead of per item, which is what lifts the
+    /// sequencer's per-item apply cost off the wave's critical path. Each delta keeps its own
+    /// `created_by` stamp (`commit_seq`), so the installed versions are byte-identical to a
+    /// per-item apply / WAL replay of the same records.
+    pub(crate) fn apply_insert_deltas_batched(
+        &self,
+        table: &str,
+        deltas: Vec<(WriteDelta, TxnId)>,
+    ) -> Result<(), EngineError> {
+        let mut plans = Vec::with_capacity(deltas.len());
+        for (delta, commit_seq) in deltas {
+            let rows_consumed = delta.rows_consumed;
+            let crate::write_path::PreparedMutation::Insert {
+                inserted_rows,
+                value_index_entries,
+                seq_advances,
+                ..
+            } = delta.mutation
+            else {
+                return Err(EngineError::ApplyFailed(
+                    "apply_insert_deltas_batched received a non-insert delta".to_string(),
+                ));
+            };
+            debug_assert!(
+                seq_advances.is_empty(),
+                "nextval inserts route through the serialized path, never the wave fast path"
+            );
+            let tuple_ids: Vec<TupleId> = (0..inserted_rows.len())
+                .map(|_| self.read_state.mvcc.reserve_tuple_id())
+                .collect();
+            debug_assert_eq!(inserted_rows.len() as u64, rows_consumed);
+            self.read_state.mvcc.advance_row_id(rows_consumed);
+            plans.push((tuple_ids, inserted_rows, value_index_entries, commit_seq));
+        }
+        self.read_state.mvcc.with_table_mut(table, |data| {
+            for (tuple_ids, inserted_rows, value_index_entries, commit_seq) in &plans {
+                for (tuple_id, (row_key, values)) in tuple_ids.iter().zip(inserted_rows.iter()) {
+                    data.rows
+                        .tuple_insert_reserved_key_with_id(
+                            *tuple_id,
+                            NewTuple {
+                                key: row_key.clone(),
+                                value: encode_relational_row(values),
+                            },
+                            *commit_seq,
+                        )
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+                for (key, row_keys) in value_index_entries {
+                    let mut slot = data.value_index.get(key).cloned().unwrap_or_default();
+                    slot.extend(row_keys.iter().cloned());
+                    data.value_index.insert(key.clone(), slot);
+                }
+            }
+            Ok::<(), EngineError>(())
+        })
     }
 
     pub(crate) fn apply_insert_with_profile(

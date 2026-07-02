@@ -180,7 +180,7 @@ fn seed_people_row(
         .get(&index_key)
         .cloned()
         .unwrap_or_default();
-    std::sync::Arc::make_mut(&mut slot).push(row_key);
+    slot.push_back(row_key);
     data.value_index.insert(index_key, slot);
 }
 

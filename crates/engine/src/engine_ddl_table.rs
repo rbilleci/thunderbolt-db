@@ -1017,7 +1017,7 @@ impl Engine {
                 }
                 for (key, keys) in &new_value_index {
                     let mut slot = data.value_index.get(key).cloned().unwrap_or_default();
-                    std::sync::Arc::make_mut(&mut slot).extend(keys.iter().cloned());
+                    slot.extend(keys.iter().cloned());
                     data.value_index.insert(key.clone(), slot);
                 }
                 Ok::<(), EngineError>(())
