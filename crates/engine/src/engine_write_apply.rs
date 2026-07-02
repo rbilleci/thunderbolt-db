@@ -1307,22 +1307,45 @@ impl Engine {
                 {
                     return Ok(());
                 }
-                let mut candidate_rows = self.visible_relational_rows(
-                    table,
-                    StorageVisibility {
-                        read_txn_id: txn_id,
-                    },
-                )?;
-                candidate_rows.extend(new_rows);
-                Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
-                Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
-                self.validate_foreign_keys_with_table_rows(
-                    &table.name,
-                    &candidate_rows,
-                    StorageVisibility {
-                        read_txn_id: txn_id,
-                    },
-                )?;
+                // PHASE C slice 1b: index-driven validation over the NEW rows only — the
+                // survivors were valid before this statement and an INSERT removes nothing.
+                // Self-referencing-FK tables keep the scan (a new row may provide for another
+                // new row, which the parent's index cannot see pre-install).
+                let self_referencing_fk = table
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_table == table.name);
+                if self.dml_value_index_resolve_enabled() && !self_referencing_fk {
+                    let table_rows = self.read_state.mvcc.table_rows(&table.name);
+                    self.validate_dml_constraints_via_index(
+                        &catalog,
+                        table,
+                        &table_rows,
+                        &new_rows,
+                        &[],
+                        &BTreeSet::new(),
+                        StorageVisibility {
+                            read_txn_id: txn_id,
+                        },
+                    )?;
+                } else {
+                    let mut candidate_rows = self.visible_relational_rows(
+                        table,
+                        StorageVisibility {
+                            read_txn_id: txn_id,
+                        },
+                    )?;
+                    candidate_rows.extend(new_rows);
+                    Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
+                    Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
+                    self.validate_foreign_keys_with_table_rows(
+                        &table.name,
+                        &candidate_rows,
+                        StorageVisibility {
+                            read_txn_id: txn_id,
+                        },
+                    )?;
+                }
             }
             Command::Update(update) => {
                 // Lock-free concurrent-DML preflight (Stage 2 — blocker #1): pin ONE catalog snapshot
@@ -1365,36 +1388,81 @@ impl Engine {
                     read_txn_id: txn_id,
                 };
                 let prefix = relational_key_prefix(&update.table);
-                let mut candidate_rows = Vec::new();
                 let table_rows = self.read_state.mvcc.table_rows(&update.table);
-                let mut cursor = table_rows
-                    .store()
-                    .seq_scan_open(visibility)
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                while let Some(tuple) = cursor.next() {
-                    if !tuple.key.starts_with(&prefix) {
-                        continue;
-                    }
-                    let mut row = decode_relational_row(&tuple.value, &table.columns)
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                    if filter_groups.iter().any(|filters| {
-                        filters
-                            .iter()
-                            .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
-                    }) {
+                // PHASE C slice 1b: resolve the matches via the value index and validate the
+                // touched images index-driven; ineligible (range-only / self-FK / flag off) ->
+                // the scan block below, unchanged.
+                let self_referencing_fk = table
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_table == table.name);
+                let index_resolved = if self_referencing_fk
+                    || !self.dml_value_index_resolve_enabled()
+                {
+                    None
+                } else {
+                    Self::resolve_dml_matches_via_value_index(
+                        table,
+                        &table_rows,
+                        &filter_groups,
+                        visibility,
+                        &prefix,
+                    )?
+                };
+                if let Some(matches) = index_resolved {
+                    let touched_keys: BTreeSet<String> =
+                        matches.iter().map(|(_, key, _)| key.clone()).collect();
+                    let mut old_images = Vec::with_capacity(matches.len());
+                    let mut new_images = Vec::with_capacity(matches.len());
+                    for (_, _, mut row) in matches {
+                        old_images.push(row.clone());
                         for (idx, value) in &assignments {
                             row[*idx] = value.clone();
                         }
+                        new_images.push(row);
                     }
-                    candidate_rows.push(row);
+                    self.validate_dml_constraints_via_index(
+                        &catalog,
+                        table,
+                        &table_rows,
+                        &new_images,
+                        &old_images,
+                        &touched_keys,
+                        visibility,
+                    )?;
+                } else {
+                    let mut candidate_rows = Vec::new();
+                    let mut cursor = table_rows
+                        .store()
+                        .seq_scan_open(visibility)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    while let Some(tuple) = cursor.next() {
+                        if !tuple.key.starts_with(&prefix) {
+                            continue;
+                        }
+                        let mut row = decode_relational_row(&tuple.value, &table.columns)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                        if filter_groups.iter().any(|filters| {
+                            filters
+                                .iter()
+                                .all(|(idx, op, value)| {
+                                    select_filter_matches(&row[*idx], *op, value)
+                                })
+                        }) {
+                            for (idx, value) in &assignments {
+                                row[*idx] = value.clone();
+                            }
+                        }
+                        candidate_rows.push(row);
+                    }
+                    Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
+                    Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
+                    self.validate_foreign_keys_with_table_rows(
+                        &table.name,
+                        &candidate_rows,
+                        visibility,
+                    )?;
                 }
-                Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
-                Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
-                self.validate_foreign_keys_with_table_rows(
-                    &table.name,
-                    &candidate_rows,
-                    visibility,
-                )?;
             }
             Command::Delete(delete) => {
                 // Lock-free concurrent-DML preflight (Stage 2 — blocker #1): pin ONE catalog snapshot
@@ -1423,31 +1491,68 @@ impl Engine {
                     read_txn_id: txn_id,
                 };
                 let prefix = relational_key_prefix(&delete.table);
-                let mut candidate_rows = Vec::new();
                 let table_rows = self.read_state.mvcc.table_rows(&delete.table);
-                let mut cursor = table_rows
-                    .store()
-                    .seq_scan_open(visibility)
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                while let Some(tuple) = cursor.next() {
-                    if !tuple.key.starts_with(&prefix) {
-                        continue;
-                    }
-                    let row = decode_relational_row(&tuple.value, &table.columns)
+                // PHASE C slice 1b: resolve the deletions via the value index and run the
+                // inbound-FK check over the REMOVED provider values; ineligible -> the scan.
+                let self_referencing_fk = table
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_table == table.name);
+                let index_resolved = if self_referencing_fk
+                    || !self.dml_value_index_resolve_enabled()
+                {
+                    None
+                } else {
+                    Self::resolve_dml_matches_via_value_index(
+                        table,
+                        &table_rows,
+                        &filter_groups,
+                        visibility,
+                        &prefix,
+                    )?
+                };
+                if let Some(matches) = index_resolved {
+                    let touched_keys: BTreeSet<String> =
+                        matches.iter().map(|(_, key, _)| key.clone()).collect();
+                    let removed: Vec<Vec<SqlValue>> =
+                        matches.into_iter().map(|(_, _, row)| row).collect();
+                    self.validate_dml_constraints_via_index(
+                        &catalog,
+                        table,
+                        &table_rows,
+                        &[],
+                        &removed,
+                        &touched_keys,
+                        visibility,
+                    )?;
+                } else {
+                    let mut candidate_rows = Vec::new();
+                    let mut cursor = table_rows
+                        .store()
+                        .seq_scan_open(visibility)
                         .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                    if !filter_groups.iter().any(|filters| {
-                        filters
-                            .iter()
-                            .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
-                    }) {
-                        candidate_rows.push(row);
+                    while let Some(tuple) = cursor.next() {
+                        if !tuple.key.starts_with(&prefix) {
+                            continue;
+                        }
+                        let row = decode_relational_row(&tuple.value, &table.columns)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                        if !filter_groups.iter().any(|filters| {
+                            filters
+                                .iter()
+                                .all(|(idx, op, value)| {
+                                    select_filter_matches(&row[*idx], *op, value)
+                                })
+                        }) {
+                            candidate_rows.push(row);
+                        }
                     }
+                    self.validate_foreign_keys_with_table_rows(
+                        &table.name,
+                        &candidate_rows,
+                        visibility,
+                    )?;
                 }
-                self.validate_foreign_keys_with_table_rows(
-                    &table.name,
-                    &candidate_rows,
-                    visibility,
-                )?;
             }
             _ => {}
         }

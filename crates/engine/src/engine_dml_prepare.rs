@@ -6,6 +6,10 @@
 
 use super::*;
 
+/// PHASE C slice 1: one resolved DML match — `(tuple_id, row_key, decoded_row)`, exactly the triple
+/// the seq_scan produced. `None` from the resolver = index-ineligible -> the caller scans.
+pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
+
 impl Engine {
     pub(crate) fn apply_insert(
         &self,
@@ -249,11 +253,15 @@ impl Engine {
                 .iter()
                 .any(|foreign_key| foreign_key.referenced_table == table.name)
         });
-        // PHASE C slice 1 (ledger #1): an inbound-FK-free table with Eq-bearing filter groups
-        // resolves its matches through the VALUE INDEX — O(matches), not the O(table) seq_scan.
-        // FK-referenced tables keep the scan (the FK validator below needs the survivor set until
-        // it is index-driven — slice 1b). `None` (ineligible) -> the scan below, unchanged.
-        let index_resolved: Option<Vec<(u64, String, Vec<SqlValue>)>> = if has_inbound_fks
+        // PHASE C slice 1 (ledger #1) + 1b: an Eq-bearing DELETE resolves its matches through the
+        // VALUE INDEX — O(matches), not the O(table) seq_scan — and (1b) its inbound-FK validation
+        // runs index-driven too. A SELF-REFERENCING FK falls back to the scan (its provider set
+        // interleaves with the statement's own images). `None` (ineligible) -> the scan, unchanged.
+        let self_referencing_fk = table
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| foreign_key.referenced_table == table.name);
+        let index_resolved: Option<Vec<DmlResolvedMatch>> = if self_referencing_fk
             || !self.dml_value_index_resolve_enabled()
         {
             None
@@ -266,10 +274,11 @@ impl Engine {
                 &prefix,
             )?
         };
-        let deletes: Vec<(u64, String, Vec<SqlValue>)> = match index_resolved {
+        let index_arm = index_resolved.is_some();
+        let deletes: Vec<DmlResolvedMatch> = match index_resolved {
             Some(matches) => matches,
             None => {
-                let mut deletes: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
+                let mut deletes: Vec<DmlResolvedMatch> = Vec::new();
                 let mut cursor = table_rows
                     .store()
                     .seq_scan_open(visibility)
@@ -295,25 +304,44 @@ impl Engine {
         };
 
         if has_inbound_fks {
-            let deleted_ids = deletes
-                .iter()
-                .map(|(tuple_id, _, _)| *tuple_id)
-                .collect::<BTreeSet<_>>();
-            let mut candidate_rows = Vec::new();
-            let mut cursor = table_rows
-                .store()
-                .seq_scan_open(visibility)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            while let Some(tuple) = cursor.next() {
-                if tuple.key.starts_with(&prefix) && !deleted_ids.contains(&tuple.tuple_id) {
-                    candidate_rows.push(
-                        decode_relational_row(&tuple.value, &table.columns)
-                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?,
-                    );
+            if index_arm {
+                // PHASE C slice 1b: index-driven inbound-FK validation over the REMOVED provider
+                // values only — O(deleted x FKs), replacing the O(table) survivor materialization
+                // (and the validator's own O(all related tables) scans).
+                let touched_keys: BTreeSet<String> =
+                    deletes.iter().map(|(_, key, _)| key.clone()).collect();
+                let removed: Vec<Vec<SqlValue>> =
+                    deletes.iter().map(|(_, _, row)| row.clone()).collect();
+                self.validate_dml_constraints_via_index(
+                    &catalog,
+                    &table,
+                    &table_rows,
+                    &[],
+                    &removed,
+                    &touched_keys,
+                    visibility,
+                )?;
+            } else {
+                let deleted_ids = deletes
+                    .iter()
+                    .map(|(tuple_id, _, _)| *tuple_id)
+                    .collect::<BTreeSet<_>>();
+                let mut candidate_rows = Vec::new();
+                let mut cursor = table_rows
+                    .store()
+                    .seq_scan_open(visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                while let Some(tuple) = cursor.next() {
+                    if tuple.key.starts_with(&prefix) && !deleted_ids.contains(&tuple.tuple_id) {
+                        candidate_rows.push(
+                            decode_relational_row(&tuple.value, &table.columns)
+                                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?,
+                        );
+                    }
                 }
+                drop(cursor);
+                self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
             }
-            drop(cursor);
-            self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
         }
 
         let mut write_set = WriteSet::default();
@@ -344,6 +372,190 @@ impl Engine {
         })
     }
 
+    /// PHASE C slice 1b: does ANY VISIBLE row (optionally excluding `exclude_keys` — the rows this
+    /// statement touches) carry `column_idx == value`? Resolves through the append-only value index
+    /// (candidates) + the visibility fetch + a STRUCTURAL-equality recheck. Structural (`==`), NOT
+    /// the 3VL matcher: the scan validators compare via `BTreeSet` membership, where NULL == NULL
+    /// and same-column values share the column's coerced representation — this must match them.
+    pub(crate) fn any_visible_row_with_value(
+        table: &RelationalTable,
+        table_rows: &crate::resident_storage::TableRowsView,
+        visibility: StorageVisibility,
+        column_idx: usize,
+        value: &SqlValue,
+        exclude_keys: Option<&BTreeSet<String>>,
+    ) -> Result<bool, EngineError> {
+        let mut keys = table_rows.index_keys(
+            &table.columns[column_idx].name,
+            &relational_index_value(value),
+        );
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
+                continue;
+            }
+            let fetched = table_rows
+                .store()
+                .tuple_fetch_by_key(&key, visibility)
+                .map_err(|err: gpu_db_storage::StorageError| {
+                    EngineError::ApplyFailed(err.to_string())
+                })?;
+            let Some(tuple) = fetched else {
+                continue; // stale index entry: no visible version at this snapshot
+            };
+            let row = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            if row[column_idx] == *value {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// PHASE C slice 1b: INDEX-DRIVEN constraint validation for an index-resolved DELETE/UPDATE —
+    /// semantically identical to the scan validators (`validate_unique_indexes_for_rows` /
+    /// `validate_check_constraints_for_rows` / `validate_foreign_keys_with_table_rows`) RESTRICTED
+    /// to what the statement can affect: the untouched survivors were valid before it (every prior
+    /// statement validated; ADD CHECK / ADD FK validate existing rows at DDL time), so only the NEW
+    /// images (unique/check/outbound-FK) and the REMOVED provider values (inbound-FK) need work —
+    /// O(rows touched x constraints) via the value indexes, replacing the validators' O(all related
+    /// tables) survivor materializations. Validator ORDER mirrors the scan path (unique -> check ->
+    /// FK) and the error messages are byte-identical. PRECONDITION (caller eligibility): `table` has
+    /// NO self-referencing FK (its provider/consumer sets would interleave with the statement's own
+    /// images — those tables fall back to the scan validators).
+    ///
+    /// DELETE passes empty `new_images` (unique/check/outbound sections no-op, exactly as the scan
+    /// path never ran them for DELETE); UPDATE passes the post-assignment images.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn validate_dml_constraints_via_index(
+        &self,
+        catalog: &CatalogSnapshot,
+        table: &RelationalTable,
+        table_rows: &crate::resident_storage::TableRowsView,
+        new_images: &[Vec<SqlValue>],
+        removed_images: &[Vec<SqlValue>],
+        touched_keys: &BTreeSet<String>,
+        visibility: StorageVisibility,
+    ) -> Result<(), EngineError> {
+        // 1. UNIQUE: in-batch duplicates among the new images (the scan validator's BTreeSet pass,
+        //    NULLs collide) + each new value vs the UNTOUCHED visible rows via the index.
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            let Some(column_idx) = table
+                .columns
+                .iter()
+                .position(|column| column.name == index.column)
+            else {
+                continue;
+            };
+            let mut seen = BTreeSet::new();
+            for row in new_images {
+                if !seen.insert(row[column_idx].clone())
+                    || Self::any_visible_row_with_value(
+                        table,
+                        table_rows,
+                        visibility,
+                        column_idx,
+                        &row[column_idx],
+                        Some(touched_keys),
+                    )?
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "duplicate key value violates unique index \"{}\"",
+                        index.name
+                    )));
+                }
+            }
+        }
+        // 2. CHECK: per-row on the new images (survivors passed at their own write; ADD CHECK
+        //    validates existing rows at DDL time — the invariant the restriction rests on).
+        Self::validate_check_constraints_for_rows(table, new_images)?;
+        // 3. OUTBOUND FK (this table is the child): each new image's FK value must have a visible
+        //    provider in the (untouched — no self-FK by precondition) parent table.
+        for foreign_key in &table.foreign_keys {
+            let Some(parent) = catalog
+                .relational_catalog
+                .get(&foreign_key.referenced_table)
+            else {
+                continue;
+            };
+            let child_idx = relational_column_index(table, &foreign_key.column)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            let parent_idx = relational_column_index(parent, &foreign_key.referenced_column)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            let parent_rows = self.read_state.mvcc.table_rows(&parent.name);
+            for row in new_images {
+                if !Self::any_visible_row_with_value(
+                    parent,
+                    &parent_rows,
+                    visibility,
+                    parent_idx,
+                    &row[child_idx],
+                    None,
+                )? {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                        table.name, foreign_key.name
+                    )));
+                }
+            }
+        }
+        // 4. INBOUND FK (children referencing this table): a REMOVED provider value that a visible
+        //    child row still references, with no surviving (or newly-installed) provider, is a
+        //    violation. Restricted-to-removed-values is equivalent to the scan validator's full
+        //    child-set check under the survivors-were-valid invariant.
+        for child in catalog.relational_catalog.values() {
+            if child.name == table.name {
+                continue; // self-FK excluded by the caller's eligibility
+            }
+            for foreign_key in &child.foreign_keys {
+                if foreign_key.referenced_table != table.name {
+                    continue;
+                }
+                let parent_idx = relational_column_index(table, &foreign_key.referenced_column)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                let child_idx = relational_column_index(child, &foreign_key.column)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                let new_provider_values: BTreeSet<&SqlValue> =
+                    new_images.iter().map(|row| &row[parent_idx]).collect();
+                let child_rows = self.read_state.mvcc.table_rows(&child.name);
+                let mut checked: BTreeSet<&SqlValue> = BTreeSet::new();
+                for old in removed_images {
+                    let value = &old[parent_idx];
+                    if !checked.insert(value) || new_provider_values.contains(value) {
+                        continue;
+                    }
+                    // A surviving untouched provider keeps the value alive.
+                    if Self::any_visible_row_with_value(
+                        table,
+                        table_rows,
+                        visibility,
+                        parent_idx,
+                        value,
+                        Some(touched_keys),
+                    )? {
+                        continue;
+                    }
+                    // No provider left: any visible child row still referencing it = violation.
+                    if Self::any_visible_row_with_value(
+                        child,
+                        &child_rows,
+                        visibility,
+                        child_idx,
+                        value,
+                        None,
+                    )? {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                            child.name, foreign_key.name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// PHASE C slice 1 (ledger #1): resolve the rows a DELETE/UPDATE touches via the per-table
     /// equality VALUE-INDEX instead of the O(table) seq_scan + decode (MEASURED: single-row
     /// DELETE/UPDATE p50 80-88ms at 262k rows, LINEAR in table size — the write path's dominant
@@ -357,13 +569,13 @@ impl Engine {
     /// (`versions.values()` is tuple_id-keyed) — so the produced WriteDelta is byte-identical to
     /// the scan path's. `None` = not eligible (no filters = full-table DML, or a range-only group)
     /// -> the caller runs the seq_scan (the oracle path, always correct).
-    fn resolve_dml_matches_via_value_index(
+    pub(crate) fn resolve_dml_matches_via_value_index(
         table: &RelationalTable,
         table_rows: &crate::resident_storage::TableRowsView,
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
         visibility: StorageVisibility,
         prefix: &str,
-    ) -> Result<Option<Vec<(u64, String, Vec<SqlValue>)>>, EngineError> {
+    ) -> Result<Option<Vec<DmlResolvedMatch>>, EngineError> {
         if filter_groups.is_empty() {
             return Ok(None);
         }
@@ -382,7 +594,7 @@ impl Engine {
         // keep only THIS table's keys (defensive — the per-table index is table-scoped already).
         candidate_keys.sort();
         candidate_keys.dedup();
-        let mut matches: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
+        let mut matches: Vec<DmlResolvedMatch> = Vec::new();
         for key in candidate_keys {
             if !key.starts_with(prefix) {
                 continue;
@@ -464,9 +676,6 @@ impl Engine {
         // write-set dedups to one slot), so an idempotent rewrite does not self-conflict.
         let mut released_unique_slots: Vec<UniqueIndexSlotKey> = Vec::new();
         let table_rows = self.read_state.mvcc.table_rows(&update.table);
-        // The constraint validators below consume `candidate_rows` (the NON-matched visible rows),
-        // which only the seq_scan produces — so a CONSTRAINED table (unique / CHECK / FK in either
-        // direction) keeps the scan until the validators are index-driven (slice 1b).
         let constrained = table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()
             || !table.foreign_keys.is_empty()
@@ -476,9 +685,16 @@ impl Engine {
                     .iter()
                     .any(|foreign_key| foreign_key.referenced_table == table.name)
             });
-        // PHASE C slice 1 (ledger #1): a constraint-free table with Eq-bearing filter groups
-        // resolves its matches through the VALUE INDEX — O(matches), not the O(table) seq_scan.
-        let index_resolved: Option<Vec<(u64, String, Vec<SqlValue>)>> = if constrained
+        // PHASE C slice 1 (ledger #1) + 1b: an Eq-bearing UPDATE resolves its matches through the
+        // VALUE INDEX — O(matches), not the O(table) seq_scan — and (1b) a CONSTRAINED table's
+        // validators run index-driven over the touched images (`validate_dml_constraints_via_index`)
+        // instead of over the scan's survivor set. A SELF-REFERENCING FK falls back to the scan
+        // (its provider set interleaves with the statement's own images).
+        let self_referencing_fk = table
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| foreign_key.referenced_table == table.name);
+        let index_resolved: Option<Vec<DmlResolvedMatch>> = if self_referencing_fk
             || !self.dml_value_index_resolve_enabled()
         {
             None
@@ -491,6 +707,7 @@ impl Engine {
                 &prefix,
             )?
         };
+        let index_arm = index_resolved.is_some();
         match index_resolved {
             Some(matches) => {
                 for (tuple_id, key, mut row) in matches {
@@ -542,33 +759,49 @@ impl Engine {
             }
         }
 
-        if table.indexes.iter().any(|index| index.unique)
-            || !table.check_constraints.is_empty()
-            || !table.foreign_keys.is_empty()
-            || catalog.relational_catalog.values().any(|candidate| {
-                candidate
-                    .foreign_keys
-                    .iter()
-                    .any(|foreign_key| foreign_key.referenced_table == table.name)
-            })
-        {
-            candidate_rows.extend(updates.iter().map(|(_, _, row)| row.clone()));
-        }
-        if table.indexes.iter().any(|index| index.unique) {
-            Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
-        }
-        if !table.check_constraints.is_empty() {
-            Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
-        }
-        if !table.foreign_keys.is_empty()
-            || catalog.relational_catalog.values().any(|candidate| {
-                candidate
-                    .foreign_keys
-                    .iter()
-                    .any(|foreign_key| foreign_key.referenced_table == table.name)
-            })
-        {
-            self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
+        if index_arm {
+            // PHASE C slice 1b: index-driven validation over the touched images — O(touched x
+            // constraints) via the value indexes, replacing the validators' survivor-set scans.
+            // (`candidate_rows` is empty in this arm and unused.)
+            if constrained {
+                let touched_keys: BTreeSet<String> =
+                    updates.iter().map(|(_, key, _)| key.clone()).collect();
+                let new_images: Vec<Vec<SqlValue>> =
+                    updates.iter().map(|(_, _, row)| row.clone()).collect();
+                self.validate_dml_constraints_via_index(
+                    &catalog,
+                    &table,
+                    &table_rows,
+                    &new_images,
+                    &updated_old_rows,
+                    &touched_keys,
+                    visibility,
+                )?;
+            }
+        } else {
+            if constrained {
+                candidate_rows.extend(updates.iter().map(|(_, _, row)| row.clone()));
+            }
+            if table.indexes.iter().any(|index| index.unique) {
+                Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
+            }
+            if !table.check_constraints.is_empty() {
+                Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
+            }
+            if !table.foreign_keys.is_empty()
+                || catalog.relational_catalog.values().any(|candidate| {
+                    candidate
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_table == table.name)
+                })
+            {
+                self.validate_foreign_keys_with_table_rows(
+                    &table.name,
+                    &candidate_rows,
+                    visibility,
+                )?;
+            }
         }
 
         let updated_rows: Vec<(String, Vec<SqlValue>)> = updates

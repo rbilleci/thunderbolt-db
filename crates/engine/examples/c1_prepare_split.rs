@@ -31,13 +31,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(50);
 
-    println!("c1_prepare_split: single-row DELETE / UPDATE p50 us vs table size (ops={ops})");
+    println!(
+        "c1_prepare_split: single-row DELETE / UPDATE p50 us vs table size (ops={ops}, \
+         constrained={})",
+        env::var("GPU_DB_BENCH_CONSTRAINED").ok().as_deref() == Some("1")
+    );
     println!("{:>10} {:>14} {:>14}", "rows", "DELETE p50", "UPDATE p50");
+    let constrained = env::var("GPU_DB_BENCH_CONSTRAINED").ok().as_deref() == Some("1");
     for &rows in &sizes {
         let e = Engine::new_local();
         e.set_auto_admit_on_commit(true);
-        e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
-        let mut seq = 2u64;
+        if env::var("GPU_DB_BENCH_INDEX_OFF").ok().as_deref() == Some("1") {
+            e.set_dml_value_index_resolve_enabled(false); // the scan-oracle configuration
+        }
+        if constrained {
+            // 1b coverage: a UNIQUE index + an inbound FK child — the validators run index-driven.
+            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")?;
+            e.execute_text(2, "CREATE TABLE c (id INT, tid INT)")?;
+            e.execute_text(
+                3,
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_tid_fk FOREIGN KEY (tid) REFERENCES t(id)",
+            )?;
+        } else {
+            e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
+        }
+        let mut seq = 4u64;
         let mut i = 0i64;
         while i < rows {
             let end = (i + 1000).min(rows);

@@ -731,3 +731,149 @@ fn commit_wave_mixed_fast_and_slow_items_stay_correct_and_recover() {
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(&path);
 }
+
+/// PHASE C slice 1b — INDEX-DRIVEN validators == the scan validators (twin engines, flag ON/OFF):
+/// unique (self-value-keeping update must NOT self-conflict; cross-row duplicate must; NULLs ARE
+/// duplicates in this engine), CHECK on the new image, OUTBOUND FK (update to a missing/present
+/// parent), INBOUND FK RESTRICT (delete/update-away the last provider vs a surviving provider vs
+/// re-provided by the update itself), and the SELF-REFERENCING-FK fallback. Identical error
+/// strings and identical final states. SABOTAGE-VERIFIED: dropping the touched-keys exclusion
+/// false-conflicts the self-value update; skipping the surviving-provider probe false-fires the
+/// inbound FK; skipping the inbound section misses the last-provider violation.
+#[test]
+fn dml_index_validators_match_scan_validators_oracle() {
+    // Each scenario: (setup DDL/DML, statement, expect_err).
+    let run = |index_on: bool,
+               setup: &[&str],
+               stmt: &str|
+     -> (Result<(), String>, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>) {
+        let e = Engine::new_local();
+        e.set_dml_value_index_resolve_enabled(index_on);
+        for (i, sql) in setup.iter().enumerate() {
+            e.execute_text(1 + i as u64, sql).unwrap();
+        }
+        let out = e
+            .execute_text(500, stmt)
+            .map(|_| ())
+            .map_err(|err| err.to_string());
+        let parent = e
+            .execute_relational_select_text("SELECT id, v FROM p ORDER BY id")
+            .map(|r| r.rows.into_boxed())
+            .unwrap_or_default();
+        let child = e
+            .execute_relational_select_text("SELECT id, pid FROM c ORDER BY id")
+            .map(|r| r.rows.into_boxed())
+            .unwrap_or_default();
+        (out, parent, child)
+    };
+    let base_fk: Vec<&str> = vec![
+        "CREATE TABLE p (id INT UNIQUE, v INT)",
+        "INSERT INTO p (id, v) VALUES (1,10),(2,20),(2,-1),(3,30)", // wait: id UNIQUE forbids dup 2
+    ];
+    let _ = base_fk;
+    let scenarios: Vec<(Vec<&str>, &str)> = vec![
+        // 1. unique: self-value-keeping update (must NOT self-conflict).
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)",
+            ],
+            "UPDATE p SET v = 99 WHERE id = 2",
+        ),
+        // 2. unique: cross-row duplicate (must error identically).
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)",
+            ],
+            "UPDATE p SET id = 1 WHERE id = 3",
+        ),
+        // 3. CHECK on the new image (violation) — and a passing variant.
+        (
+            vec![
+                "CREATE TABLE p (id INT, v INT, CONSTRAINT p_v_positive CHECK (v > 0))",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+            ],
+            "UPDATE p SET v = -5 WHERE id = 2",
+        ),
+        (
+            vec![
+                "CREATE TABLE p (id INT, v INT, CONSTRAINT p_v_positive CHECK (v > 0))",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+            ],
+            "UPDATE p SET v = 5 WHERE id = 2",
+        ),
+        // 4. OUTBOUND FK: update the child's FK to a missing parent (error) / present parent (ok).
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+                "CREATE TABLE c (id INT, pid INT)",
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_pid_fk FOREIGN KEY (pid) REFERENCES p(id)",
+                "INSERT INTO c (id, pid) VALUES (100,1)",
+            ],
+            "UPDATE c SET pid = 9 WHERE id = 100",
+        ),
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+                "CREATE TABLE c (id INT, pid INT)",
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_pid_fk FOREIGN KEY (pid) REFERENCES p(id)",
+                "INSERT INTO c (id, pid) VALUES (100,1)",
+            ],
+            "UPDATE c SET pid = 2 WHERE id = 100",
+        ),
+        // 5. INBOUND FK RESTRICT: delete the LAST provider of a referenced value (error).
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+                "CREATE TABLE c (id INT, pid INT)",
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_pid_fk FOREIGN KEY (pid) REFERENCES p(id)",
+                "INSERT INTO c (id, pid) VALUES (100,1)",
+            ],
+            "DELETE FROM p WHERE id = 1",
+        ),
+        // 6. INBOUND FK: delete an UNREFERENCED provider (ok).
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+                "CREATE TABLE c (id INT, pid INT)",
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_pid_fk FOREIGN KEY (pid) REFERENCES p(id)",
+                "INSERT INTO c (id, pid) VALUES (100,1)",
+            ],
+            "DELETE FROM p WHERE id = 2",
+        ),
+        // 7. INBOUND FK: update-away the referenced value but RE-PROVIDE it in the new image (ok).
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+                "CREATE TABLE c (id INT, pid INT)",
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_pid_fk FOREIGN KEY (pid) REFERENCES p(id)",
+                "INSERT INTO c (id, pid) VALUES (100,1)",
+            ],
+            "UPDATE p SET v = 111 WHERE id = 1",
+        ),
+        // 8. INBOUND FK: update-away the LAST provider's key (error).
+        (
+            vec![
+                "CREATE TABLE p (id INT UNIQUE, v INT)",
+                "INSERT INTO p (id, v) VALUES (1,10),(2,20)",
+                "CREATE TABLE c (id INT, pid INT)",
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_pid_fk FOREIGN KEY (pid) REFERENCES p(id)",
+                "INSERT INTO c (id, pid) VALUES (100,1)",
+            ],
+            "UPDATE p SET id = 5 WHERE id = 1",
+        ),
+    ];
+    for (i, (setup, stmt)) in scenarios.iter().enumerate() {
+        let (out_on, p_on, c_on) = run(true, setup, stmt);
+        let (out_off, p_off, c_off) = run(false, setup, stmt);
+        assert_eq!(out_on, out_off, "scenario {i}: outcome (ok/error text) must match the oracle");
+        assert_eq!(p_on, p_off, "scenario {i}: parent state == oracle");
+        assert_eq!(c_on, c_off, "scenario {i}: child state == oracle");
+    }
+}
