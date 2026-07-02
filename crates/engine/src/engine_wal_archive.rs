@@ -76,6 +76,74 @@ impl Engine {
         )
     }
 
+    /// D2: bound the live WAL. Persist a self-contained checkpoint (control file + checkpoint
+    /// segment holding the FULL durable history) and then truncate the LIVE segment to only the
+    /// records after the checkpoint boundary — so a long-lived database's active segment stays
+    /// bounded by the checkpoint cadence instead of growing forever. Recover with
+    /// [`Engine::open_durable_wal_segment_with_checkpoint`] (checkpoint first, then the live
+    /// suffix). Runs entirely under the commit_mutex so no commit can land between the checkpoint
+    /// write and the live-segment truncation (its records would be dropped from the live file).
+    ///
+    /// Note (logical-SQL redo): recovery still replays every record in the checkpoint, so this
+    /// bounds the live segment's SIZE and the per-recovery file layout, not total replay CPU —
+    /// that needs the resolved-change-record format (assessment D5/R3).
+    pub fn checkpoint_and_truncate_durable_wal(
+        &self,
+        control_path: impl AsRef<std::path::Path>,
+        checkpoint_segment_path: impl AsRef<std::path::Path>,
+    ) -> Result<WalCheckpointMeta, EngineError> {
+        let control_path = control_path.as_ref();
+        let checkpoint_segment_path = checkpoint_segment_path.as_ref();
+        let mut commit = self.commit_state();
+        if !commit.wal.is_durable() {
+            return Err(EngineError::Durability(
+                "checkpoint_and_truncate_durable_wal requires a durable WAL segment".to_string(),
+            ));
+        }
+        write_wal_segment(checkpoint_segment_path, commit.wal.flushed_records())?;
+        let control_segment_path = checkpoint_segment_path
+            .strip_prefix(
+                control_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .unwrap_or(checkpoint_segment_path)
+            .to_path_buf();
+        let meta = commit.wal.checkpoint_meta();
+        write_wal_control_file(
+            control_path,
+            &WalControlFile {
+                segment_path: control_segment_path,
+                checkpoint: meta,
+            },
+        )?;
+        let boundary = commit.wal.flushed_count();
+        commit.wal.truncate_durable_segment_prefix(boundary)?;
+        Ok(meta)
+    }
+
+    /// Byte length of the live durable segment (0 for an in-memory WAL) — the size-bound input
+    /// for the checkpoint/rotation policy.
+    pub fn wal_durable_segment_bytes(&self) -> u64 {
+        self.commit_state().wal.durable_segment_bytes()
+    }
+
+    /// Rotation-at-a-size-bound policy: checkpoint + truncate the live segment iff it has grown
+    /// beyond `max_live_segment_bytes`. Returns whether a rotation ran. Cheap when under the
+    /// bound (one lock + one field read), so callers can invoke it after commits or on a timer.
+    pub fn checkpoint_and_truncate_durable_wal_if_larger_than(
+        &self,
+        control_path: impl AsRef<std::path::Path>,
+        checkpoint_segment_path: impl AsRef<std::path::Path>,
+        max_live_segment_bytes: u64,
+    ) -> Result<bool, EngineError> {
+        if self.wal_durable_segment_bytes() <= max_live_segment_bytes {
+            return Ok(false);
+        }
+        self.checkpoint_and_truncate_durable_wal(control_path, checkpoint_segment_path)?;
+        Ok(true)
+    }
+
     pub fn persist_durable_wal_archive(
         &self,
         manifest_path: impl AsRef<std::path::Path>,

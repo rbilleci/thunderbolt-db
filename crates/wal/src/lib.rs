@@ -139,18 +139,189 @@ pub struct WalArchiveObjectBackup {
     pub objects: Vec<WalArchiveObject>,
 }
 
-/// The durable backing for a [`WalBuffer`].
+/// The durable backing for a [`WalBuffer`]: an **append-only** segment writer.
 ///
-/// When present, every `flush_all` rewrites the buffer's full record prefix to a single segment
-/// file via [`write_wal_segment`] (atomic temp-write + `sync_all` + rename) and then fsyncs the
-/// segment's **parent directory** so the rename — i.e. the segment file's *existence* — is itself
-/// crash-durable, not just the file's bytes. The parent directory is fsynced once, the first time
-/// the segment is installed (the directory entry never changes afterward — the segment keeps the
-/// same path and is replaced in place by atomic rename), so steady-state commits pay a single
-/// file fsync.
-#[derive(Debug, Clone)]
+/// The segment file is opened (or created) once; every `flush_all` serializes ONLY the
+/// currently-unflushed record tail, appends it with a single `write_all`, and `fdatasync`s it —
+/// O(new records) per commit, not O(all records ever written). The parent directory is fsynced
+/// once, when the file is first created (the directory entry never changes afterward), so
+/// steady-state commits pay exactly one file fsync.
+///
+/// Because appends are not atomic, a crash mid-append can leave a torn record tail. Recovery
+/// ([`recover_wal_segment`]) distinguishes a torn tail from bit rot of acknowledged data via the
+/// **durable tail-offset sidecar** (`<segment>.tail`): an invalid region at or beyond the recorded
+/// offset was never acknowledged and is safely truncated; corruption below it fails loudly. The
+/// sidecar is advisory (a lower bound) and is written only at cheap points — segment creation,
+/// recovery install, prefix truncation, and clean shutdown — never on the per-commit path.
+#[derive(Debug)]
 struct WalDurableSegment {
     segment_path: PathBuf,
+    /// Open append handle; `None` until the first durable flush (or recovery install).
+    file: Option<File>,
+    /// Valid, fsynced byte length of the live segment (magic + serialized flushed records).
+    durable_bytes: u64,
+    /// Records `[0, segment_base_records)` of the owning buffer are durable in an external
+    /// checkpoint segment, not in this file (set by [`WalBuffer::truncate_durable_segment_prefix`]).
+    segment_base_records: usize,
+    /// Last tail offset written to the sidecar, to skip redundant rewrites.
+    tail_offset_recorded: u64,
+    /// A failed append or fsync left the on-disk tail state unknown — fail closed on later
+    /// flushes rather than append past a possibly-torn region (restart recovery repairs it).
+    poisoned: Option<String>,
+}
+
+impl WalDurableSegment {
+    fn fresh(segment_path: PathBuf) -> Self {
+        Self {
+            segment_path,
+            file: None,
+            durable_bytes: 0,
+            segment_base_records: 0,
+            tail_offset_recorded: 0,
+            poisoned: None,
+        }
+    }
+
+    /// Best-effort sidecar update; errors are reported but tolerable (the sidecar is a lower
+    /// bound — a stale value only widens the tolerated torn-tail window, never loses data).
+    fn record_tail_offset(&mut self) -> Result<(), EngineError> {
+        if self.tail_offset_recorded == self.durable_bytes {
+            return Ok(());
+        }
+        write_wal_tail_offset(&self.segment_path, self.durable_bytes)?;
+        self.tail_offset_recorded = self.durable_bytes;
+        Ok(())
+    }
+
+    /// Append `records` durably: one buffered serialization, one `write_all`, one fsync.
+    fn append_records(&mut self, records: &[WalRecord]) -> Result<(), EngineError> {
+        if let Some(reason) = &self.poisoned {
+            return Err(EngineError::Durability(format!(
+                "WAL segment {} is poisoned by an earlier append failure ({reason}); restart to \
+                 recover from the durable prefix",
+                self.segment_path.display()
+            )));
+        }
+        let mut tail = Vec::new();
+        for record in records {
+            encode_record_into(&mut tail, record)?;
+        }
+        if self.file.is_none() {
+            // First durable flush of a fresh buffer: create (or clobber — the fresh-database
+            // constructor semantic) the segment with magic + tail in one write, fsync the file,
+            // then fsync the parent directory so the file's existence is itself crash-durable.
+            // Any stale tail-offset sidecar from a previous database at this path is removed
+            // FIRST so a crash mid-clobber cannot pair the new (short) file with the old (large)
+            // recorded tail and read as loud corruption of a database that no longer exists.
+            let _ = fs::remove_file(wal_tail_offset_path(&self.segment_path));
+            let mut bytes = Vec::with_capacity(WAL_SEGMENT_MAGIC.len() + tail.len());
+            bytes.extend_from_slice(WAL_SEGMENT_MAGIC);
+            bytes.extend_from_slice(&tail);
+            if let Some(parent) = self
+                .segment_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to create WAL segment directory {}: {err}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            {
+                let mut file = File::create(&self.segment_path).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to create WAL segment {}: {err}",
+                        self.segment_path.display()
+                    ))
+                })?;
+                file.write_all(&bytes)
+                    .and_then(|_| file.sync_all())
+                    .map_err(|err| {
+                        EngineError::Durability(format!(
+                            "failed to write WAL segment {}: {err}",
+                            self.segment_path.display()
+                        ))
+                    })?;
+            }
+            sync_segment_parent_dir(&self.segment_path)?;
+            // Keep an O_APPEND handle: every later write lands at the true EOF even after a
+            // defensive `set_len` rewind (a plain cursor would point past EOF and punch a hole).
+            let file = fs::OpenOptions::new()
+                .append(true)
+                .open(&self.segment_path)
+                .map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to reopen WAL segment for append {}: {err}",
+                        self.segment_path.display()
+                    ))
+                })?;
+            self.file = Some(file);
+            self.durable_bytes = bytes.len() as u64;
+            self.record_tail_offset()?;
+            return Ok(());
+        }
+
+        let file = self.file.as_mut().expect("append handle present");
+        if let Err(err) = file.write_all(&tail) {
+            // The tail may be partially on disk beyond `durable_bytes`. Try to rewind; if the
+            // rewind itself fails, poison the backing so no later flush appends past garbage.
+            if let Err(rewind_err) = file.set_len(self.durable_bytes) {
+                self.poisoned = Some(format!(
+                    "append write failed ({err}); rewind failed ({rewind_err})"
+                ));
+            }
+            return Err(EngineError::Durability(format!(
+                "failed to append WAL segment {}: {err}",
+                self.segment_path.display()
+            )));
+        }
+        if let Err(err) = file.sync_data() {
+            // After a failed fsync the page-cache state is unknowable (fsyncgate): the kernel may
+            // have marked dirty pages clean without persisting them, so neither a retry nor a
+            // rewind can be trusted. Fail closed; restart recovery truncates the torn tail.
+            self.poisoned = Some(format!("fsync failed ({err})"));
+            return Err(EngineError::Durability(format!(
+                "failed to fsync WAL segment {}: {err}",
+                self.segment_path.display()
+            )));
+        }
+        self.durable_bytes += tail.len() as u64;
+        Ok(())
+    }
+}
+
+impl Drop for WalDurableSegment {
+    fn drop(&mut self) {
+        // Clean-shutdown tail-offset record: after this, ANY invalid byte in the segment is
+        // detected loudly at recovery (nothing beyond the recorded offset remains tolerable).
+        let _ = self.record_tail_offset();
+    }
+}
+
+/// The result of tolerantly reading a live (append-only) WAL segment at recovery time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalSegmentRecovery {
+    /// Every record whose bytes were fully written and CRC-valid, in log order.
+    pub records: Vec<WalRecord>,
+    /// Byte length of the valid prefix (magic + `records`); the file is truncated to this on
+    /// recovery install.
+    pub valid_bytes: u64,
+    /// Bytes discarded beyond the valid prefix (a torn tail from a crash mid-append). Zero on a
+    /// clean segment.
+    pub discarded_torn_bytes: u64,
+}
+
+impl WalSegmentRecovery {
+    /// A missing / empty / never-created segment: a fresh durable database.
+    pub fn empty() -> Self {
+        Self {
+            records: Vec::new(),
+            valid_bytes: 0,
+            discarded_torn_bytes: 0,
+        }
+    }
 }
 
 /// Group-commit accounting for a [`WalBuffer`].
@@ -198,18 +369,68 @@ impl WalBuffer {
         Self::default()
     }
 
-    /// A WAL buffer backed by a real, fsync-durable segment file at `segment_path`.
+    /// A WAL buffer backed by a real, fsync-durable segment file at `segment_path` — a FRESH
+    /// durable database (an existing file at that path is clobbered on the first flush).
     ///
-    /// `flush_all` persists the buffer's record prefix to that file and fsyncs both the file and
-    /// its parent directory before advancing the durable watermark. Recovery
-    /// reads the segment back with [`read_wal_segment`].
+    /// `flush_all` appends the unflushed record tail to that file and fsyncs it before advancing
+    /// the durable watermark. Recovery reads the segment back with [`recover_wal_segment`].
     pub fn with_durable_segment(segment_path: impl Into<PathBuf>) -> Self {
         Self {
-            durable: Some(WalDurableSegment {
-                segment_path: segment_path.into(),
-            }),
+            durable: Some(WalDurableSegment::fresh(segment_path.into())),
             ..Self::default()
         }
+    }
+
+    /// A WAL buffer installed over a segment just read back by [`recover_wal_segment`], seeded
+    /// with the full recovered record history and positioned to keep APPENDING to the same file.
+    ///
+    /// `records` is the buffer's complete logical history; its first `records.len() -
+    /// recovery.records.len()` entries are the checkpoint-covered prefix that lives in an external
+    /// checkpoint segment (empty for a plain single-segment recovery), and its tail must be
+    /// exactly `recovery.records`. The segment file is truncated to `recovery.valid_bytes`
+    /// (discarding any torn tail durably) and the tail-offset sidecar is re-recorded.
+    pub fn with_recovered_durable_segment(
+        segment_path: impl Into<PathBuf>,
+        records: Vec<WalRecord>,
+        recovery: &WalSegmentRecovery,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.into();
+        debug_assert!(records.len() >= recovery.records.len());
+        debug_assert!(records.ends_with(&recovery.records));
+        let segment_base_records = records.len() - recovery.records.len();
+        let mut durable = WalDurableSegment::fresh(segment_path);
+        if recovery.valid_bytes > 0 {
+            let file = fs::OpenOptions::new()
+                .append(true)
+                .open(&durable.segment_path)
+                .map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to open WAL segment for append {}: {err}",
+                        durable.segment_path.display()
+                    ))
+                })?;
+            // Durably drop the torn tail (if any) so appends resume at the valid boundary.
+            file.set_len(recovery.valid_bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to truncate torn WAL segment tail {}: {err}",
+                        durable.segment_path.display()
+                    ))
+                })?;
+            durable.file = Some(file);
+            durable.durable_bytes = recovery.valid_bytes;
+            durable.record_tail_offset()?;
+        }
+        durable.segment_base_records = segment_base_records;
+        let flushed = records.len();
+        Ok(Self {
+            records,
+            flushed,
+            fail_next_flush: false,
+            durable: Some(durable),
+            group_commit: WalGroupCommitStats::default(),
+        })
     }
 
     /// The durable segment path, if this buffer is backed by one.
@@ -227,14 +448,18 @@ impl WalBuffer {
     }
 
     /// Seed the buffer with records already known to be durable (e.g. recovered from a segment),
-    /// marking them as the flushed prefix WITHOUT performing any I/O. Used right after a durable
-    /// segment is installed on a recovered engine so the next real `flush_all` rewrites a segment
-    /// that still contains the recovered history rather than only the newly-appended tail. Must be
-    /// called on an otherwise-empty buffer.
+    /// marking them as the flushed prefix WITHOUT performing any I/O. Only meaningful on an
+    /// in-memory buffer (a durable recovery installs via
+    /// [`WalBuffer::with_recovered_durable_segment`], which also positions the append handle).
+    /// Must be called on an otherwise-empty buffer.
     pub fn reinstate_durable_records(&mut self, records: Vec<WalRecord>) {
         debug_assert!(
             self.records.is_empty(),
             "reinstate_durable_records on a non-empty WAL buffer"
+        );
+        debug_assert!(
+            self.durable.is_none(),
+            "durable buffers are recovered via with_recovered_durable_segment"
         );
         self.flushed = records.len();
         self.records = records;
@@ -249,6 +474,33 @@ impl WalBuffer {
     }
 
     pub fn truncate(&mut self, len: usize) {
+        if len >= self.records.len() {
+            return;
+        }
+        // Commit-path rollback only ever truncates the just-appended UNFLUSHED tail (the callers
+        // capture `wal.len()` before appending), so the durable file is normally untouched. If a
+        // future caller cuts below the flushed watermark, physically rewind the segment too so
+        // the file never replays records the buffer disowned.
+        if len < self.flushed {
+            if let Some(durable) = self.durable.as_mut() {
+                let disowned_bytes: u64 = self.records
+                    [len.max(durable.segment_base_records)..self.flushed]
+                    .iter()
+                    .map(encoded_record_len)
+                    .sum();
+                if disowned_bytes > 0 {
+                    if let Some(file) = durable.file.as_mut() {
+                        let target = durable.durable_bytes.saturating_sub(disowned_bytes);
+                        if let Err(err) = file.set_len(target).and_then(|_| file.sync_all()) {
+                            durable.poisoned =
+                                Some(format!("durable-prefix truncate rewind failed ({err})"));
+                        } else {
+                            durable.durable_bytes = target;
+                        }
+                    }
+                }
+            }
+        }
         self.records.truncate(len);
         if self.flushed > self.records.len() {
             self.flushed = self.records.len();
@@ -259,14 +511,17 @@ impl WalBuffer {
     ///
     /// In-memory mode: advances the durable watermark to the full record count.
     ///
-    /// Durable mode: this is the **commit fsync** and the group-commit point. It writes the
-    /// buffer's entire record prefix to the segment as one atomic, fsynced unit (and fsyncs the
-    /// parent directory the first time the segment is installed), batching all currently-unflushed
-    /// records into a single fsync. Only after the fsync succeeds is the in-memory durable
-    /// watermark advanced — so a caller that gates visibility on `flushed_count` can never publish
-    /// a record whose WAL bytes are not yet on disk (the WAL-before-visibility invariant). On any
-    /// I/O error the watermark is left untouched and the error is returned, so the caller can roll
-    /// back the in-flight commit before it becomes visible.
+    /// Durable mode: this is the **commit fsync** and the group-commit point. It serializes ONLY
+    /// the currently-unflushed record tail, appends it to the open segment with a single
+    /// `write_all`, and `fdatasync`s it — O(group) per flush, so total WAL work over N commits is
+    /// O(N), not the O(N²) of a rewrite-per-commit scheme. The parent directory is fsynced once,
+    /// when the segment file is first created. Only after the fsync succeeds is the in-memory
+    /// durable watermark advanced — so a caller that gates visibility on `flushed_count` can never
+    /// publish a record whose WAL bytes are not yet on disk (the WAL-before-visibility
+    /// invariant). On any I/O error the watermark is left untouched and the error is returned, so
+    /// the caller can roll back the in-flight commit before it becomes visible; a failure that
+    /// leaves the on-disk tail state unknowable poisons the backing (fail-closed until restart
+    /// recovery truncates the torn tail at [`recover_wal_segment`] time).
     pub fn flush_all(&mut self) -> Result<(), EngineError> {
         if self.fail_next_flush {
             self.fail_next_flush = false;
@@ -276,17 +531,9 @@ impl WalBuffer {
         }
         let target = self.records.len();
         let group_size = target.saturating_sub(self.flushed);
-        if let Some(durable) = self.durable.as_ref() {
+        if let Some(durable) = self.durable.as_mut() {
             if group_size > 0 {
-                let segment_path = durable.segment_path.clone();
-                // Persist the FULL durable prefix (the segment is rewritten in place by atomic
-                // rename), fsyncing the segment file's bytes (`write_wal_segment` -> `sync_all`).
-                write_wal_segment(&segment_path, &self.records[..target])?;
-                // Then fsync the parent directory so the rename (the dentry->inode mapping) is durable
-                // before the watermark advances. Done after EVERY rename, not just the first install:
-                // each commit's rename-over-existing mutates the dentry, and the WAL-before-visibility
-                // invariant must not depend on the filesystem journal-ordering that metadata vs the data.
-                sync_segment_parent_dir(&segment_path)?;
+                durable.append_records(&self.records[self.flushed..target])?;
                 self.group_commit.flush_groups += 1;
                 self.group_commit.durable_records += group_size as u64;
                 self.group_commit.max_group_size = self.group_commit.max_group_size.max(group_size);
@@ -294,6 +541,68 @@ impl WalBuffer {
         }
         // Watermark advances only after the fsync has succeeded (or in in-memory mode).
         self.flushed = target;
+        Ok(())
+    }
+
+    /// Valid, fsynced byte length of the live durable segment (0 for an in-memory buffer or
+    /// before the first durable flush). The size-bound input for checkpoint/rotation policy.
+    pub fn durable_segment_bytes(&self) -> u64 {
+        self.durable.as_ref().map_or(0, |d| d.durable_bytes)
+    }
+
+    /// How many of the buffer's records are durable in an external checkpoint segment rather than
+    /// the live segment file (see [`WalBuffer::truncate_durable_segment_prefix`]).
+    pub fn durable_segment_base_records(&self) -> usize {
+        self.durable.as_ref().map_or(0, |d| d.segment_base_records)
+    }
+
+    /// Discard the live segment's prefix up to `base` (a record index into this buffer) — the
+    /// checkpoint-truncation half of D2. The caller must FIRST have made records `[0, base)`
+    /// durable elsewhere (a checkpoint segment + control file); this rewrites the live segment to
+    /// contain only `[base, flushed)` via an atomic temp-write + rename + parent-dir fsync, then
+    /// reopens the append handle on the rewritten file. The buffer's in-memory records and all
+    /// logical counters are unchanged — only the FILE is trimmed, so a long-lived database's live
+    /// segment stays bounded by the checkpoint cadence instead of growing forever.
+    pub fn truncate_durable_segment_prefix(&mut self, base: usize) -> Result<(), EngineError> {
+        let flushed = self.flushed;
+        let durable = self.durable.as_mut().ok_or_else(|| {
+            EngineError::Durability(
+                "cannot truncate the segment prefix of an in-memory WAL buffer".to_string(),
+            )
+        })?;
+        if base > flushed {
+            return Err(EngineError::Durability(format!(
+                "WAL segment prefix truncation boundary {base} exceeds the durable watermark \
+                 {flushed}"
+            )));
+        }
+        if base < durable.segment_base_records {
+            return Err(EngineError::Durability(format!(
+                "WAL segment prefix truncation boundary {base} precedes the existing checkpoint \
+                 base {}",
+                durable.segment_base_records
+            )));
+        }
+        // Close the old handle first: the rename below unlinks the inode it points at.
+        durable.file = None;
+        let retained = &self.records[base..flushed];
+        write_wal_segment(&durable.segment_path, retained)?;
+        sync_segment_parent_dir(&durable.segment_path)?;
+        let file = fs::OpenOptions::new()
+            .append(true)
+            .open(&durable.segment_path)
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to reopen WAL segment after prefix truncation {}: {err}",
+                    durable.segment_path.display()
+                ))
+            })?;
+        durable.file = Some(file);
+        durable.durable_bytes =
+            WAL_SEGMENT_MAGIC.len() as u64 + retained.iter().map(encoded_record_len).sum::<u64>();
+        durable.segment_base_records = base;
+        durable.poisoned = None;
+        durable.record_tail_offset()?;
         Ok(())
     }
 
@@ -476,6 +785,183 @@ pub fn read_wal_segment(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, Engine
         }
     }
     Ok(records)
+}
+
+const WAL_TAIL_MAGIC: &str = "GPUDBWALTAIL1";
+
+/// Path of the durable tail-offset sidecar for a live segment (`<segment>.tail`).
+pub fn wal_tail_offset_path(segment_path: &Path) -> PathBuf {
+    let file_name = segment_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wal.segment");
+    segment_path.with_file_name(format!("{file_name}.tail"))
+}
+
+/// Atomically record the segment's known-durable byte length. Advisory (a LOWER bound for
+/// recovery's torn-tail tolerance window), so it is not fsynced — losing it merely widens the
+/// window; it never loses data.
+fn write_wal_tail_offset(segment_path: &Path, durable_bytes: u64) -> Result<(), EngineError> {
+    let path = wal_tail_offset_path(segment_path);
+    let tmp_path = temporary_control_path(&path);
+    let body = format!("{WAL_TAIL_MAGIC}\n{durable_bytes}\n");
+    fs::write(&tmp_path, body).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to write WAL tail-offset file {}: {err}",
+            tmp_path.display()
+        ))
+    })?;
+    fs::rename(&tmp_path, &path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        EngineError::Durability(format!(
+            "failed to install WAL tail-offset file {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+/// The recorded durable tail offset, or 0 when the sidecar is missing or unreadable (pure
+/// torn-tail-tolerant recovery — the safe direction for an advisory lower bound).
+fn read_wal_tail_offset(segment_path: &Path) -> u64 {
+    let path = wal_tail_offset_path(segment_path);
+    let Ok(body) = fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut lines = body.lines();
+    if lines.next() != Some(WAL_TAIL_MAGIC) {
+        return 0;
+    }
+    lines.next().and_then(|raw| raw.parse().ok()).unwrap_or(0)
+}
+
+/// Tolerantly read a LIVE (append-only) segment at recovery time.
+///
+/// Unlike the strict [`read_wal_segment`] (for checkpoint/archive segments, which are written
+/// atomically and must be intact end-to-end), a live segment can legitimately end in a torn
+/// record: a crash between an append's `write_all` and its fsync acknowledgment. Such a record
+/// was never acknowledged as committed, so it is safe — and required — to truncate it away.
+///
+/// The durable tail-offset sidecar bounds how far that tolerance reaches: an invalid region
+/// starting AT or BEYOND the recorded offset is a torn tail (recovered records so far are
+/// returned, with `valid_bytes` marking the truncation boundary); an invalid record starting
+/// BELOW it means acknowledged-durable data is damaged (bit rot, external truncation), which
+/// fails loudly with the same error the strict reader would raise.
+pub fn recover_wal_segment(path: impl AsRef<Path>) -> Result<WalSegmentRecovery, EngineError> {
+    let path = path.as_ref();
+    let recorded_tail = read_wal_tail_offset(path);
+    // Every non-loud return must reach at least the recorded durable tail: a segment that ends
+    // CLEANLY short of it (external truncation, a lost/foreign file next to a live sidecar) has
+    // lost acknowledged-durable records and must fail loudly, exactly like below-tail corruption.
+    let ends_short = |valid_bytes: u64| {
+        EngineError::Durability(format!(
+            "WAL segment {} ends at byte {valid_bytes}, before the recorded durable tail offset \
+             {recorded_tail}",
+            path.display()
+        ))
+    };
+    if !path.exists() {
+        if recorded_tail > 0 {
+            return Err(ends_short(0));
+        }
+        return Ok(WalSegmentRecovery::empty());
+    }
+    let bytes = fs::read(path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL segment {}: {err}",
+            path.display()
+        ))
+    })?;
+    if bytes.len() < WAL_SEGMENT_MAGIC.len() {
+        // A crash during segment creation (mid-magic write) leaves a short prefix of the magic;
+        // treat it as a fresh database. Anything else short is a foreign file — refuse to clobber.
+        if WAL_SEGMENT_MAGIC.starts_with(bytes.as_slice()) {
+            if recorded_tail > 0 {
+                return Err(ends_short(0));
+            }
+            return Ok(WalSegmentRecovery {
+                records: Vec::new(),
+                valid_bytes: 0,
+                discarded_torn_bytes: bytes.len() as u64,
+            });
+        }
+        return Err(EngineError::Durability(format!(
+            "invalid WAL segment header {}",
+            path.display()
+        )));
+    }
+    if &bytes[..WAL_SEGMENT_MAGIC.len()] != WAL_SEGMENT_MAGIC {
+        return Err(EngineError::Durability(format!(
+            "invalid WAL segment header {}",
+            path.display()
+        )));
+    }
+    let mut records = Vec::new();
+    let mut offset = WAL_SEGMENT_MAGIC.len();
+    while offset < bytes.len() {
+        let record_start = offset;
+        let torn = |records: Vec<WalRecord>| {
+            Ok(WalSegmentRecovery {
+                records,
+                valid_bytes: record_start as u64,
+                discarded_torn_bytes: (bytes.len() - record_start) as u64,
+            })
+        };
+        let below_recorded_tail = (record_start as u64) < recorded_tail;
+        if bytes.len() - record_start < WAL_RECORD_HEADER_LEN {
+            if below_recorded_tail {
+                return Err(EngineError::Durability(format!(
+                    "failed to read WAL segment record header {}: acknowledged-durable record is \
+                     truncated at byte {record_start}",
+                    path.display()
+                )));
+            }
+            return torn(records);
+        }
+        let header = &bytes[record_start..record_start + WAL_RECORD_HEADER_LEN];
+        let txn_id = u64::from_le_bytes(header[0..8].try_into().expect("txn id bytes"));
+        let payload_len = u64::from_le_bytes(header[8..16].try_into().expect("payload len bytes"));
+        let expected_checksum =
+            u64::from_le_bytes(header[16..24].try_into().expect("checksum bytes"));
+        let payload_start = record_start + WAL_RECORD_HEADER_LEN;
+        let payload_end = usize::try_from(payload_len)
+            .ok()
+            .and_then(|len| payload_start.checked_add(len));
+        let Some(payload_end) = payload_end.filter(|end| *end <= bytes.len()) else {
+            if below_recorded_tail {
+                return Err(EngineError::Durability(format!(
+                    "failed to read WAL segment payload {}: acknowledged-durable record is \
+                     truncated at byte {record_start}",
+                    path.display()
+                )));
+            }
+            return torn(records);
+        };
+        let payload = &bytes[payload_start..payload_end];
+        let actual_checksum = wal_record_checksum(txn_id, payload_len, payload);
+        if actual_checksum != expected_checksum {
+            if below_recorded_tail {
+                return Err(EngineError::Durability(format!(
+                    "WAL segment {} record checksum mismatch for txn {}",
+                    path.display(),
+                    txn_id
+                )));
+            }
+            return torn(records);
+        }
+        records.push(WalRecord {
+            txn_id,
+            payload: payload.to_vec(),
+        });
+        offset = payload_end;
+    }
+    if (offset as u64) < recorded_tail {
+        return Err(ends_short(offset as u64));
+    }
+    Ok(WalSegmentRecovery {
+        records,
+        valid_bytes: offset as u64,
+        discarded_torn_bytes: 0,
+    })
 }
 
 pub fn write_wal_control_file(
@@ -3163,15 +3649,28 @@ fn parse_optional_u64(raw: &str, field: &str, path: &Path) -> Result<Option<u64>
 }
 
 fn write_record(file: &mut File, record: &WalRecord) -> Result<(), EngineError> {
+    let mut bytes = Vec::with_capacity(WAL_RECORD_HEADER_LEN + record.payload.len());
+    encode_record_into(&mut bytes, record)?;
+    file.write_all(&bytes)
+        .map_err(|err| EngineError::Durability(format!("failed to write WAL record: {err}")))
+}
+
+/// Serialize one record (header + payload) onto `buf` in the on-disk segment format.
+fn encode_record_into(buf: &mut Vec<u8>, record: &WalRecord) -> Result<(), EngineError> {
     let payload_len = u64::try_from(record.payload.len()).map_err(|_| {
         EngineError::Durability("WAL record payload length exceeds u64".to_string())
     })?;
     let checksum = wal_record_checksum(record.txn_id, payload_len, &record.payload);
-    file.write_all(&record.txn_id.to_le_bytes())
-        .and_then(|_| file.write_all(&payload_len.to_le_bytes()))
-        .and_then(|_| file.write_all(&checksum.to_le_bytes()))
-        .and_then(|_| file.write_all(&record.payload))
-        .map_err(|err| EngineError::Durability(format!("failed to write WAL record: {err}")))
+    buf.extend_from_slice(&record.txn_id.to_le_bytes());
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    buf.extend_from_slice(&record.payload);
+    Ok(())
+}
+
+/// On-disk byte length of one serialized record.
+fn encoded_record_len(record: &WalRecord) -> u64 {
+    WAL_RECORD_HEADER_LEN as u64 + record.payload.len() as u64
 }
 
 fn temporary_segment_path(path: &Path) -> PathBuf {
@@ -3474,7 +3973,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_flush_rewrites_full_prefix_so_history_is_preserved() {
+    fn durable_flush_preserves_history_across_flushes() {
         let path = test_wal_path("durable-history");
         let mut wal = WalBuffer::with_durable_segment(&path);
 
@@ -3489,12 +3988,217 @@ mod tests {
         });
         wal.flush_all().unwrap();
 
-        // The second flush must rewrite the segment with BOTH records, not just the new tail.
+        // The segment must contain BOTH records after the second flush (appended, not clobbered).
         let recovered = read_wal_segment(&path).unwrap();
-        let _ = fs::remove_file(&path);
+        remove_segment_files(&path);
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].txn_id, 1);
         assert_eq!(recovered[1].txn_id, 2);
+    }
+
+    fn remove_segment_files(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(wal_tail_offset_path(path));
+    }
+
+    #[test]
+    fn durable_flush_appends_only_the_unflushed_tail() {
+        // D1: the k-th commit costs O(its own bytes), not O(all bytes ever written). The already-
+        // durable prefix must be byte-identical after later flushes, and each flush must grow the
+        // file by exactly the new records' serialized size.
+        let path = test_wal_path("durable-append-only");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+
+        let first = WalRecord {
+            txn_id: 1,
+            payload: b"a large first record payload".to_vec(),
+        };
+        wal.append(first.clone());
+        wal.flush_all().unwrap();
+        let after_first = fs::read(&path).unwrap();
+        assert_eq!(
+            after_first.len() as u64,
+            WAL_SEGMENT_MAGIC.len() as u64 + encoded_record_len(&first)
+        );
+
+        let second = WalRecord {
+            txn_id: 2,
+            payload: b"b".to_vec(),
+        };
+        wal.append(second.clone());
+        wal.flush_all().unwrap();
+        let after_second = fs::read(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(
+            after_second.len() as u64,
+            after_first.len() as u64 + encoded_record_len(&second)
+        );
+        assert_eq!(&after_second[..after_first.len()], &after_first[..]);
+        assert_eq!(wal.durable_segment_bytes(), after_second.len() as u64);
+    }
+
+    #[test]
+    fn recover_truncates_torn_tail_beyond_recorded_offset_and_appends_continue() {
+        // A crash mid-append leaves a torn record BEYOND the recorded durable tail: recovery
+        // truncates it (that commit was never acknowledged) and the segment keeps accepting
+        // appends at the valid boundary.
+        let path = test_wal_path("recover-torn-tail");
+        {
+            let mut wal = WalBuffer::with_durable_segment(&path);
+            for txn_id in 1..=2 {
+                wal.append(WalRecord {
+                    txn_id,
+                    payload: format!("record {txn_id}").into_bytes(),
+                });
+                wal.flush_all().unwrap();
+            }
+            // Drop records the durable tail offset (clean shutdown).
+        }
+        let valid_bytes = fs::read(&path).unwrap().len() as u64;
+        // Simulate the torn append: garbage bytes past the acknowledged tail.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0xAB; 17]).unwrap();
+        drop(file);
+
+        let recovery = recover_wal_segment(&path).unwrap();
+        assert_eq!(recovery.records.len(), 2);
+        assert_eq!(recovery.valid_bytes, valid_bytes);
+        assert_eq!(recovery.discarded_torn_bytes, 17);
+
+        let mut wal =
+            WalBuffer::with_recovered_durable_segment(&path, recovery.records.clone(), &recovery)
+                .unwrap();
+        assert_eq!(wal.flushed_count(), 2);
+        wal.append(WalRecord {
+            txn_id: 3,
+            payload: b"post-recovery".to_vec(),
+        });
+        wal.flush_all().unwrap();
+        drop(wal);
+
+        // The torn bytes are gone and the post-recovery append reads back strictly.
+        let records = read_wal_segment(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(
+            records.iter().map(|r| r.txn_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn recover_rejects_corruption_below_recorded_tail_offset() {
+        // Damage to a record BELOW the recorded durable tail is bit rot of acknowledged data —
+        // recovery must fail loudly, never silently truncate it away.
+        let path = test_wal_path("recover-bit-rot");
+        {
+            let mut wal = WalBuffer::with_durable_segment(&path);
+            for txn_id in 1..=2 {
+                wal.append(WalRecord {
+                    txn_id,
+                    payload: format!("record {txn_id}").into_bytes(),
+                });
+                wal.flush_all().unwrap();
+            }
+        }
+        // Corrupt the FIRST record's payload (well below the recorded tail).
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[WAL_SEGMENT_MAGIC.len() + WAL_RECORD_HEADER_LEN] ^= 0x01;
+        fs::write(&path, bytes).unwrap();
+
+        let err = recover_wal_segment(&path).unwrap_err();
+        remove_segment_files(&path);
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "expected loud CRC failure for acknowledged-durable corruption, got {err}"
+        );
+    }
+
+    #[test]
+    fn recover_rejects_segment_ending_short_of_recorded_tail() {
+        // A segment that ends CLEANLY before the recorded durable tail (external truncation, a
+        // lost file) has lost acknowledged records — loud failure, not a silent fresh database.
+        let path = test_wal_path("recover-short");
+        {
+            let mut wal = WalBuffer::with_durable_segment(&path);
+            wal.append(WalRecord {
+                txn_id: 1,
+                payload: b"acknowledged".to_vec(),
+            });
+            wal.flush_all().unwrap();
+        }
+        fs::remove_file(&path).unwrap();
+        let err = recover_wal_segment(&path).unwrap_err();
+        let _ = fs::remove_file(wal_tail_offset_path(&path));
+        assert!(
+            err.to_string().contains("before the recorded durable tail"),
+            "expected loud short-segment failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn recover_without_sidecar_tolerates_any_trailing_invalid_region() {
+        // With no recorded tail offset (sidecar lost), the whole trailing invalid region is
+        // treated as torn — the safe direction for an advisory lower bound.
+        let path = test_wal_path("recover-no-sidecar");
+        {
+            let mut wal = WalBuffer::with_durable_segment(&path);
+            wal.append(WalRecord {
+                txn_id: 1,
+                payload: b"kept".to_vec(),
+            });
+            wal.flush_all().unwrap();
+        }
+        let valid_bytes = fs::read(&path).unwrap().len() as u64;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0xCD; 5]).unwrap();
+        drop(file);
+        fs::remove_file(wal_tail_offset_path(&path)).unwrap();
+
+        let recovery = recover_wal_segment(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(recovery.records.len(), 1);
+        assert_eq!(recovery.valid_bytes, valid_bytes);
+        assert_eq!(recovery.discarded_torn_bytes, 5);
+    }
+
+    #[test]
+    fn truncate_durable_segment_prefix_bounds_live_file_and_keeps_appending() {
+        // D2: after a checkpoint, the live segment drops the checkpointed prefix; logical
+        // counters are unchanged and appends continue against the trimmed file.
+        let path = test_wal_path("truncate-prefix");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        for txn_id in 1..=3 {
+            wal.append(WalRecord {
+                txn_id,
+                payload: format!("record {txn_id}").into_bytes(),
+            });
+            wal.flush_all().unwrap();
+        }
+        let full_bytes = wal.durable_segment_bytes();
+
+        wal.truncate_durable_segment_prefix(3).unwrap();
+        assert_eq!(wal.durable_segment_bytes(), WAL_SEGMENT_MAGIC.len() as u64);
+        assert!(wal.durable_segment_bytes() < full_bytes);
+        assert_eq!(wal.durable_segment_base_records(), 3);
+        // Logical counters are untouched — only the FILE was trimmed.
+        assert_eq!(wal.len(), 3);
+        assert_eq!(wal.flushed_count(), 3);
+        assert_eq!(wal.flushed_records().len(), 3);
+
+        wal.append(WalRecord {
+            txn_id: 4,
+            payload: b"post-checkpoint".to_vec(),
+        });
+        wal.flush_all().unwrap();
+        drop(wal);
+
+        let live = read_wal_segment(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(
+            live.iter().map(|r| r.txn_id).collect::<Vec<_>>(),
+            vec![4],
+            "the live segment holds only post-checkpoint records"
+        );
     }
 
     #[test]
