@@ -197,6 +197,7 @@ impl Engine {
             // RETIREMENT A2: the device resolve is DEFAULT ON (measured: see the A2 bench line);
             // the fallback chain (value-index resolve -> scan) remains complete behind it.
             dml_device_resolve_enabled: std::sync::atomic::AtomicBool::new(true),
+            dml_device_validate_enabled: std::sync::atomic::AtomicBool::new(true),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
         }

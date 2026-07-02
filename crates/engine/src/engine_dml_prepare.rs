@@ -482,6 +482,103 @@ impl Engine {
         Ok(Some(matches))
     }
 
+    /// RETIREMENT A3: the DEVICE-INDEX constraint probe — answers `any_visible_row_with_value`
+    /// through the per-shard device PK-index locate + the A1 row-identity region instead of the
+    /// host value_index. `Some(bool)` = authoritative answer; `None` = decline (the host ladder
+    /// serves). COVERAGE argument (the FALSE answer is load-bearing — a missed row would wrongly
+    /// PASS a unique/FK check): every visible row's CURRENT version occupies a live slot of some
+    /// valid shard holding its current column value (residency is maintained or invalidated in the
+    /// same serialized commit path), the locate probes EVERY shard's full-column hash (the bloom
+    /// prune has no false negatives) and declines the WHOLE probe on any shard it cannot answer
+    /// (dup/oversize/invalid/absent/unstamped) — so zero surviving hits proves no visible row
+    /// carries the value. A physical hit whose visible version no longer matches (an SV5-tombstoned
+    /// old slot) is neutralized by the fetch-at-visibility + structural recheck, exactly like the
+    /// stale host-index entry it mirrors. NULL / non-Int4 values decline (host structural
+    /// semantics, NULL == NULL, serve them).
+    fn device_visible_row_with_value(
+        &self,
+        table: &RelationalTable,
+        table_rows: &crate::resident_storage::TableRowsView,
+        visibility: StorageVisibility,
+        column_idx: usize,
+        value: &SqlValue,
+        exclude_keys: Option<&BTreeSet<String>>,
+    ) -> Option<bool> {
+        if !self.dml_device_validate_enabled() {
+            return None;
+        }
+        let SqlValue::Int4(needle) = value else {
+            return None;
+        };
+        let hits = self.locate_resident_pk_via_shard_index_detailed(table, column_idx, *needle)?;
+        let mut answer = false;
+        for hit in &hits {
+            let region = hit.row_id.as_ref()?;
+            // A device-read failure declines the whole probe (the A2 finding-2 discipline).
+            let halves = region
+                .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
+                .ok()?;
+            let (lo, hi) = (*halves.first()?, *halves.get(1)?);
+            let row_id = (lo as u32 as u64) | ((hi as u32 as u64) << 32);
+            if row_id == u64::MAX {
+                return None; // unstamped slot: identity unknown -> host ladder
+            }
+            let key = relational_row_key(&table.name, row_id);
+            if exclude_keys.is_some_and(|excluded| excluded.contains(&key)) {
+                continue; // a row this statement touches: excluded, like the host probe
+            }
+            let fetched = table_rows
+                .store()
+                .tuple_fetch_by_key(&key, visibility)
+                .ok()?;
+            let Some(tuple) = fetched else {
+                continue; // no visible version at this snapshot
+            };
+            let row = decode_relational_row(&tuple.value, &table.columns).ok()?;
+            if row[column_idx] == *value {
+                answer = true;
+                break;
+            }
+        }
+        self.read_state
+            .residency
+            .dml_device_validate_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(answer)
+    }
+
+    /// RETIREMENT A3: the probe LADDER — device index first, host value_index on decline. Every
+    /// validator probe goes through here; the ladder preserves slice-1b semantics exactly (the
+    /// device arm answers only what it can prove, everything else falls through).
+    fn visible_row_with_value(
+        &self,
+        table: &RelationalTable,
+        table_rows: &crate::resident_storage::TableRowsView,
+        visibility: StorageVisibility,
+        column_idx: usize,
+        value: &SqlValue,
+        exclude_keys: Option<&BTreeSet<String>>,
+    ) -> Result<bool, EngineError> {
+        if let Some(answer) = self.device_visible_row_with_value(
+            table,
+            table_rows,
+            visibility,
+            column_idx,
+            value,
+            exclude_keys,
+        ) {
+            return Ok(answer);
+        }
+        Self::any_visible_row_with_value(
+            table,
+            table_rows,
+            visibility,
+            column_idx,
+            value,
+            exclude_keys,
+        )
+    }
+
     /// PHASE C slice 1b: does ANY VISIBLE row (optionally excluding `exclude_keys` — the rows this
     /// statement touches) carry `column_idx == value`? Resolves through the append-only value index
     /// (candidates) + the visibility fetch + a STRUCTURAL-equality recheck. Structural (`==`), NOT
@@ -561,7 +658,7 @@ impl Engine {
             let mut seen = BTreeSet::new();
             for row in new_images {
                 if !seen.insert(row[column_idx].clone())
-                    || Self::any_visible_row_with_value(
+                    || self.visible_row_with_value(
                         table,
                         table_rows,
                         visibility,
@@ -595,7 +692,7 @@ impl Engine {
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             let parent_rows = self.read_state.mvcc.table_rows(&parent.name);
             for row in new_images {
-                if !Self::any_visible_row_with_value(
+                if !self.visible_row_with_value(
                     parent,
                     &parent_rows,
                     visibility,
@@ -636,7 +733,7 @@ impl Engine {
                         continue;
                     }
                     // A surviving untouched provider keeps the value alive.
-                    if Self::any_visible_row_with_value(
+                    if self.visible_row_with_value(
                         table,
                         table_rows,
                         visibility,
@@ -647,7 +744,7 @@ impl Engine {
                         continue;
                     }
                     // No provider left: any visible child row still referencing it = violation.
-                    if Self::any_visible_row_with_value(
+                    if self.visible_row_with_value(
                         child,
                         &child_rows,
                         visibility,

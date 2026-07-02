@@ -3430,6 +3430,140 @@ mod capacity_payload_tests {
         }
     }
 
+    /// RETIREMENT A3 — the VALIDATOR-LADDER differential: constraint outcomes (success AND the
+    /// exact violation error) with the DEVICE-INDEX probes == the value-index probes, over the same
+    /// statement sequence on twin engines. Covers unique violation + PASS (the FALSE answer is the
+    /// load-bearing one — a device miss would wrongly ADMIT a duplicate), unique-through-SV5-churn
+    /// (the version-split physical hit must be neutralized by fetch-at-visibility), unique
+    /// key-move, outbound-FK present/absent, inbound-FK blocked/allowed DELETE, and NULL-on-unique
+    /// (declines to host structural NULL==NULL semantics). NON-VACUITY: `dml_device_validate_hits`
+    /// must ADVANCE on the device engine and stay ZERO on the flag-OFF twin. Sabotage: make the
+    /// device probe skip `answer = true` and the violation statements wrongly SUCCEED -> outcome
+    /// vectors diverge -> FAIL.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a3_device_validate_matches_value_index_ladder() {
+        let run = |device: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_dml_device_validate_enabled(device);
+            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
+                .unwrap();
+            e.execute_text(2, "CREATE TABLE c (id INT, tid INT)")
+                .unwrap();
+            e.execute_text(
+                3,
+                "ALTER TABLE ONLY c ADD CONSTRAINT c_tid_fk FOREIGN KEY (tid) REFERENCES t(id)",
+            )
+            .unwrap();
+            let mut seq = 4u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", k * 10))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            e.execute_text(seq, "INSERT INTO c (id, tid) VALUES (1, 42)")
+                .unwrap();
+            seq += 1;
+            let statements = [
+                "INSERT INTO t (id, v) VALUES (50, 1)", // unique violation (device answers TRUE)
+                "INSERT INTO t (id, v) VALUES (500, 1)", // fresh id: SUCCESS (the FALSE answer)
+                "UPDATE t SET v = 5555 WHERE id = 60",  // SV5 churn: version-splits id=60
+                "INSERT INTO t (id, v) VALUES (60, 2)", // still a violation THROUGH the churn
+                "UPDATE t SET id = 70 WHERE id = 61", // unique key-move onto a live key: violation
+                "UPDATE t SET id = 600 WHERE id = 61", // key-move to a fresh key: success
+                "INSERT INTO c (id, tid) VALUES (2, 77)", // outbound FK: provider exists
+                "INSERT INTO c (id, tid) VALUES (3, 9999)", // outbound FK: no provider -> violation
+                "DELETE FROM t WHERE id = 42",        // inbound FK: a child still references 42
+                "DELETE FROM t WHERE id = 43",        // no child -> success
+                "INSERT INTO t (id, v) VALUES (NULL, 1)", // NULL on unique: host semantics serve
+                "INSERT INTO t (id, v) VALUES (NULL, 2)", // second NULL: MUST match host outcome
+            ];
+            let hits_before = e.dml_device_validate_hits();
+            let outcomes: Vec<Result<(), String>> = statements
+                .iter()
+                .map(|sql| {
+                    let r = e
+                        .execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string());
+                    seq += 1;
+                    r
+                })
+                .collect();
+            let hits = e.dml_device_validate_hits() - hits_before;
+            let t_rows = e
+                .execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            let c_rows = e
+                .execute_relational_select_text("SELECT id, tid FROM c")
+                .unwrap()
+                .rows
+                .into_boxed();
+            (outcomes, hits, t_rows, c_rows)
+        };
+        let (dev_out, dev_hits, dev_t, dev_c) = run(true);
+        let (idx_out, idx_hits, idx_t, idx_c) = run(false);
+        assert_eq!(
+            dev_out, idx_out,
+            "outcome ladder: device == value-index (incl violation text)"
+        );
+        assert_eq!(dev_t, idx_t, "end-state t: device == value-index");
+        assert_eq!(dev_c, idx_c, "end-state c: device == value-index");
+        // Audit A3 finding 1: a FLOOR, not just >0 — the 12-statement sequence carries ~14
+        // device-servable Int4 probes (unique per new image, FK survivor/child pairs); if a
+        // coverage regression silently declined most of them to the host ladder, outcomes would
+        // stay equal (declines are safe) and >0 would stay green. The floor trips on
+        // mostly-declined.
+        assert!(
+            dev_hits >= 10,
+            "non-vacuity floor: the device index must have ANSWERED most probes (got {dev_hits})"
+        );
+        assert_eq!(
+            idx_hits, 0,
+            "flag OFF must never consult the device validator"
+        );
+        // Spot-pin the shape (guards both-engines-wrong drift).
+        assert!(
+            dev_out[0].as_ref().is_err_and(|err| err.contains("unique")),
+            "statement 0 must be a unique violation: {:?}",
+            dev_out[0]
+        );
+        assert!(
+            dev_out[1].is_ok(),
+            "fresh insert must succeed: {:?}",
+            dev_out[1]
+        );
+        assert!(
+            dev_out[3].as_ref().is_err_and(|err| err.contains("unique")),
+            "the churned-key insert must STILL violate: {:?}",
+            dev_out[3]
+        );
+        assert!(
+            dev_out[7]
+                .as_ref()
+                .is_err_and(|err| err.contains("foreign key")),
+            "orphan child insert must violate the FK: {:?}",
+            dev_out[7]
+        );
+        assert!(
+            dev_out[8]
+                .as_ref()
+                .is_err_and(|err| err.contains("foreign key")),
+            "referenced-provider delete must violate the FK: {:?}",
+            dev_out[8]
+        );
+    }
+
     /// RETIREMENT A2 regression (the SV6-hammer bug): after an SV5 update-append, one LOGICAL row
     /// occupies slots in TWO shards (tombstoned old slot in its sealed shard, new version in the
     /// open shard) — the visibility-blind locate hits BOTH, and both derive the SAME key. The
@@ -4917,6 +5051,27 @@ impl Engine {
 
     pub(crate) fn dml_device_resolve_enabled(&self) -> bool {
         self.dml_device_resolve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// RETIREMENT A3: count of constraint probes ANSWERED by the device index (non-vacuity signal;
+    /// both true and false answers count — the FALSE answer is the load-bearing one).
+    pub fn dml_device_validate_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .dml_device_validate_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// RETIREMENT A3: enable/disable the DEVICE constraint-probe validators (default ON). OFF ->
+    /// the value-index probes (slice 1b), then the scan validators — the differential ladder.
+    pub fn set_dml_device_validate_enabled(&self, on: bool) {
+        self.dml_device_validate_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn dml_device_validate_enabled(&self) -> bool {
+        self.dml_device_validate_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

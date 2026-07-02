@@ -593,6 +593,10 @@ pub(crate) struct ResidencyReadState {
     /// row-identity -> keyed fetch). The non-vacuity signal — output equality cannot prove which
     /// resolver ran. `Relaxed` monotonic counter.
     pub(crate) dml_device_resolve_hits: std::sync::atomic::AtomicU64,
+    /// RETIREMENT A3: count of constraint probes ANSWERED authoritatively by the device index
+    /// (unique/FK validators). Both answers count — FALSE (no visible row carries the value) is the
+    /// load-bearing one. `Relaxed` monotonic counter.
+    pub(crate) dml_device_validate_hits: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
