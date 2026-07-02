@@ -8,6 +8,14 @@
 
 use super::*;
 
+/// Failure from [`Engine::commit_mutation_batch`]. `rolled_back` distinguishes a clean pre-durable
+/// abort (WAL truncated + proposals rolled back — every item may be requeued and retried) from a
+/// post-fsync failure (the batch's records are durable; retrying would append duplicates).
+pub(crate) struct BatchCommitFailure {
+    pub(crate) rolled_back: bool,
+    pub(crate) error: EngineError,
+}
+
 impl Engine {
     pub fn become_follower(&mut self, term: Term) {
         self.commit_state_mut().repl.become_follower(term);
@@ -87,6 +95,124 @@ impl Engine {
             token
         };
 
+        self.apply_and_publish_committed(&mut commit, txn_id, token.index)?;
+        self.metrics.inc_commit();
+        drop(commit);
+
+        Ok(token)
+    }
+
+    /// Commit a BATCH of mutations as ONE WAL flush group (write-path assessment D3 / scalability
+    /// ledger #7): every record is appended + proposed under the commit_mutex, the whole tail is
+    /// made durable by a SINGLE `flush_all` (one fsync), and only then are the entries applied in
+    /// proposal order and `committed_seq` published once at the batch's last commit seq. Compared
+    /// to committing each item through [`Engine::commit_mutation`], a k-item batch pays 1 fsync
+    /// instead of k. WAL-before-visibility is unchanged: nothing is applied or published until
+    /// the group fsync has succeeded.
+    ///
+    /// Failure semantics:
+    /// - `rolled_back: true` — the failure happened BEFORE anything was durable (propose or the
+    ///   group fsync): the WAL tail is truncated and the proposals rolled back; the caller may
+    ///   safely requeue and retry every item (none of them committed).
+    /// - `rolled_back: false` — the failure happened AFTER the group fsync: the batch's records
+    ///   are already durable and MUST NOT be retried (a retry would append duplicate records; a
+    ///   restart replays the durable log as the source of truth).
+    pub(crate) fn commit_mutation_batch(
+        &self,
+        items: &[(TxnId, Vec<u8>)],
+    ) -> Result<(), BatchCommitFailure> {
+        let Some((last_txn_id, _)) = items.last() else {
+            return Ok(());
+        };
+        let last_txn_id = *last_txn_id;
+        if self.repl_role() != Role::Leader {
+            return Err(BatchCommitFailure {
+                rolled_back: true,
+                error: EngineError::NotLeader,
+            });
+        }
+        let wall_clock = current_timestamp_micros();
+
+        let mut commit = self.commit_state();
+        let last_index = {
+            let wal_len_before = commit.wal.len();
+            let mut first_index: Option<Index> = None;
+            let mut last_index = 0;
+            for (txn_id, payload) in items {
+                commit.wal.append(WalRecord {
+                    txn_id: *txn_id,
+                    payload: payload.clone(),
+                });
+                match commit.repl.propose(payload.clone()) {
+                    Ok(token) => {
+                        first_index.get_or_insert(token.index);
+                        last_index = token.index;
+                    }
+                    Err(error) => {
+                        if let Some(first) = first_index {
+                            commit.repl.rollback_unapplied_from(first);
+                        }
+                        commit.wal.truncate(wal_len_before);
+                        return Err(BatchCommitFailure {
+                            rolled_back: true,
+                            error,
+                        });
+                    }
+                }
+            }
+            // THE group-commit point: one fsync covers every record appended above.
+            if let Err(error) = commit.wal.flush_all() {
+                commit
+                    .repl
+                    .rollback_unapplied_from(first_index.expect("non-empty batch proposed"));
+                commit.wal.truncate(wal_len_before);
+                return Err(BatchCommitFailure {
+                    rolled_back: true,
+                    error,
+                });
+            }
+            if let Err(error) = commit
+                .repl
+                .wait_committed(CommitToken { index: last_index }, Duration::from_millis(0))
+            {
+                // The records are already fsync-durable; surface the replication failure without
+                // pretending the batch can be cleanly retried.
+                return Err(BatchCommitFailure {
+                    rolled_back: false,
+                    error,
+                });
+            }
+            // Per-item strictly-monotonic commit timestamps (same formula as
+            // `next_commit_timestamp_micros`, inlined because the commit_mutex is already held).
+            for (txn_id, _) in items {
+                let timestamp_micros =
+                    wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
+                commit.record_commit_timestamp(*txn_id, timestamp_micros);
+            }
+            last_index
+        };
+
+        self.apply_and_publish_committed(&mut commit, last_txn_id, last_index)
+            .map_err(|error| BatchCommitFailure {
+                rolled_back: false,
+                error,
+            })?;
+        for _ in items {
+            self.metrics.inc_commit();
+        }
+        Ok(())
+    }
+
+    /// Shared post-durability tail of the serialized commit paths: drain the committed entries,
+    /// apply them under the catalog latch, maintain/invalidate residency, publish the catalog
+    /// snapshot, then publish `committed_seq` at `publish_index` — callers run this only AFTER
+    /// the corresponding WAL records are fsync-durable (WAL-before-visibility).
+    fn apply_and_publish_committed(
+        &self,
+        commit: &mut CommitState,
+        txn_id: TxnId,
+        publish_index: Index,
+    ) -> Result<(), EngineError> {
         let to_apply: Vec<LogEntry> = commit
             .repl
             .drain_committed_from(commit.repl.applied_index())
@@ -95,7 +221,7 @@ impl Engine {
 
         // Hold the catalog latch across the WHOLE apply loop AND the catalog publish (PART B), so a
         // DDL's working-map mutation + the published-snapshot push are atomic w.r.t. another DDL. Lock
-        // order is fixed: commit_mutex (held in `commit`) FIRST, then this latch.
+        // order is fixed: commit_mutex (held by the caller) FIRST, then this latch.
         let handled = {
             let mut catalog_guard = self.ddl_catalog();
             let cat = &mut *catalog_guard;
@@ -111,7 +237,7 @@ impl Engine {
             // Publish ordering (Stage 2 — blocker #1; PART B catalog↔data co-pinning). The apply loop
             // published this commit's data generation(s) and mutated the working catalog maps (for any
             // DDL entries). Order the rest so a lock-free reader gets a consistent (catalog, data) pair:
-            //   1. residency tombstones, 2. catalog ring push (stamped at `token.index`), then LAST
+            //   1. residency tombstones, 2. catalog ring push (stamped at `publish_index`), then LAST
             //   3. `committed_seq` release-store.
             // The catalog is pushed BEFORE `committed_seq` (the FLIP from the old order) so a reader
             // that loads `committed_seq = token.index` and selects `catalog_as_of(token.index)` is
@@ -140,25 +266,24 @@ impl Engine {
                     Some(AppliedRowMutation::Delete { table, rows })
                         if self.resident_delete_tombstone_enabled() =>
                     {
-                        self.try_tombstone_resident_delete_commit(cat, table, rows, token.index)
+                        self.try_tombstone_resident_delete_commit(cat, table, rows, publish_index)
                     }
                     Some(AppliedRowMutation::Update {
                         table,
                         old_rows,
                         new_rows,
-                    }) if self.resident_update_tombstone_enabled() => {
-                        self.try_update_resident_commit(cat, table, old_rows, new_rows, token.index)
-                    }
+                    }) if self.resident_update_tombstone_enabled() => self
+                        .try_update_resident_commit(cat, table, old_rows, new_rows, publish_index),
                     _ => false,
                 };
             if !handled {
-                self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
+                self.invalidate_relational_residency_for_commit(&to_apply, txn_id, publish_index);
             }
-            let prune_below = self.catalog_prune_boundary(token.index);
-            self.publish_catalog_snapshot(cat, token.index, prune_below);
+            let prune_below = self.catalog_prune_boundary(publish_index);
+            self.publish_catalog_snapshot(cat, publish_index, prune_below);
             handled
         };
-        self.publish_committed_seq(token.index);
+        self.publish_committed_seq(publish_index);
         // STRATA S-B: best-effort GPU-residency admission for the committed mutation's tables (flag-gated,
         // after the publish so it snapshots the new generation; never fails the already-durable commit).
         // Skipped when we maintained residency in place above — that table is already resident + current.
@@ -167,10 +292,7 @@ impl Engine {
                 self.auto_admit_resident_tables(&tables);
             }
         }
-        self.metrics.inc_commit();
-        drop(commit);
-
-        Ok(token)
+        Ok(())
     }
 
     pub(crate) fn commit_mutation_at_with_current_apply<F>(
@@ -483,27 +605,26 @@ impl Engine {
         for table in &pressured_snapshot_tables {
             self.read_state.residency.device_memory.invalidate(table);
         }
-        let pressured_shard_tables =
-            self.read_state.residency.with_shards_mut(|shards| {
-                let mut tables = Vec::new();
-                for (table, table_shards) in shards.iter_mut() {
-                    let mut table_pressured = false;
-                    for shard in table_shards {
-                        if shard.gpu_id == gpu_id {
-                            shard.invalidated_by_memory_pressure = true;
-                            shard.memory_pressure_active = true;
-                            table_pressured = true;
-                            if let Some(proof) = shard.device_memory_proof.as_mut() {
-                                proof.retained = false;
-                            }
+        let pressured_shard_tables = self.read_state.residency.with_shards_mut(|shards| {
+            let mut tables = Vec::new();
+            for (table, table_shards) in shards.iter_mut() {
+                let mut table_pressured = false;
+                for shard in table_shards {
+                    if shard.gpu_id == gpu_id {
+                        shard.invalidated_by_memory_pressure = true;
+                        shard.memory_pressure_active = true;
+                        table_pressured = true;
+                        if let Some(proof) = shard.device_memory_proof.as_mut() {
+                            proof.retained = false;
                         }
                     }
-                    if table_pressured {
-                        tables.push(table.clone());
-                    }
                 }
-                tables
-            });
+                if table_pressured {
+                    tables.push(table.clone());
+                }
+            }
+            tables
+        });
         for table in &pressured_shard_tables {
             self.read_state
                 .residency
@@ -748,13 +869,13 @@ impl Engine {
                     .map(|(table, rows)| AppliedRowMutation::Delete { table, rows });
             }
             Command::Update(update) => {
-                applied = self
-                    .apply_update(cat, update, commit_seq)?
-                    .map(|(table, old_rows, new_rows)| AppliedRowMutation::Update {
+                applied = self.apply_update(cat, update, commit_seq)?.map(
+                    |(table, old_rows, new_rows)| AppliedRowMutation::Update {
                         table,
                         old_rows,
                         new_rows,
-                    });
+                    },
+                );
             }
             _ => {}
         }
@@ -800,7 +921,10 @@ mod commit_timestamp_tests {
             "expected the commit-timestamp map to be populated (got {})",
             commit.wal_commit_timestamps_micros.len()
         );
-        assert_ne!(scan_max, 0, "non-vacuity: the scanned max must be a real timestamp");
+        assert_ne!(
+            scan_max, 0,
+            "non-vacuity: the scanned max must be a real timestamp"
+        );
         assert_eq!(
             commit.max_commit_timestamp_micros, scan_max,
             "O(1) running max diverged from the O(n) scan it replaced"
@@ -840,6 +964,9 @@ mod commit_timestamp_tests {
             assert!(commit.wal_commit_timestamps_micros.is_empty());
         }
         let ts = engine.next_commit_timestamp_micros();
-        assert!(ts > 1, "fresh-engine timestamp should be the wall clock, got {ts}");
+        assert!(
+            ts > 1,
+            "fresh-engine timestamp should be the wall clock, got {ts}"
+        );
     }
 }
