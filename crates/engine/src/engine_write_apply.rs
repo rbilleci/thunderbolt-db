@@ -290,8 +290,16 @@ impl Engine {
         cat: &mut DdlCatalogState,
         update: Update,
         txn_id: TxnId,
-    ) -> Result<Option<(String, Vec<Vec<SqlValue>>, Vec<Vec<SqlValue>>, WriteSet)>, EngineError>
-    {
+    ) -> Result<
+        Option<(
+            String,
+            Vec<Vec<SqlValue>>,
+            Vec<Vec<SqlValue>>,
+            Option<Vec<u64>>,
+            WriteSet,
+        )>,
+        EngineError,
+    > {
         // Stage 2 split: PURE prepare (resolve matches + encode new images + preflight +
         // write-set) then a `&mut self` version-rewrite install. `txn_id` is the commit-seq used as
         // both the read boundary and the version stamp, identical to the old direct apply.
@@ -307,15 +315,27 @@ impl Engine {
                 installs,
                 updated_old_rows,
                 ..
-            } => Some((
-                table.clone(),
-                updated_old_rows.clone(),
-                installs
+            } => {
+                // RETIREMENT A4b: identities ride the installs' KEYS (exact parallel to old/new
+                // rows by construction — write_set order is NOT guaranteed parallel).
+                let prefix = relational_key_prefix(table);
+                let row_ids: Option<Vec<u64>> = installs
                     .iter()
-                    .map(|(_id, _key, row)| row.clone())
-                    .collect(),
-                delta.write_set.clone(),
-            )),
+                    .map(|(_id, key, _row)| {
+                        crate::engine_residency::parse_relational_row_id(key, &prefix)
+                    })
+                    .collect();
+                Some((
+                    table.clone(),
+                    updated_old_rows.clone(),
+                    installs
+                        .iter()
+                        .map(|(_id, _key, row)| row.clone())
+                        .collect(),
+                    row_ids,
+                    delta.write_set.clone(),
+                ))
+            }
             _ => None,
         };
         self.apply_delta_serialized(cat, delta, txn_id, None)?;

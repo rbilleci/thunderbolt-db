@@ -2000,13 +2000,13 @@ mod capacity_payload_tests {
         assert!(present(&e, 5), "a row in a different shard untouched");
         assert_eq!(count(&e), 199, "COUNT drops by exactly one (== host MVCC)");
 
-        // A MULTI-ROW DELETE (2 rows) is NOT yet incremental -> exact-count gate returns false -> re-admit,
-        // which rebuilds all-live (region CLEARED by prereq #1) and is still correct.
+        // RETIREMENT A4b: a MULTI-ROW DELETE (2 rows) is now INCREMENTAL (per-row exact-1
+        // locate+tombstone) — the region stays LIVE with both slots stamped, no re-admit.
         e.execute_text(203, "DELETE FROM accounts WHERE id = 50 OR id = 51")
             .unwrap();
         assert!(
-            !table_has_any_deleted_by_cell(&e, "accounts"),
-            "multi-row DELETE fell back to re-admit (all-live rebuild -> no region)"
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "multi-row DELETE must stay incremental (region live, A4b)"
         );
         assert!(
             !present(&e, 50) && !present(&e, 51),
@@ -2157,16 +2157,16 @@ mod capacity_payload_tests {
             "COUNT unchanged after the int4-unchanged update"
         );
 
-        // A MULTI-ROW UPDATE (2 rows) is NOT yet incremental -> re-admit (all-live rebuild -> no region),
-        // still correct; the earlier single-row update persists (host store rebuilt).
+        // RETIREMENT A4b: a MULTI-ROW UPDATE (2 rows) is now INCREMENTAL (tombstones + one
+        // batched identity-stamped append) — the region stays LIVE, no re-admit.
         e.execute_text(
             204,
             "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11",
         )
         .unwrap();
         assert!(
-            !table_has_any_deleted_by_cell(&e, "accounts"),
-            "multi-row UPDATE fell back to re-admit (no region)"
+            table_has_any_deleted_by_cell(&e, "accounts"),
+            "multi-row UPDATE must stay incremental (region live, A4b)"
         );
         assert_eq!(balance_of(&e, 10), Some(0));
         assert_eq!(balance_of(&e, 11), Some(0));
@@ -2206,6 +2206,23 @@ mod capacity_payload_tests {
     /// THE PRE-FIX BUG: the key TWICE (old + new — a state that never existed). After publish, a reader at C
     /// sees exactly the NEW image (old hidden: `deleted_by = C0+1 <= C0+1`; new visible: `created_by <= C0+1`).
     /// SABOTAGE-VERIFIED: skip the `created_by` stamp on append (or drop the VM conjunct) and this FAILS.
+    /// Derive the REAL row identity for a unique int4 key via the device locate + A1 region —
+    /// what the production commit arm surfaces from the installs' keys (A4b made identity
+    /// MANDATORY on the incremental update path, so direct `try_update_resident_commit` callers
+    /// must pass the true ids).
+    fn device_row_id_for(e: &Engine, table_name: &str, key: i32) -> u64 {
+        let table = e.relational_catalog_table(table_name).unwrap();
+        let hits = e
+            .locate_resident_pk_via_shard_index_detailed(&table, 0, key)
+            .expect("locate must answer for a unique resident key");
+        let hit = hits.first().expect("at least one slot");
+        let region = hit.row_id.as_ref().expect("identity region present");
+        let halves = region
+            .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
+            .unwrap();
+        (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32)
+    }
+
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice() {
@@ -2253,6 +2270,7 @@ mod capacity_payload_tests {
             // publishing — exactly the state a concurrent reader can observe between the residency
             // maintenance and `publish_committed_seq` inside a real commit.
             {
+                let id_130 = device_row_id_for(&e, "accounts", 130);
                 let guard = e.ddl_catalog();
                 let ok = e.try_update_resident_commit(
                     &guard,
@@ -2260,7 +2278,7 @@ mod capacity_payload_tests {
                     &[vec![SqlValue::Int4(130), SqlValue::Int4(1300)]],
                     &[vec![SqlValue::Int4(130), SqlValue::Int4(9999)]],
                     c0 + 1,
-                    None,
+                    Some(&[id_130]),
                 );
                 assert!(
                     ok,
@@ -2474,17 +2492,22 @@ mod capacity_payload_tests {
             );
         };
 
-        // RE-ADMIT gate: a multi-row UPDATE falls back to invalidate + re-admit (rebuild all-live) -> the
-        // region MUST go with the buffer it annotated, or the rebuilt rows would read a stale stamp.
-        // (The re-admitted 200-row table becomes ONE dense shard with no headroom, so no later single-row
+        // RE-ADMIT gate: an AMBIGUOUS UPDATE falls back to invalidate + re-admit (rebuild all-live)
+        // -> the region MUST go with the buffer it annotated, or the rebuilt rows would read a
+        // stale stamp. A4b made plain multi-row UPDATEs INCREMENTAL, so the fallback trigger here
+        // is int4-IDENTICAL duplicate rows: the per-row locate sees count 2 and declines (the
+        // exact-count wrong-results net), forcing the re-admit this gate pins.
+        // (The re-admitted table becomes ONE dense shard with no headroom, so no later single-row
         // UPDATE can re-stamp it — hence the separate fresh engine for the DROP gate below.)
         let e = Engine::new_local();
         load(&e);
         e.execute_text(
             203,
-            "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11",
+            "INSERT INTO accounts (id, balance) VALUES (900, 5), (900, 5)",
         )
         .unwrap();
+        e.execute_text(204, "UPDATE accounts SET balance = 0 WHERE id = 900")
+            .unwrap();
         assert!(
             !table_has_any_created_by_cell(&e, "accounts"),
             "re-admit must release the stale created_by region (wrong-results + leak guard)"
@@ -2541,6 +2564,7 @@ mod capacity_payload_tests {
         let c0 = e.committed_seq();
         // Move the key: UPDATE accounts SET id = 999 WHERE id = 130, applied at C0+1, UNPUBLISHED.
         {
+            let id_130 = device_row_id_for(&e, "accounts", 130);
             let guard = e.ddl_catalog();
             let ok = e.try_update_resident_commit(
                 &guard,
@@ -2548,7 +2572,7 @@ mod capacity_payload_tests {
                 &[vec![SqlValue::Int4(130), SqlValue::Int4(1300)]],
                 &[vec![SqlValue::Int4(999), SqlValue::Int4(1300)]],
                 c0 + 1,
-                None,
+                Some(&[id_130]),
             );
             assert!(ok, "the incremental key-moving UPDATE must fire");
         }
@@ -3427,6 +3451,403 @@ mod capacity_payload_tests {
             let via_scan = build(i, false, false, statements);
             assert_eq!(via_device, via_index, "scenario {i}: device == value-index");
             assert_eq!(via_index, via_scan, "scenario {i}: value-index == scan");
+        }
+    }
+
+    /// RETIREMENT A4b — MULTI-ROW incremental DML: multi-row UPDATE/DELETE commits are handled
+    /// IN PLACE (per-row exact-1 locate+tombstone, one batched identity-stamped append) instead of
+    /// the O(table) invalidate+re-admit. Twin-engine differential (incremental ON vs OFF=re-admit
+    /// oracle) over multi-row UPDATE, multi-row DELETE, and an unchanged-values UPDATE; MECHANISM
+    /// pin: every pre-statement device buffer SURVIVES on the incremental engine (a re-admit
+    /// replaces all ptrs — output equality alone cannot see the fallback, the A2 lesson); IDENTITY
+    /// pin: after the multi-row UPDATE each new version materializes (A4a) to exactly the host row
+    /// fetched by its DERIVED key. Sabotage: force `try_update_resident_commit` multi-row arm to
+    /// false and the ptr-survival assert FAILS.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a4b_multi_row_dml_stays_incremental_and_matches_oracle() {
+        let load = |e: &Engine, incremental: bool| {
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_resident_delete_tombstone_enabled(incremental);
+            e.set_resident_update_tombstone_enabled(incremental);
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+                .unwrap();
+            for i in 0..200_i64 {
+                e.execute_text(
+                    (i as u64) + 2,
+                    &format!(
+                        "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                        i * 10
+                    ),
+                )
+                .unwrap();
+            }
+        };
+        let statements = [
+            "UPDATE accounts SET balance = 7777 WHERE id = 10 OR id = 11",
+            "DELETE FROM accounts WHERE id = 20 OR id = 21 OR id = 22",
+            // Unchanged int4 values: the tombstone-first order must still locate EXACTLY the olds.
+            "UPDATE accounts SET balance = 300 WHERE id = 30",
+            "UPDATE accounts SET balance = 1234 WHERE id = 40 OR id = 41",
+        ];
+        let e = Engine::new_local();
+        load(&e, true);
+        let o = Engine::new_local();
+        load(&o, false);
+        let ptrs_before: Vec<(u32, u64)> = {
+            let shards = e
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get("accounts")
+                .cloned()
+                .unwrap();
+            shards
+                .iter()
+                .map(|shard| {
+                    let memory = e
+                        .read_state
+                        .residency
+                        .shard_device_memory
+                        .get(&("accounts".to_string(), shard.shard_id))
+                        .unwrap();
+                    (shard.shard_id, memory.device_ptr())
+                })
+                .collect()
+        };
+        let mut seq = 300_u64;
+        for sql in &statements {
+            e.execute_text(seq, sql).unwrap();
+            o.execute_text(seq, sql).unwrap();
+            seq += 1;
+        }
+        for (shard_id, ptr) in &ptrs_before {
+            let survived = e
+                .read_state
+                .residency
+                .shard_device_memory
+                .get(&("accounts".to_string(), *shard_id))
+                .is_some_and(|memory| memory.device_ptr() == *ptr);
+            assert!(
+                survived,
+                "shard {shard_id} was REBUILT: multi-row DML must stay on the incremental path"
+            );
+        }
+        let got = e
+            .execute_relational_select_text("SELECT id, balance FROM accounts")
+            .unwrap()
+            .rows
+            .into_boxed();
+        let want = o
+            .execute_relational_select_text("SELECT id, balance FROM accounts")
+            .unwrap()
+            .rows
+            .into_boxed();
+        // The oracle re-admits (all-live rebuild) so its row ORDER can differ; compare as multisets.
+        let mut got_rows = got;
+        let mut want_rows = want;
+        got_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        want_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(
+            got_rows, want_rows,
+            "incremental multi-row DML == re-admit oracle"
+        );
+        // IDENTITY pin (A4a composition): each updated key's visible version materializes from the
+        // device to exactly the host row fetched by its derived key.
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let table_rows = e.read_state.mvcc.table_rows("accounts");
+        let now = e.committed_seq();
+        for id in [10_i32, 11, 40, 41, 30] {
+            let hits = e
+                .locate_resident_pk_via_shard_index_detailed(&table, 0, id)
+                .expect("locate must answer post-update");
+            let visible: Vec<Vec<SqlValue>> = hits
+                .iter()
+                .filter_map(|hit| {
+                    e.materialize_resident_row_via_hit(&table, hit, now)
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(visible.len(), 1, "id {id}: exactly one visible version");
+            let region = hits
+                .iter()
+                .find_map(|hit| hit.row_id.as_ref().map(|r| (hit, r)))
+                .expect("identity region");
+            let halves = region
+                .1
+                .read_resident_i32_column(u64::from(region.0.slot) * 8, 2)
+                .unwrap();
+            let row_id = (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
+            let host = table_rows
+                .store()
+                .tuple_fetch_by_key(
+                    &relational_row_key("accounts", row_id),
+                    crate::StorageVisibility { read_txn_id: now },
+                )
+                .unwrap()
+                .map(|tuple| decode_relational_row(&tuple.value, &table.columns).unwrap());
+            assert_eq!(
+                host.as_ref(),
+                Some(&visible[0]),
+                "id {id}: device == host by derived key"
+            );
+        }
+    }
+
+    /// RETIREMENT A4b — the CONCURRENT form: a reader hammers TWO keys while the writer commits
+    /// real multi-row `UPDATE ... WHERE id = 130 OR id = 131` statements through the incremental
+    /// path (per-statement: two tombstones + one batched created_by-stamped append). SI invariant
+    /// under EVERY interleaving: EACH key appears EXACTLY ONCE per read (2 = the un-stamped
+    /// double-read; 0 = a lost row). Same-key chains stay incremental here (unlike the A2 resolve)
+    /// because the locate predicate is the FULL row image and balances keep changing.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a4b_concurrent_reader_exactly_once_under_multi_row_update_load() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_resident_delete_tombstone_enabled(true);
+        e.set_resident_update_tombstone_enabled(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
+            )
+            .unwrap();
+        }
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut reads = 0_u64;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    for key in [130, 131] {
+                        let rows = e
+                            .execute_relational_select_text(&format!(
+                                "SELECT id, balance FROM accounts WHERE id = {key}"
+                            ))
+                            .unwrap()
+                            .rows;
+                        assert_eq!(
+                            rows.len(),
+                            1,
+                            "SI: key {key} must appear EXACTLY ONCE under multi-row update load"
+                        );
+                    }
+                    reads += 1;
+                }
+                reads
+            });
+            for t in 0..150_u64 {
+                e.execute_text(
+                    300 + t,
+                    &format!(
+                        "UPDATE accounts SET balance = {} WHERE id = 130 OR id = 131",
+                        100_000 + t
+                    ),
+                )
+                .unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            let reads = reader.join().expect("reader must not panic (SI violation)");
+            assert!(reads > 0, "the reader must have raced at least one read");
+        });
+        let rows = e
+            .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 131")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0), &[SqlValue::Int4(131), SqlValue::Int4(100_149)]);
+    }
+
+    /// RETIREMENT A4a — the DEVICE MATERIALIZATION differential: for located hits across every
+    /// write lineage (admission, SV5 update version-split + re-update chain, DELETE tombstone,
+    /// post-churn append) and MULTIPLE time-travel snapshots (pre/at/post each commit),
+    /// `materialize_resident_row_via_hit` == the host `tuple_fetch_by_key` at the same
+    /// `read_txn_id`: visible rows carry IDENTICAL values, invisible slots answer `Some(None)`
+    /// exactly where the host fetch misses. This is the primitive that REPLACES the host fetch
+    /// when A4e elides installs — the visibility boundary (`created_by <= t < deleted_by`) is the
+    /// load-bearing edge, probed AT the exact commit seqs. A NULL-bearing shard must DECLINE
+    /// (`None`, the M3 raw-i32 discipline). Sabotage: relax `read_txn_id < deleted_by` to `<=`
+    /// and the at-boundary probes see tombstoned rows -> FAIL.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a4a_device_materialization_matches_host_fetch() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
+            )
+            .unwrap();
+        }
+        let t_admitted = e.committed_seq();
+        e.execute_text(300, "UPDATE accounts SET balance = 9999 WHERE id = 130")
+            .unwrap();
+        let t_update = e.committed_seq();
+        e.execute_text(301, "DELETE FROM accounts WHERE id = 42")
+            .unwrap();
+        let t_delete = e.committed_seq();
+        e.execute_text(302, "INSERT INTO accounts (id, balance) VALUES (500, 5000)")
+            .unwrap();
+        // NOTE: no SECOND update of id=130 — that would duplicate the key WITHIN the open shard
+        // and locate would (correctly) DECLINE it; the dup-decline lineage is pinned by the A2
+        // same-key-chain test. Here every probed key stays locate-eligible so the materializer
+        // itself is what's under test.
+        let t_latest = e.committed_seq();
+
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let table_rows = e.read_state.mvcc.table_rows("accounts");
+        let snapshots = [
+            t_admitted,
+            t_update - 1,
+            t_update,
+            t_delete - 1,
+            t_delete,
+            t_latest,
+        ];
+        let mut visible_checked = 0_usize;
+        let mut invisible_checked = 0_usize;
+        // id=500 (an INSERT-appended slot) is probed ONLY at t_latest: insert-appended slots are
+        // BORN-VISIBLE (no created_by stamp; concurrent readers gate them via the pinned
+        // row_count) — the primitive's contract is read_txn >= the slot's insert commit, which is
+        // what the serialized DML path always passes. The admission/update/delete lineages carry
+        // stamps and are probed across ALL snapshots (the update/delete boundaries are the edge).
+        for id in [130_i32, 42, 500, 7, 60] {
+            let Some(hits) = e.locate_resident_pk_via_shard_index_detailed(&table, 0, id) else {
+                panic!("locate must answer for id {id} (unique key, valid shards)");
+            };
+            for &txn in &snapshots {
+                if id == 500 && txn < t_latest {
+                    continue; // outside the born-visible contract (see above)
+                }
+                let mut device_visible: Vec<Vec<SqlValue>> = Vec::new();
+                for hit in &hits {
+                    // Host oracle for THIS slot: the derived key fetched at the same snapshot.
+                    let region = hit.row_id.as_ref().expect("identity region present");
+                    let halves = region
+                        .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
+                        .unwrap();
+                    let row_id = (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
+                    let key = relational_row_key("accounts", row_id);
+                    let host = table_rows
+                        .store()
+                        .tuple_fetch_by_key(&key, crate::StorageVisibility { read_txn_id: txn })
+                        .unwrap()
+                        .map(|tuple| decode_relational_row(&tuple.value, &table.columns).unwrap());
+                    let device = e
+                        .materialize_resident_row_via_hit(&table, hit, txn)
+                        .unwrap_or_else(|| {
+                            panic!("materializer must not DECLINE a null-free shard (id {id})")
+                        });
+                    // The host key resolves the LOGICAL row (its current version at txn); the
+                    // device hit is a PHYSICAL slot. A visible device slot must carry exactly the
+                    // host row; an invisible slot pairs with either a host miss (row dead at txn)
+                    // OR the row being visible via its OTHER version slot — so per-slot we assert
+                    // only the visible direction, and per-(id, txn) the visible SETS must match.
+                    match device {
+                        Some(row) => {
+                            assert_eq!(
+                                Some(&row),
+                                host.as_ref(),
+                                "id {id} txn {txn} slot {}: device row == host fetch",
+                                hit.slot
+                            );
+                            device_visible.push(row);
+                            visible_checked += 1;
+                        }
+                        None => invisible_checked += 1,
+                    }
+                }
+                // Set-level: the host sees the id at txn ⟺ EXACTLY ONE device slot is visible.
+                let host_row = table_rows
+                    .store()
+                    .tuple_fetch_by_key(
+                        &relational_row_key(
+                            "accounts",
+                            // any hit's row_id resolves the same logical row for this unique id
+                            {
+                                let region = hits[0].row_id.as_ref().unwrap();
+                                let halves = region
+                                    .read_resident_i32_column(u64::from(hits[0].slot) * 8, 2)
+                                    .unwrap();
+                                (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32)
+                            },
+                        ),
+                        crate::StorageVisibility { read_txn_id: txn },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    device_visible.len(),
+                    usize::from(host_row.is_some()),
+                    "id {id} txn {txn}: exactly one visible slot iff the host sees the row"
+                );
+            }
+        }
+        assert!(
+            visible_checked >= 20,
+            "non-vacuity: visible probes ({visible_checked})"
+        );
+        assert!(
+            invisible_checked >= 4,
+            "non-vacuity: INVISIBLE probes must exercise the boundary ({invisible_checked})"
+        );
+
+        // Date column (audit A4 F1): Date/Int2 share the device i32 section, so the locate can
+        // hit — but the materializer types values Int4 and must DECLINE the whole table rather
+        // than return `Int4(days)` where the host row carries `Date(days)`.
+        e.execute_text(390, "CREATE TABLE dd (id INT, d DATE)")
+            .unwrap();
+        e.execute_text(
+            391,
+            "INSERT INTO dd (id, d) VALUES (1, '2026-07-02'), (2, '2026-07-01')",
+        )
+        .unwrap();
+        let dd_table = e.relational_catalog_table("dd").unwrap();
+        let mut date_decline_checked = false;
+        if let Some(hits) = e.locate_resident_pk_via_shard_index_detailed(&dd_table, 0, 1) {
+            for hit in &hits {
+                assert_eq!(
+                    e.materialize_resident_row_via_hit(&dd_table, hit, e.committed_seq()),
+                    None,
+                    "a Date-bearing table must DECLINE (Int4-typed materialization would mistype)"
+                );
+                date_decline_checked = true;
+            }
+        }
+        assert!(
+            date_decline_checked,
+            "the Date-decline gate must be exercised (locate answered)"
+        );
+
+        // NULL-bearing shard: the materializer must DECLINE, never alias NULL as 0.
+        e.execute_text(400, "CREATE TABLE n (id INT, v INT)")
+            .unwrap();
+        e.execute_text(401, "INSERT INTO n (id, v) VALUES (1, NULL), (2, 20)")
+            .unwrap();
+        let n_table = e.relational_catalog_table("n").unwrap();
+        if let Some(hits) = e.locate_resident_pk_via_shard_index_detailed(&n_table, 0, 1) {
+            for hit in &hits {
+                assert_eq!(
+                    e.materialize_resident_row_via_hit(&n_table, hit, e.committed_seq()),
+                    None,
+                    "a null-bearing shard must DECLINE the raw-i32 materialization"
+                );
+            }
         }
     }
 

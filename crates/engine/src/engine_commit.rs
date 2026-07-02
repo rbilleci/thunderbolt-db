@@ -319,21 +319,19 @@ impl Engine {
                         table,
                         old_rows,
                         new_rows,
-                        write_set,
+                        row_ids,
+                        ..
                     }) if self.resident_update_tombstone_enabled() => {
-                        // RETIREMENT A1: the appended new version keeps the ORIGINAL row's identity
-                        // (same key) — parsed from the single-row write-set.
-                        let prefix = relational_key_prefix(table);
-                        let row_id = write_set.rows.first().and_then(|row| {
-                            crate::engine_residency::parse_relational_row_id(&row.row_key, &prefix)
-                        });
+                        // RETIREMENT A1/A4b: the appended new versions keep the ORIGINAL rows'
+                        // identities — parsed from the installs' keys (exact parallel to
+                        // old_rows/new_rows), surfaced on the mutation.
                         self.try_update_resident_commit(
                             cat,
                             table,
                             old_rows,
                             new_rows,
                             publish_index,
-                            row_id,
+                            row_ids.as_deref(),
                         )
                     }
                     _ => false,
@@ -956,10 +954,11 @@ impl Engine {
             }
             Command::Update(update) => {
                 applied = self.apply_update(cat, update, commit_seq)?.map(
-                    |(table, old_rows, new_rows, write_set)| AppliedRowMutation::Update {
+                    |(table, old_rows, new_rows, row_ids, write_set)| AppliedRowMutation::Update {
                         table,
                         old_rows,
                         new_rows,
+                        row_ids,
                         write_set,
                     },
                 );

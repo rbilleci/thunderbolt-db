@@ -44,6 +44,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         if env::var("GPU_DB_BENCH_INDEX_OFF").ok().as_deref() == Some("1") {
             e.set_dml_value_index_resolve_enabled(false); // the scan-oracle configuration
         }
+        if env::var("GPU_DB_BENCH_TOMBSTONE_OFF").ok().as_deref() == Some("1") {
+            // The pre-A4b oracle: every DELETE/UPDATE commit invalidates + re-admits (O(table)).
+            e.set_resident_delete_tombstone_enabled(false);
+            e.set_resident_update_tombstone_enabled(false);
+        }
         if constrained {
             // 1b coverage: a UNIQUE index + an inbound FK child — the validators run index-driven.
             e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")?;
@@ -70,20 +75,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Warm the residency + index caches.
         let _ = e.execute_relational_select_text("SELECT id, v FROM t WHERE id = 1");
 
+        // GPU_DB_BENCH_MULTI=1 (A4b): 2-row OR statements — pre-A4b these fell back to the
+        // O(table) invalidate + re-admit; post-A4b they stay incremental.
+        let multi = env::var("GPU_DB_BENCH_MULTI").ok().as_deref() == Some("1");
         let mut del_us: Vec<f64> = Vec::with_capacity(ops);
         for k in 0..ops as i64 {
+            let a = 1000 + k * 2;
+            let sql = if multi {
+                format!("DELETE FROM t WHERE id = {a} OR id = {}", a + 1)
+            } else {
+                format!("DELETE FROM t WHERE id = {}", 1000 + k)
+            };
             let q = Instant::now();
-            e.execute_text(seq, &format!("DELETE FROM t WHERE id = {}", 1000 + k))?;
+            e.execute_text(seq, &sql)?;
             seq += 1;
             del_us.push(q.elapsed().as_secs_f64() * 1e6);
         }
         let mut upd_us: Vec<f64> = Vec::with_capacity(ops);
         for k in 0..ops as i64 {
+            let a = 5000 + k * 2;
+            let sql = if multi {
+                format!("UPDATE t SET v = {k} WHERE id = {a} OR id = {}", a + 1)
+            } else {
+                format!("UPDATE t SET v = {k} WHERE id = {}", 5000 + k)
+            };
             let q = Instant::now();
-            e.execute_text(
-                seq,
-                &format!("UPDATE t SET v = {} WHERE id = {}", k, 5000 + k),
-            )?;
+            e.execute_text(seq, &sql)?;
             seq += 1;
             upd_us.push(q.elapsed().as_secs_f64() * 1e6);
         }

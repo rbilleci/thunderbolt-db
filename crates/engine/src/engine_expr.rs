@@ -2312,20 +2312,46 @@ impl Engine {
         deleted_rows: &[Vec<SqlValue>],
         commit_seq: Index,
     ) -> bool {
-        // First slice: exactly one deleted row (the OLTP delete-by-key case); multi-row -> re-admit.
-        if deleted_rows.len() != 1 {
+        // RETIREMENT A4b: MULTI-ROW — per-row locate + tombstone, each gated EXACT count == 1. Any
+        // ambiguity on ANY row (dup int4 values across the statement's rows, a locate miss, an
+        // int4-identical already-tombstoned slot, NULL/non-int4) returns false -> the caller
+        // invalidates + re-admits, which SUPERSEDES any tombstones already stamped this commit
+        // (they are pre-publish; the re-admit rebuilds all-live and releases the regions — the
+        // same partial-failure argument SV5 documented for tombstone-without-append).
+        if deleted_rows.is_empty() {
             return false;
         }
         let Some(table) = cat.relational_catalog.get(table_name) else {
             return false;
         };
-        let row = &deleted_rows[0];
-        if row.len() != table.columns.len() {
-            return false;
+        for row in deleted_rows {
+            if row.len() != table.columns.len() {
+                return false;
+            }
+            let Some(predicate) = Self::resident_int4_row_predicate(table, row) else {
+                return false;
+            };
+            // EXACT-1 per row. NOTE: a slot tombstoned by an EARLIER row of this same statement
+            // may still be visible to this locate (stamped at commit_seq, read below it) — that
+            // can only happen when two deleted rows are int4-identical, and then the FIRST row's
+            // locate already saw count 2 and bailed. The per-row gate is the wrong-results net.
+            if !matches!(
+                self.try_tombstone_resident_delete(table, &predicate, commit_seq),
+                Some(1)
+            ) {
+                return false;
+            }
         }
-        // Build an AND over the table's plain-`Int4` columns: `(Column(idx) = Int4Literal(value))`. Any NULL
-        // or non-`Int4` value in an int4 column -- or a table with zero int4 columns -- returns false (can't
-        // safely / uniquely locate the physical row), and the caller re-admits.
+        true
+    }
+
+    /// The AND-of-int4-equalities predicate locating exactly one physical row image: `(col_i =
+    /// v_i)` over the table's plain-`Int4` columns. `None` when any int4 column holds NULL or a
+    /// non-`Int4` value, or the table has zero int4 columns (cannot safely locate) -> re-admit.
+    fn resident_int4_row_predicate(
+        table: &RelationalTable,
+        row: &[SqlValue],
+    ) -> Option<ResidentExpr> {
         let mut predicate: Option<ResidentExpr> = None;
         for (idx, column) in table.columns.iter().enumerate() {
             if column.ty != SqlType::Int4 {
@@ -2333,7 +2359,7 @@ impl Engine {
             }
             let value = match &row[idx] {
                 SqlValue::Int4(v) => *v,
-                _ => return false,
+                _ => return None,
             };
             let eq = ResidentExpr::Binary {
                 op: ResidentBinaryOp::Eq,
@@ -2349,16 +2375,7 @@ impl Engine {
                 },
             });
         }
-        let Some(predicate) = predicate else {
-            return false;
-        };
-        // Accept ONLY an EXACT locate (count == the deleted-row count). `None` (not resident / locate error)
-        // or a count mismatch (a duplicate int4-value row, an already-tombstoned slot with the same values,
-        // or a locate miss) -> false -> re-admit. This exact-count gate is the wrong-results safety net.
-        matches!(
-            self.try_tombstone_resident_delete(table, &predicate, commit_seq),
-            Some(n) if n == deleted_rows.len()
-        )
+        predicate
     }
 
     /// SV5 (commit path): for a single-entry UPDATE commit, TOMBSTONE the OLD version's resident slot + APPEND
@@ -2392,13 +2409,17 @@ impl Engine {
         old_rows: &[Vec<SqlValue>],
         new_rows: &[Vec<SqlValue>],
         commit_seq: Index,
-        row_id: Option<u64>,
+        row_ids: Option<&[u64]>,
     ) -> bool {
-        // First slice: exactly one updated row (the OLTP update-by-key case); multi-row -> re-admit.
-        if old_rows.len() != 1 || new_rows.len() != 1 {
+        // RETIREMENT A4b: MULTI-ROW — old/new/row_ids must be parallel and identity-complete;
+        // ALL tombstones land before ANY append (the locate must run on the pre-append buffer).
+        if old_rows.is_empty()
+            || old_rows.len() != new_rows.len()
+            || !row_ids.is_some_and(|ids| ids.len() == new_rows.len())
+        {
             return false;
         }
-        // 1. Tombstone the OLD version's slot (locate on the buffer BEFORE the new row is appended).
+        // 1. Tombstone every OLD version's slot (locates run on the buffer BEFORE the appends).
         if !self.try_tombstone_resident_delete_commit(cat, table_name, old_rows, commit_seq) {
             return false;
         }
@@ -2409,12 +2430,11 @@ impl Engine {
         //    reader (it sees exactly the OLD version, still live at its snapshot). If this fails AFTER the
         //    tombstone, the caller's re-admit rebuilds all-live from the host store (which already applied
         //    the version rewrite), superseding.
-        let row_ids: Option<Vec<u64>> = row_id.map(|id| vec![id]);
         if !self.try_append_resident_int4_open_shard(
             table_name,
             new_rows,
             Some(commit_seq),
-            row_ids.as_deref(),
+            row_ids,
         ) {
             return false;
         }

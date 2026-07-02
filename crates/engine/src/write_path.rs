@@ -139,6 +139,11 @@ pub(crate) enum AppliedRowMutation {
         table: String,
         old_rows: Vec<Vec<SqlValue>>,
         new_rows: Vec<Vec<SqlValue>>,
+        /// RETIREMENT A4b: the updated rows' IDENTITIES (parsed from the installs' row keys, EXACT
+        /// parallel to `old_rows`/`new_rows` by construction) — the appended new versions keep
+        /// them (A1). `None` for any unparseable key -> the commit arm declines the incremental
+        /// path (re-admit, always correct).
+        row_ids: Option<Vec<u64>>,
         write_set: WriteSet,
     },
 }

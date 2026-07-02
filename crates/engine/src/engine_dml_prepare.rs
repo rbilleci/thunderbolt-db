@@ -484,6 +484,82 @@ impl Engine {
         Ok(Some(matches))
     }
 
+    /// RETIREMENT A4a: materialize a located row ENTIRELY FROM THE DEVICE — values gathered from
+    /// the hit's pinned shard columns, visibility decided by the created_by/deleted_by regions —
+    /// the replacement for the host `tuple_fetch_by_key` that the install elision (A4e) removes.
+    /// Returns:
+    ///   `Some(Some(row))` — the slot is VISIBLE at `read_txn_id`, row = the device column values;
+    ///   `Some(None)`      — the slot is NOT visible at this snapshot (created after it, or
+    ///                       tombstoned at-or-before it) — the device analog of a fetch miss;
+    ///   `None`            — DECLINE: this primitive cannot answer (a null-bearing shard whose raw
+    ///                       i32 read would alias NULL as 0, a non-int4 column, or a device-read
+    ///                       failure) -> the caller must use the host fetch.
+    /// Visibility semantics are SV3b/SV6's exactly: visible ⟺ `created_by <= read_txn_id <
+    /// deleted_by`, with an ABSENT created_by region = born-visible (0) and an ABSENT deleted_by
+    /// region = never-deleted (+inf).
+    ///
+    /// CONTRACT (load-bearing): `read_txn_id` must be >= the commit seq of every INSERT-appended
+    /// slot in the hit's shard snapshot — i.e. the CURRENT published seq, which is what every
+    /// serialized DML prepare/preflight passes. Only UPDATE-appended versions carry created_by
+    /// stamps (SV6); plain INSERT appends are BORN-VISIBLE and are gated for concurrent READERS
+    /// by the snapshot-pinned `row_count` instead — a mechanism a slot-addressed materializer
+    /// cannot replicate. Historical time-travel below an unstamped insert is NOT this primitive's
+    /// contract. UNWIRED until A4e — proven by the
+    /// `a4a_device_materialization_matches_host_fetch` differential first.
+    #[allow(dead_code)]
+    pub(crate) fn materialize_resident_row_via_hit(
+        &self,
+        table: &RelationalTable,
+        hit: &crate::engine_retained_read::ShardPkHit,
+        read_txn_id: u64,
+    ) -> Option<Option<Vec<SqlValue>>> {
+        if !hit.descriptor.resident_device_null_columns.is_empty() {
+            return None; // raw i32 would read a stored NULL as 0 (the M3 decline discipline)
+        }
+        // Audit A4 F1: strictly-Int4 tables ONLY. Date/Int2 share the device i32 section (the
+        // offset helper accepts them), but this materializer types every value `SqlValue::Int4` —
+        // a Date/Int2 column would come back as the WRONG SqlValue variant. Decline -> host fetch.
+        if table
+            .columns
+            .iter()
+            .any(|column| column.ty != crate::SqlType::Int4)
+        {
+            return None;
+        }
+        let slot = u64::from(hit.slot);
+        let read_region_u64 = |region: &crate::CudaResidentDeviceMemory| -> Option<u64> {
+            let halves = region.read_resident_i32_column(slot * 8, 2).ok()?;
+            let (lo, hi) = (*halves.first()?, *halves.get(1)?);
+            Some((lo as u32 as u64) | ((hi as u32 as u64) << 32))
+        };
+        let created_by = match &hit.created_by {
+            Some(region) => read_region_u64(region)?,
+            None => 0, // un-stamped shard: born-visible
+        };
+        let deleted_by = match &hit.deleted_by {
+            Some(region) => read_region_u64(region)?,
+            None => u64::MAX, // version-free shard: never deleted
+        };
+        if !(created_by <= read_txn_id && read_txn_id < deleted_by) {
+            return Some(None);
+        }
+        let mut row = Vec::with_capacity(table.columns.len());
+        for idx in 0..table.columns.len() {
+            let base = crate::relational_model::resident_device_int4_column_offset(
+                &hit.descriptor,
+                table,
+                idx,
+            )
+            .ok()?;
+            let values = hit
+                .device_memory
+                .read_resident_i32_column(base + slot * 4, 1)
+                .ok()?;
+            row.push(SqlValue::Int4(*values.first()?));
+        }
+        Some(Some(row))
+    }
+
     /// RETIREMENT A3: the DEVICE-INDEX constraint probe — answers `any_visible_row_with_value`
     /// through the per-shard device PK-index locate + the A1 row-identity region instead of the
     /// host value_index. `Some(bool)` = authoritative answer; `None` = decline (the host ladder
