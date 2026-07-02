@@ -64,7 +64,22 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// This is the P1-M4 concurrent dispatch (the first production caller of the `&self` engine
 /// read path); `serve_sequential` is the prior one-at-a-time loop, kept as the A/B baseline.
 pub fn serve(listener: TcpListener) -> io::Result<()> {
-    serve_with_engine(listener, Arc::new(SharedEngine::new()))
+    serve_with_engine(listener, shared_engine_from_env()?)
+}
+
+/// Build the default served engine honoring the first-class durability config (write-path
+/// assessment D4): `GPU_DB_WAL_SEGMENT=<path>` serves a crash-durable engine that recovers any
+/// existing segment at that path and fsyncs every commit before visibility; unset serves the
+/// in-memory-WAL engine (no crash durability — the pre-existing default, kept for benchmarks).
+fn shared_engine_from_env() -> io::Result<Arc<SharedEngine>> {
+    let engine = SharedEngine::new_from_env().map_err(io::Error::other)?;
+    if engine.is_durable() {
+        eprintln!(
+            "gpu-db-engine-server: durable WAL enabled (GPU_DB_WAL_SEGMENT={})",
+            std::env::var("GPU_DB_WAL_SEGMENT").unwrap_or_default()
+        );
+    }
+    Ok(Arc::new(engine))
 }
 
 /// `serve` over a caller-provided shared engine — e.g. one pre-warmed to GPU residency
@@ -262,10 +277,8 @@ fn encode_outcome(outcome: Result<QueryOutcome, DbError>) -> io::Result<Vec<u8>>
                         .collect();
                     writer.row_description(&backend_columns)?;
                     for row in rows {
-                        let values: Vec<Option<String>> = row
-                            .iter()
-                            .map(pg_adapter::db_value_text_opt)
-                            .collect();
+                        let values: Vec<Option<String>> =
+                            row.iter().map(pg_adapter::db_value_text_opt).collect();
                         writer.data_row(&values)?;
                     }
                 }
@@ -371,7 +384,7 @@ pub async fn serve_async_with_permits(
 ) -> io::Result<()> {
     serve_async_with_engine(
         listener,
-        Arc::new(SharedEngine::new()),
+        shared_engine_from_env()?,
         max_concurrent_executions,
     )
     .await

@@ -332,6 +332,37 @@ impl SharedEngine {
         }
     }
 
+    /// A shared façade over a **crash-durable** engine: opens (recovering) or creates the WAL
+    /// segment at `segment_path`, and fsyncs every commit's WAL record before it becomes
+    /// visible. The durability counterpart to [`SharedEngine::new`], whose WAL is in-memory only.
+    pub fn new_durable(segment_path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let segment_path = segment_path.as_ref();
+        let engine = Engine::open_durable_wal_segment(segment_path).map_err(|err| {
+            format!(
+                "failed to open durable WAL segment {}: {err}",
+                segment_path.display()
+            )
+        })?;
+        Ok(Self::from_engine(engine))
+    }
+
+    /// Construct the shared façade honoring the first-class durability deployment config
+    /// (write-path assessment D4): when `GPU_DB_WAL_SEGMENT` is set, the engine is opened
+    /// crash-durable at that path (recover-or-create); unset keeps the in-memory WAL of
+    /// [`SharedEngine::new`]. Servers use this so durability is a deployment setting, not a
+    /// code change.
+    pub fn new_from_env() -> Result<Self, String> {
+        match durable_wal_segment_from_env(std::env::var_os("GPU_DB_WAL_SEGMENT").as_deref()) {
+            Some(segment_path) => Self::new_durable(segment_path),
+            None => Ok(Self::new()),
+        }
+    }
+
+    /// Whether this façade's engine fsyncs commits (a durable WAL segment is installed).
+    pub fn is_durable(&self) -> bool {
+        self.engine.wal_is_durable()
+    }
+
     /// Borrow the shared engine (no lock — the engine is interior-mutable). The point-lookup batcher
     /// uses this to drive a whole batch's prepare→submit→complete over ONE pinned generation; the
     /// "one read-lock per batch" invariant is now "one `committed_seq` pin per batch", enforced inside
@@ -347,6 +378,18 @@ impl Default for SharedEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Pure decode of the `GPU_DB_WAL_SEGMENT` value (`None` ⇒ unset): the durable segment path, or
+/// `None` for the in-memory default. An empty / whitespace-only value counts as unset. Kept
+/// separate from the `std::env` read so it is unit-testable without mutating process-global env
+/// in parallel tests (same pattern as the server's `parse_batching_flag`).
+pub fn durable_wal_segment_from_env(value: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let value = value?;
+    if value.to_str().is_some_and(|s| s.trim().is_empty()) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(value))
 }
 
 /// Execute one SQL statement against a shared engine (lock-free read path, write-half MVCC — the
@@ -576,7 +619,8 @@ fn classify_batchable_point_lookup(shared: &SharedEngine, sql: &str) -> Option<(
         let sharded_batchable = engine.shard_batched_point_read_enabled()
             && matches!(
                 decision.query_shape.as_str(),
-                "sharded_int4_equality_projection" | "sharded_int4_equality_multi_column_projection"
+                "sharded_int4_equality_projection"
+                    | "sharded_int4_equality_multi_column_projection"
             );
         if !decision.accepted || !(single_buffer_batchable || sharded_batchable) {
             return None;
@@ -698,6 +742,58 @@ fn command_tag(command: &Command) -> CommandTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_wal_segment_env_decode_is_unset_for_missing_or_blank() {
+        // D4 config decode (pure — no process-global env mutation in parallel tests): unset and
+        // blank values keep the in-memory default; anything else is the durable segment path.
+        assert_eq!(durable_wal_segment_from_env(None), None);
+        assert_eq!(
+            durable_wal_segment_from_env(Some(std::ffi::OsStr::new(""))),
+            None
+        );
+        assert_eq!(
+            durable_wal_segment_from_env(Some(std::ffi::OsStr::new("   "))),
+            None
+        );
+        assert_eq!(
+            durable_wal_segment_from_env(Some(std::ffi::OsStr::new("/var/lib/gpu-db/wal.segment"))),
+            Some(std::path::PathBuf::from("/var/lib/gpu-db/wal.segment"))
+        );
+    }
+
+    #[test]
+    fn new_durable_shared_engine_fsyncs_commits_and_recovers_after_restart() {
+        // D4: the served engine, when configured durable, survives a "crash" (drop + reopen at
+        // the same segment path) with its committed writes intact.
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-facade-durable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let segment_path = dir.join("served.wal");
+
+        let engine = SharedEngine::new_durable(&segment_path).unwrap();
+        assert!(engine.is_durable());
+        execute_on_shared_engine(&engine, "CREATE TABLE t (id INT)").unwrap();
+        execute_on_shared_engine(&engine, "INSERT INTO t (id) VALUES (7)").unwrap();
+        drop(engine);
+
+        let recovered = SharedEngine::new_durable(&segment_path).unwrap();
+        let outcome = execute_on_shared_engine(&recovered, "SELECT id FROM t").unwrap();
+        let QueryOutcome::Rows { rows, .. } = outcome else {
+            panic!("expected rows after durable recovery");
+        };
+        assert_eq!(rows, vec![vec![DbValue::Int4(7)]]);
+        // The in-memory default remains non-durable (the assessment's D4 gap, now a setting).
+        assert!(!SharedEngine::new().is_durable());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn null_maps_through_the_value_model_to_a_wire_null() {
