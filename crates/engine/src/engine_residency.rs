@@ -3670,6 +3670,82 @@ mod capacity_payload_tests {
         assert_eq!(off.host_install_elisions(), 0);
     }
 
+    /// Wave-BATCHED appends (audit N-1): REAL multi-item waves — 8 writer threads pump
+    /// single-row INSERTs into `execute_dml_concurrent` concurrently, so the coalescer forms
+    /// multi-item waves and `flush_appends` aggregates rows per (table, flush) (the sequential
+    /// sibling test only ever forms 1-item waves). Two tables interleave (the BTreeMap grouping);
+    /// end state must hold every row exactly once, the tables stay ELIDED through the load
+    /// (steady state = zero rehydrations), and the elision counter proves the skips.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn a4e_multi_writer_waves_batch_appends_and_stay_elided() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.set_host_install_elision_enabled(true);
+        for (seq, name) in [(1_u64, "ta"), (2, "tb")] {
+            e.execute_text(seq, &format!("CREATE TABLE {name} (id INT, v INT)"))
+                .unwrap();
+        }
+        let mut seq = 3_u64;
+        for name in ["ta", "tb"] {
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", k * 10))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO {name} (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+        }
+        let elisions_before = e.host_install_elisions();
+        std::thread::scope(|s| {
+            for w in 0..8_u64 {
+                let e = &e;
+                s.spawn(move || {
+                    for i in 0..50_u64 {
+                        let table = if w % 2 == 0 { "ta" } else { "tb" };
+                        let id = 10_000 + w * 1_000 + i;
+                        e.execute_dml_concurrent(
+                            1_000 + w * 100 + i,
+                            &format!("INSERT INTO {table} (id, v) VALUES ({id}, {i})"),
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        let elided_through_load = e.table_install_elided("ta") && e.table_install_elided("tb");
+        for name in ["ta", "tb"] {
+            let rows = e
+                .execute_relational_select_text(&format!("SELECT id, v FROM {name}"))
+                .unwrap()
+                .rows;
+            assert_eq!(rows.len(), 400, "{name}: 200 base + 4 writers x 50 waves");
+            let mut ids: Vec<i32> = (0..rows.len())
+                .map(|i| match &rows.row(i)[0] {
+                    SqlValue::Int4(v) => *v,
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), 400, "{name}: no duplicates, no losses");
+        }
+        assert!(
+            elided_through_load,
+            "both tables must stay ELIDED through the multi-writer load (no rehydration thrash)"
+        );
+        assert!(
+            e.host_install_elisions() - elisions_before >= 350,
+            "non-vacuity: the waves must have SKIPPED installs (got {})",
+            e.host_install_elisions() - elisions_before
+        );
+    }
+
     /// RETIREMENT A4c — the DEVICE GATHER differential: `gather_resident_table_rows_from_device`
     /// (the re-admit / de-elision rebuild source) == the host store's visible rows, (row_id, row)
     /// for (row_id, row), across the full write lineage (admission, SV5 version-split update,
@@ -4171,7 +4247,8 @@ mod capacity_payload_tests {
             e.set_auto_admit_on_commit(true);
             e.set_shard_size_target(64);
             e.set_dml_device_validate_enabled(device);
-            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)").unwrap();
+            e.execute_text(1, "CREATE TABLE t (id INT UNIQUE, v INT)")
+                .unwrap();
             e.execute_text(2, "CREATE TABLE c (id INT, tid INT)")
                 .unwrap();
             e.execute_text(

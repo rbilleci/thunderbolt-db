@@ -479,7 +479,7 @@ impl Engine {
         let mut next_row_id = self.read_state.mvcc.current_row_id();
 
         let mut commit = self.commit_state();
-        let mut flush_fast_run =
+        let flush_fast_run =
             |commit: &mut CommitState,
              fast_run: &mut Vec<(usize, Index, String, WriteDelta)>,
              committed: &mut Vec<(usize, Index, bool)>| {
@@ -512,7 +512,93 @@ impl Engine {
                     committed.push((position, seq, false));
                 }
             };
+        // A4e OPTIMIZATION: wave-BATCHED residency appends. The measured elision residual was
+        // the PER-ITEM device append (~27us/item = several small HtoD copies + bookkeeping per
+        // single-row INSERT). Consecutive INSERT items buffer here per table and flush as ONE
+        // `try_append_resident_int4_open_shard` call per (table, flush) — same rows, same order,
+        // ~items/wave fewer launch sets. Flush points: before any NON-insert item's processing
+        // (its device locate must see prior rows), and at the wave tail before publish (the
+        // residency-before-publish invariant is per WAVE, not per item — rows become reader-
+        // visible only at the tail publish either way). D3-COMPOSE NOTE (ADR-013): plain INSERT
+        // appends are born-visible today (created_by: None); when stamp-all-appends lands, this
+        // batch spans MULTIPLE commit seqs, so the append primitive will need a per-row
+        // created_by slice rather than one value.
+        let mut pending_appends: BTreeMap<
+            String,
+            (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>),
+        > = BTreeMap::new();
+        let flush_appends =
+            |pending: &mut BTreeMap<
+                String,
+                (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>),
+            >,
+             committed: &mut Vec<(usize, Index, bool)>| {
+                if pending.is_empty() {
+                    return;
+                }
+                for (table, (rows, row_ids, items)) in std::mem::take(pending) {
+                    let appended = self.auto_admit_on_commit_enabled()
+                        && self.try_append_resident_int4_open_shard(
+                            &table,
+                            &rows,
+                            None,
+                            Some(&row_ids),
+                        );
+                    if appended {
+                        // A4e elide-entry (audit B1 eligibility), once per flushed table.
+                        if self.host_install_elision_enabled() && !self.table_install_elided(&table)
+                        {
+                            let snapshot = self.catalog_snapshot();
+                            if self.table_elision_eligible(&snapshot, &table) {
+                                self.set_table_install_elided(&table, true);
+                            }
+                        }
+                    } else {
+                        // A4e rehydrate-on-unhandled: the batch's rows were never installed (elided
+                        // apply skip) NOR appended — they ride the rehydration as upserts over the
+                        // gather at the batch's first seq - 1 (device state is complete through it:
+                        // flushes happen in seq order).
+                        if self.table_install_elided(&table) {
+                            let first_seq = items.first().map(|(_, seq)| *seq).unwrap_or_default();
+                            let last_seq = items.last().map(|(_, seq)| *seq).unwrap_or_default();
+                            let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
+                                row_ids.iter().copied().zip(rows.iter().cloned()).collect();
+                            let catalog_table = self
+                                .relational_catalog_table(&table)
+                                .expect("an elided table is in the catalog");
+                            self.rehydrate_elided_table(
+                                &catalog_table,
+                                first_seq.saturating_sub(1),
+                                &upserts,
+                                &Default::default(),
+                                last_seq,
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "commit-path invariant violation: elided rehydration for the \
+                                 batched append on {table} failed: {err}"
+                                )
+                            });
+                        }
+                        for (position, seq) in &items {
+                            self.invalidate_relational_residency_tables_concurrent(
+                                &batch[*position].residency_tables,
+                                batch[*position].txn_id,
+                                *seq,
+                            );
+                        }
+                    }
+                    for (position, seq) in items {
+                        committed.push((position, seq, appended));
+                    }
+                }
+            };
         for (position, item) in batch.iter().enumerate() {
+            // Batched-append ORDER: a non-INSERT item's re-resolve (device locate) and its
+            // tombstone paths must observe every prior row of this wave — flush first.
+            if !matches!(item.cmd, Command::Insert(_)) {
+                flush_appends(&mut pending_appends, &mut committed);
+            }
             // (3a) SI first-committer-wins: any key in the write-set committed after this item's
             // read snapshot aborts it (retryable). Earlier items in THIS wave recorded into the
             // ledger below, so intra-wave conflicts are caught here exactly like cross-wave ones.
@@ -646,41 +732,6 @@ impl Engine {
                     }
                     _ => None,
                 };
-            // RETIREMENT A4e (concurrent-native hooks): the (upserts, removals) an elided-table
-            // rehydration would need — extracted BEFORE apply consumes the delta. Flag OFF = None.
-            // RETIREMENT A4e (concurrent-native hooks): the (upserts, removals) an elided-table
-            // rehydration would need — extracted BEFORE apply consumes the delta. INSERT-only by
-            // construction (audit note): the entry guard redirects non-INSERT elided DML to the
-            // serialized path, so Update/Delete deltas can never hit the rehydrate hook here.
-            let elided_hook: Option<(
-                String,
-                std::collections::BTreeMap<u64, Vec<SqlValue>>,
-                std::collections::BTreeSet<u64>,
-            )> = if self.host_install_elision_enabled() {
-                match &delta.mutation {
-                    crate::write_path::PreparedMutation::Insert {
-                        table,
-                        inserted_rows,
-                        ..
-                    } => {
-                        let prefix = relational_key_prefix(table);
-                        Some((
-                            table.clone(),
-                            inserted_rows
-                                .iter()
-                                .filter_map(|(key, values)| {
-                                    crate::engine_residency::parse_relational_row_id(key, &prefix)
-                                        .map(|id| (id, values.clone()))
-                                })
-                                .collect(),
-                            Default::default(),
-                        ))
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
             self.apply_delta(delta, commit_seq, None)
                 .unwrap_or_else(|err| {
                     panic!(
@@ -691,56 +742,28 @@ impl Engine {
             commit.repl.mark_applied(commit_seq);
             next_row_id = self.read_state.mvcc.current_row_id();
 
-            // Residency, before publish (residency-data consistency). Slice 1b-ii in-place append
-            // when auto-admit is on; conservative invalidation otherwise.
-            let appended = self.auto_admit_on_commit_enabled()
-                && insert_append
-                    .as_ref()
-                    .is_some_and(|(table, rows, row_ids)| {
-                        self.try_append_resident_int4_open_shard(table, rows, None, Some(row_ids))
-                    });
-            // RETIREMENT A4e (concurrent-native lifecycle, mirrors the serialized arm): a handled
-            // append on an eligible strictly-Int4 table ENTERS elision; an UNHANDLED commit on an
-            // elided table REHYDRATES (device gather @ C-1 + this commit's delta) BEFORE the
-            // invalidate below re-admits — else the re-admit would rebuild from the EMPTY store.
-            // Rehydration failure post-apply is an invariant violation: panic like the apply.
-            if let Some((table_name, upserts, removals)) = elided_hook {
-                if appended && !self.table_install_elided(&table_name) {
-                    // Audit B1: strictly-Int4 AND constraint-free both directions.
-                    let snapshot = self.catalog_snapshot();
-                    if self.table_elision_eligible(&snapshot, &table_name) {
-                        self.set_table_install_elided(&table_name, true);
-                    }
-                } else if !appended && self.table_install_elided(&table_name) {
-                    let table = self
-                        .relational_catalog_table(&table_name)
-                        .expect("an elided table is in the catalog");
-                    self.rehydrate_elided_table(
-                        &table,
-                        commit_seq.saturating_sub(1),
-                        &upserts,
-                        &removals,
+            // Residency, before publish: INSERT rows BUFFER into the wave-batched append (the
+            // flush handles elide-entry / rehydrate / invalidate per table); everything else
+            // invalidates conservatively as before.
+            wave_tail = Some((commit_seq, wal_position));
+            match insert_append {
+                Some((table, rows, row_ids)) if self.auto_admit_on_commit_enabled() => {
+                    let entry = pending_appends.entry(table).or_default();
+                    entry.0.extend(rows);
+                    entry.1.extend(row_ids);
+                    entry.2.push((position, commit_seq));
+                }
+                _ => {
+                    self.invalidate_relational_residency_tables_concurrent(
+                        &item.residency_tables,
+                        item.txn_id,
                         commit_seq,
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "commit-path invariant violation: elided rehydration at commit_seq \
-                             {commit_seq} failed: {err}"
-                        )
-                    });
+                    );
+                    committed.push((position, commit_seq, false));
                 }
             }
-            if !appended {
-                self.invalidate_relational_residency_tables_concurrent(
-                    &item.residency_tables,
-                    item.txn_id,
-                    commit_seq,
-                );
-            }
-
-            wave_tail = Some((commit_seq, wal_position));
-            committed.push((position, commit_seq, appended));
         }
+        flush_appends(&mut pending_appends, &mut committed);
         flush_fast_run(&mut commit, &mut fast_run, &mut committed);
         // Prune the ledger once per wave (was per commit) below the oldest active snapshot.
         if let Some((last_seq, _)) = wave_tail {
