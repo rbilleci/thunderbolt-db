@@ -41,7 +41,10 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 host value_index + tuple store for resident tables and makes the per-shard DEVICE indexes the resolve
 surface. Program + dependency chain in memory `retirement-program-option-a` (A1 row-identity -> A2 resolve
 -> A3 validators -> A4 install elision = the SLO win, HARD-DEPENDS on multi-row incremental CRUD + device
-re-admit -> A5 deletion). START: A1.
+re-admit -> A5 deletion). A1 is DONE (`1875441c`, opus SHIP — identity foundation verified A2-ready). START: A2 — the device
+resolve: prepare_delete/update + the preflight resolve via the 3b/SV4a locate machinery -> row_id region
+-> derived key (tuple_id via one keyed fetch until A4); decline to the host value-index resolve on
+sentinel/absent-region/ineligible shapes. The value-index resolve (slices 1/1b) becomes the FALLBACK.
 
 **Slices 1+1b are DONE (`9876d297`, `7b48fda8`): ledger #1 is CLOSED** — DML resolve AND validation are
 index-driven in both layers; constrained single-row DML measures 124-195us FLAT (~500x). **Phase D is
