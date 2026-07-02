@@ -87,10 +87,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             Engine::new_local()
         };
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
-        // RETIREMENT A4e: GPU_DB_BENCH_ELIDE=1 measures the host-install ELISION arm (the
-        // device-authoritative commit path; requires auto-admit so the table enters elision).
-        if std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1") {
+        // RETIREMENT A4e A/B: GPU_DB_BENCH_ADMIT=1 = the honest baseline (auto-admit ON, the
+        // dual-store commit path); GPU_DB_BENCH_ELIDE=1 = the elision arm on top of it.
+        if std::env::var("GPU_DB_BENCH_ADMIT").is_ok_and(|v| v == "1")
+            || std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1")
+        {
             e.set_auto_admit_on_commit(true);
+        }
+        if std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1") {
             e.set_host_install_elision_enabled(true);
         }
 

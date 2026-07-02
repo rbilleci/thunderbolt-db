@@ -265,6 +265,17 @@ impl Engine {
             .any(|foreign_key| foreign_key.referenced_table == table.name);
         let index_resolved: Option<Vec<DmlResolvedMatch>> =
             if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+                // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
+                // the scan below reads the stale store.
+                if self.table_install_elided(&table.name) {
+                    self.rehydrate_elided_table(
+                        &table,
+                        visibility.read_txn_id,
+                        &Default::default(),
+                        &Default::default(),
+                        visibility.read_txn_id,
+                    )?;
+                }
                 None
             } else {
                 // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);
@@ -405,11 +416,31 @@ impl Engine {
         visibility: StorageVisibility,
         table_rows: &crate::resident_storage::TableRowsView,
     ) -> Result<Option<Vec<DmlResolvedMatch>>, EngineError> {
+        let elided = self.table_install_elided(&table.name);
+        // A4e: EVERY decline on an elided table must REHYDRATE first (sticky de-elision) — the
+        // fallbacks below the ladder read the STALE store (elided commits never installed), so a
+        // plain decline hands them wrong-empties or stale matches. This includes the SHAPE
+        // early-exits (OR-groups / range-only / non-Int4): the stale value-index silently MISSES
+        // elided-era rows.
+        let rehydrate_if_elided = |engine: &Self| -> Result<(), EngineError> {
+            if elided {
+                engine.rehydrate_elided_table(
+                    table,
+                    visibility.read_txn_id,
+                    &Default::default(),
+                    &Default::default(),
+                    visibility.read_txn_id,
+                )?;
+            }
+            Ok(())
+        };
         if !self.dml_device_resolve_enabled() {
+            rehydrate_if_elided(self)?;
             return Ok(None);
         }
         // Single-needle shape: one group, one Eq on an Int4 column (the locate probes one key).
         let [group] = filter_groups else {
+            rehydrate_if_elided(self)?;
             return Ok(None);
         };
         let mut eq: Option<(usize, i32)> = None;
@@ -422,34 +453,62 @@ impl Engine {
             }
         }
         let Some((filter_idx, needle)) = eq else {
+            rehydrate_if_elided(self)?;
             return Ok(None);
         };
         let Some(hits) =
             self.locate_resident_pk_via_shard_index_detailed(table, filter_idx, needle)
         else {
+            rehydrate_if_elided(self)?;
             return Ok(None); // locate declined (dup / oversize / invalid / not resident)
         };
         let mut matches: Vec<DmlResolvedMatch> = Vec::new();
         let prefix = relational_key_prefix(&table.name);
         for hit in &hits {
             let Some(region) = &hit.row_id else {
+                rehydrate_if_elided(self)?;
                 return Ok(None); // identity-unknown lineage -> host path
             };
             // A device-read failure DECLINES to the host fallback (audit A2 finding 2) — the
             // value-index resolve never touches the device, so a transient CUDA error must not
             // fail a statement the fallback would serve; every sibling exit in this loop declines.
             let Ok(halves) = region.read_resident_i32_column(u64::from(hit.slot) * 8, 2) else {
+                rehydrate_if_elided(self)?;
                 return Ok(None);
             };
             let (Some(lo), Some(hi)) = (halves.first(), halves.get(1)) else {
+                rehydrate_if_elided(self)?;
                 return Ok(None);
             };
             let row_id = (*lo as u32 as u64) | ((*hi as u32 as u64) << 32);
             if row_id == u64::MAX {
+                rehydrate_if_elided(self)?;
                 return Ok(None);
             }
             let key = relational_row_key(&table.name, row_id);
             debug_assert!(key.starts_with(&prefix));
+            // A4e: an ELIDED table's rows exist ONLY on the device — the host store is a stale
+            // prefix. Materialize row + visibility from the hit (A4a); tuple_id is synthetic
+            // (= row_id; apply skips host tombstoning for elided tables, nothing consumes it).
+            if elided {
+                match self.materialize_resident_row_via_hit(table, hit, visibility.read_txn_id) {
+                    Some(Some(row)) => {
+                        if filter_groups.iter().any(|filters| {
+                            filters.iter().all(|(idx, op, value)| {
+                                select_filter_matches(&row[*idx], *op, value)
+                            })
+                        }) {
+                            matches.push((row_id, key, row));
+                        }
+                        continue;
+                    }
+                    Some(None) => continue, // not visible at this snapshot, like a fetch miss
+                    None => {
+                        rehydrate_if_elided(self)?;
+                        return Ok(None);
+                    }
+                }
+            }
             let fetched = table_rows
                 .store()
                 .tuple_fetch_by_key(&key, visibility)
@@ -991,6 +1050,17 @@ impl Engine {
             .any(|foreign_key| foreign_key.referenced_table == table.name);
         let index_resolved: Option<Vec<DmlResolvedMatch>> =
             if self_referencing_fk || !self.dml_value_index_resolve_enabled() {
+                // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
+                // the scan below reads the stale store.
+                if self.table_install_elided(&table.name) {
+                    self.rehydrate_elided_table(
+                        &table,
+                        visibility.read_txn_id,
+                        &Default::default(),
+                        &Default::default(),
+                        visibility.read_txn_id,
+                    )?;
+                }
                 None
             } else {
                 // RETIREMENT A2: the DEVICE resolve first (locate -> row-identity -> keyed fetch);

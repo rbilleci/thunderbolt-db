@@ -3490,7 +3490,13 @@ mod capacity_payload_tests {
                 "UPDATE t SET v = 999 WHERE id = 130", // device resolve + materializer
                 "DELETE FROM t WHERE id = 42",         // device resolve + materializer
                 "INSERT INTO t (id, v) VALUES (130, 1)", // unique violation THROUGH the elided probe
-                "UPDATE t SET v = -5 WHERE id = 10 OR id = 11", // OR-group: decline -> REHYDRATE
+                // ADVERSARIAL: DML on ELIDED-ERA rows — they exist ONLY on the device; a
+                // stale-store fetch would silently no-op them.
+                "UPDATE t SET v = 7 WHERE id = 500", // materializer resolves an elided-era row
+                "DELETE FROM t WHERE id = 501",      // ... and deletes one
+                // OR-group incl an elided-era row: the stale value-index MISSES id=500 -> the
+                // shape early-exit must REHYDRATE first.
+                "UPDATE t SET v = -5 WHERE id = 500 OR id = 11",
                 "INSERT INTO t (id, v) VALUES (502, 5020)", // post-rehydration: normal installs
             ];
             let mut outcomes: Vec<Result<(), String>> = Vec::new();
@@ -3596,16 +3602,19 @@ mod capacity_payload_tests {
                 )
                 .unwrap();
             }
+            // Sample BEFORE the read: the full-projection SELECT below is a HOST-path shape, so
+            // the A4e read-side ladder legitimately rehydrates + de-elides to serve it.
+            let elided_through_waves = e.table_install_elided("t");
             let mut rows = e
                 .execute_relational_select_text("SELECT id, v FROM t")
                 .unwrap()
                 .rows
                 .into_boxed();
             rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-            (e, rows)
+            (e, rows, elided_through_waves)
         };
-        let (off, off_rows) = run(false);
-        let (on, on_rows) = run(true);
+        let (off, off_rows, _off_elided) = run(false);
+        let (on, on_rows, on_elided_through_waves) = run(true);
         assert_eq!(on_rows.len(), 500, "200 + 300 waves");
         assert_eq!(on_rows, off_rows, "concurrent elided == install twin");
         assert!(
@@ -3614,7 +3623,7 @@ mod capacity_payload_tests {
             on.host_install_elisions()
         );
         assert!(
-            on.table_install_elided("t"),
+            on_elided_through_waves,
             "steady state must STAY elided through ~5 rollovers (a de-elision = degradation)"
         );
         assert_eq!(off.host_install_elisions(), 0);
@@ -5324,15 +5333,17 @@ impl Engine {
                 // S-d2: the OPEN shard carries headroom (capacity > row_count for int4); the recompaction
                 // gather + offset helpers stride by this capacity. (Dead MVCC tail omitted when padded.)
                 capacity,
-                // S-d2b: append-eligible iff purely int4 (no text / int8 / numeric / bool / NULL sections)
-                // AND it has headroom — the SAME eligibility the single-buffer append checks.
+                // S-d2b/A4e: append-eligible iff purely int4 (no text / int8 / numeric / bool /
+                // NULL sections). NOT gated on headroom: a DENSE purely-int4 open shard (S-d2c's
+                // "large admit is one dense shard") must reach the append fn's ROLLOVER branch —
+                // the in-place branch checks headroom itself. Gating headroom here made every
+                // bulk-admitted lineage decline appends outright -> O(table) re-admit per commit.
                 int4_appendable: snapshot.resident_device_int8_columns.is_empty()
                     && snapshot.resident_device_numeric_columns.is_empty()
                     && snapshot.resident_device_bool_columns.is_empty()
                     && snapshot.resident_device_text_columns.is_empty()
                     && snapshot.resident_device_null_columns.is_empty()
-                    && snapshot.column_count == snapshot.resident_device_int4_columns.len()
-                    && capacity > row_count,
+                    && snapshot.column_count == snapshot.resident_device_int4_columns.len(),
                 // S-d3: the zone map (min/max per int4 column) for shard pruning.
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats

@@ -282,6 +282,22 @@ impl Engine {
         select: &Select,
         on_bound_before_pin: impl FnOnce(),
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        // RETIREMENT A4e — the READ-SIDE ladder seam: a host-path read on an ELIDED table would
+        // scan the STALE store (elided commits never installed). Rehydrate first (device gather +
+        // reconciliation, sticky de-elision), exactly like the DML ladder — any read shape the
+        // device routes cannot serve costs one O(table) rehydration instead of wrong results.
+        if self.host_install_elision_enabled() && self.table_install_elided(&select.table) {
+            if let Some(table) = self.relational_catalog_table(&select.table) {
+                self.rehydrate_elided_table(
+                    &table,
+                    self.committed_seq(),
+                    &Default::default(),
+                    &Default::default(),
+                    self.committed_seq(),
+                )
+                .map_err(ExecuteError::Engine)?;
+            }
+        }
         let (table, bound, copin_s) = self.bind_relational_select_for_execution(select)?;
         on_bound_before_pin();
         let pin = self.pin_relational_read_at(&select.table, copin_s);
