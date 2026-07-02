@@ -243,34 +243,58 @@ impl Engine {
         // Resolve (tuple_id, key, row) for each matching version against this table's published
         // generation: tuple_id is what apply tombstones; key/row feed the write-set entries.
         let table_rows = self.read_state.mvcc.table_rows(&delete.table);
-        let mut deletes: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
-        let mut cursor = table_rows
-            .store()
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-
-        while let Some(tuple) = cursor.next() {
-            if !tuple.key.starts_with(&prefix) {
-                continue;
-            }
-            let row = decode_relational_row(&tuple.value, &table.columns)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            if filter_groups.iter().any(|filters| {
-                filters
-                    .iter()
-                    .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
-            }) {
-                deletes.push((tuple.tuple_id, tuple.key.clone(), row));
-            }
-        }
-        drop(cursor);
-
-        if catalog.relational_catalog.values().any(|candidate| {
+        let has_inbound_fks = catalog.relational_catalog.values().any(|candidate| {
             candidate
                 .foreign_keys
                 .iter()
                 .any(|foreign_key| foreign_key.referenced_table == table.name)
-        }) {
+        });
+        // PHASE C slice 1 (ledger #1): an inbound-FK-free table with Eq-bearing filter groups
+        // resolves its matches through the VALUE INDEX — O(matches), not the O(table) seq_scan.
+        // FK-referenced tables keep the scan (the FK validator below needs the survivor set until
+        // it is index-driven — slice 1b). `None` (ineligible) -> the scan below, unchanged.
+        let index_resolved: Option<Vec<(u64, String, Vec<SqlValue>)>> = if has_inbound_fks
+            || !self.dml_value_index_resolve_enabled()
+        {
+            None
+        } else {
+            Self::resolve_dml_matches_via_value_index(
+                &table,
+                &table_rows,
+                &filter_groups,
+                visibility,
+                &prefix,
+            )?
+        };
+        let deletes: Vec<(u64, String, Vec<SqlValue>)> = match index_resolved {
+            Some(matches) => matches,
+            None => {
+                let mut deletes: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
+                let mut cursor = table_rows
+                    .store()
+                    .seq_scan_open(visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+
+                while let Some(tuple) = cursor.next() {
+                    if !tuple.key.starts_with(&prefix) {
+                        continue;
+                    }
+                    let row = decode_relational_row(&tuple.value, &table.columns)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    if filter_groups.iter().any(|filters| {
+                        filters
+                            .iter()
+                            .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+                    }) {
+                        deletes.push((tuple.tuple_id, tuple.key.clone(), row));
+                    }
+                }
+                drop(cursor);
+                deletes
+            }
+        };
+
+        if has_inbound_fks {
             let deleted_ids = deletes
                 .iter()
                 .map(|(tuple_id, _, _)| *tuple_id)
@@ -318,6 +342,76 @@ impl Engine {
                 deleted_rows,
             },
         })
+    }
+
+    /// PHASE C slice 1 (ledger #1): resolve the rows a DELETE/UPDATE touches via the per-table
+    /// equality VALUE-INDEX instead of the O(table) seq_scan + decode (MEASURED: single-row
+    /// DELETE/UPDATE p50 80-88ms at 262k rows, LINEAR in table size — the write path's dominant
+    /// cost; `examples/c1_prepare_split.rs`). ELIGIBILITY: every filter group carries at least one
+    /// `Eq` filter, so the union over groups of `index_keys(column, value)` is a SUPERSET of the
+    /// matching rows — the value-index is APPEND-ONLY (a stale entry names a row whose current
+    /// visible version no longer matches), and staleness resolves exactly as the read-side equality
+    /// fast-path resolves it: fetch each candidate key at the pinned `visibility`
+    /// (`tuple_fetch_by_key`, O(log n + chain)) and RE-CHECK the FULL filter groups on the decoded
+    /// row. Matches return sorted by `tuple_id` ascending — the seq_scan's iteration order
+    /// (`versions.values()` is tuple_id-keyed) — so the produced WriteDelta is byte-identical to
+    /// the scan path's. `None` = not eligible (no filters = full-table DML, or a range-only group)
+    /// -> the caller runs the seq_scan (the oracle path, always correct).
+    fn resolve_dml_matches_via_value_index(
+        table: &RelationalTable,
+        table_rows: &crate::resident_storage::TableRowsView,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        visibility: StorageVisibility,
+        prefix: &str,
+    ) -> Result<Option<Vec<(u64, String, Vec<SqlValue>)>>, EngineError> {
+        if filter_groups.is_empty() {
+            return Ok(None);
+        }
+        let mut candidate_keys: Vec<String> = Vec::new();
+        for group in filter_groups {
+            let Some((idx, _, value)) = group
+                .iter()
+                .find(|(_, op, _)| *op == SelectFilterOp::Eq)
+            else {
+                return Ok(None); // a range-only group: the index cannot bound it -> scan
+            };
+            let column = &table.columns[*idx].name;
+            candidate_keys.extend(table_rows.index_keys(column, &relational_index_value(value)));
+        }
+        // The append-only index records a key once per version that wrote the slot: dedup, and
+        // keep only THIS table's keys (defensive — the per-table index is table-scoped already).
+        candidate_keys.sort();
+        candidate_keys.dedup();
+        let mut matches: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
+        for key in candidate_keys {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            let fetched = table_rows
+                .store()
+                .tuple_fetch_by_key(&key, visibility)
+                .map_err(|err: gpu_db_storage::StorageError| {
+                    EngineError::ApplyFailed(err.to_string())
+                })?;
+            let Some(tuple) = fetched else {
+                continue; // deleted / not visible at this snapshot (a stale index entry)
+            };
+            let row = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            // The full predicate recheck: the candidate came from ONE Eq per group; the row must
+            // satisfy SOME complete group (and a stale entry whose current version no longer
+            // matches is excluded here).
+            if filter_groups.iter().any(|filters| {
+                filters
+                    .iter()
+                    .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+            }) {
+                matches.push((tuple.tuple_id, key, row));
+            }
+        }
+        // The seq_scan iterates tuple_id-ascending; match it so the delta bytes are identical.
+        matches.sort_by_key(|(tuple_id, _, _)| *tuple_id);
+        Ok(Some(matches))
     }
 
     /// PURE preflight + scan + encode for `UPDATE` (write-half MVCC, Stage 2). Resolves the
@@ -370,37 +464,83 @@ impl Engine {
         // write-set dedups to one slot), so an idempotent rewrite does not self-conflict.
         let mut released_unique_slots: Vec<UniqueIndexSlotKey> = Vec::new();
         let table_rows = self.read_state.mvcc.table_rows(&update.table);
-        let mut cursor = table_rows
-            .store()
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-
-        while let Some(tuple) = cursor.next() {
-            if !tuple.key.starts_with(&prefix) {
-                continue;
-            }
-            let mut row = decode_relational_row(&tuple.value, &table.columns)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            if filter_groups.iter().any(|filters| {
-                filters
+        // The constraint validators below consume `candidate_rows` (the NON-matched visible rows),
+        // which only the seq_scan produces — so a CONSTRAINED table (unique / CHECK / FK in either
+        // direction) keeps the scan until the validators are index-driven (slice 1b).
+        let constrained = table.indexes.iter().any(|index| index.unique)
+            || !table.check_constraints.is_empty()
+            || !table.foreign_keys.is_empty()
+            || catalog.relational_catalog.values().any(|candidate| {
+                candidate
+                    .foreign_keys
                     .iter()
-                    .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
-            }) {
-                // Capture the old image's unique slots BEFORE the assignments overwrite them.
-                let mut old_slots = WriteSet::default();
-                old_slots.add_unique_slots(&table, &row);
-                released_unique_slots.append(&mut old_slots.unique_slots);
-                // SV5: capture the OLD image before the assignments overwrite it (parallel to `updates`).
-                updated_old_rows.push(row.clone());
-                for (idx, value) in &assignments {
-                    row[*idx] = value.clone();
+                    .any(|foreign_key| foreign_key.referenced_table == table.name)
+            });
+        // PHASE C slice 1 (ledger #1): a constraint-free table with Eq-bearing filter groups
+        // resolves its matches through the VALUE INDEX — O(matches), not the O(table) seq_scan.
+        let index_resolved: Option<Vec<(u64, String, Vec<SqlValue>)>> = if constrained
+            || !self.dml_value_index_resolve_enabled()
+        {
+            None
+        } else {
+            Self::resolve_dml_matches_via_value_index(
+                &table,
+                &table_rows,
+                &filter_groups,
+                visibility,
+                &prefix,
+            )?
+        };
+        match index_resolved {
+            Some(matches) => {
+                for (tuple_id, key, mut row) in matches {
+                    // Identical per-match processing to the scan arm below (old-image slots ->
+                    // released; old image captured; assignments applied; install tuple pushed).
+                    let mut old_slots = WriteSet::default();
+                    old_slots.add_unique_slots(&table, &row);
+                    released_unique_slots.append(&mut old_slots.unique_slots);
+                    updated_old_rows.push(row.clone());
+                    for (idx, value) in &assignments {
+                        row[*idx] = value.clone();
+                    }
+                    updates.push((tuple_id, key, row));
                 }
-                updates.push((tuple.tuple_id, tuple.key.clone(), row));
-            } else {
-                candidate_rows.push(row);
+            }
+            None => {
+                let mut cursor = table_rows
+                    .store()
+                    .seq_scan_open(visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+
+                while let Some(tuple) = cursor.next() {
+                    if !tuple.key.starts_with(&prefix) {
+                        continue;
+                    }
+                    let mut row = decode_relational_row(&tuple.value, &table.columns)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    if filter_groups.iter().any(|filters| {
+                        filters
+                            .iter()
+                            .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+                    }) {
+                        // Capture the old image's unique slots BEFORE the assignments overwrite them.
+                        let mut old_slots = WriteSet::default();
+                        old_slots.add_unique_slots(&table, &row);
+                        released_unique_slots.append(&mut old_slots.unique_slots);
+                        // SV5: capture the OLD image before the assignments overwrite it (parallel to
+                        // `updates`).
+                        updated_old_rows.push(row.clone());
+                        for (idx, value) in &assignments {
+                            row[*idx] = value.clone();
+                        }
+                        updates.push((tuple.tuple_id, tuple.key.clone(), row));
+                    } else {
+                        candidate_rows.push(row);
+                    }
+                }
+                drop(cursor);
             }
         }
-        drop(cursor);
 
         if table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()

@@ -536,3 +536,103 @@ fn group_fsync_failure_wedges_the_concurrent_commit_path_without_exposing_the_de
     let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
     let _ = std::fs::remove_file(&path);
 }
+
+/// PHASE C slice 1 (ledger #1) — the VALUE-INDEX DML resolve == the seq_scan ORACLE. Runs every
+/// scenario TWICE (flag ON = index resolve, flag OFF = the scan) on twin engines fed identical
+/// statements, comparing the final table states; plus the semantics corners that could diverge:
+/// STALE index entries (the index is append-only: an UPDATE moves the indexed value but the old
+/// (column,value)->key entry survives — the visibility fetch + full predicate RECHECK must exclude
+/// it), OR filter groups, duplicate values (multi-row match, tuple_id order), range-only fallback
+/// (ineligible -> the scan arm serves under the flag), and DELETE-then-reinsert key reuse.
+/// SABOTAGE-VERIFIED: skip the predicate recheck in `resolve_dml_matches_via_value_index` and the
+/// stale-entry scenario FAILS (the moved row is wrongly deleted); force eligibility on a range-only
+/// group and the fallback scenario FAILS.
+#[test]
+fn dml_value_index_resolve_matches_seq_scan_oracle() {
+    let scenarios: Vec<Vec<&str>> = vec![
+        // 1. Point DELETE + point UPDATE on distinct values.
+        vec![
+            "DELETE FROM t WHERE id = 3",
+            "UPDATE t SET v = 999 WHERE id = 5",
+        ],
+        // 2. STALE-ENTRY (DELETE): move id 7 -> 70, then DELETE by the OLD value — it must delete
+        //    NOTHING (the index still carries the (id,7)->key entry; the fetched current version is
+        //    id=70 and the predicate RECHECK excludes it). The scenario ENDS here so a wrongly
+        //    deleted row diverges the final state (a follow-up delete-by-70 would mask it).
+        vec!["UPDATE t SET id = 70 WHERE id = 7", "DELETE FROM t WHERE id = 7"],
+        // 2b. STALE-ENTRY (UPDATE): same window, an UPDATE by the OLD value must update nothing.
+        vec!["UPDATE t SET id = 70 WHERE id = 7", "UPDATE t SET v = 111 WHERE id = 7"],
+        // 2c. The NEW value resolves through its own (appended) entry.
+        vec!["UPDATE t SET id = 70 WHERE id = 7", "DELETE FROM t WHERE id = 70"],
+        // 3. OR groups + duplicate matches (v carries duplicates by construction).
+        vec![
+            "DELETE FROM t WHERE id = 1 OR id = 4",
+            "UPDATE t SET v = -1 WHERE v = 20",
+        ],
+        // 4. Range-only predicate -> ineligible -> the scan arm under the flag (still correct).
+        vec!["DELETE FROM t WHERE id < 3", "UPDATE t SET v = 0 WHERE id > 8"],
+        // 5. DELETE then re-insert the same value, then UPDATE by it (key/entry reuse).
+        vec![
+            "DELETE FROM t WHERE id = 6",
+            "INSERT INTO t (id, v) VALUES (6, 606)",
+            "UPDATE t SET v = 707 WHERE id = 6",
+        ],
+    ];
+    for (i, statements) in scenarios.iter().enumerate() {
+        let build = |index_on: bool| -> Vec<Vec<SqlValue>> {
+            let e = Engine::new_local();
+            e.set_dml_value_index_resolve_enabled(index_on);
+            e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+            // v = (id % 5) * 10 -> deliberate duplicates in v.
+            let values: Vec<String> =
+                (0..10_i64).map(|k| format!("({k},{})", (k % 5) * 10)).collect();
+            e.execute_text(2, &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))
+                .unwrap();
+            for (j, sql) in statements.iter().enumerate() {
+                e.execute_text(10 + j as u64, sql).unwrap();
+            }
+            e.execute_relational_select_text("SELECT id, v FROM t ORDER BY id")
+                .unwrap()
+                .rows
+                .into_boxed()
+        };
+        let with_index = build(true);
+        let with_scan = build(false);
+        assert_eq!(
+            with_index, with_scan,
+            "scenario {i}: value-index resolve must equal the seq_scan oracle"
+        );
+    }
+}
+
+/// PHASE C slice 1 — constrained tables (unique / CHECK / FK either direction) and full-table DML
+/// keep the SCAN path (the validators need the survivor set until they are index-driven): the
+/// results are oracle-equal AND the constraint errors still fire.
+#[test]
+fn dml_value_index_resolve_constrained_tables_fall_back_correctly() {
+    let build = |index_on: bool| -> (Vec<Vec<SqlValue>>, String) {
+        let e = Engine::new_local();
+        e.set_dml_value_index_resolve_enabled(index_on);
+        e.execute_text(1, "CREATE TABLE p (id INT UNIQUE, v INT)").unwrap();
+        e.execute_text(2, "INSERT INTO p (id, v) VALUES (1,10),(2,20),(3,30)").unwrap();
+        e.execute_text(3, "DELETE FROM p WHERE id = 2").unwrap();
+        e.execute_text(4, "UPDATE p SET v = 99 WHERE id = 3").unwrap();
+        // A unique violation must still fire through the (scan-backed) validator.
+        let err = e
+            .execute_text(5, "UPDATE p SET id = 1 WHERE id = 3")
+            .unwrap_err()
+            .to_string();
+        // Range-only predicate: index-ineligible -> the scan arm serves (fallback coverage).
+        e.execute_text(6, "UPDATE p SET v = 7 WHERE v > -100").unwrap();
+        let rows = e
+            .execute_relational_select_text("SELECT id, v FROM p ORDER BY id")
+            .unwrap()
+            .rows
+            .into_boxed();
+        (rows, err)
+    };
+    let (rows_on, err_on) = build(true);
+    let (rows_off, err_off) = build(false);
+    assert_eq!(rows_on, rows_off, "constrained-table DML == oracle");
+    assert_eq!(err_on, err_off, "constraint error identical through both paths");
+}

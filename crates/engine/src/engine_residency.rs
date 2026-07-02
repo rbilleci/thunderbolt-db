@@ -4528,6 +4528,18 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// PHASE C slice 1: enable/disable the VALUE-INDEX resolve for DELETE/UPDATE prepare (default
+    /// ON). OFF = the O(table) seq_scan (the oracle path) — the A/B lever the differentials use.
+    pub fn set_dml_value_index_resolve_enabled(&self, on: bool) {
+        self.dml_value_index_resolve_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn dml_value_index_resolve_enabled(&self) -> bool {
+        self.dml_value_index_resolve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// S-d2c: set the target row count per shard (the rollover/seal threshold). Settable small in tests.
     pub fn set_shard_size_target(&self, rows: usize) {
         self.shard_size_target
