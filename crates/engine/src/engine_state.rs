@@ -510,6 +510,16 @@ pub(crate) struct ResidencyReadState {
     /// (out-of-line — the immutable column payload is never touched). The read filter (SV3) gathers it into
     /// the recompaction's unified buffer for the `deleted_by > read_txn_id` mask.
     pub(crate) shard_deleted_by_memory: ShardResidentDeviceMemoryMap,
+    /// SV6 (`created_by` SI lower bound — the SV5 flip-gate): the per-shard on-demand `created_by` region,
+    /// keyed `(table, shard_id)`, PARALLEL to `shard_deleted_by_memory` and under the SAME lifecycle
+    /// discipline (cleaned at every site the buffer it annotates is retired). A shard whose rows are all
+    /// born-visible has NO entry (the sparse-versioning property); the region — a `capacity`-sized i64
+    /// buffer born all-visible (fill `0x00` = created_by 0 <= every read snapshot) — is allocated the first
+    /// time an incremental UPDATE commit (SV5) APPENDS a new row version, which stamps
+    /// `created_by[slot] = commit_seq` there. The read filter ANDs `created_by <= read_txn_id` so a reader
+    /// bound to an OLDER snapshot cannot see the appended version (the SV5 P2 double-read window). Plain
+    /// INSERT appends stay unstamped (born-visible, today's semantics).
+    pub(crate) shard_created_by_memory: ShardResidentDeviceMemoryMap,
     /// ADR-009 R1: per-table GPU hash-index reuse cache for the index-probe point-lookup route (built
     /// lazily, behind the default-OFF `index_probe_enabled` flag). A plain `Mutex` (not the lock-free
     /// `ArcSwap` the hot path uses) because the index route is opt-in + the lock is taken only off the

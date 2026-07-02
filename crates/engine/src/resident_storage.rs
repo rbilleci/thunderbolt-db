@@ -793,6 +793,8 @@ impl RelationalResidentCache {
         // table is not yet an eviction candidate -- this is a no-op until shard-eviction is wired, but it keeps
         // this method's cleanup COMPLETE (mirrors the `shard_device_memory.remove_table` on the line above).
         residency.shard_deleted_by_memory.remove_table(table);
+        // SV6: the evictee's `created_by` regions go with its buffers (same stale-region/leak contract).
+        residency.shard_created_by_memory.remove_table(table);
         // Sub-slice 3b: drop the evicted table's cached per-shard PK indexes (they pin the freed buffers).
         residency.purge_shard_pk_index_for_table(table);
         telemetry.remove_table(table);

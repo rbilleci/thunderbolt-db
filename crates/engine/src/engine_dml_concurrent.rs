@@ -324,9 +324,10 @@ impl Engine {
         // success skip the invalidation it replaces; otherwise invalidate (and the re-admit below
         // rebuilds, with fresh headroom).
         let appended = self.auto_admit_on_commit_enabled()
-            && insert_append
-                .as_ref()
-                .is_some_and(|(table, rows)| self.try_append_resident_int4_open_shard(table, rows));
+            && insert_append.as_ref().is_some_and(|(table, rows)| {
+                // Plain INSERT appends are unstamped/born-visible (SV6 `created_by = None`).
+                self.try_append_resident_int4_open_shard(table, rows, None)
+            });
         if !appended {
             self.invalidate_relational_residency_tables_concurrent(
                 &residency_tables,

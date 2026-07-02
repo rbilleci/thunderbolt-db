@@ -809,12 +809,18 @@ impl Engine {
                 key,
             ) {
                 ShardPkProbe::Hit(row) => {
-                    // Capture the deleted_by region (if versioned) from the SAME snapshot -> the visibility
-                    // gate reads a `deleted_by[slot]` aligned to the SAME generation as the slot + buffer.
+                    // Capture the deleted_by + created_by regions (if versioned) from the SAME snapshot ->
+                    // the visibility gates read `deleted_by[slot]`/`created_by[slot]` aligned to the SAME
+                    // generation as the slot + buffer.
                     let deleted_by = self
                         .read_state
                         .residency
                         .shard_deleted_by_memory
+                        .get(&(table.name.clone(), shard.shard_id));
+                    let created_by = self
+                        .read_state
+                        .residency
+                        .shard_created_by_memory
                         .get(&(table.name.clone(), shard.shard_id));
                     out.push(ShardPkHit {
                         shard_id: shard.shard_id,
@@ -822,6 +828,7 @@ impl Engine {
                         descriptor,
                         device_memory,
                         deleted_by,
+                        created_by,
                     });
                 }
                 ShardPkProbe::Miss => {}
@@ -1066,10 +1073,16 @@ impl Engine {
                 .residency
                 .shard_deleted_by_memory
                 .get(&(table.name.clone(), shard.shard_id));
+            let created_by = self
+                .read_state
+                .residency
+                .shard_created_by_memory
+                .get(&(table.name.clone(), shard.shard_id));
             groups.push(BatchShardGroup {
                 descriptor,
                 device_memory,
                 deleted_by,
+                created_by,
                 hits,
             });
         }
@@ -1145,7 +1158,7 @@ impl Engine {
         for group in &groups {
             let slots: Vec<u64> = group.hits.iter().map(|&(_, slot)| slot as u64).collect();
             // SV3b visibility: ONE batched i64 gather of deleted_by at the slots (versioned shard), else live.
-            let visible: Vec<bool> = match &group.deleted_by {
+            let mut visible: Vec<bool> = match &group.deleted_by {
                 Some(region) => {
                     let dby = region.project_i64_rows_from_payload(0, &slots).ok()?;
                     if dby.len() != slots.len() {
@@ -1155,6 +1168,18 @@ impl Engine {
                 }
                 None => vec![true; slots.len()],
             };
+            // SV6 lower bound: AND `created_by <= read_txn_id` (one batched i64 gather) so an
+            // UPDATE-appended version whose commit exceeds the read snapshot stays hidden (the
+            // double-read gate). An un-stamped shard (no region) is born-visible.
+            if let Some(region) = &group.created_by {
+                let cby = region.project_i64_rows_from_payload(0, &slots).ok()?;
+                if cby.len() != slots.len() {
+                    return None;
+                }
+                for (v, &c) in visible.iter_mut().zip(cby.iter()) {
+                    *v = *v && c <= read_txn_id;
+                }
+            }
             // ONE batched i32 gather per projected column at the group's slots.
             let mut col_values: Vec<Vec<i32>> = Vec::with_capacity(ncols);
             for &idx in selected_indexes {
@@ -1336,14 +1361,26 @@ impl Engine {
             if shard.row_count == 0 {
                 continue;
             }
-            // DELETE-FREE gate: a VERSIONED shard needs the SV3b `deleted_by[slot]` visibility gate, which the
-            // dense kernel does not apply -> fall back to the host gather (which does) for the whole batch.
+            // VERSION-FREE gate: a VERSIONED shard needs the SV3b `deleted_by[slot]` (and/or the SV6
+            // `created_by[slot]`) visibility gate, which the dense kernel does not apply -> fall back to
+            // the host gather (which applies both) for the whole batch. The `created_by` arm is DEFENSIVE
+            // today (sabotage-checked UNREACHABLE-to-violate: an incremental UPDATE always tombstones the
+            // old version FIRST, and the old row's shard precedes-or-equals the stamped open/rolled shard
+            // in this published-order scan, so the `deleted_by` arm always declines the batch no later
+            // than this one could). It becomes LOAD-BEARING the moment `deleted_by` regions can be
+            // reclaimed independently (VACUUM/GC, scalability-ledger #5) — do NOT remove it then.
             if self
                 .read_state
                 .residency
                 .shard_deleted_by_memory
                 .get(&(table.name.clone(), shard.shard_id))
                 .is_some()
+                || self
+                    .read_state
+                    .residency
+                    .shard_created_by_memory
+                    .get(&(table.name.clone(), shard.shard_id))
+                    .is_some()
             {
                 return None;
             }
@@ -2063,6 +2100,10 @@ pub(crate) struct ShardPkHit {
     pub(crate) descriptor: RelationalResidencySnapshot,
     pub(crate) device_memory: Arc<CudaResidentDeviceMemory>,
     pub(crate) deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+    /// SV6: the shard's `created_by` region (same snapshot/pin discipline as `deleted_by`) — the route's
+    /// `created_by[slot] <= read_txn_id` lower-bound gate hides an UPDATE-appended version from a reader
+    /// bound to an older snapshot. `None` = un-stamped shard, born-visible.
+    pub(crate) created_by: Option<Arc<CudaResidentDeviceMemory>>,
 }
 
 /// Step 1 (lpb-for-shards): a shard's BATCHED hits — the generation-consistent captured handles (descriptor,
@@ -2072,6 +2113,8 @@ struct BatchShardGroup {
     descriptor: RelationalResidencySnapshot,
     device_memory: Arc<CudaResidentDeviceMemory>,
     deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+    /// SV6: the shard's `created_by` region (same snapshot/pin discipline) for the batched lower-bound gate.
+    created_by: Option<Arc<CudaResidentDeviceMemory>>,
     hits: Vec<(u32, u32)>, // (needle_index, local slot)
 }
 

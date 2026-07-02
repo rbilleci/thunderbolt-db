@@ -1957,6 +1957,58 @@ pub(crate) struct ResidentExecSource {
     pub(crate) row_count: u64,
 }
 
+/// SV3b/SV6: the on-device MVCC visibility descriptor for a VERSIONED (unified) buffer. A row is visible
+/// iff `deleted_by > read_txn_id` (SV3b upper bound — tombstoned-at-or-before-my-snapshot rows are hidden)
+/// AND `created_by <= read_txn_id` (SV6 lower bound — versions appended by a commit newer than my snapshot
+/// are hidden; the SV5 UPDATE double-read flip-gate). Each bound is present only when SOME gathered shard
+/// carries the corresponding on-demand region (the sparse-versioning property: an UPDATE can tombstone in
+/// one shard and append into another, so the two offsets are independent); at least one is `Some` by
+/// construction — a buffer with neither takes the `None` visibility path, byte-identical to pre-SV3b.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResidentVisibility {
+    /// The read snapshot (`committed_seq` bound at read start), as the signed i64 the s64 kernels compare.
+    pub(crate) read_txn_id: i64,
+    /// Byte offset of the co-resident dense i64 `deleted_by` column in the unified buffer, if gathered.
+    pub(crate) deleted_by_offset: Option<u64>,
+    /// Byte offset of the co-resident dense i64 `created_by` column in the unified buffer, if gathered.
+    pub(crate) created_by_offset: Option<u64>,
+}
+
+impl ResidentVisibility {
+    /// Append this visibility's conjunct(s) to a mask-VM `program`. Each conjunct is a `LoadColumnI64`
+    /// IMMEDIATELY consumed by its `CompareScalarI64` (the mixed-width VM caller contract: an i64 compare
+    /// must pop an 8-byte buffer), producing a 0/1 mask. `and_onto_existing_mask` = a WHERE mask is already
+    /// on the VM stack, so EVERY conjunct is ANDed onto it; otherwise the FIRST conjunct becomes the mask
+    /// and only a second conjunct ANDs (`MaskBinary` op 0). `deleted_by > read_txn_id` is cmp 3 (Gt);
+    /// `created_by <= read_txn_id` is cmp 2 (Le) — see the PTX cmp code table
+    /// (`gpu_db_buffer_i64_compare_scalar_to_mask`: 0=eq/1=lt/2=le/3=gt/4=ge/5=ne).
+    pub(crate) fn push_conjuncts(
+        &self,
+        program: &mut Vec<gpu_db_execution::ExprStep>,
+        and_onto_existing_mask: bool,
+    ) {
+        let mut have_mask = and_onto_existing_mask;
+        for (byte_offset, cmp) in [
+            (self.deleted_by_offset, 3_u32), // visible: deleted_by > read_txn_id
+            (self.created_by_offset, 2_u32), // visible: created_by <= read_txn_id
+        ] {
+            let Some(byte_offset) = byte_offset else {
+                continue;
+            };
+            program.push(gpu_db_execution::ExprStep::LoadColumnI64 { byte_offset });
+            program.push(gpu_db_execution::ExprStep::CompareScalarI64 {
+                cmp,
+                scalar: self.read_txn_id,
+                scalar_on_left: false,
+            });
+            if have_mask {
+                program.push(gpu_db_execution::ExprStep::MaskBinary { op: 0 });
+            }
+            have_mask = true;
+        }
+    }
+}
+
 impl Engine {
     /// General GPU executor entry (Charter rule 2): run `SELECT <int4 columns> FROM <table>` filtered
     /// by a general predicate [`ResidentExpr`], evaluating the predicate on the GPU via the device
@@ -2250,16 +2302,19 @@ impl Engine {
     /// tombstone-without-append (append failed after the tombstone) is harmless -- the re-admit supersedes it
     /// and SV4-prereq-#1 releases the partial region. Runs under commit_mutex + catalog latch.
     ///
-    /// **SI CAVEAT (audit-flagged P2 — LOAD-BEARING FLIP GATE):** the appended NEW version has NO
-    /// `created_by <= read_txn_id` lower-bound gate (SV deferred `created_by`). The append + `row_count` bump
-    /// happen BEFORE `publish_committed_seq`, and lock-free reads bind `read_txn_id = committed_seq()` then
-    /// load `shards` separately -- so a concurrent reader that observes `committed_seq = C-1` while the shards
-    /// ALREADY carry the appended row sees the key TWICE (old visible via `deleted_by=C > C-1`, new
-    /// wrongly-visible with no created_by gate). INERT today (flag default OFF); but
-    /// `resident_update_tombstone_enabled` MUST NOT be flipped ON until the `created_by` lower-bound gate
-    /// (or a committed_seq<->shards consistent-snapshot fix) lands + a concurrent-reader test gates it. This
-    /// is the roadmap's "old-snapshot visibility / reintroduce created_by" item, elevated to a flip gate.
-    /// (DELETE/SV4b is unaffected -- no new row; INSERT append has the milder premature-insert form.)
+    /// **SI (SV6 — the audit-flagged P2 flip-gate, FIXED):** the append + `row_count` bump happen BEFORE
+    /// `publish_committed_seq`, and lock-free reads bind `read_txn_id = committed_seq()` then load `shards`
+    /// separately -- so a concurrent reader that observes `committed_seq = C-1` can observe the shards with
+    /// the appended row already present. The appended NEW version is therefore STAMPED
+    /// `created_by = commit_seq` (a per-shard on-demand i64 region mirroring `deleted_by`, written while the
+    /// slots are still invisible headroom — see the append path's ORDER comment), and EVERY sharded read
+    /// path ANDs the device-side `created_by <= read_txn_id` lower bound (scan/VM conjunct, 3b route
+    /// per-hit gate, batched gather gate; the un-gated GPU dense kernel DECLINES stamped shards). So the
+    /// C-1 reader sees the key EXACTLY ONCE (the OLD version: `deleted_by = C > C-1` visible, new hidden)
+    /// and a reader at C sees exactly the NEW one. Gated by the
+    /// `sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice` torn-window differential
+    /// and the concurrent hammer test. (DELETE/SV4b needs no lower bound -- no new row; a plain INSERT
+    /// append stays unstamped/born-visible, the milder as-if-later read of a decided commit.)
     pub(crate) fn try_update_resident_commit(
         &self,
         cat: &DdlCatalogState,
@@ -2276,9 +2331,14 @@ impl Engine {
         if !self.try_tombstone_resident_delete_commit(cat, table_name, old_rows, commit_seq) {
             return false;
         }
-        // 2. Append the NEW image to the open shard. If this fails AFTER the tombstone, the caller's re-admit
-        //    rebuilds all-live from the host store (which already applied the version rewrite), superseding.
-        if !self.try_append_resident_int4_open_shard(table_name, new_rows) {
+        // 2. Append the NEW image to the open shard, stamped `created_by = commit_seq` (SV6 — the P2
+        //    flip-gate fix): the append + row_count bump land BEFORE `publish_committed_seq`, so a
+        //    concurrent reader bound to `committed_seq = C-1` can observe the appended slots; the stamp +
+        //    the read path's `created_by <= read_txn_id` device conjunct hide the new version from that
+        //    reader (it sees exactly the OLD version, still live at its snapshot). If this fails AFTER the
+        //    tombstone, the caller's re-admit rebuilds all-live from the host store (which already applied
+        //    the version rewrite), superseding.
+        if !self.try_append_resident_int4_open_shard(table_name, new_rows, Some(commit_seq)) {
             return false;
         }
         true
@@ -2449,14 +2509,15 @@ impl Engine {
         };
 
         // Run one (already-bound) select against an injected source via the general executor. `vis` is the
-        // SV3b MVCC visibility descriptor for the unified buffer (`Some((deleted_by_offset, read_txn_id))`
-        // when any surviving shard is versioned, else `None`) -- forwarded so the on-device predicate ANDs
-        // `deleted_by > read_txn_id` and hides tombstoned rows. BOTH the COUNT precheck and the real run pass
-        // the SAME `vis` so the count and the projection agree on which rows are visible.
+        // SV3b/SV6 MVCC visibility descriptor for the unified buffer (`Some` when any surviving shard is
+        // versioned, else `None`) -- forwarded so the on-device predicate ANDs the visibility bound(s)
+        // (`deleted_by > read_txn_id`, `created_by <= read_txn_id`) and hides invisible versions. BOTH the
+        // COUNT precheck and the real run pass the SAME `vis` so the count and the projection agree on
+        // which rows are visible.
         let run = |select_ref: &Select,
                    bound_for_select: BoundRelationalSelect,
                    src: &ResidentExecSource,
-                   vis: Option<(u64, i64)>|
+                   vis: Option<ResidentVisibility>|
          -> Result<RelationalSelectResult, ExecuteError> {
             self.execute_resident_expr_select_with_binding(
                 select_ref,
@@ -2548,60 +2609,76 @@ impl Engine {
         }
         let int4_bytes = 8 + (total_row_count as u64) * 4 * (num_int4_cols as u64);
 
-        // SV3b MVCC visibility gather: if ANY surviving shard is VERSIONED (carries an on-demand `deleted_by`
-        // region), append a co-resident DENSE i64 `deleted_by` column to the unified buffer right after the
-        // int4 columns. The predicate then ANDs `deleted_by > read_txn_id` to hide tombstoned rows. Only the
-        // versioned shards contribute bytes, so the whole region is first MEMSET to the all-live sentinel
-        // (SV3a fill, byte 0x7F = a large positive i64 > every commit Index) and each versioned shard's live
-        // prefix is DtoD-copied over its rows. The int4 descriptor/offsets are untouched (the executor reads
-        // deleted_by by ABSOLUTE byte offset via LoadColumnI64). The un-versioned majority allocates zero
-        // extra bytes and takes the `None` visibility path -- byte-identical to the pre-SV3b read.
+        // SV3b/SV6 MVCC visibility gather: if ANY surviving shard is VERSIONED (carries an on-demand
+        // `deleted_by` and/or `created_by` region), append the corresponding co-resident DENSE i64 column(s)
+        // to the unified buffer right after the int4 columns. The predicate then ANDs
+        // `deleted_by > read_txn_id` (hide tombstoned rows) and/or `created_by <= read_txn_id` (hide
+        // versions appended by a commit newer than the read snapshot — the SV5 double-read flip-gate). The
+        // int4 descriptor/offsets are untouched (the executor reads the version columns by ABSOLUTE byte
+        // offset via LoadColumnI64). The un-versioned majority allocates zero extra bytes and takes the
+        // `None` visibility path -- byte-identical to the pre-SV3b read.
         let mut fills: Vec<gpu_db_execution::RecompactFill> = Vec::new();
-        let mut visibility: Option<(u64, i64)> = None;
-        let has_versioned = shards.iter().any(|shard| {
-            self.read_state
-                .residency
-                .shard_deleted_by_memory
-                .get(&(table.name.clone(), shard.shard_id))
-                .is_some()
-        });
-        let allocated_bytes = if has_versioned {
-            let deleted_by_offset = int4_bytes;
-            let deleted_by_bytes = (total_row_count as u64) * 8;
-            // Fill the WHOLE deleted_by region live first (covers un-versioned shards' rows + any tail);
-            // versioned segments below overwrite only their own live rows.
+        let mut deleted_by_offset: Option<u64> = None;
+        let mut created_by_offset: Option<u64> = None;
+        let mut allocated_bytes = int4_bytes;
+        // The two version-metadata regions (`deleted_by` upper bound, SV3b; `created_by` lower bound, SV6)
+        // are gathered INDEPENDENTLY — an UPDATE tombstones the old version in one shard and appends the
+        // stamped new version into the OPEN shard, so a shard can carry either region without the other.
+        // Each region mirrors the same fill+segment pattern: FILL the whole unified column with the
+        // "visible" sentinel (covers un-versioned shards' rows + any tail), then one DtoD segment per
+        // region-bearing shard overwrites its own live rows. `rows_before` walks shards in the SAME
+        // published order the int4 gather used, so the version rows line up 1:1 with the int4 rows.
+        for (region_map, fill_byte, offset_out) in [
+            (
+                &self.read_state.residency.shard_deleted_by_memory,
+                crate::engine_residency::DELETED_BY_LIVE_FILL_BYTE,
+                &mut deleted_by_offset,
+            ),
+            (
+                &self.read_state.residency.shard_created_by_memory,
+                crate::engine_residency::CREATED_BY_VISIBLE_FILL_BYTE,
+                &mut created_by_offset,
+            ),
+        ] {
+            let has_region = shards
+                .iter()
+                .any(|shard| region_map.get(&(table.name.clone(), shard.shard_id)).is_some());
+            if !has_region {
+                continue;
+            }
+            let region_offset = allocated_bytes;
+            let region_bytes = (total_row_count as u64) * 8;
             fills.push(gpu_db_execution::RecompactFill {
-                byte_offset: deleted_by_offset,
-                len: deleted_by_bytes,
-                fill_byte: crate::engine_residency::DELETED_BY_LIVE_FILL_BYTE,
+                byte_offset: region_offset,
+                len: region_bytes,
+                fill_byte,
             });
-            // One DtoD segment per versioned shard: its `row_count` live deleted_by slots (dense at the
-            // region front, byte 0..row_count*8, NO header) -> the unified dense slot at `rows_before*8`.
-            // `rows_before` walks shards in the SAME published order the int4 gather used, so deleted_by
-            // rows line up 1:1 with the int4 rows.
             let mut rows_before = 0_u64;
             for shard in &shards {
                 let row_count = shard.row_count as u64;
-                if let Some(region) = self
-                    .read_state
-                    .residency
-                    .shard_deleted_by_memory
-                    .get(&(table.name.clone(), shard.shard_id))
-                {
+                if let Some(region) = region_map.get(&(table.name.clone(), shard.shard_id)) {
                     segments.push(gpu_db_execution::RecompactSegment {
                         src_device_ptr: region.device_ptr(),
                         src_byte_offset: 0,
-                        dst_byte_offset: deleted_by_offset + rows_before * 8,
+                        dst_byte_offset: region_offset + rows_before * 8,
                         byte_len: row_count * 8,
                     });
                 }
                 rows_before = rows_before.saturating_add(row_count);
             }
-            visibility = Some((deleted_by_offset, copin_s as i64));
-            int4_bytes + deleted_by_bytes
-        } else {
-            int4_bytes
-        };
+            *offset_out = Some(region_offset);
+            allocated_bytes += region_bytes;
+        }
+        let visibility: Option<ResidentVisibility> =
+            if deleted_by_offset.is_some() || created_by_offset.is_some() {
+                Some(ResidentVisibility {
+                    read_txn_id: copin_s as i64,
+                    deleted_by_offset,
+                    created_by_offset,
+                })
+            } else {
+                None
+            };
 
         // M3-for-shards: recompact each column's NULL VALIDITY BITMAP into the unified buffer (mirrors the
         // deleted_by region: FILL all-valid, then DtoD-copy each null-bearing shard's bitmap). A column gets a
@@ -2613,7 +2690,6 @@ impl Engine {
         // by construction (the rollover admit rejects NULLs -> a null-bearing table is a SINGLE shard with
         // rows_before == 0), so this always holds -- a misaligned null-bearing shard errors rather than
         // mis-copy bits (never a wrong result). No null-bearing shard -> zero extra bytes, byte-identical read.
-        let mut allocated_bytes = allocated_bytes;
         let mut unified_null_columns: Vec<crate::relational_model::ResidentDeviceNullBitmapLayout> =
             Vec::new();
         {
@@ -2888,14 +2964,23 @@ impl Engine {
             // header, little-endian) HIDES the row when `deleted_by <= read_txn_id`; an un-versioned shard (no
             // region) is all-live. `copin_s as i64` is the read snapshot, exactly the scan's `vis`. The region
             // is the SAME-generation handle captured in the hit.
+            let read_i64_at_slot = |region: &Arc<CudaResidentDeviceMemory>| -> Option<i64> {
+                let halves = region.read_resident_i32_column(slot * 8, 2).ok()?;
+                Some(
+                    ((*halves.first()? as u32 as u64) | ((*halves.get(1)? as u32 as u64) << 32))
+                        as i64,
+                )
+            };
             let visible = match &hit.deleted_by {
-                Some(region) => {
-                    let halves = region.read_resident_i32_column(slot * 8, 2).ok()?;
-                    let deleted_by =
-                        ((*halves.first()? as u32 as u64) | ((*halves.get(1)? as u32 as u64) << 32))
-                            as i64;
-                    deleted_by > copin_s as i64
-                }
+                Some(region) => read_i64_at_slot(region)? > copin_s as i64,
+                None => true,
+            }
+            // SV6 lower bound: a `created_by`-versioned shard's `created_by[slot]` HIDES the row when it
+            // exceeds the read snapshot (an UPDATE-appended version whose commit this reader must not see —
+            // the double-read gate), mirroring the scan's `created_by <= read_txn_id` conjunct. An
+            // un-stamped shard (no region) is born-visible.
+            && match &hit.created_by {
+                Some(region) => read_i64_at_slot(region)? <= copin_s as i64,
                 None => true,
             };
             if visible {
@@ -4084,11 +4169,11 @@ impl Engine {
         copin_s: Index,
         // `None` = no WHERE clause: a full-table scan (every row survives).
         predicate: Option<&ResidentExpr>,
-        // SV3b (MVCC visibility): `Some((deleted_by_offset, read_txn_id))` = this (unified) buffer carries a
-        // co-resident i64 `deleted_by` column at `deleted_by_offset`; AND `deleted_by > read_txn_id` onto the
-        // survivors so tombstoned rows are hidden. `None` = a delete-free/unversioned buffer (the common case)
-        // -> no visibility mask, byte-identical to the pre-SV3b path. Only the sharded read passes `Some`.
-        visibility: Option<(u64, i64)>,
+        // SV3b/SV6 (MVCC visibility): `Some` = this (unified) buffer carries co-resident i64 version
+        // column(s); AND `deleted_by > read_txn_id` (hide tombstoned rows) and/or `created_by <=
+        // read_txn_id` (hide too-new appended versions) onto the survivors. `None` = a version-free buffer
+        // (the common case) -> no visibility mask, byte-identical. Only the sharded read passes `Some`.
+        visibility: Option<ResidentVisibility>,
         // Parallel to `select.order_by`: `Some(expr)` = a SORT EXPRESSION key (`ORDER BY a+b`),
         // evaluated on-device into an i64 key column; `None` = a plain column key. Empty = no ORDER BY.
         order_by_exprs: &[Option<ResidentExpr>],
@@ -4261,20 +4346,13 @@ impl Engine {
                     visibility,
                 )?,
                 None => match visibility {
-                    // SV3b: no WHERE but a versioned buffer -> the survivors are exactly the VISIBLE rows.
-                    // Run a visibility-only VM program (`deleted_by > read_txn_id`) at elem=I64 -- the same
-                    // mixed-width interpreter, with no i32 WHERE mask to AND against.
-                    Some((deleted_by_offset, read_txn_id)) => {
-                        let program = vec![
-                            gpu_db_execution::ExprStep::LoadColumnI64 {
-                                byte_offset: deleted_by_offset,
-                            },
-                            gpu_db_execution::ExprStep::CompareScalarI64 {
-                                cmp: 3,
-                                scalar: read_txn_id,
-                                scalar_on_left: false,
-                            },
-                        ];
+                    // SV3b/SV6: no WHERE but a versioned buffer -> the survivors are exactly the VISIBLE
+                    // rows. Run a visibility-only VM program (`deleted_by > read_txn_id` and/or
+                    // `created_by <= read_txn_id`) at elem=I64 -- the same mixed-width interpreter, with no
+                    // i32 WHERE mask to AND against (the first conjunct IS the mask).
+                    Some(vis) => {
+                        let mut program: Vec<gpu_db_execution::ExprStep> = Vec::new();
+                        vis.push_conjuncts(&mut program, false);
                         device_memory
                             .run_expr_predicate_filter_with_text(
                                 &program,
@@ -8076,16 +8154,16 @@ impl Engine {
         snapshot: &RelationalResidencySnapshot,
         device_memory: &CudaResidentDeviceMemory,
         row_count: u64,
-        // SV3b (MVCC visibility): `Some((deleted_by_offset, read_txn_id))` on a VERSIONED shard — AND the
-        // on-device `deleted_by > read_txn_id` mask onto the WHERE survivors. `None` (delete-free/cold shard,
-        // the majority) keeps the peephole fast paths below byte-identically.
-        visibility: Option<(u64, i64)>,
+        // SV3b/SV6 (MVCC visibility): `Some` on a VERSIONED shard — AND the on-device visibility mask
+        // (`deleted_by > read_txn_id`, and/or `created_by <= read_txn_id`) onto the WHERE survivors.
+        // `None` (version-free/cold shard, the majority) keeps the peephole fast paths below byte-identically.
+        visibility: Option<ResidentVisibility>,
     ) -> Result<Vec<u32>, ExecuteError> {
         // SV3b: a versioned shard forces the mask VM (bypassing the typed peephole kernels) so the WHERE is a
         // program we can AND the i64 visibility mask onto — via the mixed-width VM (int4 WHERE at elem=I32 +
-        // an i64 `deleted_by` compare). Only versioned shards reach here, so the peephole fast paths below
-        // stay the common-case default.
-        if let Some((deleted_by_offset, read_txn_id)) = visibility {
+        // an i64 `deleted_by`/`created_by` compare). Only versioned shards reach here, so the peephole fast
+        // paths below stay the common-case default.
+        if let Some(vis) = visibility {
             // A predicate the VM can't lower at one elem width (mixed non-int8 widths / an unsupported shape)
             // can't compose the i64 visibility conjunct, so this HARD-ERRORS rather than risk leaking
             // tombstoned rows. NB: this is NOT the CPU fallback (that fires only on residency invalidation);
@@ -8101,14 +8179,9 @@ impl Engine {
             let mut program: Vec<gpu_db_execution::ExprStep> = Vec::new();
             let mut needles: Vec<Vec<u8>> = Vec::new();
             compile_predicate_program(predicate, table, snapshot, &mut program, &mut needles)?;
-            // AND the visibility: `deleted_by > read_txn_id` (cmp 3 = Gt), then MaskBinary op 0 = AND.
-            program.push(gpu_db_execution::ExprStep::LoadColumnI64 { byte_offset: deleted_by_offset });
-            program.push(gpu_db_execution::ExprStep::CompareScalarI64 {
-                cmp: 3,
-                scalar: read_txn_id,
-                scalar_on_left: false,
-            });
-            program.push(gpu_db_execution::ExprStep::MaskBinary { op: 0 });
+            // AND the visibility conjunct(s) onto the WHERE mask. Each `CompareScalarI64` immediately
+            // consumes its own `LoadColumnI64` buffer (the mixed-width VM caller contract).
+            vis.push_conjuncts(&mut program, true);
             return device_memory
                 .run_expr_predicate_filter_with_text(&program, &needles, row_count, elem)
                 .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())));

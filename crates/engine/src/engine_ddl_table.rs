@@ -1175,6 +1175,11 @@ impl Engine {
                 .residency
                 .shard_deleted_by_memory
                 .remove_table(name);
+            // SV6: the dropped table's `created_by` region cells are erased the same way (same leak guard).
+            self.read_state
+                .residency
+                .shard_created_by_memory
+                .remove_table(name);
             // Sub-slice 3b: a DROPped table's cached per-shard PK indexes are gone for good -> purge them.
             self.read_state
                 .residency

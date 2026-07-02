@@ -307,6 +307,13 @@ pub(crate) fn sql_value_as_int4(value: &SqlValue) -> i32 {
 /// recompaction fill.
 pub(crate) const DELETED_BY_LIVE_FILL_BYTE: u8 = 0x7F;
 
+/// SV6: the uniform memset byte whose repetition is the `created_by` BORN-VISIBLE sentinel `0` — the device
+/// lower-bound compare is `created_by <= read_txn_id` (signed s64) and every read snapshot is `>= 0`, so a
+/// row without a stamp (admission-built rows, plain INSERT appends, un-versioned shards in the recompaction
+/// fill) is visible to every reader. Memset-friendly (uniform `0x00`) for both the on-demand region and the
+/// recompaction fill, mirroring [`DELETED_BY_LIVE_FILL_BYTE`].
+pub(crate) const CREATED_BY_VISIBLE_FILL_BYTE: u8 = 0x00;
+
 /// Slice 1b-ii: compute the per-section append chunks that write `new_rows` into an OPEN shard's
 /// reserved headroom starting at slot `row_start`, for a capacity-padded INT4 layout of `capacity`
 /// slots. Each chunk lands EXACTLY where the capacity-aware read offsets expect it (column `c` at
@@ -1220,6 +1227,31 @@ mod capacity_payload_tests {
             .any(|(cell_table, _)| cell_table == table)
     }
 
+    /// SV6 test helper: does ANY shard of `table` hold a LIVE `created_by` region? Mirrors
+    /// `table_has_any_deleted_by_cell` — the presence proof that the UPDATE-append STAMP path ran (a
+    /// re-admit fallback rebuilds all-live with NO region), and the release proof for the lifecycle gates.
+    fn table_has_any_created_by_cell(e: &Engine, table: &str) -> bool {
+        e.read_state
+            .residency
+            .shard_created_by_memory
+            .cells
+            .load()
+            .iter()
+            .any(|((cell_table, _), cell)| cell_table == table && cell.load().get().is_some())
+    }
+
+    /// SV6 test helper: does ANY `created_by` cell KEY for `table` still exist? Mirrors
+    /// `table_has_any_deleted_by_key` (DROP must erase keys, not just publish `None`).
+    fn table_has_any_created_by_key(e: &Engine, table: &str) -> bool {
+        e.read_state
+            .residency
+            .shard_created_by_memory
+            .cells
+            .load()
+            .keys()
+            .any(|(cell_table, _)| cell_table == table)
+    }
+
     /// SV2 (sparse-versioning): a shard is born DELETE-FREE and carries NO `deleted_by` region — the HyPer
     /// "un-versioned rows pay nothing" property. Across admission + in-place append + rollover, NO shard has a
     /// tombstone region until a DELETE touches it (SV4). NON-VACUITY: the table is really multiple shards
@@ -1811,6 +1843,361 @@ mod capacity_payload_tests {
         );
         assert_eq!(balance_of(&c, 130), Some(9999), "control: new balance");
         assert_eq!(count(&c), 200, "control: COUNT 200 == the flag-ON result (byte-identical semantics)");
+    }
+
+    /// SV6 (`created_by` SI flip-gate) — the DOUBLE-READ differential, deterministic torn-window form.
+    /// The SV5 incremental UPDATE appends the new version + bumps `row_count` BEFORE `publish_committed_seq`,
+    /// and a lock-free reader binds `read_txn_id = committed_seq()` THEN loads shards — so a reader that
+    /// observes `committed_seq = C-1` while the shards ALREADY carry the appended row is the torn window the
+    /// SV5 audit flagged (P2). This test constructs that window EXACTLY: it applies the incremental UPDATE at
+    /// `commit_seq = C0+1` directly (the same call the commit path makes) WITHOUT publishing, then reads.
+    /// SNAPSHOT-CORRECT (the `created_by` gate): the C-1 reader sees the key EXACTLY ONCE, with the OLD image
+    /// (old visible: `deleted_by = C0+1 > C0`; new hidden: `created_by = C0+1 > C0`); COUNT is unchanged.
+    /// THE PRE-FIX BUG: the key TWICE (old + new — a state that never existed). After publish, a reader at C
+    /// sees exactly the NEW image (old hidden: `deleted_by = C0+1 <= C0+1`; new visible: `created_by <= C0+1`).
+    /// SABOTAGE-VERIFIED: skip the `created_by` stamp on append (or drop the VM conjunct) and this FAILS.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice() {
+        // Run the torn-window differential over BOTH stamp branches: 200 rows -> the open shard has
+        // headroom, the append stamps IN PLACE; 258 rows (= 2 + 64*4: the 1-row admit builds a capacity-2
+        // shard 0, then target-64 rollovers) -> the open shard is FULL, the append ROLLS OVER a new stamped
+        // shard (whose created_by region must install before the shard publishes). The branch actually
+        // taken is PROVEN structurally below (shard-count delta), so neither variant can go vacuous if the
+        // admit shape changes.
+        for total_rows in [200_i64, 258_i64] {
+            let e = Engine::new_local();
+            e.set_shard_residency_enabled(true);
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            for i in 0..total_rows {
+                e.execute_text(
+                    (i as u64) + 2,
+                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                )
+                .unwrap();
+            }
+            let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
+            let c0 = e.committed_seq();
+            assert_eq!(sel("SELECT id, balance FROM accounts WHERE id = 130").len(), 1, "pre-update: one row");
+            let shard_count =
+                |e: &Engine| e.read_state.residency.shards.load().get("accounts").map_or(0, |s| s.len());
+            let shards_before = shard_count(&e);
+
+            // Apply the incremental UPDATE (tombstone-old + append-new) at commit_seq C0+1 WITHOUT
+            // publishing — exactly the state a concurrent reader can observe between the residency
+            // maintenance and `publish_committed_seq` inside a real commit.
+            {
+                let guard = e.ddl_catalog();
+                let ok = e.try_update_resident_commit(
+                    &guard,
+                    "accounts",
+                    &[vec![SqlValue::Int4(130), SqlValue::Int4(1300)]],
+                    &[vec![SqlValue::Int4(130), SqlValue::Int4(9999)]],
+                    c0 + 1,
+                );
+                assert!(
+                    ok,
+                    "the incremental tombstone-old + append-new route must fire at {total_rows} rows \
+                     (else this test is vacuous)"
+                );
+            }
+            // NON-VACUITY (route proof): the append STAMPED a created_by region (fallback re-admit / an
+            // unstamped append would leave none — and the reads below would then double-count).
+            assert!(
+                table_has_any_created_by_cell(&e, "accounts"),
+                "the UPDATE append must have stamped a created_by region at {total_rows} rows"
+            );
+            // NON-VACUITY (branch proof): 200 rows must exercise the IN-PLACE stamp (same shard set);
+            // 258 rows must exercise the ROLLOVER stamp (a new shard appeared). If the admit shape ever
+            // changes these row counts, this assert flags the variant instead of silently going vacuous.
+            if total_rows == 200 {
+                assert_eq!(shard_count(&e), shards_before, "200 rows: the in-place branch must serve");
+            } else {
+                assert_eq!(
+                    shard_count(&e),
+                    shards_before + 1,
+                    "{total_rows} rows: the ROLLOVER branch must serve (open shard full)"
+                );
+            }
+
+            // The C-1 reader (committed_seq is still C0): EXACTLY ONE row, the OLD image.
+            let rows = sel("SELECT id, balance FROM accounts WHERE id = 130");
+            assert_eq!(
+                rows.len(),
+                1,
+                "SI at {total_rows} rows: a reader at committed_seq C-1 must see the updated key EXACTLY \
+                 ONCE (2 = the SV5 P2 double-read: old visible via deleted_by > C-1 AND new visible with \
+                 no created_by gate)"
+            );
+            assert_eq!(
+                rows.row(0),
+                &[SqlValue::Int4(130), SqlValue::Int4(1300)],
+                "the C-1 snapshot reads the OLD image (the appended new version is not yet visible)"
+            );
+            assert_eq!(
+                sel("SELECT COUNT(*) FROM accounts").row(0),
+                &[SqlValue::Int8(total_rows)],
+                "COUNT at C-1 is snapshot-correct (no phantom appended row)"
+            );
+
+            // Publish the commit: a reader at C sees exactly the NEW image, once.
+            e.publish_committed_seq(c0 + 1);
+            let rows = sel("SELECT id, balance FROM accounts WHERE id = 130");
+            assert_eq!(rows.len(), 1, "post-publish: exactly one row");
+            assert_eq!(
+                rows.row(0),
+                &[SqlValue::Int4(130), SqlValue::Int4(9999)],
+                "a reader at C sees the NEW image (old hidden by deleted_by, new admitted by created_by)"
+            );
+            assert_eq!(sel("SELECT COUNT(*) FROM accounts").row(0), &[SqlValue::Int8(total_rows)]);
+        }
+    }
+
+    /// SV6 — the CONCURRENT-reader form of the double-read differential: a reader thread hammers the point
+    /// lookup while the writer commits real single-row SQL UPDATEs with `resident_update_tombstone_enabled`
+    /// ON. SI invariant under EVERY interleaving: the key appears EXACTLY ONCE per read (never 2 = the SV5
+    /// double-read; never 0 = a lost row). Crosses open-shard append headroom AND rollover (shard target 64,
+    /// ~300 appended versions), so both created_by stamp branches are exercised under load.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sv6_concurrent_reader_never_sees_updated_key_twice_under_update_load() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_resident_delete_tombstone_enabled(true);
+        e.set_resident_update_tombstone_enabled(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut reads = 0_u64;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let rows = e
+                        .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")
+                        .unwrap()
+                        .rows;
+                    assert_eq!(
+                        rows.len(),
+                        1,
+                        "SI under concurrency: id=130 must appear EXACTLY ONCE per read (2 = the SV5 \
+                         double-read window; 0 = a lost row)"
+                    );
+                    assert_eq!(rows.row(0)[0], SqlValue::Int4(130));
+                    reads += 1;
+                }
+                reads
+            });
+            for t in 0..300_u64 {
+                e.execute_text(
+                    300 + t,
+                    &format!("UPDATE accounts SET balance = {} WHERE id = 130", 100_000 + t),
+                )
+                .unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            let reads = reader.join().expect("reader thread must not panic (SI violation = panic)");
+            assert!(reads > 0, "the reader must have raced at least one read");
+        });
+        // Quiescent end-state: the last committed value, exactly once.
+        let rows = e
+            .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(100_299)]);
+    }
+
+    /// SV6 lifecycle (mirrors `shard_deleted_by_region_released_on_warmup_readmit`): a WARMUP/REFRESH
+    /// re-admit reaches the SHARDED re-admit branch with NO preceding commit invalidate, so it must itself
+    /// erase stale `created_by` regions — else the fresh all-live shard 0 (reused shard_id) inherits the
+    /// stamp region and wrongly HIDES rebuilt rows from older-snapshot readers. NON-VACUITY: region proven
+    /// present, then KEY-absent after the refresh. Sabotage: remove the sharded-branch
+    /// `shard_created_by_memory.remove_table` and this FAILS.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sv6_created_by_region_released_on_warmup_readmit() {
+        let mut e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        e.execute_text(2, "INSERT INTO accounts (id, balance) VALUES (1,10),(2,20),(3,30)").unwrap();
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        let (shard_id, capacity, gpu_id) = {
+            let shards = e.read_state.residency.shards.load();
+            let shard = &shards.get("accounts").unwrap()[0];
+            (shard.shard_id, shard.capacity, shard.gpu_id)
+        };
+        assert!(e.stamp_created_by_resident_shard_slots("accounts", shard_id, 1, 1, capacity, gpu_id, 777));
+        assert!(
+            table_has_any_created_by_cell(&e, "accounts"),
+            "precondition: the stamp allocated a live created_by region"
+        );
+        // Warmup/refresh re-admit -- NO commit, so NO invalidate precedes it.
+        e.populate_relational_residency_snapshot("accounts").unwrap();
+        assert!(
+            !table_has_any_created_by_key(&e, "accounts"),
+            "warmup re-admit (no preceding invalidate) must erase the stale created_by region"
+        );
+    }
+
+    /// SV6 lifecycle (mirrors SV4-prereq-#1 for `created_by`): the on-demand `created_by` region is
+    /// RELEASED at every site the buffer it annotates is retired — a re-admit (here: a multi-row UPDATE
+    /// falling back to invalidate + rebuild-all-live) must not leave a stale stamp region that would
+    /// wrongly HIDE rebuilt rows from older-snapshot readers, and DROP TABLE must erase the cell keys
+    /// entirely (no per-table host-cell leak). Sabotage: remove the `shard_created_by_memory` cleanup at
+    /// either site and the corresponding assert FAILS.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sv6_created_by_region_released_on_readmit_and_drop() {
+        let load = |e: &Engine| {
+            e.set_shard_residency_enabled(true);
+            e.set_auto_admit_on_commit(true);
+            e.set_resident_delete_tombstone_enabled(true);
+            e.set_resident_update_tombstone_enabled(true);
+            e.set_shard_size_target(64);
+            e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+            for i in 0..200_i64 {
+                e.execute_text(
+                    (i as u64) + 2,
+                    &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+                )
+                .unwrap();
+            }
+            e.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130").unwrap();
+            assert!(
+                table_has_any_created_by_cell(e, "accounts"),
+                "precondition: the incremental UPDATE stamped a live created_by region"
+            );
+        };
+
+        // RE-ADMIT gate: a multi-row UPDATE falls back to invalidate + re-admit (rebuild all-live) -> the
+        // region MUST go with the buffer it annotated, or the rebuilt rows would read a stale stamp.
+        // (The re-admitted 200-row table becomes ONE dense shard with no headroom, so no later single-row
+        // UPDATE can re-stamp it — hence the separate fresh engine for the DROP gate below.)
+        let e = Engine::new_local();
+        load(&e);
+        e.execute_text(203, "UPDATE accounts SET balance = 0 WHERE id = 10 OR id = 11").unwrap();
+        assert!(
+            !table_has_any_created_by_cell(&e, "accounts"),
+            "re-admit must release the stale created_by region (wrong-results + leak guard)"
+        );
+        // Reads after the re-admit are the plain all-live scan (no phantom hiding).
+        let rows = e
+            .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(9999)]);
+
+        // DROP gate (fresh engine, live stamped region): the cell KEYS must be erased (not just
+        // tombstoned to `None`) — invalidate alone would leak a dangling key per dropped table.
+        let d = Engine::new_local();
+        load(&d);
+        d.execute_text(203, "DROP TABLE accounts").unwrap();
+        assert!(
+            !table_has_any_created_by_key(&d, "accounts"),
+            "DROP TABLE must erase the created_by cell entries (no leaked per-table keys / device memory)"
+        );
+    }
+
+    /// SV6 — the created_by gate on the INDEX ROUTES (3b single-flight per-hit gate + the batched gather
+    /// gate + the GPU dense-emit DECLINE). The double-read shape can't reach the routes (a duplicated key
+    /// declines them to the scan), but a KEY-MOVING incremental UPDATE (`id 130 -> 999` at unpublished
+    /// `C0+1`) leaves the NEW key as a SINGLE stamped hit: a C-1 reader looking up 999 must get ZERO rows
+    /// (999 does not exist at its snapshot) while 130 still reads the OLD image — on the 3b route AND the
+    /// batched path (whose GPU dense kernel is un-gated and MUST decline the stamped shard to the gated
+    /// host gather). Post-publish, 999 is visible and 130 is gone. NON-VACUITY: `shard_index_route_hits` /
+    /// `sharded_point_batch_hits` prove the routes (not the scan) served. Sabotage: drop the per-hit
+    /// created_by check, the batched AND, or the dense-kernel decline — each makes 999 visible at C-1.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn sv6_created_by_gate_on_index_routes_hides_moved_key_from_older_snapshot() {
+        let e = Engine::new_local();
+        e.set_shard_residency_enabled(true);
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_index_probe_enabled(true);
+        e.set_shard_batched_point_read_enabled(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)").unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!("INSERT INTO accounts (id, balance) VALUES ({i}, {})", i * 10),
+            )
+            .unwrap();
+        }
+        let c0 = e.committed_seq();
+        // Move the key: UPDATE accounts SET id = 999 WHERE id = 130, applied at C0+1, UNPUBLISHED.
+        {
+            let guard = e.ddl_catalog();
+            let ok = e.try_update_resident_commit(
+                &guard,
+                "accounts",
+                &[vec![SqlValue::Int4(130), SqlValue::Int4(1300)]],
+                &[vec![SqlValue::Int4(999), SqlValue::Int4(1300)]],
+                c0 + 1,
+            );
+            assert!(ok, "the incremental key-moving UPDATE must fire");
+        }
+        assert!(table_has_any_created_by_cell(&e, "accounts"), "stamp route proof");
+        let table = e.relational_catalog_table("accounts").unwrap();
+        let sel = |sql: &str| e.execute_relational_select_text(sql).unwrap().rows;
+
+        // (a) 3b single-flight route: the NEW key is a single stamped hit -> the per-hit created_by gate
+        // hides it (0 rows at C-1); the OLD key is a single tombstoned-at-C0+1 hit -> still visible.
+        let route_hits_before = e.shard_index_route_hits();
+        assert_eq!(
+            sel("SELECT id, balance FROM accounts WHERE id = 999").len(),
+            0,
+            "3b route: the moved-to key must be HIDDEN from the C-1 reader (created_by gate)"
+        );
+        let rows = sel("SELECT id, balance FROM accounts WHERE id = 130");
+        assert_eq!(rows.len(), 1, "3b route: the old key is still live at C-1");
+        assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(1300)]);
+        assert!(
+            e.shard_index_route_hits() > route_hits_before,
+            "non-vacuity: the 3b index route (not the scan) served the C-1 point lookups"
+        );
+
+        // (b) Batched gather (the GPU dense kernel MUST decline the stamped shard -> gated host path):
+        // needle 999 -> 0 rows; needle 130 -> the old image.
+        let batch_hits_before = e.sharded_point_batch_hits();
+        let batch = e
+            .gather_sharded_int4_point_lookups_batched(&table, 0, &[0, 1], &[999, 130])
+            .expect("the batched sharded gather must serve (gated host path)");
+        assert_eq!(batch.ncols, 2);
+        assert_eq!(
+            batch.needle_ranges[0].1, 0,
+            "batched: the moved-to key must be HIDDEN from the C-1 reader (created_by gate)"
+        );
+        assert_eq!(batch.needle_ranges[1].1, 1, "batched: the old key is still live at C-1");
+        let start = batch.needle_ranges[1].0 as usize * 2;
+        assert_eq!(&batch.values[start..start + 2], &[130, 1300]);
+        assert!(
+            e.sharded_point_batch_hits() > batch_hits_before,
+            "non-vacuity: the batched path (not a fallback) served"
+        );
+
+        // (c) Publish -> a reader at C sees the move: 999 visible, 130 gone (both routes).
+        e.publish_committed_seq(c0 + 1);
+        let rows = sel("SELECT id, balance FROM accounts WHERE id = 999");
+        assert_eq!(rows.len(), 1, "post-publish: the moved-to key is visible");
+        assert_eq!(rows.row(0), &[SqlValue::Int4(999), SqlValue::Int4(1300)]);
+        assert_eq!(sel("SELECT id FROM accounts WHERE id = 130").len(), 0, "post-publish: the old key is gone");
+        let batch = e
+            .gather_sharded_int4_point_lookups_batched(&table, 0, &[0, 1], &[999, 130])
+            .expect("batched gather post-publish");
+        assert_eq!(batch.needle_ranges[0].1, 1, "batched post-publish: 999 visible");
+        assert_eq!(batch.needle_ranges[1].1, 0, "batched post-publish: 130 hidden");
     }
 
     /// CROSS-SHARD PK INDEX sub-slice 1: the per-shard hash-index locate returns the IDENTICAL physical
@@ -2861,6 +3248,9 @@ impl Engine {
             // shard_id) or the fresh shard would inherit them (SV4 wrong-results). Symmetric to the
             // single-buffer path below. INERT until SV4 (no region exists today).
             read_state.residency.shard_deleted_by_memory.remove_table(table);
+            // SV6: erase stale `created_by` regions symmetrically -- a fresh all-live shard 0 inheriting a
+            // stale stamp region would wrongly HIDE rebuilt rows from older-snapshot readers.
+            read_state.residency.shard_created_by_memory.remove_table(table);
             // Sub-slice 3b: this sharded re-admit replaces the table's shards -> purge stale cached indexes.
             read_state.residency.purge_shard_pk_index_for_table(table);
             let dm = device_memory.expect("device_memory.is_some() checked");
@@ -2923,6 +3313,8 @@ impl Engine {
         // `deleted_by` regions -- a flag flip / re-admit must not leave a tombstone region shadowing the fresh
         // all-live buffer (wrong-results guard). INERT until SV4 (no region exists today).
         read_state.residency.shard_deleted_by_memory.remove_table(table);
+        // SV6: clear stale `created_by` regions symmetrically (same wrong-results guard).
+        read_state.residency.shard_created_by_memory.remove_table(table);
         // Sub-slice 3b: the single-buffer path replaces the table's shards -> purge stale cached indexes.
         read_state.residency.purge_shard_pk_index_for_table(table);
         cat
@@ -3146,10 +3538,12 @@ impl Engine {
     /// invalidate + re-admit. DEFAULT OFF (nested under the shard path); OFF => an UPDATE re-admits exactly as
     /// before (byte-identical). The A/B lever for the incremental-UPDATE win. Interior-mutable.
     ///
-    /// **DO NOT FLIP ON in production yet (audit P2):** the appended new version has no `created_by`
-    /// lower-bound gate, so a concurrent reader at `committed_seq = C-1` (pre-publish torn read) sees the
-    /// updated key TWICE. Gated on the `created_by` boundary / consistent-snapshot fix + a concurrent-reader
-    /// test. See `Engine::try_update_resident_commit`'s SI CAVEAT.
+    /// **The audit-P2 `created_by` flip-gate is FIXED (SV6):** the appended new version is stamped
+    /// `created_by = commit_seq` and every sharded read path ANDs the device-side
+    /// `created_by <= read_txn_id` lower bound, so a concurrent reader at `committed_seq = C-1`
+    /// (pre-publish torn read) sees the updated key exactly once (the OLD version). Gated by the SV6
+    /// torn-window + concurrent-reader differentials. See `Engine::try_update_resident_commit`'s SI note.
+    /// (The default stays OFF pending the remaining shards-default gates — sharded predicate NULL 3VL.)
     pub fn set_resident_update_tombstone_enabled(&self, on: bool) {
         self.resident_update_tombstone_enabled
             .store(on, std::sync::atomic::Ordering::Relaxed);
@@ -3294,6 +3688,12 @@ impl Engine {
         &self,
         table: &str,
         new_rows: &[Vec<SqlValue>],
+        // SV6: `Some(commit_seq)` = the appended rows are a NEW VERSION an incremental UPDATE commit (SV5)
+        // publishes BEFORE `publish_committed_seq`, so they MUST be stamped `created_by = commit_seq` (and
+        // hidden from readers bound to an older snapshot) — the SV5 P2 double-read flip-gate. `None` = a
+        // plain INSERT append: unstamped, born-visible (today's semantics; the milder premature-insert
+        // form is an as-if-later read of a decided commit, not a mixed-state anomaly).
+        created_by: Option<Index>,
     ) -> bool {
         if new_rows.is_empty() {
             return false;
@@ -3323,7 +3723,14 @@ impl Engine {
             .get(table)
             .is_some_and(|shards| !shards.is_empty())
         {
-            return self.try_append_to_resident_open_shard(table, new_rows);
+            return self.try_append_to_resident_open_shard(table, new_rows, created_by);
+        }
+        // SV6 defensive: a versioned (created_by-stamped) append is a SHARD-path concept — the single
+        // unified buffer carries no per-row version regions, so decline and let the caller re-admit
+        // (always correct). Unreachable today: the SV5 UPDATE route requires shard residency (its
+        // tombstone step already declined a single-buffer table before the append runs).
+        if created_by.is_some() {
+            return false;
         }
         let (capacity, row_start, column_count) = {
             let snapshots = self.read_state.residency.snapshots.load();
@@ -3411,7 +3818,12 @@ impl Engine {
     /// device recompaction, not the host-materialization path) and no single-buffer `wave_index` to drop.
     /// (The sub-slice-3a `shard_pk_index` per-shard cache IS ptr-keyed but ALSO row_count-validated, so an
     /// in-place append grows row_count -> next probe misses -> rebuild; no explicit invalidation needed here.)
-    fn try_append_to_resident_open_shard(&self, table: &str, new_rows: &[Vec<SqlValue>]) -> bool {
+    fn try_append_to_resident_open_shard(
+        &self,
+        table: &str,
+        new_rows: &[Vec<SqlValue>],
+        created_by: Option<Index>,
+    ) -> bool {
         let pressured_gpus = self
             .router
             .runtime()
@@ -3462,13 +3874,26 @@ impl Engine {
                     Ok(chunks) => chunks,
                     Err(_) => return false,
                 };
-            // SV1: no `created_by` stamp on append (per-row created_by is gone). `deleted_by` needs no write
-            // either — the headroom was pre-filled with the live sentinel at admission, so appended rows are
-            // born live. Only the value-column + header chunks are written.
+            // `deleted_by` needs no write on append — the headroom was pre-filled with the live sentinel at
+            // admission, so appended rows are born live. SV6: an UPDATE-appended NEW VERSION additionally
+            // stamps `created_by = commit_seq` (below); a plain INSERT append stays unstamped (born-visible).
             if shard_device_memory.append_owned_chunks(chunks).is_err() {
                 // Partial/failed append leaves bytes only in invisible headroom beyond row_count;
                 // returning false makes the caller invalidate + re-admit, discarding them.
                 return false;
+            }
+            // SV6 ORDER (load-bearing): stamp created_by BEFORE the `row_count` bump below publishes the
+            // appended slots. The slots are still invisible headroom here, so a torn state (values + stamps
+            // written, count not bumped) is unreadable; stamping AFTER the bump would let a reader bound to
+            // an older snapshot observe the new version born-visible (created_by = fill 0) — exactly the
+            // SV5 P2 double-read window this gate closes. A stamp failure -> false -> the caller re-admits
+            // (the re-admit purge releases any partial region; rebuild-all-live is always correct).
+            if let Some(commit_seq) = created_by {
+                if !self.stamp_created_by_resident_shard_slots(
+                    table, shard_id, row_count, k, capacity, gpu_id, commit_seq,
+                ) {
+                    return false;
+                }
             }
             let appended_bytes = (k * column_count * std::mem::size_of::<i32>()) as u64;
             // S-d3: extend the open shard's zone map (min/max per int4 column) to cover the appended rows,
@@ -3552,6 +3977,28 @@ impl Engine {
             invalidated_by_memory_pressure: pressured,
             memory_pressure_active: pressured,
         };
+        // SV6: a version-stamped (UPDATE-appended) rollover installs the NEW shard's `created_by` region
+        // BEFORE the shard's device memory + metadata publish — a reader that observes the new shard in the
+        // shards list must also observe its created_by region, else the appended version would read
+        // born-visible at an older snapshot (the double-read window). First `k` slots = `commit_seq`;
+        // the headroom stays the born-visible fill (0) so later plain INSERT appends keep today's semantics.
+        if let Some(commit_seq) = created_by {
+            let mut created_payload =
+                vec![CREATED_BY_VISIBLE_FILL_BYTE; new_capacity * std::mem::size_of::<u64>()];
+            for slot in 0..k {
+                created_payload[slot * 8..slot * 8 + 8].copy_from_slice(&commit_seq.to_le_bytes());
+            }
+            let Some(created_region) =
+                self.relational_residency_device_memory(gpu_id, &created_payload)
+            else {
+                return false;
+            };
+            self.read_state.residency.shard_created_by_memory.insert_shard(
+                table,
+                new_shard_id,
+                created_region,
+            );
+        }
         // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard
         // in the shards list always finds its device memory (the recompaction loads the list then the memory).
         self.read_state
@@ -3675,6 +4122,77 @@ impl Engine {
             })
             .collect();
         region.append_owned_chunks(chunks).is_ok()
+    }
+
+    /// SV6 (the SV5 `created_by` flip-gate): stamp `created_by[slot] = commit_seq` for the `k` just-appended
+    /// CONTIGUOUS slots `[first_slot, first_slot + k)` of a resident shard, get-or-allocating the shard's
+    /// ON-DEMAND `created_by` region — a `capacity`-sized i64 device buffer born all-visible
+    /// ([`CREATED_BY_VISIBLE_FILL_BYTE`] = 0x00: `0 <= read_txn_id` for every snapshot) — on its first
+    /// stamped append, so un-versioned shards pay zero (the same sparse-versioning property as
+    /// `deleted_by`). The caller MUST invoke this BEFORE the shard's `row_count` bump publishes the slots
+    /// (they are invisible headroom here — see the append path's ORDER comment) and runs under the commit
+    /// lock, making the get-or-allocate atomic (SV2 prereq #2). Returns `false` (caller falls back to
+    /// invalidate + re-admit; the re-admit purge releases any partial region) on any allocation or device
+    /// write failure. ONE contiguous chunk write (`k * 8` bytes at `first_slot * 8`), bounds-checked by
+    /// `append_owned_chunks` against the region's allocation.
+    #[allow(clippy::too_many_arguments)] // mirrors the shard-shape tuple its caller already destructured
+    fn stamp_created_by_resident_shard_slots(
+        &self,
+        table: &str,
+        shard_id: u32,
+        first_slot: usize,
+        k: usize,
+        capacity: usize,
+        gpu_id: u16,
+        commit_seq: Index,
+    ) -> bool {
+        if k == 0 {
+            return true;
+        }
+        // Bounds: the stamped slots must lie inside the region (capacity slots). `append_owned_chunks`
+        // re-checks against the real allocation, so a torn shape read can only reject, never write OOB.
+        if first_slot.saturating_add(k) > capacity {
+            return false;
+        }
+        let region = match self
+            .read_state
+            .residency
+            .shard_created_by_memory
+            .get(&(table.to_string(), shard_id))
+        {
+            Some(region) => region,
+            None => {
+                let payload =
+                    vec![CREATED_BY_VISIBLE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+                let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) else {
+                    return false;
+                };
+                self.read_state.residency.shard_created_by_memory.insert_shard(
+                    table,
+                    shard_id,
+                    region,
+                );
+                match self
+                    .read_state
+                    .residency
+                    .shard_created_by_memory
+                    .get(&(table.to_string(), shard_id))
+                {
+                    Some(region) => region,
+                    None => return false,
+                }
+            }
+        };
+        let mut bytes = Vec::with_capacity(k * std::mem::size_of::<u64>());
+        for _ in 0..k {
+            bytes.extend_from_slice(&commit_seq.to_le_bytes());
+        }
+        region
+            .append_owned_chunks(vec![CudaOwnedDeviceMemoryChunk {
+                byte_offset: (first_slot as u64) * std::mem::size_of::<u64>() as u64,
+                bytes,
+            }])
+            .is_ok()
     }
 
     /// STRATA S-B: commit-triggered, best-effort GPU-residency admission for the tables a commit

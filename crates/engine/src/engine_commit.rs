@@ -134,7 +134,8 @@ impl Engine {
                 && to_apply.len() == 1
                 && match applied.as_ref() {
                     Some(AppliedRowMutation::Insert { table, rows }) => {
-                        self.try_append_resident_int4_open_shard(table, rows)
+                        // Plain INSERT appends are unstamped/born-visible (SV6 `created_by = None`).
+                        self.try_append_resident_int4_open_shard(table, rows, None)
                     }
                     Some(AppliedRowMutation::Delete { table, rows })
                         if self.resident_delete_tombstone_enabled() =>
@@ -338,6 +339,12 @@ impl Engine {
             .residency
             .shard_deleted_by_memory
             .invalidate_table(table);
+        // SV6: the `created_by` region lives and dies with the buffer it annotates, exactly like
+        // `deleted_by` (a stale region surviving a re-admit would wrongly HIDE rebuilt all-live rows).
+        self.read_state
+            .residency
+            .shard_created_by_memory
+            .invalidate_table(table);
         // Sub-slice 3b: drop the table's cached per-shard PK indexes (they pin stale buffers).
         self.read_state
             .residency
@@ -373,6 +380,11 @@ impl Engine {
             self.read_state
                 .residency
                 .shard_deleted_by_memory
+                .invalidate_table(table);
+            // SV6: mirror the created_by cleanup (same lifecycle contract).
+            self.read_state
+                .residency
+                .shard_created_by_memory
                 .invalidate_table(table);
             // Sub-slice 3b: drop the table's cached per-shard PK indexes.
             self.read_state
@@ -501,6 +513,11 @@ impl Engine {
             self.read_state
                 .residency
                 .shard_deleted_by_memory
+                .invalidate_table(table);
+            // SV6: a pressured shard's created_by region is released with its buffer too.
+            self.read_state
+                .residency
+                .shard_created_by_memory
                 .invalidate_table(table);
             // Sub-slice 3b: drop the pressured table's cached per-shard PK indexes.
             self.read_state
