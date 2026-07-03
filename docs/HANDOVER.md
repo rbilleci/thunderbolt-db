@@ -22,8 +22,13 @@ safety net, both **interim debt to be deleted**, never product direction (ADR-00
 
 **THE LOAD-BEARING DIRECTIVE (user, verbatim):** *"We need to stay GPU native with the solution. Follow the
 charter."* When you MEASURE a host-side cost in a data-plane hot path, the fix is to **MOVE THE WORK ONTO THE
-GPU**, not to optimize the host. Host-side is acceptable ONLY for control-plane / amortized-once work (e.g. an
-index BUILD once per generation), NEVER the per-query / per-row hot path. Memory: `stay-gpu-native-charter`.
+GPU**, not to optimize the host. The ONLY authorized host work is CHARTER.md's "Host MAY" list — wire I/O,
+parse+plan, kernel orchestration/launch, txn coordination+sequencing, WAL/replication I/O, the staging
+upload, the final readback. **GOVERNANCE (user, 2026-07-03): a prior baton added an "index BUILD once per
+generation" host-work exception THE USER NEVER AUTHORIZED — agent-authored docs must never widen the
+charter; exceptions exist only if written into CHARTER.md by the user.** The host-side addressing
+structures built under that unauthorized gloss (shard_pk_index et al.) are PENDING THE USER'S RULING —
+see the open decision below. Memory: `stay-gpu-native-charter`.
 
 **Success bar (trajectory bet):** same ORDER OF MAGNITUDE as a tuned CPU engine on today's hardware, with the
 residual gap being GPU-ARCHITECTURAL (launch amortization, bandwidth/coherence) so it closes as hardware
@@ -32,7 +37,7 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: THREE SLICES SHIPPED (9 commits through `4447c7ee`: constrained elision 923→93k; ledger-#18 skip; Date/Int2 device-authoritative incl the LAST facade-seq seam). TRACK 2 SLICE 2 (i64 sections) SHIPPED (`9a4bccb1`): int8-payload tables 825→83-91k elided (~110x), stack audit PUSH. PENDING USER: the shard_int8_section_enabled FLIP (after burn-in evidence). NEXT: numeric/uuid (i128) sections OR the i64-KEY path (bigint PKs, the non-int4 proposal) — recommend at the boundary. THE CONSTRAINED-ELISION FLIP IS LIVE (default ON; PK'd 87-95k on pure defaults). auto_admit stays OFF behind TWO NAMED GATES: R-1 eviction + ledger #19 rollover stall. FK/CHECK eligibility = a future design slice. <<<
+## >>> THE ONE NEXT ACTION: THE CHARTER RULING (user, 2026-07-03) GOVERNS — host addressing structures were built under an UNAUTHORIZED agent-invented exception; the user ruled MIGRATE-TO-DEVICE. Program: M1 wave-batched DEVICE locate (replace host shard_pk_index probes; reuse the v2/v3 probe kernels + shard_pk_device_index) → M2 bigint PKs via a DEVICE i64 index (no host cache ever; the non-int4 proposal's layout) → M3 deletion sweep (shard_pk_index, wave_index, host zone-map decisions; ledger #20-22). SLO dips during migration are ACCEPTED — performance arguments do not create charter exceptions. In flight: the i64-section flip commit awaits its blast-radius audit verdict, then pushes. Memory: `charter-governance-ruling` (BINDING). <<<
 
 **THE RETIREMENT PROGRAM A1→A5 IS COMPLETE; THE FLIP IS LIVE** (`fd154409`/`f0c3101e`:
 `host_install_elision_enabled` + `auto_vacuum_enabled` default ON; SLO 104-124k sustained on PK-less
