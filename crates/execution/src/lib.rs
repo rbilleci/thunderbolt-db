@@ -11327,6 +11327,346 @@ impl Drop for CudaI32IndexProbeDenseSubmission {
     }
 }
 
+/// M1 (charter-pure device WRITE-LOCATE): one shard's DEVICE hash index + its packing params. The
+/// write path (A2 DML resolve, A3 validators) probes these ON THE DEVICE — replacing the host
+/// `shard_pk_index` hash probe (the charter ruling, 2026-07-03: key->slot ADDRESSING is device work).
+pub struct WriteLocateShard {
+    /// The shard's DEVICE hash index (`(key<<32)|(row+1)`, 0 = empty), pinned until the kernel completes.
+    pub index: Arc<CudaResidentDeviceMemory>,
+    pub table_mask: u32,
+    pub hash_shift: u32,
+}
+
+/// Per-needle device-locate result: a fixed `max_hits` window of `(shard_idx, slot)` pairs +
+/// a per-needle count. `count[n] == u32::MAX` = OVERFLOW (more than `max_hits` shards held the key —
+/// the host declines that needle to the scan, exactly like a cross-shard-dup host decline).
+pub struct WriteLocateResult {
+    pub max_hits: u32,
+    /// `needle_count * max_hits`: the shard index (into the passed `shards` slice) of each hit.
+    pub shard_idx: Vec<u32>,
+    /// `needle_count * max_hits`: the LOCAL slot of each hit within its shard.
+    pub slot: Vec<u32>,
+    /// `needle_count`: hits found (u32::MAX = overflow).
+    pub count: Vec<u32>,
+}
+
+/// The WRITE-LOCATE kernel: each thread (needle) loops ALL shards, probes each shard's device hash
+/// index (fib-hash + linear probe, 256 cap — BYTE-IDENTICAL to the read probe + the host
+/// `build_int4_pk_hash_table_host`), and emits EVERY hit (shard_idx, local slot) into the needle's
+/// fixed window. Unlike the read kernel (first-hit + decline-on-dup), the write path needs ALL hits
+/// (an SV5 update-append puts a key in two shards: tombstoned-old + new). NO bloom/zone prune here —
+/// those only skip shards a hit can't be in, so the hash probe is authoritative and the hits are
+/// identical to the host probe's. ASCII-only PTX.
+const WRITE_LOCATE_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_multi_shard_i32_write_locate(
+    .param .u64 desc_array_ptr,
+    .param .u32 shard_count,
+    .param .u32 needle_count,
+    .param .u64 needles_ptr,
+    .param .u32 max_hits,
+    .param .u64 out_shard_ptr,
+    .param .u64 out_slot_ptr,
+    .param .u64 out_count_ptr
+)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [desc_array_ptr];
+    ld.param.u32 %r1, [shard_count];
+    ld.param.u32 %r2, [needle_count];
+    ld.param.u64 %rd2, [needles_ptr];
+    ld.param.u32 %r3, [max_hits];
+    ld.param.u64 %rd3, [out_shard_ptr];
+    ld.param.u64 %rd4, [out_slot_ptr];
+    ld.param.u64 %rd5, [out_count_ptr];
+
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mad.lo.u32 %r7, %r5, %r6, %r4;
+    setp.ge.u32 %p1, %r7, %r2;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd6, %r7, 4;
+    add.u64 %rd7, %rd2, %rd6;
+    ld.global.s32 %r8, [%rd7];
+
+    mov.u32 %r9, 0;
+    mov.u32 %r10, 0;
+
+SHARD:
+    setp.ge.u32 %p1, %r10, %r1;
+    @%p1 bra WRITECOUNT;
+    mul.wide.u32 %rd8, %r10, 16;
+    add.u64 %rd9, %rd1, %rd8;
+    ld.global.u64 %rd10, [%rd9];
+    ld.global.u64 %rd11, [%rd9+8];
+    cvt.u32.u64 %r11, %rd11;
+    shr.u64 %rd12, %rd11, 32;
+    cvt.u32.u64 %r12, %rd12;
+
+    mul.lo.u32 %r13, %r8, 2654435761;
+    shr.u32 %r14, %r13, %r12;
+    and.b32 %r14, %r14, %r11;
+    mov.u32 %r15, 0;
+
+PROBE:
+    mul.wide.u32 %rd13, %r14, 8;
+    add.u64 %rd14, %rd10, %rd13;
+    ld.global.u64 %rd15, [%rd14];
+    setp.eq.u64 %p2, %rd15, 0;
+    @%p2 bra NEXTSHARD;
+    shr.u64 %rd16, %rd15, 32;
+    cvt.u32.u64 %r16, %rd16;
+    setp.eq.s32 %p2, %r16, %r8;
+    @%p2 bra FOUND;
+    add.u32 %r14, %r14, 1;
+    and.b32 %r14, %r14, %r11;
+    add.u32 %r15, %r15, 1;
+    setp.ge.u32 %p3, %r15, 256;
+    @%p3 bra NEXTSHARD;
+    bra PROBE;
+
+FOUND:
+    cvt.u32.u64 %r17, %rd15;
+    sub.u32 %r17, %r17, 1;
+    setp.ge.u32 %p4, %r9, %r3;
+    @%p4 bra INCCOUNT;
+    mad.lo.u32 %r18, %r7, %r3, %r9;
+    mul.wide.u32 %rd18, %r18, 4;
+    add.u64 %rd19, %rd3, %rd18;
+    st.global.u32 [%rd19], %r10;
+    add.u64 %rd20, %rd4, %rd18;
+    st.global.u32 [%rd20], %r17;
+INCCOUNT:
+    add.u32 %r9, %r9, 1;
+NEXTSHARD:
+    add.u32 %r10, %r10, 1;
+    bra SHARD;
+
+WRITECOUNT:
+    mul.wide.u32 %rd21, %r7, 4;
+    add.u64 %rd22, %rd5, %rd21;
+    setp.gt.u32 %p5, %r9, %r3;
+    @%p5 bra WOVER;
+    st.global.u32 [%rd22], %r9;
+    bra DONE;
+WOVER:
+    mov.u32 %r19, 4294967295;
+    st.global.u32 [%rd22], %r19;
+
+DONE:
+    ret;
+}
+"#;
+
+impl CudaResidentDeviceMemory {
+    /// M1 (charter-pure): probe a BATCH of int4 `needles` against ALL `shards`' DEVICE hash indexes in
+    /// ONE kernel launch, emitting each needle's `(shard_idx, slot)` hits. Replaces the host
+    /// `shard_pk_index` hash probe for the write path (A2/A3). Synchronous (null stream + context sync):
+    /// the write path's batches are small (one wave), so the launch+readback round-trip is the design,
+    /// not a throughput bottleneck. `self` is only the allocation/launch context (any device buffer on
+    /// the GPU works). `max_hits` bounds the per-needle window (2 suffices for SV5 old+new; overflow
+    /// declines).
+    pub fn submit_multi_shard_i32_write_locate(
+        &self,
+        shards: &[WriteLocateShard],
+        needles: &[i32],
+        max_hits: u32,
+    ) -> Result<WriteLocateResult, CudaRuntimeProbeError> {
+        type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if shards.is_empty() || needles.is_empty() || max_hits == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        const DESC_U64_PER_SHARD: usize = 2; // index_ptr, mask|shift
+        let mut desc: Vec<u64> = Vec::with_capacity(shards.len() * DESC_U64_PER_SHARD);
+        let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len());
+        for shard in shards {
+            if shard.index.device_ptr() == 0 {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+            }
+            desc.push(shard.index.device_ptr());
+            desc.push((shard.table_mask as u64) | ((shard.hash_shift as u64) << 32));
+            index_guards.push(Arc::clone(&shard.index));
+        }
+        let shard_count_u32 = u32::try_from(shards.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(shards.len()))?;
+        let needle_count_u32 = u32::try_from(needles.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
+
+        let window = (needles.len() as u64)
+            .checked_mul(max_hits as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let window_bytes = usize::try_from(
+            window
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+        )
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let count_bytes = needles
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let needle_bytes = needles
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let desc_bytes = desc
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_memset_d8 = unsafe {
+            primary
+                .lib()
+                .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_memcpy_dtoh = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let needles_guard = primary.lease_device_buffer_owned(needle_bytes)?;
+        let shard_out_guard = primary.lease_device_buffer_owned(window_bytes)?;
+        let slot_out_guard = primary.lease_device_buffer_owned(window_bytes)?;
+        let count_guard = primary.lease_device_buffer_owned(count_bytes)?;
+        let desc_guard = primary.lease_device_buffer_owned(desc_bytes)?;
+
+        let mut ptx = Vec::with_capacity(WRITE_LOCATE_PTX.len() + 1);
+        ptx.extend_from_slice(WRITE_LOCATE_PTX);
+        ptx.push(0);
+        let function =
+            primary.cached_function(c"gpu_db_resident_multi_shard_i32_write_locate", &ptx)?;
+
+        // HtoD needles + descriptor; memset the count buffer to 0 (a thread that early-returns —
+        // never happens here since every thread writes its count — leaves 0, a clean "no hits").
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_htod(desc_guard.ptr, desc.as_ptr().cast::<c_void>(), desc_bytes)
+        })?;
+        check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, count_bytes) })?;
+
+        let mut desc_arg = desc_guard.ptr;
+        let mut shard_count_arg = shard_count_u32;
+        let mut needle_count_arg = needle_count_u32;
+        let mut needles_arg = needles_guard.ptr;
+        let mut max_hits_arg = max_hits;
+        let mut shard_out_arg = shard_out_guard.ptr;
+        let mut slot_out_arg = slot_out_guard.ptr;
+        let mut count_arg = count_guard.ptr;
+        let mut args = [
+            (&mut desc_arg as *mut u64).cast::<c_void>(),
+            (&mut shard_count_arg as *mut u32).cast::<c_void>(),
+            (&mut needle_count_arg as *mut u32).cast::<c_void>(),
+            (&mut needles_arg as *mut u64).cast::<c_void>(),
+            (&mut max_hits_arg as *mut u32).cast::<c_void>(),
+            (&mut shard_out_arg as *mut u64).cast::<c_void>(),
+            (&mut slot_out_arg as *mut u64).cast::<c_void>(),
+            (&mut count_arg as *mut u64).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = needle_count_u32.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        check_cuda(unsafe { (primary.cu_stream_synchronize)(std::ptr::null_mut()) })?;
+
+        let mut shard_idx = vec![0u32; window as usize];
+        let mut slot = vec![0u32; window as usize];
+        let mut count = vec![0u32; needles.len()];
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                shard_idx.as_mut_ptr().cast::<c_void>(),
+                shard_out_guard.ptr,
+                window_bytes,
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                slot.as_mut_ptr().cast::<c_void>(),
+                slot_out_guard.ptr,
+                window_bytes,
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                count.as_mut_ptr().cast::<c_void>(),
+                count_guard.ptr,
+                count_bytes,
+            )
+        })?;
+        // The guards (device buffers + pinned indexes) drop here — after the sync, so the kernel is done.
+        drop(index_guards);
+        Ok(WriteLocateResult {
+            max_hits,
+            shard_idx,
+            slot,
+            count,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentReadSource>(
     resident: &R,
@@ -23932,6 +24272,91 @@ mod tests {
         PlannedOp {
             name: "scan".to_string(),
             target: DeviceTarget::Gpu(id),
+        }
+    }
+
+    /// Build an int4 PK hash table in the kernel's format: open-addressing `(key<<32)|(row+1)`,
+    /// 0 = empty, size = next_pow2(2*n), fib hash `(key*0x9E3779B1) >> shift`, linear probe.
+    /// Returns `(index_words, table_mask, hash_shift)` — mirrors the engine's host builder byte-for-byte.
+    #[cfg(test)]
+    fn build_pk_hash(keys: &[i32]) -> (Vec<u64>, u32, u32) {
+        let table_size = (keys.len() as u64 * 2).next_power_of_two().max(2);
+        let table_mask = (table_size - 1) as u32;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        let mut index = vec![0u64; table_size as usize];
+        for (row, &key) in keys.iter().enumerate() {
+            let kb = key as u32;
+            let mut slot = (kb.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            loop {
+                if index[slot as usize] == 0 {
+                    index[slot as usize] = ((kb as u64) << 32) | (row as u64 + 1);
+                    break;
+                }
+                slot = (slot + 1) & table_mask;
+            }
+        }
+        (index, table_mask, hash_shift)
+    }
+
+    /// M1 device WRITE-LOCATE kernel: probe multi-shard device indexes for a batch of needles and
+    /// verify EVERY (shard, slot) hit matches a naive host scan of the same key sets — including a
+    /// CROSS-SHARD DUPLICATE (a key in two shards, the SV5 old+new case) which must emit BOTH hits.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn write_locate_kernel_matches_host_scan() {
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        if !runtime.snapshot().driver_available {
+            return;
+        }
+        // Two shards. Key 130 is in BOTH (the cross-shard version case).
+        let shard_keys: [Vec<i32>; 2] = [vec![10, 20, 130, 40], vec![130, 200, 300]];
+        let mut shards = Vec::new();
+        for keys in &shard_keys {
+            let (index_words, table_mask, hash_shift) = build_pk_hash(keys);
+            let bytes: Vec<u8> = index_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let Ok(mem) = runtime.retain_device_memory_copy(0, &bytes) else {
+                return; // no device -> skip
+            };
+            shards.push(WriteLocateShard {
+                index: std::sync::Arc::new(mem),
+                table_mask,
+                hash_shift,
+            });
+        }
+        let needles = [130, 20, 999, 300, 10];
+        // The launch context is any device buffer on the GPU (the method mirrors the v2 probe).
+        let ctx = std::sync::Arc::clone(&shards[0].index);
+        let result = ctx
+            .submit_multi_shard_i32_write_locate(&shards, &needles, 2)
+            .expect("write-locate kernel");
+        for (ni, &needle) in needles.iter().enumerate() {
+            // Naive host truth: every (shard, local slot) whose key == needle.
+            let mut expected: Vec<(u32, u32)> = Vec::new();
+            for (si, keys) in shard_keys.iter().enumerate() {
+                for (row, &k) in keys.iter().enumerate() {
+                    if k == needle {
+                        expected.push((si as u32, row as u32));
+                    }
+                }
+            }
+            let count = result.count[ni];
+            assert_ne!(count, u32::MAX, "needle {needle}: no overflow at max_hits=2");
+            assert_eq!(
+                count as usize,
+                expected.len(),
+                "needle {needle}: hit count"
+            );
+            let mut got: Vec<(u32, u32)> = (0..count as usize)
+                .map(|h| {
+                    let idx = ni * result.max_hits as usize + h;
+                    (result.shard_idx[idx], result.slot[idx])
+                })
+                .collect();
+            got.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(got, expected, "needle {needle}: exact (shard, slot) hits");
         }
     }
 
