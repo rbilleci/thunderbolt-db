@@ -75,6 +75,14 @@ pub(crate) struct CommitWaveItem {
     /// would silently bypass the new constraint; any DDL bumps the stamp and forces the
     /// always-correct Full re-validation instead.
     prepared_catalog_seq: Index,
+    /// DELTA-REUSE (B): the OFF-LOCK-prepared insert delta, carried forward for reuse-eligible
+    /// items (elided, FK-free, no nextval). The under-lock re-resolve then only RE-KEYS it at the
+    /// wave's `next_row_id` (`rekey_offlock_insert_delta`) instead of re-running the full
+    /// coerce+validate+write-set rebuild — the coerced values / write-set are input-deterministic,
+    /// so they are identical to a fresh re-prepare while the catalog generation still matches
+    /// (`prepared_catalog_seq`; a DDL bump forces the Full path, dropping the reuse). `None` = the
+    /// item takes the normal `prepare_dml` re-resolve.
+    offlock_delta: Option<crate::write_path::WriteDelta>,
     outcome: CommitWaveOutcome,
 }
 
@@ -308,16 +316,23 @@ impl Engine {
         // (Tests barrier here to align two writers' snapshots before their commits race.)
         on_prepared();
 
+        // DELTA-REUSE (B): carry the whole delta forward for reuse-eligible (elided, no-nextval)
+        // inserts so the under-lock re-resolve only re-keys it; every other item keeps just its
+        // write-set (the conflict path reads it BEFORE the re-resolve, so it is always needed).
+        let write_set = prepared.write_set.clone();
+        let offlock_delta = Self::reresolve_reuse_eligible(&prepared).then_some(prepared);
+
         // (3) Commit: enqueue into the deterministic commit WAVE (ledger #6) and wait for the
         // sequencer to durably commit + publish it (or abort it with a retryable conflict).
         self.commit_dml_concurrent(
             txn_id,
             cmd,
             text,
-            prepared.write_set,
+            write_set,
             read_snapshot,
             residency_tables,
             prepared_catalog_seq,
+            offlock_delta,
         )
     }
 
@@ -344,6 +359,64 @@ impl Engine {
             }
         }?;
         Ok(delta)
+    }
+
+    /// DELTA-REUSE (B): is this off-lock-prepared delta safe to REUSE at the under-lock re-resolve
+    /// (re-key only) instead of re-preparing? An INSERT with (a) NO nextval advances (those route
+    /// through the serialized path) and (b) an EMPTY value-index. An empty value-index is the exact
+    /// ground truth that `prepare_insert` skipped it because the table was ELIDED at prepare (a
+    /// non-elided insert of >=1 row into a >=1-column table always yields >=1 entry) — and an elided
+    /// table is FK-free + CHECK-free by `table_elision_eligible`, so the re-resolve owes no
+    /// constraint re-validation beyond the ledger. The generation gate (ReResolveLedgerCovered) is
+    /// enforced at reuse time, so a post-prepare DDL (e.g. ADD FK) still forces the Full path.
+    fn reresolve_reuse_eligible(delta: &crate::write_path::WriteDelta) -> bool {
+        matches!(
+            &delta.mutation,
+            crate::write_path::PreparedMutation::Insert { seq_advances, value_index_entries, .. }
+                if seq_advances.is_empty() && value_index_entries.is_empty()
+        )
+    }
+
+    /// DELTA-REUSE (B): rebuild a reuse-eligible off-lock INSERT delta at `snapshot`'s
+    /// `next_row_id`, recomputing ONLY the per-row keys (the sole `next_row_id`-dependent output).
+    /// The coerced VALUES, the (value-derived) `write_set`, `rows_consumed`, and the empty
+    /// value-index / seq-advances are input-deterministic, so under a matched catalog generation
+    /// this equals a fresh `prepare_insert` re-resolve — minus the re-coerce + not-null + write-set
+    /// rebuild. (value-index stays empty; the apply recomputes it if the table de-elided —
+    /// `value_index_entries_for_deferred_apply`.)
+    fn rekey_offlock_insert_delta(
+        delta: &crate::write_path::WriteDelta,
+        snapshot: DmlReadSnapshot,
+    ) -> crate::write_path::WriteDelta {
+        let crate::write_path::PreparedMutation::Insert {
+            table,
+            inserted_rows,
+            value_index_entries,
+            seq_advances,
+        } = &delta.mutation
+        else {
+            unreachable!("reresolve_reuse_eligible gates this to inserts");
+        };
+        let rekeyed: Vec<(String, Vec<SqlValue>)> = inserted_rows
+            .iter()
+            .enumerate()
+            .map(|(offset, (_stale_key, values))| {
+                (
+                    relational_row_key(table, snapshot.next_row_id + offset as u64),
+                    values.clone(),
+                )
+            })
+            .collect();
+        crate::write_path::WriteDelta {
+            write_set: delta.write_set.clone(),
+            rows_consumed: delta.rows_consumed,
+            mutation: crate::write_path::PreparedMutation::Insert {
+                table: table.clone(),
+                inserted_rows: rekeyed,
+                value_index_entries: value_index_entries.clone(),
+                seq_advances: seq_advances.clone(),
+            },
+        }
     }
 
     /// The set of tables a DML command mutates (for per-table residency invalidation on commit).
@@ -390,6 +463,7 @@ impl Engine {
         read_snapshot: Index,
         residency_tables: BTreeSet<String>,
         prepared_catalog_seq: Index,
+        offlock_delta: Option<crate::write_path::WriteDelta>,
     ) -> Result<(), ExecuteError> {
         let outcome: CommitWaveOutcome = Arc::new(CommitWaveDone::default());
         let mut queue = self.lock_commit_wave_queue();
@@ -403,6 +477,7 @@ impl Engine {
             cmd,
             payload: text.as_bytes().to_vec(),
             prepared_catalog_seq,
+            offlock_delta,
             write_set,
             read_snapshot,
             residency_tables,
@@ -960,7 +1035,16 @@ impl Engine {
                 } else {
                     InsertPrepareValidation::Full
                 };
-            let prepared = self.prepare_dml(&item.cmd, install_snapshot, insert_validation);
+            // DELTA-REUSE (B): a reuse-eligible elided insert whose catalog generation still
+            // matches (ReResolveLedgerCovered) owes no re-validation — RE-KEY the off-lock delta
+            // at the wave's `next_row_id` instead of re-coercing + rebuilding it. A generation
+            // drift (Full) or a non-eligible item falls through to the authoritative re-prepare.
+            let prepared = match &item.offlock_delta {
+                Some(delta) if insert_validation == InsertPrepareValidation::ReResolveLedgerCovered => {
+                    Ok(Self::rekey_offlock_insert_delta(delta, install_snapshot))
+                }
+                _ => self.prepare_dml(&item.cmd, install_snapshot, insert_validation),
+            };
             if let Some(table_name) = insert_table.as_deref() {
                 if was_elided && !self.table_install_elided(table_name) {
                     // Mid-re-resolve de-elision: reconcile the buffered same-table rows into
