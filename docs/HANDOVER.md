@@ -32,7 +32,7 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: THREE SLICES SHIPPED (9 commits through `4447c7ee`: constrained elision 923→93k; ledger-#18 skip; Date/Int2 device-authoritative incl the LAST facade-seq seam). TRACK 2 SLICE 2 (i64 sections) COMPLETE LOCALLY: int8-payload tables 825→83-91k elided (~110x), 4 commits in STACK AUDIT — then push; next = the i64-KEY path (the non-int4 proposal) or numeric/uuid sections. THE CONSTRAINED-ELISION FLIP IS LIVE (default ON; PK'd 87-95k on pure defaults). auto_admit stays OFF behind TWO NAMED GATES: R-1 eviction + ledger #19 rollover stall. FK/CHECK eligibility = a future design slice. <<<
+## >>> THE ONE NEXT ACTION: THREE SLICES SHIPPED (9 commits through `4447c7ee`: constrained elision 923→93k; ledger-#18 skip; Date/Int2 device-authoritative incl the LAST facade-seq seam). TRACK 2 SLICE 2 (i64 sections) SHIPPED (`9a4bccb1`): int8-payload tables 825→83-91k elided (~110x), stack audit PUSH. PENDING USER: the shard_int8_section_enabled FLIP (after burn-in evidence). NEXT: numeric/uuid (i128) sections OR the i64-KEY path (bigint PKs, the non-int4 proposal) — recommend at the boundary. THE CONSTRAINED-ELISION FLIP IS LIVE (default ON; PK'd 87-95k on pure defaults). auto_admit stays OFF behind TWO NAMED GATES: R-1 eviction + ledger #19 rollover stall. FK/CHECK eligibility = a future design slice. <<<
 
 **THE RETIREMENT PROGRAM A1→A5 IS COMPLETE; THE FLIP IS LIVE** (`fd154409`/`f0c3101e`:
 `host_install_elision_enabled` + `auto_vacuum_enabled` default ON; SLO 104-124k sustained on PK-less
