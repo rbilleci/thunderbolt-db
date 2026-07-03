@@ -24298,6 +24298,77 @@ mod tests {
         (index, table_mask, hash_shift)
     }
 
+    /// M1 BAKEOFF micro-bench: the write-locate kernel's AMORTIZATION curve — us/needle at batch
+    /// sizes 1..256 across a realistic shard set. Decides A-vs-B viability: if launch-dominated
+    /// (us/needle falls ~linearly with batch size), a wave of ~17 needles amortizes ~17x and both
+    /// batching designs reach the host-oracle class; if compute-dominated, batching gains less.
+    /// Prints a table; asserts only that batching HELPS (256-batch us/needle < single-needle).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn write_locate_kernel_amortization_curve() {
+        use std::time::Instant;
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        if !runtime.snapshot().driver_available {
+            return;
+        }
+        // 8 shards of 4096 keys each (a mid-size resident table, ~32k rows — the SLO regime).
+        const SHARDS: usize = 8;
+        const PER_SHARD: usize = 4096;
+        let mut all_keys: Vec<i32> = Vec::new();
+        let mut shards = Vec::new();
+        for s in 0..SHARDS {
+            let keys: Vec<i32> = (0..PER_SHARD)
+                .map(|i| (s * PER_SHARD + i) as i32)
+                .collect();
+            all_keys.extend_from_slice(&keys);
+            let (index_words, table_mask, hash_shift) = build_pk_hash(&keys);
+            let bytes: Vec<u8> = index_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let Ok(mem) = runtime.retain_device_memory_copy(0, &bytes) else {
+                return;
+            };
+            shards.push(WriteLocateShard {
+                index: std::sync::Arc::new(mem),
+                table_mask,
+                hash_shift,
+            });
+        }
+        let ctx = std::sync::Arc::clone(&shards[0].index);
+        // Warm up (JIT the kernel).
+        let _ = ctx.submit_multi_shard_i32_write_locate(&shards, &all_keys[..1], 2);
+        eprintln!("  batch |   total us | us/needle");
+        let mut single_us = 0.0;
+        let mut big_us = 0.0;
+        for &batch in &[1usize, 4, 16, 32, 64, 256] {
+            // Spread needles across shards (real workload hits many shards).
+            let needles: Vec<i32> = (0..batch)
+                .map(|i| all_keys[(i * 997) % all_keys.len()])
+                .collect();
+            const REPS: u32 = 200;
+            let t0 = Instant::now();
+            for _ in 0..REPS {
+                let r = ctx
+                    .submit_multi_shard_i32_write_locate(&shards, &needles, 2)
+                    .expect("locate");
+                std::hint::black_box(&r.count);
+            }
+            let per_call_us = t0.elapsed().as_micros() as f64 / REPS as f64;
+            let per_needle = per_call_us / batch as f64;
+            eprintln!("  {batch:>5} | {per_call_us:>9.1} | {per_needle:>8.3}");
+            if batch == 1 {
+                single_us = per_needle;
+            }
+            if batch == 256 {
+                big_us = per_needle;
+            }
+        }
+        assert!(
+            big_us < single_us,
+            "batching must amortize: 256-batch {big_us:.3} us/needle vs single {single_us:.3}"
+        );
+    }
+
     /// M1 device WRITE-LOCATE kernel: probe multi-shard device indexes for a batch of needles and
     /// verify EVERY (shard, slot) hit matches a naive host scan of the same key sets — including a
     /// CROSS-SHARD DUPLICATE (a key in two shards, the SV5 old+new case) which must emit BOTH hits.
