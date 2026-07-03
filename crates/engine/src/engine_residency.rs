@@ -420,12 +420,15 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
             "open-shard append capacity {capacity} is implausibly large"
         ))));
     }
-    if !column_types
-        .iter()
-        .all(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
-    {
+    if !column_types.iter().all(|ty| {
+        matches!(
+            ty,
+            SqlType::Int4 | SqlType::Date | SqlType::Int2 | SqlType::Int8 | SqlType::Timestamp
+        )
+    }) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "open-shard append supports int4/date/int2 columns only (this slice)".to_string(),
+            "open-shard append supports fixed-width (i32/i64) sections only (this slice)"
+                .to_string(),
         )));
     }
     // Row-arity guard: a malformed (short/long) row must return the fallback Err, never panic on the
@@ -436,28 +439,65 @@ pub(crate) fn compute_open_shard_int4_append_chunks(
         )));
     }
     let header_bytes = std::mem::size_of::<u64>();
-    let width = std::mem::size_of::<i32>();
+    // TYPE-COVERAGE track 2 slice 2 stage (ii): MIXED fixed-width sections. Catalog order no
+    // longer equals section ordinal - each column maps to (section, within-section ordinal):
+    // i32 sections first (header + c32*capacity*4), then i64 sections
+    // (header + num_i32*capacity*4 + c64*capacity*8) - the shared offset-helper formula.
+    let num_i32_cols = column_types
+        .iter()
+        .filter(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
+        .count();
+    let i64_section_base = header_bytes + num_i32_cols * capacity * std::mem::size_of::<i32>();
     // Column chunks FIRST, header LAST (the partial-failure contract: never advertise un-written rows).
     let mut chunks = Vec::with_capacity(column_types.len() + 1);
-    for (col_idx, _ty) in column_types.iter().enumerate() {
-        let section_start = header_bytes + col_idx * capacity * width;
-        let byte_offset = (section_start + row_start * width) as u64;
-        let mut bytes = Vec::with_capacity(appended * width);
-        for row in new_rows {
-            let value: i32 = match row[col_idx] {
-                SqlValue::Int4(value) | SqlValue::Date(value) => value,
-                SqlValue::Int2(value) => i32::from(value),
-                // A NULL int4 materializes as 0 (the validity bitmap, a later slice, marks the row).
-                SqlValue::Null => 0,
-                _ => {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                        "open-shard int4 append encountered a non-i32 value".to_string(),
-                    )))
+    let mut i32_ordinal = 0_usize;
+    let mut i64_ordinal = 0_usize;
+    for (col_idx, ty) in column_types.iter().enumerate() {
+        match ty {
+            SqlType::Int4 | SqlType::Date | SqlType::Int2 => {
+                let width = std::mem::size_of::<i32>();
+                let section_start = header_bytes + i32_ordinal * capacity * width;
+                let byte_offset = (section_start + row_start * width) as u64;
+                let mut bytes = Vec::with_capacity(appended * width);
+                for row in new_rows {
+                    let value: i32 = match row[col_idx] {
+                        SqlValue::Int4(value) | SqlValue::Date(value) => value,
+                        SqlValue::Int2(value) => i32::from(value),
+                        // A NULL materializes as 0 (the validity bitmap, a later slice, marks the row).
+                        SqlValue::Null => 0,
+                        _ => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "open-shard int4 append encountered a non-i32 value".to_string(),
+                            )))
+                        }
+                    };
+                    bytes.extend_from_slice(&value.to_le_bytes());
                 }
-            };
-            bytes.extend_from_slice(&value.to_le_bytes());
+                chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
+                i32_ordinal += 1;
+            }
+            SqlType::Int8 | SqlType::Timestamp => {
+                let width = std::mem::size_of::<i64>();
+                let section_start = i64_section_base + i64_ordinal * capacity * width;
+                let byte_offset = (section_start + row_start * width) as u64;
+                let mut bytes = Vec::with_capacity(appended * width);
+                for row in new_rows {
+                    let value: i64 = match row[col_idx] {
+                        SqlValue::Int8(value) | SqlValue::Timestamp(value) => value,
+                        SqlValue::Null => 0,
+                        _ => {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                "open-shard i64 append encountered a non-i64 value".to_string(),
+                            )))
+                        }
+                    };
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
+                i64_ordinal += 1;
+            }
+            _ => unreachable!("the section guard above rejects non-fixed-width columns"),
         }
-        chunks.push(CudaOwnedDeviceMemoryChunk { byte_offset, bytes });
     }
     chunks.push(CudaOwnedDeviceMemoryChunk {
         byte_offset: 0,
@@ -4290,6 +4330,95 @@ mod capacity_payload_tests {
         );
     }
 
+    /// TYPE-COVERAGE track 2 slice 2, stage (ii) — the i64 APPEND + MULTI-SHARD RECOMPACTION
+    /// differential: wave INSERTs on a flag-ON int8/timestamp table append IN PLACE through
+    /// ROLLOVERS (shard target 64 -> multiple shards), then a full read recompacts every
+    /// shard's i32 AND i64 sections into the unified buffer. The single-buffer twin is the
+    /// oracle. NON-VACUITY: the sharded arm must (a) really append (open_shard_append_hits
+    /// advances), (b) really roll over (>= 2 shards), and (c) beyond-i32 bigint values +
+    /// per-row timestamps must read back exactly — a broken i64 chunk offset or a missing
+    /// recompaction segment corrupts them (sabotage-verified: skipping the i64 recompaction
+    /// axis fails this test NOW that multi-shard i64 tables exist).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn int8_section_appends_roll_over_and_recompact_to_parity() {
+        let run = |int8_shards: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_shard_int8_section_enabled(int8_shards);
+            e.execute_text(
+                1,
+                "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, ts TIMESTAMP)",
+            )
+            .unwrap();
+            // Seed 100 rows (one bulk admit), then 200 wave INSERTs -> ~3-4 rollovers at target 64.
+            let seed: Vec<String> = (0..100_i64)
+                .map(|k| {
+                    format!(
+                        "({k}, {}, '2026-01-01 00:00:{:02}')",
+                        7_000_000_000_i64 - k,
+                        k % 60
+                    )
+                })
+                .collect();
+            e.execute_text(2, &format!("INSERT INTO t8 (id, v, ts) VALUES {}", seed.join(",")))
+                .unwrap();
+            let hits_before = e.open_shard_append_hits();
+            for t in 0..200_u64 {
+                e.execute_dml_concurrent(
+                    100 + t,
+                    &format!(
+                        "INSERT INTO t8 (id, v, ts) VALUES ({}, {}, '2027-06-15 08:30:{:02}')",
+                        1_000 + t,
+                        6_000_000_000_i64 + t as i64,
+                        t % 60
+                    ),
+                )
+                .unwrap();
+            }
+            let appends = e.open_shard_append_hits() - hits_before;
+            let shard_count = e.resident_shard_count("t8");
+            let queries = [
+                "SELECT id, v, ts FROM t8",
+                "SELECT v FROM t8 WHERE id = 1100",
+                "SELECT id FROM t8 WHERE v = 6000000100",
+                "SELECT id, v FROM t8 ORDER BY v",
+            ];
+            let mut outs: Vec<Result<String, String>> = Vec::new();
+            for q in &queries {
+                outs.push(match e.execute_relational_select_text(q) {
+                    Ok(result) => {
+                        let mut rows = result.rows.into_boxed();
+                        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                        Ok(format!("{rows:?}"))
+                    }
+                    Err(err) => Err(err.to_string()),
+                });
+            }
+            (appends, shard_count, outs)
+        };
+        let (appends_on, shards_on, on) = run(true);
+        let (_appends_off, shards_off, off) = run(false);
+        assert!(
+            appends_on >= 100,
+            "non-vacuity: the int8 table must APPEND in place (got {appends_on} hits)"
+        );
+        assert!(
+            shards_on >= 2,
+            "non-vacuity: the appends must ROLL OVER to multiple shards (got {shards_on})"
+        );
+        assert_eq!(shards_off, 0, "flag OFF keeps the int8 table single-buffer");
+        for (i, (a, b)) in on.iter().zip(off.iter()).enumerate() {
+            assert_eq!(a, b, "query {i}: multi-shard i64 == single-buffer oracle");
+        }
+        // Every query must SUCCEED on both arms (these shapes are all served pre-slice).
+        assert!(
+            on.iter().all(|o| o.is_ok()),
+            "all stage-(ii) shapes must succeed: {on:?}"
+        );
+    }
+
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
     /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
     /// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
@@ -6498,12 +6627,13 @@ impl Engine {
                 // "large admit is one dense shard") must reach the append fn's ROLLOVER branch —
                 // the in-place branch checks headroom itself. Gating headroom here made every
                 // bulk-admitted lineage decline appends outright -> O(table) re-admit per commit.
-                int4_appendable: snapshot.resident_device_int8_columns.is_empty()
-                    && snapshot.resident_device_numeric_columns.is_empty()
+                int4_appendable: snapshot.resident_device_numeric_columns.is_empty()
                     && snapshot.resident_device_bool_columns.is_empty()
                     && snapshot.resident_device_text_columns.is_empty()
                     && snapshot.resident_device_null_columns.is_empty()
-                    && snapshot.column_count == snapshot.resident_device_int4_columns.len(),
+                    && snapshot.column_count
+                        == snapshot.resident_device_int4_columns.len()
+                            + snapshot.resident_device_int8_columns.len(),
                 // S-d3: the zone map (min/max per int4 column) for shard pruning.
                 resident_device_int4_column_stats: snapshot
                     .resident_device_int4_column_stats
@@ -7305,8 +7435,8 @@ impl Engine {
             capacity,
             row_count,
             row_start,
-            column_count,
-            column_names,
+            shard_int4_names,
+            shard_int8_names,
             gpu_id,
             schema,
             max_shard_id,
@@ -7326,14 +7456,41 @@ impl Engine {
                 open.capacity,
                 open.row_count,
                 open.row_start,
-                open.resident_device_int4_columns.len(),
                 open.resident_device_int4_columns.clone(),
+                open.resident_device_int8_columns.clone(),
                 open.gpu_id,
                 open.schema.clone(),
                 table_shards.iter().map(|s| s.shard_id).max().unwrap_or(0),
             )
         };
-        let column_types = vec![SqlType::Int4; column_count];
+        // TYPE-COVERAGE track 2 slice 2 stage (ii): CATALOG-ordered names/types drive the
+        // section-aware chunk encoder + the rollover payload (mixed i32/i64 sections —
+        // catalog order != section ordinal). Defensive arity guard: the shard's section
+        // lists must cover the catalog exactly, else decline to the re-admit oracle.
+        let Some(catalog_table) = self
+            .catalog_snapshot()
+            .relational_catalog
+            .get(table)
+            .cloned()
+        else {
+            return false;
+        };
+        let column_names: Vec<String> = catalog_table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let column_types: Vec<SqlType> = catalog_table
+            .columns
+            .iter()
+            .map(|column| column.ty)
+            .collect();
+        let column_count = column_types.len();
+        if shard_int4_names.len() + shard_int8_names.len() != column_count {
+            return false;
+        }
+        let num_i32_cols = shard_int4_names.len();
+        let num_i64_cols = shard_int8_names.len();
 
         // FITS the open shard's headroom -> append IN PLACE (1b-ii on the shard path).
         if row_count.checked_add(k).is_some_and(|end| end <= capacity) {
@@ -7383,10 +7540,19 @@ impl Engine {
                     return false;
                 }
             }
-            let appended_bytes = (k * column_count * std::mem::size_of::<i32>()) as u64;
-            // S-d3: extend the open shard's zone map (min/max per int4 column) to cover the appended rows,
-            // so a point-lookup prune never wrongly skips a shard holding a just-appended needle. O(k*cols).
+            let appended_bytes = (k
+                * (num_i32_cols * std::mem::size_of::<i32>()
+                    + num_i64_cols * std::mem::size_of::<i64>())) as u64;
+            // S-d3: extend the open shard's zone map (min/max per int4 column) to cover the appended
+            // rows. The stats vector is INT4-ORDINAL-aligned, so iterate only the i32-section catalog
+            // columns, in order (stage ii: i64 columns carry no zone map — they simply never prune).
             let new_min_max: Vec<(i32, i32)> = (0..column_count)
+                .filter(|&c| {
+                    matches!(
+                        column_types[c],
+                        SqlType::Int4 | SqlType::Date | SqlType::Int2
+                    )
+                })
                 .map(|c| {
                     new_rows.iter().fold((i32::MAX, i32::MIN), |(lo, hi), row| {
                         let v = sql_value_as_int4(&row[c]);
@@ -7401,9 +7567,10 @@ impl Engine {
             // FRESH count found a stale entry and raced into tail-DtoH reads against this very
             // extension (run-to-run TPS swung 51-84k @32w); pre-publish, probers at the old
             // count read the AHEAD entry via the slot-bound rule and probers at the new count
-            // find the cache already current. Catalog order == i32-section order here (this
-            // path appends only all-i32-section shards). NULL-free by the guard above, so
-            // `sql_value_as_int4` yields exactly the bytes the chunks wrote.
+            // find the cache already current. Stage (ii): entries are keyed by CATALOG col_idx;
+            // i64 columns produce inert placeholder vecs (their probes decline pre-cache, so no
+            // entry can exist to extend). NULL-free by the guard above, so `sql_value_as_int4`
+            // yields exactly the bytes the chunks wrote for the i32 columns.
             let column_values: Vec<Vec<i32>> = (0..column_count)
                 .map(|c| new_rows.iter().map(|row| sql_value_as_int4(&row[c])).collect())
                 .collect();
@@ -7509,10 +7676,8 @@ impl Engine {
             resident_bytes: (8 + k * column_count * std::mem::size_of::<i32>()) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
-            resident_device_int4_columns: column_names,
-            // Stage (ii) of the i64-section slice threads the rolled shard's int8 names; the
-            // append gate keeps int8-bearing tables off this path until then.
-            resident_device_int8_columns: Vec::new(),
+            resident_device_int4_columns: shard_int4_names.clone(),
+            resident_device_int8_columns: shard_int8_names.clone(),
             resident_device_text_columns: Vec::new(),
             // Rollover shards are int4-only + NULL-free by precondition (the caller rejects NULLs).
             resident_device_null_columns: Vec::new(),
