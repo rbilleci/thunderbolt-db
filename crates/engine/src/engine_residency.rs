@@ -8001,6 +8001,18 @@ impl Engine {
                 row_count,
                 &column_values,
             );
+            // M1 (ledger #24): incrementally maintain the DEVICE PK index too (the index_insert
+            // kernel), so the wave-batched device locate never triggers the O(rows) rebuild.
+            // Only fires when a device index is cached (device_write_locate on); no-op otherwise.
+            if self.device_write_locate_enabled() {
+                self.extend_shard_pk_device_index_on_append(
+                    table,
+                    shard_id,
+                    shard_device_memory.device_ptr(),
+                    row_count,
+                    &column_values,
+                );
+            }
             self.read_state.residency.with_shards_mut(|shards| {
                 if let Some(table_shards) = shards.get_mut(table) {
                     if let Some(open) = table_shards.last_mut() {

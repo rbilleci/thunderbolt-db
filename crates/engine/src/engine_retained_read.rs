@@ -843,6 +843,97 @@ impl Engine {
         Some(out)
     }
 
+    /// M1 (ledger #24): INCREMENTALLY maintain a cached DEVICE PK index over an in-place append —
+    /// insert only the k appended keys via the `index_insert` kernel (O(k)) instead of the O(rows)
+    /// rebuild (`ensure_shard_pk_device_index`) the (ptr,row_count) validation would otherwise force
+    /// every wave (the measured 305us/wave bottleneck). Device analog of the host
+    /// `extend_shard_pk_index_cache_on_append`. Called at the append chokepoint with the appended
+    /// values in hand (no DtoH). Per entry: a different ptr (re-admit) or a basis != `base_row_count`
+    /// (a prober rebuilt) is skipped; a DECLINED entry stays declined (monotone); a dup/overflow ->
+    /// DECLINED; past the load rule (`2*new_count > table_size`) the entry is DROPPED (the next probe
+    /// rebuilds at the grown size).
+    pub(crate) fn extend_shard_pk_device_index_on_append(
+        &self,
+        table_name: &str,
+        shard_id: u32,
+        device_ptr: u64,
+        base_row_count: usize,
+        column_values: &[Vec<i32>],
+    ) {
+        let appended = column_values.first().map_or(0, Vec::len);
+        if appended == 0 {
+            return;
+        }
+        let new_count = base_row_count + appended;
+        for (col_idx, tail) in column_values.iter().enumerate() {
+            let key = (table_name.to_string(), shard_id, col_idx);
+            // Snapshot the entry basis under the lock (index Arc is cheap-cloned for the launch).
+            let (index, table_mask, hash_shift) = {
+                let cache = self
+                    .read_state
+                    .residency
+                    .shard_pk_device_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(entry) = cache.get(&key) else {
+                    continue; // not built on the device -> nothing to maintain
+                };
+                if entry.resident_device_ptr != device_ptr || entry.row_count != base_row_count {
+                    continue; // re-admit / a prober advanced it -> the prober path converges it
+                }
+                let Some(index) = entry.device_index.clone() else {
+                    continue; // DECLINED is monotone under appends
+                };
+                (index, entry.table_mask, entry.hash_shift)
+            };
+            let table_size = (table_mask as u64) + 1;
+            if (new_count as u64).saturating_mul(2) > table_size {
+                // Past the builder's load rule -> drop so the next probe rebuilds at the grown size.
+                self.read_state
+                    .residency
+                    .shard_pk_device_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&key);
+                continue;
+            }
+            let Ok(base_row_u32) = u32::try_from(base_row_count) else {
+                continue;
+            };
+            // The kernel mutates the device index buffer IN PLACE (atom.cas). A launch failure ->
+            // drop the entry (rebuild next probe); never a wrong index.
+            match index.submit_i32_index_insert(&index, table_mask, hash_shift, tail, base_row_u32) {
+                Ok(dup) => {
+                    let mut cache = self
+                        .read_state
+                        .residency
+                        .shard_pk_device_index
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Some(entry) = cache.get_mut(&key) else {
+                        continue;
+                    };
+                    // Re-validate the basis (a racing rebuild could have replaced it).
+                    if entry.resident_device_ptr != device_ptr || entry.row_count != base_row_count {
+                        continue;
+                    }
+                    if dup {
+                        entry.device_index = None; // dup appended key -> monotone DECLINE
+                    }
+                    entry.row_count = new_count;
+                }
+                Err(_) => {
+                    self.read_state
+                        .residency
+                        .shard_pk_device_index
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&key);
+                }
+            }
+        }
+    }
+
     /// M1 design B (wave-time batched validation): probe a BATCH of `needles` against the table's
     /// DEVICE hash indexes in ONE kernel launch, returning each needle's HIT COUNT (any shard). A
     /// FAST-PATH FILTER for the wave's PK-unique validation: `count == 0` proves NO physical slot
