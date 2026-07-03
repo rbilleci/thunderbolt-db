@@ -903,3 +903,56 @@ fn dml_index_validators_match_scan_validators_oracle() {
         assert_eq!(c_on, c_off, "scenario {i}: child state == oracle");
     }
 }
+
+/// Ledger #18 audit fix (the mid-flight constraint-adding DDL race): an INSERT whose OFF-LOCK
+/// prepare ran BEFORE an `ADD CHECK` (or `ADD UNIQUE`) committed must be FULLY re-validated at
+/// its wave re-resolve — the ledger-covered skip's coverage proof only holds while the catalog
+/// generation matches (the DDL records nothing in the conflict ledger and the item's write_set
+/// lacks slots for a constraint that did not exist at S). Deterministic via the instrumented
+/// hook: the writer parks between prepare and enqueue while the DDL commits. Sabotage-verified:
+/// granting the skip on a stamp mismatch lets the violating row COMMIT silently.
+#[test]
+fn wave_insert_prepared_before_add_check_is_revalidated() {
+    let e = std::sync::Arc::new(Engine::new_local());
+    e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+    e.execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10)")
+        .unwrap();
+    let (prepared_tx, prepared_rx) = std::sync::mpsc::channel::<()>();
+    let (ddl_done_tx, ddl_done_rx) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let e = std::sync::Arc::clone(&e);
+        std::thread::spawn(move || {
+            // v = -5 violates the CHECK that commits while this item is parked post-prepare.
+            e.execute_dml_concurrent_instrumented(
+                100,
+                "INSERT INTO t (id, v) VALUES (2, -5)",
+                move || {
+                    prepared_tx.send(()).unwrap();
+                    ddl_done_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("the DDL must commit while the writer is parked");
+                },
+            )
+        })
+    };
+    prepared_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the writer must reach the post-prepare hook");
+    e.execute_text(
+        3,
+        "ALTER TABLE ONLY t ADD CONSTRAINT t_v_floor CHECK (v > 0)",
+    )
+    .unwrap();
+    ddl_done_tx.send(()).unwrap();
+    let outcome = writer.join().unwrap();
+    assert!(
+        outcome.is_err(),
+        "the post-DDL wave re-resolve must reject the violating row (got {outcome:?})"
+    );
+    // The violating row must not exist; the seed row must.
+    let rows = e
+        .execute_relational_select_text("SELECT id, v FROM t")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 1, "only the seed row survives");
+}

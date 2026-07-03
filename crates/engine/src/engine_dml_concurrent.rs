@@ -30,6 +30,13 @@ pub(crate) struct CommitWaveItem {
     write_set: WriteSet,
     read_snapshot: Index,
     residency_tables: BTreeSet<String>,
+    /// Ledger #18 audit fix: the catalog generation the OFF-LOCK prepare validated against.
+    /// The sequencer grants the ledger-covered re-resolve skip ONLY while the live catalog
+    /// still carries this stamp — a constraint-adding DDL (ADD UNIQUE/CHECK) committing
+    /// between the snapshot and the wave records NOTHING in the conflict ledger, so the skip
+    /// would silently bypass the new constraint; any DDL bumps the stamp and forces the
+    /// always-correct Full re-validation instead.
+    prepared_catalog_seq: Index,
     outcome: CommitWaveOutcome,
 }
 
@@ -250,6 +257,11 @@ impl Engine {
             drop(_snapshot_guard);
             return self.execute_text(txn_id, text).map(|_| ());
         }
+        // Ledger #18 audit fix: capture the catalog generation BEFORE the prepare — the
+        // prepare's own catalog bind is at least this fresh, so a stamp match at re-resolve
+        // proves no constraint-adding DDL landed since the off-lock validation (a capture
+        // AFTER prepare could miss a DDL slipping between the bind and the capture).
+        let prepared_catalog_seq = self.catalog_snapshot().commit_seq;
         let snapshot = self.dml_read_snapshot(read_snapshot);
         let prepared = self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)?;
         let residency_tables = Self::dml_mutated_tables(&cmd);
@@ -267,6 +279,7 @@ impl Engine {
             prepared.write_set,
             read_snapshot,
             residency_tables,
+            prepared_catalog_seq,
         )
     }
 
@@ -338,6 +351,7 @@ impl Engine {
         write_set: WriteSet,
         read_snapshot: Index,
         residency_tables: BTreeSet<String>,
+        prepared_catalog_seq: Index,
     ) -> Result<(), ExecuteError> {
         let outcome: CommitWaveOutcome = Arc::new(CommitWaveDone::default());
         let mut queue = self.lock_commit_wave_queue();
@@ -350,6 +364,7 @@ impl Engine {
             txn_id,
             cmd,
             payload: text.as_bytes().to_vec(),
+            prepared_catalog_seq,
             write_set,
             read_snapshot,
             residency_tables,
@@ -663,12 +678,18 @@ impl Engine {
                 .is_some_and(|table| self.table_install_elided(table));
             // Ledger #18: FK-free INSERT re-resolves skip the redundant unique/CHECK pass —
             // the conflicts() check above IS the commit-time guard (coverage proof on
-            // InsertPrepareValidation).
-            let prepared = self.prepare_dml(
-                &item.cmd,
-                install_snapshot,
-                InsertPrepareValidation::ReResolveLedgerCovered,
-            );
+            // InsertPrepareValidation) — but ONLY while the catalog generation still matches
+            // the off-lock prepare's (audit fix): a constraint-adding DDL committed since S
+            // records nothing in the ledger and the item's write_set lacks slots for the new
+            // index, so the skip would silently bypass it. Any DDL bumps the stamp -> Full
+            // (always correct; DDL is rare so the hot path keeps the skip).
+            let insert_validation =
+                if self.catalog_snapshot().commit_seq == item.prepared_catalog_seq {
+                    InsertPrepareValidation::ReResolveLedgerCovered
+                } else {
+                    InsertPrepareValidation::Full
+                };
+            let prepared = self.prepare_dml(&item.cmd, install_snapshot, insert_validation);
             if let Some(table_name) = insert_table.as_deref() {
                 if was_elided && !self.table_install_elided(table_name) {
                     // Mid-re-resolve de-elision: reconcile the buffered same-table rows into

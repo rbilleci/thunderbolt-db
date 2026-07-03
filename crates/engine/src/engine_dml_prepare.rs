@@ -28,6 +28,13 @@ pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 /// PARENT's row keys into the ledger, which the CHILD's write-set never claims — no
 /// conflict), so FK-bearing tables always validate fully. PK NOT-NULL (O(new), pure) runs
 /// unconditionally as cheap defense.
+///
+/// PRECONDITION (audit 3b1be580): the skip is granted ONLY while the catalog generation
+/// still matches the off-lock prepare's (`CommitWaveItem::prepared_catalog_seq`) — a
+/// constraint-adding DDL (ADD UNIQUE/CHECK) committing in (S, wave] records NOTHING in the
+/// conflict ledger and the item's write_set lacks slots for the new index, so an unguarded
+/// skip silently bypassed it (sabotage-verified by
+/// `wave_insert_prepared_before_add_check_is_revalidated`). Any DDL bumps the stamp -> Full.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InsertPrepareValidation {
     Full,
