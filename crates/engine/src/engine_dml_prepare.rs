@@ -574,9 +574,8 @@ impl Engine {
     /// stamps (SV6); plain INSERT appends are BORN-VISIBLE and are gated for concurrent READERS
     /// by the snapshot-pinned `row_count` instead — a mechanism a slot-addressed materializer
     /// cannot replicate. Historical time-travel below an unstamped insert is NOT this primitive's
-    /// contract. UNWIRED until A4e — proven by the
-    /// `a4a_device_materialization_matches_host_fetch` differential first.
-    #[allow(dead_code)]
+    /// contract. WIRED by A4e: the elided resolve + probe materialize through this (proven
+    /// first by the `a4a_device_materialization_matches_host_fetch` differential).
     pub(crate) fn materialize_resident_row_via_hit(
         &self,
         table: &RelationalTable,

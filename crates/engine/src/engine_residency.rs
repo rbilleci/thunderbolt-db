@@ -7770,7 +7770,6 @@ impl Engine {
     /// callers pass the invalidating commit's seq or newer). Completeness rests on the pinned
     /// `row_count` bounding born-visible slots and on seq monotonicity making any concurrent
     /// commit's mutations (seq > read_txn) correctly invisible to the sequential region reads.
-    #[allow(dead_code)]
     pub(crate) fn gather_resident_table_rows_from_device(
         &self,
         table: &RelationalTable,
