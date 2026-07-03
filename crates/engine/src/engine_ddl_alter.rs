@@ -346,9 +346,10 @@ impl Engine {
         );
 
         let prefix = relational_key_prefix(&add.table);
-        let visibility = StorageVisibility {
-            read_txn_id: txn_id,
-        };
+        // Re-audit hardening: a row-REWRITING scan (see `ddl_rewrite_scan_visibility`) — an
+        // elided stale prefix or a facade-below-committed boundary would silently leave rows
+        // behind on the old layout.
+        let visibility = self.ddl_rewrite_scan_visibility(&add.table, txn_id)?;
         let mut updates = Vec::new();
         let mut default_values = default_values.into_iter();
         {
@@ -587,9 +588,8 @@ impl Engine {
         }
 
         let prefix = relational_key_prefix(&drop_column.table);
-        let visibility = StorageVisibility {
-            read_txn_id: txn_id,
-        };
+        // Re-audit hardening: row-REWRITING scan (see `ddl_rewrite_scan_visibility`).
+        let visibility = self.ddl_rewrite_scan_visibility(&drop_column.table, txn_id)?;
         let mut updates = Vec::new();
         {
             let table_rows = self.read_state.mvcc.table_rows(&drop_column.table);

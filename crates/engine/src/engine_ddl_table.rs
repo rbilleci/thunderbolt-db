@@ -504,8 +504,14 @@ impl Engine {
         // (DDL row-validators would silently pass over data that violates the new constraint;
         // the flag-off scan validators would bypass unique/FK checks). Rehydrate FIRST, whatever
         // the caller: this fn is elision-safe by construction, not by caller discipline.
+        let mut visibility = visibility;
         if self.table_install_elided(&table.name) {
             self.rehydrate_elided_serialized(&table.name)?;
+            // Re-audit SHOULD-FIX (the FINDING-C class, scan-arm side): the reconcile stamps
+            // every elided-era row at committed_seq; callers reading at a FACADE txn id below
+            // it (the FK preflight, flag-off validators) would miss them all — the un-raised
+            // sibling of the index arm's probe boundary. Raise identically.
+            visibility.read_txn_id = visibility.read_txn_id.max(self.committed_seq());
         }
         let prefix = relational_key_prefix(&table.name);
         let mut rows = Vec::new();
@@ -526,6 +532,29 @@ impl Engine {
             }
         }
         Ok(rows)
+    }
+
+    /// Re-audit hardening (2330965b item-2 NOTE): the visibility for a DDL applier that scans a
+    /// table's store DIRECTLY (add-column rewrite, drop-column rewrite, rename-table move —
+    /// the row-REWRITING appliers, where a missed row is silent data loss). Rehydrates an
+    /// elided table first (stale prefix), then reads at `max(txn_id, committed_seq)`: DDL
+    /// applies run under the commit lock with every commit <= committed_seq fully applied and
+    /// must see ALL of them (a rename moves every row), while facade txn ids are DECOUPLED
+    /// from commit seqs and can sit below — and an elision rehydration re-stamps rows at
+    /// committed_seq. Row-DISCARDING appliers (DROP/TRUNCATE) deliberately skip this: a stale
+    /// prefix only shrinks the set of tuples to delete, and the device invalidate + elided-flag
+    /// purge make the end state correct regardless.
+    pub(crate) fn ddl_rewrite_scan_visibility(
+        &self,
+        table: &str,
+        txn_id: TxnId,
+    ) -> Result<StorageVisibility, EngineError> {
+        if self.table_install_elided(table) {
+            self.rehydrate_elided_serialized(table)?;
+        }
+        Ok(StorageVisibility {
+            read_txn_id: txn_id.max(self.committed_seq()),
+        })
     }
 
     /// PG: PRIMARY KEY implies NOT NULL — a NULL may never enter a PK column (PG rejects it with a
@@ -1003,9 +1032,15 @@ impl Engine {
         };
 
         let old_prefix = relational_key_prefix(&rename.old_name);
-        let visibility = StorageVisibility {
-            read_txn_id: txn_id,
-        };
+        // Re-audit hardening: the rename MOVES every row — a row-REWRITING scan (see
+        // `ddl_rewrite_scan_visibility`): an elided stale prefix or a facade-below-committed
+        // boundary would silently strand rows in the old partition.
+        let visibility = self.ddl_rewrite_scan_visibility(&rename.old_name, txn_id)?;
+        // The moved table starts NON-elided under its new name, and the OLD name's flag must
+        // not linger (the SF4 drop-purge discipline): an orphaned entry would mislabel a
+        // future same-name table as device-authoritative.
+        self.set_table_install_elided(&rename.old_name, false);
+        self.set_table_install_elided(&rename.new_name, false);
         // Read the rows to move out of the OLD partition's published generation.
         let mut moves = Vec::new();
         {
