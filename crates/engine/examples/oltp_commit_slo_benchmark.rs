@@ -92,8 +92,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         // baseline the constrained-elision slice must move.
         if std::env::var("GPU_DB_BENCH_INT8").is_ok_and(|v| v == "1") {
             // TYPE-COVERAGE track 2 slice 2: the int4-keyed / i64-payload core-banking shape
-            // (BIGINT balances). Baseline: not purely-i32-section -> single-buffer -> O(table)
-            // re-admit per write, no elision.
+            // (BIGINT balances). Since the i64-SECTION FLIP (default ON) this shards + elides
+            // like a pure-int4 PK'd table (~83-91k); GPU_DB_BENCH_I64SHARDS=0 reproduces the
+            // pre-flip single-buffer O(table)-re-admit baseline (825 TPS).
             e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)")?;
         } else if std::env::var("GPU_DB_BENCH_DATE").is_ok_and(|v| v == "1") {
             // TYPE-COVERAGE track 2: the Date/Int2 PK'd shape — every i32-section type
