@@ -251,7 +251,7 @@ impl Engine {
             return self.execute_text(txn_id, text).map(|_| ());
         }
         let snapshot = self.dml_read_snapshot(read_snapshot);
-        let prepared = self.prepare_dml(&cmd, snapshot)?;
+        let prepared = self.prepare_dml(&cmd, snapshot, InsertPrepareValidation::Full)?;
         let residency_tables = Self::dml_mutated_tables(&cmd);
 
         // The snapshot is now pinned and prepare is done; the commit critical section has not started.
@@ -271,13 +271,19 @@ impl Engine {
     }
 
     /// Off-lock prepare dispatch: run the pure `prepare_*` for a DML command against `snapshot`.
+    /// `insert_validation` = `Full` off-lock (the authoritative validation);
+    /// `ReResolveLedgerCovered` only from the sequencer's under-lock re-resolve (ledger #18 —
+    /// the coverage proof lives on [`InsertPrepareValidation`]).
     fn prepare_dml(
         &self,
         cmd: &Command,
         snapshot: DmlReadSnapshot,
+        insert_validation: InsertPrepareValidation,
     ) -> Result<WriteDelta, ExecuteError> {
         let delta = match cmd {
-            Command::Insert(insert) => self.prepare_insert(insert, snapshot, None),
+            Command::Insert(insert) => {
+                self.prepare_insert(insert, snapshot, None, insert_validation)
+            }
             Command::Update(update) => self.prepare_update(update, snapshot),
             Command::Delete(delete) => self.prepare_delete(delete, snapshot),
             _ => {
@@ -655,7 +661,14 @@ impl Engine {
             let was_elided = insert_table
                 .as_deref()
                 .is_some_and(|table| self.table_install_elided(table));
-            let prepared = self.prepare_dml(&item.cmd, install_snapshot);
+            // Ledger #18: FK-free INSERT re-resolves skip the redundant unique/CHECK pass —
+            // the conflicts() check above IS the commit-time guard (coverage proof on
+            // InsertPrepareValidation).
+            let prepared = self.prepare_dml(
+                &item.cmd,
+                install_snapshot,
+                InsertPrepareValidation::ReResolveLedgerCovered,
+            );
             if let Some(table_name) = insert_table.as_deref() {
                 if was_elided && !self.table_install_elided(table_name) {
                     // Mid-re-resolve de-elision: reconcile the buffered same-table rows into

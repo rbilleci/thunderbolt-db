@@ -89,6 +89,7 @@ fn prepare_dml_does_not_mutate_engine_state() {
             &parse_insert("INSERT INTO t (id, label) VALUES (4, 'd')"),
             snapshot,
             None,
+            InsertPrepareValidation::Full,
         )
         .unwrap();
     assert_eq!(
@@ -162,6 +163,7 @@ fn prepare_insert_with_sequence_default_is_pure_and_advances_on_apply() {
             &parse_insert("INSERT INTO s (v) VALUES ('x'), ('y')"),
             snapshot,
             None,
+            InsertPrepareValidation::Full,
         )
         .unwrap();
     assert_eq!(
@@ -240,6 +242,7 @@ fn prepare_insert_failing_preflight_advances_nothing() {
         &parse_insert("INSERT INTO p (code) VALUES (100)"),
         next_commit_snapshot(&e),
         None,
+            InsertPrepareValidation::Full,
     );
     assert!(err.is_err(), "duplicate unique value must fail preflight");
     assert_eq!(
@@ -270,6 +273,7 @@ fn write_set_is_exactly_the_keys_apply_touches_for_insert() {
             &parse_insert("INSERT INTO t (id, label) VALUES (2, 'b'), (3, 'c')"),
             snapshot,
             None,
+            InsertPrepareValidation::Full,
         )
         .unwrap();
     // The conflict write-set carries NO insert row keys (BUG-1 fix) and (no unique index here) no
@@ -312,6 +316,7 @@ fn insert_write_set_records_unique_slots_but_not_row_keys() {
             &parse_insert("INSERT INTO u (id, label) VALUES (7, 'g')"),
             snapshot,
             None,
+            InsertPrepareValidation::Full,
         )
         .unwrap();
     assert!(
@@ -415,6 +420,7 @@ fn write_set_records_unique_index_slots_for_unique_insert() {
             &parse_insert("INSERT INTO u (id, label) VALUES (7, 'a'), (8, 'b')"),
             snapshot,
             None,
+            InsertPrepareValidation::Full,
         )
         .unwrap();
 
@@ -478,6 +484,7 @@ fn prepare_apply_round_trips_to_same_state_as_public_path() {
             &parse_insert("INSERT INTO t (id, label) VALUES (4, 'd')"),
             insert_snapshot,
             None,
+            InsertPrepareValidation::Full,
         )
         .unwrap();
     manual.apply_delta(insert_delta, insert_seq, None).unwrap();
@@ -594,6 +601,7 @@ fn serialized_unique_insert_records_its_unique_slot_into_the_si_ledger() {
             &parse_insert("INSERT INTO t (id, v) VALUES (7, 1)"),
             e.dml_read_snapshot(stale_snapshot),
             None,
+            InsertPrepareValidation::Full,
         )
         .unwrap();
 

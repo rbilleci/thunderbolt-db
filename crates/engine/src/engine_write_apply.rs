@@ -254,7 +254,8 @@ impl Engine {
         // the version stamp exactly as before. The snapshot is taken immediately before prepare, so
         // `next_row_id` and the read visibility match what the in-line apply used.
         let snapshot = self.dml_read_snapshot(txn_id);
-        let delta = self.prepare_insert(&insert, snapshot, profile.as_deref_mut())?;
+        let delta =
+            self.prepare_insert(&insert, snapshot, profile.as_deref_mut(), InsertPrepareValidation::Full)?;
         // Slice 1b-ii-c: surface the APPLIED rows (post-coercion / post-default, catalog order — the
         // actual stored images) for the commit path's in-place open-shard append, plus the delta's
         // write-set for SI ledger recording (C2). Captured BEFORE apply_delta_serialized consumes

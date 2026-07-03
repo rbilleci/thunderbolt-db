@@ -4048,6 +4048,82 @@ mod capacity_payload_tests {
         assert_eq!(ids.len(), expected, "no duplicate ids survived the race");
     }
 
+    /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
+    /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
+    /// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
+    /// ONLY guard left — the under-lock re-resolve deliberately skips the redundant unique
+    /// pass on FK-free tables (`InsertPrepareValidation::ReResolveLedgerCovered`). Exactly one
+    /// must win; sabotaging the ledger's unique-slot arm makes BOTH land and this test FAIL
+    /// (verified — the stochastic dup-race test above cannot certify this window).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn constrained_elision_same_snapshot_dup_insert_single_winner() {
+        let e = std::sync::Arc::new(Engine::new_local());
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.set_constrained_elision_enabled(true);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k * 10))
+                .collect();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )
+            .unwrap();
+            seq += 1;
+        }
+        // Enter elision via a handled wave append.
+        for t in 0..20_u64 {
+            e.execute_dml_concurrent(
+                100 + t,
+                &format!("INSERT INTO t (id, v) VALUES ({}, {t})", 5_000 + t),
+            )
+            .unwrap();
+        }
+        assert!(e.table_install_elided("t"), "premise: elided");
+        for round in 0..20_u64 {
+            let key = 7_000 + round;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let outcomes: Vec<Result<(), String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..2_u64)
+                    .map(|w| {
+                        let e = std::sync::Arc::clone(&e);
+                        let barrier = std::sync::Arc::clone(&barrier);
+                        s.spawn(move || {
+                            e.execute_dml_concurrent_instrumented(
+                                1_000 + round * 10 + w,
+                                &format!("INSERT INTO t (id, v) VALUES ({key}, {w})"),
+                                || {
+                                    // Both writers are PREPARED (same-snapshot validated) and
+                                    // not yet committed: the exact window only the ledger covers.
+                                    barrier.wait();
+                                },
+                            )
+                            .map_err(|err| err.to_string())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let wins = outcomes.iter().filter(|o| o.is_ok()).count();
+            assert_eq!(
+                wins, 1,
+                "round {round}: exactly ONE same-snapshot writer may win key {key} \
+                 (outcomes: {outcomes:?})"
+            );
+        }
+        // Device truth: each contended key exactly once.
+        let rows = e
+            .execute_relational_select_text("SELECT id, v FROM t")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 200 + 20 + 20, "seed + waved + one win per round");
+    }
+
     /// TYPE-COVERAGE track 1 — the CONCURRENT dup race on an ELIDED PK'd table: 8 writers all
     /// try to INSERT the SAME key set through `execute_dml_concurrent`. Off-lock prepares may
     /// all pass validation (the device probe at their snapshots sees no dup — flushes are

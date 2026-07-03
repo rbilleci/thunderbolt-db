@@ -32,7 +32,7 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: TYPE-COVERAGE #14 TRACK 1 SLICE 1 (constrained elision) is IMPLEMENTED — finish the OPUS AUDIT, adopt findings, rebase, push. Then track-1 follow-ups or track 2 per the plan below. <<<
+## >>> THE ONE NEXT ACTION: TRACK-1 SLICE 1 SHIPPED (`f80f2350`+`2330965b`+`9c564e7b`: PK'd 923→77-84k, both audits adopted). NOW: the #18 OPTIMIZATION ROUND (skip the ledger-covered re-resolve validation for FK-free INSERTs + slot-key interning; spec in memory `type-coverage-14`), then the constrained-elision default-flip decision, CHECK/FK eligibility, track 2. <<<
 
 **THE RETIREMENT PROGRAM A1→A5 IS COMPLETE; THE FLIP IS LIVE** (`fd154409`/`f0c3101e`:
 `host_install_elision_enabled` + `auto_vacuum_enabled` default ON; SLO 104-124k sustained on PK-less

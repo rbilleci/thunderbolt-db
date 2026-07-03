@@ -10,6 +10,30 @@ use super::*;
 /// the seq_scan produced. `None` from the resolver = index-ineligible -> the caller scans.
 pub(crate) type DmlResolvedMatch = (u64, String, Vec<SqlValue>);
 
+/// Ledger #18: how much constraint validation `prepare_insert` runs. `Full` everywhere EXCEPT
+/// the wave sequencer's under-lock RE-RESOLVE, where unique/CHECK re-validation of an FK-FREE
+/// table is PROVABLY REDUNDANT — the coverage argument, verified against the sequencer:
+///  - a dup committed at C <= S (the item's read snapshot): the OFF-LOCK prepare validated
+///    against every row visible at S and errored the statement before it ever enqueued;
+///  - a dup committed in (S, commit] — INCLUDING an earlier item of the SAME wave: the
+///    ledger conflict check runs BEFORE the re-resolve (`conflicts` at the item loop head;
+///    each item `record`s before later items validate) and aborts with a retryable
+///    serialization conflict; the item's registered snapshot guard pins ledger pruning <= S,
+///    so no entry it needs can vanish mid-flight;
+///  - a WITHIN-STATEMENT dup (VALUES (1),(1)): deterministic on the statement text — the
+///    off-lock prepare's in-batch check already rejected it;
+///  - CHECK constraints are row-local and deterministic on the values: same verdict as the
+///    off-lock pass.
+/// FK re-validation is NOT covered (a parent provider deleted in (S, commit] writes the
+/// PARENT's row keys into the ledger, which the CHILD's write-set never claims — no
+/// conflict), so FK-bearing tables always validate fully. PK NOT-NULL (O(new), pure) runs
+/// unconditionally as cheap defense.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InsertPrepareValidation {
+    Full,
+    ReResolveLedgerCovered,
+}
+
 impl Engine {
     pub(crate) fn apply_insert(
         &self,
@@ -49,6 +73,7 @@ impl Engine {
         insert: &Insert,
         snapshot: DmlReadSnapshot,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
+        validation: InsertPrepareValidation,
     ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
         // Lock-free concurrent-DML path (Stage 2 — blocker #1): bind the target against a pinned
@@ -137,7 +162,15 @@ impl Engine {
         let has_constraints = table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()
             || !table.foreign_keys.is_empty();
-        if self.dml_value_index_resolve_enabled() && !self_referencing_fk {
+        // Ledger #18: the under-lock re-resolve skips the redundant unique/CHECK pass on
+        // FK-free tables — the ledger conflict check IS the commit-time guard (see
+        // [`InsertPrepareValidation`] for the coverage proof). Measured: the second validator
+        // probe per commit was the PK'd arm's largest sequencer-side residual.
+        let ledger_covered = validation == InsertPrepareValidation::ReResolveLedgerCovered
+            && table.foreign_keys.is_empty();
+        if ledger_covered {
+            // fall through to encode: PK not-null already ran above; unique/CHECK covered.
+        } else if self.dml_value_index_resolve_enabled() && !self_referencing_fk {
             if has_constraints {
                 let validate_started = Instant::now();
                 self.validate_dml_constraints_via_index(
