@@ -273,6 +273,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     idx as f64 / waves.max(1) as f64 / 1e3,
                 );
             }
+            // HOST-phase recon (GPU_DB_BENCH_HOSTPHASE=1): the serial work under the commit_mutex.
+            let h = &gpu_db_engine::engine_dml_concurrent_wave_host_stats();
+            let hp: Vec<u64> = (0..7).map(|i| h[i].swap(0, Ordering::Relaxed)).collect();
+            if hp.iter().sum::<u64>() > 0 {
+                let per = |n: u64| n as f64 / items.max(1) as f64 / 1e3;
+                eprintln!(
+                    "    [host-phase us/item: validate {:.2} conflict {:.2} reresolve {:.2} \
+                     sequence {:.2} ledger {:.2} apply {:.2} invalidate {:.2}]",
+                    per(hp[0]), per(hp[1]), per(hp[2]), per(hp[3]), per(hp[4]), per(hp[5]), per(hp[6]),
+                );
+            }
             // Elision/validator engagement (constrained-elision A/B): steady state = elisions
             // GROWING, the table STILL elided at teardown, device validate answering.
             eprintln!(

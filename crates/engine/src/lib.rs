@@ -602,3 +602,10 @@ pub fn engine_dml_concurrent_wave_device_stats() -> &'static [std::sync::atomic:
     &engine_dml_concurrent::WAVE_DEVICE_STATS
 }
 
+/// HOST-sequencer per-item phase timing accessor: `[wave_validate, conflict, reresolve, sequence,
+/// ledger, apply, invalidate]` nanos (see `engine_dml_concurrent::WAVE_HOST_STATS`; populated only
+/// under `GPU_DB_BENCH_HOSTPHASE=1`). The serial work under the commit_mutex — the peak-throughput wall.
+pub fn engine_dml_concurrent_wave_host_stats() -> &'static [std::sync::atomic::AtomicU64; 7] {
+    &engine_dml_concurrent::WAVE_HOST_STATS
+}
+

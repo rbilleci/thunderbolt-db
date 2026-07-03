@@ -37,6 +37,28 @@ pub(crate) fn wave_device_phase_timing_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GPU_DB_BENCH_DEVPHASE").is_ok_and(|v| v == "1"))
 }
 
+/// HOST-sequencer per-item phase timing (nanos summed): the serial work under the commit_mutex,
+/// which the driver-call probe showed is the PEAK-throughput wall (not device round-trips). Indices:
+/// [0]=wave_batch_validate (design-B batched unique, whole call incl. its device locate),
+/// [1]=SI conflict check, [2]=under-lock re-resolve (prepare_dml), [3]=sequence (WAL append +
+/// propose + wait_committed), [4]=ledger record, [5]=apply (apply_delta / fast-run / append flush),
+/// [6]=residency invalidate. Gated on `GPU_DB_BENCH_HOSTPHASE=1` so it never touches steady state.
+pub static WAVE_HOST_STATS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// True when `GPU_DB_BENCH_HOSTPHASE=1` — enables the [`WAVE_HOST_STATS`] per-phase timing.
+pub(crate) fn wave_host_phase_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GPU_DB_BENCH_HOSTPHASE").is_ok_and(|v| v == "1"))
+}
+
 /// One enqueued concurrent commit: everything the sequencer needs to conflict-check, re-resolve,
 /// append, apply, and publish it — plus the shared slot its owner blocks on.
 pub(crate) struct CommitWaveItem {
@@ -855,8 +877,30 @@ impl Engine {
         // unique check off-lock (`prepare_insert`); validate the whole wave here with ONE device
         // locate per (table, key-column) (the amortization win). Returns the item positions that
         // are unique violations -> aborted in the loop below with the byte-identical 23505.
+        let hostphase = wave_host_phase_timing_enabled();
+        let wave_validate_started = hostphase.then(Instant::now);
         let wave_unique_violations = self.wave_batch_validate_unique(&batch);
+        if let Some(started) = wave_validate_started {
+            WAVE_HOST_STATS[0]
+                .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }
+        // HOST-phase probe: `_hp` timestamps the running phase boundary; `hp!(k)` charges the elapsed
+        // time since the last boundary to WAVE_HOST_STATS[k] and resets. Reset at each item's top.
+        let mut _hp = hostphase.then(Instant::now);
+        macro_rules! hp {
+            ($k:expr) => {
+                if let Some(ref mut t) = _hp {
+                    let now = Instant::now();
+                    WAVE_HOST_STATS[$k]
+                        .fetch_add(now.duration_since(*t).as_nanos() as u64, AtomicOrdering::Relaxed);
+                    *t = now;
+                }
+            };
+        }
         for (position, item) in batch.iter().enumerate() {
+            if let Some(ref mut t) = _hp {
+                *t = Instant::now();
+            }
             // M1 design B: a deferred INSERT whose PK value already exists (wave-batch verdict)
             // aborts here — the same 23505 the off-lock validation would have raised.
             if let Some(err) = wave_unique_violations.get(&position) {
@@ -878,6 +922,7 @@ impl Engine {
                 ))));
                 continue;
             }
+            hp!(1);
 
             // (3b) Re-resolve at the peeked commit seq — sees every PRIOR wave item's applied
             // delta (they are installed already), so wave order is the only order there is. A
@@ -965,6 +1010,7 @@ impl Engine {
                     continue;
                 }
             };
+            hp!(2);
 
             // (3c) Assign the seq for real: WAL append + propose (the sequencer is the single
             // proposer under the commit_mutex). The fsync is deferred to the wave tail.
@@ -995,10 +1041,12 @@ impl Engine {
             let timestamp_micros =
                 wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
             commit.record_commit_timestamp(item.txn_id, timestamp_micros);
+            hp!(3);
 
             // (3e) Record the write-set for future conflict detection (also read by LATER items
             // in this same wave — the intra-wave conflict path above).
             commit.ledger.record(&item.write_set, commit_seq);
+            hp!(4);
 
             // Fast-run eligibility: a plain INSERT into a table with no unique index, no CHECK,
             // and no FK (its re-resolve read no rows and claimed no unique slots), with auto-admit
@@ -1074,6 +1122,7 @@ impl Engine {
                 });
             commit.repl.mark_applied(commit_seq);
             next_row_id = self.read_state.mvcc.current_row_id();
+            hp!(5);
 
             // Residency, before publish: INSERT rows BUFFER into the wave-batched append (the
             // flush handles elide-entry / rehydrate / invalidate per table); everything else
@@ -1099,6 +1148,7 @@ impl Engine {
                     committed.push((position, commit_seq, false));
                 }
             }
+            hp!(6);
         }
         flush_appends(&mut pending_appends, &mut committed);
         flush_fast_run(&mut commit, &mut fast_run, &mut committed);
