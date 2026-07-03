@@ -514,73 +514,144 @@ impl Engine {
             return violations;
         }
         let catalog = self.catalog_snapshot();
-        // Groups: (table_name, filter_idx) -> [(item_position, needle, index_name)].
-        let mut groups: std::collections::BTreeMap<(String, usize), Vec<(usize, i32, String)>> =
-            std::collections::BTreeMap::new();
-        // Full-validate fallback for drifted / non-batchable inserts.
+        // PERF (this fn runs SERIALLY on the sequencer, so per-item host work must be tiny — the
+        // off-lock path it replaced ran 32-way parallel): NO per-item String allocs. Distinct
+        // tables are cached once (a wave is usually one table); groups key on the DISTINCT-table
+        // INDEX + filter_idx (integers); the 23505 index name is looked up only on the rare
+        // violation. All table refs borrow the pinned `catalog`.
+        struct TableCtx<'c> {
+            name: &'c str,
+            table: &'c RelationalTable,
+            // (filter_idx, unique-index ordinal) for each strictly-i32 unique index; empty = not
+            // eligible (its inserts take the full-validate fallback / were validated off-lock).
+            unique_cols: Vec<(usize, usize)>,
+        }
+        let mut tables: Vec<TableCtx> = Vec::new();
+        // group key = (distinct-table index, filter_idx) -> (needles, positions).
+        let mut group_keys: Vec<(usize, usize)> = Vec::new();
+        let mut group_needles: Vec<Vec<i32>> = Vec::new();
+        let mut group_positions: Vec<Vec<usize>> = Vec::new();
         let mut full_validate: Vec<usize> = Vec::new();
+
         for (pos, item) in batch.iter().enumerate() {
             let Command::Insert(insert) = &item.cmd else {
                 continue;
             };
             if insert.rows.len() != 1 {
-                continue; // multi-row was validated off-lock (in-statement dup)
+                continue;
             }
-            let Some(table) = catalog.relational_catalog.get(&insert.table) else {
-                continue; // a dropped table -> its own apply errors
+            // Locate (or bind + cache) this insert's distinct-table context.
+            let tctx_idx = match tables.iter().position(|t| t.name == insert.table) {
+                Some(i) => i,
+                None => {
+                    let Some(table) = catalog.relational_catalog.get(&insert.table) else {
+                        continue;
+                    };
+                    let eligible = self.insert_unique_wave_batchable(&catalog, table);
+                    let unique_cols = if eligible {
+                        table
+                            .indexes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, index)| index.unique)
+                            .filter_map(|(ord, index)| {
+                                table
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name == index.column)
+                                    .map(|fi| (fi, ord))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    tables.push(TableCtx {
+                        name: &insert.table,
+                        table,
+                        unique_cols,
+                    });
+                    tables.len() - 1
+                }
             };
             let gen_matches = catalog.commit_seq == item.prepared_catalog_seq;
-            if gen_matches && self.insert_unique_wave_batchable(&catalog, table) {
-                // Re-derived eligible (== off-lock eligible) -> it was deferred. Extract each
-                // unique index's needle from the single insert row.
-                for index in table.indexes.iter().filter(|index| index.unique) {
-                    let Some((filter_idx, needle)) =
-                        insert_i32_unique_needle(insert, table, &index.column)
-                    else {
-                        // Can't bind the needle (odd shape) -> full-validate to be safe.
-                        full_validate.push(pos);
-                        break;
-                    };
-                    groups
-                        .entry((table.name.clone(), filter_idx))
-                        .or_default()
-                        .push((pos, needle, index.name.clone()));
-                }
-            } else if !gen_matches {
-                // Catalog drift: the item might have deferred off-lock -> full-validate now.
+            if !gen_matches {
+                // Catalog drift: might have deferred off-lock -> full-validate to be safe.
+                full_validate.push(pos);
+                continue;
+            }
+            if tables[tctx_idx].unique_cols.is_empty() {
+                continue; // not eligible -> off-lock validated it
+            }
+            // Eligible + gen-matched -> it was deferred. Bind each unique needle (no alloc).
+            let table = tables[tctx_idx].table;
+            let mut bound_all = true;
+            let cols = tables[tctx_idx].unique_cols.clone();
+            for (filter_idx, _ord) in &cols {
+                let Some((_, needle)) = insert_i32_unique_needle_at(insert, table, *filter_idx)
+                else {
+                    bound_all = false;
+                    break;
+                };
+                // Find/create the (tctx_idx, filter_idx) group.
+                let gk = (tctx_idx, *filter_idx);
+                let gi = match group_keys.iter().position(|k| *k == gk) {
+                    Some(i) => i,
+                    None => {
+                        group_keys.push(gk);
+                        group_needles.push(Vec::new());
+                        group_positions.push(Vec::new());
+                        group_keys.len() - 1
+                    }
+                };
+                group_needles[gi].push(needle);
+                group_positions[gi].push(pos);
+            }
+            if !bound_all {
                 full_validate.push(pos);
             }
-            // gen matches + not eligible -> off-lock validated it, nothing to do.
         }
         // Batched device locate per group; count==0 passes, count>0 authoritative-checks.
-        for ((table_name, filter_idx), members) in &groups {
-            let Some(table) = catalog.relational_catalog.get(table_name) else {
-                continue;
-            };
-            let needles: Vec<i32> = members.iter().map(|(_, n, _)| *n).collect();
-            match self.wave_batch_locate_hit_counts(table, *filter_idx, &needles) {
+        for (gi, &(tctx_idx, filter_idx)) in group_keys.iter().enumerate() {
+            let table = tables[tctx_idx].table;
+            match self.wave_batch_locate_hit_counts(table, filter_idx, &group_needles[gi]) {
                 Some(counts) => {
-                    for ((pos, needle, index_name), &count) in members.iter().zip(counts.iter()) {
+                    for ((&pos, &needle), &count) in group_positions[gi]
+                        .iter()
+                        .zip(group_needles[gi].iter())
+                        .zip(counts.iter())
+                    {
                         if count == 0 {
-                            continue; // no physical slot holds the key -> no dup
+                            continue; // the common case: no physical slot holds the key
                         }
-                        // >0 hits: authoritative visibility+value check at the item's snapshot.
+                        // Rare: >0 hits -> authoritative visibility+value check.
                         let visibility = crate::StorageVisibility {
-                            read_txn_id: batch[*pos].read_snapshot,
+                            read_txn_id: batch[pos].read_snapshot,
                         };
-                        let table_rows = self.read_state.mvcc.table_rows(table_name);
-                        let dup = self
+                        if self
                             .visible_row_with_value(
                                 table,
                                 visibility,
-                                *filter_idx,
-                                &SqlValue::Int4(*needle),
+                                filter_idx,
+                                &SqlValue::Int4(needle),
                                 None,
                             )
-                            .unwrap_or(false);
-                        let _ = table_rows;
-                        if dup {
-                            violations.entry(*pos).or_insert_with(|| {
+                            .unwrap_or(false)
+                        {
+                            // Look up the index name ONLY now (rare) for the byte-identical 23505.
+                            let index_name = table
+                                .indexes
+                                .iter()
+                                .find(|idx| {
+                                    idx.unique
+                                        && table
+                                            .columns
+                                            .iter()
+                                            .position(|c| c.name == idx.column)
+                                            == Some(filter_idx)
+                                })
+                                .map(|idx| idx.name.as_str())
+                                .unwrap_or("");
+                            violations.entry(pos).or_insert_with(|| {
                                 format!(
                                     "duplicate key value violates unique index \"{index_name}\""
                                 )
@@ -588,13 +659,10 @@ impl Engine {
                         }
                     }
                 }
-                None => {
-                    // Locate declined -> full-validate each member (safe fallback).
-                    full_validate.extend(members.iter().map(|(pos, _, _)| *pos));
-                }
+                None => full_validate.extend(group_positions[gi].iter().copied()),
             }
         }
-        // Full validation for drifted / declined / unbindable inserts.
+        // Full validation for drifted / declined / unbindable inserts (rare).
         for pos in full_validate {
             if violations.contains_key(&pos) {
                 continue;
@@ -602,12 +670,12 @@ impl Engine {
             let Command::Insert(insert) = &batch[pos].cmd else {
                 continue;
             };
-            let Some(table) = catalog.relational_catalog.get(&insert.table) else {
+            if catalog.relational_catalog.get(&insert.table).is_none() {
                 continue;
-            };
+            }
             let snapshot = self.dml_read_snapshot(batch[pos].read_snapshot);
-            // A pure re-validation via prepare_insert (Full) — any Err is the constraint verdict.
-            if let Err(err) = self.prepare_insert(insert, snapshot, None, InsertPrepareValidation::Full)
+            if let Err(err) =
+                self.prepare_insert(insert, snapshot, None, InsertPrepareValidation::Full)
             {
                 violations.insert(pos, err.to_string());
             }
@@ -1509,6 +1577,17 @@ fn insert_i32_unique_needle(
     unique_column: &str,
 ) -> Option<(usize, i32)> {
     let filter_idx = table.columns.iter().position(|c| c.name == *unique_column)?;
+    insert_i32_unique_needle_at(insert, table, filter_idx)
+}
+
+/// M1 design B (perf): bind the needle by catalog COLUMN INDEX (no column-name search — the
+/// caller cached the filter_idx). Same coercion + strict `i32_section_needle` encode.
+fn insert_i32_unique_needle_at(
+    insert: &Insert,
+    table: &RelationalTable,
+    filter_idx: usize,
+) -> Option<(usize, i32)> {
+    let unique_column = &table.columns.get(filter_idx)?.name;
     let column_ty = table.columns[filter_idx].ty;
     let row = insert.rows.first()?;
     // Where does this column's value sit in the insert row? Explicit column list -> its index;

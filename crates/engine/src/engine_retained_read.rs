@@ -950,7 +950,9 @@ impl Engine {
         filter_idx: usize,
         needles: &[i32],
     ) -> Option<Vec<u32>> {
-        const MAX_HITS: u32 = 4;
+        // COUNT-ONLY (max_hits=0): the kernel emits per-needle counts only (0 = no dup, else
+        // u32::MAX), skipping the shard/slot buffers + 2 DtoH reads this fn never consumes.
+        const MAX_HITS: u32 = 0;
         if needles.is_empty() {
             return Some(Vec::new());
         }
@@ -975,9 +977,11 @@ impl Engine {
             if shard.row_count == 0 {
                 continue;
             }
-            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            // PERF (this runs SERIALLY on the sequencer, per wave): compute the i32 filter offset
+            // DIRECTLY from the shard's own fields — `resident_snapshot_for_shard` would clone the
+            // whole descriptor (int4/int8/text/null name vectors) per shard per wave for nothing.
             let filter_offset =
-                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
+                shard_i32_filter_offset(shard, table, filter_idx)?;
             let device_memory = shard.device_memory.clone()?;
             let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
                 &table.name,
@@ -2681,6 +2685,45 @@ fn bloom_hashes(key: i32) -> (u64, u64) {
 fn bloom_bit(h1: u64, h2: u64, i: u32, num_bits: u64) -> u64 {
     let shift = 64 - num_bits.trailing_zeros();
     h1.wrapping_add((i as u64).wrapping_mul(h2)) >> shift
+}
+
+/// M1 (perf): the i32-SECTION byte offset of column `filter_idx` in a shard's payload, computed
+/// DIRECTLY from the shard's fields (no descriptor clone). Mirrors
+/// `resident_device_int4_column_offset` byte-for-byte: header (u64) + `int4_ordinal * capacity * 4`,
+/// where `int4_ordinal` = the count of i32-section columns before `filter_idx` in catalog order,
+/// validated against the shard's `resident_device_int4_columns` label. `None` on any mismatch
+/// (non-i32 column / stale layout) -> the caller declines (per-item full validation).
+fn shard_i32_filter_offset(
+    shard: &RelationalResidentShard,
+    table: &RelationalTable,
+    filter_idx: usize,
+) -> Option<u64> {
+    let column = table.columns.get(filter_idx)?;
+    if !matches!(
+        column.ty,
+        SqlType::Int4 | SqlType::Date | SqlType::Int2
+    ) {
+        return None;
+    }
+    let int4_ordinal = table
+        .columns
+        .iter()
+        .take(filter_idx)
+        .filter(|c| matches!(c.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2))
+        .count();
+    if shard
+        .resident_device_int4_columns
+        .get(int4_ordinal)
+        .is_none_or(|name| name != &column.name)
+    {
+        return None;
+    }
+    let capacity = u64::try_from(shard.capacity).ok()?;
+    let int4_width = std::mem::size_of::<i32>() as u64;
+    capacity
+        .checked_mul(int4_width)
+        .and_then(|col_bytes| (int4_ordinal as u64).checked_mul(col_bytes))
+        .and_then(|prefix| (std::mem::size_of::<u64>() as u64).checked_add(prefix))
 }
 
 /// Cross-shard PK index (sub-slice 2): build a per-shard membership BLOOM over the int4 key column. `m` =

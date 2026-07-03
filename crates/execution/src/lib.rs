@@ -11722,9 +11722,15 @@ impl CudaResidentDeviceMemory {
             *mut *mut c_void,
         ) -> i32;
 
-        if shards.is_empty() || needles.is_empty() || max_hits == 0 {
+        if shards.is_empty() || needles.is_empty() {
             return Err(CudaRuntimeProbeError::InvalidInputLength(0));
         }
+        // COUNT-ONLY fast path (`max_hits == 0`): the kernel emits only per-needle counts (any hit
+        // -> u32::MAX), NO shard/slot output — so wave-batch validation skips 2 device buffers +
+        // 2 DtoH reads per wave (the shard/slot outputs it never consumes). The FOUND arm takes
+        // INCCOUNT (count >= max_hits == 0 always), so the shard/slot pointers are never
+        // dereferenced; a valid dummy (the count buffer) is passed for them.
+        let count_only = max_hits == 0;
         const DESC_U64_PER_SHARD: usize = 2; // index_ptr, mask|shift
         let mut desc: Vec<u64> = Vec::with_capacity(shards.len() * DESC_U64_PER_SHARD);
         let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len());
@@ -11794,10 +11800,22 @@ impl CudaResidentDeviceMemory {
         };
 
         let needles_guard = primary.lease_device_buffer_owned(needle_bytes)?;
-        let shard_out_guard = primary.lease_device_buffer_owned(window_bytes)?;
-        let slot_out_guard = primary.lease_device_buffer_owned(window_bytes)?;
         let count_guard = primary.lease_device_buffer_owned(count_bytes)?;
         let desc_guard = primary.lease_device_buffer_owned(desc_bytes)?;
+        // Count-only skips the shard/slot buffers (unused); their args point at the count buffer
+        // (never written — the kernel takes INCCOUNT for every hit at max_hits==0).
+        let shard_out_guard = if count_only {
+            None
+        } else {
+            Some(primary.lease_device_buffer_owned(window_bytes)?)
+        };
+        let slot_out_guard = if count_only {
+            None
+        } else {
+            Some(primary.lease_device_buffer_owned(window_bytes)?)
+        };
+        let shard_out_ptr = shard_out_guard.as_ref().map_or(count_guard.ptr, |g| g.ptr);
+        let slot_out_ptr = slot_out_guard.as_ref().map_or(count_guard.ptr, |g| g.ptr);
 
         let mut ptx = Vec::with_capacity(WRITE_LOCATE_PTX.len() + 1);
         ptx.extend_from_slice(WRITE_LOCATE_PTX);
@@ -11824,8 +11842,8 @@ impl CudaResidentDeviceMemory {
         let mut needle_count_arg = needle_count_u32;
         let mut needles_arg = needles_guard.ptr;
         let mut max_hits_arg = max_hits;
-        let mut shard_out_arg = shard_out_guard.ptr;
-        let mut slot_out_arg = slot_out_guard.ptr;
+        let mut shard_out_arg = shard_out_ptr;
+        let mut slot_out_arg = slot_out_ptr;
         let mut count_arg = count_guard.ptr;
         let mut args = [
             (&mut desc_arg as *mut u64).cast::<c_void>(),
@@ -11859,20 +11877,18 @@ impl CudaResidentDeviceMemory {
         let mut shard_idx = vec![0u32; window as usize];
         let mut slot = vec![0u32; window as usize];
         let mut count = vec![0u32; needles.len()];
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                shard_idx.as_mut_ptr().cast::<c_void>(),
-                shard_out_guard.ptr,
-                window_bytes,
-            )
-        })?;
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                slot.as_mut_ptr().cast::<c_void>(),
-                slot_out_guard.ptr,
-                window_bytes,
-            )
-        })?;
+        if let (Some(sg), Some(lg)) = (shard_out_guard.as_ref(), slot_out_guard.as_ref()) {
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(
+                    shard_idx.as_mut_ptr().cast::<c_void>(),
+                    sg.ptr,
+                    window_bytes,
+                )
+            })?;
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(slot.as_mut_ptr().cast::<c_void>(), lg.ptr, window_bytes)
+            })?;
+        }
         check_cuda(unsafe {
             cu_memcpy_dtoh(
                 count.as_mut_ptr().cast::<c_void>(),

@@ -595,3 +595,4 @@ mod tests;
 pub fn engine_dml_concurrent_wave_stats() -> &'static [std::sync::atomic::AtomicU64; 3] {
     &engine_dml_concurrent::WAVE_STATS
 }
+
