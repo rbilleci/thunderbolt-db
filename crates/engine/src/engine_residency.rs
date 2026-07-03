@@ -3659,10 +3659,11 @@ mod capacity_payload_tests {
             "post-rehydration host store == the install twin's, key for key"
         );
 
-        // Audit B1 gate, updated by the constrained-elision slice: with
-        // `constrained_elision_enabled` at its DEFAULT (off), a unique-indexed table must NEVER
-        // enter elision. (Flag ON is covered by `constrained_elision_pk_table_matches_install_twin`
-        // — the validators now run device-first through the self-pinning probe ladder.)
+        // Audit B1 gate, KILL-SWITCH-scoped since THE CONSTRAINED-ELISION FLIP (default ON,
+        // 2026-07-03): with the switch OFF, a unique-indexed table must NEVER enter elision.
+        // (Default-ON behavior is covered by `constrained_elision_pk_table_matches_install_twin`
+        // — the validators run device-first through the self-pinning probe ladder.)
+        on.set_constrained_elision_enabled(false);
         on.execute_text(400, "CREATE TABLE u (id INT UNIQUE, v INT)")
             .unwrap();
         for i in 0..3_i64 {
@@ -3674,7 +3675,7 @@ mod capacity_payload_tests {
         }
         assert!(
             !on.table_install_elided("u"),
-            "a UNIQUE table must never elide while constrained_elision_enabled is default-OFF"
+            "a UNIQUE table must never elide with the constrained-elision KILL SWITCH off"
         );
         assert!(
             on.execute_text(420, "INSERT INTO u (id, v) VALUES (1, 9)")
@@ -6823,8 +6824,9 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// TYPE-COVERAGE track 1: enable/disable elision for UNIQUE-INDEXED (PK'd) strictly-Int4
-    /// tables (default OFF — the constrained-elision A/B lever; flip gated on SLO + audit).
+    /// TYPE-COVERAGE track 1: enable/disable elision for UNIQUE-INDEXED (PK'd) i32-section
+    /// tables (Int4/Date/Int2). DEFAULT ON since the 2026-07-03 flip; OFF = the kill switch
+    /// (stops NEW elisions only — already-elided tables keep rehydrating through the seams).
     pub fn set_constrained_elision_enabled(&self, on: bool) {
         self.constrained_elision_enabled
             .store(on, std::sync::atomic::Ordering::Relaxed);

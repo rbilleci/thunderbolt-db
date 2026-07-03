@@ -416,9 +416,9 @@ pub struct Engine {
     dml_device_resolve_enabled: std::sync::atomic::AtomicBool,
     dml_device_validate_enabled: std::sync::atomic::AtomicBool,
     host_install_elision_enabled: std::sync::atomic::AtomicBool,
-    /// TYPE-COVERAGE track 1: UNIQUE-INDEXED (PK'd) strictly-Int4 tables may ELIDE — the
+    /// TYPE-COVERAGE track 1: UNIQUE-INDEXED (PK'd) i32-section tables may ELIDE — the
     /// core-banking table shape. Requires the resolve+validate ladders ON (eligibility checks
-    /// them); default OFF until the SLO gate + audit. Kill switch -> unique tables never enter
+    /// them). DEFAULT ON (the 2026-07-03 flip). Kill switch -> unique tables never enter
     /// elision (already-elided tables rehydrate through the ladder seams as usual).
     constrained_elision_enabled: std::sync::atomic::AtomicBool,
     auto_vacuum_enabled: std::sync::atomic::AtomicBool,

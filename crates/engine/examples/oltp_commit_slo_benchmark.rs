@@ -109,10 +109,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         if std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1") {
             e.set_host_install_elision_enabled(true);
         }
-        // TYPE-COVERAGE track 1: GPU_DB_BENCH_CELIDE=1 = the constrained-elision arm (PK'd
-        // tables become elision-eligible; pair with GPU_DB_BENCH_PK=1 + GPU_DB_BENCH_ELIDE=1).
-        if std::env::var("GPU_DB_BENCH_CELIDE").is_ok_and(|v| v == "1") {
-            e.set_constrained_elision_enabled(true);
+        // Constrained elision is DEFAULT ON since the 2026-07-03 flip; GPU_DB_BENCH_CELIDE=0
+        // is the kill-switch A/B arm (GPU_DB_BENCH_CELIDE=1 remains accepted, now redundant).
+        match std::env::var("GPU_DB_BENCH_CELIDE").as_deref() {
+            Ok("0") => e.set_constrained_elision_enabled(false),
+            Ok("1") => e.set_constrained_elision_enabled(true),
+            _ => {}
         }
 
         let engine = Arc::new(e);

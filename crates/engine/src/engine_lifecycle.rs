@@ -169,6 +169,12 @@ impl Engine {
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
             cached_cuda_probe_runtime: OnceLock::new(),
+            // AUTO-ADMIT stays default OFF behind TWO NAMED GATES (user-ratified 2026-07-03,
+            // with the constrained-elision flip): (1) R-1 admission budgeting / shard-aware
+            // EVICTION (a default that admits every eligible table has no principled memory
+            // policy); (2) the ~200ms FIRST-ROLLOVER STALL off the commit critical path
+            // (ledger #19 — a p-max landmine on the first write after bulk admission). Flip
+            // when both land: the charter makes GPU residency the substrate, not an opt-in.
             auto_admit_on_commit: std::sync::atomic::AtomicBool::new(false),
             // DEFAULT ON (user 2026-06-29: lpb chosen over the wave engine): the R1 unique-key index probe is
             // the production read path (O(1)/needle vs the O(rows) scan it replaces; byte-identical). The
@@ -205,10 +211,13 @@ impl Engine {
             // FIXED by re-pinning the view at every post-rehydration fallback — pinned by the
             // SV6 concurrent hammer, which now runs elided BY DEFAULT.
             host_install_elision_enabled: std::sync::atomic::AtomicBool::new(true),
-            // TYPE-COVERAGE track 1: constrained (unique/PK'd) elision — default OFF, the
-            // measured A/B lever (923 TPS PK'd vs 102k PK-less @16w; GPU_DB_BENCH_PK=1). Flip
-            // is gated on the SLO re-measure + the adversarial audit, like every default.
-            constrained_elision_enabled: std::sync::atomic::AtomicBool::new(false),
+            // THE CONSTRAINED-ELISION FLIP (user-authorized 2026-07-03): unique/PK'd
+            // i32-section tables are device-authoritative BY DEFAULT — the core-banking shape
+            // runs 90-94k @32w vs 16.5k host-installed. Evidence at the flip: six GPU
+            // differentials + three deterministic CPU races (all sabotage-verified), three
+            // adversarial audits adopted to zero open findings; default-ON makes the whole
+            // suite the continuing burn-in (the A5-flip lesson). Kill switch retained.
+            constrained_elision_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_vacuum_enabled: std::sync::atomic::AtomicBool::new(true),
             tombstone_churn_threshold_override: std::sync::atomic::AtomicU64::new(0),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
