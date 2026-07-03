@@ -596,3 +596,9 @@ pub fn engine_dml_concurrent_wave_stats() -> &'static [std::sync::atomic::Atomic
     &engine_dml_concurrent::WAVE_STATS
 }
 
+/// FUSE-recon device-phase timing accessor: `[locate_nanos, append_nanos, index_insert_nanos]`
+/// (see `engine_dml_concurrent::WAVE_DEVICE_STATS`; populated only under `GPU_DB_BENCH_DEVPHASE=1`).
+pub fn engine_dml_concurrent_wave_device_stats() -> &'static [std::sync::atomic::AtomicU64; 3] {
+    &engine_dml_concurrent::WAVE_DEVICE_STATS
+}
+

@@ -21,6 +21,22 @@ pub static WAVE_STATS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// FUSE-recon device-phase timing (nanos summed across the run): [0]=wave-batch LOCATE (validate),
+/// [1]=device APPEND (HtoD chunks), [2]=device INDEX-INSERT (atom.cas kernel). Relaxed adds gated on
+/// `GPU_DB_BENCH_DEVPHASE=1` so they never touch the steady-state hot path; the SLO benchmark reads
+/// them to attribute the per-wave device round-trip cost and pick the fusion target.
+pub static WAVE_DEVICE_STATS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// True when `GPU_DB_BENCH_DEVPHASE=1` — enables the [`WAVE_DEVICE_STATS`] per-phase timing.
+pub(crate) fn wave_device_phase_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GPU_DB_BENCH_DEVPHASE").is_ok_and(|v| v == "1"))
+}
+
 /// One enqueued concurrent commit: everything the sequencer needs to conflict-check, re-resolve,
 /// append, apply, and publish it — plus the shared slot its owner blocks on.
 pub(crate) struct CommitWaveItem {
@@ -613,7 +629,13 @@ impl Engine {
         // Batched device locate per group; count==0 passes, count>0 authoritative-checks.
         for (gi, &(tctx_idx, filter_idx)) in group_keys.iter().enumerate() {
             let table = tables[tctx_idx].table;
-            match self.wave_batch_locate_hit_counts(table, filter_idx, &group_needles[gi]) {
+            let locate_started = wave_device_phase_timing_enabled().then(Instant::now);
+            let locate = self.wave_batch_locate_hit_counts(table, filter_idx, &group_needles[gi]);
+            if let Some(started) = locate_started {
+                WAVE_DEVICE_STATS[0]
+                    .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            }
+            match locate {
                 Some(counts) => {
                     for ((&pos, &needle), &count) in group_positions[gi]
                         .iter()

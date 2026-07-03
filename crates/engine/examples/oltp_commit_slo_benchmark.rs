@@ -258,6 +258,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                 items as f64 / waves.max(1) as f64,
                 nanos as f64 / items.max(1) as f64 / 1e3,
             );
+            // FUSE recon (GPU_DB_BENCH_DEVPHASE=1): per-wave device round-trip attribution.
+            let d = &gpu_db_engine::engine_dml_concurrent_wave_device_stats();
+            let (loc, app, idx) = (
+                d[0].swap(0, Ordering::Relaxed),
+                d[1].swap(0, Ordering::Relaxed),
+                d[2].swap(0, Ordering::Relaxed),
+            );
+            if loc + app + idx > 0 {
+                eprintln!(
+                    "    [dev-phase us/wave: locate {:.1}  append {:.1}  index-insert {:.1}]",
+                    loc as f64 / waves.max(1) as f64 / 1e3,
+                    app as f64 / waves.max(1) as f64 / 1e3,
+                    idx as f64 / waves.max(1) as f64 / 1e3,
+                );
+            }
             // Elision/validator engagement (constrained-elision A/B): steady state = elisions
             // GROWING, the table STILL elided at teardown, device validate answering.
             eprintln!(

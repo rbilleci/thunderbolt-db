@@ -7936,7 +7936,17 @@ impl Engine {
             // `deleted_by` needs no write on append — the headroom was pre-filled with the live sentinel at
             // admission, so appended rows are born live. SV6: an UPDATE-appended NEW VERSION additionally
             // stamps `created_by = commit_seq` (below); a plain INSERT append stays unstamped (born-visible).
-            if shard_device_memory.append_owned_chunks(chunks).is_err() {
+            let append_started =
+                crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
+                    .then(std::time::Instant::now);
+            let append_result = shard_device_memory.append_owned_chunks(chunks);
+            if let Some(started) = append_started {
+                crate::engine_dml_concurrent::WAVE_DEVICE_STATS[1].fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            if append_result.is_err() {
                 // Partial/failed append leaves bytes only in invisible headroom beyond row_count;
                 // returning false makes the caller invalidate + re-admit, discarding them.
                 return false;
@@ -8005,6 +8015,9 @@ impl Engine {
             // kernel), so the wave-batched device locate never triggers the O(rows) rebuild.
             // Only fires when a device index is cached (device_write_locate on); no-op otherwise.
             if self.device_write_locate_enabled() {
+                let idx_started =
+                    crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
+                        .then(std::time::Instant::now);
                 self.extend_shard_pk_device_index_on_append(
                     table,
                     shard_id,
@@ -8012,6 +8025,12 @@ impl Engine {
                     row_count,
                     &column_values,
                 );
+                if let Some(started) = idx_started {
+                    crate::engine_dml_concurrent::WAVE_DEVICE_STATS[2].fetch_add(
+                        started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
             self.read_state.residency.with_shards_mut(|shards| {
                 if let Some(table_shards) = shards.get_mut(table) {
