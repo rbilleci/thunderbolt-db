@@ -1496,13 +1496,25 @@ impl Engine {
                             &table_rows,
                         )? {
                             Some(matches) => Some(matches),
-                            None => Self::resolve_dml_matches_via_value_index(
-                                table,
-                                &table_rows,
-                                &filter_groups,
-                                visibility,
-                                &prefix,
-                            )?,
+                            None => {
+                                // A5 FLIP SI FIX: the decline may have REHYDRATED (fresh COW
+                                // generation) — re-pin or the fallback resolves stale images
+                                // (see engine_dml_prepare's ladder for the full account).
+                                // The SHADOWING (unlike the prepare ladders' outer-mut) is
+                                // sufficient here: these preflight ladders run only for
+                                // CONSTRAINED tables, which are non-elided BY ELIGIBILITY, so
+                                // no rehydration can actually fire — the re-pin is
+                                // defense-in-depth and the downstream validator's original
+                                // binding is provably fresh (audit N2).
+                                let table_rows = self.read_state.mvcc.table_rows(&table.name);
+                                Self::resolve_dml_matches_via_value_index(
+                                    table,
+                                    &table_rows,
+                                    &filter_groups,
+                                    visibility,
+                                    &prefix,
+                                )?
+                            }
                         }
                     };
                 if let Some(matches) = index_resolved {
@@ -1614,13 +1626,25 @@ impl Engine {
                             &table_rows,
                         )? {
                             Some(matches) => Some(matches),
-                            None => Self::resolve_dml_matches_via_value_index(
-                                table,
-                                &table_rows,
-                                &filter_groups,
-                                visibility,
-                                &prefix,
-                            )?,
+                            None => {
+                                // A5 FLIP SI FIX: the decline may have REHYDRATED (fresh COW
+                                // generation) — re-pin or the fallback resolves stale images
+                                // (see engine_dml_prepare's ladder for the full account).
+                                // The SHADOWING (unlike the prepare ladders' outer-mut) is
+                                // sufficient here: these preflight ladders run only for
+                                // CONSTRAINED tables, which are non-elided BY ELIGIBILITY, so
+                                // no rehydration can actually fire — the re-pin is
+                                // defense-in-depth and the downstream validator's original
+                                // binding is provably fresh (audit N2).
+                                let table_rows = self.read_state.mvcc.table_rows(&table.name);
+                                Self::resolve_dml_matches_via_value_index(
+                                    table,
+                                    &table_rows,
+                                    &filter_groups,
+                                    visibility,
+                                    &prefix,
+                                )?
+                            }
                         }
                     };
                 if let Some(matches) = index_resolved {

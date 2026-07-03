@@ -2397,10 +2397,12 @@ mod capacity_payload_tests {
         e.set_auto_admit_on_commit(true);
         e.set_resident_delete_tombstone_enabled(true);
         e.set_resident_update_tombstone_enabled(true);
-        // A5 FLIP GATE (open SI bug): run this hammer with the next line commented IN to
-        // reproduce the elided-churn double-read (reader sees versions t and t+1 at once —
-        // an older version's tombstone misses under the rehydrate-at-prepare path).
-        e.set_host_install_elision_enabled(false);
+        // A5 FLIP: this hammer runs ELIDED BY DEFAULT — it is the regression gate for the
+        // (fixed) elided-churn SI bug: a rehydrating decline used to leave the fallback on a
+        // STALE view -> stale old image -> the tombstone stamped an already-dead slot -> the
+        // current version leaked (double-read) or the update silently no-oped (lost update,
+        // caught by the end-state assert below). Fix = re-pin the view at every
+        // post-rehydration fallback.
         e.set_shard_size_target(64);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
@@ -2423,13 +2425,6 @@ mod capacity_payload_tests {
                         .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")
                         .unwrap()
                         .rows;
-                    if rows.len() != 1 {
-                        eprintln!(
-                            "[flipdbg] DOUBLE-READ: rows={:?} committed={}",
-                            (0..rows.len()).map(|r| rows.row(r).to_vec()).collect::<Vec<_>>(),
-                            e.committed_seq()
-                        );
-                    }
                     assert_eq!(
                         rows.len(),
                         1,

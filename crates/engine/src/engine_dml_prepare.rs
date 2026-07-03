@@ -124,17 +124,16 @@ impl Engine {
         // validator's profile bucket (they used to pay one scan each); validation semantics and
         // errors are unchanged (`prepare_update` already shares its scan the same way).
         let mut candidate_rows: Option<Vec<Vec<SqlValue>>> = None;
-        let mut materialize_candidates =
-            |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
-                let mut rows = engine.visible_relational_rows(
-                    &table,
-                    StorageVisibility {
-                        read_txn_id: txn_id,
-                    },
-                )?;
-                rows.extend(new_rows.clone());
-                Ok(rows)
-            };
+        let materialize_candidates = |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
+            let mut rows = engine.visible_relational_rows(
+                &table,
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?;
+            rows.extend(new_rows.clone());
+            Ok(rows)
+        };
         // PG constraint order: not-null (23502) BEFORE unique — over the NEW rows only, O(new).
         Self::validate_primary_key_not_null(&table, new_rows.iter().map(Vec::as_slice))?;
         if table.indexes.iter().any(|index| index.unique) {
@@ -248,7 +247,7 @@ impl Engine {
         let prefix = relational_key_prefix(&delete.table);
         // Resolve (tuple_id, key, row) for each matching version against this table's published
         // generation: tuple_id is what apply tombstones; key/row feed the write-set entries.
-        let table_rows = self.read_state.mvcc.table_rows(&delete.table);
+        let mut table_rows = self.read_state.mvcc.table_rows(&delete.table);
         let has_inbound_fks = catalog.relational_catalog.values().any(|candidate| {
             candidate
                 .foreign_keys
@@ -275,6 +274,8 @@ impl Engine {
                         &Default::default(),
                         visibility.read_txn_id,
                     )?;
+                    // A5 FLIP SI FIX: the scan below must read the FRESH generation.
+                    table_rows = self.read_state.mvcc.table_rows(&table.name);
                 }
                 None
             } else {
@@ -287,13 +288,23 @@ impl Engine {
                     &table_rows,
                 )? {
                     Some(matches) => Some(matches),
-                    None => Self::resolve_dml_matches_via_value_index(
-                        &table,
-                        &table_rows,
-                        &filter_groups,
-                        visibility,
-                        &prefix,
-                    )?,
+                    None => {
+                        // A5 FLIP SI FIX (the SV6 elided-churn double-read): the device decline
+                        // may have REHYDRATED — a COW publish of a FRESH host generation — and
+                        // the view pinned above predates it. Falling back on the stale view
+                        // resolves a STALE OLD IMAGE, whose visibility-blind tombstone locate
+                        // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
+                        // the truly-current version live forever; a stale-EMPTY view silently
+                        // LOSES the update (0 matches). RE-PIN before every fallback.
+                        table_rows = self.read_state.mvcc.table_rows(&table.name);
+                        Self::resolve_dml_matches_via_value_index(
+                            &table,
+                            &table_rows,
+                            &filter_groups,
+                            visibility,
+                            &prefix,
+                        )?
+                    }
                 }
             };
         let index_arm = index_resolved.is_some();
@@ -716,6 +727,28 @@ impl Engine {
         ) {
             return Ok(answer);
         }
+        // A4e + A5 FLIP SI FIX: a device decline on an ELIDED table must rehydrate BEFORE the
+        // host probe (the stale value-index would answer from missing/old rows = a constraint
+        // hole), and the probe must then read the FRESH post-rehydration generation — the view
+        // pinned by the caller predates the COW publish.
+        if self.table_install_elided(&table.name) {
+            self.rehydrate_elided_table(
+                table,
+                visibility.read_txn_id,
+                &Default::default(),
+                &Default::default(),
+                visibility.read_txn_id,
+            )?;
+            let fresh = self.read_state.mvcc.table_rows(&table.name);
+            return Self::any_visible_row_with_value(
+                table,
+                &fresh,
+                visibility,
+                column_idx,
+                value,
+                exclude_keys,
+            );
+        }
         Self::any_visible_row_with_value(
             table,
             table_rows,
@@ -1029,7 +1062,7 @@ impl Engine {
         // UPDATE records the same slot as both released (old) and claimed (new) — harmless (the
         // write-set dedups to one slot), so an idempotent rewrite does not self-conflict.
         let mut released_unique_slots: Vec<UniqueIndexSlotKey> = Vec::new();
-        let table_rows = self.read_state.mvcc.table_rows(&update.table);
+        let mut table_rows = self.read_state.mvcc.table_rows(&update.table);
         let constrained = table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()
             || !table.foreign_keys.is_empty()
@@ -1060,6 +1093,8 @@ impl Engine {
                         &Default::default(),
                         visibility.read_txn_id,
                     )?;
+                    // A5 FLIP SI FIX: the scan below must read the FRESH generation.
+                    table_rows = self.read_state.mvcc.table_rows(&table.name);
                 }
                 None
             } else {
@@ -1072,13 +1107,23 @@ impl Engine {
                     &table_rows,
                 )? {
                     Some(matches) => Some(matches),
-                    None => Self::resolve_dml_matches_via_value_index(
-                        &table,
-                        &table_rows,
-                        &filter_groups,
-                        visibility,
-                        &prefix,
-                    )?,
+                    None => {
+                        // A5 FLIP SI FIX (the SV6 elided-churn double-read): the device decline
+                        // may have REHYDRATED — a COW publish of a FRESH host generation — and
+                        // the view pinned above predates it. Falling back on the stale view
+                        // resolves a STALE OLD IMAGE, whose visibility-blind tombstone locate
+                        // then stamps an ALREADY-DEAD slot (exact-count 1 passes!) and leaves
+                        // the truly-current version live forever; a stale-EMPTY view silently
+                        // LOSES the update (0 matches). RE-PIN before every fallback.
+                        table_rows = self.read_state.mvcc.table_rows(&table.name);
+                        Self::resolve_dml_matches_via_value_index(
+                            &table,
+                            &table_rows,
+                            &filter_groups,
+                            visibility,
+                            &prefix,
+                        )?
+                    }
                 }
             };
         let index_arm = index_resolved.is_some();
