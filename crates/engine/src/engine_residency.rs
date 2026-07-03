@@ -4201,6 +4201,95 @@ mod capacity_payload_tests {
         );
     }
 
+    /// TYPE-COVERAGE track 2 slice 2, stage (i) — the i64-SECTION read differential: an
+    /// int8/timestamp-bearing table admitted SHARDED (flag ON) must read byte-identically to
+    /// its single-buffer twin (flag OFF) across the general shapes — full projection, bigint
+    /// aggregates/filters (values beyond i32 range are the mistype canary), ORDER BY the i64
+    /// column, point reads, and a NULL in the bigint column (the single-shard invariant).
+    /// Stage (i) is READ-only: appends still decline (int4_appendable=false for int8-bearing
+    /// shards), so writes re-admit — correctness unchanged, perf comes with stage (ii).
+    ///
+    /// COVERAGE BOUNDARY (deliberate): a stage-(i) table is single-shard by construction (no
+    /// appends -> no rollover), so device service goes through the ZERO-COPY single-shard
+    /// source (`resident_snapshot_for_shard`, int8-labeled) and the CPU-pinned host path — the
+    /// multi-shard i64 RECOMPACTION axis is unreachable here and gets its non-vacuous
+    /// differential + sabotage with stage (ii)'s rollover-created multi-shard tables.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn int8_section_sharded_reads_match_single_buffer_twin() {
+        let queries = [
+            "SELECT id, v, t FROM t8",
+            "SELECT SUM(v) FROM t8",
+            "SELECT v FROM t8 WHERE id = 7",
+            "SELECT id FROM t8 WHERE v = 5000000007",
+            "SELECT id, v FROM t8 ORDER BY v",
+            "SELECT COUNT(*) FROM t8 WHERE v IS NULL",
+            "SELECT id, v, t FROM t8 WHERE t = '2026-07-03 12:00:00'",
+        ];
+        let run = |int8_shards: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_shard_int8_section_enabled(int8_shards);
+            e.execute_text(
+                1,
+                "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, t TIMESTAMP)",
+            )
+            .unwrap();
+            let values: Vec<String> = (0..100_i64)
+                .map(|k| {
+                    if k == 50 {
+                        format!("({k}, NULL, '2026-07-03 12:00:00')")
+                    } else {
+                        format!(
+                            "({k}, {}, '2026-01-01 00:00:{:02}')",
+                            5_000_000_000_i64 + k, // beyond i32: the mistype canary
+                            k % 60
+                        )
+                    }
+                })
+                .collect();
+            e.execute_text(2, &format!("INSERT INTO t8 (id, v, t) VALUES {}", values.join(",")))
+                .unwrap();
+            let sharded = e
+                .read_state
+                .residency
+                .shards
+                .load()
+                .get("t8")
+                .is_some_and(|s| !s.is_empty());
+            // TWIN outcomes (rows OR the exact error): a shape unsupported on BOTH layouts is
+            // pre-existing scope, not a slice regression — parity is the contract.
+            let mut outs: Vec<Result<String, String>> = Vec::new();
+            for q in &queries {
+                outs.push(match e.execute_relational_select_text(q) {
+                    Ok(result) => {
+                        let mut rows = result.rows.into_boxed();
+                        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                        Ok(format!("{rows:?}"))
+                    }
+                    Err(err) => Err(err.to_string()),
+                });
+            }
+            (sharded, outs)
+        };
+        let (sharded_on, on) = run(true);
+        let (sharded_off, off) = run(false);
+        assert!(sharded_on, "non-vacuity: the flag must shard-admit the int8 table");
+        assert!(!sharded_off, "flag OFF keeps the int8 table single-buffer");
+        let mut ok_count = 0;
+        for (i, (a, b)) in on.iter().zip(off.iter()).enumerate() {
+            assert_eq!(a, b, "query {i} ({}): sharded == single-buffer", queries[i]);
+            if a.is_ok() {
+                ok_count += 1;
+            }
+        }
+        assert!(
+            ok_count >= 4,
+            "non-vacuity: most shapes must SUCCEED on both arms (got {ok_count}/7)"
+        );
+    }
+
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
     /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
     /// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
@@ -6208,11 +6297,33 @@ impl Engine {
             && column_types
                 .iter()
                 .all(|ty| matches!(ty, SqlType::Int4 | SqlType::Date | SqlType::Int2));
+        // TYPE-COVERAGE track 2 slice 2 (i64 sections, default-OFF flag): a FIXED-WIDTH-SECTION
+        // table (every column i32- or i64-section) shard-admits like the purely-i32 shape — the
+        // payload builder already lays the i64 section after the i32 ones, capacity-strided, so
+        // the same headroom/rollover story applies. Everything below that branches on
+        // `purely_int4 || fixed_width_sections` treats both shapes identically EXCEPT
+        // appendability, which stage (ii) widens (int8-bearing shards decline appends -> writes
+        // re-admit until then).
+        let fixed_width_sections = !purely_int4
+            && self.shard_int8_section_enabled()
+            && row_count > 0
+            && row_count < (1usize << 29)
+            && !column_types.is_empty()
+            && column_types.iter().all(|ty| {
+                matches!(
+                    ty,
+                    SqlType::Int4
+                        | SqlType::Date
+                        | SqlType::Int2
+                        | SqlType::Int8
+                        | SqlType::Timestamp
+                )
+            });
         // A PURELY-int4 table is laid down with capacity HEADROOM (~2x rows, power-of-two) so committed
         // INSERTs append in place (1b-ii). S-d2: the sharded read is now capacity-aware (the recompaction
         // gather + `resident_snapshot_for_shard` stride by `shard.capacity`), so the OPEN shard gets the
         // same headroom as the single buffer. Other shapes (and huge/empty tables) stay dense.
-        let capacity = if purely_int4 {
+        let capacity = if purely_int4 || fixed_width_sections {
             let doubled = row_count.saturating_mul(2).next_power_of_two();
             // S-d2c: on the shard path, CAP the open shard at the target size (`row_count` if it already
             // exceeds it — a large admit is one dense shard) so it seals + rolls over at the target rather
@@ -6322,7 +6433,10 @@ impl Engine {
         // single-buffer GPU paths to the CPU fallback — the opposite of the flip's goal (caught by the
         // burn-in: the single-buffer text-probe suite). Mixed-type tables keep the single-buffer layout
         // until shards carry every section (type-coverage ledger item).
-        if self.shard_residency_enabled() && device_memory.is_some() && purely_int4 {
+        if self.shard_residency_enabled()
+            && device_memory.is_some()
+            && (purely_int4 || fixed_width_sections)
+        {
             // Audit (S-d1) fix: this re-admit makes the SHARD representation authoritative — clear any prior
             // single-buffer cell for the table so a runtime flag flip (OFF->ON) cannot leave a stale
             // snapshot/device_memory shadowing the shards. Idempotent (a no-op when none exists).
@@ -6398,6 +6512,8 @@ impl Engine {
                 allocated_bytes: device_payload.len() as u64,
                 count_header_byte_offset: 0,
                 resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
+                // TYPE-COVERAGE track 2 slice 2: the i64 section rides the same payload.
+                resident_device_int8_columns: snapshot.resident_device_int8_columns.clone(),
                 resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
                 // M3-for-shards: carry the payload's per-column NULL validity bitmaps so the sharded scan's
                 // recompaction can rebuild them into the unified buffer (this re-admit path is the ONLY
@@ -6834,6 +6950,18 @@ impl Engine {
 
     pub(crate) fn constrained_elision_enabled(&self) -> bool {
         self.constrained_elision_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// TYPE-COVERAGE track 2 slice 2: enable/disable i64-SECTION (Int8/Timestamp) columns in
+    /// sharded admission (default OFF — flips after the read/append/elision stages + SLO + audit).
+    pub fn set_shard_int8_section_enabled(&self, on: bool) {
+        self.shard_int8_section_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn shard_int8_section_enabled(&self) -> bool {
+        self.shard_int8_section_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -7382,6 +7510,9 @@ impl Engine {
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
             resident_device_int4_columns: column_names,
+            // Stage (ii) of the i64-section slice threads the rolled shard's int8 names; the
+            // append gate keeps int8-bearing tables off this path until then.
+            resident_device_int8_columns: Vec::new(),
             resident_device_text_columns: Vec::new(),
             // Rollover shards are int4-only + NULL-free by precondition (the caller rejects NULLs).
             resident_device_null_columns: Vec::new(),
@@ -8176,6 +8307,7 @@ impl Engine {
                 allocated_bytes: shard.allocated_bytes,
                 count_header_byte_offset: 0,
                 resident_device_int4_columns: shard.resident_device_int4_columns,
+                resident_device_int8_columns: Vec::new(), // benchmark chunks are int4-only
                 resident_device_text_columns: shard.resident_device_text_columns,
                 // Benchmark installs carry no NULL metadata (dense, read-only, NULL-free chunks).
                 resident_device_null_columns: Vec::new(),
@@ -8635,7 +8767,9 @@ impl Engine {
             resident_bytes: shard.resident_bytes,
             resident_device_int4_columns: shard.resident_device_int4_columns.clone(),
             resident_device_int4_column_stats: Vec::new(),
-            resident_device_int8_columns: Vec::new(),
+            // TYPE-COVERAGE track 2 slice 2: the shard's i64 section labels ride the synthesized
+            // descriptor so the shared offset helpers address it (layout == single-buffer).
+            resident_device_int8_columns: shard.resident_device_int8_columns.clone(),
             resident_device_numeric_columns: Vec::new(),
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: shard.resident_device_text_columns.clone(),
@@ -8673,6 +8807,9 @@ impl Engine {
         resident_bytes: u64,
         proof: CudaDeviceMemoryProof,
         int4_columns: Vec<String>,
+        // TYPE-COVERAGE track 2 slice 2: the i64-section columns recompacted into the unified
+        // buffer (after every i32 section, total_row_count-strided). Empty pre-slice.
+        int8_columns: Vec<String>,
         // M3-for-shards: the per-column NULL bitmaps recompacted into the unified buffer (offsets ABSOLUTE
         // in that buffer). Empty when no surviving shard carries a NULL — byte-identical to the pre-M3 read.
         null_columns: Vec<ResidentDeviceNullBitmapLayout>,
@@ -8689,7 +8826,7 @@ impl Engine {
             resident_bytes,
             resident_device_int4_columns,
             resident_device_int4_column_stats: Vec::new(),
-            resident_device_int8_columns: Vec::new(),
+            resident_device_int8_columns: int8_columns,
             resident_device_numeric_columns: Vec::new(),
             resident_device_bool_columns: Vec::new(),
             resident_device_text_columns: Vec::new(),

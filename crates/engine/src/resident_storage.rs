@@ -734,6 +734,11 @@ pub(crate) struct RelationalResidentShard {
     pub(crate) allocated_bytes: u64,
     pub(crate) count_header_byte_offset: u64,
     pub(crate) resident_device_int4_columns: Vec<String>,
+    /// TYPE-COVERAGE track 2 slice 2: the i64-SECTION columns (Int8/Timestamp) this shard's
+    /// payload carries, in catalog order — laid out by `build_relational_device_payload_*`
+    /// AFTER every i32 section, capacity-strided (the single-buffer layout, so the shared
+    /// offset helpers address both). Empty on int4-only lineages (the pre-slice universe).
+    pub(crate) resident_device_int8_columns: Vec<String>,
     pub(crate) resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     /// M3-for-shards: per-column NULL validity bitmaps carried in THIS shard's device payload (1 = valid,
     /// 0 = NULL), in catalog order, one entry per column that contains a NULL. The sharded scan's unified

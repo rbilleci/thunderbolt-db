@@ -105,7 +105,19 @@ impl Engine {
                     let shard_resident_int4_only =
                         || {
                             table.columns.iter().all(|c| {
-                                matches!(c.ty, SqlType::Int4 | SqlType::Int2 | SqlType::Date)
+                                // TYPE-COVERAGE track 2 slice 2: the unified exec source now
+                                // gathers the i64 sections too, so Int8/Timestamp columns route
+                                // to the GPU general path when the flag admitted them to shards
+                                // (without the flag such tables are never shard-resident and the
+                                // shards.load() check below keeps this arm false).
+                                matches!(
+                                    c.ty,
+                                    SqlType::Int4
+                                        | SqlType::Int2
+                                        | SqlType::Date
+                                        | SqlType::Int8
+                                        | SqlType::Timestamp
+                                )
                             }) && self
                                 .read_state
                                 .residency

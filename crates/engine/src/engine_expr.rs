@@ -2641,6 +2641,12 @@ impl Engine {
         // layout validation, so we enforce uniformity per shard in the gather loop below (audit F1).
         let int4_columns = shards[0].resident_device_int4_columns.clone();
         let num_int4_cols = int4_columns.len();
+        // TYPE-COVERAGE track 2 slice 2: the i64 SECTION (Int8/Timestamp) recompacts exactly like
+        // the i32 sections — same builder layout (header + all i32 sections + all i64 sections,
+        // capacity-strided, NO padding: the offset helper + the 2x-u32 load discipline own the
+        // 4-mod-8 case), same per-shard uniformity guard, same positional-ordinal DtoD plan.
+        let int8_columns = shards[0].resident_device_int8_columns.clone();
+        let num_int8_cols = int8_columns.len();
 
         // Gather each shard's (device_ptr, row_count) by running the SAME identity/validity precheck the
         // probes did (via `source_for`), accumulate `total_row_count`, and build the device-to-device copy
@@ -2659,6 +2665,12 @@ impl Engine {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "resident shard {} int4 column layout {:?} does not match shard 0 layout {:?}",
                     shard.shard_id, shard.resident_device_int4_columns, int4_columns
+                ))));
+            }
+            if shard.resident_device_int8_columns != int8_columns {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident shard {} int8 column layout {:?} does not match shard 0 layout {:?}",
+                    shard.shard_id, shard.resident_device_int8_columns, int8_columns
                 ))));
             }
             shard_ptrs.push((
@@ -2692,6 +2704,29 @@ impl Engine {
             }
         }
         let int4_bytes = 8 + (total_row_count as u64) * 4 * (num_int4_cols as u64);
+        // The i64 sections sit immediately after the i32 sections in BOTH the shard payloads and
+        // the unified buffer (the shared offset-helper formula; per-shard stride = capacity,
+        // unified stride = total_row_count).
+        for ordinal in 0..num_int8_cols {
+            let mut rows_before = 0_u64;
+            for (device_ptr, row_count, capacity) in &shard_ptrs {
+                let row_count = *row_count as u64;
+                let capacity = *capacity as u64;
+                segments.push(gpu_db_execution::RecompactSegment {
+                    src_device_ptr: *device_ptr,
+                    src_byte_offset: 8
+                        + (num_int4_cols as u64) * capacity * 4
+                        + (ordinal as u64) * capacity * 8,
+                    dst_byte_offset: int4_bytes
+                        + (ordinal as u64) * (total_row_count as u64) * 8
+                        + rows_before * 8,
+                    byte_len: row_count.saturating_mul(8),
+                });
+                rows_before = rows_before.saturating_add(row_count);
+            }
+        }
+        let fixed_section_bytes =
+            int4_bytes + (total_row_count as u64) * 8 * (num_int8_cols as u64);
 
         // SV3b/SV6 MVCC visibility gather: if ANY surviving shard is VERSIONED (carries an on-demand
         // `deleted_by` and/or `created_by` region), append the corresponding co-resident DENSE i64 column(s)
@@ -2704,7 +2739,7 @@ impl Engine {
         let mut fills: Vec<gpu_db_execution::RecompactFill> = Vec::new();
         let mut deleted_by_offset: Option<u64> = None;
         let mut created_by_offset: Option<u64> = None;
-        let mut allocated_bytes = int4_bytes;
+        let mut allocated_bytes = fixed_section_bytes;
         // The two version-metadata regions (`deleted_by` upper bound, SV3b; `created_by` lower bound, SV6)
         // are gathered INDEPENDENTLY — an UPDATE tombstones the old version in one shard and appends the
         // stamped new version into the OPEN shard, so a shard can carry either region without the other.
@@ -2870,6 +2905,7 @@ impl Engine {
             allocated_bytes,
             proof,
             int4_columns,
+            int8_columns,
             unified_null_columns,
         );
         Ok(ShardedUnifiedExecSource {
