@@ -11466,7 +11466,231 @@ DONE:
 }
 "#;
 
+/// M1 (charter-pure, ledger #24): the INCREMENTAL device-index INSERT kernel — lock-free
+/// open-addressing insert of the k APPENDED keys into an existing device hash, so the device
+/// index is APPEND-MAINTAINED (O(k)) instead of REBUILT O(rows) every wave (the measured
+/// 305us/wave bottleneck: DtoH keys + host hash + HtoD). Each thread inserts one key via
+/// `atom.global.cas.b64` (the charter's advance-on-failure discipline — NO spin-locks): claim an
+/// empty slot (CAS 0 -> packed) or find its own key already present (a DUP -> set the decline
+/// flag). Packing + hash are BYTE-IDENTICAL to `build_int4_pk_hash_table_host` + the probe kernels
+/// (`(key<<32)|(row+1)`, fib `key*0x9E3779B1 >> shift & mask`, 256 cap). Overflow (256 probes) ->
+/// decline (the caller drops the cache -> a full rebuild at the grown size, mirroring the host
+/// extend's load rule). ASCII-only.
+const INDEX_INSERT_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_index_insert(
+    .param .u64 index_ptr,
+    .param .u32 table_mask,
+    .param .u32 hash_shift,
+    .param .u64 keys_ptr,
+    .param .u32 key_count,
+    .param .u32 base_row,
+    .param .u64 decline_ptr
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [index_ptr];
+    ld.param.u32 %r1, [table_mask];
+    ld.param.u32 %r2, [hash_shift];
+    ld.param.u64 %rd2, [keys_ptr];
+    ld.param.u32 %r3, [key_count];
+    ld.param.u32 %r4, [base_row];
+    ld.param.u64 %rd3, [decline_ptr];
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;
+    setp.ge.u32 %p1, %r8, %r3;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd4, %r8, 4;
+    add.u64 %rd5, %rd2, %rd4;
+    ld.global.s32 %r9, [%rd5];
+
+    // packed = ((u64)key_bits << 32) | (base_row + tid + 1)
+    add.u32 %r10, %r4, %r8;
+    add.u32 %r10, %r10, 1;
+    cvt.u64.u32 %rd6, %r10;
+    cvt.u64.u32 %rd7, %r9;
+    shl.b64 %rd8, %rd7, 32;
+    or.b64 %rd9, %rd8, %rd6;
+
+    // slot = (key * 0x9E3779B1) >> shift & mask
+    mul.lo.u32 %r11, %r9, 2654435761;
+    shr.u32 %r12, %r11, %r2;
+    and.b32 %r12, %r12, %r1;
+    mov.u32 %r13, 0;
+
+INSLOOP:
+    mul.wide.u32 %rd10, %r12, 8;
+    add.u64 %rd11, %rd1, %rd10;
+    // atomicCAS(slot, 0, packed) -> old
+    mov.u64 %rd12, 0;
+    atom.global.cas.b64 %rd13, [%rd11], %rd12, %rd9;
+    setp.eq.u64 %p2, %rd13, 0;
+    @%p2 bra DONE;
+    // occupied: is it OUR key? (old >> 32) == key_bits -> DUP
+    shr.u64 %rd14, %rd13, 32;
+    cvt.u32.u64 %r14, %rd14;
+    setp.eq.s32 %p3, %r14, %r9;
+    @%p3 bra DUP;
+    add.u32 %r12, %r12, 1;
+    and.b32 %r12, %r12, %r1;
+    add.u32 %r13, %r13, 1;
+    setp.ge.u32 %p3, %r13, 256;
+    @%p3 bra DUP;
+    bra INSLOOP;
+
+DUP:
+    mov.u32 %r15, 1;
+    st.global.u32 [%rd3], %r15;
+
+DONE:
+    ret;
+}
+"#;
+
 impl CudaResidentDeviceMemory {
+    /// M1 (ledger #24): insert `keys` (the APPENDED tail, at device rows `base_row..`) INTO this
+    /// device hash index IN PLACE via the lock-free `index_insert` kernel. Returns `true` if a DUP
+    /// (or 256-probe overflow) was hit — the caller then transitions the cache to the DECLINED
+    /// state (monotone, like the host path). The caller MUST enforce the load rule
+    /// (`2*(base_row+keys.len()) <= table_size`) BEFORE calling (else drop + rebuild). Synchronous.
+    pub fn submit_i32_index_insert(
+        &self,
+        index: &Arc<CudaResidentDeviceMemory>,
+        table_mask: u32,
+        hash_shift: u32,
+        keys: &[i32],
+        base_row: u32,
+    ) -> Result<bool, CudaRuntimeProbeError> {
+        type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        if index.device_ptr() == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let key_count = u32::try_from(keys.len())
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(keys.len()))?;
+        let keys_bytes = keys
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_memset_d8 = unsafe {
+            primary
+                .lib()
+                .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_memcpy_dtoh = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let keys_guard = primary.lease_device_buffer_owned(keys_bytes)?;
+        let decline_guard = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
+
+        let mut ptx = Vec::with_capacity(INDEX_INSERT_PTX.len() + 1);
+        ptx.extend_from_slice(INDEX_INSERT_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_resident_i32_index_insert", &ptx)?;
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(keys_guard.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes)
+        })?;
+        check_cuda(unsafe { cu_memset_d8(decline_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
+
+        let mut index_arg = index.device_ptr();
+        let mut mask_arg = table_mask;
+        let mut shift_arg = hash_shift;
+        let mut keys_arg = keys_guard.ptr;
+        let mut count_arg = key_count;
+        let mut base_arg = base_row;
+        let mut decline_arg = decline_guard.ptr;
+        let mut args = [
+            (&mut index_arg as *mut u64).cast::<c_void>(),
+            (&mut mask_arg as *mut u32).cast::<c_void>(),
+            (&mut shift_arg as *mut u32).cast::<c_void>(),
+            (&mut keys_arg as *mut u64).cast::<c_void>(),
+            (&mut count_arg as *mut u32).cast::<c_void>(),
+            (&mut base_arg as *mut u32).cast::<c_void>(),
+            (&mut decline_arg as *mut u64).cast::<c_void>(),
+        ];
+        let threads_per_block: u32 = 128;
+        let blocks = key_count.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        check_cuda(unsafe { (primary.cu_stream_synchronize)(std::ptr::null_mut()) })?;
+
+        let mut decline = [0u32; 1];
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                decline.as_mut_ptr().cast::<c_void>(),
+                decline_guard.ptr,
+                std::mem::size_of::<u32>(),
+            )
+        })?;
+        Ok(decline[0] != 0)
+    }
+
     /// M1 (charter-pure): probe a BATCH of int4 `needles` against ALL `shards`' DEVICE hash indexes in
     /// ONE kernel launch, emitting each needle's `(shard_idx, slot)` hits. Replaces the host
     /// `shard_pk_index` hash probe for the write path (A2/A3). Synchronous (null stream + context sync):
@@ -24296,6 +24520,71 @@ mod tests {
             }
         }
         (index, table_mask, hash_shift)
+    }
+
+    /// M1 (ledger #24): the INCREMENTAL index-insert kernel == a full rebuild. Build an index for
+    /// a prefix of keys, INSERT the appended tail via the kernel, and verify the extended index
+    /// probes IDENTICALLY to a from-scratch build over all keys (via the write-locate kernel).
+    /// Also verifies DUP detection (re-inserting an existing key sets the decline flag).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn index_insert_kernel_extends_like_a_rebuild() {
+        let Ok(runtime) = CudaDriverRuntime::probe() else {
+            return;
+        };
+        if !runtime.snapshot().driver_available {
+            return;
+        }
+        // Build for 6 keys, then INSERT 4 more into the SAME (over-sized) table.
+        let all: Vec<i32> = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let prefix = &all[..6];
+        // Size the table for ALL 10 (so the tail fits without a resize).
+        let table_size = (all.len() as u64 * 2).next_power_of_two().max(2);
+        let table_mask = (table_size - 1) as u32;
+        let hash_shift = 32 - table_size.trailing_zeros();
+        // Host-build the prefix into a table of the full size.
+        let mut words = vec![0u64; table_size as usize];
+        for (row, &key) in prefix.iter().enumerate() {
+            let kb = key as u32;
+            let mut slot = (kb.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+            loop {
+                if words[slot as usize] == 0 {
+                    words[slot as usize] = ((kb as u64) << 32) | (row as u64 + 1);
+                    break;
+                }
+                slot = (slot + 1) & table_mask;
+            }
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let Ok(mem) = runtime.retain_device_memory_copy(0, &bytes) else {
+            return;
+        };
+        let index = std::sync::Arc::new(mem);
+        // INSERT the tail (rows 6..10) via the kernel.
+        let tail = &all[6..];
+        let dup = index
+            .submit_i32_index_insert(&index, table_mask, hash_shift, tail, 6)
+            .expect("index insert");
+        assert!(!dup, "no dup inserting fresh keys");
+        // Probe ALL keys via the write-locate kernel: each must resolve to its row.
+        let shards = [WriteLocateShard {
+            index: std::sync::Arc::clone(&index),
+            table_mask,
+            hash_shift,
+        }];
+        let result = index
+            .submit_multi_shard_i32_write_locate(&shards, &all, 2)
+            .expect("locate");
+        for (i, &key) in all.iter().enumerate() {
+            assert_eq!(result.count[i], 1, "key {key}: exactly one hit after extend");
+            let slot = result.slot[i * result.max_hits as usize];
+            assert_eq!(slot as usize, i, "key {key}: row {i} preserved");
+        }
+        // DUP: re-inserting an existing key sets the decline flag.
+        let dup2 = index
+            .submit_i32_index_insert(&index, table_mask, hash_shift, &[30], 99)
+            .expect("dup insert");
+        assert!(dup2, "re-inserting key 30 must flag a dup");
     }
 
     /// M1 BAKEOFF micro-bench: the write-locate kernel's AMORTIZATION curve — us/needle at batch
