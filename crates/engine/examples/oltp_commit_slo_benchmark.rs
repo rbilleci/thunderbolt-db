@@ -157,15 +157,36 @@ fn main() -> Result<(), Box<dyn Error>> {
                     barrier.wait();
                     let run_started = Instant::now();
                     let mut i = 0_u64;
+                    // lpb-for-writes probe: GPU_DB_BENCH_ROWS=N inserts N rows per commit (the
+                    // write-path deep-batch analog of a 65536-needle read batch). rows/sec =
+                    // commits/sec * N.
+                    let rows_per: u64 = std::env::var("GPU_DB_BENCH_ROWS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1)
+                        .max(1);
                     while !stop.load(Ordering::Relaxed) {
                         let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
-                        let id = w as u64 * 10_000_000 + i; // stays within int4 for <=200 writers
-                        let sql = if std::env::var("GPU_DB_BENCH_INT8").is_ok_and(|v| v == "1") {
-                            format!("INSERT INTO t (id, v) VALUES ({id}, {})", 5_000_000_000_i64 + id as i64)
-                        } else if std::env::var("GPU_DB_BENCH_DATE").is_ok_and(|v| v == "1") {
-                            format!("INSERT INTO t (id, d, v) VALUES ({id}, '2026-07-03', 1)")
+                        // Per-writer disjoint id ranges (no cross-writer collision); consecutive
+                        // within a writer. Keep writers*128M + rows under i32 for the multi-row probe.
+                        let base = w as u64 * 128_000_000 + i * rows_per;
+                        let sql = if rows_per > 1 {
+                            let vals: Vec<String> = (0..rows_per)
+                                .map(|r| format!("({}, 1)", base + r))
+                                .collect();
+                            format!("INSERT INTO t (id, v) VALUES {}", vals.join(","))
                         } else {
-                            format!("INSERT INTO t (id, v) VALUES ({id}, 1)")
+                            let id = w as u64 * 10_000_000 + i; // stays within int4 for <=200 writers
+                            if std::env::var("GPU_DB_BENCH_INT8").is_ok_and(|v| v == "1") {
+                                format!(
+                                    "INSERT INTO t (id, v) VALUES ({id}, {})",
+                                    5_000_000_000_i64 + id as i64
+                                )
+                            } else if std::env::var("GPU_DB_BENCH_DATE").is_ok_and(|v| v == "1") {
+                                format!("INSERT INTO t (id, d, v) VALUES ({id}, '2026-07-03', 1)")
+                            } else {
+                                format!("INSERT INTO t (id, v) VALUES ({id}, 1)")
+                            }
                         };
                         let commit_started = Instant::now();
                         let prepared_nanos = std::cell::Cell::new(0u64);

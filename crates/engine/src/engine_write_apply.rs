@@ -8,6 +8,29 @@
 use super::*;
 
 impl Engine {
+    /// Recover the host value-index entries an INSERT delta deferred under the elided-skip
+    /// (`prepare_insert`): if `entries` is empty for a non-empty insert, the table was elided at
+    /// off-lock prepare but is NOT elided at this under-lock apply (a de-elision race), so the
+    /// per-row `ColumnValueKey`s were never computed. Recompute them from the published catalog so
+    /// the non-elided host install stays complete. A genuine insert of >=1 row into a >=1-column
+    /// table always yields >=1 entry, so `empty && rows non-empty` uniquely identifies the deferral
+    /// (never a legitimately-empty map). The common path (non-empty entries) returns untouched with
+    /// no catalog pin.
+    pub(crate) fn value_index_entries_for_deferred_apply(
+        &self,
+        table: &str,
+        inserted_rows: &[(String, Vec<SqlValue>)],
+        entries: BTreeMap<ColumnValueKey, Vec<String>>,
+    ) -> BTreeMap<ColumnValueKey, Vec<String>> {
+        if !entries.is_empty() || inserted_rows.is_empty() {
+            return entries;
+        }
+        match self.catalog_snapshot().relational_catalog.get(table) {
+            Some(t) => relational_value_index_entries_for_rows(&t.columns, inserted_rows),
+            None => entries,
+        }
+    }
+
     /// Install a prepared [`WriteDelta`]'s data, stamping new versions with `commit_seq` (Stage 0
     /// stamp/boundary unification: `commit_seq == commit Index`). `&self` (write-half Stage 4): it
     /// mutates exactly the structures the write-set names — the mutated table's `TableVersionData`
@@ -54,6 +77,13 @@ impl Engine {
                     debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
                     return Ok(());
                 }
+                // Non-elided install: recover any value-index entries deferred by the elided-skip
+                // (this table de-elided between prepare and now); a no-op on the common path.
+                let value_index_entries = self.value_index_entries_for_deferred_apply(
+                    &table,
+                    &inserted_rows,
+                    value_index_entries,
+                );
                 // Reserve the globally-unique tuple ids up front (the old in-line bump consumed one
                 // per row from the single shared allocator; `next_tuple_id` is now shared across all
                 // partitions so ids are identical). Advance the relational row-id allocator by the
@@ -215,6 +245,14 @@ impl Engine {
                 .collect();
             debug_assert_eq!(inserted_rows.len() as u64, rows_consumed);
             self.read_state.mvcc.advance_row_id(rows_consumed);
+            // The fast-run batched path installs into the host store; if this table carries a stale
+            // elided flag (elided under a prior auto_admit wave, now on the !auto_admit fast run),
+            // prepare deferred its value-index — recompute so tuples + value-index stay consistent.
+            let value_index_entries = self.value_index_entries_for_deferred_apply(
+                table,
+                &inserted_rows,
+                value_index_entries,
+            );
             plans.push((tuple_ids, inserted_rows, value_index_entries, commit_seq));
         }
         self.read_state.mvcc.with_table_mut(table, |data| {

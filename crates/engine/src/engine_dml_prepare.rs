@@ -286,8 +286,19 @@ impl Engine {
             let row_key = relational_row_key(&insert.table, row_id);
             inserted_rows.push((row_key, values));
         }
-        let value_index_entries =
-            relational_value_index_entries_for_rows(&table.columns, &inserted_rows);
+        // ELIDED-SKIP (lpb per-row-work cut): an elided (device-authoritative) table's apply
+        // arm discards the host value-index entirely (engine_write_apply.rs), so computing the
+        // per-row `ColumnValueKey`s here is pure waste on the sequencer's hot path — for a 64-row
+        // batch this compute is ~40% of the per-row host cost. Skip it. SAFETY across a de-elision
+        // race (elided at off-lock prepare, NOT elided by under-lock apply): both apply sites
+        // recompute from the published catalog when they see an empty map for a non-empty insert
+        // (`value_index_entries_for_deferred_apply`) — a real insert of >=1 row into a >=1-column
+        // table always yields >=1 entry, so empty-and-non-empty-rows uniquely marks the deferral.
+        let value_index_entries = if self.table_install_elided(&table.name) {
+            BTreeMap::new()
+        } else {
+            relational_value_index_entries_for_rows(&table.columns, &inserted_rows)
+        };
 
         let mut write_set = WriteSet::default();
         for (_row_key, values) in &inserted_rows {
