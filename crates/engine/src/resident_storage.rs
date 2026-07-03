@@ -800,6 +800,7 @@ impl PartialEq for RelationalResidentShard {
             && self.allocated_bytes == other.allocated_bytes
             && self.count_header_byte_offset == other.count_header_byte_offset
             && self.resident_device_int4_columns == other.resident_device_int4_columns
+            && self.resident_device_int8_columns == other.resident_device_int8_columns
             && self.resident_device_text_columns == other.resident_device_text_columns
             && self.resident_device_null_columns == other.resident_device_null_columns
             && self.gpu_id == other.gpu_id

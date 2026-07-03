@@ -7808,7 +7808,11 @@ impl Engine {
             capacity: new_capacity,
             int4_appendable: true,
             resident_device_int4_column_stats: int4_stats,
-            resident_bytes: (8 + k * column_count * std::mem::size_of::<i32>()) as u64,
+            // Audit NOTE adopted: count i64 columns at 8 bytes (was a telemetry undercount
+            // vs the admit path; allocated_bytes was always correct).
+            resident_bytes: (8
+                + k * (num_i32_cols * std::mem::size_of::<i32>()
+                    + num_i64_cols * std::mem::size_of::<i64>())) as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
             resident_device_int4_columns: shard_int4_names.clone(),
