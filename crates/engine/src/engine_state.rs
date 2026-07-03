@@ -559,6 +559,9 @@ pub(crate) struct ResidencyReadState {
     /// TYPE-COVERAGE track 1 diagnostics: how the shard PK-index cache converges under append
     /// churn — writer-side extensions applied at the flush, prober-side tail-DtoH extensions,
     /// and full O(shard) rebuilds. Steady state = writer extends dominating, rebuilds ~doublings.
+    /// M1: count of PK locates served by the DEVICE write-locate kernel (non-vacuity: proves the
+    /// device path FIRED, not a silent fallback to the host probe / scan).
+    pub(crate) device_write_locate_hits: std::sync::atomic::AtomicU64,
     pub(crate) pk_index_writer_extends: std::sync::atomic::AtomicU64,
     pub(crate) pk_index_prober_extends: std::sync::atomic::AtomicU64,
     pub(crate) pk_index_rebuilds: std::sync::atomic::AtomicU64,

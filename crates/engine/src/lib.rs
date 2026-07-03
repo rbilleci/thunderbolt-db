@@ -14,7 +14,7 @@ use gpu_db_execution::{
     CudaI32Stats, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory,
     CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget, ExprStep, FilterOperator,
     LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator, ResidentElemType,
-    RouteDecision, ScanOperator, SortOperator,
+    RouteDecision, ScanOperator, SortOperator, WriteLocateShard,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -426,6 +426,11 @@ pub struct Engine {
     /// DEFAULT ON (the 2026-07-03 flip). Kill switch -> int8-bearing tables admit
     /// single-buffer (the pre-slice layout).
     shard_int8_section_enabled: std::sync::atomic::AtomicBool,
+    /// M1 (charter ruling 2026-07-03): the write path's PK locate (A2 resolve, A3 validators)
+    /// probes the per-shard DEVICE hash index via a kernel instead of the host `shard_pk_index`
+    /// hash cache — key->slot ADDRESSING is device work. Default OFF until the SLO gate + audit;
+    /// the host cache stays as the flag-off oracle until M3 deletes it. Kill switch -> host probe.
+    device_write_locate_enabled: std::sync::atomic::AtomicBool,
     auto_vacuum_enabled: std::sync::atomic::AtomicBool,
     tombstone_churn_threshold_override: std::sync::atomic::AtomicU64,
     /// S-d2c: the target row count per shard (the rollover/seal threshold; default 4M). Settable

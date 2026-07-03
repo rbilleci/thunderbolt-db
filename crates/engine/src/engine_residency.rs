@@ -4532,6 +4532,77 @@ mod capacity_payload_tests {
         );
     }
 
+    /// M1 (charter-pure device locate) — the DEVICE-vs-HOST-PROBE differential: an elided PK'd
+    /// table runs the constraint + DML gauntlet with the DEVICE write-locate ON vs OFF (the host
+    /// PK-hash-probe oracle). Every outcome (incl violation text) + final read must match — the
+    /// locate feeds BOTH the A2 resolve (point DML) and the A3 validators (dup checks). Includes
+    /// an UPDATE that appends a new version (SV5) so a key lands in TWO shards — the kernel's
+    /// multi-hit emission is exercised (the host path returns both hits too). NON-VACUITY: the
+    /// device arm's `device_write_locate_hits` advances (the kernel really fired).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn device_write_locate_matches_host_probe_twin() {
+        let run = |device: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_device_write_locate_enabled(device);
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", k * 10))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let ladder = [
+                "INSERT INTO t (id, v) VALUES (500, 5000)",
+                "INSERT INTO t (id, v) VALUES (42, 1)",   // dup PK -> 23505 (A3 via locate)
+                "UPDATE t SET v = 999 WHERE id = 130",    // A2 resolve + SV5 append (2-shard key)
+                "UPDATE t SET v = 7 WHERE id = 130",      // now id=130 is in 2 shards -> multi-hit
+                "DELETE FROM t WHERE id = 42",            // A2 resolve
+                "INSERT INTO t (id, v) VALUES (42, 77)",  // reuse the deleted key -> ok
+                "UPDATE t SET v = -1 WHERE id = 500",     // elided-era row
+            ];
+            let mut outcomes: Vec<Result<(), String>> = Vec::new();
+            for sql in &ladder {
+                outcomes.push(
+                    e.execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
+                );
+                seq += 1;
+            }
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            (e, outcomes, rows)
+        };
+        let (on, on_out, on_rows) = run(true);
+        let (off, off_out, off_rows) = run(false);
+        assert_eq!(on_out, off_out, "device locate outcome ladder == host-probe oracle");
+        assert_eq!(on_rows, off_rows, "device locate reads == host-probe oracle");
+        assert!(
+            on.device_write_locate_hits() > 0,
+            "non-vacuity: the DEVICE write-locate kernel must have FIRED (got {})",
+            on.device_write_locate_hits()
+        );
+        assert_eq!(
+            off.device_write_locate_hits(),
+            0,
+            "flag OFF never touches the device locate"
+        );
+    }
+
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
     /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
     /// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
@@ -7205,6 +7276,25 @@ impl Engine {
 
     pub(crate) fn shard_int8_section_enabled(&self) -> bool {
         self.shard_int8_section_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// M1 (charter-pure): enable/disable the DEVICE write-locate (host PK-hash probe replacement).
+    pub fn set_device_write_locate_enabled(&self, on: bool) {
+        self.device_write_locate_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn device_write_locate_enabled(&self) -> bool {
+        self.device_write_locate_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// M1: PK locates served by the DEVICE kernel (non-vacuity telemetry).
+    pub fn device_write_locate_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .device_write_locate_hits
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

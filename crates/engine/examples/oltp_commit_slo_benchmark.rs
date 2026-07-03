@@ -121,6 +121,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok("1") => e.set_shard_int8_section_enabled(true),
             _ => {}
         }
+        // M1 (charter-pure device locate): GPU_DB_BENCH_DEVLOCATE=1 exercises the DEVICE
+        // write-locate (host PK-hash-probe replacement). Per-item today; wave-prefetch pending.
+        if std::env::var("GPU_DB_BENCH_DEVLOCATE").is_ok_and(|v| v == "1") {
+            e.set_device_write_locate_enabled(true);
+        }
         // Constrained elision is DEFAULT ON since the 2026-07-03 flip; GPU_DB_BENCH_CELIDE=0
         // is the kill-switch A/B arm (GPU_DB_BENCH_CELIDE=1 remains accepted, now redundant).
         match std::env::var("GPU_DB_BENCH_CELIDE").as_deref() {

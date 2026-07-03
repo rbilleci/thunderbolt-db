@@ -763,6 +763,12 @@ impl Engine {
         filter_idx: usize,
         key: i32,
     ) -> Option<Vec<ShardPkHit>> {
+        // M1 (charter ruling 2026-07-03): the DEVICE write-locate replaces the host PK-hash probe.
+        // Same Vec<ShardPkHit> output (region-Arc capture unchanged) -> a drop-in the consumers
+        // never see. The host-probe path below is the flag-off oracle until M3 deletes it.
+        if self.device_write_locate_enabled() {
+            return self.locate_resident_pk_via_device(table, filter_idx, key);
+        }
         let shards = self.read_state.residency.shards.load();
         let table_shards = shards.get(&table.name)?;
         if table_shards.is_empty() {
@@ -833,6 +839,117 @@ impl Engine {
                     return None;
                 }
             }
+        }
+        Some(out)
+    }
+
+    /// M1 (charter-pure): the DEVICE write-locate — probe the per-shard DEVICE hash indexes in ONE
+    /// kernel launch (`submit_multi_shard_i32_write_locate`) instead of the host `shard_pk_index`
+    /// hash cache. Builds the SAME `Vec<ShardPkHit>` the host path does (region Arcs captured from
+    /// the same loaded descriptor), so callers are identical. Declines (None -> caller scans) on:
+    /// any invalid/pressured/mismatched shard (parity with the host path's precheck), a shard whose
+    /// device index can't be built (dup keys — matches `ShardPkProbe::Declined`), a device-probe
+    /// failure, or a per-needle overflow past `MAX_HITS` (a cross-shard multiplicity the host path
+    /// likewise declines). NO host hash probe anywhere on this path.
+    fn locate_resident_pk_via_device(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        key: i32,
+    ) -> Option<Vec<ShardPkHit>> {
+        const MAX_HITS: u32 = 4;
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let runtime_snapshot = self.router.runtime().snapshot();
+        // Parallel Vecs: the kernel descriptors + the per-descriptor shard context (descriptor,
+        // buffer, region Arcs) so a hit's shard_idx maps back to build the ShardPkHit. Empty +
+        // 0-row shards are SKIPPED (parity with the host path); a hit's shard_idx indexes into
+        // `ctxs`, which lists only the probed shards in order.
+        let mut descs: Vec<WriteLocateShard> = Vec::new();
+        struct ShardCtx {
+            shard_id: u32,
+            descriptor: RelationalResidencySnapshot,
+            device_memory: Arc<CudaResidentDeviceMemory>,
+            deleted_by: Option<Arc<CudaResidentDeviceMemory>>,
+            created_by: Option<Arc<CudaResidentDeviceMemory>>,
+            row_id: Option<Arc<CudaResidentDeviceMemory>>,
+        }
+        let mut ctxs: Vec<ShardCtx> = Vec::new();
+        for shard in table_shards.iter() {
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            let memory_pressure_active = runtime_snapshot
+                .memory_pressured_gpu_ids
+                .contains(&shard.gpu_id);
+            if !shard.is_valid(memory_pressure_active) {
+                return None;
+            }
+            if shard.row_count == 0 {
+                continue;
+            }
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let filter_offset =
+                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
+            let device_memory = shard.device_memory.clone()?;
+            // Build/reuse the shard's DEVICE hash index (uploaded once per generation,
+            // (ptr,row_count)-validated). None = the shard has DUP keys -> decline the whole
+            // locate to the scan, exactly like the host `ShardPkProbe::Declined`.
+            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
+                &table.name,
+                shard.shard_id,
+                filter_idx,
+                &device_memory,
+                filter_offset,
+                shard.row_count,
+            )?;
+            descs.push(WriteLocateShard {
+                index: device_index,
+                table_mask,
+                hash_shift,
+            });
+            ctxs.push(ShardCtx {
+                shard_id: shard.shard_id,
+                descriptor,
+                device_memory,
+                deleted_by: shard.deleted_by_region.clone(),
+                created_by: shard.created_by_region.clone(),
+                row_id: shard.row_id_region.clone(),
+            });
+        }
+        if descs.is_empty() {
+            return Some(Vec::new()); // no probed shards -> no hits (parity with the host loop)
+        }
+        // ONE device launch: the launch context is any device buffer on the GPU (the first shard's).
+        let ctx = Arc::clone(&descs[0].index);
+        let result = ctx
+            .submit_multi_shard_i32_write_locate(&descs, &[key], MAX_HITS)
+            .ok()?;
+        let count = *result.count.first()?;
+        if count == u32::MAX {
+            return None; // overflow past MAX_HITS -> decline to the scan (cross-shard multiplicity)
+        }
+        self.read_state
+            .residency
+            .device_write_locate_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut out: Vec<ShardPkHit> = Vec::with_capacity(count as usize);
+        for h in 0..count as usize {
+            let shard_idx = *result.shard_idx.get(h)? as usize;
+            let slot = *result.slot.get(h)?;
+            let c = ctxs.get(shard_idx)?;
+            out.push(ShardPkHit {
+                shard_id: c.shard_id,
+                slot,
+                descriptor: c.descriptor.clone(),
+                device_memory: Arc::clone(&c.device_memory),
+                deleted_by: c.deleted_by.clone(),
+                created_by: c.created_by.clone(),
+                row_id: c.row_id.clone(),
+            });
         }
         Some(out)
     }

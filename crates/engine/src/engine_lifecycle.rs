@@ -225,6 +225,9 @@ impl Engine {
             // at the 4-mod-8 case; tombstone weak-predicate soundness; i64-unique never elides).
             // Kill switch retained; default-ON makes the suite the continuing burn-in.
             shard_int8_section_enabled: std::sync::atomic::AtomicBool::new(true),
+            // M1 (charter-pure device locate): default OFF (the A/B lever vs the host-probe
+            // oracle); flip after the SLO gate (wave-prefetch batching) + audit.
+            device_write_locate_enabled: std::sync::atomic::AtomicBool::new(false),
             tombstone_churn_threshold_override: std::sync::atomic::AtomicU64::new(0),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
