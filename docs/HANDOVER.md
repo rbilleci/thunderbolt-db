@@ -34,7 +34,7 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: FIX THE ELIDED-CHURN SI BUG (the A5 flip is user-authorized + HELD on it; repro pinned in the SV6 hammer; theory + fix candidates in memory `retirement-program-option-a`) <<<
+## >>> THE ONE NEXT ACTION: A5 IS COMPLETE (the flip is LIVE, `fd154409`) — next frontier: TYPE COVERAGE #14 (the true CPU-engine-deletion gate), per the post-A5 plan in memory `retirement-program-option-a` <<<
 
 **THE FORK IS DECIDED (user, 2026-07-02): OPTION A — DEVICE-AUTHORITATIVE.** The measured install split
 (value_index 48% / COW publish 32% / tuple 18% / payload 2%) killed the drop-payloads idea; A deletes the
