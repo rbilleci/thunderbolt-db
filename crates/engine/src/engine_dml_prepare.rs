@@ -83,16 +83,20 @@ impl Engine {
         validation: InsertPrepareValidation,
     ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
-        // Lock-free concurrent-DML path (Stage 2 — blocker #1): bind the target against a pinned
-        // catalog snapshot, cloning it out. FK validation pins its own snapshot internally.
-        let table = self
-            .catalog_snapshot()
+        // Lock-free concurrent-DML path (Stage 2 — blocker #1): PIN ONE catalog generation and
+        // BORROW the target out of it (no clone). This runs per item on the sequencer's under-lock
+        // re-resolve (host-phase probe: ~2.6us/item, the 2nd-largest phase), where cloning the whole
+        // RelationalTable (columns + indexes + constraints) per call was pure waste; the returned
+        // WriteDelta owns only the table NAME + coerced rows, so `table` never needs to outlive this
+        // pin. Reusing the ONE pin for the wave-deferred / index-validate checks below is also more
+        // consistent than re-pinning (all reads see the same generation).
+        let catalog = self.catalog_snapshot();
+        let table = catalog
             .relational_catalog
             .get(&insert.table)
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", insert.table))
-            })?
-            .clone();
+            })?;
         let column_indexes = if insert.columns.is_empty() {
             (0..table.columns.len()).collect::<Vec<_>>()
         } else {
@@ -187,7 +191,7 @@ impl Engine {
         // keeps the off-lock path. The bench + common OLTP shape is single-row.
         let wave_deferred = validation == InsertPrepareValidation::Full
             && insert.rows.len() == 1
-            && self.insert_unique_wave_batchable(&self.catalog_snapshot(), &table);
+            && self.insert_unique_wave_batchable(&catalog, table);
         if ledger_covered || wave_deferred {
             // fall through to encode: PK not-null ran; unique covered by the ledger (#18) or
             // deferred to the wave batch (B).
@@ -195,8 +199,8 @@ impl Engine {
             if has_constraints {
                 let validate_started = Instant::now();
                 self.validate_dml_constraints_via_index(
-                    &self.catalog_snapshot(),
-                    &table,
+                    &catalog,
+                    table,
                     &new_rows,
                     &[],
                     &BTreeSet::new(),
@@ -343,9 +347,8 @@ impl Engine {
             .get(&delete.table)
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", delete.table))
-            })?
-            .clone();
-        let filter_groups = bind_delete_filter_groups(&table, delete)
+            })?;
+        let filter_groups = bind_delete_filter_groups(table, delete)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         let visibility = StorageVisibility {
             read_txn_id: txn_id,
@@ -1178,9 +1181,8 @@ impl Engine {
             .get(&update.table)
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", update.table))
-            })?
-            .clone();
-        let assignments = bind_update_assignments(&table, update)
+            })?;
+        let assignments = bind_update_assignments(table, update)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         let filter_groups = bind_delete_filter_groups(
             &table,
