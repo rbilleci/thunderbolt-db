@@ -2339,6 +2339,9 @@ impl Engine {
                 return false;
             }
         }
+        // VACUUM #5: every stamped tombstone is a DEAD SLOT until a rebuild — feed the churn
+        // signal the auto-trigger reads (serialized path; the counter resets on any re-admit).
+        self.add_tombstone_churn(table_name, deleted_rows.len() as u64);
         true
     }
 
@@ -2919,8 +2922,7 @@ impl Engine {
                 // window (copin_s < hwm) falls through to the gated device path.
                 let version_free = shards.iter().all(|shard| {
                     shard.deleted_by_region.is_none()
-                        && (shard.created_by_region.is_none()
-                            || copin_s >= shard.max_created_by)
+                        && (shard.created_by_region.is_none() || copin_s >= shard.max_created_by)
                 });
                 if version_free && !shards.is_empty() {
                     let total: i64 = shards.iter().map(|s| s.row_count as i64).sum();
@@ -3411,8 +3413,7 @@ impl Engine {
                         .get(name)
                         .is_some_and(|shards| !shards.is_empty())
                 {
-                    let unified = self
-                        .build_sharded_unified_exec_source(table, None, copin_s)?;
+                    let unified = self.build_sharded_unified_exec_source(table, None, copin_s)?;
                     if unified.visibility.is_some() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                             "relation \"{name}\" is a VERSIONED sharded table: the join path does \

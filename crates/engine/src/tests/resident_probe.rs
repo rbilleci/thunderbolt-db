@@ -2011,7 +2011,8 @@ fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
     // own seq. SABOTAGE: skip the created_by stamp in the append (or drop the hwm/created_by gate on
     // any route below) and the phantom reappears -> this test FAILS.
     let mut e = Engine::new_local();
-    e.execute_text(1, "CREATE TABLE d3t (id INT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE d3t (id INT, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO d3t (id, v) VALUES (1, 10), (2, 20), (3, 30)",
@@ -2036,7 +2037,10 @@ fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
     {
         let shards = e.read_state.residency.shards.load();
         let shard = &shards.get("d3t").unwrap()[0];
-        assert_eq!(shard.row_count, 4, "the appended slot IS published on-device");
+        assert_eq!(
+            shard.row_count, 4,
+            "the appended slot IS published on-device"
+        );
         assert_eq!(
             shard.max_created_by,
             s0 + 1,
@@ -2066,7 +2070,11 @@ fn gpu_d3_pinned_reader_is_hidden_an_unpublished_insert_append() {
         unreachable!()
     };
     let scanned = e.execute_relational_select(&scan).unwrap();
-    assert_eq!(scanned.rows.len(), 3, "scan at s0 must hide the appended slot");
+    assert_eq!(
+        scanned.rows.len(),
+        3,
+        "scan at s0 must hide the appended slot"
+    );
 
     // (c) The batched point route, explicitly at BOTH boundaries: hidden at s0, visible at s0+1.
     let table = e.relational_catalog_table("d3t").unwrap();
@@ -2103,7 +2111,8 @@ fn gpu_d4_captured_generation_survives_a_readmit_purge() {
     let mut e = Engine::new_local();
     // The incremental DELETE tombstone path is nested under auto-admit (the commit-path lever).
     e.set_auto_admit_on_commit(true);
-    e.execute_text(1, "CREATE TABLE d4t (id INT, v INT)").unwrap();
+    e.execute_text(1, "CREATE TABLE d4t (id INT, v INT)")
+        .unwrap();
     e.execute_text(
         2,
         "INSERT INTO d4t (id, v) VALUES (1, 10), (2, 20), (3, 30)",

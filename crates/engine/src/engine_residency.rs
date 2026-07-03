@@ -2633,7 +2633,13 @@ mod capacity_payload_tests {
         // needle 999 -> 0 rows; needle 130 -> the old image.
         let batch_hits_before = e.sharded_point_batch_hits();
         let batch = e
-            .gather_sharded_int4_point_lookups_batched(e.committed_seq(), &table, 0, &[0, 1], &[999, 130])
+            .gather_sharded_int4_point_lookups_batched(
+                e.committed_seq(),
+                &table,
+                0,
+                &[0, 1],
+                &[999, 130],
+            )
             .expect("the batched sharded gather must serve (gated host path)");
         assert_eq!(batch.ncols, 2);
         assert_eq!(
@@ -2662,7 +2668,13 @@ mod capacity_payload_tests {
             "post-publish: the old key is gone"
         );
         let batch = e
-            .gather_sharded_int4_point_lookups_batched(e.committed_seq(), &table, 0, &[0, 1], &[999, 130])
+            .gather_sharded_int4_point_lookups_batched(
+                e.committed_seq(),
+                &table,
+                0,
+                &[0, 1],
+                &[999, 130],
+            )
             .expect("batched gather post-publish");
         assert_eq!(
             batch.needle_ranges[0].1, 1,
@@ -3776,6 +3788,167 @@ mod capacity_payload_tests {
         );
     }
 
+    /// VACUUM #5 — the INDEX-RESTORATION differential: same-key update churn leaves the key in
+    /// TWO physical slots (old tombstoned + new), so the per-shard PK index dup-DECLINES and the
+    /// 3b point route stops serving (`shard_index_route_hits` stalls; the scan serves, correct
+    /// but slower — and the monotone decline caches it). `vacuum_table` rebuilds DENSE ALL-LIVE
+    /// (new buffer ptr -> the cached decline clears BY DESIGN) — the route serves again, rows are
+    /// byte-identical, and the churn counter resets. Also pins the tombstone-churn accounting.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn vacuum_restores_pk_index_after_update_churn() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        for i in 0..200_i64 {
+            e.execute_text(
+                (i as u64) + 2,
+                &format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({i}, {})",
+                    i * 10
+                ),
+            )
+            .unwrap();
+        }
+        // Churn: two same-key updates -> id=130 occupies THREE slots (two dead) across shards.
+        e.execute_text(300, "UPDATE accounts SET balance = 111 WHERE id = 130")
+            .unwrap();
+        e.execute_text(301, "UPDATE accounts SET balance = 222 WHERE id = 130")
+            .unwrap();
+        assert!(
+            e.tombstone_churn("accounts") >= 2,
+            "the churn counter must track the tombstone stamps (got {})",
+            e.tombstone_churn("accounts")
+        );
+        let point = |e: &Engine| {
+            e.execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")
+                .unwrap()
+                .rows
+        };
+        // The dup-declined regime: the point route must NOT serve via the PK index.
+        let hits_before = e.shard_index_route_hits();
+        let rows = point(&e);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(222)]);
+        assert_eq!(
+            e.shard_index_route_hits(),
+            hits_before,
+            "precondition: the churned key dup-declines the index route (scan serves)"
+        );
+        let all_rows_sorted = |e: &Engine| {
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, balance FROM accounts")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            rows
+        };
+        let all_before = all_rows_sorted(&e);
+
+        e.vacuum_table("accounts").unwrap();
+
+        // Post-vacuum: the SAME reads, now index-served; data byte-identical; churn reset.
+        let hits_before = e.shard_index_route_hits();
+        let rows = point(&e);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0), &[SqlValue::Int4(130), SqlValue::Int4(222)]);
+        assert!(
+            e.shard_index_route_hits() > hits_before,
+            "vacuum must RESTORE index serving (the rebuilt generation is dup-free)"
+        );
+        let all_after = all_rows_sorted(&e);
+        assert_eq!(all_after, all_before, "vacuum preserves every row");
+        assert_eq!(e.tombstone_churn("accounts"), 0, "the churn signal resets");
+    }
+
+    /// VACUUM #5 — the AUTO-TRIGGER + ELIDED lifecycle: an ELIDED table churns past the (forced)
+    /// threshold; the NEXT handled tombstone commit vacuums inside its own commit (rehydrate ->
+    /// rebuild), data stays correct, and the table RE-ENTERS elision on the following insert.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn vacuum_auto_trigger_rebuilds_elided_table_and_reelides() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.set_host_install_elision_enabled(true);
+        e.set_auto_vacuum_enabled(true);
+        e.set_tombstone_churn_threshold_override(3);
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k * 10))
+                .collect();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )
+            .unwrap();
+            seq += 1;
+        }
+        e.execute_text(seq, "INSERT INTO t (id, v) VALUES (500, 5000)")
+            .unwrap();
+        seq += 1;
+        assert!(
+            e.table_install_elided("t"),
+            "precondition: elided before the churn"
+        );
+        // Three single-key updates = 3 tombstone stamps -> the third commit crosses the forced
+        // threshold and auto-vacuums (rehydrate + rebuild) INSIDE its own commit.
+        for (i, key) in [10_i64, 11, 12].iter().enumerate() {
+            e.execute_text(
+                seq + i as u64,
+                &format!("UPDATE t SET v = -1 WHERE id = {key}"),
+            )
+            .unwrap();
+        }
+        seq += 3;
+        assert_eq!(
+            e.tombstone_churn("t"),
+            0,
+            "the auto-vacuum reset the churn signal"
+        );
+        // Data correct after the mid-commit rebuild (incl the elided-era insert id=500).
+        let rows = e
+            .execute_relational_select_text("SELECT id, v FROM t WHERE id = 500")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.row(0), &[SqlValue::Int4(500), SqlValue::Int4(5000)]);
+        for key in [10, 11, 12] {
+            let rows = e
+                .execute_relational_select_text(&format!("SELECT id, v FROM t WHERE id = {key}"))
+                .unwrap()
+                .rows;
+            assert_eq!(rows.len(), 1, "id {key}");
+            assert_eq!(
+                rows.row(0),
+                &[SqlValue::Int4(key as i32), SqlValue::Int4(-1)]
+            );
+        }
+        // The vacuum de-elided (rehydration is sticky); the next handled insert RE-ENTERS.
+        e.execute_text(seq, "INSERT INTO t (id, v) VALUES (501, 5010)")
+            .unwrap();
+        seq += 1;
+        e.execute_text(seq, "INSERT INTO t (id, v) VALUES (502, 5020)")
+            .unwrap();
+        assert!(
+            e.table_install_elided("t"),
+            "the table must RE-ENTER elision after the vacuum (the normal entry path)"
+        );
+        assert_eq!(
+            e.execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .len(),
+            203,
+            "200 + 3 inserts, updates in place"
+        );
+    }
+
     /// RETIREMENT A4c — the DEVICE GATHER differential: `gather_resident_table_rows_from_device`
     /// (the re-admit / de-elision rebuild source) == the host store's visible rows, (row_id, row)
     /// for (row_id, row), across the full write lineage (admission, SV5 version-split update,
@@ -4828,7 +5001,13 @@ mod capacity_payload_tests {
         let gpu_hb = e.sharded_point_gpu_probe_hits();
         let bin_hb = e.sharded_point_binary_route_hits();
         let proj = e
-            .gather_sharded_int4_point_lookups_batched(e.committed_seq(), &table, id_col, &[id_col, bal_col], &needles)
+            .gather_sharded_int4_point_lookups_batched(
+                e.committed_seq(),
+                &table,
+                id_col,
+                &[id_col, bal_col],
+                &needles,
+            )
             .expect("batched path served this shape");
         assert!(
             e.sharded_point_batch_hits() > hb,
@@ -4903,8 +5082,14 @@ mod capacity_payload_tests {
         let did = crate::rel_exec_helpers::relational_column_index(&dt, "id").unwrap();
         let dbal = crate::rel_exec_helpers::relational_column_index(&dt, "balance").unwrap();
         assert!(
-            d.gather_sharded_int4_point_lookups_batched(d.committed_seq(), &dt, did, &[did, dbal], &[1, 2])
-                .is_none(),
+            d.gather_sharded_int4_point_lookups_batched(
+                d.committed_seq(),
+                &dt,
+                did,
+                &[did, dbal],
+                &[1, 2]
+            )
+            .is_none(),
             "duplicate key -> batched path declines -> None (caller falls back to the scan)"
         );
 
@@ -4935,8 +5120,14 @@ mod capacity_payload_tests {
         let xid = crate::rel_exec_helpers::relational_column_index(&xt, "id").unwrap();
         let xbal = crate::rel_exec_helpers::relational_column_index(&xt, "balance").unwrap();
         assert!(
-            x.gather_sharded_int4_point_lookups_batched(x.committed_seq(), &xt, xid, &[xid, xbal], &[5])
-                .is_none(),
+            x.gather_sharded_int4_point_lookups_batched(
+                x.committed_seq(),
+                &xt,
+                xid,
+                &[xid, xbal],
+                &[5]
+            )
+            .is_none(),
             "cross-shard duplicate key -> batched declines -> None (scan returns BOTH rows)"
         );
         let xrows = x
@@ -5042,7 +5233,13 @@ mod capacity_payload_tests {
         let bin_hb = k.sharded_point_binary_route_hits();
         let gpu_hb = k.sharded_point_gpu_probe_hits();
         let proj = k
-            .gather_sharded_int4_point_lookups_batched(k.committed_seq(), &t, id, &[id, bal], &needles)
+            .gather_sharded_int4_point_lookups_batched(
+                k.committed_seq(),
+                &t,
+                id,
+                &[id, bal],
+                &needles,
+            )
             .expect("batched served (delete-free)");
         assert!(
             k.sharded_point_gpu_probe_hits() > gpu_hb,
@@ -5119,7 +5316,13 @@ mod capacity_payload_tests {
         let needles: Vec<i32> = vec![129, 130, 131];
         let gpu_hb = t.sharded_point_gpu_probe_hits();
         let proj = t
-            .gather_sharded_int4_point_lookups_batched(t.committed_seq(), &table, id_col, &[id_col, bal_col], &needles)
+            .gather_sharded_int4_point_lookups_batched(
+                t.committed_seq(),
+                &table,
+                id_col,
+                &[id_col, bal_col],
+                &needles,
+            )
             .expect("batched served");
         // Sub-slice 8: the shard is VERSIONED (has a deleted_by region), so the un-gated GPU dense-emit path
         // must DECLINE -> the host-probe path (which applies the SV3b gate) serves it. Prove the GPU path did
@@ -5468,10 +5671,11 @@ impl Engine {
                     .relational_residency_device_memory(gpu_id, &payload)
                     .map(Arc::new);
                 if let Some(region) = &region {
-                    read_state
-                        .residency
-                        .shard_row_id_memory
-                        .insert_shard(table, 0, Arc::clone(region));
+                    read_state.residency.shard_row_id_memory.insert_shard(
+                        table,
+                        0,
+                        Arc::clone(region),
+                    );
                 }
                 region
             };
@@ -6366,10 +6570,9 @@ impl Engine {
         };
         // SV1/SV2: the rolled shard carries NO version metadata in its payload — `created_by` is gone and
         // `deleted_by` is on-demand (allocated in `shard_deleted_by_memory` on the shard's first delete).
-        let Some(new_device_memory) =
-            self
-                .relational_residency_device_memory(gpu_id, &device_payload)
-                .map(Arc::new)
+        let Some(new_device_memory) = self
+            .relational_residency_device_memory(gpu_id, &device_payload)
+            .map(Arc::new)
         else {
             return false;
         };
@@ -6402,7 +6605,8 @@ impl Engine {
             for (slot, row_id) in ids.iter().enumerate() {
                 payload[slot * 8..slot * 8 + 8].copy_from_slice(&row_id.to_le_bytes());
             }
-            self.relational_residency_device_memory(gpu_id, &payload).map(Arc::new)
+            self.relational_residency_device_memory(gpu_id, &payload)
+                .map(Arc::new)
         } else {
             None
         };
@@ -6440,18 +6644,16 @@ impl Engine {
         // Write-side bookkeeping mirrors of the SAME Arcs (alloc/stamp/purge choreography unchanged);
         // readers take them from the published descriptor above.
         if let Some(created_region) = rolled_created_by_region {
-            self.read_state.residency.shard_created_by_memory.insert_shard(
-                table,
-                new_shard_id,
-                created_region,
-            );
+            self.read_state
+                .residency
+                .shard_created_by_memory
+                .insert_shard(table, new_shard_id, created_region);
         }
         if let Some(region) = rolled_row_id_region {
-            self.read_state.residency.shard_row_id_memory.insert_shard(
-                table,
-                new_shard_id,
-                region,
-            );
+            self.read_state
+                .residency
+                .shard_row_id_memory
+                .insert_shard(table, new_shard_id, region);
         }
         // Publish the new shard's device memory BEFORE its metadata, so a reader that observes the new shard
         // in the shards list always finds its device memory (the recompaction loads the list then the memory).
@@ -6703,6 +6905,10 @@ impl Engine {
     /// dropped-table simply leaves the table non-resident (reads fall back to the host path). N=1
     /// unified buffer per table (single-GPU); shard/spill is S-C/S-E.
     pub(crate) fn auto_admit_resident_tables(&self, tables: &std::collections::BTreeSet<String>) {
+        // VACUUM #5: any rebuild resets the churn signal (the new generation is dense all-live).
+        for table in tables {
+            self.reset_tombstone_churn(table);
+        }
         if tables.is_empty() {
             return;
         }
@@ -7251,6 +7457,143 @@ impl Engine {
     /// the lock — detected via the same thread-local that suppresses their leader check — so they
     /// rehydrate directly (a second acquisition would self-deadlock). The elided-ness RE-CHECK
     /// under the lock closes the race with a rehydrator that won the lock first.
+    /// VACUUM #5 (A5 gate): REBUILD a churned table's residency DENSE + ALL-LIVE — reclaims
+    /// tombstoned slots and stale duplicate physical keys (an SV5/A4b update-append leaves the
+    /// old version's slot holding the key, which dup-declines the per-shard PK index until a
+    /// rebuild changes the buffer ptr — the monotone decline clears BY DESIGN on a new
+    /// generation). Composition of audited pieces: an ELIDED table first REHYDRATES (the A4c
+    /// device gather is the truth; the host store is a stale prefix), then the standard
+    /// invalidate + re-admit rebuilds dense from the now-complete store; a non-elided table's
+    /// store is already complete, so it skips straight to the rebuild. The table RE-ENTERS
+    /// elision on its next handled commit (the normal entry path) — vacuum does not special-case
+    /// it. Runs under the COMMIT LOCK (the same discipline as `rehydrate_elided_serialized`; the
+    /// mid-commit-read detection makes an auto-trigger from inside a commit safe). The churn
+    /// counter resets so the auto-trigger re-arms.
+    ///
+    /// V2 (ledgered): KEY-CLUSTERED rebuild (feed the builder rows sorted by PK so zone maps
+    /// tighten under update scatter) — needs the slot-order-decoupled builder.
+    pub fn vacuum_table(&self, table_name: &str) -> Result<(), EngineError> {
+        if self.mvcc_read_skips_leader_check() {
+            return self.vacuum_table_locked(table_name);
+        }
+        let _commit_guard = self.commit_state();
+        self.vacuum_table_locked(table_name)
+    }
+
+    /// The vacuum core for callers ALREADY under the commit lock (the auto-trigger fires inside
+    /// the serialized commit arm; a second acquisition would self-deadlock).
+    pub(crate) fn vacuum_table_locked(&self, table_name: &str) -> Result<(), EngineError> {
+        let run = |engine: &Self| -> Result<(), EngineError> {
+            let Some(table) = engine.relational_catalog_table(table_name) else {
+                return Ok(()); // no such table: vacuum is a no-op, not an error
+            };
+            if engine.table_install_elided(table_name) {
+                let seq = engine.committed_seq();
+                engine.rehydrate_elided_table(
+                    &table,
+                    seq,
+                    &Default::default(),
+                    &Default::default(),
+                    seq,
+                )?;
+            }
+            let seq = engine.committed_seq();
+            let tables: std::collections::BTreeSet<String> =
+                std::iter::once(table_name.to_string()).collect();
+            engine.invalidate_relational_residency_tables_concurrent(&tables, seq, seq);
+            if engine.auto_admit_on_commit_enabled() {
+                engine.auto_admit_resident_tables(&tables);
+            }
+            engine.reset_tombstone_churn(table_name);
+            Ok(())
+        };
+        run(self)
+    }
+
+    /// VACUUM #5: enable/disable the churn-triggered AUTO vacuum (default OFF — the A/B lever;
+    /// `vacuum_table` stays callable either way).
+    pub fn set_auto_vacuum_enabled(&self, on: bool) {
+        self.auto_vacuum_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// VACUUM #5 (audit F1): deferred auto-vacuums that failed (telemetry; the trigger re-arms).
+    pub fn auto_vacuum_failures(&self) -> u64 {
+        self.read_state
+            .residency
+            .auto_vacuum_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn auto_vacuum_enabled(&self) -> bool {
+        self.auto_vacuum_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// VACUUM #5: bump the per-table churn counter by `stamps` tombstones (serialized path only)
+    /// and return the new value.
+    pub(crate) fn add_tombstone_churn(&self, table: &str, stamps: u64) -> u64 {
+        let cur = self.read_state.residency.resident_tombstone_churn.load();
+        let mut next = (**cur).clone();
+        let counter = next.entry(table.to_string()).or_insert(0);
+        *counter += stamps;
+        let value = *counter;
+        self.read_state
+            .residency
+            .resident_tombstone_churn
+            .store(std::sync::Arc::new(next));
+        value
+    }
+
+    pub(crate) fn reset_tombstone_churn(&self, table: &str) {
+        let cur = self.read_state.residency.resident_tombstone_churn.load();
+        if !cur.contains_key(table) {
+            return;
+        }
+        let mut next = (**cur).clone();
+        next.remove(table);
+        self.read_state
+            .residency
+            .resident_tombstone_churn
+            .store(std::sync::Arc::new(next));
+    }
+
+    /// VACUUM #5: the churn threshold — max(1024, table's resident rows / 8). Above it the
+    /// auto-trigger rebuilds (dead slots ≥ ~12% bloat scans and keep the PK index dup-declined).
+    pub(crate) fn tombstone_churn(&self, table: &str) -> u64 {
+        self.read_state
+            .residency
+            .resident_tombstone_churn
+            .load()
+            .get(table)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Test lever: force the auto-vacuum threshold (0 = the size-derived default).
+    pub fn set_tombstone_churn_threshold_override(&self, threshold: u64) {
+        self.tombstone_churn_threshold_override
+            .store(threshold, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn tombstone_churn_threshold(&self, table: &str) -> u64 {
+        let forced = self
+            .tombstone_churn_threshold_override
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if forced != 0 {
+            return forced;
+        }
+        let rows: usize = self
+            .read_state
+            .residency
+            .shards
+            .load()
+            .get(table)
+            .map(|shards| shards.iter().map(|shard| shard.row_count).sum())
+            .unwrap_or(0);
+        (rows as u64 / 8).max(1024)
+    }
+
     pub(crate) fn rehydrate_elided_serialized(&self, table_name: &str) -> Result<(), EngineError> {
         let rehydrate = |engine: &Self| -> Result<(), EngineError> {
             if !engine.table_install_elided(table_name) {

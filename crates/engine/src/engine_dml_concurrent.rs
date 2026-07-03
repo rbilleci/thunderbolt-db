@@ -524,12 +524,22 @@ impl Engine {
         // seqs; the stamps + the hwm publish with the row_count bump at flush.
         let mut pending_appends: BTreeMap<
             String,
-            (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>, Vec<Index>),
+            (
+                Vec<Vec<SqlValue>>,
+                Vec<u64>,
+                Vec<(usize, Index)>,
+                Vec<Index>,
+            ),
         > = BTreeMap::new();
         let flush_appends =
             |pending: &mut BTreeMap<
                 String,
-                (Vec<Vec<SqlValue>>, Vec<u64>, Vec<(usize, Index)>, Vec<Index>),
+                (
+                    Vec<Vec<SqlValue>>,
+                    Vec<u64>,
+                    Vec<(usize, Index)>,
+                    Vec<Index>,
+                ),
             >,
              committed: &mut Vec<(usize, Index, bool)>| {
                 if pending.is_empty() {
@@ -751,7 +761,9 @@ impl Engine {
                 Some((table, rows, row_ids)) if self.auto_admit_on_commit_enabled() => {
                     let entry = pending_appends.entry(table).or_default();
                     // D3: one birth stamp per row of THIS item (the flush spans commit seqs).
-                    entry.3.extend(std::iter::repeat(commit_seq).take(rows.len()));
+                    entry
+                        .3
+                        .extend(std::iter::repeat(commit_seq).take(rows.len()));
                     entry.0.extend(rows);
                     entry.1.extend(row_ids);
                     entry.2.push((position, commit_seq));
@@ -928,6 +940,37 @@ impl Engine {
     }
 
     pub fn execute_text_at_timestamp_micros(
+        &self,
+        txn_id: u64,
+        text: &str,
+        timestamp_micros: u64,
+    ) -> Result<(), ExecuteError> {
+        let result = self.execute_text_at_timestamp_micros_inner(txn_id, text, timestamp_micros);
+        // VACUUM #5: run a commit-parked auto-vacuum now — the commit lock + catalog latch are
+        // released, so `vacuum_table` can take them fresh (the in-commit trigger would deadlock).
+        let parked = self
+            .read_state
+            .residency
+            .pending_auto_vacuum
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(table) = parked {
+            // Audit F1: the statement is already durable + published — a MAINTENANCE failure
+            // must not turn its result into an error (a client retry would double-apply). The
+            // scan still serves dead slots correctly; the churn counter was NOT reset, so the
+            // trigger re-arms on the table's next tombstone. Count it and move on.
+            if self.vacuum_table(&table).is_err() {
+                self.read_state
+                    .residency
+                    .auto_vacuum_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    fn execute_text_at_timestamp_micros_inner(
         &self,
         txn_id: u64,
         text: &str,

@@ -401,6 +401,33 @@ impl Engine {
                     }
                 }
             }
+            // VACUUM #5 auto-trigger: a handled incremental commit that pushed the table's
+            // tombstone churn past the threshold rebuilds it NOW, inside the held commit lock
+            // (dead slots bloat every scan and keep the PK index dup-declined; the rebuild is
+            // the same invalidate+re-admit a declined commit would do — pre-publish, so its
+            // all-live born-visible semantics match the existing re-admit class).
+            if handled && self.auto_vacuum_enabled() {
+                if let Some(applied_ref) = applied.as_ref() {
+                    let table_name = match applied_ref {
+                        AppliedRowMutation::Insert { table, .. }
+                        | AppliedRowMutation::Delete { table, .. }
+                        | AppliedRowMutation::Update { table, .. } => table.as_str(),
+                    };
+                    let churn = self.tombstone_churn(table_name);
+                    if churn >= self.tombstone_churn_threshold(table_name) {
+                        // DEFER (deadlock discipline): this arm holds the commit lock AND the
+                        // catalog latch; the vacuum's re-admit needs the latch. Park the table —
+                        // the execute_text tail vacuums right after both release.
+                        *self
+                            .read_state
+                            .residency
+                            .pending_auto_vacuum
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(table_name.to_string());
+                    }
+                }
+            }
             if !handled {
                 self.invalidate_relational_residency_for_commit(&to_apply, txn_id, publish_index);
             }

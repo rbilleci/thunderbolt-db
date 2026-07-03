@@ -604,6 +604,20 @@ pub(crate) struct ResidencyReadState {
     pub(crate) elided_tables: ArcSwap<std::collections::BTreeSet<String>>,
     /// RETIREMENT A4e: commits that skipped the host install (the non-vacuity signal).
     pub(crate) host_install_elisions: std::sync::atomic::AtomicU64,
+    /// VACUUM #5: per-table count of incremental tombstone stamps since the last rebuild —
+    /// the CHURN signal (each SV4b/SV5/A4b tombstone adds a dead slot; enough of them degrade
+    /// the PK index to dup-declines and bloat scans). Reset by vacuum/re-admit. Serialized-path
+    /// writers only; COW map, readers load() wait-free.
+    pub(crate) resident_tombstone_churn: ArcSwap<std::collections::BTreeMap<String, u64>>,
+    /// VACUUM #5: the auto-trigger's DEFERRED handoff — the commit arm detects the threshold
+    /// while holding the commit lock + catalog latch (running the vacuum there self-deadlocks:
+    /// its re-admit needs the latch), so it parks the table name here and the execute_text tail
+    /// runs `vacuum_table` after the commit releases both.
+    pub(crate) pending_auto_vacuum: std::sync::Mutex<Option<String>>,
+    /// VACUUM #5 (audit F1): deferred auto-vacuums that FAILED — maintenance errors must never
+    /// fail the (already durable) statement that drained them; they land here as telemetry and
+    /// the churn counter re-arms the trigger.
+    pub(crate) auto_vacuum_failures: std::sync::atomic::AtomicU64,
     // The per-table resident snapshot metadata + shard metadata, each an immutable published map
     // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
     // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
