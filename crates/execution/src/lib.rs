@@ -11678,8 +11678,13 @@ impl CudaResidentDeviceMemory {
                 std::ptr::null_mut(),
             )
         })?;
-        check_cuda(unsafe { (primary.cu_stream_synchronize)(std::ptr::null_mut()) })?;
-
+        // FUSE (driver-call trim): the explicit stream-synchronize is REDUNDANT — the decline DtoH
+        // below is a BLOCKING `cuMemcpyDtoH` on the null stream, which already waits for the kernel
+        // before copying. Dropping the sync removes one driver call per wave, zero semantic change.
+        // FENCE INVARIANT (do not break): this fences the kernel's `atom.cas` index mutation (so the
+        // pooled guards below are not recycled mid-flight) ONLY because the launch is on the NULL
+        // stream and this 4-byte blocking DtoH runs on that same stream before return (keys.is_empty
+        // early-returns above, so it is always a real transfer). Keep both true, or re-add the sync.
         let mut decline = [0u32; 1];
         check_cuda(unsafe {
             cu_memcpy_dtoh(
@@ -11823,8 +11828,7 @@ impl CudaResidentDeviceMemory {
         let function =
             primary.cached_function(c"gpu_db_resident_multi_shard_i32_write_locate", &ptx)?;
 
-        // HtoD needles + descriptor; memset the count buffer to 0 (a thread that early-returns —
-        // never happens here since every thread writes its count — leaves 0, a clean "no hits").
+        // HtoD needles + descriptor (the count buffer's zero-init was dropped — see below).
         check_cuda(unsafe {
             cu_memcpy_htod(
                 needles_guard.ptr,
@@ -11835,7 +11839,11 @@ impl CudaResidentDeviceMemory {
         check_cuda(unsafe {
             cu_memcpy_htod(desc_guard.ptr, desc.as_ptr().cast::<c_void>(), desc_bytes)
         })?;
-        check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, count_bytes) })?;
+        // FUSE (driver-call trim): the count-buffer zero-init is DEAD — every needle-thread
+        // (tid < needle_count) stores its own final count at WRITECOUNT/overflow, so no slot is
+        // ever read stale. (Threads tid >= needle_count early-return but own no count slot.)
+        // Dropping the memset removes one driver call per wave; `_` binds the unused fn ptr.
+        let _ = cu_memset_d8;
 
         let mut desc_arg = desc_guard.ptr;
         let mut shard_count_arg = shard_count_u32;
@@ -11872,8 +11880,15 @@ impl CudaResidentDeviceMemory {
                 std::ptr::null_mut(),
             )
         })?;
-        check_cuda(unsafe { (primary.cu_stream_synchronize)(std::ptr::null_mut()) })?;
-
+        // FUSE (driver-call trim): the explicit stream-synchronize is REDUNDANT — the count DtoH
+        // below (and, on the full path, the shard/slot DtoH) is a BLOCKING `cuMemcpyDtoH` on the
+        // null stream, which already waits for this kernel before copying. Dropping the sync
+        // removes one driver call per wave with zero semantic change (the readback still blocks).
+        // FENCE INVARIANT (do not break): this only fences the kernel — so the pooled guards below
+        // are not recycled mid-flight — because (a) the kernel launches on the NULL stream and (b) a
+        // NON-ZERO-length blocking DtoH runs on that same null stream on EVERY path before return.
+        // If you move the launch to a pooled/non-blocking stream or make the readback conditional,
+        // restore an explicit synchronize.
         let mut shard_idx = vec![0u32; window as usize];
         let mut slot = vec![0u32; window as usize];
         let mut count = vec![0u32; needles.len()];
