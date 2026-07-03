@@ -421,10 +421,10 @@ pub struct Engine {
     /// them). DEFAULT ON (the 2026-07-03 flip). Kill switch -> unique tables never enter
     /// elision (already-elided tables rehydrate through the ladder seams as usual).
     constrained_elision_enabled: std::sync::atomic::AtomicBool,
-    /// TYPE-COVERAGE track 2 slice 2: sharded admission may include i64-SECTION columns
-    /// (Int8/Timestamp) alongside the i32 sections — the first non-i32 shard section. Default
-    /// OFF until the read/append/elision stages land + the SLO gate + audit. Kill switch ->
-    /// int8-bearing tables stay single-buffer (the pre-slice layout).
+    /// TYPE-COVERAGE track 2 slice 2: sharded admission includes i64-SECTION columns
+    /// (Int8/Timestamp) alongside the i32 sections — the first non-i32 shard section.
+    /// DEFAULT ON (the 2026-07-03 flip). Kill switch -> int8-bearing tables admit
+    /// single-buffer (the pre-slice layout).
     shard_int8_section_enabled: std::sync::atomic::AtomicBool,
     auto_vacuum_enabled: std::sync::atomic::AtomicBool,
     tombstone_churn_threshold_override: std::sync::atomic::AtomicU64,

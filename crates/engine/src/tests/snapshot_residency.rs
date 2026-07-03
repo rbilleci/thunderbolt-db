@@ -259,6 +259,9 @@ fn residency_snapshot_retains_int8_columns_at_the_layout_offset() {
     // section. Verify the bookkeeping (the column list + the offset resolver); the on-device read is
     // exercised by the int8 VM slice. CPU-side bookkeeping, so this runs without a GPU.
     let mut e = Engine::new_local();
+    // i64-SECTION FLIP pin: this test verifies the SINGLE-BUFFER int8 layout bookkeeping —
+    // the kill-switch configuration since the 2026-07-03 flip (default = sharded admission).
+    e.set_shard_int8_section_enabled(false);
     e.execute_text(1, "CREATE TABLE t (a INT, big BIGINT, b INT, big2 BIGINT)")
         .unwrap();
     e.execute_text(

@@ -8312,6 +8312,9 @@ fn gpu_grouped_by_int8_key_i64min_heavy_contention_and_misaligned() {
     let mut e = Engine::new_local();
     e.execute_text(1, "CREATE TABLE t (b INT, g BIGINT)")
         .unwrap();
+    // i64-SECTION FLIP pin: this guard exercises the SINGLE-BUFFER misaligned int8 key
+    // (the kill-switch configuration since the 2026-07-03 flip).
+    e.set_shard_int8_section_enabled(false);
     // N i64::MIN-key rows + 1 normal-key row => N+1 (odd) rows => one int4 col (b) * odd rows is odd
     // => the int8 `g` section lands at 4-mod-8.
     let sentinel = vec!["(7,-9223372036854775808)"; N].join(",");

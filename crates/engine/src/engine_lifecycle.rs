@@ -219,9 +219,12 @@ impl Engine {
             // suite the continuing burn-in (the A5-flip lesson). Kill switch retained.
             constrained_elision_enabled: std::sync::atomic::AtomicBool::new(true),
             auto_vacuum_enabled: std::sync::atomic::AtomicBool::new(true),
-            // TYPE-COVERAGE track 2 slice 2 (i64 sections): default OFF — the staged A/B lever
-            // (baseline: the int8-payload shape measured 825 TPS @16w, GPU_DB_BENCH_INT8=1).
-            shard_int8_section_enabled: std::sync::atomic::AtomicBool::new(false),
+            // THE i64-SECTION FLIP (user-authorized 2026-07-03): Int8/Timestamp columns ride
+            // sharded admission BY DEFAULT — the int8-payload core-banking shape runs 83-91k
+            // elided vs 825 single-buffer. Stack-audited (PUSH: byte-level offset verification
+            // at the 4-mod-8 case; tombstone weak-predicate soundness; i64-unique never elides).
+            // Kill switch retained; default-ON makes the suite the continuing burn-in.
+            shard_int8_section_enabled: std::sync::atomic::AtomicBool::new(true),
             tombstone_churn_threshold_override: std::sync::atomic::AtomicU64::new(0),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
             shard_size_target: std::sync::atomic::AtomicUsize::new(4_000_000),
