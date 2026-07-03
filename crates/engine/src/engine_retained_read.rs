@@ -837,6 +837,279 @@ impl Engine {
         Some(out)
     }
 
+    /// TYPE-COVERAGE track 1 (ledger #3, WRITER-side maintenance): extend every cached
+    /// `(table, shard, col)` PK-index entry over the rows an in-place append just wrote. The
+    /// appended values are known HOST-SIDE at the append chokepoint, so maintenance is O(k)
+    /// hash+bloom inserts with NO device read — probers stop paying the per-flush tail DtoH
+    /// (the prober-side `try_extend_cached_shard_pk_index` remains the fallback for entries
+    /// whose basis this call skips). Per entry: a different ptr (re-admit raced) or a basis
+    /// other than `base_row_count` (a prober's DtoH extension raced ahead) is skipped — the
+    /// prober ladder converges it; a DECLINED entry is left untouched (advancing its count
+    /// would shrink the monotone-decline window for probers pinned between the dup point and
+    /// this append); a duplicate appended key transitions the entry to DECLINED (the same
+    /// conclusion a full rebuild reaches — e.g. an SV5 update-append duplicating its key
+    /// against the old slot); past the builder's load rule the entry is DROPPED so the next
+    /// probe rebuilds + resizes off the hot flush path.
+    pub(crate) fn extend_shard_pk_index_cache_on_append(
+        &self,
+        table_name: &str,
+        shard_id: u32,
+        device_ptr: u64,
+        base_row_count: usize,
+        column_values: &[Vec<i32>],
+    ) {
+        let appended = column_values.first().map_or(0, Vec::len);
+        if appended == 0 {
+            return;
+        }
+        let mut cache = self
+            .read_state
+            .residency
+            .shard_pk_index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (col_idx, tail) in column_values.iter().enumerate() {
+            let key = (table_name.to_string(), shard_id, col_idx);
+            let mut drop_entry = false;
+            {
+                let Some(entry) = cache.get_mut(&key) else {
+                    continue; // never probed: built on demand later
+                };
+                if entry.resident_device_ptr != device_ptr
+                    || entry.row_count != base_row_count
+                    || entry.index.is_none()
+                {
+                    continue;
+                }
+                let new_count = base_row_count + appended;
+                let data = entry.index.as_mut().expect("checked above");
+                if (new_count as u64).saturating_mul(2) > data.hash_table.len() as u64 {
+                    drop_entry = true; // resize belongs to the prober's rebuild, not the flush
+                } else if extend_int4_pk_hash_table_host(
+                    &mut data.hash_table,
+                    data.table_mask,
+                    data.hash_shift,
+                    tail,
+                    base_row_count,
+                ) {
+                    extend_int4_pk_bloom_host(
+                        &mut data.bloom_words,
+                        data.bloom_num_bits,
+                        data.bloom_num_hashes,
+                        tail,
+                    );
+                    entry.row_count = new_count;
+                    self.read_state
+                        .residency
+                        .pk_index_writer_extends
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    entry.index = None; // dup appended key: monotone decline at this basis
+                    entry.row_count = new_count;
+                }
+            }
+            if drop_entry {
+                cache.remove(&key);
+            }
+        }
+    }
+
+    /// The batch twin of `probe_shard_pk_index_fast_path`: probe EVERY needle under ONE lock
+    /// against a covering entry. `Some(true)` = all needles answered (`on_hit` called per Hit
+    /// within the caller's slot bound); `Some(false)` = the shard DECLINES (monotone dup state);
+    /// `None` = extend/rebuild. A `Some(index)` entry never yields `Declined` mid-batch
+    /// (`Declined` only comes from `index: None`), so `on_hit` sees no partial batch.
+    fn probe_shard_pk_index_batch_fast_path<F: FnMut(u32, u32)>(
+        &self,
+        cache_key: &(String, u32, usize),
+        device_ptr: u64,
+        row_count: usize,
+        needles: &[i32],
+        on_hit: &mut F,
+    ) -> Option<bool> {
+        let cache = self
+            .read_state
+            .residency
+            .shard_pk_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache.get(cache_key)?;
+        if entry.resident_device_ptr != device_ptr {
+            return None;
+        }
+        if entry.index.is_none() {
+            if row_count >= entry.row_count {
+                return Some(false);
+            }
+            return None; // declined at MORE rows: the shorter prefix may be dup-free -> rebuild
+        }
+        if entry.row_count < row_count {
+            return None; // stale: appended since the build -> extend (or rebuild)
+        }
+        for (ni, &key) in needles.iter().enumerate() {
+            match probe_cached_shard_pk(entry, key) {
+                ShardPkProbe::Hit(slot) if (slot as usize) < row_count => on_hit(ni as u32, slot),
+                ShardPkProbe::Hit(_) => {} // appended after this caller's pinned snapshot -> miss
+                ShardPkProbe::Miss => {}
+                ShardPkProbe::Declined => return Some(false),
+            }
+        }
+        Some(true)
+    }
+
+    /// The cached-entry fast path shared by the single and batch probes: answer from the cache
+    /// when the entry's ptr matches and its row_count COVERS the caller's pinned `row_count`.
+    /// `Some(probe)` = answered; `None` = the caller must extend or rebuild.
+    ///
+    /// AHEAD entries (`entry.row_count > row_count`: a prober pinned to a NEWER shard descriptor
+    /// extended first) are probeable with a SLOT-BOUND filter — the hash holds at most one row
+    /// per key (dups decline the whole entry), so a Hit at `slot >= row_count` proves the key's
+    /// only occurrence is newer than this caller's snapshot -> Miss. This also removes the
+    /// two-direction rebuild thrash the old EXACT row_count rule caused between probers pinned
+    /// at different generations. An ahead DECLINED entry is NOT declinable here: dup-ness at
+    /// MORE rows says nothing about the shorter prefix -> fall to rebuild at the caller's count.
+    fn probe_shard_pk_index_fast_path(
+        &self,
+        cache_key: &(String, u32, usize),
+        device_ptr: u64,
+        row_count: usize,
+        key: i32,
+    ) -> Option<ShardPkProbe> {
+        let cache = self
+            .read_state
+            .residency
+            .shard_pk_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache.get(cache_key)?;
+        if entry.resident_device_ptr != device_ptr {
+            return None; // re-admit/rollover: a different buffer -> rebuild against live bytes
+        }
+        // RETIREMENT A2 (measured cliff): a DECLINED entry (`index: None` — duplicate keys, e.g.
+        // an SV5 update-append duplicating its key across old+new slots) stays declined under
+        // FURTHER APPENDS on the same buffer: dup-ness is MONOTONE under appends (MEASURED:
+        // single-row UPDATE p50 went linear, 358->887us at 64k->262k, rebuild-to-decline each
+        // statement). Only a ptr change (re-admit / VACUUM re-clustering) can clear a dup.
+        if entry.index.is_none() {
+            if row_count >= entry.row_count {
+                return Some(ShardPkProbe::Declined);
+            }
+            return None; // declined at MORE rows: the shorter prefix may be dup-free -> rebuild
+        }
+        if entry.row_count < row_count {
+            return None; // stale: appended since the build -> extend (or rebuild)
+        }
+        match probe_cached_shard_pk(entry, key) {
+            ShardPkProbe::Hit(slot) if (slot as usize) >= row_count => Some(ShardPkProbe::Miss),
+            other => Some(other),
+        }
+    }
+
+    /// TYPE-COVERAGE track 1 (ledger #3): bring a cached shard PK index CURRENT after in-place
+    /// appends by inserting ONLY the appended tail keys — O(delta) instead of the O(shard)
+    /// rebuild that made every constrained-INSERT probe pay ~1ms under per-commit append churn.
+    /// Returns `true` when the cache entry is now current for `(device_ptr, row_count)` (either
+    /// extended live, transitioned to the monotone DECLINED state on a dup/overflow tail key, or
+    /// another prober already brought it current); `false` when no extension applies (absent
+    /// entry, ptr changed, load rule exceeded — the builder's `2*count <= table_size`) and the
+    /// caller must full-rebuild (which re-sizes both hash and bloom).
+    ///
+    /// Locking: the tail DtoH read happens OUTSIDE the lock (it can stall ~10s of µs); the
+    /// mutation re-validates `(ptr, base_count)` under the lock and retries once if a concurrent
+    /// extender advanced the entry meanwhile (their tail may already cover ours).
+    fn try_extend_cached_shard_pk_index(
+        &self,
+        cache_key: &(String, u32, usize),
+        device_memory: &Arc<CudaResidentDeviceMemory>,
+        filter_offset: u64,
+        row_count: usize,
+    ) -> bool {
+        let device_ptr = device_memory.device_ptr();
+        for _attempt in 0..2 {
+            // Snapshot the extension basis under the lock.
+            let (base_count, table_size) = {
+                let cache = self
+                    .read_state
+                    .residency
+                    .shard_pk_index
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(entry) = cache.get(cache_key) else {
+                    return false;
+                };
+                if entry.resident_device_ptr != device_ptr {
+                    return false; // re-admit/rollover: a different buffer -> full rebuild
+                }
+                if entry.row_count >= row_count {
+                    return true; // already current (or ahead: a fresher probe won)
+                }
+                let Some(data) = entry.index.as_ref() else {
+                    return true; // DECLINED is monotone under appends: current by definition
+                };
+                (entry.row_count, data.hash_table.len() as u64)
+            };
+            // The builder sizes `table_size = next_pow2(2*count)`; extending past its own load
+            // rule risks probe-cap overflows a fresh build would not have -> rebuild/resize.
+            if (row_count as u64).saturating_mul(2) > table_size {
+                return false;
+            }
+            let tail_len = row_count - base_count;
+            let Ok(tail_keys) = device_memory.read_resident_i32_column(
+                filter_offset + (base_count as u64) * 4,
+                tail_len,
+            ) else {
+                return false; // read failure -> the rebuild path's conservative decline
+            };
+            if tail_keys.len() != tail_len {
+                return false;
+            }
+            let mut cache = self
+                .read_state
+                .residency
+                .shard_pk_index
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = cache.get_mut(cache_key) else {
+                return false;
+            };
+            if entry.resident_device_ptr != device_ptr {
+                return false;
+            }
+            if entry.row_count != base_count {
+                continue; // a concurrent extender moved the base: re-snapshot and retry once
+            }
+            let Some(data) = entry.index.as_mut() else {
+                return true;
+            };
+            if extend_int4_pk_hash_table_host(
+                &mut data.hash_table,
+                data.table_mask,
+                data.hash_shift,
+                &tail_keys,
+                base_count,
+            ) {
+                extend_int4_pk_bloom_host(
+                    &mut data.bloom_words,
+                    data.bloom_num_bits,
+                    data.bloom_num_hashes,
+                    &tail_keys,
+                );
+                self.read_state
+                    .residency
+                    .pk_index_prober_extends
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                // A dup/overflow tail key: the shard is now dup-bearing — the same conclusion a
+                // full rebuild reaches, recorded WITHOUT the O(shard) re-discovery (A2's monotone
+                // decline discipline; only a ptr change can clear it).
+                entry.index = None;
+            }
+            entry.row_count = row_count;
+            return true;
+        }
+        false // two basis moves in a row: give up, the rebuild path is always correct
+    }
+
     /// Sub-slice 3: probe the CACHED per-shard host PK index (hash + bloom) for `key`. Builds + caches the
     /// index ONCE per shard generation -- keyed `(table, shard_id, col_idx)`, VALIDATED by
     /// `resident_device_ptr` so a re-admit / rollover (new device buffer -> new ptr) misses and rebuilds
@@ -857,35 +1130,27 @@ impl Engine {
         let device_ptr = device_memory.device_ptr();
         let cache_key = (table_name.to_string(), shard_id, col_idx);
         // Fast path: a cached entry whose ptr still matches the live buffer -> probe under the lock.
+        if let Some(result) = self.probe_shard_pk_index_fast_path(&cache_key, device_ptr, row_count, key)
         {
-            let cache = self
-                .read_state
-                .residency
-                .shard_pk_index
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(entry) = cache.get(&cache_key) {
-                // Validate (ptr, row_count): a re-admit/rollover changes the ptr; an in-place open-shard
-                // APPEND grows row_count with the SAME ptr -> either mismatch rebuilds against the live shard.
-                if entry.resident_device_ptr == device_ptr && entry.row_count == row_count {
-                    return probe_cached_shard_pk(entry, key);
-                }
-                // RETIREMENT A2 (measured cliff): a DECLINED entry (`index: None` — the shard holds
-                // duplicate keys, e.g. an SV5 update-append duplicating its key across the old+new
-                // slots) stays declined under FURTHER APPENDS on the same buffer: dup-ness is
-                // MONOTONE under appends, so rebuilding O(shard) per statement only re-discovers the
-                // same dup (MEASURED: single-row UPDATE p50 went linear, 358->887us at 64k->262k,
-                // rebuild-to-decline each statement). Only a ptr change (re-admit / compaction /
-                // VACUUM re-clustering) can clear a dup -> revalidate then.
-                if entry.resident_device_ptr == device_ptr
-                    && entry.index.is_none()
-                    && row_count >= entry.row_count
-                {
-                    return ShardPkProbe::Declined;
-                }
+            return result;
+        }
+        // TYPE-COVERAGE track 1 (ledger #3): same ptr + larger live row_count = an in-place
+        // append — EXTEND the cached index with the tail keys (O(delta)) instead of rebuilding
+        // O(shard) per probe (the measured constrained-INSERT cliff: ~1ms prepare under
+        // per-commit append churn). On success the entry is current -> the fast path answers.
+        if self.try_extend_cached_shard_pk_index(&cache_key, device_memory, filter_offset, row_count)
+        {
+            if let Some(result) =
+                self.probe_shard_pk_index_fast_path(&cache_key, device_ptr, row_count, key)
+            {
+                return result;
             }
         }
         // Miss / stale ptr: build OUTSIDE the lock (DtoH the key column + host hash + bloom), then publish.
+        self.read_state
+            .residency
+            .pk_index_rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Ok(keys) = device_memory.read_resident_i32_column(filter_offset, row_count) else {
             return ShardPkProbe::Declined; // a read failure forces the conservative scan (not cached)
         };
@@ -920,7 +1185,7 @@ impl Engine {
         self.read_state
             .residency
             .shard_pk_index
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(cache_key, entry);
         result
@@ -947,28 +1212,36 @@ impl Engine {
     ) -> bool {
         let device_ptr = device_memory.device_ptr();
         let cache_key = (table_name.to_string(), shard_id, col_idx);
-        // Fast path: a valid cached entry -> probe ALL needles under ONE lock.
+        // Fast path: a COVERING cached entry -> probe ALL needles under ONE lock (ahead entries
+        // slot-bound filtered, declined entries monotone — the single-probe fast-path rules).
+        if let Some(answer) = self.probe_shard_pk_index_batch_fast_path(
+            &cache_key,
+            device_ptr,
+            row_count,
+            needles,
+            &mut on_hit,
+        ) {
+            return answer;
+        }
+        // TYPE-COVERAGE track 1 (ledger #3): extend the cached index over an in-place append
+        // (O(delta)) before falling back to the O(shard) rebuild.
+        if self.try_extend_cached_shard_pk_index(&cache_key, device_memory, filter_offset, row_count)
         {
-            let cache = self
-                .read_state
-                .residency
-                .shard_pk_index
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(entry) = cache.get(&cache_key) {
-                if entry.resident_device_ptr == device_ptr && entry.row_count == row_count {
-                    for (ni, &key) in needles.iter().enumerate() {
-                        match probe_cached_shard_pk(entry, key) {
-                            ShardPkProbe::Hit(slot) => on_hit(ni as u32, slot),
-                            ShardPkProbe::Miss => {}
-                            ShardPkProbe::Declined => return false,
-                        }
-                    }
-                    return true;
-                }
+            if let Some(answer) = self.probe_shard_pk_index_batch_fast_path(
+                &cache_key,
+                device_ptr,
+                row_count,
+                needles,
+                &mut on_hit,
+            ) {
+                return answer;
             }
         }
         // Miss / stale ptr: build OUTSIDE the lock, probe against the built entry, then publish it.
+        self.read_state
+            .residency
+            .pk_index_rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Ok(keys) = device_memory.read_resident_i32_column(filter_offset, row_count) else {
             return false;
         };
@@ -1010,7 +1283,7 @@ impl Engine {
         self.read_state
             .residency
             .shard_pk_index
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(cache_key, entry);
         !declined
@@ -2013,6 +2286,66 @@ pub(crate) fn build_int4_pk_hash_table_host(
         }
     }
     Some((index, table_mask, hash_shift))
+}
+
+/// TYPE-COVERAGE track 1 (ledger #3 incremental-maintenance gate, measured on the PK'd-table SLO):
+/// EXTEND an existing host hash table with the shard's APPENDED tail keys — the in-place
+/// open-shard append grows `row_count` under the SAME device ptr every commit/wave-flush, and a
+/// full O(shard) rebuild per probe made the constrained-INSERT prepare ~1ms (923→5.5k TPS was the
+/// scan fix alone; this is the rest). IDENTICAL probing scheme to the builder (Fibonacci hash +
+/// linear probe, 256 cap, `(key<<32)|(row+1)` packing). Returns `false` on a DUPLICATE tail key or
+/// probe overflow — the shard has become dup-bearing and the entry must transition to the
+/// monotone DECLINED state (exactly what a full rebuild would conclude, without paying O(shard)
+/// to re-discover it). The caller enforces the builder's load rule (`2*count <= table_size`)
+/// BEFORE calling; within it, insertion is always possible absent dups/overflow.
+fn extend_int4_pk_hash_table_host(
+    index: &mut [u64],
+    table_mask: u32,
+    hash_shift: u32,
+    tail_keys: &[i32],
+    base_row: usize,
+) -> bool {
+    for (offset, &key) in tail_keys.iter().enumerate() {
+        let row = base_row + offset;
+        let key_bits = key as u32;
+        let mut slot = (key_bits.wrapping_mul(0x9E37_79B1) >> hash_shift) & table_mask;
+        let mut probes = 0_u32;
+        loop {
+            let occupant = index[slot as usize];
+            if occupant == 0 {
+                index[slot as usize] = ((key_bits as u64) << 32) | (row as u64 + 1);
+                break;
+            }
+            if (occupant >> 32) as u32 == key_bits {
+                return false; // duplicate: the shard declines (monotone under appends)
+            }
+            slot = (slot + 1) & table_mask;
+            probes += 1;
+            if probes >= 256 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// TYPE-COVERAGE track 1: set the bloom bits for appended tail keys. The bit array is sized at
+/// build time (10 bits/key THEN), so post-append inserts raise the false-POSITIVE rate slightly
+/// (perf-only: an FP costs one hash probe of the shard) — never a false NEGATIVE, the
+/// load-bearing invariant. The periodic load-factor rebuild re-sizes both structures. A `(0,0)`
+/// fallback bloom (num_bits == 0) means "maybe contains everything": extending it is a no-op and
+/// stays conservative.
+fn extend_int4_pk_bloom_host(words: &mut [u64], num_bits: u64, num_hashes: u32, tail_keys: &[i32]) {
+    if num_bits == 0 || words.is_empty() {
+        return;
+    }
+    for &key in tail_keys {
+        let (h1, h2) = bloom_hashes(key);
+        for i in 0..num_hashes {
+            let bit = bloom_bit(h1, h2, i, num_bits);
+            words[(bit / 64) as usize] |= 1_u64 << (bit % 64);
+        }
+    }
 }
 
 /// Cross-shard PK index (sub-slice 1): probe the host hash table built by `build_int4_pk_hash_table_host`

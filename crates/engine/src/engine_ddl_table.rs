@@ -499,6 +499,14 @@ impl Engine {
         table: &RelationalTable,
         visibility: StorageVisibility,
     ) -> Result<Vec<Vec<SqlValue>>, EngineError> {
+        // CONSTRAINED-ELISION SEAM (audit-B1 closure at the SOURCE): on an ELIDED table the host
+        // store is a stale prefix — a seq_scan here would materialize MISSING elided-era rows
+        // (DDL row-validators would silently pass over data that violates the new constraint;
+        // the flag-off scan validators would bypass unique/FK checks). Rehydrate FIRST, whatever
+        // the caller: this fn is elision-safe by construction, not by caller discipline.
+        if self.table_install_elided(&table.name) {
+            self.rehydrate_elided_serialized(&table.name)?;
+        }
         let prefix = relational_key_prefix(&table.name);
         let mut rows = Vec::new();
         // Load this table's published MVCC generation; the cursor reads its immutable rows

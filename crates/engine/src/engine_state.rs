@@ -537,18 +537,16 @@ pub(crate) struct ResidencyReadState {
     /// fast cache-hit path; staleness is handled by the per-entry `generation` tag, not by eviction.
     pub(crate) wave_index: Mutex<BTreeMap<String, WaveResidentIndex>>,
     /// Cross-shard PK index (sub-slice 3): per-`(table, shard_id, column_idx)` host hash+bloom index reuse
-    /// cache, built lazily + validated by `resident_device_ptr` (a re-admit/rollover's new ptr -> rebuild).
-    /// A plain `Mutex` like `wave_index`; the index-probe point-lookup route is opt-in behind
-    /// `shard_index_probe_enabled` (wired in sub-slice 3b). Staleness handled by the per-entry `(ptr,
-    /// row_count)` tag + the entry's buffer-pinning ABA guard.
+    /// cache, built lazily + validated by `resident_device_ptr` (a re-admit/rollover's new ptr -> rebuild)
+    /// and by `row_count` (an in-place append EXTENDS the entry incrementally — writer-side at the
+    /// append chokepoint, prober-side via the tail-DtoH fallback; ledger #3). Purged at all
+    /// residency-retire sites via `purge_shard_pk_index_for_table` (`5303f478`).
     ///
-    /// **3b PREREQUISITE (audit P2, INERT until wired):** this cache is NOT cleaned on shard evict /
-    /// invalidate / drop / re-admit, so once the route is wired a dropped/evicted shard leaks its buffer
-    /// (the `_resident_guard` pins it). Before 3b wires the route, add `shard_pk_index` cleanup at the SAME
-    /// lifecycle sites as `shard_deleted_by_memory` (SV4-prereq-#1: `invalidate_relational_residency_*`,
-    /// `apply_drop_table`, the re-admit clears) to bound memory. Leak-only (never wrong-results: the pinned
-    /// guard makes ptr-reuse impossible while an entry lives).
-    pub(crate) shard_pk_index: Mutex<BTreeMap<(String, u32, usize), CachedShardPkIndex>>,
+    /// An `RwLock` (was Mutex): the constrained-elision slice put TWO validator probes on every DML
+    /// commit (prepare + under-lock re-resolve), and 32 writers CONVOYED on the Mutex (measured: 32w
+    /// regressed below 16w). Probes take `read()` (pure lookups); extend/rebuild/purge take `write()`.
+    pub(crate) shard_pk_index:
+        std::sync::RwLock<BTreeMap<(String, u32, usize), CachedShardPkIndex>>,
     /// Sub-slice 8 (GPU-native probe): per-shard PK hash index resident ON THE DEVICE (uploaded once per
     /// generation), so the batched point lookup probes+gathers+emits on the GPU. Keyed `(table, shard_id,
     /// col_idx)`, validated by `(ptr, row_count)` + ABA `_resident_guard`, PURGED at the same lifecycle sites
@@ -558,6 +556,12 @@ pub(crate) struct ResidencyReadState {
     /// DECISIONS "lpb read levers" #1: count of batches served by the DENSE-emit index probe (vs the atomic
     /// kernel). The test signal that proves the dense route actually ran (output equality alone can't, since
     /// dense and atomic are byte-identical by design). `Relaxed` monotonic counter.
+    /// TYPE-COVERAGE track 1 diagnostics: how the shard PK-index cache converges under append
+    /// churn — writer-side extensions applied at the flush, prober-side tail-DtoH extensions,
+    /// and full O(shard) rebuilds. Steady state = writer extends dominating, rebuilds ~doublings.
+    pub(crate) pk_index_writer_extends: std::sync::atomic::AtomicU64,
+    pub(crate) pk_index_prober_extends: std::sync::atomic::AtomicU64,
+    pub(crate) pk_index_rebuilds: std::sync::atomic::AtomicU64,
     pub(crate) dense_index_probe_hits: std::sync::atomic::AtomicU64,
     /// Slice 1b-ii-c: count of commits served by the IN-PLACE open-shard APPEND (vs a whole-table
     /// re-admit). The test signal that the append actually fired — output equality can't prove it
@@ -640,7 +644,7 @@ impl ResidencyReadState {
     /// residency changed. Cheap `retain` over the small cache; INERT for a delete/index-free table (empty).
     pub(crate) fn purge_shard_pk_index_for_table(&self, table: &str) {
         self.shard_pk_index
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|(cached_table, _, _), _| cached_table != table);
         // Sub-slice 8: the parallel DEVICE index cache is purged at the SAME lifecycle sites (it pins the

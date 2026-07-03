@@ -2853,7 +2853,7 @@ mod capacity_payload_tests {
             !e.read_state
                 .residency
                 .shard_pk_index
-                .lock()
+                .read()
                 .unwrap()
                 .is_empty(),
             "the per-shard PK index cache is populated after a locate"
@@ -2983,7 +2983,7 @@ mod capacity_payload_tests {
             e.read_state
                 .residency
                 .shard_pk_index
-                .lock()
+                .read()
                 .unwrap()
                 .keys()
                 .filter(|(cached, _, _)| cached == t)
@@ -3629,8 +3629,10 @@ mod capacity_payload_tests {
             "post-rehydration host store == the install twin's, key for key"
         );
 
-        // Audit B1 gate: a CONSTRAINT-BEARING table must NEVER enter elision (its validators
-        // read the host store; a stale prefix would silently bypass UNIQUE/FK checks).
+        // Audit B1 gate, updated by the constrained-elision slice: with
+        // `constrained_elision_enabled` at its DEFAULT (off), a unique-indexed table must NEVER
+        // enter elision. (Flag ON is covered by `constrained_elision_pk_table_matches_install_twin`
+        // — the validators now run device-first through the self-pinning probe ladder.)
         on.execute_text(400, "CREATE TABLE u (id INT UNIQUE, v INT)")
             .unwrap();
         for i in 0..3_i64 {
@@ -3642,7 +3644,7 @@ mod capacity_payload_tests {
         }
         assert!(
             !on.table_install_elided("u"),
-            "a UNIQUE table must never elide (constraint validators read the host store)"
+            "a UNIQUE table must never elide while constrained_elision_enabled is default-OFF"
         );
         assert!(
             on.execute_text(420, "INSERT INTO u (id, v) VALUES (1, 9)")
@@ -3732,6 +3734,203 @@ mod capacity_payload_tests {
             "steady state must STAY elided through ~5 rollovers (a de-elision = degradation)"
         );
         assert_eq!(off.host_install_elisions(), 0);
+    }
+
+    /// TYPE-COVERAGE track 1 — CONSTRAINED ELISION differential: twin engines (elision ON vs OFF,
+    /// `constrained_elision_enabled` ON in BOTH) run a PK'd table through the full constraint
+    /// gauntlet. The ON twin ELIDES (PK'd tables are the core-banking shape the flag exists for);
+    /// every outcome INCLUDING exact violation text must match the install twin:
+    ///   - dup of a SEEDED key and of an ELIDED-ERA key (the audit-B1 bypass repro: the elided
+    ///     host store/value_index is EMPTY for elided-era rows — a stale-view probe would let
+    ///     the dup IN silently),
+    ///   - within-batch dup VALUES,
+    ///   - dup-by-UPDATE, self-key UPDATE (exclude_keys), delete-then-reinsert,
+    ///   - PK NOT NULL (23502 before 23505),
+    ///   - post-UPDATE churn probe: the SV5 append dups the id column in the open shard -> the
+    ///     cached index DECLINES (monotone) -> the probe ladder REHYDRATES (sticky de-elision)
+    ///     and must answer from the FRESH post-rehydration generation (the A5-flip SI-fix class).
+    /// NON-VACUITY: the ON twin is still ELIDED after the INSERT-only prefix with elisions > 0
+    /// and device-validate answering; the flag-OFF-arm eligibility gate is asserted by the
+    /// existing `a4e_elision_lifecycle_matches_install_twin` UNIQUE-never-elides check.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn constrained_elision_pk_table_matches_install_twin() {
+        let run = |elide: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_host_install_elision_enabled(elide);
+            e.set_constrained_elision_enabled(true);
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", k * 10))
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            // INSERT-only prefix: the elided steady state (checkpointed below, pre-churn).
+            let insert_prefix = [
+                "INSERT INTO t (id, v) VALUES (500, 5000)",
+                "INSERT INTO t (id, v) VALUES (501, 5010)",
+                "INSERT INTO t (id, v) VALUES (42, 1)", // dup of a SEEDED key -> 23505
+                "INSERT INTO t (id, v) VALUES (500, 1)", // dup of an ELIDED-ERA key -> 23505 (B1)
+                "INSERT INTO t (id, v) VALUES (600, 1), (600, 2)", // within-batch dup -> 23505
+                "INSERT INTO t (id, v) VALUES (NULL, 1)", // PK NOT NULL -> 23502 (before unique)
+            ];
+            let mut outcomes: Vec<Result<(), String>> = Vec::new();
+            for sql in &insert_prefix {
+                outcomes.push(
+                    e.execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
+                );
+                seq += 1;
+            }
+            let elided_after_insert_prefix = e.table_install_elided("t");
+            // Churn + post-churn probes: exercises the decline -> rehydrate -> fresh-pin seam.
+            let churn_ladder = [
+                "UPDATE t SET v = 999 WHERE id = 130", // SV5 append dups the open shard's id col
+                "INSERT INTO t (id, v) VALUES (130, 1)", // post-churn dup probe -> 23505 (rehydrates)
+                "UPDATE t SET id = 42 WHERE id = 131", // dup-by-UPDATE -> 23505
+                "UPDATE t SET id = 131 WHERE id = 131", // self-key UPDATE: excluded -> ok
+                "DELETE FROM t WHERE id = 42",
+                "INSERT INTO t (id, v) VALUES (42, 77)", // deleted key is reusable -> ok
+            ];
+            for sql in &churn_ladder {
+                outcomes.push(
+                    e.execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
+                );
+                seq += 1;
+            }
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            (e, outcomes, rows, elided_after_insert_prefix)
+        };
+        let (on, on_out, on_rows, on_elided_mid) = run(true);
+        let (off, off_out, off_rows, _off_elided_mid) = run(false);
+        assert_eq!(
+            on_out, off_out,
+            "constrained outcome ladder (incl violation text): elided == install twin"
+        );
+        assert_eq!(on_rows, off_rows, "reads: elided == install twin");
+        assert!(
+            on_elided_mid,
+            "the PK'd table must be ELIDED through the INSERT-only prefix (the flag's purpose)"
+        );
+        assert!(
+            on.host_install_elisions() > 0,
+            "non-vacuity: commits must have SKIPPED host installs on the PK'd table"
+        );
+        assert!(
+            on.dml_device_validate_hits() > 0,
+            "non-vacuity: the DEVICE validator must have answered probes"
+        );
+        assert_eq!(off.host_install_elisions(), 0, "flag OFF never elides");
+    }
+
+    /// TYPE-COVERAGE track 1 — the CONCURRENT dup race on an ELIDED PK'd table: 8 writers all
+    /// try to INSERT the SAME key set through `execute_dml_concurrent`. Off-lock prepares may
+    /// all pass validation (the device probe at their snapshots sees no dup — flushes are
+    /// wave-tail-deferred), so the UNIQUE-SLOT conflict ledger is the LOAD-BEARING guard:
+    /// first-committer-wins per slot, later writers get a retryable serialization conflict or
+    /// the 23505 at re-resolve. End state: every key EXACTLY once, no silent double-append,
+    /// table still elided (INSERT-only), elisions advancing.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn constrained_elision_concurrent_dup_race_single_winner_per_key() {
+        let e = Engine::new_local();
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.set_host_install_elision_enabled(true);
+        e.set_constrained_elision_enabled(true);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k * 10))
+                .collect();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )
+            .unwrap();
+            seq += 1;
+        }
+        let successes: Vec<std::sync::atomic::AtomicU32> =
+            (0..200).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        let txn = std::sync::atomic::AtomicU64::new(1_000);
+        std::thread::scope(|s| {
+            for w in 0..8_u64 {
+                let e = &e;
+                let successes = &successes;
+                let txn = &txn;
+                s.spawn(move || {
+                    for k in 0..200_i64 {
+                        // Every writer contends for EVERY key; retry serialization conflicts a
+                        // few times so the race resolves to a definitive dup answer, never a
+                        // silent skip. `w` staggers start points to vary interleavings.
+                        let key = (k + w as i64 * 25) % 200;
+                        let mut attempts = 0;
+                        loop {
+                            let t = txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match e.execute_dml_concurrent(
+                                t,
+                                &format!("INSERT INTO t (id, v) VALUES ({}, {w})", 10_000 + key),
+                            ) {
+                                Ok(()) => {
+                                    successes[key as usize]
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(err) => {
+                                    let text = err.to_string();
+                                    if text.contains("duplicate key") {
+                                        break; // definitive: another writer owns the slot
+                                    }
+                                    attempts += 1;
+                                    if attempts > 50 {
+                                        panic!("key {key}: unresolved after 50 retries: {text}");
+                                    }
+                                    // serialization conflict: retry with a fresh snapshot
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        for (k, wins) in successes.iter().enumerate() {
+            assert_eq!(
+                wins.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "key {k}: exactly ONE writer may win the unique slot"
+            );
+        }
+        assert!(
+            e.table_install_elided("t"),
+            "INSERT-only dup race must not de-elide the table"
+        );
+        assert!(e.host_install_elisions() > 0, "non-vacuity: elisions fired");
+        // Device truth: every contended key exactly once (no silent double-append survived).
+        let rows = e
+            .execute_relational_select_text("SELECT id, v FROM t")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 400, "200 seeded + 200 contended keys, each once");
     }
 
     /// Wave-BATCHED appends (audit N-1): REAL multi-item waves — 8 writer threads pump
@@ -6164,13 +6363,29 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// RETIREMENT A4e (audit B1): may `table` ENTER elision? Strictly-Int4 AND CONSTRAINT-FREE
-    /// in BOTH directions — no unique indexes, no checks, no outbound FKs, and NO OTHER TABLE
-    /// REFERENCES IT. Constraint validation (INSERT preflight `visible_relational_rows`, the DDL
-    /// row-validators) reads the HOST store; on an elided table that store is a stale prefix, so
-    /// a unique/FK check would silently pass against MISSING elided-era rows (constraint bypass).
-    /// Constraint-free tables never run those validators; DDL that ADDS a constraint rehydrates
-    /// first (the execute_text DDL seam).
+    /// TYPE-COVERAGE track 1: enable/disable elision for UNIQUE-INDEXED (PK'd) strictly-Int4
+    /// tables (default OFF — the constrained-elision A/B lever; flip gated on SLO + audit).
+    pub fn set_constrained_elision_enabled(&self, on: bool) {
+        self.constrained_elision_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn constrained_elision_enabled(&self) -> bool {
+        self.constrained_elision_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// RETIREMENT A4e (audit B1) + TYPE-COVERAGE track 1: may `table` ENTER elision?
+    /// Strictly-Int4, no checks, no outbound FKs, NO OTHER TABLE REFERENCES IT — and UNIQUE
+    /// indexes (PK'd tables, the core-banking shape) allowed ONLY under
+    /// `constrained_elision_enabled` with BOTH validator-ladder flags live. The original B1
+    /// hazard (constraint validation reading the elided host store's stale prefix = silent
+    /// bypass) is closed at both ends: every hot-path validator probe now runs through the
+    /// index-driven ladder (`validate_dml_constraints_via_index` -> `visible_row_with_value`,
+    /// device-first, rehydrate-on-decline, self-pinned views — including `prepare_insert`,
+    /// this slice) and the residual scan arm's source (`visible_relational_rows`) rehydrates
+    /// elided tables itself. CHECK/FK exclusions stay: CHECKs ride the scan arm when the
+    /// resolve flag is off, and FK elision is cross-table interplay (the ledgered next step).
     pub(crate) fn table_elision_eligible(
         &self,
         catalog: &CatalogSnapshot,
@@ -6179,11 +6394,15 @@ impl Engine {
         let Some(table) = catalog.relational_catalog.get(table_name) else {
             return false;
         };
+        let unique_ok = !table.indexes.iter().any(|index| index.unique)
+            || (self.constrained_elision_enabled()
+                && self.dml_value_index_resolve_enabled()
+                && self.dml_device_validate_enabled());
         table
             .columns
             .iter()
             .all(|column| column.ty == gpu_db_sql::SqlType::Int4)
-            && !table.indexes.iter().any(|index| index.unique)
+            && unique_ok
             && table.check_constraints.is_empty()
             && table.foreign_keys.is_empty()
             && !catalog.relational_catalog.values().any(|other| {
@@ -6195,12 +6414,32 @@ impl Engine {
     }
 
     /// RETIREMENT A4e: is `table` device-authoritative (commits skip the host install)?
-    pub(crate) fn table_install_elided(&self, table: &str) -> bool {
+    /// `pub` for bench/telemetry (read-only; the A/B arms assert steady-state elided-ness).
+    pub fn table_install_elided(&self, table: &str) -> bool {
         self.read_state
             .residency
             .elided_tables
             .load()
             .contains(table)
+    }
+
+    /// TYPE-COVERAGE track 1 diagnostics: shard PK-index cache convergence counters
+    /// (writer-side flush extensions / prober-side tail-DtoH extensions / full O(shard) rebuilds).
+    pub fn pk_index_maintenance_stats(&self) -> (u64, u64, u64) {
+        (
+            self.read_state
+                .residency
+                .pk_index_writer_extends
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.read_state
+                .residency
+                .pk_index_prober_extends
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.read_state
+                .residency
+                .pk_index_rebuilds
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// RETIREMENT A4e: commits that skipped the host install (non-vacuity telemetry).
@@ -6555,6 +6794,26 @@ impl Engine {
                     })
                 })
                 .collect();
+            // TYPE-COVERAGE track 1 (ledger #3): writer-side PK-index cache maintenance — the
+            // appended values are in hand, so cached (table, shard, col) entries extend O(k)
+            // with no device read. ORDER (measured): extend BEFORE the row_count publish below.
+            // Post-publish extension opened a per-flush window where preparers pinned to the
+            // FRESH count found a stale entry and raced into tail-DtoH reads against this very
+            // extension (run-to-run TPS swung 51-84k @32w); pre-publish, probers at the old
+            // count read the AHEAD entry via the slot-bound rule and probers at the new count
+            // find the cache already current. Catalog order == i32-section order here (this
+            // path appends only all-i32-section shards). NULL-free by the guard above, so
+            // `sql_value_as_int4` yields exactly the bytes the chunks wrote.
+            let column_values: Vec<Vec<i32>> = (0..column_count)
+                .map(|c| new_rows.iter().map(|row| sql_value_as_int4(&row[c])).collect())
+                .collect();
+            self.extend_shard_pk_index_cache_on_append(
+                table,
+                shard_id,
+                shard_device_memory.device_ptr(),
+                row_count,
+                &column_values,
+            );
             self.read_state.residency.with_shards_mut(|shards| {
                 if let Some(table_shards) = shards.get_mut(table) {
                     if let Some(open) = table_shards.last_mut() {

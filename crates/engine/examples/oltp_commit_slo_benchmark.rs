@@ -86,7 +86,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             Engine::new_local()
         };
-        e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
+        // TYPE-COVERAGE track 1 (constrained elision): GPU_DB_BENCH_PK=1 declares the PK — the
+        // core-banking table shape. Today a unique-indexed table is elision-INELIGIBLE and its
+        // INSERT prepare pays the O(table) candidate scan (prepare_insert), so this arm is the
+        // baseline the constrained-elision slice must move.
+        if std::env::var("GPU_DB_BENCH_PK").is_ok_and(|v| v == "1") {
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")?;
+        } else {
+            e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
+        }
         // RETIREMENT A4e A/B: GPU_DB_BENCH_ADMIT=1 = the honest baseline (auto-admit ON, the
         // dual-store commit path); GPU_DB_BENCH_ELIDE=1 = the elision arm on top of it.
         if std::env::var("GPU_DB_BENCH_ADMIT").is_ok_and(|v| v == "1")
@@ -96,6 +104,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1") {
             e.set_host_install_elision_enabled(true);
+        }
+        // TYPE-COVERAGE track 1: GPU_DB_BENCH_CELIDE=1 = the constrained-elision arm (PK'd
+        // tables become elision-eligible; pair with GPU_DB_BENCH_PK=1 + GPU_DB_BENCH_ELIDE=1).
+        if std::env::var("GPU_DB_BENCH_CELIDE").is_ok_and(|v| v == "1") {
+            e.set_constrained_elision_enabled(true);
         }
 
         let engine = Arc::new(e);
@@ -189,6 +202,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 items as f64 / waves.max(1) as f64,
                 nanos as f64 / items.max(1) as f64 / 1e3,
             );
+            // Elision/validator engagement (constrained-elision A/B): steady state = elisions
+            // GROWING, the table STILL elided at teardown, device validate answering.
+            eprintln!(
+                "    [elisions: {}  still-elided: {}  device-validate-hits: {}]",
+                engine.host_install_elisions(),
+                engine.table_install_elided("t"),
+                engine.dml_device_validate_hits(),
+            );
+            let (wx, px, rb) = engine.pk_index_maintenance_stats();
+            eprintln!("    [pk-index: writer-extends {wx}  prober-extends {px}  rebuilds {rb}]");
         }
         let stats = engine.wal_group_commit_stats();
         let fsyncs = stats.flush_groups;

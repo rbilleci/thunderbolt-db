@@ -1404,11 +1404,9 @@ impl Engine {
                     .iter()
                     .any(|foreign_key| foreign_key.referenced_table == table.name);
                 if self.dml_value_index_resolve_enabled() && !self_referencing_fk {
-                    let table_rows = self.read_state.mvcc.table_rows(&table.name);
                     self.validate_dml_constraints_via_index(
                         &catalog,
                         table,
-                        &table_rows,
                         &new_rows,
                         &[],
                         &BTreeSet::new(),
@@ -1532,7 +1530,6 @@ impl Engine {
                     self.validate_dml_constraints_via_index(
                         &catalog,
                         table,
-                        &table_rows,
                         &new_images,
                         &old_images,
                         &touched_keys,
@@ -1655,7 +1652,6 @@ impl Engine {
                     self.validate_dml_constraints_via_index(
                         &catalog,
                         table,
-                        &table_rows,
                         &[],
                         &removed,
                         &touched_keys,

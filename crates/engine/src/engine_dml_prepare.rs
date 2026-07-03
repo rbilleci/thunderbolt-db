@@ -118,65 +118,106 @@ impl Engine {
             profile.row_prepare_micros += row_prepare_started.elapsed().as_micros();
         }
 
-        // P2 (write-path assessment): ONE shared visible-row materialization for all three
-        // validators — this used to be three separate O(table) scans (+ a `new_rows` clone each)
-        // per prepare, i.e. per constraint dimension. The scan cost lands in the first active
-        // validator's profile bucket (they used to pay one scan each); validation semantics and
-        // errors are unchanged (`prepare_update` already shares its scan the same way).
-        let mut candidate_rows: Option<Vec<Vec<SqlValue>>> = None;
-        let materialize_candidates = |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
-            let mut rows = engine.visible_relational_rows(
-                &table,
-                StorageVisibility {
-                    read_txn_id: txn_id,
-                },
-            )?;
-            rows.extend(new_rows.clone());
-            Ok(rows)
-        };
         // PG constraint order: not-null (23502) BEFORE unique — over the NEW rows only, O(new).
         Self::validate_primary_key_not_null(&table, new_rows.iter().map(Vec::as_slice))?;
-        if table.indexes.iter().any(|index| index.unique) {
-            let unique_preflight_started = Instant::now();
-            if candidate_rows.is_none() {
-                candidate_rows = Some(materialize_candidates(self)?);
+        // TYPE-COVERAGE track 1 (ledger #17): INDEX-DRIVEN INSERT validation — O(new x constraints)
+        // through the 1b-audited `validate_dml_constraints_via_index` (probe ladder: device index
+        // first, value_index on decline), replacing the O(table) candidate materialization below.
+        // This is THE measured PK'd-table collapse: `prepare_insert` is the concurrent path's
+        // authoritative validation (P2 removed its duplicate preflight) AND re-runs under the
+        // sequencer lock at re-resolve, so the scan cost 923 vs 102,045 sustained TPS @16w rode
+        // on it twice per commit (oltp_commit_slo_benchmark, GPU_DB_BENCH_PK=1). Same eligibility
+        // as the serialized write-apply Insert arm: self-referencing-FK tables keep the scan (a
+        // new row may provide for another new row, which the parent's index cannot see
+        // pre-install). Semantics + error text are byte-identical (the 1b contract).
+        let self_referencing_fk = table
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| foreign_key.referenced_table == table.name);
+        let has_constraints = table.indexes.iter().any(|index| index.unique)
+            || !table.check_constraints.is_empty()
+            || !table.foreign_keys.is_empty();
+        if self.dml_value_index_resolve_enabled() && !self_referencing_fk {
+            if has_constraints {
+                let validate_started = Instant::now();
+                self.validate_dml_constraints_via_index(
+                    &self.catalog_snapshot(),
+                    &table,
+                    &new_rows,
+                    &[],
+                    &BTreeSet::new(),
+                    StorageVisibility {
+                        read_txn_id: txn_id,
+                    },
+                )?;
+                if let Some(profile) = profile.as_mut() {
+                    // The index-driven pass validates all three dimensions in one call; its cost
+                    // lands in the unique bucket (the first the scan path would have charged).
+                    profile.unique_preflight_micros += validate_started.elapsed().as_micros();
+                }
             }
-            Self::validate_unique_indexes_for_rows(
-                &table,
-                candidate_rows.as_ref().expect("materialized above"),
-            )?;
-            if let Some(profile) = profile.as_mut() {
-                profile.unique_preflight_micros += unique_preflight_started.elapsed().as_micros();
+        } else {
+            // P2 (write-path assessment): ONE shared visible-row materialization for all three
+            // validators — this used to be three separate O(table) scans (+ a `new_rows` clone
+            // each) per prepare, i.e. per constraint dimension. The scan cost lands in the first
+            // active validator's profile bucket (they used to pay one scan each); validation
+            // semantics and errors are unchanged (`prepare_update` already shares its scan the
+            // same way). Kept as the flag-off / self-referencing-FK oracle arm.
+            let mut candidate_rows: Option<Vec<Vec<SqlValue>>> = None;
+            let materialize_candidates = |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
+                let mut rows = engine.visible_relational_rows(
+                    &table,
+                    StorageVisibility {
+                        read_txn_id: txn_id,
+                    },
+                )?;
+                rows.extend(new_rows.clone());
+                Ok(rows)
+            };
+            if table.indexes.iter().any(|index| index.unique) {
+                let unique_preflight_started = Instant::now();
+                if candidate_rows.is_none() {
+                    candidate_rows = Some(materialize_candidates(self)?);
+                }
+                Self::validate_unique_indexes_for_rows(
+                    &table,
+                    candidate_rows.as_ref().expect("materialized above"),
+                )?;
+                if let Some(profile) = profile.as_mut() {
+                    profile.unique_preflight_micros +=
+                        unique_preflight_started.elapsed().as_micros();
+                }
             }
-        }
-        if !table.check_constraints.is_empty() {
-            let check_preflight_started = Instant::now();
-            if candidate_rows.is_none() {
-                candidate_rows = Some(materialize_candidates(self)?);
+            if !table.check_constraints.is_empty() {
+                let check_preflight_started = Instant::now();
+                if candidate_rows.is_none() {
+                    candidate_rows = Some(materialize_candidates(self)?);
+                }
+                Self::validate_check_constraints_for_rows(
+                    &table,
+                    candidate_rows.as_ref().expect("materialized above"),
+                )?;
+                if let Some(profile) = profile.as_mut() {
+                    profile.check_preflight_micros +=
+                        check_preflight_started.elapsed().as_micros();
+                }
             }
-            Self::validate_check_constraints_for_rows(
-                &table,
-                candidate_rows.as_ref().expect("materialized above"),
-            )?;
-            if let Some(profile) = profile.as_mut() {
-                profile.check_preflight_micros += check_preflight_started.elapsed().as_micros();
-            }
-        }
-        if !table.foreign_keys.is_empty() {
-            let foreign_key_preflight_started = Instant::now();
-            if candidate_rows.is_none() {
-                candidate_rows = Some(materialize_candidates(self)?);
-            }
-            self.validate_foreign_keys_with_table_rows(
-                &table.name,
-                candidate_rows.as_ref().expect("materialized above"),
-                StorageVisibility {
-                    read_txn_id: txn_id,
-                },
-            )?;
-            if let Some(profile) = profile.as_mut() {
-                profile.foreign_key_preflight_micros +=
-                    foreign_key_preflight_started.elapsed().as_micros();
+            if !table.foreign_keys.is_empty() {
+                let foreign_key_preflight_started = Instant::now();
+                if candidate_rows.is_none() {
+                    candidate_rows = Some(materialize_candidates(self)?);
+                }
+                self.validate_foreign_keys_with_table_rows(
+                    &table.name,
+                    candidate_rows.as_ref().expect("materialized above"),
+                    StorageVisibility {
+                        read_txn_id: txn_id,
+                    },
+                )?;
+                if let Some(profile) = profile.as_mut() {
+                    profile.foreign_key_preflight_micros +=
+                        foreign_key_preflight_started.elapsed().as_micros();
+                }
             }
         }
 
@@ -267,12 +308,15 @@ impl Engine {
                 // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
                 // the scan below reads the stale store.
                 if self.table_install_elided(&table.name) {
+                    // STAMP AT committed_seq, never the caller's visibility (the facade-seq
+                    // poison find — see `visible_row_with_value`).
+                    let seq = self.committed_seq();
                     self.rehydrate_elided_table(
                         &table,
-                        visibility.read_txn_id,
+                        seq,
                         &Default::default(),
                         &Default::default(),
-                        visibility.read_txn_id,
+                        seq,
                     )?;
                     // A5 FLIP SI FIX: the scan below must read the FRESH generation.
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
@@ -348,7 +392,6 @@ impl Engine {
                 self.validate_dml_constraints_via_index(
                     &catalog,
                     &table,
-                    &table_rows,
                     &[],
                     &removed,
                     &touched_keys,
@@ -645,7 +688,6 @@ impl Engine {
     fn device_visible_row_with_value(
         &self,
         table: &RelationalTable,
-        table_rows: &crate::resident_storage::TableRowsView,
         visibility: StorageVisibility,
         column_idx: usize,
         value: &SqlValue,
@@ -683,6 +725,9 @@ impl Engine {
                     None => return None,
                 }
             } else {
+                // Self-pinned view (the SI-fix discipline): loaded fresh per probe so a
+                // mid-statement rehydration can never leave this fetch on a stale generation.
+                let table_rows = self.read_state.mvcc.table_rows(&table.name);
                 let fetched = table_rows
                     .store()
                     .tuple_fetch_by_key(&key, visibility)
@@ -707,50 +752,51 @@ impl Engine {
     /// RETIREMENT A3: the probe LADDER — device index first, host value_index on decline. Every
     /// validator probe goes through here; the ladder preserves slice-1b semantics exactly (the
     /// device arm answers only what it can prove, everything else falls through).
+    ///
+    /// SELF-PINNED VIEW (constrained-elision slice): the host arm loads the table's CURRENT
+    /// generation itself — callers no longer thread a view. A probe earlier in the same statement
+    /// may have rehydrated this (or another) table, COW-publishing a fresh generation; a
+    /// caller-pinned view from before that publish is a stale prefix whose value_index would
+    /// silently miss elided-era rows (the A5-flip SI-fix class, here a constraint bypass).
+    /// Snapshot correctness is untouched: visibility rides `visibility.read_txn_id`.
     fn visible_row_with_value(
         &self,
         table: &RelationalTable,
-        table_rows: &crate::resident_storage::TableRowsView,
         visibility: StorageVisibility,
         column_idx: usize,
         value: &SqlValue,
         exclude_keys: Option<&BTreeSet<String>>,
     ) -> Result<bool, EngineError> {
-        if let Some(answer) = self.device_visible_row_with_value(
-            table,
-            table_rows,
-            visibility,
-            column_idx,
-            value,
-            exclude_keys,
-        ) {
+        if let Some(answer) =
+            self.device_visible_row_with_value(table, visibility, column_idx, value, exclude_keys)
+        {
             return Ok(answer);
         }
         // A4e + A5 FLIP SI FIX: a device decline on an ELIDED table must rehydrate BEFORE the
         // host probe (the stale value-index would answer from missing/old rows = a constraint
-        // hole), and the probe must then read the FRESH post-rehydration generation — the view
-        // pinned by the caller predates the COW publish.
+        // hole); the fresh pin below then reads the post-rehydration generation.
+        //
+        // STAMP AT THE ENGINE'S committed_seq, NEVER the caller's visibility (constrained-
+        // elision find): the serialized PREFLIGHT probes at the FACADE txn id (the P2 "worse
+        // visibility boundary"), and threading that into the reconcile stamped store versions
+        // with future/foreign seqs — seeded chains became all-dead-at-facade-seq, and the next
+        // reader's reconcile hit "tuple not found" (observed: tombstones at seq 310 against
+        // committed_seq 9). The probe itself still answers at `visibility` (MVCC: a fresher
+        // generation at an older read boundary is always sound).
         if self.table_install_elided(&table.name) {
+            let seq = self.committed_seq();
             self.rehydrate_elided_table(
                 table,
-                visibility.read_txn_id,
+                seq,
                 &Default::default(),
                 &Default::default(),
-                visibility.read_txn_id,
+                seq,
             )?;
-            let fresh = self.read_state.mvcc.table_rows(&table.name);
-            return Self::any_visible_row_with_value(
-                table,
-                &fresh,
-                visibility,
-                column_idx,
-                value,
-                exclude_keys,
-            );
         }
+        let fresh = self.read_state.mvcc.table_rows(&table.name);
         Self::any_visible_row_with_value(
             table,
-            table_rows,
+            &fresh,
             visibility,
             column_idx,
             value,
@@ -813,12 +859,17 @@ impl Engine {
     ///
     /// DELETE passes empty `new_images` (unique/check/outbound sections no-op, exactly as the scan
     /// path never ran them for DELETE); UPDATE passes the post-assignment images.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// VIEW DISCIPLINE (constrained-elision slice, the A5-flip SI-fix class): the probes pin their
+    /// OWN table view per probe (`visible_row_with_value` self-pins) — no caller-threaded view. A
+    /// probe on an elided table may REHYDRATE (COW-publishing a fresh host generation); any view
+    /// pinned before that publish is a stale prefix, and a later probe reading it would validate
+    /// against MISSING elided-era rows (constraint bypass). MVCC makes the fresh pin sound: row
+    /// visibility rides `visibility.read_txn_id`, not view recency.
     pub(crate) fn validate_dml_constraints_via_index(
         &self,
         catalog: &CatalogSnapshot,
         table: &RelationalTable,
-        table_rows: &crate::resident_storage::TableRowsView,
         new_images: &[Vec<SqlValue>],
         removed_images: &[Vec<SqlValue>],
         touched_keys: &BTreeSet<String>,
@@ -841,7 +892,6 @@ impl Engine {
                 if !seen.insert(row[column_idx].clone())
                     || self.visible_row_with_value(
                         table,
-                        table_rows,
                         visibility,
                         column_idx,
                         &row[column_idx],
@@ -871,11 +921,9 @@ impl Engine {
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             let parent_idx = relational_column_index(parent, &foreign_key.referenced_column)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            let parent_rows = self.read_state.mvcc.table_rows(&parent.name);
             for row in new_images {
                 if !self.visible_row_with_value(
                     parent,
-                    &parent_rows,
                     visibility,
                     parent_idx,
                     &row[child_idx],
@@ -906,7 +954,6 @@ impl Engine {
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 let new_provider_values: BTreeSet<&SqlValue> =
                     new_images.iter().map(|row| &row[parent_idx]).collect();
-                let child_rows = self.read_state.mvcc.table_rows(&child.name);
                 let mut checked: BTreeSet<&SqlValue> = BTreeSet::new();
                 for old in removed_images {
                     let value = &old[parent_idx];
@@ -916,7 +963,6 @@ impl Engine {
                     // A surviving untouched provider keeps the value alive.
                     if self.visible_row_with_value(
                         table,
-                        table_rows,
                         visibility,
                         parent_idx,
                         value,
@@ -927,7 +973,6 @@ impl Engine {
                     // No provider left: any visible child row still referencing it = violation.
                     if self.visible_row_with_value(
                         child,
-                        &child_rows,
                         visibility,
                         child_idx,
                         value,
@@ -1085,12 +1130,15 @@ impl Engine {
                 // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
                 // the scan below reads the stale store.
                 if self.table_install_elided(&table.name) {
+                    // STAMP AT committed_seq, never the caller's visibility (the facade-seq
+                    // poison find — see `visible_row_with_value`).
+                    let seq = self.committed_seq();
                     self.rehydrate_elided_table(
                         &table,
-                        visibility.read_txn_id,
+                        seq,
                         &Default::default(),
                         &Default::default(),
-                        visibility.read_txn_id,
+                        seq,
                     )?;
                     // A5 FLIP SI FIX: the scan below must read the FRESH generation.
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
@@ -1189,7 +1237,6 @@ impl Engine {
                 self.validate_dml_constraints_via_index(
                     &catalog,
                     &table,
-                    &table_rows,
                     &new_images,
                     &updated_old_rows,
                     &touched_keys,

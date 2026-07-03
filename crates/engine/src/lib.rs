@@ -415,6 +415,11 @@ pub struct Engine {
     dml_device_resolve_enabled: std::sync::atomic::AtomicBool,
     dml_device_validate_enabled: std::sync::atomic::AtomicBool,
     host_install_elision_enabled: std::sync::atomic::AtomicBool,
+    /// TYPE-COVERAGE track 1: UNIQUE-INDEXED (PK'd) strictly-Int4 tables may ELIDE — the
+    /// core-banking table shape. Requires the resolve+validate ladders ON (eligibility checks
+    /// them); default OFF until the SLO gate + audit. Kill switch -> unique tables never enter
+    /// elision (already-elided tables rehydrate through the ladder seams as usual).
+    constrained_elision_enabled: std::sync::atomic::AtomicBool,
     auto_vacuum_enabled: std::sync::atomic::AtomicBool,
     tombstone_churn_threshold_override: std::sync::atomic::AtomicU64,
     /// S-d2c: the target row count per shard (the rollover/seal threshold; default 4M). Settable

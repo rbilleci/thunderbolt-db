@@ -205,6 +205,10 @@ impl Engine {
             // FIXED by re-pinning the view at every post-rehydration fallback — pinned by the
             // SV6 concurrent hammer, which now runs elided BY DEFAULT.
             host_install_elision_enabled: std::sync::atomic::AtomicBool::new(true),
+            // TYPE-COVERAGE track 1: constrained (unique/PK'd) elision — default OFF, the
+            // measured A/B lever (923 TPS PK'd vs 102k PK-less @16w; GPU_DB_BENCH_PK=1). Flip
+            // is gated on the SLO re-measure + the adversarial audit, like every default.
+            constrained_elision_enabled: std::sync::atomic::AtomicBool::new(false),
             auto_vacuum_enabled: std::sync::atomic::AtomicBool::new(true),
             tombstone_churn_threshold_override: std::sync::atomic::AtomicU64::new(0),
             // S-d2c: ~4M rows/shard (seals ~3ms, ~250 shards/1B); settable small in tests.
