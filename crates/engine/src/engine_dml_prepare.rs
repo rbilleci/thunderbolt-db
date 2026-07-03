@@ -672,13 +672,17 @@ impl Engine {
         if !hit.descriptor.resident_device_null_columns.is_empty() {
             return None; // raw i32 would read a stored NULL as 0 (the M3 decline discipline)
         }
-        // Audit A4 F1, lifted by TYPE-COVERAGE track 2: Date/Int2 share the device i32 section
-        // and now materialize with their CATALOG-derived variant (`sql_value_from_i32_section`)
-        // — the F1 mistype (everything typed Int4) is gone. Non-i32-section types still decline.
+        // Audit A4 F1, lifted by TYPE-COVERAGE track 2 (stages 1 + iii): every FIXED-WIDTH
+        // section materializes with its CATALOG-derived variant — i32 via one u32/slot, i64 via
+        // two (the 4-mod-8 discipline). Non-fixed-width types still decline to the host fetch.
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
-                crate::SqlType::Int4 | crate::SqlType::Date | crate::SqlType::Int2
+                crate::SqlType::Int4
+                    | crate::SqlType::Date
+                    | crate::SqlType::Int2
+                    | crate::SqlType::Int8
+                    | crate::SqlType::Timestamp
             )
         }) {
             return None;
@@ -702,20 +706,42 @@ impl Engine {
         }
         let mut row = Vec::with_capacity(table.columns.len());
         for idx in 0..table.columns.len() {
-            let base = crate::relational_model::resident_device_int4_column_offset(
-                &hit.descriptor,
-                table,
-                idx,
-            )
-            .ok()?;
-            let values = hit
-                .device_memory
-                .read_resident_i32_column(base + slot * 4, 1)
-                .ok()?;
-            row.push(crate::engine_residency::sql_value_from_i32_section(
-                table.columns[idx].ty,
-                *values.first()?,
-            )?);
+            match table.columns[idx].ty {
+                crate::SqlType::Int8 | crate::SqlType::Timestamp => {
+                    let base = crate::relational_model::resident_device_int8_column_offset(
+                        &hit.descriptor,
+                        table,
+                        idx,
+                    )
+                    .ok()?;
+                    let halves = hit
+                        .device_memory
+                        .read_resident_i32_column(base + slot * 8, 2)
+                        .ok()?;
+                    let lo = *halves.first()? as u32 as u64;
+                    let hi = *halves.get(1)? as u32 as u64;
+                    row.push(crate::engine_residency::sql_value_from_i64_section(
+                        table.columns[idx].ty,
+                        (lo | (hi << 32)) as i64,
+                    )?);
+                }
+                _ => {
+                    let base = crate::relational_model::resident_device_int4_column_offset(
+                        &hit.descriptor,
+                        table,
+                        idx,
+                    )
+                    .ok()?;
+                    let values = hit
+                        .device_memory
+                        .read_resident_i32_column(base + slot * 4, 1)
+                        .ok()?;
+                    row.push(crate::engine_residency::sql_value_from_i32_section(
+                        table.columns[idx].ty,
+                        *values.first()?,
+                    )?);
+                }
+            }
         }
         Some(Some(row))
     }

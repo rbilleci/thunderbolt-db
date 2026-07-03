@@ -317,6 +317,17 @@ pub(crate) fn sql_value_from_i32_section(ty: gpu_db_sql::SqlType, v: i32) -> Opt
     }
 }
 
+/// TYPE-COVERAGE track 2 slice 2 stage (iii): the typed DECODE for the i64 section
+/// (Int8/Timestamp) — the A4a materializer / A4c gather read these columns as two u32 halves
+/// (the 4-mod-8 discipline) and type the value from the CATALOG. `None` for any other type.
+pub(crate) fn sql_value_from_i64_section(ty: gpu_db_sql::SqlType, v: i64) -> Option<SqlValue> {
+    match ty {
+        gpu_db_sql::SqlType::Int8 => Some(SqlValue::Int8(v)),
+        gpu_db_sql::SqlType::Timestamp => Some(SqlValue::Timestamp(v)),
+        _ => None,
+    }
+}
+
 /// TYPE-COVERAGE track 2: encode an equality NEEDLE for the device i32-section probe, requiring
 /// the value VARIANT to agree with the column's catalog type (Int4->Int4, Date->Date,
 /// Int2->Int2). Strict agreement is load-bearing for the A3 probe's authoritative FALSE (a
@@ -4419,6 +4430,108 @@ mod capacity_payload_tests {
         );
     }
 
+    /// TYPE-COVERAGE track 2 slice 2, stage (iii) — the i64-PAYLOAD ELISION differential: an
+    /// int4-PK / BIGINT+TIMESTAMP-payload table (THE core-banking shape) elides under the
+    /// flags; elided-era DML resolves via the A4a materializer typing i64 payloads from the
+    /// catalog; a decline REHYDRATES through the A4c i64 gather (store + value_index rebuilt
+    /// with Int8/Timestamp variants — a mistype would corrupt the index representations).
+    /// Outcomes + reads must match the install twin. Sabotage: mistyping the i64 decode fails
+    /// the read parity; an i64-UNIQUE table must NEVER elide (the locate cannot probe it).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn int8_payload_elision_matches_install_twin() {
+        let run = |elide: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_shard_int8_section_enabled(true);
+            e.set_host_install_elision_enabled(elide);
+            e.execute_text(1, "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, ts TIMESTAMP)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| {
+                        format!(
+                            "({k}, {}, '2026-01-01 00:00:{:02}')",
+                            9_000_000_000_i64 + k,
+                            k % 60
+                        )
+                    })
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t8 (id, v, ts) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let statements = [
+                "INSERT INTO t8 (id, v, ts) VALUES (500, 8000000000, '2027-01-01 00:00:00')",
+                "INSERT INTO t8 (id, v, ts) VALUES (501, 8000000001, '2027-01-02 00:00:00')",
+                "INSERT INTO t8 (id, v, ts) VALUES (42, 1, '2027-01-03 00:00:00')", // dup PK
+                "INSERT INTO t8 (id, v, ts) VALUES (500, 2, '2027-01-04 00:00:00')", // elided-era dup
+                // Point DML on elided-era + seeded rows: the materializer types v/ts.
+                "UPDATE t8 SET v = 8500000000 WHERE id = 500",
+                "DELETE FROM t8 WHERE id = 42",
+                "UPDATE t8 SET v = 9999999999 WHERE id = 130",
+                // A shape the resolve declines (OR-group) -> rehydration through the i64 gather.
+                "UPDATE t8 SET v = -1 WHERE id = 500 OR id = 11",
+                "INSERT INTO t8 (id, v, ts) VALUES (502, 8000000002, '2027-02-01 00:00:00')",
+            ];
+            let mut outcomes: Vec<Result<(), String>> = Vec::new();
+            for sql in &statements {
+                outcomes.push(
+                    e.execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
+                );
+                seq += 1;
+            }
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, v, ts FROM t8")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            (e, outcomes, rows)
+        };
+        let (on, on_out, on_rows) = run(true);
+        let (off, off_out, off_rows) = run(false);
+        assert_eq!(on_out, off_out, "i64-payload outcome ladder: elided == twin");
+        assert_eq!(on_rows, off_rows, "i64-payload reads: elided == twin");
+        assert!(
+            on.host_install_elisions() > 0,
+            "non-vacuity: the i64-payload PK table must ELIDE installs"
+        );
+        assert!(
+            on.dml_device_validate_hits() > 0,
+            "non-vacuity: device validation answered on the i64-payload table"
+        );
+        assert_eq!(off.host_install_elisions(), 0);
+
+        // The i64-UNIQUE guard: a unique index on a BIGINT column must keep the table OFF
+        // elision (the i32 locate cannot probe it; eligibility must reject it).
+        on.execute_text(700, "CREATE TABLE u8 (v BIGINT UNIQUE, x INT)")
+            .unwrap();
+        for i in 0..30_u64 {
+            on.execute_dml_concurrent(
+                710 + i,
+                &format!("INSERT INTO u8 (v, x) VALUES ({}, {i})", 8_100_000_000_i64 + i as i64),
+            )
+            .unwrap();
+        }
+        assert!(
+            !on.table_install_elided("u8"),
+            "an i64-UNIQUE table must never elide (no device probe for i64 keys)"
+        );
+        assert!(
+            on.execute_text(750, "INSERT INTO u8 (v, x) VALUES (8100000005, 9)")
+                .is_err(),
+            "the i64 unique constraint still fires (host-validated)"
+        );
+    }
+
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
     /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
     /// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
@@ -7122,15 +7235,37 @@ impl Engine {
             .columns
             .iter()
             .all(|column| {
-                // TYPE-COVERAGE track 2: every i32-section type is device-authoritative-capable
-                // (the A4a/A4c primitives type from the catalog; appends/indexes ride the same
-                // i32 encoding).
+                // TYPE-COVERAGE track 2 (stages 1 + iii): every FIXED-WIDTH-section type is
+                // device-authoritative-capable (A4a/A4c type from the catalog; appends ride the
+                // section-aware encoder). The gather requires the shard layout the flag admits,
+                // so i64 columns only ever appear here when `shard_int8_section_enabled` built
+                // them — eligibility composes with admission by construction.
                 matches!(
                     column.ty,
                     gpu_db_sql::SqlType::Int4
                         | gpu_db_sql::SqlType::Date
                         | gpu_db_sql::SqlType::Int2
+                        | gpu_db_sql::SqlType::Int8
+                        | gpu_db_sql::SqlType::Timestamp
                 )
+            })
+            && table.indexes.iter().all(|index| {
+                // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
+                // i64 column could not be validated device-side, so such a table must not
+                // elide (its probes would decline -> rehydrate thrash at best).
+                !index.unique
+                    || table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == index.column)
+                        .is_some_and(|column| {
+                            matches!(
+                                column.ty,
+                                gpu_db_sql::SqlType::Int4
+                                    | gpu_db_sql::SqlType::Date
+                                    | gpu_db_sql::SqlType::Int2
+                            )
+                        })
             })
             && unique_ok
             && table.check_constraints.is_empty()
@@ -8816,12 +8951,16 @@ impl Engine {
         table: &RelationalTable,
         read_txn: u64,
     ) -> Option<Vec<(u64, Vec<SqlValue>)>> {
-        // TYPE-COVERAGE track 2: every i32-SECTION type gathers with its catalog-derived
-        // variant (was strictly-Int4 with the F1 mistype decline).
+        // TYPE-COVERAGE track 2 (stage iii): every FIXED-WIDTH-section type gathers with its
+        // catalog-derived variant (i32 via one u32/slot; i64 via two — the 4-mod-8 discipline).
         if table.columns.iter().any(|column| {
             !matches!(
                 column.ty,
-                gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2
+                gpu_db_sql::SqlType::Int4
+                    | gpu_db_sql::SqlType::Date
+                    | gpu_db_sql::SqlType::Int2
+                    | gpu_db_sql::SqlType::Int8
+                    | gpu_db_sql::SqlType::Timestamp
             )
         }) {
             return None;
@@ -8866,15 +9005,38 @@ impl Engine {
                 Some(region) => Some(region.read_resident_i32_column(0, rows * 2).ok()?),
                 None => None,
             };
-            let mut columns: Vec<Vec<i32>> = Vec::with_capacity(table.columns.len());
+            // Per-column raw reads: i32 sections one u32/slot, i64 sections two u32/slot (the
+            // halves pair below). The enum keeps slot addressing uniform for the typing zip.
+            enum GatheredColumn {
+                I32(Vec<i32>),
+                I64(Vec<i32>),
+            }
+            let mut columns: Vec<GatheredColumn> = Vec::with_capacity(table.columns.len());
             for idx in 0..table.columns.len() {
-                let base = crate::relational_model::resident_device_int4_column_offset(
-                    &descriptor,
-                    table,
-                    idx,
-                )
-                .ok()?;
-                columns.push(device_memory.read_resident_i32_column(base, rows).ok()?);
+                match table.columns[idx].ty {
+                    gpu_db_sql::SqlType::Int8 | gpu_db_sql::SqlType::Timestamp => {
+                        let base = crate::relational_model::resident_device_int8_column_offset(
+                            &descriptor,
+                            table,
+                            idx,
+                        )
+                        .ok()?;
+                        columns.push(GatheredColumn::I64(
+                            device_memory.read_resident_i32_column(base, rows * 2).ok()?,
+                        ));
+                    }
+                    _ => {
+                        let base = crate::relational_model::resident_device_int4_column_offset(
+                            &descriptor,
+                            table,
+                            idx,
+                        )
+                        .ok()?;
+                        columns.push(GatheredColumn::I32(
+                            device_memory.read_resident_i32_column(base, rows).ok()?,
+                        ));
+                    }
+                }
             }
             let u64_at = |halves: &[i32], slot: usize| -> u64 {
                 (halves[slot * 2] as u32 as u64) | ((halves[slot * 2 + 1] as u32 as u64) << 32)
@@ -8892,8 +9054,15 @@ impl Engine {
                 let row: Vec<SqlValue> = columns
                     .iter()
                     .zip(table.columns.iter())
-                    .map(|(column, catalog_column)| {
-                        sql_value_from_i32_section(catalog_column.ty, column[slot])
+                    .map(|(column, catalog_column)| match column {
+                        GatheredColumn::I32(vals) => {
+                            sql_value_from_i32_section(catalog_column.ty, vals[slot])
+                        }
+                        GatheredColumn::I64(halves) => {
+                            let lo = halves[slot * 2] as u32 as u64;
+                            let hi = halves[slot * 2 + 1] as u32 as u64;
+                            sql_value_from_i64_section(catalog_column.ty, (lo | (hi << 32)) as i64)
+                        }
                     })
                     .collect::<Option<Vec<SqlValue>>>()?;
                 out.push((row_id, row));
