@@ -198,6 +198,11 @@ impl Engine {
             // the fallback chain (value-index resolve -> scan) remains complete behind it.
             dml_device_resolve_enabled: std::sync::atomic::AtomicBool::new(true),
             dml_device_validate_enabled: std::sync::atomic::AtomicBool::new(true),
+            // A5 FLIP HELD (2026-07-03): the flip is user-authorized but BLOCKED on a real SI
+            // violation the SV6 concurrent hammer caught under elided same-key churn (a reader
+            // saw two consecutive versions at once — an older version's tombstone never landed;
+            // repro + leading theory in the handover). Flip both to true ONLY after that fix +
+            // a green hammer.
             host_install_elision_enabled: std::sync::atomic::AtomicBool::new(false),
             auto_vacuum_enabled: std::sync::atomic::AtomicBool::new(false),
             tombstone_churn_threshold_override: std::sync::atomic::AtomicU64::new(0),

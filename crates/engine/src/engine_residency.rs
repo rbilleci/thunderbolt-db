@@ -709,6 +709,8 @@ mod capacity_payload_tests {
         };
 
         let e = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        e.set_host_install_elision_enabled(false);
         // THE FLIP: this test gates the SINGLE-BUFFER layer's in-place append + retained-template +
         // wave-index contract (1b-ii-c / Finding A). Sharded tables are served by the sharded batched
         // gather in production (the retained-template API cleanly rejects sharded shapes); the SHARDED
@@ -867,6 +869,8 @@ mod capacity_payload_tests {
         // Resident path: auto-admit -> the open-shard append fires repeatedly, accumulating host_rows
         // SEGMENTS between headroom-overflow re-admits.
         let e = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        e.set_host_install_elision_enabled(false);
         // THE FLIP: this test exercises the SINGLE-BUFFER layer (a supported, settable configuration;
         // sharded is the default) — pin the layout under test.
         e.set_shard_residency_enabled(false);
@@ -885,6 +889,8 @@ mod capacity_payload_tests {
 
         // Non-resident store baseline (single canonical materialization).
         let base = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        base.set_host_install_elision_enabled(false);
         load(&base);
 
         let resident = |sql: &str| match parse_command(sql).unwrap() {
@@ -1999,6 +2005,8 @@ mod capacity_payload_tests {
 
         // --- flag ON: the single-row DELETE routes through the in-place tombstone ---
         let e = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        e.set_host_install_elision_enabled(false);
         e.set_resident_delete_tombstone_enabled(true);
         load(&e);
         assert!(
@@ -2045,6 +2053,8 @@ mod capacity_payload_tests {
 
         // --- flag OFF control: the SAME single-row DELETE via re-admit -> identical result, NO region ---
         let c = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        c.set_host_install_elision_enabled(false);
         c.set_resident_delete_tombstone_enabled(false); // THE FLIP: the control pins the re-admit path
         load(&c);
         c.execute_text(202, "DELETE FROM accounts WHERE id = 130")
@@ -2121,6 +2131,8 @@ mod capacity_payload_tests {
 
         // --- flag ON: the single-row UPDATE routes through tombstone-old + append-new ---
         let e = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        e.set_host_install_elision_enabled(false);
         e.set_resident_update_tombstone_enabled(true);
         load(&e);
         assert!(
@@ -2204,6 +2216,8 @@ mod capacity_payload_tests {
 
         // --- flag OFF control: the SAME single-row UPDATE via re-admit -> identical result, NO region ---
         let c = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        c.set_host_install_elision_enabled(false);
         c.set_resident_update_tombstone_enabled(false); // THE FLIP: the control pins the re-admit path
         load(&c);
         c.execute_text(202, "UPDATE accounts SET balance = 9999 WHERE id = 130")
@@ -2383,6 +2397,10 @@ mod capacity_payload_tests {
         e.set_auto_admit_on_commit(true);
         e.set_resident_delete_tombstone_enabled(true);
         e.set_resident_update_tombstone_enabled(true);
+        // A5 FLIP GATE (open SI bug): run this hammer with the next line commented IN to
+        // reproduce the elided-churn double-read (reader sees versions t and t+1 at once —
+        // an older version's tombstone misses under the rehydrate-at-prepare path).
+        e.set_host_install_elision_enabled(false);
         e.set_shard_size_target(64);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
             .unwrap();
@@ -2405,6 +2423,13 @@ mod capacity_payload_tests {
                         .execute_relational_select_text("SELECT id, balance FROM accounts WHERE id = 130")
                         .unwrap()
                         .rows;
+                    if rows.len() != 1 {
+                        eprintln!(
+                            "[flipdbg] DOUBLE-READ: rows={:?} committed={}",
+                            (0..rows.len()).map(|r| rows.row(r).to_vec()).collect::<Vec<_>>(),
+                            e.committed_seq()
+                        );
+                    }
                     assert_eq!(
                         rows.len(),
                         1,
@@ -3320,6 +3345,8 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn flip_f1_filtered_shapes_gpu_served_and_match_single_buffer_oracle() {
         let load = |e: &Engine| {
+            // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+            e.set_host_install_elision_enabled(false);
             e.set_auto_admit_on_commit(true);
             e.execute_text(1, "CREATE TABLE t (a INT, b INT, c INT)")
                 .unwrap();
@@ -4073,8 +4100,12 @@ mod capacity_payload_tests {
             "UPDATE accounts SET balance = 1234 WHERE id = 40 OR id = 41",
         ];
         let e = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        e.set_host_install_elision_enabled(false);
         load(&e, true);
         let o = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        o.set_host_install_elision_enabled(false);
         load(&o, false);
         let ptrs_before: Vec<(u32, u64)> = {
             let shards = e
@@ -4262,6 +4293,8 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn a4a_device_materialization_matches_host_fetch() {
         let e = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        e.set_host_install_elision_enabled(false);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
@@ -4579,6 +4612,8 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn a2_same_key_update_chain_stays_on_incremental_path() {
         let e = Engine::new_local();
+        // PINNED NON-ELIDED (A5 flip): the oracle reads the HOST store / pins pre-elision mechanics (production-live for non-eligible tables).
+        e.set_host_install_elision_enabled(false);
         e.set_auto_admit_on_commit(true);
         e.set_shard_size_target(64);
         e.execute_text(1, "CREATE TABLE accounts (id INT, balance INT)")
