@@ -2280,12 +2280,51 @@ impl Engine {
         commit_seq: Index,
     ) -> Option<usize> {
         let located = self.locate_resident_delete_slots(table, predicate)?;
+        // Ledger #16 (SI-fix audit follow-up) — the DEFENSIVE consumer gate: the locate is
+        // visibility-blind (physical int4-image match), so a caller-supplied STALE old image can
+        // physically match an ALREADY-DEAD slot; re-stamping it would leave the truly-current
+        // version live (the fixed SV6 double-read class). Read each located slot's deleted_by
+        // FIRST and treat any already-tombstoned slot as NO MATCH (drop it) — the caller's
+        // exact-count gate then mismatches and falls to the always-correct re-admit. One i64
+        // read per located slot on an O(rows-touched) path; a false "already dead" can only
+        // trigger a correct rebuild, never a wrong result.
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
         let mut total = 0usize;
         for (shard_id, slots) in &located {
-            if !self.tombstone_resident_shard_slots(&table.name, *shard_id, slots, commit_seq) {
+            let live_slots: Vec<u32> = match table_shards
+                .iter()
+                .find(|shard| shard.shard_id == *shard_id)
+                .and_then(|shard| shard.deleted_by_region.clone())
+            {
+                None => slots.clone(), // no region = delete-free shard: every located slot is live
+                Some(region) => slots
+                    .iter()
+                    .copied()
+                    .filter(|slot| {
+                        region
+                            .read_resident_i32_column(u64::from(*slot) * 8, 2)
+                            .ok()
+                            .map(|halves| {
+                                let deleted =
+                                    (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
+                                // The delete-free fill (0x7F...) reads far above any real seq.
+                                deleted > commit_seq
+                            })
+                            // A device-read failure keeps the slot: the stamp attempt below
+                            // fails loudly -> None -> re-admit (never a silent drop).
+                            .unwrap_or(true)
+                    })
+                    .collect(),
+            };
+            if live_slots.is_empty() {
+                continue;
+            }
+            if !self.tombstone_resident_shard_slots(&table.name, *shard_id, &live_slots, commit_seq)
+            {
                 return None;
             }
-            total = total.saturating_add(slots.len());
+            total = total.saturating_add(live_slots.len());
         }
         Some(total)
     }

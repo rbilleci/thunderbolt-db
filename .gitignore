@@ -6,3 +6,4 @@ target/
 # Python bytecode cache from scripts/ (e.g. aggregate_concurrency_runs.py)
 __pycache__/
 *.pyc
+claude.log
