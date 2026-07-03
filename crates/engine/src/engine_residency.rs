@@ -4603,6 +4603,142 @@ mod capacity_payload_tests {
         );
     }
 
+    /// M1 design B — WAVE-TIME batched validation differential: an elided PK'd table runs the
+    /// constraint+DML gauntlet with wave-batch ON (device_write_locate + wave_batch) vs the
+    /// host-probe oracle (both off). Every outcome (incl 23505 text) + read must match — the
+    /// deferred INSERT unique check now happens at wave time, batched. NON-VACUITY: the batched
+    /// locate FIRED (device_write_locate_hits > 0).
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_batch_validation_matches_host_oracle() {
+        let run = |wave_batch: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            if wave_batch {
+                e.set_device_write_locate_enabled(true);
+                e.set_device_write_locate_wave_batch_enabled(true);
+            }
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| format!("({k},{})", k * 10))
+                    .collect();
+                e.execute_text(seq, &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))
+                    .unwrap();
+                seq += 1;
+            }
+            // A DDL mid-stream forces the catalog-drift full-validate path for a later insert.
+            let ladder = [
+                "INSERT INTO t (id, v) VALUES (500, 5000)",   // new key -> pass (batched)
+                "INSERT INTO t (id, v) VALUES (42, 1)",       // dup seeded key -> 23505
+                "INSERT INTO t (id, v) VALUES (500, 9)",      // dup elided-era key -> 23505
+                "UPDATE t SET v = 7 WHERE id = 130",          // A2 resolve (not a wave-batch insert)
+                "DELETE FROM t WHERE id = 43",
+                "INSERT INTO t (id, v) VALUES (43, 2)",       // reuse deleted key -> pass
+            ];
+            let mut outcomes: Vec<Result<(), String>> = Vec::new();
+            for sql in &ladder {
+                outcomes.push(
+                    e.execute_text(seq, sql).map(|_| ()).map_err(|err| err.to_string()),
+                );
+                seq += 1;
+            }
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, v FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            (e, outcomes, rows)
+        };
+        let (on, on_out, on_rows) = run(true);
+        let (off, off_out, off_rows) = run(false);
+        assert_eq!(on_out, off_out, "wave-batch outcome ladder == host oracle");
+        assert_eq!(on_rows, off_rows, "wave-batch reads == host oracle");
+        assert!(
+            on.device_write_locate_hits() > 0,
+            "non-vacuity: the batched locate must have FIRED"
+        );
+        assert_eq!(off.device_write_locate_hits(), 0);
+    }
+
+    /// M1 design B — the CONCURRENT dup race through the WAVE-BATCH path: 8 writers contend for
+    /// the SAME 200 keys on an elided PK'd table with wave-batch validation ON. Exactly one
+    /// writer wins each key: same-wave dups fall to the unique-slot conflict ledger (#18), and
+    /// already-committed dups fall to the wave-batch device locate. No key double-inserts.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn wave_batch_concurrent_dup_race_single_winner() {
+        let e = std::sync::Arc::new(Engine::new_local());
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.set_device_write_locate_enabled(true);
+        e.set_device_write_locate_wave_batch_enabled(true);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k * 10))
+                .collect();
+            e.execute_text(seq, &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))
+                .unwrap();
+            seq += 1;
+        }
+        // Enter elision.
+        for t in 0..20_u64 {
+            e.execute_dml_concurrent(100 + t, &format!("INSERT INTO t (id, v) VALUES ({}, 1)", 5_000 + t))
+                .unwrap();
+        }
+        assert!(e.table_install_elided("t"), "premise: elided");
+        let wins: Vec<std::sync::atomic::AtomicU32> =
+            (0..200).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        let txn = std::sync::atomic::AtomicU64::new(10_000);
+        std::thread::scope(|scope| {
+            for w in 0..8_u64 {
+                let e = &e;
+                let wins = &wins;
+                let txn = &txn;
+                scope.spawn(move || {
+                    for k in 0..200_i64 {
+                        let key = 20_000 + ((k + w as i64 * 25) % 200);
+                        loop {
+                            let t = txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match e.execute_dml_concurrent(
+                                t,
+                                &format!("INSERT INTO t (id, v) VALUES ({key}, {w})"),
+                            ) {
+                                Ok(()) => {
+                                    wins[(key - 20_000) as usize]
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(err) => {
+                                    if err.to_string().contains("duplicate key") {
+                                        break;
+                                    }
+                                    // serialization conflict -> retry
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        for (k, c) in wins.iter().enumerate() {
+            assert_eq!(
+                c.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "key {k}: exactly one winner"
+            );
+        }
+        let rows = e.execute_relational_select_text("SELECT id FROM t").unwrap().rows;
+        assert_eq!(rows.len(), 200 + 20 + 200, "seed + waved + one win per contended key");
+    }
+
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
     /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
     /// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
@@ -7288,6 +7424,65 @@ impl Engine {
     pub(crate) fn device_write_locate_enabled(&self) -> bool {
         self.device_write_locate_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// M1 design B: enable/disable WAVE-TIME batched PK-unique validation.
+    pub fn set_device_write_locate_wave_batch_enabled(&self, on: bool) {
+        self.device_write_locate_wave_batch_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn device_write_locate_wave_batch_enabled(&self) -> bool {
+        self.device_write_locate_wave_batch_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// M1 design B: is this INSERT's PK-unique check DEFERRABLE to the wave-time batched locate?
+    /// The eligibility is SHARED by the off-lock skip (`prepare_insert`) and the wave-time
+    /// validate (the sequencer), so they can never diverge into a constraint bypass. Requires:
+    /// the wave-batch + device-locate flags; the table ELIDED (device-authoritative — the locate
+    /// is the source of truth); every unique index on a strictly-i32 column (the device locate
+    /// probes i32 keys); NO CHECK / outbound-FK / inbound-FK (those aren't device-batch-validated
+    /// here — they keep the off-lock path). Same-wave dups are caught by the unique-slot conflict
+    /// ledger (#18); the wave-time locate catches ALREADY-COMMITTED dups.
+    pub(crate) fn insert_unique_wave_batchable(
+        &self,
+        catalog: &CatalogSnapshot,
+        table: &RelationalTable,
+    ) -> bool {
+        if !self.device_write_locate_wave_batch_enabled() || !self.device_write_locate_enabled() {
+            return false;
+        }
+        if !self.table_install_elided(&table.name) {
+            return false;
+        }
+        if !table.check_constraints.is_empty() || !table.foreign_keys.is_empty() {
+            return false;
+        }
+        // No OTHER table references this one (inbound FK -> off-lock path).
+        if catalog.relational_catalog.values().any(|other| {
+            other
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.referenced_table == table.name)
+        }) {
+            return false;
+        }
+        // At least one unique index, and EVERY unique index is on a strictly-i32 column.
+        let mut has_unique = false;
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            has_unique = true;
+            let Some(column) = table.columns.iter().find(|c| c.name == index.column) else {
+                return false;
+            };
+            if !matches!(
+                column.ty,
+                gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2
+            ) {
+                return false;
+            }
+        }
+        has_unique
     }
 
     /// M1: PK locates served by the DEVICE kernel (non-vacuity telemetry).

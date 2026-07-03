@@ -431,6 +431,11 @@ pub struct Engine {
     /// hash cache — key->slot ADDRESSING is device work. Default OFF until the SLO gate + audit;
     /// the host cache stays as the flag-off oracle until M3 deletes it. Kill switch -> host probe.
     device_write_locate_enabled: std::sync::atomic::AtomicBool,
+    /// M1 design B (wave-time batched validation): eligible INSERTs' PK-unique check is DEFERRED
+    /// from the off-lock prepare to the wave sequencer, which batches the whole wave's PK needles
+    /// into ONE device locate (the amortization win: launch cost is flat vs batch size). Default
+    /// OFF; requires device_write_locate_enabled. Kill switch -> per-item off-lock validation.
+    device_write_locate_wave_batch_enabled: std::sync::atomic::AtomicBool,
     auto_vacuum_enabled: std::sync::atomic::AtomicBool,
     tombstone_churn_threshold_override: std::sync::atomic::AtomicU64,
     /// S-d2c: the target row count per shard (the rollover/seal threshold; default 4M). Settable

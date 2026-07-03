@@ -175,8 +175,22 @@ impl Engine {
         // probe per commit was the PK'd arm's largest sequencer-side residual.
         let ledger_covered = validation == InsertPrepareValidation::ReResolveLedgerCovered
             && table.foreign_keys.is_empty();
-        if ledger_covered {
-            // fall through to encode: PK not-null already ran above; unique/CHECK covered.
+        // M1 design B (wave-time batched validation): eligible INSERTs DEFER the PK-unique check
+        // to the wave sequencer (one batched device locate for the whole wave). The off-lock
+        // prepare here skips it; the sequencer re-validates via `wave_batch_validate_unique`
+        // (SHARED eligibility `insert_unique_wave_batchable` -> no bypass). PK not-null already
+        // ran above; eligible tables have only unique indexes (no CHECK/FK), so the whole
+        // constraint pass is deferred. Off the wave path (serialized apply, Full validation)
+        // this is never set -> unchanged.
+        // Scoped to SINGLE-ROW inserts: a multi-row insert's in-statement dup (two rows, same PK)
+        // is caught by the off-lock `seen` set but NOT by a pre-wave device locate, so multi-row
+        // keeps the off-lock path. The bench + common OLTP shape is single-row.
+        let wave_deferred = validation == InsertPrepareValidation::Full
+            && insert.rows.len() == 1
+            && self.insert_unique_wave_batchable(&self.catalog_snapshot(), &table);
+        if ledger_covered || wave_deferred {
+            // fall through to encode: PK not-null ran; unique covered by the ledger (#18) or
+            // deferred to the wave batch (B).
         } else if self.dml_value_index_resolve_enabled() && !self_referencing_fk {
             if has_constraints {
                 let validate_started = Instant::now();
@@ -836,7 +850,7 @@ impl Engine {
     /// caller-pinned view from before that publish is a stale prefix whose value_index would
     /// silently miss elided-era rows (the A5-flip SI-fix class, here a constraint bypass).
     /// Snapshot correctness is untouched: visibility rides `visibility.read_txn_id`.
-    fn visible_row_with_value(
+    pub(crate) fn visible_row_with_value(
         &self,
         table: &RelationalTable,
         visibility: StorageVisibility,

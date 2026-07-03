@@ -843,6 +843,82 @@ impl Engine {
         Some(out)
     }
 
+    /// M1 design B (wave-time batched validation): probe a BATCH of `needles` against the table's
+    /// DEVICE hash indexes in ONE kernel launch, returning each needle's HIT COUNT (any shard). A
+    /// FAST-PATH FILTER for the wave's PK-unique validation: `count == 0` proves NO physical slot
+    /// holds the key -> no visible dup -> the INSERT passes with zero further work (the common
+    /// case: unique keys). `count > 0` (incl u32::MAX overflow) -> the caller runs the
+    /// authoritative per-item `visible_row_with_value` (a tombstoned/invisible slot is a
+    /// false-positive here, filtered there). `None` (caller validates per-item) on: no shards,
+    /// any invalid/pressured/mismatched shard, a dup-key index (== host Declined), a device-probe
+    /// failure. One launch amortizes across the whole wave (the amortization curve: launch cost
+    /// is flat vs batch size).
+    pub(crate) fn wave_batch_locate_hit_counts(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        needles: &[i32],
+    ) -> Option<Vec<u32>> {
+        const MAX_HITS: u32 = 4;
+        if needles.is_empty() {
+            return Some(Vec::new());
+        }
+        let shards = self.read_state.residency.shards.load();
+        let table_shards = shards.get(&table.name)?;
+        if table_shards.is_empty() {
+            return None;
+        }
+        let runtime_snapshot = self.router.runtime().snapshot();
+        let mut descs: Vec<WriteLocateShard> = Vec::new();
+        for shard in table_shards.iter() {
+            if shard.schema != table.schema || shard.table != table.name {
+                return None;
+            }
+            if !shard.is_valid(
+                runtime_snapshot
+                    .memory_pressured_gpu_ids
+                    .contains(&shard.gpu_id),
+            ) {
+                return None;
+            }
+            if shard.row_count == 0 {
+                continue;
+            }
+            let descriptor = self.resident_snapshot_for_shard(shard, table);
+            let filter_offset =
+                resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
+            let device_memory = shard.device_memory.clone()?;
+            let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
+                &table.name,
+                shard.shard_id,
+                filter_idx,
+                &device_memory,
+                filter_offset,
+                shard.row_count,
+            )?;
+            descs.push(WriteLocateShard {
+                index: device_index,
+                table_mask,
+                hash_shift,
+            });
+        }
+        if descs.is_empty() {
+            return Some(vec![0u32; needles.len()]); // no probed shards -> every needle misses
+        }
+        let ctx = Arc::clone(&descs[0].index);
+        let result = ctx
+            .submit_multi_shard_i32_write_locate(&descs, needles, MAX_HITS)
+            .ok()?;
+        if result.count.len() != needles.len() {
+            return None;
+        }
+        self.read_state
+            .residency
+            .device_write_locate_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(result.count)
+    }
+
     /// M1 (charter-pure): the DEVICE write-locate — probe the per-shard DEVICE hash indexes in ONE
     /// kernel launch (`submit_multi_shard_i32_write_locate`) instead of the host `shard_pk_index`
     /// hash cache. Builds the SAME `Vec<ShardPkHit>` the host path does (region Arcs captured from

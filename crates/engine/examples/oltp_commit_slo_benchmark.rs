@@ -127,6 +127,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         if std::env::var("GPU_DB_BENCH_DEVLOCATE").is_ok_and(|v| v == "1") {
             e.set_device_write_locate_enabled(true);
         }
+        // M1 design B: GPU_DB_BENCH_WAVEBATCH=1 = wave-time batched PK-unique validation.
+        if std::env::var("GPU_DB_BENCH_WAVEBATCH").is_ok_and(|v| v == "1") {
+            e.set_device_write_locate_enabled(true);
+            e.set_device_write_locate_wave_batch_enabled(true);
+        }
         // Constrained elision is DEFAULT ON since the 2026-07-03 flip; GPU_DB_BENCH_CELIDE=0
         // is the kill-switch A/B arm (GPU_DB_BENCH_CELIDE=1 remains accepted, now redundant).
         match std::env::var("GPU_DB_BENCH_CELIDE").as_deref() {
@@ -241,7 +246,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 engine.dml_device_validate_hits(),
             );
             let (wx, px, rb) = engine.pk_index_maintenance_stats();
-            eprintln!("    [pk-index: writer-extends {wx}  prober-extends {px}  rebuilds {rb}]");
+            eprintln!("    [pk-index: writer-extends {wx}  prober-extends {px}  rebuilds {rb}  devlocate {}]", engine.device_write_locate_hits());
         }
         let stats = engine.wal_group_commit_stats();
         let fsyncs = stats.flush_groups;

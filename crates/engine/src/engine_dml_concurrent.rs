@@ -490,6 +490,131 @@ impl Engine {
         })
     }
 
+    // (helper is a free fn below the impl)
+
+    /// M1 design B: WAVE-TIME batched PK-unique validation. For every eligible SINGLE-ROW INSERT
+    /// whose off-lock unique check was DEFERRED (`insert_unique_wave_batchable`, re-derived here
+    /// under the catalog-generation gate), batch the whole wave's PK needles per (table, column)
+    /// into ONE device locate (`wave_batch_locate_hit_counts`): count==0 -> no visible dup, pass;
+    /// count>0 -> the authoritative per-item `visible_row_with_value` (a tombstoned/invisible
+    /// slot passes there). Returns the byte-identical 23505 message per violating item position.
+    ///
+    /// CATALOG DRIFT (a constraint-adding DDL committed since the item's prepare, gen mismatch):
+    /// the item MIGHT have been deferred but its eligibility can't be re-derived, so full-validate
+    /// it now (redundant if it wasn't deferred, safe either way — DDL mid-wave is rare). SAME-wave
+    /// dups are caught by the unique-slot conflict ledger (#18), NOT here; this catches
+    /// ALREADY-COMMITTED dups. A locate DECLINE / non-batchable item -> per-item full validation.
+    fn wave_batch_validate_unique(
+        &self,
+        batch: &[CommitWaveItem],
+    ) -> std::collections::BTreeMap<usize, String> {
+        let mut violations: std::collections::BTreeMap<usize, String> =
+            std::collections::BTreeMap::new();
+        if !self.device_write_locate_wave_batch_enabled() {
+            return violations;
+        }
+        let catalog = self.catalog_snapshot();
+        // Groups: (table_name, filter_idx) -> [(item_position, needle, index_name)].
+        let mut groups: std::collections::BTreeMap<(String, usize), Vec<(usize, i32, String)>> =
+            std::collections::BTreeMap::new();
+        // Full-validate fallback for drifted / non-batchable inserts.
+        let mut full_validate: Vec<usize> = Vec::new();
+        for (pos, item) in batch.iter().enumerate() {
+            let Command::Insert(insert) = &item.cmd else {
+                continue;
+            };
+            if insert.rows.len() != 1 {
+                continue; // multi-row was validated off-lock (in-statement dup)
+            }
+            let Some(table) = catalog.relational_catalog.get(&insert.table) else {
+                continue; // a dropped table -> its own apply errors
+            };
+            let gen_matches = catalog.commit_seq == item.prepared_catalog_seq;
+            if gen_matches && self.insert_unique_wave_batchable(&catalog, table) {
+                // Re-derived eligible (== off-lock eligible) -> it was deferred. Extract each
+                // unique index's needle from the single insert row.
+                for index in table.indexes.iter().filter(|index| index.unique) {
+                    let Some((filter_idx, needle)) =
+                        insert_i32_unique_needle(insert, table, &index.column)
+                    else {
+                        // Can't bind the needle (odd shape) -> full-validate to be safe.
+                        full_validate.push(pos);
+                        break;
+                    };
+                    groups
+                        .entry((table.name.clone(), filter_idx))
+                        .or_default()
+                        .push((pos, needle, index.name.clone()));
+                }
+            } else if !gen_matches {
+                // Catalog drift: the item might have deferred off-lock -> full-validate now.
+                full_validate.push(pos);
+            }
+            // gen matches + not eligible -> off-lock validated it, nothing to do.
+        }
+        // Batched device locate per group; count==0 passes, count>0 authoritative-checks.
+        for ((table_name, filter_idx), members) in &groups {
+            let Some(table) = catalog.relational_catalog.get(table_name) else {
+                continue;
+            };
+            let needles: Vec<i32> = members.iter().map(|(_, n, _)| *n).collect();
+            match self.wave_batch_locate_hit_counts(table, *filter_idx, &needles) {
+                Some(counts) => {
+                    for ((pos, needle, index_name), &count) in members.iter().zip(counts.iter()) {
+                        if count == 0 {
+                            continue; // no physical slot holds the key -> no dup
+                        }
+                        // >0 hits: authoritative visibility+value check at the item's snapshot.
+                        let visibility = crate::StorageVisibility {
+                            read_txn_id: batch[*pos].read_snapshot,
+                        };
+                        let table_rows = self.read_state.mvcc.table_rows(table_name);
+                        let dup = self
+                            .visible_row_with_value(
+                                table,
+                                visibility,
+                                *filter_idx,
+                                &SqlValue::Int4(*needle),
+                                None,
+                            )
+                            .unwrap_or(false);
+                        let _ = table_rows;
+                        if dup {
+                            violations.entry(*pos).or_insert_with(|| {
+                                format!(
+                                    "duplicate key value violates unique index \"{index_name}\""
+                                )
+                            });
+                        }
+                    }
+                }
+                None => {
+                    // Locate declined -> full-validate each member (safe fallback).
+                    full_validate.extend(members.iter().map(|(pos, _, _)| *pos));
+                }
+            }
+        }
+        // Full validation for drifted / declined / unbindable inserts.
+        for pos in full_validate {
+            if violations.contains_key(&pos) {
+                continue;
+            }
+            let Command::Insert(insert) = &batch[pos].cmd else {
+                continue;
+            };
+            let Some(table) = catalog.relational_catalog.get(&insert.table) else {
+                continue;
+            };
+            let snapshot = self.dml_read_snapshot(batch[pos].read_snapshot);
+            // A pure re-validation via prepare_insert (Full) — any Err is the constraint verdict.
+            if let Err(err) = self.prepare_insert(insert, snapshot, None, InsertPrepareValidation::Full)
+            {
+                violations.insert(pos, err.to_string());
+            }
+        }
+        violations
+    }
+
     fn sequence_commit_wave_inner(&self, batch: Vec<CommitWaveItem>) {
         let guard = CommitWaveBatchGuard {
             engine: self,
@@ -636,7 +761,18 @@ impl Engine {
                     }
                 }
             };
+        // M1 design B: WAVE-TIME BATCHED PK-UNIQUE VALIDATION. Eligible INSERTs deferred their
+        // unique check off-lock (`prepare_insert`); validate the whole wave here with ONE device
+        // locate per (table, key-column) (the amortization win). Returns the item positions that
+        // are unique violations -> aborted in the loop below with the byte-identical 23505.
+        let wave_unique_violations = self.wave_batch_validate_unique(&batch);
         for (position, item) in batch.iter().enumerate() {
+            // M1 design B: a deferred INSERT whose PK value already exists (wave-batch verdict)
+            // aborts here — the same 23505 the off-lock validation would have raised.
+            if let Some(err) = wave_unique_violations.get(&position) {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(err.clone()))));
+                continue;
+            }
             // Batched-append ORDER: a non-INSERT item's re-resolve (device locate) and its
             // tombstone paths must observe every prior row of this wave — flush first.
             if !matches!(item.cmd, Command::Insert(_)) {
@@ -1359,4 +1495,31 @@ impl Engine {
             table_rows: self.read_state.mvcc.table_rows(table),
         }
     }
+}
+
+/// M1 design B: bind an INSERT's value for a UNIQUE-index column to its i32-section needle +
+/// the column's catalog position. Handles the insert's own column list (explicit or catalog
+/// order) and coerces the raw literal (Text->Date, Int4->Int2) as the DML binder does, then
+/// encodes via `i32_section_needle` (strict variant agreement). `None` (odd shape / non-i32
+/// section / NULL / uncoercible) -> the caller full-validates that item instead of batching.
+/// SINGLE-ROW only (the caller gates on `insert.rows.len() == 1`).
+fn insert_i32_unique_needle(
+    insert: &Insert,
+    table: &RelationalTable,
+    unique_column: &str,
+) -> Option<(usize, i32)> {
+    let filter_idx = table.columns.iter().position(|c| c.name == *unique_column)?;
+    let column_ty = table.columns[filter_idx].ty;
+    let row = insert.rows.first()?;
+    // Where does this column's value sit in the insert row? Explicit column list -> its index;
+    // empty column list -> catalog order (== filter_idx).
+    let source_pos = if insert.columns.is_empty() {
+        filter_idx
+    } else {
+        insert.columns.iter().position(|c| c == unique_column)?
+    };
+    let raw = row.get(source_pos)?.clone();
+    let coerced = coerce_filter_literal(raw, column_ty);
+    let needle = crate::engine_residency::i32_section_needle(column_ty, &coerced)?;
+    Some((filter_idx, needle))
 }
