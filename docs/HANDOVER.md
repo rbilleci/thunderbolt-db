@@ -32,7 +32,7 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: TRACK-1 SLICE 1 + THE #18 ROUND ARE SHIPPED (5 commits through `78049145`: PK'd 923→~93k @32w stable, p99 <0.7ms; three audits adopted, every mechanism sabotage-verified). NOW: TRACK 2 SLICE 1 — Date/Int2 typing (near-free: they ride the i32 section; the A4a/A4c/A3 SqlValue typing + eligibility gate them). PENDING USER CHECK-IN: the constrained_elision_enabled DEFAULT FLIP (evidence ready — flips are user-authorized by precedent). >100k PK'd = the structural burst levers, not micro-opts (memory `type-coverage-14`). <<<
+## >>> THE ONE NEXT ACTION: THREE SLICES SHIPPED (9 commits through `4447c7ee`: constrained elision 923→93k; ledger-#18 skip; Date/Int2 device-authoritative incl the LAST facade-seq seam). NOW: TRACK 2 SLICE 2 — int8/Timestamp (the first NEW device section: shard fields + i64 recompaction axis + i64 append chunks + the key path). PENDING USER CHECK-IN: the constrained_elision_enabled DEFAULT FLIP (evidence pack ready). <<<
 
 **THE RETIREMENT PROGRAM A1→A5 IS COMPLETE; THE FLIP IS LIVE** (`fd154409`/`f0c3101e`:
 `host_install_elision_enabled` + `auto_vacuum_enabled` default ON; SLO 104-124k sustained on PK-less
