@@ -3841,6 +3841,213 @@ mod capacity_payload_tests {
         assert_eq!(off.host_install_elisions(), 0, "flag OFF never elides");
     }
 
+    /// AUDIT f80f2350 FINDING A regression: a single-entry constraint DDL (`CREATE UNIQUE
+    /// INDEX`) whose apply-time row validator reads an ELIDED table must not self-deadlock on
+    /// the commit lock. The pre-fix wedge: the off-lock execute_text sweep de-elides, a racing
+    /// INSERT wave RE-ELIDES during the DDL's commit window, the under-lock
+    /// `visible_relational_rows` seam then called `rehydrate_elided_serialized` whose re-lock
+    /// branch blocked on the mutex this thread held — permanently wedging the commit path. The
+    /// fix flags the whole apply (and the whole wave) as an internal read so the seam takes its
+    /// direct branch. This hammers the interleaving and fails by TIMEOUT if any iteration
+    /// wedges.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn constrained_elision_ddl_race_does_not_wedge_the_commit_path() {
+        let e = std::sync::Arc::new(Engine::new_local());
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        // Defaults: elision ON (the A5 flip). The wedge repro does NOT need constrained
+        // elision — the DDL's validator read on an A5-elided table is enough.
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k * 10))
+                .collect();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )
+            .unwrap();
+            seq += 1;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let txn = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(10_000));
+        // Writer pressure: keeps the table entering elision between the DDL's off-lock sweep
+        // and its commit window (the race the wedge needs).
+        let writers: Vec<_> = (0..4_u64)
+            .map(|w| {
+                let e = std::sync::Arc::clone(&e);
+                let stop = std::sync::Arc::clone(&stop);
+                let txn = std::sync::Arc::clone(&txn);
+                std::thread::spawn(move || {
+                    let mut i = 0_u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let t = txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let id = 1_000_000 + w * 1_000_000 + i;
+                        // Ignore result: unique-index windows can reject dup-free inserts only
+                        // via serialization retries; correctness is asserted at the end.
+                        let _ = e.execute_dml_concurrent(
+                            t,
+                            &format!("INSERT INTO t (id, v) VALUES ({id}, 1)"),
+                        );
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        {
+            let e = std::sync::Arc::clone(&e);
+            let txn = std::sync::Arc::clone(&txn);
+            std::thread::spawn(move || {
+                for round in 0..40_u64 {
+                    let t1 = txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(err) =
+                        e.execute_text(t1, "CREATE UNIQUE INDEX t_id_uq ON t (id)")
+                    {
+                        let _ = done_tx.send(Err(format!("round {round} create: {err}")));
+                        return;
+                    }
+                    let t2 = txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(err) = e.execute_text(t2, "DROP INDEX t_id_uq") {
+                        let _ = done_tx.send(Err(format!("round {round} drop: {err}")));
+                        return;
+                    }
+                }
+                let _ = done_tx.send(Ok(()));
+            });
+        }
+        // The wedge detector: pre-fix, an iteration deadlocks and the DDL thread never reports.
+        // DISTINGUISH deadlock from commit-mutex STARVATION (the std Mutex is unfair and the
+        // writers re-acquire in a tight loop): stop the writers after the first window — a
+        // starved DDL thread then finishes; a DEADLOCKED one stays stuck forever.
+        let outcome = match done_rx.recv_timeout(std::time::Duration::from_secs(45)) {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .map_err(|_| ())
+            }
+        };
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => panic!("DDL round failed: {err}"),
+            Err(()) => panic!(
+                "WEDGED: the DDL/wave race deadlocked the commit path (FINDING A regression) — \
+                 still stuck with all writers stopped"
+            ),
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        // Post-race sanity: the table still reads consistently.
+        let rows = e
+            .execute_relational_select_text("SELECT id, v FROM t")
+            .unwrap()
+            .rows;
+        assert!(rows.len() >= 200, "seed rows survive the race");
+    }
+
+    /// AUDIT f80f2350 FINDING B regression: an OFF-LOCK concurrent INSERT prepare whose
+    /// validator ladder REHYDRATES an elided PK'd table (device-probe decline via a dup-churned
+    /// open shard) must serialize the store mutation behind the commit lock — the pre-fix direct
+    /// call raced `with_table_mut`'s clone-mutate-publish against the sequencer (lost/torn
+    /// generation publish). Concurrent writer pressure keeps the sequencer busy while the
+    /// decline-bearing INSERTs prepare off-lock; end state must hold every row exactly once.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn constrained_elision_offlock_rehydrate_races_sequencer_safely() {
+        let e = std::sync::Arc::new(Engine::new_local());
+        e.set_auto_admit_on_commit(true);
+        e.set_shard_size_target(64);
+        e.set_constrained_elision_enabled(true);
+        e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let mut seq = 2u64;
+        for chunk in 0..2_i64 {
+            let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                .map(|k| format!("({k},{})", k * 10))
+                .collect();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )
+            .unwrap();
+            seq += 1;
+        }
+        // Elide via waves, then CHURN the open shard: the SV5 update-append duplicates key 130
+        // in the id column -> the cached index entry DECLINES (monotone) -> subsequent unique
+        // probes must rehydrate.
+        for t in 0..50_u64 {
+            e.execute_dml_concurrent(
+                100 + t,
+                &format!("INSERT INTO t (id, v) VALUES ({}, {t})", 5_000 + t),
+            )
+            .unwrap();
+        }
+        assert!(
+            e.table_install_elided("t"),
+            "premise: the PK'd table is elided before the churn"
+        );
+        e.execute_text(300, "UPDATE t SET v = 999 WHERE id = 130").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let txn = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(20_000));
+        let writers: Vec<_> = (0..6_u64)
+            .map(|w| {
+                let e = std::sync::Arc::clone(&e);
+                let stop = std::sync::Arc::clone(&stop);
+                let txn = std::sync::Arc::clone(&txn);
+                std::thread::spawn(move || {
+                    let mut i = 0_u64;
+                    let mut ok = 0_u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) && ok < 200 {
+                        let t = txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let id = 2_000_000 + w * 1_000_000 + i;
+                        if e.execute_dml_concurrent(
+                            t,
+                            &format!("INSERT INTO t (id, v) VALUES ({id}, 1)"),
+                        )
+                        .is_ok()
+                        {
+                            ok += 1;
+                        }
+                        i += 1;
+                    }
+                    ok
+                })
+            })
+            .collect();
+        let mut total_ok = 0_u64;
+        for w in writers {
+            total_ok += w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Every successful INSERT must be readable exactly once — a torn generation publish
+        // (the pre-fix race) loses rows or duplicates value-index entries.
+        let rows = e
+            .execute_relational_select_text("SELECT id, v FROM t")
+            .unwrap()
+            .rows;
+        let expected = 200 + 50 + total_ok as usize;
+        assert_eq!(
+            rows.len(),
+            expected,
+            "seed + waved + raced inserts, each exactly once"
+        );
+        let mut ids: Vec<i32> = (0..rows.len())
+            .map(|i| match &rows.row(i)[0] {
+                SqlValue::Int4(v) => *v,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), expected, "no duplicate ids survived the race");
+    }
+
     /// TYPE-COVERAGE track 1 — the CONCURRENT dup race on an ELIDED PK'd table: 8 writers all
     /// try to INSERT the SAME key set through `execute_dml_concurrent`. Off-lock prepares may
     /// all pass validation (the device probe at their snapshots sees no dup — flushes are
@@ -7888,7 +8095,20 @@ impl Engine {
             if !engine.table_install_elided(table_name) {
                 return Ok(()); // another rehydrator won the race
             }
-            let Some(table) = engine.relational_catalog_table(table_name) else {
+            // PUBLISHED-SNAPSHOT catalog read, NEVER `relational_catalog_table` (audit f80f2350
+            // FINDING A, second cycle): that accessor takes the CATALOG LATCH, and this seam is
+            // reachable from the DDL apply loop which already HOLDS it (the internal-read flag
+            // wrap) — the re-acquire self-deadlocked (gdb-verified: apply_and_publish held
+            // commit_mutex + latch, this closure blocked in ddl_catalog()). The published
+            // snapshot is layout-correct here: any column-shape-changing DDL rehydrates via the
+            // pre-commit execute_text sweep, so the mid-apply seam only fires on the re-elision
+            // race, where the layout is unchanged (the in-vacuum catalog-latch lesson, again).
+            let Some(table) = engine
+                .catalog_snapshot()
+                .relational_catalog
+                .get(table_name)
+                .cloned()
+            else {
                 return Ok(());
             };
             let seq = engine.committed_seq();

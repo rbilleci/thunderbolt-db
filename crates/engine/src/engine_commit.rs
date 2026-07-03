@@ -224,7 +224,28 @@ impl Engine {
     /// apply them under the catalog latch, maintain/invalidate residency, publish the catalog
     /// snapshot, then publish `committed_seq` at `publish_index` — callers run this only AFTER
     /// the corresponding WAL records are fsync-durable (WAL-before-visibility).
+    ///
+    /// AUDIT f80f2350 FINDING A: the whole apply runs inside the commit critical section, so
+    /// every internal read it performs (the DDL row-validators via `visible_relational_rows`,
+    /// mat-view reads, the elision rehydrate seams) is flagged via
+    /// `skip_leader_check_during_internal_read` — a lock-aware seam
+    /// (`rehydrate_elided_serialized`) then takes its DIRECT branch instead of self-deadlocking
+    /// on the commit_mutex re-lock. The repro this closes: a concurrent INSERT wave RE-ELIDED a
+    /// table during a single-entry `CREATE UNIQUE INDEX` commit's fsync window (the off-lock
+    /// execute_text sweep had de-elided it earlier); the apply-time unique validator then hit
+    /// the rehydrate seam under the held lock and wedged the commit path permanently.
     fn apply_and_publish_committed(
+        &self,
+        commit: &mut CommitState,
+        txn_id: TxnId,
+        publish_index: Index,
+    ) -> Result<(), EngineError> {
+        self.skip_leader_check_during_internal_read(|engine| {
+            engine.apply_and_publish_committed_inner(commit, txn_id, publish_index)
+        })
+    }
+
+    fn apply_and_publish_committed_inner(
         &self,
         commit: &mut CommitState,
         txn_id: TxnId,

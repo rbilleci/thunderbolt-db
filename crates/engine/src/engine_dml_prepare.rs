@@ -308,16 +308,12 @@ impl Engine {
                 // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
                 // the scan below reads the stale store.
                 if self.table_install_elided(&table.name) {
-                    // STAMP AT committed_seq, never the caller's visibility (the facade-seq
-                    // poison find — see `visible_row_with_value`).
-                    let seq = self.committed_seq();
-                    self.rehydrate_elided_table(
-                        &table,
-                        seq,
-                        &Default::default(),
-                        &Default::default(),
-                        seq,
-                    )?;
+                    // LOCK-AWARE + committed_seq stamps (audit f80f2350 FINDING B + the
+                    // facade-seq poison find — see `visible_row_with_value`). Also closes the
+                    // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
+                    // this prepare now rehydrates under the commit lock, never a bare
+                    // `with_table_mut` race.
+                    self.rehydrate_elided_serialized(&table.name)?;
                     // A5 FLIP SI FIX: the scan below must read the FRESH generation.
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
                 }
@@ -776,28 +772,29 @@ impl Engine {
         // host probe (the stale value-index would answer from missing/old rows = a constraint
         // hole); the fresh pin below then reads the post-rehydration generation.
         //
-        // STAMP AT THE ENGINE'S committed_seq, NEVER the caller's visibility (constrained-
-        // elision find): the serialized PREFLIGHT probes at the FACADE txn id (the P2 "worse
-        // visibility boundary"), and threading that into the reconcile stamped store versions
-        // with future/foreign seqs — seeded chains became all-dead-at-facade-seq, and the next
-        // reader's reconcile hit "tuple not found" (observed: tombstones at seq 310 against
-        // committed_seq 9). The probe itself still answers at `visibility` (MVCC: a fresher
-        // generation at an older read boundary is always sound).
+        // LOCK DISCIPLINE (audit f80f2350 FINDING B): rehydration goes through the LOCK-AWARE
+        // `rehydrate_elided_serialized` — this ladder runs OFF-LOCK in the concurrent INSERT
+        // prepare (where the direct call raced `with_table_mut`'s clone-mutate-publish against
+        // the sequencer: lost/torn generation publish) AND under the commit lock in the
+        // serialized preflight / wave re-resolve (where the internal-read flag routes it to the
+        // direct branch — the FINDING-A wraps). `_serialized` also stamps the reconcile at the
+        // ENGINE's committed_seq, never the caller's visibility (the facade-seq poison find:
+        // the preflight probes at the FACADE txn id; threading it into the reconcile stamped
+        // store versions with future/foreign seqs -> "tuple not found" for later readers).
+        let mut probe_visibility = visibility;
         if self.table_install_elided(&table.name) {
-            let seq = self.committed_seq();
-            self.rehydrate_elided_table(
-                table,
-                seq,
-                &Default::default(),
-                &Default::default(),
-                seq,
-            )?;
+            self.rehydrate_elided_serialized(&table.name)?;
+            // Audit FINDING C hardening: the reconcile stamps at committed_seq; a caller
+            // boundary BELOW it (facade txn ids are decoupled from commit seqs) would read
+            // `created_by > boundary` on the just-rehydrated committed rows = false MISS =
+            // constraint bypass. Raise the probe boundary to cover the reconcile's stamps.
+            probe_visibility.read_txn_id = probe_visibility.read_txn_id.max(self.committed_seq());
         }
         let fresh = self.read_state.mvcc.table_rows(&table.name);
         Self::any_visible_row_with_value(
             table,
             &fresh,
-            visibility,
+            probe_visibility,
             column_idx,
             value,
             exclude_keys,
@@ -1130,16 +1127,12 @@ impl Engine {
                 // A4e: the ladder is bypassed entirely -> an elided table must rehydrate before
                 // the scan below reads the stale store.
                 if self.table_install_elided(&table.name) {
-                    // STAMP AT committed_seq, never the caller's visibility (the facade-seq
-                    // poison find — see `visible_row_with_value`).
-                    let seq = self.committed_seq();
-                    self.rehydrate_elided_table(
-                        &table,
-                        seq,
-                        &Default::default(),
-                        &Default::default(),
-                        seq,
-                    )?;
+                    // LOCK-AWARE + committed_seq stamps (audit f80f2350 FINDING B + the
+                    // facade-seq poison find — see `visible_row_with_value`). Also closes the
+                    // GAP-1 TOCTOU: a table eliding between the concurrent guard's check and
+                    // this prepare now rehydrates under the commit lock, never a bare
+                    // `with_table_mut` race.
+                    self.rehydrate_elided_serialized(&table.name)?;
                     // A5 FLIP SI FIX: the scan below must read the FRESH generation.
                     table_rows = self.read_state.mvcc.table_rows(&table.name);
                 }

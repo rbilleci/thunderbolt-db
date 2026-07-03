@@ -459,6 +459,17 @@ impl Engine {
     /// this thread panics mid-wave (e.g. the apply-invariant panic, which also poisons the
     /// commit_mutex — the established wedge-don't-serve-torn-state policy).
     fn sequence_commit_wave(&self, batch: Vec<CommitWaveItem>) {
+        // AUDIT f80f2350 FINDING A/B: the entire wave (conflict-check, re-resolve, flush,
+        // apply, publish) runs inside the commit critical section — flag it so any lock-aware
+        // rehydrate seam reached from the re-resolve's validator ladder
+        // (`rehydrate_elided_serialized`) takes its DIRECT branch instead of re-locking the
+        // commit_mutex this thread already holds.
+        self.skip_leader_check_during_internal_read(|engine| {
+            engine.sequence_commit_wave_inner(batch)
+        })
+    }
+
+    fn sequence_commit_wave_inner(&self, batch: Vec<CommitWaveItem>) {
         let guard = CommitWaveBatchGuard {
             engine: self,
             items: &batch,
@@ -630,7 +641,58 @@ impl Engine {
                 commit_seq,
                 next_row_id,
             };
-            let delta = match self.prepare_dml(&item.cmd, install_snapshot) {
+            // AUDIT f80f2350 FINDING D: capture elided-ness BEFORE the re-resolve — a
+            // constrained INSERT's validator ladder can REHYDRATE on a device-probe decline
+            // (de-eliding the table mid-wave), and the rehydration gather reads only the
+            // DEVICE + the pre-elision store, so this wave's still-BUFFERED appends are
+            // invisible to it (they exist nowhere until the tail flush, whose unhandled
+            // recovery is elided-gated and would now skip). Detected below, repaired with the
+            // flush's own upsert convention.
+            let insert_table = match &item.cmd {
+                Command::Insert(insert) => Some(insert.table.clone()),
+                _ => None,
+            };
+            let was_elided = insert_table
+                .as_deref()
+                .is_some_and(|table| self.table_install_elided(table));
+            let prepared = self.prepare_dml(&item.cmd, install_snapshot);
+            if let Some(table_name) = insert_table.as_deref() {
+                if was_elided && !self.table_install_elided(table_name) {
+                    // Mid-re-resolve de-elision: reconcile the buffered same-table rows into
+                    // the freshly rehydrated store (repair runs even when the re-resolve
+                    // errored — the de-elision happened and the earlier items' hole exists
+                    // regardless). The tail flush still appends them to the device.
+                    if let Some((rows, row_ids, items_meta, _stamps)) =
+                        pending_appends.get(table_name)
+                    {
+                        if !rows.is_empty() {
+                            let first_seq =
+                                items_meta.first().map(|(_, seq)| *seq).unwrap_or_default();
+                            let last_seq =
+                                items_meta.last().map(|(_, seq)| *seq).unwrap_or_default();
+                            let upserts: std::collections::BTreeMap<u64, Vec<SqlValue>> =
+                                row_ids.iter().copied().zip(rows.iter().cloned()).collect();
+                            let catalog_table = self
+                                .relational_catalog_table(table_name)
+                                .expect("a just-rehydrated table is in the catalog");
+                            self.rehydrate_elided_table(
+                                &catalog_table,
+                                first_seq.saturating_sub(1),
+                                &upserts,
+                                &Default::default(),
+                                last_seq,
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "commit-path invariant violation: mid-wave de-elision \
+                                     repair on {table_name} failed: {err}"
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            let delta = match prepared {
                 Ok(delta) => delta,
                 Err(err) => {
                     item.set_outcome(Err(match err {
