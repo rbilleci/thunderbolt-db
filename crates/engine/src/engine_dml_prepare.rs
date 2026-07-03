@@ -536,8 +536,14 @@ impl Engine {
         let mut eq: Option<(usize, i32)> = None;
         for (idx, op, value) in group {
             if *op == SelectFilterOp::Eq {
-                if let SqlValue::Int4(needle) = value {
-                    eq = Some((*idx, *needle));
+                // TYPE-COVERAGE track 2: any i32-section-typed Eq (Int4/Date/Int2, variant
+                // agreeing with the column) can drive the locate.
+                if let Some(needle) = table
+                    .columns
+                    .get(*idx)
+                    .and_then(|column| crate::engine_residency::i32_section_needle(column.ty, value))
+                {
+                    eq = Some((*idx, needle));
                     break;
                 }
             }
@@ -664,14 +670,15 @@ impl Engine {
         if !hit.descriptor.resident_device_null_columns.is_empty() {
             return None; // raw i32 would read a stored NULL as 0 (the M3 decline discipline)
         }
-        // Audit A4 F1: strictly-Int4 tables ONLY. Date/Int2 share the device i32 section (the
-        // offset helper accepts them), but this materializer types every value `SqlValue::Int4` —
-        // a Date/Int2 column would come back as the WRONG SqlValue variant. Decline -> host fetch.
-        if table
-            .columns
-            .iter()
-            .any(|column| column.ty != crate::SqlType::Int4)
-        {
+        // Audit A4 F1, lifted by TYPE-COVERAGE track 2: Date/Int2 share the device i32 section
+        // and now materialize with their CATALOG-derived variant (`sql_value_from_i32_section`)
+        // — the F1 mistype (everything typed Int4) is gone. Non-i32-section types still decline.
+        if table.columns.iter().any(|column| {
+            !matches!(
+                column.ty,
+                crate::SqlType::Int4 | crate::SqlType::Date | crate::SqlType::Int2
+            )
+        }) {
             return None;
         }
         let slot = u64::from(hit.slot);
@@ -703,7 +710,10 @@ impl Engine {
                 .device_memory
                 .read_resident_i32_column(base + slot * 4, 1)
                 .ok()?;
-            row.push(SqlValue::Int4(*values.first()?));
+            row.push(crate::engine_residency::sql_value_from_i32_section(
+                table.columns[idx].ty,
+                *values.first()?,
+            )?);
         }
         Some(Some(row))
     }
@@ -732,10 +742,13 @@ impl Engine {
         if !self.dml_device_validate_enabled() {
             return None;
         }
-        let SqlValue::Int4(needle) = value else {
-            return None;
-        };
-        let hits = self.locate_resident_pk_via_shard_index_detailed(table, column_idx, *needle)?;
+        // TYPE-COVERAGE track 2: i32-section needles (Int4/Date/Int2) probe with the exact
+        // section encoding; anything else declines to the host ladder.
+        let needle = crate::engine_residency::i32_section_needle(
+            table.columns.get(column_idx)?.ty,
+            value,
+        )?;
+        let hits = self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle)?;
         let mut answer = false;
         for hit in &hits {
             let region = hit.row_id.as_ref()?;

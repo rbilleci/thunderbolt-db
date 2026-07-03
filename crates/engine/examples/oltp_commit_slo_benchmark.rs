@@ -90,7 +90,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         // core-banking table shape. Today a unique-indexed table is elision-INELIGIBLE and its
         // INSERT prepare pays the O(table) candidate scan (prepare_insert), so this arm is the
         // baseline the constrained-elision slice must move.
-        if std::env::var("GPU_DB_BENCH_PK").is_ok_and(|v| v == "1") {
+        if std::env::var("GPU_DB_BENCH_DATE").is_ok_and(|v| v == "1") {
+            // TYPE-COVERAGE track 2: the Date/Int2 PK'd shape — every i32-section type
+            // elides + validates device-side (pair with GPU_DB_BENCH_ELIDE/CELIDE).
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, d DATE, v INT2)")?;
+        } else if std::env::var("GPU_DB_BENCH_PK").is_ok_and(|v| v == "1") {
             e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")?;
         } else {
             e.execute_text(1, "CREATE TABLE t (id INT, v INT)")?;
@@ -131,7 +135,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     while !stop.load(Ordering::Relaxed) {
                         let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
                         let id = w as u64 * 10_000_000 + i; // stays within int4 for <=200 writers
-                        let sql = format!("INSERT INTO t (id, v) VALUES ({id}, 1)");
+                        let sql = if std::env::var("GPU_DB_BENCH_DATE").is_ok_and(|v| v == "1") {
+                            format!("INSERT INTO t (id, d, v) VALUES ({id}, '2026-07-03', 1)")
+                        } else {
+                            format!("INSERT INTO t (id, v) VALUES ({id}, 1)")
+                        };
                         let commit_started = Instant::now();
                         let prepared_nanos = std::cell::Cell::new(0u64);
                         engine

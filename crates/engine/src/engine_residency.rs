@@ -302,6 +302,36 @@ pub(crate) fn sql_value_as_int4(value: &SqlValue) -> i32 {
     }
 }
 
+/// TYPE-COVERAGE track 2 (Date/Int2): the typed DECODE inverse of `sql_value_as_int4` for the
+/// i32-section types — the A4a materializer / A4c gather previously DECLINED any non-strictly-
+/// Int4 table because they typed every value `SqlValue::Int4` (the A4a audit-F1 mistype
+/// discipline); deriving the variant from the CATALOG column type lifts that. `None` for any
+/// non-i32-section type (the caller declines to the host path) and for an out-of-range Int2
+/// payload (corrupt section bytes must DECLINE, never silently truncate).
+pub(crate) fn sql_value_from_i32_section(ty: gpu_db_sql::SqlType, v: i32) -> Option<SqlValue> {
+    match ty {
+        gpu_db_sql::SqlType::Int4 => Some(SqlValue::Int4(v)),
+        gpu_db_sql::SqlType::Date => Some(SqlValue::Date(v)),
+        gpu_db_sql::SqlType::Int2 => i16::try_from(v).ok().map(SqlValue::Int2),
+        _ => None,
+    }
+}
+
+/// TYPE-COVERAGE track 2: encode an equality NEEDLE for the device i32-section probe, requiring
+/// the value VARIANT to agree with the column's catalog type (Int4->Int4, Date->Date,
+/// Int2->Int2). Strict agreement is load-bearing for the A3 probe's authoritative FALSE (a
+/// loosely-coerced needle could encode to bytes the section never stores -> false MISS =
+/// constraint hole); the section bytes were written by `sql_value_as_int4` from values of the
+/// column's own type, so the exact-variant encode is exact.
+pub(crate) fn i32_section_needle(ty: gpu_db_sql::SqlType, value: &SqlValue) -> Option<i32> {
+    match (ty, value) {
+        (gpu_db_sql::SqlType::Int4, SqlValue::Int4(v)) => Some(*v),
+        (gpu_db_sql::SqlType::Date, SqlValue::Date(v)) => Some(*v),
+        (gpu_db_sql::SqlType::Int2, SqlValue::Int2(v)) => Some(i32::from(*v)),
+        _ => None,
+    }
+}
+
 /// The uniform memset byte whose repetition is the `deleted_by` LIVE sentinel `0x7F7F_7F7F_7F7F_7F7F` — a
 /// large POSITIVE signed i64 (the device visibility compare `deleted_by > read_txn_id` is a signed s64
 /// kernel; `u64::MAX` would be -1 signed and a live row would wrongly fail the compare) that exceeds every
@@ -4048,6 +4078,91 @@ mod capacity_payload_tests {
         assert_eq!(ids.len(), expected, "no duplicate ids survived the race");
     }
 
+    /// TYPE-COVERAGE track 2 — the Date/Int2 ELISION differential: a PK'd table whose payload
+    /// columns are DATE and INT2 runs the constraint gauntlet elided-vs-install-twin. Exercises
+    /// the catalog-derived i32-section typing end to end: elided-era INSERT flushes encode
+    /// Date/Int2 to the i32 section, the A2 resolve + A3 probes accept Date/Int2 needles
+    /// (variant-agreeing), the A4a materializer types values from the catalog (a mistyped
+    /// `Int4(days)` would break read equality AND the value_index rebuilt at rehydration),
+    /// and the A4c gather rehydrates the store with correctly-typed rows. Outcomes (incl
+    /// violation text) + reads must match the twin exactly.
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn date_int2_pk_table_elision_matches_install_twin() {
+        let run = |elide: bool| {
+            let e = Engine::new_local();
+            e.set_auto_admit_on_commit(true);
+            e.set_shard_size_target(64);
+            e.set_host_install_elision_enabled(elide);
+            e.set_constrained_elision_enabled(true);
+            e.execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, d DATE, s INT2)")
+                .unwrap();
+            let mut seq = 2u64;
+            for chunk in 0..2_i64 {
+                let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
+                    .map(|k| {
+                        format!(
+                            "({k}, '2026-{:02}-{:02}', {})",
+                            1 + (k % 12),
+                            1 + (k % 28),
+                            k % 1000
+                        )
+                    })
+                    .collect();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, d, s) VALUES {}", values.join(",")),
+                )
+                .unwrap();
+                seq += 1;
+            }
+            let statements = [
+                // Elided steady-state inserts with Date/Int2 payloads.
+                "INSERT INTO t (id, d, s) VALUES (500, '2027-01-01', 7)",
+                "INSERT INTO t (id, d, s) VALUES (501, '2027-02-02', -8)",
+                "INSERT INTO t (id, d, s) VALUES (42, '2027-03-03', 9)", // dup PK -> 23505
+                "INSERT INTO t (id, d, s) VALUES (500, '2027-04-04', 1)", // elided-era dup -> 23505
+                // Date-needle DML: the A2 resolve locates by the DATE column's i32 encoding.
+                "UPDATE t SET s = 99 WHERE d = '2027-01-01'",
+                "DELETE FROM t WHERE d = '2027-02-02'",
+                // Int2-needle DML.
+                "UPDATE t SET d = '2028-01-01' WHERE s = 99",
+                // Int4 PK point DML on a Date/Int2-payload row (the materializer types d + s).
+                "UPDATE t SET s = -1 WHERE id = 130",
+                "DELETE FROM t WHERE id = 42",
+            ];
+            let mut outcomes: Vec<Result<(), String>> = Vec::new();
+            for sql in &statements {
+                outcomes.push(
+                    e.execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
+                );
+                seq += 1;
+            }
+            let mut rows = e
+                .execute_relational_select_text("SELECT id, d, s FROM t")
+                .unwrap()
+                .rows
+                .into_boxed();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            (e, outcomes, rows)
+        };
+        let (on, on_out, on_rows) = run(true);
+        let (off, off_out, off_rows) = run(false);
+        assert_eq!(on_out, off_out, "Date/Int2 outcome ladder: elided == twin");
+        assert_eq!(on_rows, off_rows, "Date/Int2 reads: elided == twin");
+        assert!(
+            on.host_install_elisions() > 0,
+            "non-vacuity: the Date/Int2 PK'd table must have ELIDED installs"
+        );
+        assert!(
+            on.dml_device_validate_hits() > 0,
+            "non-vacuity: the device validator answered typed probes"
+        );
+        assert_eq!(off.host_install_elisions(), 0);
+    }
+
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
     /// on an elided table, BARRIERED between snapshot+prepare and commit (the instrumented
     /// hook), so BOTH pass the off-lock validation and the UNIQUE-SLOT CONFLICT LEDGER is the
@@ -4898,9 +5013,10 @@ mod capacity_payload_tests {
             "non-vacuity: INVISIBLE probes must exercise the boundary ({invisible_checked})"
         );
 
-        // Date column (audit A4 F1): Date/Int2 share the device i32 section, so the locate can
-        // hit — but the materializer types values Int4 and must DECLINE the whole table rather
-        // than return `Int4(days)` where the host row carries `Date(days)`.
+        // Date column (audit A4 F1, LIFTED by type-coverage track 2): Date/Int2 share the
+        // device i32 section; the materializer now derives the SqlValue variant from the
+        // CATALOG column type — the materialized row must carry `Date(days)` matching the host
+        // fetch EXACTLY (the F1 mistype `Int4(days)` would fail this equality).
         e.execute_text(390, "CREATE TABLE dd (id INT, d DATE)")
             .unwrap();
         e.execute_text(
@@ -4909,20 +5025,44 @@ mod capacity_payload_tests {
         )
         .unwrap();
         let dd_table = e.relational_catalog_table("dd").unwrap();
-        let mut date_decline_checked = false;
+        let dd_rows = e.read_state.mvcc.table_rows("dd");
+        let mut date_typed_checked = false;
         if let Some(hits) = e.locate_resident_pk_via_shard_index_detailed(&dd_table, 0, 1) {
             for hit in &hits {
-                assert_eq!(
-                    e.materialize_resident_row_via_hit(&dd_table, hit, e.committed_seq()),
-                    None,
-                    "a Date-bearing table must DECLINE (Int4-typed materialization would mistype)"
+                let device_row = e
+                    .materialize_resident_row_via_hit(&dd_table, hit, e.committed_seq())
+                    .expect("an i32-section table must answer, not decline")
+                    .expect("id 1 is live");
+                assert!(
+                    matches!(device_row[1], SqlValue::Date(_)),
+                    "the d column must materialize as Date, not Int4 (got {:?})",
+                    device_row[1]
                 );
-                date_decline_checked = true;
+                let host_row = {
+                    let region = hit.row_id.as_ref().unwrap();
+                    let halves = region
+                        .read_resident_i32_column(u64::from(hit.slot) * 8, 2)
+                        .unwrap();
+                    let row_id = (halves[0] as u32 as u64) | ((halves[1] as u32 as u64) << 32);
+                    let tuple = dd_rows
+                        .store()
+                        .tuple_fetch_by_key(
+                            &relational_row_key("dd", row_id),
+                            crate::StorageVisibility {
+                                read_txn_id: e.committed_seq(),
+                            },
+                        )
+                        .unwrap()
+                        .expect("host row exists");
+                    decode_relational_row(&tuple.value, &dd_table.columns).unwrap()
+                };
+                assert_eq!(device_row, host_row, "typed device row == host fetch");
+                date_typed_checked = true;
             }
         }
         assert!(
-            date_decline_checked,
-            "the Date-decline gate must be exercised (locate answered)"
+            date_typed_checked,
+            "the Date-typing path must be exercised (locate answered)"
         );
 
         // NULL-bearing shard: the materializer must DECLINE, never alias NULL as 0.
@@ -6684,7 +6824,17 @@ impl Engine {
         table
             .columns
             .iter()
-            .all(|column| column.ty == gpu_db_sql::SqlType::Int4)
+            .all(|column| {
+                // TYPE-COVERAGE track 2: every i32-section type is device-authoritative-capable
+                // (the A4a/A4c primitives type from the catalog; appends/indexes ride the same
+                // i32 encoding).
+                matches!(
+                    column.ty,
+                    gpu_db_sql::SqlType::Int4
+                        | gpu_db_sql::SqlType::Date
+                        | gpu_db_sql::SqlType::Int2
+                )
+            })
             && unique_ok
             && table.check_constraints.is_empty()
             && table.foreign_keys.is_empty()
@@ -8330,11 +8480,14 @@ impl Engine {
         table: &RelationalTable,
         read_txn: u64,
     ) -> Option<Vec<(u64, Vec<SqlValue>)>> {
-        if table
-            .columns
-            .iter()
-            .any(|column| column.ty != gpu_db_sql::SqlType::Int4)
-        {
+        // TYPE-COVERAGE track 2: every i32-SECTION type gathers with its catalog-derived
+        // variant (was strictly-Int4 with the F1 mistype decline).
+        if table.columns.iter().any(|column| {
+            !matches!(
+                column.ty,
+                gpu_db_sql::SqlType::Int4 | gpu_db_sql::SqlType::Date | gpu_db_sql::SqlType::Int2
+            )
+        }) {
             return None;
         }
         let shards = self.read_state.residency.shards.load();
@@ -8402,8 +8555,11 @@ impl Engine {
                 }
                 let row: Vec<SqlValue> = columns
                     .iter()
-                    .map(|column| SqlValue::Int4(column[slot]))
-                    .collect();
+                    .zip(table.columns.iter())
+                    .map(|(column, catalog_column)| {
+                        sql_value_from_i32_section(catalog_column.ty, column[slot])
+                    })
+                    .collect::<Option<Vec<SqlValue>>>()?;
                 out.push((row_id, row));
             }
         }

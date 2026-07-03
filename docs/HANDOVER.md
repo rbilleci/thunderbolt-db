@@ -32,7 +32,7 @@ p50/p99/p99.9 < 0.5/1/5 ms.
 
 ---
 
-## >>> THE ONE NEXT ACTION: TRACK-1 SLICE 1 SHIPPED (`f80f2350`+`2330965b`+`9c564e7b`: PK'd 923→77-84k, both audits adopted). NOW: the #18 OPTIMIZATION ROUND (skip the ledger-covered re-resolve validation for FK-free INSERTs + slot-key interning; spec in memory `type-coverage-14`), then the constrained-elision default-flip decision, CHECK/FK eligibility, track 2. <<<
+## >>> THE ONE NEXT ACTION: TRACK-1 SLICE 1 + THE #18 ROUND ARE SHIPPED (5 commits through `78049145`: PK'd 923→~93k @32w stable, p99 <0.7ms; three audits adopted, every mechanism sabotage-verified). NOW: TRACK 2 SLICE 1 — Date/Int2 typing (near-free: they ride the i32 section; the A4a/A4c/A3 SqlValue typing + eligibility gate them). PENDING USER CHECK-IN: the constrained_elision_enabled DEFAULT FLIP (evidence ready — flips are user-authorized by precedent). >100k PK'd = the structural burst levers, not micro-opts (memory `type-coverage-14`). <<<
 
 **THE RETIREMENT PROGRAM A1→A5 IS COMPLETE; THE FLIP IS LIVE** (`fd154409`/`f0c3101e`:
 `host_install_elision_enabled` + `auto_vacuum_enabled` default ON; SLO 104-124k sustained on PK-less
