@@ -514,13 +514,15 @@ impl Engine {
         // elided-era rows.
         let rehydrate_if_elided = |engine: &Self| -> Result<(), EngineError> {
             if elided {
-                engine.rehydrate_elided_table(
-                    table,
-                    visibility.read_txn_id,
-                    &Default::default(),
-                    &Default::default(),
-                    visibility.read_txn_id,
-                )?;
+                // THE FACADE-SEQ POISON, final seam (found by the Date/Int2 gauntlet's
+                // dup-date decline — the Int4-only ladders never lit this exit up): stamping
+                // the reconcile at `visibility.read_txn_id` (the serialized path's FACADE txn
+                // id, here observed 8 vs committed 5) made the reconciled elided-era rows
+                // created_by=FUTURE -> invisible to the commit's own re-admit -> both rows
+                // VANISHED from the device (k=5 bisect: 202 reconciled, store readable 200,
+                // point500=0). `_serialized` stamps at the ENGINE's committed_seq and is
+                // lock-aware, like every other prepare/probe seam post-audit.
+                engine.rehydrate_elided_serialized(&table.name)?;
             }
             Ok(())
         };

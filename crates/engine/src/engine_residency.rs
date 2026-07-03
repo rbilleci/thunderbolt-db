@@ -4161,6 +4161,43 @@ mod capacity_payload_tests {
             "non-vacuity: the device validator answered typed probes"
         );
         assert_eq!(off.host_install_elisions(), 0);
+
+        // DATE-PK table (audit cede8e70: the Date NEEDLE must fire, not silently decline —
+        // the binder now coerces the plain literal): elided-era dup-DATE inserts drive the
+        // A3 probe with a Date needle through `i32_section_needle`. Sabotage-verified: a
+        // skewed Date encode (+1) makes the probe miss the dup -> the elided arm ACCEPTS it.
+        let hits_before_date_needle = on.dml_device_validate_hits();
+        on.execute_text(600, "CREATE TABLE dp (d DATE PRIMARY KEY, v INT)")
+            .unwrap();
+        for (i, day) in (1..=8_u32).enumerate() {
+            on.execute_text(
+                601 + i as u64,
+                &format!("INSERT INTO dp (d, v) VALUES ('2027-06-{day:02}', {i})"),
+            )
+            .unwrap();
+        }
+        // Force shard admission + elision entry via wave inserts.
+        for t in 0..30_u64 {
+            on.execute_dml_concurrent(
+                650 + t,
+                &format!("INSERT INTO dp (d, v) VALUES ('2028-{:02}-{:02}', 1)", 1 + t / 28, 1 + t % 28),
+            )
+            .unwrap();
+        }
+        assert!(on.table_install_elided("dp"), "the DATE-PK table must elide");
+        // Elided-era dup DATE -> 23505 through the DEVICE Date-needle probe.
+        let dup = on.execute_text(700, "INSERT INTO dp (d, v) VALUES ('2028-01-01', 9)");
+        assert!(
+            dup.is_err() && dup.unwrap_err().to_string().contains("duplicate key"),
+            "the elided-era dup DATE must violate the PK via the device Date needle"
+        );
+        // Fresh DATE still inserts.
+        on.execute_text(701, "INSERT INTO dp (d, v) VALUES ('2029-01-01', 1)")
+            .unwrap();
+        assert!(
+            on.dml_device_validate_hits() > hits_before_date_needle,
+            "non-vacuity: the DATE-needle probes must have been answered by the DEVICE"
+        );
     }
 
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK

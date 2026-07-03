@@ -202,6 +202,23 @@ pub(crate) fn coerce_filter_literal(value: SqlValue, column_ty: SqlType) -> SqlV
                 .unwrap_or(SqlValue::Numeric(d)),
             None => SqlValue::Numeric(d),
         },
+        // TYPE-COVERAGE track 2 (audit cede8e70 SHOULD-FIX): the natural PG forms
+        // `WHERE d = '2027-01-01'` and `WHERE s = 5` bind Text/Int4 literals against
+        // Date/Int2 columns — without these arms the DML binder rejected them outright
+        // ("invalid value for column"), leaving the device Date/Int2 needle path
+        // unreachable via plain syntax. Mirrors `coerce_insert_value`: a parseable date
+        // string coerces; an unparseable one stays Text (the binder's type check then
+        // errors, as PG does on a bad date literal); an out-of-i16-range integer stays
+        // Int4 (the binder errors — stricter than PG's promote-and-compare, consistent
+        // with this engine's checked-arithmetic posture).
+        (SqlValue::Text(s), SqlType::Date) => match gpu_db_sql::datetime::parse_date(&s) {
+            Some(days) => SqlValue::Date(days),
+            None => SqlValue::Text(s),
+        },
+        (SqlValue::Int4(v), SqlType::Int2) => match i16::try_from(v) {
+            Ok(narrowed) => SqlValue::Int2(narrowed),
+            Err(_) => SqlValue::Int4(v),
+        },
         (other, _) => other,
     }
 }
