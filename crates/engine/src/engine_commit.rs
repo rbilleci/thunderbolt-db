@@ -663,37 +663,11 @@ impl Engine {
     /// unconditional, so in degenerate cache states it may clear a stray cross-map
     /// entry the old two-loop form left — strictly-safe extra cleanup, never stale.
     fn invalidate_relational_residency_table(&self, table: &str, txn_id: TxnId, index: Index) {
-        // Stage 3 — blocker #2: the snapshot/shard flag maps are now published behind `ArcSwap`,
-        // so flag the invalidation copy-on-write under the serialized catalog latch (this never runs
-        // on the concurrent commit path — that uses `invalidate_relational_residency_tables_concurrent`
-        // which only tombstones the device-memory cells via `&self`).
-        self.read_state.residency.with_snapshots_mut(|snapshots| {
-            if let Some(entry) = snapshots.get_mut(table) {
-                // make_mut COWs the shared descriptor into a fresh version (host_rows stays shared).
-                let snapshot = std::sync::Arc::make_mut(&mut entry.descriptor);
-                if snapshot.invalidated_by_txn_id.is_none() {
-                    snapshot.invalidated_by_txn_id = Some(txn_id);
-                    snapshot.invalidated_at_index = Some(index);
-                }
-                if let Some(proof) = snapshot.device_memory_proof.as_mut() {
-                    proof.retained = false;
-                }
-            }
-        });
+        // Stage 3 — blocker #2: the snapshot/shard flag maps are published behind `ArcSwap`;
+        // W0 extracted the copy-on-write flagging into a helper SHARED with the concurrent
+        // invalidation (publishers serialize on `descriptor_publish_lock`).
+        self.flag_residency_descriptors_invalidated(table, txn_id, index);
         self.read_state.residency.device_memory.invalidate(table);
-        self.read_state.residency.with_shards_mut(|shards| {
-            if let Some(shards) = shards.get_mut(table) {
-                for shard in shards.iter_mut() {
-                    if shard.invalidated_by_txn_id.is_none() {
-                        shard.invalidated_by_txn_id = Some(txn_id);
-                        shard.invalidated_at_index = Some(index);
-                    }
-                    if let Some(proof) = shard.device_memory_proof.as_mut() {
-                        proof.retained = false;
-                    }
-                }
-            }
-        });
         self.read_state
             .residency
             .shard_device_memory
@@ -724,6 +698,52 @@ impl Engine {
             .purge_shard_pk_index_for_table(table);
     }
 
+    /// W0: flag a table's residency DESCRIPTORS (table snapshot + every shard) invalidated at
+    /// `(txn_id, index)` — the copy-on-write mutation both invalidation paths share. This is what
+    /// the descriptor-trusting consumers observe: the sharded read-route planner + executor
+    /// (`plan_relational_sharded_resident_route` reads `shard.is_valid()` and the descriptor's
+    /// riding `device_memory`) and the write-locates. Before W0 only the SERIALIZED path set these
+    /// flags; the concurrent path tombstoned the CELLS only, which the D4 descriptor-riding
+    /// consumers never consult — so a concurrent commit on a shard-resident table left readers
+    /// serving STALE device bytes (a read-your-writes violation) and let a duplicate key
+    /// FALSE-PASS the write-locate's unique probe. Publishers of the descriptor maps serialize on
+    /// `descriptor_publish_lock`; runs BEFORE `committed_seq` publishes, so a reader that pins the
+    /// new boundary and THEN loads the maps observes the flags (pin-seq-before-load ordering).
+    /// Repro + regression: `w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards`.
+    pub(crate) fn flag_residency_descriptors_invalidated(
+        &self,
+        table: &str,
+        txn_id: TxnId,
+        index: Index,
+    ) {
+        self.read_state.residency.with_snapshots_mut(|snapshots| {
+            if let Some(entry) = snapshots.get_mut(table) {
+                // make_mut COWs the shared descriptor into a fresh version (host_rows stays shared).
+                let snapshot = std::sync::Arc::make_mut(&mut entry.descriptor);
+                if snapshot.invalidated_by_txn_id.is_none() {
+                    snapshot.invalidated_by_txn_id = Some(txn_id);
+                    snapshot.invalidated_at_index = Some(index);
+                }
+                if let Some(proof) = snapshot.device_memory_proof.as_mut() {
+                    proof.retained = false;
+                }
+            }
+        });
+        self.read_state.residency.with_shards_mut(|shards| {
+            if let Some(shards) = shards.get_mut(table) {
+                for shard in shards.iter_mut() {
+                    if shard.invalidated_by_txn_id.is_none() {
+                        shard.invalidated_by_txn_id = Some(txn_id);
+                        shard.invalidated_at_index = Some(index);
+                    }
+                    if let Some(proof) = shard.device_memory_proof.as_mut() {
+                        proof.retained = false;
+                    }
+                }
+            }
+        });
+    }
+
     /// Invalidate the GPU residency of the `tables` a CONCURRENT commit mutated, via `&self`
     /// (write-half MVCC, Stage 4). Publishes a `None` tombstone on each table's resident
     /// device-memory cell(s) — the authoritative gate the read-path's `plan_relational_resident_route`
@@ -732,18 +752,21 @@ impl Engine {
     /// Called INSIDE the commit critical section, before `committed_seq` is bumped, so a reader that
     /// observes the new `committed_seq` also observes the residency tombstone.
     ///
-    /// It deliberately does NOT mutate the `snapshots`/`shards` flag maps (those are not
-    /// interior-mutable and are read lock-free by `&self` readers): the cell tombstone alone forces
-    /// the CPU route. The flag-based telemetry / the explicit resident-snapshot-probe API are kept
-    /// current only on the serialized invalidation path (`invalidate_relational_residency_table`),
-    /// which runs under the exclusive catalog latch.
+    /// W0: it ALSO flags the `snapshots`/`shards` DESCRIPTOR maps (the pre-W0 form tombstoned only
+    /// the cells, believing "the cell tombstone alone forces the CPU route" — true for the
+    /// TABLE-level route, but the D4 SHARDED planner/executor and the write-locates read the
+    /// descriptor's `is_valid()` + its riding `device_memory` Arc and never consult the cells, so
+    /// a concurrent commit left them serving/probing STALE device bytes). The maps' publishers
+    /// serialize on `descriptor_publish_lock`, so this is safe from the commit critical section
+    /// without the catalog latch.
     pub(crate) fn invalidate_relational_residency_tables_concurrent(
         &self,
         tables: &BTreeSet<String>,
-        _txn_id: TxnId,
-        _index: Index,
+        txn_id: TxnId,
+        index: Index,
     ) {
         for table in tables {
+            self.flag_residency_descriptors_invalidated(table, txn_id, index);
             self.read_state.residency.device_memory.invalidate(table);
             self.read_state
                 .residency
@@ -772,8 +795,8 @@ impl Engine {
         // ADR-009 R2.2b: deliberately does NOT evict the persistent wave read engine here. Dropping it tears
         // a live kernel down (petter join ~watchdog window + stream sync) — far too costly to do inside the
         // commit critical section. It is unnecessary for correctness: this concurrent path tombstones the
-        // `device_memory` cell (above) but NOT the `snapshots` ArcSwap, so the gate that fires is the
-        // `device_memory.get(...) -> None -> Err` ("relation has no retained resident device memory") at the
+        // `device_memory` cell (above; and since W0 also flags the descriptor maps), so the gate that fires is
+        // the `device_memory.get(...) -> None -> Err` ("relation has no retained resident device memory") at the
         // TOP of `submit_resident_int4_equal_any_payload`, which returns BEFORE the wave route is reached
         // (NOT the `!snapshot.is_valid()` check — `is_valid()` reads the untouched descriptor). Either way a
         // stale engine is never used; a re-admission allocates a new resident buffer (new ptr) whose first

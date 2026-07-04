@@ -4491,3 +4491,77 @@ fn r2_dense_index_probe_matches_atomic() {
     }
     e.set_dense_index_probe_enabled(false);
 }
+
+/// W0 (write-path reimplementation, correctness first): the CONCURRENT commit path's residency
+/// invalidation (`invalidate_relational_residency_tables_concurrent`) tombstones only the
+/// device-memory CELLS and deliberately leaves the `shards` DESCRIPTOR flags untouched — its doc
+/// says "the cell tombstone alone forces the CPU route". That is true for the READ route (gated on
+/// `device_memory.get`), but the D4 write-locate (`locate_resident_pk_via_shard_index_detailed`)
+/// never consults the cells: it trusts the descriptor's `is_valid()` and the `device_memory` Arc
+/// riding ON the descriptor. After a concurrent host-installed INSERT invalidates a read-admitted
+/// shard, the next statement's unique validation rebuilds the (purged) PK cache FROM STALE DEVICE
+/// BYTES, where a physical MISS is load-bearing (`device_visible_row_with_value` -> `Some(false)`
+/// = "no visible duplicate") — so a duplicate key FALSE-PASSES and a second row commits.
+///
+/// The SI ledger does NOT rescue this: it catches CONCURRENT writers (slot committed after the
+/// reader's snapshot), not an already-committed-and-visible row — which is exactly what this
+/// validation exists to catch.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards() {
+    let mut e = Engine::new_local();
+    // Pin the plain host-install regime (the shipped default has auto_admit OFF, which makes
+    // elision inert anyway — pin both OFF so the regime under test is explicit and stable).
+    e.set_host_install_elision_enabled(false);
+    e.set_constrained_elision_enabled(false);
+
+    e.execute_text(1, "CREATE TABLE t (id INT)").unwrap();
+    e.execute_text(2, "CREATE UNIQUE INDEX t_id ON t (id)")
+        .unwrap();
+    e.execute_text(3, "INSERT INTO t (id) VALUES (1), (2), (3)")
+        .unwrap();
+
+    // Read-path admission: an INT-only table lays down as an OPEN shard; device bytes = {1,2,3}.
+    if e.populate_relational_residency_snapshot("t").is_err() {
+        return; // self-guard: no GPU on this box
+    }
+    let Command::Select(probe) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    if !e.plan_relational_resident_route(&probe).accepted {
+        return; // self-guard: residency did not stick (no GPU)
+    }
+
+    // Production-route INSERT: host-installs id=42, then invalidates the residency CELLS.
+    // The shard DESCRIPTORS stay valid-looking — the bug's precondition.
+    e.execute_dml_concurrent(10, "INSERT INTO t (id) VALUES (42)")
+        .unwrap();
+
+    // The SAME key again: uniqueness validation must see the committed id=42. On the buggy build
+    // the device probe rebuilds the PK cache from the STALE shard bytes (42 was never appended),
+    // the physical miss reads as "no duplicate", and the INSERT false-passes.
+    let dup = e
+        .execute_dml_concurrent(11, "INSERT INTO t (id) VALUES (42)")
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        dup.contains("duplicate key value violates unique index"),
+        "expected 23505 after concurrent invalidation, got: {dup}"
+    );
+
+    // Exactly one id=42 row exists, and the READ observes it: post-invalidation the sharded
+    // route must DECLINE (descriptor flags now set by the concurrent path) and the host route
+    // serves the truth. Pre-fix this returned Int8(0) — the sharded bridge accepted the
+    // valid-looking descriptors and counted STALE device bytes (a read-your-writes violation).
+    let Command::Select(count42) = parse_command("SELECT COUNT(*) FROM t WHERE id = 42").unwrap()
+    else {
+        unreachable!()
+    };
+    let rows = e.execute_relational_select(&count42).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Int8(1)]],
+        "read must observe exactly the one committed id=42 (got {rows:?})"
+    );
+}

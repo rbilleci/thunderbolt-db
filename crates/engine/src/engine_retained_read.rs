@@ -745,6 +745,31 @@ impl Engine {
             .map(|hits| hits.into_iter().map(|h| (h.shard_id, h.slot)).collect())
     }
 
+    /// W0 (concurrent-invalidation liveness): the CONCURRENT commit path invalidates residency by
+    /// tombstoning the device-memory CELL only (`invalidate_relational_residency_tables_concurrent`)
+    /// — the `shards` descriptor flags are owned by the SERIALIZED path (they are not interior-
+    /// mutable via `&self`), so `is_valid()` alone cannot prove a shard's bytes are current. Any
+    /// WRITE-locate that trusts the descriptor's riding buffer must ALSO require the authoritative
+    /// cell to still publish EXACTLY that Arc (ptr-identical). A tombstoned (`None`) or re-admitted
+    /// (different-ptr) cell declines the locate, sending the caller to the always-correct host
+    /// ladder. Without this gate, a concurrent host-installed write purges the PK cache but leaves
+    /// the descriptor valid-looking, and the next probe REBUILDS the cache from STALE device bytes
+    /// — where a physical miss is load-bearing ("no visible duplicate" / "0 matches"): a duplicate
+    /// key FALSE-PASSES or an Eq-resolved UPDATE/DELETE loses its row. Repro + regression:
+    /// `w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards`.
+    fn shard_write_locate_cell_live(
+        &self,
+        table_name: &str,
+        shard_id: u32,
+        descriptor_memory: &Arc<CudaResidentDeviceMemory>,
+    ) -> bool {
+        self.read_state
+            .residency
+            .shard_device_memory
+            .get(&(table_name.to_string(), shard_id))
+            .is_some_and(|cell| Arc::ptr_eq(&cell, descriptor_memory))
+    }
+
     /// CROSS-SHARD PK INDEX: the GENERATION-CONSISTENT locate. Resolves `filter_idx = key` per shard via the
     /// cached hash+bloom index and, for each HIT, CAPTURES the exact `(descriptor, device_memory,
     /// deleted_by)` the slot was resolved against -- all from the SAME `shards.load()` snapshot, with the
@@ -803,6 +828,11 @@ impl Engine {
             // D4 (ADR-013 pre2): the buffer rides the loaded descriptor — the SAME generation as
             // the metadata/zone-map this loop already read (no second map load to race a re-admit).
             let device_memory = shard.device_memory.clone()?;
+            // W0: the descriptor flags don't see concurrent invalidations — require the
+            // authoritative cell to still publish THIS buffer, else decline to the host ladder.
+            if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
+                return None;
+            }
             // Sub-slice 3: probe the CACHED per-shard hash+bloom index (built once per shard generation,
             // ptr-validated) instead of a per-lookup DtoH + rebuild. Bloom-prunes then hash-probes.
             match self.probe_shard_pk_index_cached(
@@ -983,6 +1013,11 @@ impl Engine {
             let filter_offset =
                 shard_i32_filter_offset(shard, table, filter_idx)?;
             let device_memory = shard.device_memory.clone()?;
+            // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
+            // concurrent invalidations); a stale shard declines the whole wave-batch probe.
+            if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
+                return None;
+            }
             let (device_index, table_mask, hash_shift) = self.ensure_shard_pk_device_index(
                 &table.name,
                 shard.shard_id,
@@ -1066,6 +1101,11 @@ impl Engine {
             let filter_offset =
                 resident_device_int4_column_offset(&descriptor, table, filter_idx).ok()?;
             let device_memory = shard.device_memory.clone()?;
+            // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
+            // concurrent invalidations); a stale shard declines the device locate to the ladder.
+            if !self.shard_write_locate_cell_live(&table.name, shard.shard_id, &device_memory) {
+                return None;
+            }
             // Build/reuse the shard's DEVICE hash index (uploaded once per generation,
             // (ptr,row_count)-validated). None = the shard has DUP keys -> decline the whole
             // locate to the scan, exactly like the host `ShardPkProbe::Declined`.

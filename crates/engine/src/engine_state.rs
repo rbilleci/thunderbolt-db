@@ -496,8 +496,9 @@ pub(crate) struct CatalogSnapshot {
 /// are the authoritative residency tombstone gate the concurrent commit path flips via `&self`; the
 /// snapshot/shard metadata (Stage 3 — blocker #2) is published behind `ArcSwap` so the resident
 /// route can `load()` a guard whose pinned `Arc` outlives the across-kernel-launch read, and the
-/// serialized catalog-latch path (warm-up / DDL drop / invalidate / memory-pressure — NEVER the
-/// concurrent commit path) mutates it copy-on-write.
+/// publishers (the serialized catalog-latch paths — warm-up / DDL drop / invalidate /
+/// memory-pressure — plus, since W0, the CONCURRENT commit path's invalidation FLAGGING) mutate it
+/// copy-on-write, serialized by `descriptor_publish_lock`.
 #[derive(Debug, Default)]
 pub(crate) struct ResidencyReadState {
     pub(crate) device_memory: ResidentDeviceMemoryMap,
@@ -631,6 +632,9 @@ pub(crate) struct ResidencyReadState {
     // memory-pressure.
     pub(crate) snapshots: ArcSwap<BTreeMap<String, RelationalResidencyEntry>>,
     pub(crate) shards: ArcSwap<BTreeMap<String, Vec<RelationalResidentShard>>>,
+    /// W0: serializes the load→clone→store publishers of `snapshots`/`shards` (see
+    /// [`ResidencyReadState::with_snapshots_mut`]). Readers never touch it.
+    pub(crate) descriptor_publish_lock: Mutex<()>,
     /// THE FLIP (deadlock fix, caught by the burn-in): a LOCK-FREE mirror of the catalog's
     /// `relational_resident_cache.budget_bytes_by_gpu`, updated by the (rare, `&mut self`) budget
     /// setters. The resident-route PLANNER reads budgets from HERE — reading them through
@@ -658,25 +662,36 @@ impl ResidencyReadState {
             .retain(|(cached_table, _, _), _| cached_table != table);
     }
 
-    /// COW-mutate the resident snapshot map under the serialized catalog latch: clone the published
-    /// map, apply `mutate`, then atomically store it. In-flight readers keep the generation they
-    /// loaded. One publisher (the catalog-latch path), so the load→clone→store is race-free.
+    /// COW-mutate the resident snapshot map: clone the published map, apply `mutate`, then
+    /// atomically store it. In-flight readers keep the generation they loaded. W0: publishers
+    /// serialize on `descriptor_publish_lock` — the catalog-latch paths were the single publisher
+    /// historically, but the CONCURRENT commit path now flags invalidations here too (it holds the
+    /// commit_mutex, NOT the latch), and two racing load→clone→store publishers would lose one
+    /// side's update. Readers stay lock-free (`ArcSwap::load`).
     pub(crate) fn with_snapshots_mut<R>(
         &self,
         mutate: impl FnOnce(&mut BTreeMap<String, RelationalResidencyEntry>) -> R,
     ) -> R {
+        let _publish = self
+            .descriptor_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut next = (**self.snapshots.load()).clone();
         let result = mutate(&mut next);
         self.snapshots.store(Arc::new(next));
         result
     }
 
-    /// COW-mutate the resident shard map under the serialized catalog latch (see
-    /// [`ResidencyReadState::with_snapshots_mut`]).
+    /// COW-mutate the resident shard map (see [`ResidencyReadState::with_snapshots_mut`] for the
+    /// W0 publisher-serialization contract).
     pub(crate) fn with_shards_mut<R>(
         &self,
         mutate: impl FnOnce(&mut BTreeMap<String, Vec<RelationalResidentShard>>) -> R,
     ) -> R {
+        let _publish = self
+            .descriptor_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut next = (**self.shards.load()).clone();
         let result = mutate(&mut next);
         self.shards.store(Arc::new(next));
