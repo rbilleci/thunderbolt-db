@@ -157,9 +157,13 @@ fn durable_recovery_rejects_a_torn_trailing_record() {
             .unwrap();
     }
 
-    // Corrupt the last byte of the durable segment (simulates a torn write of the last record).
+    // Corrupt the last byte of the LOGICAL durable tail (W4a: the physical file carries a
+    // preallocated zero tail past it — the file's last byte is a zero, not record data). This
+    // damages an ACKNOWLEDGED record below the recorded tail offset, which recovery must
+    // reject loudly.
+    let valid_bytes = gpu_db_wal::recover_wal_segment(&path).unwrap().valid_bytes;
     let mut bytes = std::fs::read(&path).unwrap();
-    *bytes.last_mut().unwrap() ^= 0x01;
+    bytes[valid_bytes as usize - 1] ^= 0x01;
     std::fs::write(&path, bytes).unwrap();
 
     let result = Engine::open_durable_wal_segment(&path);

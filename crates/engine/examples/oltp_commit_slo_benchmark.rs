@@ -176,7 +176,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 .collect();
                             format!("INSERT INTO t (id, v) VALUES {}", vals.join(","))
                         } else {
-                            let id = w as u64 * 10_000_000 + i; // stays within int4 for <=200 writers
+                            // W4 open-loop sweeps: 4M per writer keeps ids within int4 up to
+                            // ~536 writers (536 * 4M ~= i32::MAX); a 60s point at 10k/writer/s
+                            // stays well under the 4M per-writer budget.
+                            let id = w as u64 * 4_000_000 + i;
                             if std::env::var("GPU_DB_BENCH_INT8").is_ok_and(|v| v == "1") {
                                 format!(
                                     "INSERT INTO t (id, v) VALUES ({id}, {})",

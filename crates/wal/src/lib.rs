@@ -172,12 +172,50 @@ struct WalDurableCore {
     cv: Condvar,
 }
 
+/// W4a — WAL segment PREALLOCATION chunk. Appending into a growing file forces the filesystem
+/// to journal a size-change on EVERY `fdatasync` (measured on this box: 2.46ms p50 append-grow
+/// vs 0.84ms p50 inside preallocated+zeroed extents — 3.4x, the standard Postgres/etcd WAL
+/// discipline). Segments are zero-filled ahead in chunks of this size and all record IO is
+/// POSITIONAL (`write_all_at` at the logical tail); the zero tail is unambiguous end-of-log to
+/// both readers (an all-zero record header can never be valid: the FNV checksum of a zero
+/// header is nonzero — test-asserted). Override with `GPU_DB_WAL_PREALLOC_BYTES` (min 1MB) for
+/// growth tests.
+fn wal_prealloc_chunk_bytes() -> u64 {
+    static CHUNK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("GPU_DB_WAL_PREALLOC_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1024 * 1024))
+            .unwrap_or(64 * 1024 * 1024)
+    })
+}
+
+/// Zero-fill `[from, to)` of `file` and `sync_all` (the size/extent change is metadata — a full
+/// fsync persists it so later group syncs can stay `fdatasync`-fast inside written extents).
+fn zero_fill_extend(file: &File, from: u64, to: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    const ZEROS: [u8; 1024 * 1024] = [0; 1024 * 1024];
+    let mut offset = from;
+    while offset < to {
+        let n = ((to - offset) as usize).min(ZEROS.len());
+        file.write_all_at(&ZEROS[..n], offset)?;
+        offset += n as u64;
+    }
+    file.sync_all()
+}
+
 #[derive(Debug)]
 struct WalDurableState {
-    /// Open `O_APPEND` handle (every write lands at the true EOF even after a defensive
-    /// `set_len` rewind); `None` until the first durable flush. Behind an `Arc` so a
-    /// [`WalGroupFlushJob`] can perform its IO after the lock is released.
+    /// Open write handle for POSITIONAL record IO (`write_all_at` at the logical tail
+    /// `durable_bytes` — W4a; was `O_APPEND`, incompatible with preallocation because appends
+    /// would land after the zero fill). `None` until the first durable flush. Behind an `Arc`
+    /// so a [`WalGroupFlushJob`] can perform its IO after the lock is released.
     file: Option<Arc<File>>,
+    /// W4a: physical zero-filled length. Records live in `[0, durable_bytes)`; zeros in
+    /// `[durable_bytes, prealloc_bytes)`. Writes never grow the file inside this region, so
+    /// `fdatasync` skips the filesystem's size-change journaling.
+    prealloc_bytes: u64,
     /// Valid, fsynced byte length of the live segment (magic + serialized flushed records).
     durable_bytes: u64,
     /// Durable watermark: how many of the owning buffer's records are fsynced. Lives HERE (not
@@ -204,6 +242,7 @@ impl WalDurableCore {
             segment_path,
             state: Mutex::new(WalDurableState {
                 file: None,
+                prealloc_bytes: 0,
                 durable_bytes: 0,
                 flushed_records: 0,
                 segment_base_records: 0,
@@ -295,14 +334,24 @@ impl WalDurableCore {
         }
         sync_segment_parent_dir(&self.segment_path)?;
         let file = fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .open(&self.segment_path)
             .map_err(|err| {
                 EngineError::Durability(format!(
-                    "failed to reopen WAL segment for append {}: {err}",
+                    "failed to reopen WAL segment for positional IO {}: {err}",
                     self.segment_path.display()
                 ))
             })?;
+        // W4a: zero-fill the first preallocation chunk so per-group fdatasyncs never pay the
+        // filesystem's size-change journaling (one-time cost at creation).
+        let prealloc_to = wal_prealloc_chunk_bytes();
+        zero_fill_extend(&file, WAL_SEGMENT_MAGIC.len() as u64, prealloc_to).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to preallocate WAL segment {}: {err}",
+                self.segment_path.display()
+            ))
+        })?;
+        state.prealloc_bytes = prealloc_to;
         state.file = Some(Arc::new(file));
         state.durable_bytes = WAL_SEGMENT_MAGIC.len() as u64;
         self.record_tail_offset(state)?;
@@ -328,6 +377,7 @@ impl Drop for WalDurableCore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             WalDurableState {
                 file: None,
+                prealloc_bytes: 0,
                 durable_bytes: 0,
                 flushed_records: 0,
                 segment_base_records: 0,
@@ -361,6 +411,11 @@ pub enum WalGroupFlushBegin {
 pub struct WalGroupFlushJob {
     core: Arc<WalDurableCore>,
     file: Arc<File>,
+    /// W4a: the logical tail this group writes at (positional IO inside preallocated extents).
+    offset: u64,
+    /// W4a: the zero-filled frontier at snapshot time; the job extends it lock-free if needed
+    /// (`io_in_flight` already excludes every other writer of the file).
+    prealloc_end: u64,
     bytes: Vec<u8>,
     target_records: usize,
     group_size: usize,
@@ -376,25 +431,36 @@ impl WalGroupFlushJob {
     /// POISONED fail-closed (the group's members may already have applied their deltas; see the
     /// engine's group-commit wedge semantics) and waiters are still woken.
     pub fn commit(mut self) -> Result<usize, EngineError> {
+        use std::os::unix::fs::FileExt;
         self.completed = true;
-        let io_result = (&*self.file)
-            .write_all(&self.bytes)
-            .and_then(|_| self.file.sync_data());
+        // W4a: extend the zero-filled frontier lock-free if this group crosses it (rare — once
+        // per chunk; `io_in_flight` excludes every other writer), then write POSITIONALLY at
+        // the snapshotted logical tail so `sync_data` never pays size-change journaling.
+        let write_end = self.offset + self.bytes.len() as u64;
+        let mut new_prealloc_end = self.prealloc_end;
+        let io_result = if write_end > self.prealloc_end {
+            new_prealloc_end = write_end.max(self.prealloc_end + wal_prealloc_chunk_bytes());
+            zero_fill_extend(&self.file, self.prealloc_end, new_prealloc_end)
+        } else {
+            Ok(())
+        }
+        .and_then(|_| self.file.write_all_at(&self.bytes, self.offset))
+        .and_then(|_| self.file.sync_data());
         let mut state = self.core.lock_state();
         state.io_in_flight = false;
         let outcome = match io_result {
             Ok(()) => {
+                state.prealloc_bytes = state.prealloc_bytes.max(new_prealloc_end);
                 state.durable_bytes += self.bytes.len() as u64;
                 WalDurableCore::note_group(&mut state, self.group_size, self.target_records);
                 Ok(self.target_records)
             }
             Err(err) => {
-                // The tail may be partially on disk (or, after a failed fsync, in an unknowable
-                // page-cache state — fsyncgate). Attempt a rewind for tidiness, but poison the
-                // backing REGARDLESS: the group's records may back already-applied deltas, so
-                // nothing may ever append past this point until restart recovery truncates the
-                // torn tail.
-                let _ = self.file.set_len(state.durable_bytes);
+                // A partial positional write leaves garbage inside the preallocated region past
+                // `durable_bytes` (no size rewind — it would chop the preallocation, and after
+                // a failed fsync the page-cache state is unknowable anyway). Poison the backing:
+                // the group's records may back already-applied deltas, so nothing may ever
+                // append past this point until restart recovery truncates the torn tail.
                 state.poisoned = Some(format!("group flush failed ({err})"));
                 Err(EngineError::Durability(format!(
                     "failed to flush WAL segment group {}: {err}",
@@ -529,23 +595,31 @@ impl WalBuffer {
             let mut state = core.lock_state();
             if recovery.valid_bytes > 0 {
                 let file = fs::OpenOptions::new()
-                    .append(true)
+                    .write(true)
                     .open(&core.segment_path)
                     .map_err(|err| {
                         EngineError::Durability(format!(
-                            "failed to open WAL segment for append {}: {err}",
+                            "failed to open WAL segment for positional IO {}: {err}",
                             core.segment_path.display()
                         ))
                     })?;
-                // Durably drop the torn tail (if any) so appends resume at the valid boundary.
+                // Durably drop the torn tail (if any) so appends resume at the valid boundary,
+                // then re-establish the zero-filled preallocation window (W4a) the truncate
+                // chopped — recovery is the one-time place to pay it.
+                let prealloc_to = recovery
+                    .valid_bytes
+                    .max(wal_prealloc_chunk_bytes())
+                    .max(recovery.valid_bytes + wal_prealloc_chunk_bytes() / 2);
                 file.set_len(recovery.valid_bytes)
                     .and_then(|_| file.sync_all())
+                    .and_then(|_| zero_fill_extend(&file, recovery.valid_bytes, prealloc_to))
                     .map_err(|err| {
                         EngineError::Durability(format!(
-                            "failed to truncate torn WAL segment tail {}: {err}",
+                            "failed to truncate/preallocate WAL segment tail {}: {err}",
                             core.segment_path.display()
                         ))
                     })?;
+                state.prealloc_bytes = prealloc_to;
                 state.file = Some(Arc::new(file));
                 state.durable_bytes = recovery.valid_bytes;
                 core.record_tail_offset(&mut state)?;
@@ -643,6 +717,9 @@ impl WalBuffer {
                                     Some(format!("durable-prefix truncate rewind failed ({err})"));
                             } else {
                                 state.durable_bytes = target;
+                                // W4a: the set_len chopped the zero fill; account for it so the
+                                // next write re-extends before writing.
+                                state.prealloc_bytes = target;
                             }
                         }
                     }
@@ -697,19 +774,37 @@ impl WalBuffer {
         for record in &self.records[state.flushed_records..target] {
             encode_record_into(&mut tail, record)?;
         }
-        let file = state.file.clone().expect("append handle present");
-        if let Err(err) = (&*file).write_all(&tail) {
-            // The tail may be partially on disk beyond `durable_bytes`. Try to rewind; if the
-            // rewind itself fails, poison the backing so no later flush appends past garbage.
-            if let Err(rewind_err) = file.set_len(state.durable_bytes) {
-                state.poisoned = Some(format!(
-                    "append write failed ({err}); rewind failed ({rewind_err})"
-                ));
+        let file = state.file.clone().expect("write handle present");
+        // W4a: keep the write inside zero-filled extents (extend by whole chunks, rare) and
+        // write POSITIONALLY at the logical tail — the file size never changes on the hot
+        // path, so `sync_data` skips the filesystem's size-change journaling.
+        let write_end = state.durable_bytes + tail.len() as u64;
+        if write_end > state.prealloc_bytes {
+            let new_prealloc = write_end
+                .max(state.prealloc_bytes + wal_prealloc_chunk_bytes())
+                .max(wal_prealloc_chunk_bytes());
+            if let Err(err) = zero_fill_extend(&file, state.prealloc_bytes, new_prealloc) {
+                state.poisoned = Some(format!("preallocation extend failed ({err})"));
+                return Err(EngineError::Durability(format!(
+                    "failed to extend WAL segment preallocation {}: {err}",
+                    core.segment_path.display()
+                )));
             }
-            return Err(EngineError::Durability(format!(
-                "failed to append WAL segment {}: {err}",
-                core.segment_path.display()
-            )));
+            state.prealloc_bytes = new_prealloc;
+        }
+        {
+            use std::os::unix::fs::FileExt;
+            if let Err(err) = file.write_all_at(&tail, state.durable_bytes) {
+                // A partial positional write leaves garbage INSIDE the preallocated region past
+                // `durable_bytes`; the next successful write overwrites it and recovery's
+                // checksum walk truncates it — no size rewind needed (or wanted: it would chop
+                // the preallocation).
+                state.poisoned = Some(format!("append write failed ({err})"));
+                return Err(EngineError::Durability(format!(
+                    "failed to append WAL segment {}: {err}",
+                    core.segment_path.display()
+                )));
+            }
         }
         if let Err(err) = file.sync_data() {
             // After a failed fsync the page-cache state is unknowable (fsyncgate): the kernel may
@@ -772,11 +867,13 @@ impl WalBuffer {
         for record in &self.records[state.flushed_records..target] {
             encode_record_into(&mut tail, record)?;
         }
-        let file = state.file.clone().expect("append handle present");
+        let file = state.file.clone().expect("write handle present");
         state.io_in_flight = true;
         Ok(WalGroupFlushBegin::Job(WalGroupFlushJob {
             core: Arc::clone(core),
             file,
+            offset: state.durable_bytes,
+            prealloc_end: state.prealloc_bytes,
             bytes: tail,
             target_records: target,
             group_size,
@@ -804,7 +901,8 @@ impl WalBuffer {
     /// checkpoint-truncation half of D2. The caller must FIRST have made records `[0, base)`
     /// durable elsewhere (a checkpoint segment + control file); this rewrites the live segment to
     /// contain only `[base, flushed)` via an atomic temp-write + rename + parent-dir fsync, then
-    /// reopens the append handle on the rewritten file. The buffer's in-memory records and all
+    /// reopens a positional write handle on the rewritten file and re-establishes the W4a
+    /// preallocation frontier. The buffer's in-memory records and all
     /// logical counters are unchanged — only the FILE is trimmed, so a long-lived database's live
     /// segment stays bounded by the checkpoint cadence instead of growing forever.
     pub fn truncate_durable_segment_prefix(&mut self, base: usize) -> Result<(), EngineError> {
@@ -834,8 +932,13 @@ impl WalBuffer {
         let retained = &self.records[base..flushed];
         write_wal_segment(&core.segment_path, retained)?;
         sync_segment_parent_dir(&core.segment_path)?;
+        // AUDIT 9d6e9f96 BLOCKER: the reopen MUST be a plain write handle — on Linux, pwrite on
+        // an O_APPEND fd IGNORES the offset and appends at EOF, so every positional record write
+        // (and worse, a frontier-crossing zero_fill_extend) after a rotation would silently
+        // append past the logical tail: acknowledged records stranded behind a 64MB zero hole
+        // that recovery either rejects loudly (clean shutdown) or truncates silently (crash).
         let file = fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .open(&core.segment_path)
             .map_err(|err| {
                 EngineError::Durability(format!(
@@ -843,9 +946,22 @@ impl WalBuffer {
                     core.segment_path.display()
                 ))
             })?;
-        state.file = Some(Arc::new(file));
-        state.durable_bytes =
+        let durable_bytes =
             WAL_SEGMENT_MAGIC.len() as u64 + retained.iter().map(encoded_record_len).sum::<u64>();
+        // AUDIT 9d6e9f96 BLOCKER (part 2): the rewrite produced a COMPACT file — the old
+        // `prealloc_bytes` frontier is stale and must be re-established here (rotation is
+        // already a heavy, rare operation; paying the zero fill now keeps every subsequent
+        // group fdatasync on the fast no-size-change path).
+        let prealloc_to = durable_bytes.max(wal_prealloc_chunk_bytes());
+        zero_fill_extend(&file, durable_bytes, prealloc_to).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to re-preallocate WAL segment after prefix truncation {}: {err}",
+                core.segment_path.display()
+            ))
+        })?;
+        state.prealloc_bytes = prealloc_to;
+        state.file = Some(Arc::new(file));
+        state.durable_bytes = durable_bytes;
         state.segment_base_records = base;
         state.poisoned = None;
         core.record_tail_offset(&mut state)?;
@@ -1006,6 +1122,12 @@ pub fn read_wal_segment(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, Engine
                     u64::from_le_bytes(header[8..16].try_into().expect("payload len bytes"));
                 let expected_checksum =
                     u64::from_le_bytes(header[16..24].try_into().expect("checksum bytes"));
+                // W4a: an ALL-ZERO header is the preallocated zero tail — clean end-of-log. It
+                // can never be a real record: the FNV checksum of a zero header is nonzero
+                // (test-asserted), so (0, 0, 0) is unrepresentable by any valid record.
+                if txn_id == 0 && payload_len == 0 && expected_checksum == 0 {
+                    break;
+                }
                 let payload_len = usize::try_from(payload_len).map_err(|_| {
                     EngineError::Durability(format!(
                         "WAL segment {} record payload length is too large",
@@ -1179,6 +1301,24 @@ pub fn recover_wal_segment(path: impl AsRef<Path>) -> Result<WalSegmentRecovery,
         let payload_len = u64::from_le_bytes(header[8..16].try_into().expect("payload len bytes"));
         let expected_checksum =
             u64::from_le_bytes(header[16..24].try_into().expect("checksum bytes"));
+        // W4a: an all-zero header starts the preallocated zero tail. If the ENTIRE remainder is
+        // zeros this is a CLEAN end-of-log (discarded_torn_bytes = 0); any non-zero byte in the
+        // remainder is a genuine torn tail and takes the torn path below. An all-zero header can
+        // never be a real record (the FNV checksum of a zero header is nonzero, test-asserted),
+        // and acknowledged-durable records live below `recorded_tail`, which the zero region
+        // never reaches (`below_recorded_tail` would fail loudly first).
+        if txn_id == 0
+            && payload_len == 0
+            && expected_checksum == 0
+            && !below_recorded_tail
+            && bytes[record_start..].iter().all(|&b| b == 0)
+        {
+            return Ok(WalSegmentRecovery {
+                records,
+                valid_bytes: record_start as u64,
+                discarded_torn_bytes: 0,
+            });
+        }
         let payload_start = record_start + WAL_RECORD_HEADER_LEN;
         let payload_end = usize::try_from(payload_len)
             .ok()
@@ -4272,11 +4412,11 @@ mod tests {
         };
         wal.append(first.clone());
         wal.flush_all().unwrap();
-        let after_first = fs::read(&path).unwrap();
-        assert_eq!(
-            after_first.len() as u64,
-            WAL_SEGMENT_MAGIC.len() as u64 + encoded_record_len(&first)
-        );
+        // W4a: the physical file is PREALLOCATED (zero tail); the logical watermark is the
+        // durable length, and the logical prefix must stay byte-identical across flushes.
+        let first_logical = WAL_SEGMENT_MAGIC.len() as u64 + encoded_record_len(&first);
+        assert_eq!(wal.durable_segment_bytes(), first_logical);
+        let after_first = fs::read(&path).unwrap()[..first_logical as usize].to_vec();
 
         let second = WalRecord {
             txn_id: 2,
@@ -4284,14 +4424,12 @@ mod tests {
         };
         wal.append(second.clone());
         wal.flush_all().unwrap();
-        let after_second = fs::read(&path).unwrap();
+        let second_logical = first_logical + encoded_record_len(&second);
+        assert_eq!(wal.durable_segment_bytes(), second_logical);
+        let after_second = fs::read(&path).unwrap()[..second_logical as usize].to_vec();
         remove_segment_files(&path);
-        assert_eq!(
-            after_second.len() as u64,
-            after_first.len() as u64 + encoded_record_len(&second)
-        );
         assert_eq!(&after_second[..after_first.len()], &after_first[..]);
-        assert_eq!(wal.durable_segment_bytes(), after_second.len() as u64);
+        // The zero tail past the watermark reads back as clean end-of-log.
     }
 
     #[test]
@@ -4311,16 +4449,21 @@ mod tests {
             }
             // Drop records the durable tail offset (clean shutdown).
         }
-        let valid_bytes = fs::read(&path).unwrap().len() as u64;
-        // Simulate the torn append: garbage bytes past the acknowledged tail.
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&[0xAB; 17]).unwrap();
-        drop(file);
+        // W4a: the physical file carries the preallocated zero tail; the LOGICAL valid length
+        // is what recovery must report. Plant the torn garbage AT the logical tail (a real torn
+        // append writes positionally there), overwriting the first zero bytes.
+        let valid_bytes = recover_wal_segment(&path).unwrap().valid_bytes;
+        {
+            use std::os::unix::fs::FileExt;
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all_at(&[0xAB; 17], valid_bytes).unwrap();
+        }
 
         let recovery = recover_wal_segment(&path).unwrap();
         assert_eq!(recovery.records.len(), 2);
         assert_eq!(recovery.valid_bytes, valid_bytes);
-        assert_eq!(recovery.discarded_torn_bytes, 17);
+        // Discarded = the torn garbage plus the preallocated zero tail behind it.
+        assert!(recovery.discarded_torn_bytes >= 17);
 
         let mut wal =
             WalBuffer::with_recovered_durable_segment(&path, recovery.records.clone(), &recovery)
@@ -4405,17 +4548,166 @@ mod tests {
             });
             wal.flush_all().unwrap();
         }
-        let valid_bytes = fs::read(&path).unwrap().len() as u64;
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&[0xCD; 5]).unwrap();
-        drop(file);
+        // W4a: plant the garbage at the LOGICAL tail (inside the preallocated region).
+        let valid_bytes = recover_wal_segment(&path).unwrap().valid_bytes;
+        {
+            use std::os::unix::fs::FileExt;
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all_at(&[0xCD; 5], valid_bytes).unwrap();
+        }
         fs::remove_file(wal_tail_offset_path(&path)).unwrap();
 
         let recovery = recover_wal_segment(&path).unwrap();
         remove_segment_files(&path);
         assert_eq!(recovery.records.len(), 1);
         assert_eq!(recovery.valid_bytes, valid_bytes);
-        assert_eq!(recovery.discarded_torn_bytes, 5);
+        assert!(recovery.discarded_torn_bytes >= 5);
+    }
+
+    #[test]
+    fn w4a_rotation_then_frontier_crossing_group_survives_reopen() {
+        // AUDIT 9d6e9f96 BLOCKER regression: after a checkpoint prefix-truncation (rotation),
+        // the reopened handle must write POSITIONALLY (not O_APPEND, whose pwrite ignores the
+        // offset on Linux) and the preallocation frontier must be re-established — a
+        // frontier-crossing group after rotation previously stranded acknowledged records
+        // behind a zero hole (loud startup rejection after clean shutdown; silent loss after
+        // a crash).
+        let path = test_wal_path("w4a-rotation-crossing");
+        {
+            let mut wal = WalBuffer::with_durable_segment(&path);
+            for txn_id in 1..=3 {
+                wal.append(WalRecord {
+                    txn_id,
+                    payload: format!("pre-rotation {txn_id}").into_bytes().into(),
+                });
+                wal.flush_all().unwrap();
+            }
+            // Rotate: records [0,2) move to a (simulated) checkpoint; the live file keeps [2,3).
+            wal.truncate_durable_segment_prefix(2).unwrap();
+            // A group LARGER than the preallocation chunk forces the extension arm on the
+            // post-rotation handle — the exact interaction the blocker corrupted.
+            let big = vec![0xBB_u8; (wal_prealloc_chunk_bytes() + 256 * 1024) as usize];
+            wal.append(WalRecord {
+                txn_id: 4,
+                payload: big.into(),
+            });
+            wal.flush_all().unwrap();
+            wal.append(WalRecord {
+                txn_id: 5,
+                payload: b"after crossing".to_vec().into(),
+            });
+            wal.flush_all().unwrap();
+            // Drop = clean shutdown (records the tail-offset sidecar).
+        }
+        // Reopen: every post-rotation record must be present and the segment clean.
+        let recovery = recover_wal_segment(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(recovery.discarded_torn_bytes, 0);
+        let txns: Vec<u64> = recovery.records.iter().map(|r| r.txn_id).collect();
+        assert_eq!(txns, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn w4a_zero_header_is_never_a_valid_record() {
+        // The preallocated zero tail is end-of-log to BOTH readers only because an all-zero
+        // 24-byte header is unrepresentable: a real record with txn_id=0 and payload_len=0
+        // would carry the FNV checksum of the zero header, which must never itself be 0.
+        assert_ne!(
+            wal_record_checksum(0, 0, &[]),
+            0,
+            "FNV checksum of a zero header must be nonzero or zero-tail detection is unsound"
+        );
+    }
+
+    #[test]
+    fn w4a_preallocation_keeps_physical_size_stable_across_flushes() {
+        // The whole point of W4a: per-flush fdatasync must not grow the file (size-change
+        // journaling is what cost 3x on fdatasync latency).
+        let path = test_wal_path("w4a-stable-size");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"first".to_vec().into(),
+        });
+        wal.flush_all().unwrap();
+        let physical_after_first = fs::metadata(&path).unwrap().len();
+        for txn_id in 2..=50 {
+            wal.append(WalRecord {
+                txn_id,
+                payload: format!("record {txn_id}").into_bytes().into(),
+            });
+            wal.flush_all().unwrap();
+        }
+        let physical_after_fifty = fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            physical_after_first, physical_after_fifty,
+            "flushes inside the preallocated window must not change the physical size"
+        );
+        drop(wal);
+        // Clean recovery: the zero tail reads as a clean end (no torn bytes).
+        let recovery = recover_wal_segment(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(recovery.records.len(), 50);
+        assert_eq!(recovery.discarded_torn_bytes, 0);
+    }
+
+    #[test]
+    fn w4a_growth_crosses_the_prealloc_chunk_inline_flush() {
+        // A record larger than the preallocation chunk forces the INLINE flush's extension arm;
+        // everything must stay readable and recoverable across the boundary.
+        let path = test_wal_path("w4a-growth-inline");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"small before growth".to_vec().into(),
+        });
+        wal.flush_all().unwrap();
+        let big = vec![0xEE_u8; (wal_prealloc_chunk_bytes() + 1024 * 1024) as usize];
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: big.clone().into(),
+        });
+        wal.flush_all().unwrap();
+        wal.append(WalRecord {
+            txn_id: 3,
+            payload: b"small after growth".to_vec().into(),
+        });
+        wal.flush_all().unwrap();
+        drop(wal);
+        let recovery = recover_wal_segment(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(recovery.records.len(), 3);
+        assert_eq!(recovery.discarded_torn_bytes, 0);
+        assert_eq!(&recovery.records[1].payload[..], &big[..]);
+    }
+
+    #[test]
+    fn w4a_growth_crosses_the_prealloc_chunk_group_job() {
+        // Same boundary crossing through the GROUP flush job (the concurrent path's flusher).
+        let path = test_wal_path("w4a-growth-job");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        let big = vec![0xDD_u8; (wal_prealloc_chunk_bytes() + 512 * 1024) as usize];
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: big.clone().into(),
+        });
+        let begun = wal.begin_group_flush().unwrap();
+        let flushed = match begun {
+            WalGroupFlushBegin::Job(job) => job.commit().unwrap(),
+            WalGroupFlushBegin::Clean { flushed_records } => flushed_records,
+        };
+        assert_eq!(flushed, 1);
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"after job growth".to_vec().into(),
+        });
+        wal.flush_all().unwrap();
+        drop(wal);
+        let recovery = recover_wal_segment(&path).unwrap();
+        remove_segment_files(&path);
+        assert_eq!(recovery.records.len(), 2);
+        assert_eq!(recovery.discarded_torn_bytes, 0);
+        assert_eq!(&recovery.records[0].payload[..], &big[..]);
     }
 
     #[test]
