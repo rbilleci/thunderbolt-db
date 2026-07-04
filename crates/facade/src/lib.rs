@@ -337,7 +337,7 @@ impl SharedEngine {
     /// visible. The durability counterpart to [`SharedEngine::new`], whose WAL is in-memory only.
     pub fn new_durable(segment_path: impl AsRef<std::path::Path>) -> Result<Self, String> {
         let segment_path = segment_path.as_ref();
-        let engine = Engine::open_durable_wal_segment(segment_path).map_err(|err| {
+        let engine = Engine::open_durable_wal_segment_auto(segment_path).map_err(|err| {
             format!(
                 "failed to open durable WAL segment {}: {err}",
                 segment_path.display()

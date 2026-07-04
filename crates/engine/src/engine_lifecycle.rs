@@ -430,16 +430,74 @@ impl Engine {
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref();
         let (_control, checkpoint_records) = read_wal_checkpoint(control_path)?;
-        let recovery = recover_wal_segment(segment_path)?;
+        let mut recovery = recover_wal_segment(segment_path)?;
+        // W1b — the checkpoint/truncation crash window: `checkpoint_and_truncate_durable_wal`
+        // writes the checkpoint segment (the FULL flushed history), then the control file, then
+        // truncates the live segment's prefix. A crash between the control-file write and the
+        // truncation leaves overlapping records in BOTH files; blindly chaining them would
+        // replay the overlap TWICE (duplicate rows). The overlap shape is: the LIVE segment's
+        // HEAD equals the CHECKPOINT'S TAIL —
+        //   - first-rotation crash: live = the full history = exactly the checkpoint (the tail
+        //     match is the whole checkpoint);
+        //   - Nth-rotation crash: live = the (N-1)th rotation's suffix, which is the tail of
+        //     the new full-history checkpoint. (Head-to-head prefix matching would miss this
+        //     and double-replay the suffix.)
+        // Find the largest k where live[..k] == checkpoint[C-k..] (txn_id + payload) and skip
+        // it. A properly-truncated segment shares no such region (its first record is
+        // post-checkpoint), so k=0 on the normal path.
+        let c = checkpoint_records.len();
+        let max_k = c.min(recovery.records.len());
+        let overlap = (0..=max_k)
+            .rev()
+            .find(|&k| {
+                checkpoint_records[c - k..]
+                    .iter()
+                    .zip(recovery.records[..k].iter())
+                    .all(|(checkpointed, live)| {
+                        checkpointed.txn_id == live.txn_id && checkpointed.payload == live.payload
+                    })
+            })
+            .unwrap_or(0);
+        if overlap > 0 {
+            recovery.records.drain(..overlap);
+        }
         let mut engine = Self::new_local();
         for record in checkpoint_records.iter().chain(recovery.records.iter()) {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
+        let checkpoint_count = checkpoint_records.len();
         let mut records = checkpoint_records;
         records.extend_from_slice(&recovery.records);
         engine.commit_state_mut().wal =
             WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
+        if overlap > 0 {
+            // Repair: complete the crashed rotation's truncation so the live segment converges
+            // to the suffix-only layout (the overlap-skip above makes the pre-repair state
+            // readable; this makes it go away). Failure here is non-fatal for serving — the
+            // next successful rotation or reopen repairs again.
+            let _ = engine
+                .commit_state_mut()
+                .wal
+                .truncate_durable_segment_prefix(checkpoint_count);
+        }
         Ok(engine)
+    }
+
+    /// W1b — the CHECKPOINT-AWARE standard open: recovers checkpoint-then-suffix when the
+    /// convention control file (`<segment>.control`) exists, else exactly the plain open. This
+    /// is the entry point the facade uses, so an auto-rotated database restarts with its FULL
+    /// history — wiring auto-checkpointing through the plain open would silently drop the
+    /// checkpointed prefix on restart.
+    pub fn open_durable_wal_segment_auto(
+        segment_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.as_ref();
+        let control_path = gpu_db_wal::wal_checkpoint_control_path(segment_path);
+        if control_path.exists() {
+            Self::open_durable_wal_segment_with_checkpoint(control_path, segment_path)
+        } else {
+            Self::open_durable_wal_segment(segment_path)
+        }
     }
 
     pub fn simulate_next_wal_flush_failure(&mut self) {

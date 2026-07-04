@@ -1929,3 +1929,198 @@ fn checkpoint_vacuum_rejects_unsafe_boundaries() {
     // With no active snapshot, pruning strictly below the durable boundary is allowed.
     e.checkpoint_vacuum_mvcc_versions(1).unwrap();
 }
+
+/// W1b — the checkpoint-aware AUTO open (the facade's entry point): after a size-bound rotation
+/// through the convention paths, a restart recovers checkpoint-then-suffix with the FULL history.
+#[test]
+fn w1b_auto_open_recovers_full_history_after_rotation() {
+    let path = test_wal_path("w1b-auto-open");
+    let control = gpu_db_wal::wal_checkpoint_control_path(&path);
+    let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
+    {
+        let e = Engine::with_durable_wal_segment(&path);
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        for i in 0..8 {
+            e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        // Rotate at a tiny explicit bound (bypasses the env-configured default).
+        let rotated = e
+            .checkpoint_and_truncate_durable_wal_if_larger_than(&control, &checkpoint, 1)
+            .unwrap();
+        assert!(rotated, "the live segment must exceed a 1-byte bound");
+        // Post-rotation commits land in the truncated live segment.
+        for i in 8..12 {
+            e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+    }
+    let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    let rows = recovered.execute_relational_select(&count).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Int8(12)]],
+        "auto open must recover the checkpointed prefix AND the live suffix"
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&checkpoint));
+    let _ = std::fs::remove_file(&control);
+    let _ = std::fs::remove_file(&checkpoint);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// W1b — the rotation CRASH WINDOW: checkpoint segment + control file written, live-segment
+/// truncation NOT performed (simulated crash between them). The auto open must (a) not replay
+/// the checkpointed records twice, and (b) REPAIR the live segment to the suffix-only layout.
+#[test]
+fn w1b_auto_open_repairs_the_checkpoint_truncation_crash_window() {
+    let path = test_wal_path("w1b-crash-window");
+    let control = gpu_db_wal::wal_checkpoint_control_path(&path);
+    let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
+    {
+        let e = Engine::with_durable_wal_segment(&path);
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        for i in 0..6 {
+            e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        // Simulate the crashed rotation: write the checkpoint + control file exactly as
+        // checkpoint_and_truncate_durable_wal does, but skip the truncation (the crash).
+        let records = e.durable_wal_records();
+        gpu_db_wal::write_wal_segment(&checkpoint, &records).unwrap();
+        gpu_db_wal::write_wal_control_file(
+            &control,
+            &gpu_db_wal::WalControlFile {
+                segment_path: checkpoint
+                    .file_name()
+                    .map(std::path::PathBuf::from)
+                    .unwrap(),
+                checkpoint: gpu_db_wal::WalCheckpointMeta {
+                    durable_record_count: records.len(),
+                    last_durable_txn_id: records.last().map(|r| r.txn_id),
+                },
+            },
+        )
+        .unwrap();
+        // Engine drops WITHOUT truncating: the live segment still holds the full history.
+    }
+    let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    let rows = recovered.execute_relational_select(&count).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Int8(6)]],
+        "the overlap must be recovered exactly once (6 rows, not 12)"
+    );
+    // The open repaired the live segment: reopen again and verify convergence.
+    drop(recovered);
+    let reopened = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    let rows = reopened.execute_relational_select(&count).unwrap().rows;
+    assert_eq!(rows, vec![vec![SqlValue::Int8(6)]]);
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&checkpoint));
+    let _ = std::fs::remove_file(&control);
+    let _ = std::fs::remove_file(&checkpoint);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// W1b — the rotation prunes ALL THREE per-commit unbounded structures in lock-step: the live
+/// segment (bytes), the commit-timestamp map, and the replication log's applied prefix.
+#[test]
+fn w1b_rotation_prunes_timestamps_and_replication_log() {
+    let path = test_wal_path("w1b-prune-trio");
+    let control = gpu_db_wal::wal_checkpoint_control_path(&path);
+    let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
+    let e = Engine::with_durable_wal_segment(&path);
+    e.execute_text(1, "CREATE TABLE t (id INT)").unwrap();
+    for i in 0..8 {
+        e.execute_text(2 + i, &format!("INSERT INTO t (id) VALUES ({i})"))
+            .unwrap();
+    }
+    let bytes_before = e.wal_durable_segment_bytes();
+    let entries_before = e.replication_retained_entry_count();
+    assert!(
+        entries_before >= 9,
+        "repl log holds every commit pre-rotation"
+    );
+    e.checkpoint_and_truncate_durable_wal_if_larger_than(&control, &checkpoint, 1)
+        .unwrap();
+    assert!(e.wal_durable_segment_bytes() < bytes_before);
+    assert_eq!(
+        e.replication_retained_entry_count(),
+        0,
+        "the applied replication prefix is discarded at the checkpoint boundary"
+    );
+    // The engine keeps serving writes after the rotation.
+    e.execute_text(100, "INSERT INTO t (id) VALUES (100)")
+        .unwrap();
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&checkpoint));
+    let _ = std::fs::remove_file(&control);
+    let _ = std::fs::remove_file(&checkpoint);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// W1b — the SECOND rotation's crash window: after one successful rotation, the live segment
+/// holds only the suffix; a second rotation writes a NEW full-history checkpoint, and a crash
+/// before its truncation leaves live = the suffix = the new checkpoint's TAIL (not its head —
+/// head-to-head prefix matching would find no overlap and double-replay the suffix).
+#[test]
+fn w1b_auto_open_repairs_a_second_rotation_crash_window() {
+    let path = test_wal_path("w1b-crash-window-2");
+    let control = gpu_db_wal::wal_checkpoint_control_path(&path);
+    let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
+    {
+        let e = Engine::with_durable_wal_segment(&path);
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        for i in 0..4 {
+            e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 1)"))
+                .unwrap();
+        }
+        // Rotation 1 completes normally: live = suffix only.
+        e.checkpoint_and_truncate_durable_wal_if_larger_than(&control, &checkpoint, 1)
+            .unwrap();
+        for i in 4..7 {
+            e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 2)"))
+                .unwrap();
+        }
+        // Rotation 2 CRASHES between the control-file write and the truncation: write the new
+        // full-history checkpoint + control exactly as the rotation does, skip the truncate.
+        let records = e.durable_wal_records();
+        gpu_db_wal::write_wal_segment(&checkpoint, &records).unwrap();
+        gpu_db_wal::write_wal_control_file(
+            &control,
+            &gpu_db_wal::WalControlFile {
+                segment_path: checkpoint
+                    .file_name()
+                    .map(std::path::PathBuf::from)
+                    .unwrap(),
+                checkpoint: gpu_db_wal::WalCheckpointMeta {
+                    durable_record_count: records.len(),
+                    last_durable_txn_id: records.last().map(|r| r.txn_id),
+                },
+            },
+        )
+        .unwrap();
+    }
+    let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    let rows = recovered.execute_relational_select(&count).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Int8(7)]],
+        "the second rotation's overlap (the live suffix = the checkpoint's tail) must replay once"
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&checkpoint));
+    let _ = std::fs::remove_file(&control);
+    let _ = std::fs::remove_file(&checkpoint);
+    let _ = std::fs::remove_file(&path);
+}

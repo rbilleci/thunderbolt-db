@@ -663,6 +663,9 @@ impl Engine {
                     // case's latency identical to the pre-pipeline path). Tails already claimed
                     // by an in-flight waiter finish on that waiter.
                     while self.try_finish_pending_wave_tail() {}
+                    // W1b: idle moment — the cheap auto-checkpoint bound probe (see the wave
+                    // counter probe above for the sustained-load path).
+                    self.maybe_auto_checkpoint_wal();
                     self.commit_wave.cv.notify_all();
                     return;
                 }
@@ -671,7 +674,14 @@ impl Engine {
             let wave_started = std::time::Instant::now();
             let wave_len = batch.len() as u64;
             let tail = self.sequence_commit_wave(batch);
-            WAVE_STATS[0].fetch_add(1, AtomicOrdering::Relaxed);
+            let waves = WAVE_STATS[0].fetch_add(1, AtomicOrdering::Relaxed);
+            // W1b: periodic auto-checkpoint probe OFF the critical section (the rotation takes
+            // the commit_mutex itself). Every 256 waves keeps the under-bound check (one mutex
+            // lock + field read) off the per-wave path; sustained load can never starve
+            // rotation, and the empty-queue step-down below covers bursty loads.
+            if waves % 256 == 255 {
+                self.maybe_auto_checkpoint_wal();
+            }
             WAVE_STATS[1].fetch_add(wave_len, AtomicOrdering::Relaxed);
             WAVE_STATS[2].fetch_add(
                 wave_started.elapsed().as_nanos() as u64,
@@ -1745,6 +1755,9 @@ impl Engine {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        // W1b: the serialized path's maintenance point — commit lock + catalog latch are
+        // released here, so the rotation can take them fresh (cheap under the size bound).
+        self.maybe_auto_checkpoint_wal();
         result
     }
 

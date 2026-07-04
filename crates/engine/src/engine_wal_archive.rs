@@ -117,6 +117,12 @@ impl Engine {
                 checkpoint: meta,
             },
         )?;
+        // W1b audit fix 1: the checkpoint + control RENAMES are not crash-durable until their
+        // parent directories are fsynced — and this must happen BEFORE the live truncation, or
+        // a crash could persist the truncated live segment WITHOUT the control file that points
+        // at the checkpointed prefix (silent loss of the whole prefix).
+        gpu_db_wal::sync_wal_parent_dir(checkpoint_segment_path)?;
+        gpu_db_wal::sync_wal_parent_dir(control_path)?;
         let boundary = commit.wal.flushed_count();
         commit.wal.truncate_durable_segment_prefix(boundary)?;
         // R2 (write-path assessment): the commit-timestamp map grew by one entry per commit
@@ -135,6 +141,11 @@ impl Engine {
         commit
             .wal_commit_timestamps_micros
             .retain(|txn_id, _| !checkpointed_txn_ids.contains(txn_id));
+        // W1b: the replication log is the third per-commit unbounded structure — its applied
+        // prefix is never read again (drain_committed_from yields only past-applied entries), so
+        // the checkpoint boundary is its discard point too. No-op for Raft (its log serves
+        // follower catch-up and has its own compaction).
+        commit.repl.compact_applied_prefix();
         Ok(meta)
     }
 
@@ -142,6 +153,12 @@ impl Engine {
     /// for the checkpoint/rotation policy.
     pub fn wal_durable_segment_bytes(&self) -> u64 {
         self.commit_state().wal.durable_segment_bytes()
+    }
+
+    /// W1b — retained replication-log entries (observability for the rotation's lock-step
+    /// pruning of the applied prefix).
+    pub fn replication_retained_entry_count(&self) -> usize {
+        self.commit_state().repl.retained_entry_count()
     }
 
     /// Rotation-at-a-size-bound policy: checkpoint + truncate the live segment iff it has grown
@@ -158,6 +175,52 @@ impl Engine {
         }
         self.checkpoint_and_truncate_durable_wal(control_path, checkpoint_segment_path)?;
         Ok(true)
+    }
+
+    /// W1b — AUTO-CHECKPOINT (the durability mandate's bounded-recovery requirement): rotate the
+    /// live WAL segment through the convention paths (`<segment>.control` /
+    /// `<segment>.checkpoint`) when it exceeds the size bound. Bound from
+    /// `GPU_DB_WAL_CHECKPOINT_BYTES` (default 256MB; `0` disables). Cheap when under the bound
+    /// (one lock + one field read). Called from the commit paths' maintenance points — NEVER
+    /// inside the commit critical section (it takes the commit_mutex itself and the rotation
+    /// rewrites the retained history). The checkpoint-aware open (`open_durable_wal_segment_auto`,
+    /// the facade's entry point) recovers checkpoint-then-suffix, tolerating and repairing the
+    /// crash window between the control-file write and the live truncation.
+    pub fn maybe_auto_checkpoint_wal(&self) -> bool {
+        fn bound() -> u64 {
+            static BOUND: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *BOUND.get_or_init(|| {
+                std::env::var("GPU_DB_WAL_CHECKPOINT_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(256 * 1024 * 1024)
+            })
+        }
+        let max = bound();
+        if max == 0 {
+            return false;
+        }
+        let Some(segment_path) = ({
+            let commit = self.commit_state();
+            commit.wal.durable_segment_path().map(|p| p.to_path_buf())
+        }) else {
+            return false;
+        };
+        let control = gpu_db_wal::wal_checkpoint_control_path(&segment_path);
+        let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&segment_path);
+        match self.checkpoint_and_truncate_durable_wal_if_larger_than(control, checkpoint, max) {
+            Ok(rotated) => rotated,
+            Err(_) => {
+                // Non-fatal maintenance failure (mirrors the auto-vacuum policy): the statement
+                // that triggered the check is already durable; the bound check re-arms on the
+                // next trigger. Count it for observability.
+                self.read_state
+                    .residency
+                    .auto_vacuum_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+        }
     }
 
     pub fn persist_durable_wal_archive(

@@ -1094,6 +1094,13 @@ impl RecoveryState {
 
 pub trait LogReplicator {
     fn propose(&mut self, payload: std::sync::Arc<[u8]>) -> Result<CommitToken, EngineError>;
+
+    /// W1b — drop retained log entries that are both COMMITTED and APPLIED (never read again:
+    /// `drain_committed_from` only yields entries past the applied index). Default no-op; the
+    /// local single-node replicator compacts its in-memory Vec (the third unbounded per-commit
+    /// structure alongside the WAL buffer and the timestamp map); Raft keeps its own log
+    /// management (follower catch-up may still need applied entries).
+    fn compact_applied_prefix(&mut self) {}
     fn wait_committed(
         &self,
         token: CommitToken,
@@ -1213,6 +1220,13 @@ impl LocalReplicator {
         if let Some(term) = self.entry_at(bounded).map(|entry| entry.term) {
             self.applied_term = term;
         }
+    }
+
+    /// W1b: drop the applied prefix (see [`LogReplicator::compact_applied_prefix`]). Keeps the
+    /// log contiguous-from-first (the `entry_at` invariant): only a PREFIX is removed.
+    pub fn compact_applied_prefix_inner(&mut self) {
+        let applied = self.applied_index;
+        self.entries.retain(|e| e.index > applied);
     }
 
     pub fn rollback_unapplied_from(&mut self, index_inclusive: Index) {
@@ -1843,6 +1857,10 @@ impl RaftReplicator {
 }
 
 impl LogReplicator for LocalReplicator {
+    fn compact_applied_prefix(&mut self) {
+        self.compact_applied_prefix_inner();
+    }
+
     fn propose(&mut self, payload: std::sync::Arc<[u8]>) -> Result<CommitToken, EngineError> {
         if self.role != Role::Leader {
             return Err(EngineError::NotLeader);

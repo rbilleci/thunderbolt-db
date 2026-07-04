@@ -928,24 +928,35 @@ impl WalBuffer {
             )));
         }
         // Close the old handle first: the rename below unlinks the inode it points at.
+        // W1b audit fix 3: any failure past this point leaves `file = None`, and the next
+        // flush's ensure_created would CLOBBER the live segment with fresh-database semantics —
+        // poison the backing instead so the half-rotated state is fail-closed until restart
+        // recovery (which reads the on-disk files, not this handle).
         state.file = None;
         let retained = &self.records[base..flushed];
-        write_wal_segment(&core.segment_path, retained)?;
-        sync_segment_parent_dir(&core.segment_path)?;
+        if let Err(err) = write_wal_segment(&core.segment_path, retained) {
+            state.poisoned = Some(format!("prefix-truncation rewrite failed ({err})"));
+            return Err(err);
+        }
+        if let Err(err) = sync_segment_parent_dir(&core.segment_path) {
+            state.poisoned = Some(format!("prefix-truncation dir fsync failed ({err})"));
+            return Err(err);
+        }
         // AUDIT 9d6e9f96 BLOCKER: the reopen MUST be a plain write handle — on Linux, pwrite on
         // an O_APPEND fd IGNORES the offset and appends at EOF, so every positional record write
         // (and worse, a frontier-crossing zero_fill_extend) after a rotation would silently
         // append past the logical tail: acknowledged records stranded behind a 64MB zero hole
         // that recovery either rejects loudly (clean shutdown) or truncates silently (crash).
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(&core.segment_path)
-            .map_err(|err| {
-                EngineError::Durability(format!(
+        let file = match fs::OpenOptions::new().write(true).open(&core.segment_path) {
+            Ok(file) => file,
+            Err(err) => {
+                state.poisoned = Some(format!("post-truncation reopen failed ({err})"));
+                return Err(EngineError::Durability(format!(
                     "failed to reopen WAL segment after prefix truncation {}: {err}",
                     core.segment_path.display()
-                ))
-            })?;
+                )));
+            }
+        };
         let durable_bytes =
             WAL_SEGMENT_MAGIC.len() as u64 + retained.iter().map(encoded_record_len).sum::<u64>();
         // AUDIT 9d6e9f96 BLOCKER (part 2): the rewrite produced a COMPACT file — the old
@@ -953,12 +964,13 @@ impl WalBuffer {
         // already a heavy, rare operation; paying the zero fill now keeps every subsequent
         // group fdatasync on the fast no-size-change path).
         let prealloc_to = durable_bytes.max(wal_prealloc_chunk_bytes());
-        zero_fill_extend(&file, durable_bytes, prealloc_to).map_err(|err| {
-            EngineError::Durability(format!(
+        if let Err(err) = zero_fill_extend(&file, durable_bytes, prealloc_to) {
+            state.poisoned = Some(format!("post-truncation preallocation failed ({err})"));
+            return Err(EngineError::Durability(format!(
                 "failed to re-preallocate WAL segment after prefix truncation {}: {err}",
                 core.segment_path.display()
-            ))
-        })?;
+            )));
+        }
         state.prealloc_bytes = prealloc_to;
         state.file = Some(Arc::new(file));
         state.durable_bytes = durable_bytes;
@@ -1011,6 +1023,14 @@ impl WalBuffer {
 /// directory entry is persisted). A best-effort no-op on platforms / filesystems that refuse to
 /// open a directory for fsync is intentionally NOT done — a hard error here means the existence of
 /// the just-written WAL could be lost on crash, which would violate durability, so it propagates.
+/// W1b audit fix 1: crash-durability for the checkpoint/control RENAMES — a rename is not
+/// durable until the parent directory is fsynced; the rotation must do this BEFORE truncating
+/// the live segment, or a strict-POSIX crash can lose the control file (and with it the entire
+/// checkpointed prefix, silently) after the truncation survived.
+pub fn sync_wal_parent_dir(path: &Path) -> Result<(), EngineError> {
+    sync_segment_parent_dir(path)
+}
+
 fn sync_segment_parent_dir(segment_path: &Path) -> Result<(), EngineError> {
     let parent = segment_path.parent().filter(|p| !p.as_os_str().is_empty());
     let Some(parent) = parent else {
@@ -1164,6 +1184,28 @@ pub fn read_wal_segment(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, Engine
         }
     }
     Ok(records)
+}
+
+/// W1b — the AUTO-CHECKPOINT path convention: for a live segment `P`, the rolling checkpoint
+/// control file is `P.control` and the checkpoint segment is `P.checkpoint`. The engine's
+/// auto-rotation writes with these paths and the checkpoint-aware open detects `P.control` to
+/// recover checkpoint-then-suffix; a database that never checkpointed has no control file and
+/// opens exactly as before.
+pub fn wal_checkpoint_control_path(segment_path: &Path) -> PathBuf {
+    let file_name = segment_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wal.segment");
+    segment_path.with_file_name(format!("{file_name}.control"))
+}
+
+/// See [`wal_checkpoint_control_path`].
+pub fn wal_checkpoint_segment_path(segment_path: &Path) -> PathBuf {
+    let file_name = segment_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wal.segment");
+    segment_path.with_file_name(format!("{file_name}.checkpoint"))
 }
 
 const WAL_TAIL_MAGIC: &str = "GPUDBWALTAIL1";
@@ -1481,7 +1523,17 @@ pub fn read_wal_checkpoint(
             .unwrap_or_else(|| Path::new("."))
             .join(&control.segment_path)
     };
-    let records = read_wal_segment(&segment_path)?;
+    let mut records = read_wal_segment(&segment_path)?;
+    // W1b audit fix 2: the rotation renames the checkpoint segment BEFORE the control file; a
+    // crash between them leaves a NEWER (longer) checkpoint paired with the previous control.
+    // The CONTROL FILE is the commit point — the checkpoint's extra tail records were never
+    // committed as a checkpoint, but every one of them is still covered by the (untruncated)
+    // live segment, so truncating the LIST to the control's count recovers exactly the
+    // committed state. A SHORTER checkpoint than the control commits to remains a loud error
+    // (acknowledged checkpoint data is missing).
+    if records.len() > control.checkpoint.durable_record_count {
+        records.truncate(control.checkpoint.durable_record_count);
+    }
     validate_checkpoint_control(control_path, &control, &records)?;
     Ok((control, records))
 }
