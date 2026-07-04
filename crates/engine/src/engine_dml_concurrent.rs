@@ -11,10 +11,23 @@ use super::*;
 /// under saturation the NEXT wave picks the rest up immediately).
 const COMMIT_WAVE_MAX: usize = 1024;
 
+/// W2b — max sequenced-but-unpublished wave tails outstanding in the durability pipeline. Depth 1
+/// forced one fsync per wave (the sequencer stalled at the gate for ~the full fdatasync — a
+/// measured 14% durable-arm REGRESSION); at depth N consecutive waves' records coalesce into
+/// SHARED fsyncs (the group covers everything appended while the previous flush was in flight),
+/// so the fsync count per commit drops toward 1/N. Correctness does not depend on finish order:
+/// a tail's durability wait covers all EARLIER WAL positions (prefix durability) and
+/// `publish_committed_seq` is a CAS-max, so concurrent claimers may finish tails out of order.
+/// The bound caps applied-but-unpublished state at N waves (restart recovery replays the durable
+/// prefix; nothing unpublished was ever acked).
+const WAVE_TAIL_PIPELINE_DEPTH: u64 = 8;
+
 /// Commit-wave telemetry (waves sequenced / items committed through waves / total sequencing
-/// nanos including each wave's group-durability tail). Three relaxed adds PER WAVE — not per
-/// item — so it stays on permanently; the phase-D SLO benchmark reads it to report wave
-/// amortization (`items/waves`) alongside TPS.
+/// nanos). W2 CHANGED [2]'s meaning: the timer now stops when `sequence_commit_wave` returns —
+/// the group-durability tail (fsync-wait + publish + acks) is PIPELINED off the sequencer and
+/// is NOT included (pre-W2 numbers included it; comparisons across d6d10f8e are
+/// apples-to-oranges). Three relaxed adds PER WAVE — not per item — so it stays on permanently;
+/// the phase-D SLO benchmark reads it to report wave amortization (`items/waves`) alongside TPS.
 pub static WAVE_STATS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -122,10 +135,29 @@ impl CommitWaveItem {
 
 /// The deterministic commit-wave state (ledger #6): the arrival-ordered item queue, the
 /// single-sequencer election flag, and the sticky wedge. The condvar doubles as the completion
-/// signal for waiters and the promotion signal for the next sequencer.
+/// signal for waiters, the promotion signal for the next sequencer, and (W2) the tail-finished
+/// signal for the depth-1 durability pipeline.
 pub(crate) struct CommitWaveState {
     pub(crate) queue: Mutex<CommitWaveQueue>,
     pub(crate) cv: std::sync::Condvar,
+    /// W2/W2b — the DURABILITY PIPELINE (depth [`WAVE_TAIL_PIPELINE_DEPTH`]): sequenced waves
+    /// whose group-fsync wait, `committed_seq` publish, and outcome acks have NOT yet run. The
+    /// sequencer pushes tails here and immediately drains/sequences the NEXT wave under the
+    /// commit_mutex; tails are FINISHED (fsync-wait → publish → acks) by whichever threads claim
+    /// them — the waves' own blocked waiters (they are spinning on their outcomes anyway) or the
+    /// sequencer as the fallback claimer at the capacity gate. Finish order is UNCONSTRAINED:
+    /// a tail's durability wait covers all earlier WAL positions (prefix frontier) and the
+    /// publish is a CAS-max, so concurrent out-of-order finishing is safe. This is what lets
+    /// wave N+1's serial sequencing overlap wave N's fdatasync, and lets consecutive waves'
+    /// records coalesce into SHARED fsyncs via the WAL's group-flush protocol.
+    /// Liveness: a pending tail always has ≥1 live claimer — its members' outcomes are unset
+    /// until it finishes, so they are by definition still in the waiter loops (which probe this
+    /// deque), and the sequencer try-claims before ever blocking on the capacity gate.
+    pub(crate) pending_tails: Mutex<std::collections::VecDeque<CommitWaveTail>>,
+    /// Tails handed to the pipeline slot / tails fully finished. `handed == finished` ⇔ the
+    /// pipeline is empty (the depth-1 gate the sequencer enforces before handing a new tail).
+    pub(crate) tails_handed: AtomicU64,
+    pub(crate) tails_finished: AtomicU64,
 }
 
 impl Default for CommitWaveState {
@@ -133,6 +165,48 @@ impl Default for CommitWaveState {
         Self {
             queue: Mutex::new(CommitWaveQueue::default()),
             cv: std::sync::Condvar::new(),
+            pending_tails: Mutex::new(std::collections::VecDeque::new()),
+            tails_handed: AtomicU64::new(0),
+            tails_finished: AtomicU64::new(0),
+        }
+    }
+}
+
+/// W2 — one sequenced-but-not-yet-durable wave: everything needed to finish it OFF the
+/// sequencer's critical path. The deltas are applied and the WAL records appended (that is what
+/// lets the next wave's re-resolves see them); nothing is client-visible until `finish` runs the
+/// group-durability wait and publishes `committed_seq` (WAL-before-visibility per tail; the
+/// CAS-max publish makes out-of-order tail completion safe). `armed` keeps the wedge-don't-strand policy:
+/// a tail dropped unfinished (claimer panic, pipeline abandonment) fails every still-unset
+/// outcome and wedges the queue, exactly like `CommitWaveBatchGuard` does for the in-section
+/// half of the wave.
+pub(crate) struct CommitWaveTail {
+    batch: Vec<CommitWaveItem>,
+    /// `(batch position, commit_seq, appended)` for every item that reached the durable-commit
+    /// point, in wave order (aborted items' outcomes were already set in-section).
+    committed: Vec<(usize, Index, bool)>,
+    last_seq: Index,
+    last_position: usize,
+    armed: bool,
+}
+
+impl Drop for CommitWaveTail {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The durability half of the wave died before acking (the group-fsync-failure panic
+        // path, or claimer death): fail every still-unset member outcome. Queue wedging + the
+        // finished-counter bump need `&Engine` and are handled by `finish_wave_tail`'s
+        // unwind-safe completion guard.
+        for item in &self.batch {
+            if !item.outcome.done.load(AtomicOrdering::Acquire) {
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                    "the concurrent commit path is wedged pending restart recovery: the \
+                     commit-wave durability tail died before completing"
+                        .to_string(),
+                ))));
+            }
         }
     }
 }
@@ -497,12 +571,18 @@ impl Engine {
             // Spin first: under load a wave completes within tens of µs, far cheaper to poll than
             // to pay a futex sleep + wake per commit. The periodic promotion probe keeps queued
             // items from ever being leaderless (the previous sequencer may have stepped down
-            // between our enqueue and our first probe).
+            // between our enqueue and our first probe). W2: the same probe CLAIMS the pipeline's
+            // pending durability tail — a waiter whose own wave was pipelined is the natural
+            // thread to run its fsync-wait + publish + acks (including its own).
             for spin in 0..4096_u32 {
                 if let Some(result) = outcome.take_if_done() {
                     return result;
                 }
                 if spin % 64 == 63 {
+                    self.try_finish_pending_wave_tail();
+                    if let Some(result) = outcome.take_if_done() {
+                        return result;
+                    }
                     if let Ok(mut queue) = self.commit_wave.queue.try_lock() {
                         if !queue.sequencer_active && !queue.items.is_empty() {
                             queue.sequencer_active = true;
@@ -516,6 +596,17 @@ impl Engine {
             // Fall back to the condvar (arrival lulls / oversubscribed cores).
             let mut queue = self.lock_commit_wave_queue();
             loop {
+                if let Some(result) = outcome.take_if_done() {
+                    return result;
+                }
+                // W2: claim the pending tail before sleeping — the sequencer's hand-off
+                // notify_all wakes this loop, and the claim may complete our own outcome.
+                drop(queue);
+                if self.try_finish_pending_wave_tail() {
+                    queue = self.lock_commit_wave_queue();
+                    continue;
+                }
+                queue = self.lock_commit_wave_queue();
                 if let Some(result) = outcome.take_if_done() {
                     return result;
                 }
@@ -548,6 +639,16 @@ impl Engine {
     /// hand leadership off) or the queue is empty. Wave size self-tunes to the arrival rate —
     /// everything queued while the previous wave was committing forms the next wave (bounded by
     /// `COMMIT_WAVE_MAX` per drain to keep worst-case wave latency bounded).
+    ///
+    /// W2/W2b — the durability pipeline: a sequenced wave's tail (fsync-wait → publish → acks)
+    /// is handed to `pending_tails` instead of running inline, so this loop's next iteration
+    /// sequences wave N+1 while claimers (the waves' own blocked waiters, or this thread at the
+    /// capacity gate) run the fdatasyncs. Consecutive waves' records coalesce into shared
+    /// fsyncs via the WAL's group-flush protocol (the sequencer keeps appending while a flush
+    /// is in flight). The capacity gate bounds applied-but-unpublished state at
+    /// [`WAVE_TAIL_PIPELINE_DEPTH`] waves; post-publish auto_admit re-admissions stay HERE
+    /// (behind a clean full-drain barrier) so a stale re-admission can never interleave with a
+    /// later wave's apply (the internal form of ledger #26).
     fn run_commit_wave_sequencer(&self, own_outcome: &CommitWaveOutcome) {
         loop {
             let batch: Vec<CommitWaveItem> = {
@@ -556,6 +657,12 @@ impl Engine {
                 if n == 0 {
                     queue.sequencer_active = false;
                     drop(queue);
+                    // Liveness on the empty-queue step-down: never leave pipelined tails
+                    // behind with no sequencer (their member waiters would still claim them,
+                    // but finishing inline here is strictly sooner and keeps the single-writer
+                    // case's latency identical to the pre-pipeline path). Tails already claimed
+                    // by an in-flight waiter finish on that waiter.
+                    while self.try_finish_pending_wave_tail() {}
                     self.commit_wave.cv.notify_all();
                     return;
                 }
@@ -563,20 +670,60 @@ impl Engine {
             };
             let wave_started = std::time::Instant::now();
             let wave_len = batch.len() as u64;
-            self.sequence_commit_wave(batch);
+            let tail = self.sequence_commit_wave(batch);
             WAVE_STATS[0].fetch_add(1, AtomicOrdering::Relaxed);
             WAVE_STATS[1].fetch_add(wave_len, AtomicOrdering::Relaxed);
             WAVE_STATS[2].fetch_add(
                 wave_started.elapsed().as_nanos() as u64,
                 AtomicOrdering::Relaxed,
             );
-            {
+            if let Some((tail, admit_tables)) = tail {
+                // W2b capacity gate: at most WAVE_TAIL_PIPELINE_DEPTH tails outstanding —
+                // consecutive waves' records coalesce into shared fsyncs while the bound caps
+                // applied-but-unpublished state. Claim tails ourselves when the pipe is full
+                // (under load the shared fsync already covered them and the finishes are
+                // instant).
+                self.wait_wave_tail_capacity(WAVE_TAIL_PIPELINE_DEPTH - 1);
+                {
+                    let mut tails = self
+                        .commit_wave
+                        .pending_tails
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    tails.push_back(tail);
+                }
+                self.commit_wave
+                    .tails_handed
+                    .fetch_add(1, AtomicOrdering::Release);
+                {
+                    // Wake spinners/sleepers so a member waiter can claim the tail while we
+                    // drain + sequence the next wave.
+                    let _queue = self.lock_commit_wave_queue();
+                    self.commit_wave.cv.notify_all();
+                }
+                if !admit_tables.is_empty() {
+                    // Rare (auto_admit ON + a committed item whose device append declined):
+                    // the re-admission must observe THIS wave's publish and must not overlap a
+                    // later wave's apply — drain the WHOLE pipeline, then re-admit, then
+                    // continue. AUDIT d6d10f8e E: on a WEDGED early-return the drain is NOT
+                    // complete (an in-flight tail may still legitimately publish after the
+                    // wedge via the durable-frontier fast path) — admitting then would install
+                    // a fresh valid snapshot gathered BELOW that late publish, serving stale
+                    // reads in the wedged-but-still-readable state. Skip the admit; residency
+                    // stays invalidated, which is always correct.
+                    if self.wait_wave_tail_capacity(0) {
+                        self.auto_admit_resident_tables(&admit_tables);
+                    }
+                }
+            } else {
                 let _queue = self.lock_commit_wave_queue();
                 self.commit_wave.cv.notify_all();
             }
             if own_outcome.done.load(AtomicOrdering::Acquire) {
                 // Step down so this client thread can return; a waiter with a still-queued item
-                // (or the next arrival) promotes itself.
+                // (or the next arrival) promotes itself. A pending tail may remain — its member
+                // waiters claim it (their outcomes are unset, so they are still in the waiter
+                // loops by definition).
                 let mut queue = self.lock_commit_wave_queue();
                 queue.sequencer_active = false;
                 drop(queue);
@@ -586,13 +733,64 @@ impl Engine {
         }
     }
 
+    /// W2/W2b — the sequencer's pipeline gate: block until at most `max_outstanding` handed
+    /// tails remain unfinished, claiming pending ones ourselves first (the common single-writer
+    /// / idle-waiter case finishes them inline; under load member waiters usually already did
+    /// during our sequencing). `0` = full drain (the admit barrier). Returns `true` when the
+    /// capacity condition genuinely holds; `false` on the WEDGED early-return, where in-flight
+    /// tails may still complete (and even publish, via the durable-frontier fast path) after
+    /// this returns — callers needing a REAL barrier (the admit arm) must treat `false` as
+    /// "barrier not established".
+    fn wait_wave_tail_capacity(&self, max_outstanding: u64) -> bool {
+        loop {
+            let handed = self.commit_wave.tails_handed.load(AtomicOrdering::Acquire);
+            let finished = self
+                .commit_wave
+                .tails_finished
+                .load(AtomicOrdering::Acquire);
+            if handed.saturating_sub(finished) <= max_outstanding {
+                return true;
+            }
+            if self.try_finish_pending_wave_tail() {
+                continue;
+            }
+            // Claimers are mid-flight (took the tails, still fsyncing): wait for their signal.
+            let queue = self.lock_commit_wave_queue();
+            if queue.wedged.is_some() {
+                // Defensive: a wedged path never completes tails normally; the completion
+                // guard's counter bump is the primary unblock, this is the belt-and-braces.
+                return false;
+            }
+            let finished = self
+                .commit_wave
+                .tails_finished
+                .load(AtomicOrdering::Acquire);
+            let handed = self.commit_wave.tails_handed.load(AtomicOrdering::Acquire);
+            if handed.saturating_sub(finished) <= max_outstanding {
+                return true;
+            }
+            let _queue = self
+                .commit_wave
+                .cv
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
     /// Commit one WAVE: the per-item (3a)-(3e) steps of the old per-commit critical section, run
-    /// back-to-back under ONE commit_mutex hold in wave order, then one group-durability wait +
-    /// one `committed_seq` publish for the whole wave. Every item's outcome slot is set exactly
-    /// once; the `CommitWaveBatchGuard` fails any still-unset outcome (and wedges the queue) if
-    /// this thread panics mid-wave (e.g. the apply-invariant panic, which also poisons the
-    /// commit_mutex — the established wedge-don't-serve-torn-state policy).
-    fn sequence_commit_wave(&self, batch: Vec<CommitWaveItem>) {
+    /// back-to-back under ONE commit_mutex hold in wave order. W2: the durability tail (group
+    /// fsync wait + `committed_seq` publish + acks) is RETURNED as a [`CommitWaveTail`] (plus the
+    /// sequencer-owned post-publish admit set) instead of running inline, so the caller can
+    /// pipeline it against the next wave's sequencing. `None` = every item aborted pre-durable
+    /// (outcomes already set). Every item's outcome slot is set exactly once; the
+    /// `CommitWaveBatchGuard` fails any still-unset outcome (and wedges the queue) if this
+    /// thread panics mid-wave (e.g. the apply-invariant panic, which also poisons the
+    /// commit_mutex — the established wedge-don't-serve-torn-state policy); once the tail is
+    /// built, its `armed` Drop carries that responsibility.
+    fn sequence_commit_wave(
+        &self,
+        batch: Vec<CommitWaveItem>,
+    ) -> Option<(CommitWaveTail, BTreeSet<String>)> {
         // AUDIT f80f2350 FINDING A/B: the entire wave (conflict-check, re-resolve, flush,
         // apply, publish) runs inside the commit critical section — flag it so any lock-aware
         // rehydrate seam reached from the re-resolve's validator ladder
@@ -799,7 +997,10 @@ impl Engine {
         violations
     }
 
-    fn sequence_commit_wave_inner(&self, batch: Vec<CommitWaveItem>) {
+    fn sequence_commit_wave_inner(
+        &self,
+        batch: Vec<CommitWaveItem>,
+    ) -> Option<(CommitWaveTail, BTreeSet<String>)> {
         let guard = CommitWaveBatchGuard {
             engine: self,
             items: &batch,
@@ -1256,33 +1457,151 @@ impl Engine {
         let Some((last_seq, last_position)) = wave_tail else {
             // Every item aborted pre-durable; outcomes are already set.
             std::mem::forget(guard);
-            return;
+            return None;
         };
 
-        // Wave tail: ONE group-durability wait covering every record this wave appended, then ONE
-        // publish at the wave's last seq (CAS max). WAL-before-visibility holds wave-wide: nothing
-        // in this wave is visible until its highest record is fsync-covered.
-        if let Err(err) = self.wait_group_durable(last_position) {
-            // The wave's deltas are applied-but-unpublishable; the flush protocol has recorded its
-            // sticky failure (and the flusher wedge-panicked if we were the flusher — in that case
-            // this line is unreachable). Fail the wave's outcomes and wedge the queue.
-            let mut queue = self.lock_commit_wave_queue();
-            queue.wedged = Some(err.to_string());
-            drop(queue);
-            drop(guard); // fails every still-unset outcome with the wedge error
-            return;
-        }
-        self.publish_committed_seq(last_seq);
-
-        for (position, _seq, appended) in &committed {
-            let item = &batch[*position];
-            if self.auto_admit_on_commit_enabled() && !appended {
-                self.auto_admit_resident_tables(&item.residency_tables);
+        // W2: the durability tail (fsync-wait → publish → acks) no longer runs on the
+        // sequencer's critical path — it is handed back as a `CommitWaveTail` for the depth-1
+        // pipeline, so the NEXT wave's sequencing overlaps THIS wave's fdatasync. The batch
+        // guard's responsibility transfers to the tail's own `armed` Drop.
+        // The post-publish auto_admit re-admissions stay a SEQUENCER duty (running them from an
+        // arbitrary claimer thread could interleave a stale re-admission with the next wave's
+        // apply — the internal form of ledger #26): collect the tables here; the sequencer waits
+        // for this tail and runs them before draining the next wave (rare — only !appended
+        // committed items with auto_admit ON).
+        let mut admit_tables: BTreeSet<String> = BTreeSet::new();
+        if self.auto_admit_on_commit_enabled() {
+            for (position, _seq, appended) in &committed {
+                if !appended {
+                    admit_tables.extend(batch[*position].residency_tables.iter().cloned());
+                }
             }
-            self.metrics.inc_commit();
-            item.set_outcome(Ok(()));
         }
         std::mem::forget(guard);
+        Some((
+            CommitWaveTail {
+                batch,
+                committed,
+                last_seq,
+                last_position,
+                armed: true,
+            },
+            admit_tables,
+        ))
+    }
+
+    /// W2 — finish one pipelined wave tail: ONE group-durability wait covering every record the
+    /// wave appended, then ONE `committed_seq` publish at the wave's last seq (CAS max), then the
+    /// outcome acks. WAL-before-visibility holds wave-wide: nothing in the wave is visible until
+    /// its highest record is fsync-covered. Runs on WHICHEVER thread claimed the tail (a member
+    /// waiter or the sequencer); requires no locks beyond what `wait_group_durable` takes
+    /// internally, and never the commit_mutex the sequencer may be holding for the next wave.
+    fn finish_wave_tail(&self, mut tail: CommitWaveTail) {
+        // AUDIT d6d10f8e D (documented decision): on an fsync FAILURE the flusher arm panics on
+        // the CLAIMING thread — which may be a client whose OWN statement is already durably
+        // acked (it claimed a DIFFERENT wave's tail). That client observes a panic for a
+        // committed statement: the classic group-commit ack ambiguity, bounded to the fail-stop
+        // fsync-failure world where the whole path wedges anyway. Accepted: the pre-W2 shape
+        // had the same ambiguity on the sequencer's client thread, and any retry-after-restart
+        // discipline must already tolerate acked-but-uncertain outcomes.
+        // Unwind-safe completion accounting: the finished-counter bump + wakeups MUST fire even
+        // when the group-fsync-failure arm PANICS below (wait_group_durable's flusher arm panics
+        // holding the commit_mutex — the wedge-don't-serve-torn-state policy). Without it the
+        // next sequencer parks forever at the depth gate (handed > finished, empty slot). On any
+        // unclean exit the guard also WEDGES the queue and fails everything still queued —
+        // parity with `CommitWaveBatchGuard` for the durability half of the wave (the tail's own
+        // Drop fails its member outcomes).
+        struct TailCompletion<'a> {
+            engine: &'a Engine,
+            clean: bool,
+        }
+        impl Drop for TailCompletion<'_> {
+            fn drop(&mut self) {
+                if !self.clean {
+                    let mut queue = self.engine.lock_commit_wave_queue();
+                    let reason = queue.wedged.clone().unwrap_or_else(|| {
+                        "the commit-wave durability tail died before completing".to_string()
+                    });
+                    queue.wedged = Some(reason.clone());
+                    queue.sequencer_active = false;
+                    let stranded: Vec<CommitWaveItem> = queue.items.drain(..).collect();
+                    drop(queue);
+                    for item in &stranded {
+                        if !item.outcome.done.load(AtomicOrdering::Acquire) {
+                            item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                                format!(
+                                    "the concurrent commit path is wedged pending restart \
+                                     recovery: {reason}"
+                                ),
+                            ))));
+                        }
+                    }
+                }
+                self.engine
+                    .commit_wave
+                    .tails_finished
+                    .fetch_add(1, AtomicOrdering::Release);
+                let _queue = self.engine.lock_commit_wave_queue();
+                self.engine.commit_wave.cv.notify_all();
+            }
+        }
+        let mut completion = TailCompletion {
+            engine: self,
+            clean: false,
+        };
+        if let Err(err) = self.wait_group_durable(tail.last_position) {
+            // The wave's deltas are applied-but-unpublishable; the flush protocol has recorded
+            // its sticky failure (and the flusher wedge-panicked if we were the flusher — in
+            // that case this line is unreachable and the completion guard runs on unwind). Fail
+            // the wave's outcomes and wedge the queue.
+            let mut queue = self.lock_commit_wave_queue();
+            queue.wedged.get_or_insert_with(|| err.to_string());
+            drop(queue);
+            drop(tail); // armed: fails every still-unset member outcome with the wedge error
+            return; // completion guard (clean=false) wedges idempotently + counts + notifies
+        }
+        self.publish_committed_seq(tail.last_seq);
+        for (position, _seq, _appended) in &tail.committed {
+            self.metrics.inc_commit();
+            tail.batch[*position].set_outcome(Ok(()));
+        }
+        tail.armed = false;
+        completion.clean = true;
+    }
+
+    /// W2 — claim and finish the pending pipeline tail if one is waiting. Called from the waiter
+    /// loops' probes (the tail's own members are the natural claimers — they are blocked on its
+    /// outcomes) and by the sequencer as the fallback claimer at the depth gate. Returns whether
+    /// a tail was finished.
+    pub(crate) fn try_finish_pending_wave_tail(&self) -> bool {
+        // AUDIT d6d10f8e F: every waiter probes this every 64 spin iterations — pre-check the
+        // counters (two atomic loads) so the common nothing-pending case never touches the
+        // shared mutex.
+        {
+            let handed = self.commit_wave.tails_handed.load(AtomicOrdering::Acquire);
+            let finished = self
+                .commit_wave
+                .tails_finished
+                .load(AtomicOrdering::Acquire);
+            if handed <= finished {
+                return false;
+            }
+        }
+        let taken = {
+            let mut tails = self
+                .commit_wave
+                .pending_tails
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tails.pop_front()
+        };
+        match taken {
+            Some(tail) => {
+                self.finish_wave_tail(tail);
+                true
+            }
+            None => false,
+        }
     }
 
     /// D3b — the group-commit flush protocol. Blocks until the WAL's durable frontier covers
