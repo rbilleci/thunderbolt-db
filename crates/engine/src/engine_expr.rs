@@ -2995,8 +2995,18 @@ impl Engine {
                 // D3 hwm gate: created_by-only shards whose stamps are all <= the reader's boundary
                 // count every row (effectively version-free); a reader pinned inside an append
                 // window (copin_s < hwm) falls through to the gated device path.
+                // W0c (audit B1): ALSO require every shard VALID — this executor-side load can be
+                // NEWER than the accepted route plan's (a concurrent commit flags + publishes in
+                // between), and a flagged shard's row_count excludes the host-installed rows the
+                // reader's pinned boundary includes. An invalid shard falls through to the gated
+                // device path, whose source_for declines and the statement re-serves from the CPU.
+                let runtime_snapshot = self.router.runtime().snapshot();
                 let version_free = shards.iter().all(|shard| {
-                    shard.deleted_by_region.is_none()
+                    shard.is_valid(
+                        runtime_snapshot
+                            .memory_pressured_gpu_ids
+                            .contains(&shard.gpu_id),
+                    ) && shard.deleted_by_region.is_none()
                         && (shard.created_by_region.is_none() || copin_s >= shard.max_created_by)
                 });
                 if version_free && !shards.is_empty() {

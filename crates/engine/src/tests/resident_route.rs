@@ -4564,4 +4564,17 @@ fn w0_concurrent_invalidation_must_not_leave_write_locate_trusting_stale_shards(
         vec![vec![SqlValue::Int8(1)]],
         "read must observe exactly the one committed id=42 (got {rows:?})"
     );
+
+    // W0c (audit B1 guard): the UNPREDICATED COUNT(*) has a metadata fast path that sums
+    // `shard.row_count` from the descriptors — post-invalidation it must decline (shard flags)
+    // and the truth (4 = 3 admitted + 1 host-installed) must be served, not the stale sum (3).
+    let Command::Select(count_all) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    let rows = e.execute_relational_select(&count_all).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Int8(4)]],
+        "unpredicated COUNT must include the concurrently committed row (got {rows:?})"
+    );
 }

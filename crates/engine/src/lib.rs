@@ -248,6 +248,9 @@ impl ExecuteError {
             self,
             ExecuteError::Engine(EngineError::ApplyFailed(msg))
                 if msg.contains(RESIDENT_DEVICE_MEMORY_MISSING)
+                    || (msg.contains(RESIDENT_SHARD_PREFIX)
+                        && (msg.contains(RESIDENT_SHARD_INVALID)
+                            || msg.contains(RESIDENT_SHARD_MEMORY_MISSING)))
         )
     }
 }
@@ -256,6 +259,18 @@ impl ExecuteError {
 /// (tombstoned/never-populated). Used to detect the residency-invalidated-mid-statement case so the
 /// read can fall back to the CPU pinned-read path (write-half MVCC, Stage 4).
 const RESIDENT_DEVICE_MEMORY_MISSING: &str = "has no retained resident device memory";
+
+/// W0c (audit B2): the SHARDED unified-source errors (`build_sharded_unified_exec_source`'s
+/// `source_for`: "resident shard {id} is invalid" / "resident shard {id} has no retained device
+/// memory") are the same residency-invalidated-mid-statement case in per-shard form — the route
+/// plan accepted an earlier generation and a concurrent commit flagged the shards before the
+/// executor's own load. W0 made that window COMMON under OLTP write load (every concurrent
+/// invalidation now flags descriptors), and without these matches a racing reader got a hard
+/// client error where the transparent CPU pinned-read fallback is the correct behavior. Matched
+/// as (prefix AND suffix) so a genuine device/CUDA error is never masked.
+const RESIDENT_SHARD_PREFIX: &str = "resident shard ";
+const RESIDENT_SHARD_INVALID: &str = " is invalid";
+const RESIDENT_SHARD_MEMORY_MISSING: &str = " has no retained device memory";
 
 #[derive(Debug, Clone)]
 struct PendingMutation {
