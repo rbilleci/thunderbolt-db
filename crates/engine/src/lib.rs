@@ -67,6 +67,8 @@ use gpu_db_wal::{
 
 mod rel_exec_helpers;
 pub(crate) use rel_exec_helpers::*;
+mod wal_binary;
+pub(crate) use wal_binary::*;
 mod write_path;
 pub(crate) use write_path::*;
 mod mvcc_read_model;
@@ -431,6 +433,9 @@ pub struct Engine {
     dml_device_resolve_enabled: std::sync::atomic::AtomicBool,
     dml_device_validate_enabled: std::sync::atomic::AtomicBool,
     host_install_elision_enabled: std::sync::atomic::AtomicBool,
+    /// W5a: covered inserts log RESOLVED BINARY WAL records (decode+install replay) instead of
+    /// SQL text. Default OFF until the replay-differential burn-in flips it.
+    binary_wal_records_enabled: std::sync::atomic::AtomicBool,
     /// TYPE-COVERAGE track 1: UNIQUE-INDEXED (PK'd) i32-section tables may ELIDE — the
     /// core-banking table shape. Requires the resolve+validate ladders ON (eligibility checks
     /// them). DEFAULT ON (the 2026-07-03 flip). Kill switch -> unique tables never enter

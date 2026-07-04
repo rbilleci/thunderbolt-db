@@ -792,6 +792,18 @@ impl Engine {
     pub(crate) fn residency_invalidation_scope(entries: &[LogEntry]) -> Option<BTreeSet<String>> {
         let mut tables = BTreeSet::new();
         for entry in entries {
+            // W5a: a binary record is single-table by construction; decode its header for the
+            // exact scope (an undecodable tagged record falls back to the conservative global
+            // invalidation, same as any unparseable payload).
+            if is_binary_wal_record(&entry.payload) {
+                match decode_binary_insert(&entry.payload) {
+                    Ok(record) => {
+                        tables.insert(record.table);
+                        continue;
+                    }
+                    Err(_) => return None,
+                }
+            }
             let text = std::str::from_utf8(&entry.payload).ok()?;
             let command = parse_command(text).ok()?;
             match command {
@@ -914,6 +926,70 @@ impl Engine {
     /// — PART B). Lock order is fixed: the caller already holds the commit_mutex, then the catalog
     /// latch. The `apply_*` methods (now `&self`) freely call `self.read_state.*` and the `&self`
     /// `preflight_*` tree (which reads the published catalog snapshot, never this latch — no reentry).
+    /// W5a — apply a BINARY insert record (replay + serialized apply): decode → reconstruct the
+    /// [`WriteDelta`] → install via [`Engine::apply_delta`], the SAME installer the runtime wave
+    /// used. No parse, no coercion, no validation re-run: the record exists only because the
+    /// original commit validated it, and it carries the ORIGINAL row ids (replay does not
+    /// re-derive them from the allocator; the allocator advances by `rows_consumed` to stay in
+    /// lock-step for interleaved text records). `value_index_entries` ride empty — apply_delta's
+    /// deferred-recompute seam (`value_index_entries_for_deferred_apply`) builds them iff the
+    /// table is non-elided at apply time, exactly as the runtime elided path relies on.
+    fn apply_binary_wal_entry(
+        &self,
+        entry: &LogEntry,
+        cat: &mut DdlCatalogState,
+    ) -> Result<Option<AppliedRowMutation>, EngineError> {
+        let record = decode_binary_insert(&entry.payload)?;
+        let table = cat
+            .relational_catalog
+            .get(&record.table)
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "binary WAL record targets unknown relation \"{}\"",
+                    record.table
+                ))
+            })?
+            .clone();
+        let commit_seq = entry.index;
+        let mut write_set = WriteSet::default();
+        let mut inserted_rows = Vec::with_capacity(record.rows.len());
+        let mut rows = Vec::with_capacity(record.rows.len());
+        let mut row_ids = Vec::with_capacity(record.rows.len());
+        for (row_id, encoded) in &record.rows {
+            let values = decode_relational_row(encoded, &table.columns).map_err(|err| {
+                EngineError::Durability(format!(
+                    "binary WAL record row decode failed for \"{}\": {err}",
+                    record.table
+                ))
+            })?;
+            let row_key = relational_row_key(&record.table, *row_id);
+            // Parity with prepare_insert (audit 21eddaa7 B): freshly-inserted rows are
+            // DELIBERATELY not conflict points (a predicted key would falsely conflict), so the
+            // replayed write_set matches text replay exactly — unique slots only.
+            write_set.add_unique_slots(&table, &values);
+            inserted_rows.push((row_key, values.clone()));
+            rows.push(values);
+            row_ids.push(*row_id);
+        }
+        let delta = WriteDelta {
+            write_set: write_set.clone(),
+            rows_consumed: record.rows.len() as u64,
+            mutation: PreparedMutation::Insert {
+                table: record.table.clone(),
+                inserted_rows,
+                value_index_entries: BTreeMap::new(),
+                seq_advances: BTreeMap::new(),
+            },
+        };
+        self.apply_delta(delta, commit_seq, None)?;
+        Ok(Some(AppliedRowMutation::Insert {
+            table: record.table,
+            rows,
+            write_set,
+            row_ids,
+        }))
+    }
+
     fn apply_mvcc_entry(
         &self,
         entry: &LogEntry,
@@ -923,6 +999,15 @@ impl Engine {
         // residency incrementally for a single-entry commit: Insert -> append in place, Delete -> tombstone
         // in place; Slice 1b-ii-c / SV4b); `None` for every other command (and for a non-UTF-8 /
         // unparseable payload — a defensive no-op as before).
+        //
+        // W5a: BINARY records dispatch FIRST — their 0xFF tag deliberately fails the UTF-8 check
+        // below, and the defensive no-op arm would otherwise SILENTLY SKIP an acknowledged
+        // insert's apply (data loss at replay). A tagged record that fails to decode is loud.
+        if is_binary_wal_record(&entry.payload) {
+            return self
+                .apply_binary_wal_entry(entry, cat)
+                .map_err(EngineError::from);
+        }
         let Ok(text) = std::str::from_utf8(&entry.payload) else {
             return Ok(None);
         };

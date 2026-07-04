@@ -2124,3 +2124,96 @@ fn w1b_auto_open_repairs_a_second_rotation_crash_window() {
     let _ = std::fs::remove_file(&checkpoint);
     let _ = std::fs::remove_file(&path);
 }
+
+/// W5a — binary WAL records: a covered (elided, constraint-free) concurrent INSERT logs the
+/// RESOLVED binary record; restart replay decodes+installs it with the ORIGINAL row ids, and the
+/// recovered state is identical to what SQL-text replay produces.
+#[test]
+fn w5a_binary_wal_records_replay_identically_to_text() {
+    let run = |binary: bool, tag: &str| -> Vec<Vec<SqlValue>> {
+        let path = test_wal_path(&format!("w5a-replay-{tag}"));
+        {
+            let e = Engine::with_durable_wal_segment(&path);
+            e.set_binary_wal_records_enabled(binary);
+            e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+            // Force the covered class deterministically (no GPU needed for the WAL semantics
+            // under test): an elided table's prepare skips the value-index, which is exactly
+            // reresolve_reuse_eligible / the binary-record condition.
+            e.set_table_install_elided("t", true);
+            for i in 0..6 {
+                e.execute_dml_concurrent(
+                    2 + i,
+                    &format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10),
+                )
+                .unwrap();
+            }
+        }
+        let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+        let Command::Select(select) = parse_command("SELECT id, v FROM t ORDER BY id").unwrap()
+        else {
+            unreachable!()
+        };
+        let rows: Vec<Vec<SqlValue>> = recovered
+            .execute_relational_select(&select)
+            .unwrap()
+            .rows
+            .into_boxed();
+        let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+        let _ = std::fs::remove_file(&path);
+        rows
+    };
+    let text_rows = run(false, "text");
+    let binary_rows = run(true, "binary");
+    assert_eq!(text_rows.len(), 6);
+    assert_eq!(
+        text_rows, binary_rows,
+        "binary replay must produce byte-identical state to text replay"
+    );
+}
+
+/// W5a — binary records survive a checkpoint rotation (they live inside the checkpoint segment)
+/// and interleave correctly with text records (DDL + serialized inserts) across replay: the
+/// row-id allocator stays in lock-step because binary applies advance it by rows_consumed.
+#[test]
+fn w5a_binary_records_interleave_with_text_and_survive_rotation() {
+    let path = test_wal_path("w5a-rotation-mix");
+    let control = gpu_db_wal::wal_checkpoint_control_path(&path);
+    let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
+    {
+        let e = Engine::with_durable_wal_segment(&path);
+        e.set_binary_wal_records_enabled(true);
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        // Text-record inserts (serialized path) BEFORE elision.
+        e.execute_text(2, "INSERT INTO t (id, v) VALUES (100, 1)")
+            .unwrap();
+        e.set_table_install_elided("t", true);
+        // Binary-record inserts (covered concurrent path).
+        for i in 0..4 {
+            e.execute_dml_concurrent(3 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 2)"))
+                .unwrap();
+        }
+        // Rotate: the binary records move into the checkpoint segment.
+        e.checkpoint_and_truncate_durable_wal_if_larger_than(&control, &checkpoint, 1)
+            .unwrap();
+        // More binary records into the fresh live suffix.
+        for i in 4..7 {
+            e.execute_dml_concurrent(3 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 3)"))
+                .unwrap();
+        }
+    }
+    let recovered = Engine::open_durable_wal_segment_auto(&path).unwrap();
+    let Command::Select(count) = parse_command("SELECT COUNT(*) FROM t").unwrap() else {
+        unreachable!()
+    };
+    let rows = recovered.execute_relational_select(&count).unwrap().rows;
+    assert_eq!(
+        rows,
+        vec![vec![SqlValue::Int8(8)]],
+        "1 text + 7 binary inserts must all replay exactly once through the rotation"
+    );
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&path));
+    let _ = std::fs::remove_file(gpu_db_wal::wal_tail_offset_path(&checkpoint));
+    let _ = std::fs::remove_file(&control);
+    let _ = std::fs::remove_file(&checkpoint);
+    let _ = std::fs::remove_file(&path);
+}

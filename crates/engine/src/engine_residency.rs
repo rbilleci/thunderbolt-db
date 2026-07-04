@@ -7438,6 +7438,20 @@ impl Engine {
 
     /// RETIREMENT A4e: enable/disable the HOST-INSTALL ELISION (default OFF — the A/B lever; the
     /// flip is gated on the SLO measurement + the ADR-013 stamps/publication gates + audits).
+    /// W5a kill switch: covered inserts log binary WAL records (see `wal_binary`). NOTE for the
+    /// flip checklist (audit 21eddaa7, MEDIUM): once BINWAL records exist in a segment, binaries
+    /// OLDER than 21eddaa7 silently DROP them at replay (their from_utf8 skip arm) — the WAL is
+    /// non-downgradeable past this commit once enabled.
+    pub fn set_binary_wal_records_enabled(&self, on: bool) {
+        self.binary_wal_records_enabled
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn binary_wal_records_enabled(&self) -> bool {
+        self.binary_wal_records_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn set_host_install_elision_enabled(&self, on: bool) {
         self.host_install_elision_enabled
             .store(on, std::sync::atomic::Ordering::Relaxed);
@@ -7654,7 +7668,11 @@ impl Engine {
     }
 
     /// RETIREMENT A4e: COW-add/remove a table from the elided set (serialized commit path only).
-    pub(crate) fn set_table_install_elided(&self, table: &str, elided: bool) {
+    /// Testing/probe seam (W5a recovery probe): elision normally engages automatically at the
+    /// wave append flush; forcing it marks the table device-authoritative WITHOUT device
+    /// backing, so use only in WAL/replay experiments that never read pre-restart state.
+    #[doc(hidden)]
+    pub fn set_table_install_elided(&self, table: &str, elided: bool) {
         let cur = self.read_state.residency.elided_tables.load();
         if cur.contains(table) == elided {
             return;

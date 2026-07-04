@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
     let durable = std::env::var("GPU_DB_BENCH_DURABLE").is_ok_and(|v| v == "1");
+    let binary_wal = std::env::var("GPU_DB_BENCH_BINWAL").is_ok_and(|v| v == "1");
     let wal_dir = std::env::var("GPU_DB_BENCH_WAL_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("target/wal-bench"));
@@ -114,6 +115,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if std::env::var("GPU_DB_BENCH_ELIDE").is_ok_and(|v| v == "1") {
             e.set_host_install_elision_enabled(true);
+        }
+        if binary_wal {
+            // W5a: covered inserts log resolved binary records (decode+install replay).
+            e.set_binary_wal_records_enabled(true);
         }
         // i64 sections are DEFAULT ON since the 2026-07-03 flip; GPU_DB_BENCH_I64SHARDS=0 is
         // the kill-switch A/B arm (=1 remains accepted, now redundant).

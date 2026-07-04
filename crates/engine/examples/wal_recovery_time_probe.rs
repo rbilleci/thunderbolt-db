@@ -6,7 +6,8 @@
 //! bound and the residual are visible.
 //!
 //! Run: cargo run --release -p gpu_db_engine --example wal_recovery_time_probe
-//! Env: GPU_DB_PROBE_ROWS (default 20000)
+//! Env: GPU_DB_PROBE_ROWS (default 20000); GPU_DB_PROBE_BINARY=1 = W5a binary records
+//! (covered concurrent inserts; replay = decode+install, no SQL parse)
 
 use gpu_db_engine::Engine;
 use std::time::Instant;
@@ -23,13 +24,23 @@ fn main() {
     let control = gpu_db_wal::wal_checkpoint_control_path(&path);
     let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
 
+    let binary = std::env::var("GPU_DB_PROBE_BINARY").is_ok_and(|v| v == "1");
     let live_bytes;
     {
         let e = Engine::with_durable_wal_segment(&path);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
-        for i in 0..rows {
-            e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 1)"))
-                .unwrap();
+        if binary {
+            e.set_binary_wal_records_enabled(true);
+            e.set_table_install_elided("t", true);
+            for i in 0..rows {
+                e.execute_dml_concurrent(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 1)"))
+                    .unwrap();
+            }
+        } else {
+            for i in 0..rows {
+                e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 1)"))
+                    .unwrap();
+            }
         }
         live_bytes = e.wal_durable_segment_bytes();
     }

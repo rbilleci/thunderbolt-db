@@ -211,6 +211,7 @@ impl Engine {
             // FIXED by re-pinning the view at every post-rehydration fallback — pinned by the
             // SV6 concurrent hammer, which now runs elided BY DEFAULT.
             host_install_elision_enabled: std::sync::atomic::AtomicBool::new(true),
+            binary_wal_records_enabled: std::sync::atomic::AtomicBool::new(false),
             // THE CONSTRAINED-ELISION FLIP (user-authorized 2026-07-03): unique/PK'd
             // i32-section tables are device-authoritative BY DEFAULT — the core-banking shape
             // runs 90-94k @32w vs 16.5k host-installed. Evidence at the flip: six GPU

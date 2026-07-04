@@ -1312,13 +1312,47 @@ impl Engine {
 
             // (3c) Assign the seq for real: WAL append + propose (the sequencer is the single
             // proposer under the commit_mutex). The fsync is deferred to the wave tail.
+            // W5a: covered inserts (the delta-reuse class — elided, FK/CHECK-free, no sequence
+            // defaults, ledger-covered uniqueness) log the RESOLVED BINARY record instead of the
+            // SQL text: replay becomes decode+install (no parse, no re-resolve), the record
+            // carries the ORIGINAL row ids, and checkpoints shrink. Everything else keeps the
+            // SQL-text payload unchanged.
+            let wal_payload: std::sync::Arc<[u8]> =
+                if self.binary_wal_records_enabled() && Self::reresolve_reuse_eligible(&delta) {
+                    let crate::write_path::PreparedMutation::Insert {
+                        table,
+                        inserted_rows,
+                        ..
+                    } = &delta.mutation
+                    else {
+                        unreachable!("reuse-eligible is insert-shaped");
+                    };
+                    let prefix = relational_key_prefix(table);
+                    let id_rows: Vec<(u64, &[SqlValue])> = inserted_rows
+                        .iter()
+                        .map(|(key, values)| {
+                            (
+                                crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                    .expect("re-keyed insert rows carry canonical row keys"),
+                                values.as_slice(),
+                            )
+                        })
+                        .collect();
+                    match try_encode_binary_insert(table, &id_rows) {
+                        Some(payload) => payload.into(),
+                        // Width-exceeding shape (unrealistic; audit 21eddaa7 C): keep the text.
+                        None => item.payload.clone(),
+                    }
+                } else {
+                    item.payload.clone()
+                };
             let wal_len_before = commit.wal.len();
             commit.wal.append(WalRecord {
                 txn_id: item.txn_id,
-                payload: item.payload.clone(),
+                payload: wal_payload.clone(),
             });
             let wal_position = commit.wal.len();
-            let token = match commit.repl.propose(item.payload.clone()) {
+            let token = match commit.repl.propose(wal_payload) {
                 Ok(token) => token,
                 Err(err) => {
                     commit.wal.truncate(wal_len_before);
