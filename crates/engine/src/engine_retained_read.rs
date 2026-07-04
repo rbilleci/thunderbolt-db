@@ -932,7 +932,8 @@ impl Engine {
             };
             // The kernel mutates the device index buffer IN PLACE (atom.cas). A launch failure ->
             // drop the entry (rebuild next probe); never a wrong index.
-            match index.submit_i32_index_insert(&index, table_mask, hash_shift, tail, base_row_u32) {
+            match index.submit_i32_index_insert(&index, table_mask, hash_shift, tail, base_row_u32)
+            {
                 Ok(dup) => {
                     let mut cache = self
                         .read_state
@@ -944,7 +945,8 @@ impl Engine {
                         continue;
                     };
                     // Re-validate the basis (a racing rebuild could have replaced it).
-                    if entry.resident_device_ptr != device_ptr || entry.row_count != base_row_count {
+                    if entry.resident_device_ptr != device_ptr || entry.row_count != base_row_count
+                    {
                         continue;
                     }
                     if dup {
@@ -1010,8 +1012,7 @@ impl Engine {
             // PERF (this runs SERIALLY on the sequencer, per wave): compute the i32 filter offset
             // DIRECTLY from the shard's own fields — `resident_snapshot_for_shard` would clone the
             // whole descriptor (int4/int8/text/null name vectors) per shard per wave for nothing.
-            let filter_offset =
-                shard_i32_filter_offset(shard, table, filter_idx)?;
+            let filter_offset = shard_i32_filter_offset(shard, table, filter_idx)?;
             let device_memory = shard.device_memory.clone()?;
             // W0: same cell-liveness gate as the host-probe locate (descriptor flags don't see
             // concurrent invalidations); a stale shard declines the whole wave-batch probe.
@@ -1382,10 +1383,9 @@ impl Engine {
                 return false;
             }
             let tail_len = row_count - base_count;
-            let Ok(tail_keys) = device_memory.read_resident_i32_column(
-                filter_offset + (base_count as u64) * 4,
-                tail_len,
-            ) else {
+            let Ok(tail_keys) = device_memory
+                .read_resident_i32_column(filter_offset + (base_count as u64) * 4, tail_len)
+            else {
                 return false; // read failure -> the rebuild path's conservative decline
             };
             if tail_keys.len() != tail_len {
@@ -1458,7 +1458,8 @@ impl Engine {
         let device_ptr = device_memory.device_ptr();
         let cache_key = (table_name.to_string(), shard_id, col_idx);
         // Fast path: a cached entry whose ptr still matches the live buffer -> probe under the lock.
-        if let Some(result) = self.probe_shard_pk_index_fast_path(&cache_key, device_ptr, row_count, key)
+        if let Some(result) =
+            self.probe_shard_pk_index_fast_path(&cache_key, device_ptr, row_count, key)
         {
             return result;
         }
@@ -1466,8 +1467,12 @@ impl Engine {
         // append — EXTEND the cached index with the tail keys (O(delta)) instead of rebuilding
         // O(shard) per probe (the measured constrained-INSERT cliff: ~1ms prepare under
         // per-commit append churn). On success the entry is current -> the fast path answers.
-        if self.try_extend_cached_shard_pk_index(&cache_key, device_memory, filter_offset, row_count)
-        {
+        if self.try_extend_cached_shard_pk_index(
+            &cache_key,
+            device_memory,
+            filter_offset,
+            row_count,
+        ) {
             if let Some(result) =
                 self.probe_shard_pk_index_fast_path(&cache_key, device_ptr, row_count, key)
             {
@@ -1553,8 +1558,12 @@ impl Engine {
         }
         // TYPE-COVERAGE track 1 (ledger #3): extend the cached index over an in-place append
         // (O(delta)) before falling back to the O(shard) rebuild.
-        if self.try_extend_cached_shard_pk_index(&cache_key, device_memory, filter_offset, row_count)
-        {
+        if self.try_extend_cached_shard_pk_index(
+            &cache_key,
+            device_memory,
+            filter_offset,
+            row_count,
+        ) {
             if let Some(answer) = self.probe_shard_pk_index_batch_fast_path(
                 &cache_key,
                 device_ptr,
@@ -2739,10 +2748,7 @@ fn shard_i32_filter_offset(
     filter_idx: usize,
 ) -> Option<u64> {
     let column = table.columns.get(filter_idx)?;
-    if !matches!(
-        column.ty,
-        SqlType::Int4 | SqlType::Date | SqlType::Int2
-    ) {
+    if !matches!(column.ty, SqlType::Int4 | SqlType::Date | SqlType::Int2) {
         return None;
     }
     let int4_ordinal = table

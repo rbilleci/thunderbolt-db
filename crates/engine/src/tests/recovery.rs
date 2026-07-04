@@ -591,11 +591,15 @@ fn relational_state_recovers_after_wal_archive_segment_ingestion() {
     let tail_records = vec![
         WalRecord {
             txn_id: 3,
-            payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+            payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')"
+                .to_vec()
+                .into(),
         },
         WalRecord {
             txn_id: 4,
-            payload: b"INSERT INTO people (id, name) VALUES (3, 'Katherine')".to_vec(),
+            payload: b"INSERT INTO people (id, name) VALUES (3, 'Katherine')"
+                .to_vec()
+                .into(),
         },
     ];
     let tail_timestamps = vec![

@@ -15,7 +15,11 @@ pub enum Role {
 pub struct LogEntry {
     pub term: Term,
     pub index: Index,
-    pub payload: Vec<u8>,
+    /// W1a: shared, immutable statement bytes. One allocation at ingress is refcounted through
+    /// the WAL record, the replication log, and the commit-wave item (previously three `Vec`
+    /// copies per committed statement on the hot path). serde's `rc` feature covers ser/de
+    /// (deserialize allocates fresh, as before).
+    pub payload: std::sync::Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

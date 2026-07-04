@@ -102,30 +102,29 @@ impl Engine {
                     // pinned path previously returned rows (audit P2: `mt (id INT, name TEXT)` sharded +
                     // `ORDER BY id`). Mixed-type sharded tables keep the CPU pinned path until the
                     // unified source gathers every section.
-                    let shard_resident_int4_only =
-                        || {
-                            table.columns.iter().all(|c| {
-                                // TYPE-COVERAGE track 2 slice 2: the unified exec source now
-                                // gathers the i64 sections too, so Int8/Timestamp columns route
-                                // to the GPU general path when the flag admitted them to shards
-                                // (without the flag such tables are never shard-resident and the
-                                // shards.load() check below keeps this arm false).
-                                matches!(
-                                    c.ty,
-                                    SqlType::Int4
-                                        | SqlType::Int2
-                                        | SqlType::Date
-                                        | SqlType::Int8
-                                        | SqlType::Timestamp
-                                )
-                            }) && self
-                                .read_state
-                                .residency
-                                .shards
-                                .load()
-                                .get(&table.name)
-                                .is_some_and(|shards| !shards.is_empty())
-                        };
+                    let shard_resident_int4_only = || {
+                        table.columns.iter().all(|c| {
+                            // TYPE-COVERAGE track 2 slice 2: the unified exec source now
+                            // gathers the i64 sections too, so Int8/Timestamp columns route
+                            // to the GPU general path when the flag admitted them to shards
+                            // (without the flag such tables are never shard-resident and the
+                            // shards.load() check below keeps this arm false).
+                            matches!(
+                                c.ty,
+                                SqlType::Int4
+                                    | SqlType::Int2
+                                    | SqlType::Date
+                                    | SqlType::Int8
+                                    | SqlType::Timestamp
+                            )
+                        }) && self
+                            .read_state
+                            .residency
+                            .shards
+                            .load()
+                            .get(&table.name)
+                            .is_some_and(|shards| !shards.is_empty())
+                    };
                     if select_is_gpu_sortable_projection(&select, &table)
                         && (self.relational_residency_snapshot(&select.table).is_some()
                             || shard_resident_int4_only())

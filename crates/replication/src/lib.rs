@@ -353,7 +353,7 @@ impl AppendEntriesRequest {
             entries.push(LogEntry {
                 term: cursor.read_u64("entry.term")?,
                 index: cursor.read_u64("entry.index")?,
-                payload: cursor.read_bytes("entry.payload")?.to_vec(),
+                payload: cursor.read_bytes("entry.payload")?.to_vec().into(),
             });
         }
         cursor.finish()?;
@@ -1093,7 +1093,7 @@ impl RecoveryState {
 }
 
 pub trait LogReplicator {
-    fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError>;
+    fn propose(&mut self, payload: std::sync::Arc<[u8]>) -> Result<CommitToken, EngineError>;
     fn wait_committed(
         &self,
         token: CommitToken,
@@ -1843,7 +1843,7 @@ impl RaftReplicator {
 }
 
 impl LogReplicator for LocalReplicator {
-    fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError> {
+    fn propose(&mut self, payload: std::sync::Arc<[u8]>) -> Result<CommitToken, EngineError> {
         if self.role != Role::Leader {
             return Err(EngineError::NotLeader);
         }
@@ -1904,7 +1904,7 @@ impl LogReplicator for LocalReplicator {
 }
 
 impl LogReplicator for RaftReplicator {
-    fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError> {
+    fn propose(&mut self, payload: std::sync::Arc<[u8]>) -> Result<CommitToken, EngineError> {
         if self.role != Role::Leader {
             return Err(EngineError::NotLeader);
         }
@@ -2033,25 +2033,27 @@ mod tests {
 
         leader.become_leader(1);
         assert!(matches!(
-            follower_a.propose(b"blocked follower write".to_vec()),
+            follower_a.propose(b"blocked follower write".to_vec().into()),
             Err(EngineError::NotLeader)
         ));
 
-        let first = leader.propose(b"create table t(id int)".to_vec()).unwrap();
+        let first = leader
+            .propose(b"create table t(id int)".to_vec().into())
+            .unwrap();
         let second = leader
-            .propose(b"insert into t values (1)".to_vec())
+            .propose(b"insert into t values (1)".to_vec().into())
             .unwrap();
         let term_one = leader.current_term();
         let first_batch = vec![
             LogEntry {
                 term: term_one,
                 index: first.index,
-                payload: b"create table t(id int)".to_vec(),
+                payload: b"create table t(id int)".to_vec().into(),
             },
             LogEntry {
                 term: term_one,
                 index: second.index,
-                payload: b"insert into t values (1)".to_vec(),
+                payload: b"insert into t values (1)".to_vec().into(),
             },
         ];
 
@@ -2120,13 +2122,13 @@ mod tests {
         }
         assert!(election_passed);
         let old_leader_rejected_after_failover = matches!(
-            leader.propose(b"blocked after failover".to_vec()),
+            leader.propose(b"blocked after failover".to_vec().into()),
             Err(EngineError::NotLeader)
         );
         assert!(old_leader_rejected_after_failover);
 
         let third = follower_a
-            .propose(b"insert into t values (2)".to_vec())
+            .propose(b"insert into t values (2)".to_vec().into())
             .unwrap();
         let term_two = follower_a.current_term();
         append_batches_sent += 1;
@@ -2139,7 +2141,7 @@ mod tests {
                 vec![LogEntry {
                     term: term_two,
                     index: third.index,
-                    payload: b"insert into t values (2)".to_vec(),
+                    payload: b"insert into t values (2)".to_vec().into(),
                 }],
                 follower_a.commit_index(),
             )
@@ -2294,11 +2296,11 @@ mod tests {
         let mut stale = RaftReplicator::new(3);
         let mut stale_voter = RaftReplicator::new(3);
         leader.become_leader(1);
-        let first = leader.propose(vec![1]).unwrap();
+        let first = leader.propose(vec![1].into()).unwrap();
         let entry = LogEntry {
             term: leader.current_term(),
             index: first.index,
-            payload: vec![1],
+            payload: vec![1].into(),
         };
         assert!(
             AppendEntriesRequest {
@@ -2325,7 +2327,7 @@ mod tests {
                 entries: vec![LogEntry {
                     term: 1,
                     index: 1,
-                    payload: vec![1],
+                    payload: vec![1].into(),
                 }],
                 leader_commit: 0,
             }
@@ -2351,7 +2353,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 2,
                 index: 1,
-                payload: b"replicated".to_vec(),
+                payload: b"replicated".to_vec().into(),
             }],
             leader_commit: 1,
         }
@@ -2392,12 +2394,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 4,
-                    payload: b"set a=1".to_vec(),
+                    payload: b"set a=1".to_vec().into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 5,
-                    payload: b"set b=2".to_vec(),
+                    payload: b"set b=2".to_vec().into(),
                 },
             ],
             leader_commit: 5,
@@ -2425,7 +2427,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 1,
                 index: 1,
-                payload: b"payload".to_vec(),
+                payload: b"payload".to_vec().into(),
             }],
             leader_commit: 0,
         };
@@ -2461,7 +2463,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 3,
                 index: 1,
-                payload: b"replicated over loopback".to_vec(),
+                payload: b"replicated over loopback".to_vec().into(),
             }],
             leader_commit: 1,
         };
@@ -2477,8 +2479,8 @@ mod tests {
     #[test]
     fn commit_index_monotonic() {
         let mut r = LocalReplicator::leader();
-        let a = r.propose(vec![1]).unwrap();
-        let b = r.propose(vec![2]).unwrap();
+        let a = r.propose(vec![1].into()).unwrap();
+        let b = r.propose(vec![2].into()).unwrap();
 
         assert!(b.index > a.index);
         assert_eq!(r.commit_index(), b.index);
@@ -2489,7 +2491,7 @@ mod tests {
     fn follower_rejects_writes() {
         let mut r = LocalReplicator::leader();
         r.become_follower(2);
-        let err = r.propose(vec![1]).unwrap_err();
+        let err = r.propose(vec![1].into()).unwrap_err();
         assert!(matches!(err, EngineError::NotLeader));
         assert_eq!(r.current_term(), 2);
     }
@@ -2499,7 +2501,7 @@ mod tests {
         let mut r = LocalReplicator::leader();
         r.become_follower(2);
         r.become_leader(3);
-        let tok = r.propose(vec![42]).unwrap();
+        let tok = r.propose(vec![42].into()).unwrap();
         assert_eq!(tok.index, 1);
         assert_eq!(r.current_term(), 3);
     }
@@ -2509,7 +2511,7 @@ mod tests {
         let mut r = LocalReplicator::leader();
         r.become_candidate(2);
 
-        let err = r.propose(vec![1]).unwrap_err();
+        let err = r.propose(vec![1].into()).unwrap_err();
 
         assert!(matches!(err, EngineError::NotLeader));
         assert_eq!(r.current_term(), 2);
@@ -2519,22 +2521,22 @@ mod tests {
     #[test]
     fn rollback_unapplied_removes_tail_and_resets_indices() {
         let mut r = LocalReplicator::leader();
-        let _ = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let _ = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
         assert_eq!(r.commit_index(), t2.index);
 
         r.rollback_unapplied_from(t2.index);
 
         assert_eq!(r.commit_index(), 1);
-        let t3 = r.propose(vec![3]).unwrap();
+        let t3 = r.propose(vec![3].into()).unwrap();
         assert_eq!(t3.index, 2);
     }
 
     #[test]
     fn local_progress_snapshot_tracks_rollback_of_unapplied_tail() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
         r.mark_applied(t1.index);
 
         let before = r.progress();
@@ -2562,7 +2564,7 @@ mod tests {
     #[test]
     fn snapshot_meta_tracks_applied_index() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.mark_applied(t1.index);
 
         let meta = r.export_snapshot_meta();
@@ -2575,7 +2577,7 @@ mod tests {
     #[test]
     fn snapshot_meta_preserves_last_applied_term_across_term_bumps() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.mark_applied(t1.index);
 
         r.become_follower(5);
@@ -2595,7 +2597,7 @@ mod tests {
     fn local_drain_and_entry_at_after_prefix_compaction() {
         let mut r = LocalReplicator::leader();
         for i in 1..=8u64 {
-            assert_eq!(r.propose(vec![i as u8]).unwrap().index, i);
+            assert_eq!(r.propose(vec![i as u8].into()).unwrap().index, i);
         }
         // Compact the prefix: apply through 5, snapshot, install -> retained entries become 6,7,8.
         r.mark_applied(5);
@@ -2604,7 +2606,7 @@ mod tests {
         r.install_snapshot(meta);
         // Append more committed entries (indices 9, 10) on top of the compacted log.
         for i in 9..=10u64 {
-            assert_eq!(r.propose(vec![i as u8]).unwrap().index, i);
+            assert_eq!(r.propose(vec![i as u8].into()).unwrap().index, i);
         }
         // entries[0].index is now 6 (not 1). drain over EVERY start must equal the predicate it
         // replaced: `index > start && index <= commit_index`, over the retained set [6, commit_index].
@@ -2636,8 +2638,8 @@ mod tests {
     #[test]
     fn install_snapshot_advances_log_watermarks() {
         let mut r = LocalReplicator::leader();
-        let _ = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let _ = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
 
         r.install_snapshot(SnapshotMeta {
             last_included_index: t2.index,
@@ -2650,14 +2652,14 @@ mod tests {
         assert_eq!(r.current_term(), 2);
         assert_eq!(r.snapshot_meta().snapshot_id, 9);
 
-        let t3 = r.propose(vec![3]).unwrap();
+        let t3 = r.propose(vec![3].into()).unwrap();
         assert_eq!(t3.index, t2.index + 1);
     }
 
     #[test]
     fn install_older_snapshot_is_a_progress_no_op() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.mark_applied(t1.index);
         let baseline = r.progress();
 
@@ -2674,8 +2676,8 @@ mod tests {
     #[test]
     fn local_install_snapshot_preserves_next_index_from_uncompacted_tail() {
         let mut r = LocalReplicator::leader();
-        let _t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let _t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
 
         r.install_snapshot(SnapshotMeta {
             last_included_index: t2.index - 1,
@@ -2683,14 +2685,14 @@ mod tests {
             snapshot_id: 11,
         });
 
-        let next = r.propose(vec![3]).unwrap();
+        let next = r.propose(vec![3].into()).unwrap();
         assert_eq!(next.index, t2.index + 1);
     }
 
     #[test]
     fn local_install_snapshot_updates_snapshot_id_for_same_frontier_same_term() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.mark_applied(t1.index);
 
         r.install_snapshot(SnapshotMeta {
@@ -2707,7 +2709,7 @@ mod tests {
     #[test]
     fn local_install_snapshot_advancing_frontier_replaces_snapshot_identity_exactly() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.mark_applied(t1.index);
 
         r.install_snapshot(SnapshotMeta {
@@ -2731,7 +2733,7 @@ mod tests {
     #[test]
     fn local_install_snapshot_with_higher_index_lower_term_is_a_progress_no_op() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.mark_applied(t1.index);
         r.install_snapshot(SnapshotMeta {
             last_included_index: t1.index + 1,
@@ -2753,7 +2755,7 @@ mod tests {
     #[test]
     fn mark_applied_does_not_exceed_commit_index() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
 
         r.mark_applied(t1.index + 10);
 
@@ -2763,7 +2765,7 @@ mod tests {
     #[test]
     fn local_progress_snapshot_clamps_apply_frontier_to_commit_boundary() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
 
         r.mark_applied(t1.index + 10);
 
@@ -2777,8 +2779,8 @@ mod tests {
     #[test]
     fn local_replicator_pending_apply_helpers_track_committed_tail() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
-        let _t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let _t2 = r.propose(vec![2].into()).unwrap();
 
         assert_eq!(r.retained_entry_count(), 2);
         assert!(r.has_committed_entries_pending_apply());
@@ -2796,8 +2798,8 @@ mod tests {
     #[test]
     fn local_progress_snapshot_matches_commit_and_apply_state() {
         let mut r = LocalReplicator::leader();
-        let t1 = r.propose(vec![1]).unwrap();
-        let _t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let _t2 = r.propose(vec![2].into()).unwrap();
         r.mark_applied(t1.index);
 
         let progress = r.progress();
@@ -2818,7 +2820,7 @@ mod tests {
     #[test]
     fn raft_replicator_rejects_proposal_when_not_leader() {
         let mut r = RaftReplicator::new(3);
-        let err = r.propose(vec![1]).unwrap_err();
+        let err = r.propose(vec![1].into()).unwrap_err();
         assert!(matches!(err, EngineError::NotLeader));
     }
 
@@ -2827,16 +2829,16 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
-        let _uncommitted = r.propose(vec![2]).unwrap();
+        let _uncommitted = r.propose(vec![2].into()).unwrap();
 
         r.become_candidate(2);
-        let err = r.propose(vec![3]).unwrap_err();
+        let err = r.propose(vec![3].into()).unwrap_err();
         assert!(matches!(err, EngineError::NotLeader));
 
         r.become_leader(3);
-        let tok = r.propose(vec![4]).unwrap();
+        let tok = r.propose(vec![4].into()).unwrap();
         assert_eq!(tok.index, t1.index + 1);
     }
 
@@ -2845,7 +2847,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(2);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         assert_eq!(r.commit_index(), 0, "self-ack is not quorum for 3 voters");
 
         r.register_follower_ack(t1.index, 1);
@@ -2860,8 +2862,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
 
-        let t1 = r.propose(vec![10]).unwrap();
-        let t2 = r.propose(vec![20]).unwrap();
+        let t1 = r.propose(vec![10].into()).unwrap();
+        let t2 = r.propose(vec![20].into()).unwrap();
 
         r.register_follower_ack(t2.index, 2);
         assert_eq!(r.commit_index(), 0, "cannot skip index 1");
@@ -2875,8 +2877,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
 
-        let t1 = r.propose(vec![10]).unwrap();
-        let t2 = r.propose(vec![20]).unwrap();
+        let t1 = r.propose(vec![10].into()).unwrap();
+        let t2 = r.propose(vec![20].into()).unwrap();
 
         let before = r.progress();
         assert_eq!(before.commit_index, 0);
@@ -2910,8 +2912,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
 
-        let t1 = r.propose(vec![10]).unwrap();
-        let t2 = r.propose(vec![20]).unwrap();
+        let t1 = r.propose(vec![10].into()).unwrap();
+        let t2 = r.propose(vec![20].into()).unwrap();
 
         assert_eq!(r.retained_entry_count(), 2);
         assert!(r.has_uncommitted_entries());
@@ -2940,8 +2942,8 @@ mod tests {
     fn raft_follower_lagging_apply_delay_exposes_pending_apply_until_catch_up() {
         let mut leader = RaftReplicator::new(3);
         leader.become_leader(3);
-        let t1 = leader.propose(vec![10]).unwrap();
-        let t2 = leader.propose(vec![20]).unwrap();
+        let t1 = leader.propose(vec![10].into()).unwrap();
+        let t2 = leader.propose(vec![20].into()).unwrap();
         leader.register_follower_ack(t1.index, 1);
         leader.register_follower_ack(t2.index, 1);
 
@@ -2956,12 +2958,12 @@ mod tests {
                     LogEntry {
                         term: 3,
                         index: t1.index,
-                        payload: vec![10],
+                        payload: vec![10].into(),
                     },
                     LogEntry {
                         term: 3,
                         index: t2.index,
-                        payload: vec![20],
+                        payload: vec![20].into(),
                     },
                 ],
                 t2.index,
@@ -2987,8 +2989,8 @@ mod tests {
     fn raft_progress_snapshot_clamps_apply_frontier_to_commit_boundary() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
-        let t1 = r.propose(vec![10]).unwrap();
-        let t2 = r.propose(vec![20]).unwrap();
+        let t1 = r.propose(vec![10].into()).unwrap();
+        let t2 = r.propose(vec![20].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
 
         r.mark_applied(t2.index + 10);
@@ -3007,8 +3009,8 @@ mod tests {
     fn raft_recovery_state_resumes_pending_apply_without_rewinding_commit() {
         let mut leader = RaftReplicator::new(3);
         leader.become_leader(4);
-        let t1 = leader.propose(vec![1]).unwrap();
-        let t2 = leader.propose(vec![2]).unwrap();
+        let t1 = leader.propose(vec![1].into()).unwrap();
+        let t2 = leader.propose(vec![2].into()).unwrap();
         leader.register_follower_ack(t1.index, 1);
         leader.register_follower_ack(t2.index, 1);
         leader.mark_applied(t1.index);
@@ -3031,8 +3033,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
 
-        let t1 = r.propose(vec![10]).unwrap();
-        let _t2 = r.propose(vec![20]).unwrap();
+        let t1 = r.propose(vec![10].into()).unwrap();
+        let _t2 = r.propose(vec![20].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
 
         let progress = r.progress();
@@ -3067,7 +3069,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             6,
         )
@@ -3092,7 +3094,7 @@ mod tests {
     fn replication_progress_reports_caught_up_only_when_apply_and_tail_are_clear() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(5);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
 
         let before_apply = r.progress();
@@ -3117,7 +3119,7 @@ mod tests {
             committed_entries: vec![LogEntry {
                 term: 4,
                 index: 4,
-                payload: vec![1],
+                payload: vec![1].into(),
             }],
             applied_index: 3,
         };
@@ -3152,7 +3154,7 @@ mod tests {
             committed_entries: vec![LogEntry {
                 term: 4,
                 index: 4,
-                payload: vec![1],
+                payload: vec![1].into(),
             }],
             applied_index: 4,
         };
@@ -3203,7 +3205,7 @@ mod tests {
             committed_entries: vec![LogEntry {
                 term: 4,
                 index: 4,
-                payload: vec![1],
+                payload: vec![1].into(),
             }],
             applied_index: 5,
         }
@@ -3223,8 +3225,8 @@ mod tests {
     fn resumed_follower_progress_matches_recovery_projection() {
         let mut leader = RaftReplicator::new(3);
         leader.become_leader(4);
-        let t1 = leader.propose(vec![1]).unwrap();
-        let t2 = leader.propose(vec![2]).unwrap();
+        let t1 = leader.propose(vec![1].into()).unwrap();
+        let t2 = leader.propose(vec![2].into()).unwrap();
         leader.register_follower_ack(t1.index, 1);
         leader.register_follower_ack(t2.index, 1);
         leader.mark_applied(t1.index);
@@ -3269,12 +3271,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![11],
+                    payload: vec![11].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 12,
-                    payload: vec![12],
+                    payload: vec![12].into(),
                 },
             ],
             applied_index: 10,
@@ -3304,12 +3306,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![11],
+                    payload: vec![11].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 12,
-                    payload: vec![12],
+                    payload: vec![12].into(),
                 },
             ],
             applied_index: 10,
@@ -3339,12 +3341,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![11],
+                    payload: vec![11].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 12,
-                    payload: vec![12],
+                    payload: vec![12].into(),
                 },
             ],
             applied_index: 10,
@@ -3373,7 +3375,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 14,
-                    payload: vec![14],
+                    payload: vec![14].into(),
                 }],
                 14,
             )
@@ -3392,7 +3394,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 13,
-                    payload: vec![13],
+                    payload: vec![13].into(),
                 }],
                 12,
             )
@@ -3472,7 +3474,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 13,
-                    payload: vec![13],
+                    payload: vec![13].into(),
                 }],
                 13,
             )
@@ -3713,8 +3715,8 @@ mod tests {
     fn raft_recovery_progress_projects_durable_follower_state_from_live_leader() {
         let mut leader = RaftReplicator::new(3);
         leader.become_leader(4);
-        let t1 = leader.propose(vec![1]).unwrap();
-        let _t2 = leader.propose(vec![2]).unwrap();
+        let t1 = leader.propose(vec![1].into()).unwrap();
+        let _t2 = leader.propose(vec![2].into()).unwrap();
         leader.register_follower_ack(t1.index, 1);
         leader.mark_applied(t1.index);
 
@@ -3758,7 +3760,7 @@ mod tests {
     #[test]
     fn local_status_snapshot_is_always_restart_equivalent() {
         let mut local = LocalReplicator::leader();
-        let token = local.propose(b"set a=1".to_vec()).unwrap();
+        let token = local.propose(b"set a=1".to_vec().into()).unwrap();
         local.mark_applied(token.index);
 
         let status = local.status_snapshot();
@@ -3783,7 +3785,7 @@ mod tests {
                 committed_entries: vec![LogEntry {
                     term: 5,
                     index: 5,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 }],
                 applied_index: 3,
             },
@@ -3796,14 +3798,14 @@ mod tests {
     #[test]
     fn raft_single_node_leader_commits_immediately() {
         let mut r = RaftReplicator::single_node_leader();
-        let tok = r.propose(vec![7]).unwrap();
+        let tok = r.propose(vec![7].into()).unwrap();
         assert_eq!(r.commit_index(), tok.index);
     }
 
     #[test]
     fn raft_progress_snapshot_tracks_single_node_immediate_commit() {
         let mut r = RaftReplicator::single_node_leader();
-        let tok = r.propose(vec![7]).unwrap();
+        let tok = r.propose(vec![7].into()).unwrap();
 
         let progress = r.progress();
         assert_eq!(progress.role, Role::Leader);
@@ -3823,7 +3825,7 @@ mod tests {
     fn raft_follower_acks_are_ignored_when_not_leader() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
 
         r.become_follower(2);
         r.register_follower_ack(t1.index, 1);
@@ -3835,7 +3837,7 @@ mod tests {
     fn raft_progress_snapshot_is_stable_when_acks_arrive_off_leader() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
 
         r.become_follower(2);
         let before = r.progress();
@@ -3849,7 +3851,7 @@ mod tests {
     fn raft_rejects_ack_for_unknown_index() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let _ = r.propose(vec![1]).unwrap();
+        let _ = r.propose(vec![1].into()).unwrap();
 
         r.register_follower_ack(2, 1);
 
@@ -3860,7 +3862,7 @@ mod tests {
     fn raft_progress_snapshot_is_stable_when_ack_targets_unknown_index() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let _ = r.propose(vec![1]).unwrap();
+        let _ = r.propose(vec![1].into()).unwrap();
 
         let before = r.progress();
         r.register_follower_ack(2, 1);
@@ -3874,7 +3876,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 0);
 
         assert_eq!(
@@ -3889,7 +3891,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         let before = r.progress();
         r.register_follower_ack(t1.index, 0);
         let after = r.progress();
@@ -3902,12 +3904,12 @@ mod tests {
         let mut r = RaftReplicator::new(5);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.register_follower_ack(t1.index, 2);
         assert_eq!(r.commit_index(), t1.index);
 
-        let t2 = r.propose(vec![2]).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
         r.register_follower_ack(t2.index, 1);
         r.register_follower_ack(t2.index, 1);
 
@@ -3926,12 +3928,12 @@ mod tests {
         let mut r = RaftReplicator::new(5);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.register_follower_ack(t1.index, 2);
         assert_eq!(r.commit_index(), t1.index);
 
-        let t2 = r.propose(vec![2]).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
         r.register_follower_ack(t2.index, 1);
         let before_duplicate = r.progress();
 
@@ -3951,8 +3953,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
 
         assert!(r.ack_counts.contains_key(&t1.index));
         assert!(r.ack_counts.contains_key(&t2.index));
@@ -3972,8 +3974,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
 
         r.register_follower_ack(t1.index, 1);
         let after_first_commit = r.progress();
@@ -3993,17 +3995,17 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
 
-        let _t2_uncommitted = r.propose(vec![2]).unwrap();
+        let _t2_uncommitted = r.propose(vec![2].into()).unwrap();
         assert_eq!(r.commit_index(), t1.index);
 
         r.become_follower(2);
         r.become_leader(3);
 
-        let t2_new_epoch = r.propose(vec![3]).unwrap();
+        let t2_new_epoch = r.propose(vec![3].into()).unwrap();
         assert_eq!(t2_new_epoch.index, t1.index + 1);
 
         r.register_follower_ack(t2_new_epoch.index, 1);
@@ -4015,9 +4017,9 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
-        let _t2_uncommitted = r.propose(vec![2]).unwrap();
+        let _t2_uncommitted = r.propose(vec![2].into()).unwrap();
 
         let before = r.progress();
         assert_eq!(before.commit_index, t1.index);
@@ -4062,12 +4064,12 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
 
-        let t2 = r.propose(vec![2]).unwrap();
-        let t3 = r.propose(vec![3]).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
+        let t3 = r.propose(vec![3].into()).unwrap();
         assert!(r.ack_counts.contains_key(&t2.index));
         assert!(r.ack_counts.contains_key(&t3.index));
 
@@ -4077,7 +4079,7 @@ mod tests {
         assert!(r.entries.iter().all(|entry| entry.index <= t1.index));
         assert!(r.ack_counts.is_empty());
 
-        let replacement = r.propose(vec![9]).unwrap();
+        let replacement = r.propose(vec![9].into()).unwrap();
         assert_eq!(replacement.index, t1.index + 1);
     }
 
@@ -4086,10 +4088,10 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
-        let t2 = r.propose(vec![2]).unwrap();
-        let t3 = r.propose(vec![3]).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
+        let t3 = r.propose(vec![3].into()).unwrap();
 
         let before = r.progress();
         assert_eq!(before.commit_index, t1.index);
@@ -4118,7 +4120,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
 
@@ -4133,7 +4135,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
 
         let before = r.progress();
@@ -4146,7 +4148,7 @@ mod tests {
     #[test]
     fn local_wait_committed_rejects_uncommitted_token() {
         let mut r = LocalReplicator::leader();
-        let token = r.propose(vec![1]).unwrap();
+        let token = r.propose(vec![1].into()).unwrap();
         r.rollback_unapplied_from(token.index);
 
         let err = r
@@ -4160,7 +4162,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(2);
 
-        let token = r.propose(vec![1]).unwrap();
+        let token = r.propose(vec![1].into()).unwrap();
         let pending = r.wait_committed(token, std::time::Duration::from_millis(1));
         assert!(matches!(pending, Err(EngineError::ProposalFailed(_))));
 
@@ -4176,7 +4178,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(2);
 
-        let token = r.propose(vec![1]).unwrap();
+        let token = r.propose(vec![1].into()).unwrap();
         let before_pending = r.progress();
         let pending = r.wait_committed(token, std::time::Duration::from_millis(1));
         assert!(matches!(pending, Err(EngineError::ProposalFailed(_))));
@@ -4198,9 +4200,9 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(4);
 
-        let t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
-        let t3 = r.propose(vec![3]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
+        let t3 = r.propose(vec![3].into()).unwrap();
 
         r.register_follower_ack(t1.index, 1);
         r.register_follower_ack(t2.index, 1);
@@ -4228,8 +4230,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(4);
 
-        let t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
 
         r.register_follower_ack(t1.index, 1);
         r.register_follower_ack(t2.index, 1);
@@ -4261,8 +4263,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
 
-        let t1 = r.propose(vec![1]).unwrap();
-        let _t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let _t2 = r.propose(vec![2].into()).unwrap();
 
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
@@ -4273,7 +4275,7 @@ mod tests {
             snapshot_id: 7,
         });
 
-        let replacement = r.propose(vec![9]).unwrap();
+        let replacement = r.propose(vec![9].into()).unwrap();
         assert_eq!(replacement.index, 3);
     }
 
@@ -4282,8 +4284,8 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
 
-        let t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
 
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
@@ -4309,7 +4311,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(2);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.mark_applied(t1.index);
 
@@ -4326,11 +4328,11 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
 
-        let _t2_old = r.propose(vec![2]).unwrap();
+        let _t2_old = r.propose(vec![2].into()).unwrap();
         r.become_follower(2);
 
         r.append_entries_from_leader(
@@ -4340,7 +4342,7 @@ mod tests {
             vec![LogEntry {
                 term: 2,
                 index: t1.index + 1,
-                payload: vec![9],
+                payload: vec![9].into(),
             }],
             t1.index + 1,
         )
@@ -4359,7 +4361,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
 
@@ -4372,7 +4374,7 @@ mod tests {
             vec![LogEntry {
                 term: 2,
                 index: t2_index,
-                payload: vec![2],
+                payload: vec![2].into(),
             }],
             t1.index,
         )
@@ -4391,7 +4393,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
 
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(2);
 
@@ -4403,7 +4405,7 @@ mod tests {
             vec![LogEntry {
                 term: 2,
                 index: t2_index,
-                payload: vec![2],
+                payload: vec![2].into(),
             }],
             t1.index,
         )
@@ -4459,7 +4461,7 @@ mod tests {
     fn raft_follower_append_entries_rejects_stale_term_without_state_mutation() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(5);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(5);
 
@@ -4477,7 +4479,7 @@ mod tests {
                 vec![LogEntry {
                     term: 4,
                     index: t1.index + 1,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 }],
                 t1.index + 1,
             )
@@ -4495,7 +4497,7 @@ mod tests {
     fn raft_progress_snapshot_is_stable_across_stale_append_rejection() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(5);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(5);
 
@@ -4509,7 +4511,7 @@ mod tests {
                 vec![LogEntry {
                     term: 4,
                     index: t1.index + 1,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 }],
                 t1.index + 1,
             )
@@ -4532,7 +4534,7 @@ mod tests {
                 vec![LogEntry {
                     term: 6,
                     index: 1,
-                    payload: vec![1],
+                    payload: vec![1].into(),
                 }],
                 1,
             )
@@ -4550,7 +4552,7 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(6);
 
-        let committed = r.propose(vec![1]).unwrap();
+        let committed = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(committed.index, 1);
 
         let role_before = r.role();
@@ -4566,7 +4568,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: committed.index + 1,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 }],
                 committed.index + 1,
             )
@@ -4584,7 +4586,7 @@ mod tests {
     fn raft_follower_append_entries_rejects_prev_term_mismatch() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(2);
 
@@ -4596,7 +4598,7 @@ mod tests {
                 vec![LogEntry {
                     term: 2,
                     index: t1.index + 1,
-                    payload: vec![2],
+                    payload: vec![2].into(),
                 }],
                 t1.index + 1,
             )
@@ -4610,7 +4612,7 @@ mod tests {
     fn raft_follower_append_entries_rejects_non_contiguous_batches() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(2);
 
@@ -4623,12 +4625,12 @@ mod tests {
                     LogEntry {
                         term: 2,
                         index: t1.index + 1,
-                        payload: vec![2],
+                        payload: vec![2].into(),
                     },
                     LogEntry {
                         term: 2,
                         index: t1.index + 3,
-                        payload: vec![3],
+                        payload: vec![3].into(),
                     },
                 ],
                 t1.index + 3,
@@ -4645,7 +4647,7 @@ mod tests {
     fn raft_progress_snapshot_is_stable_across_non_contiguous_append_rejection() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(2);
 
@@ -4660,12 +4662,12 @@ mod tests {
                     LogEntry {
                         term: 2,
                         index: t1.index + 1,
-                        payload: vec![2],
+                        payload: vec![2].into(),
                     },
                     LogEntry {
                         term: 2,
                         index: t1.index + 3,
-                        payload: vec![3],
+                        payload: vec![3].into(),
                     },
                 ],
                 t1.index + 3,
@@ -4680,7 +4682,7 @@ mod tests {
     fn raft_follower_append_entries_rejects_first_entry_that_skips_prev_index() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(2);
 
@@ -4692,7 +4694,7 @@ mod tests {
                 vec![LogEntry {
                     term: 2,
                     index: t1.index + 2,
-                    payload: vec![2],
+                    payload: vec![2].into(),
                 }],
                 t1.index + 2,
             )
@@ -4707,7 +4709,7 @@ mod tests {
     fn raft_follower_append_entries_does_not_overwrite_committed_entries() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
-        let t1 = r.propose(vec![1]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(t1.index, 1);
         r.become_follower(2);
 
@@ -4719,7 +4721,7 @@ mod tests {
                 vec![LogEntry {
                     term: 2,
                     index: t1.index,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 }],
                 t1.index,
             )
@@ -4732,7 +4734,7 @@ mod tests {
             .find(|entry| entry.index == t1.index)
             .unwrap();
         assert_eq!(committed.term, 1);
-        assert_eq!(committed.payload, vec![1]);
+        assert_eq!(&committed.payload[..], &vec![1][..]);
     }
 
     #[test]
@@ -4747,7 +4749,7 @@ mod tests {
             vec![LogEntry {
                 term: 3,
                 index: 1,
-                payload: vec![1],
+                payload: vec![1].into(),
             }],
             1,
         )
@@ -4764,7 +4766,7 @@ mod tests {
                 vec![LogEntry {
                     term: 3,
                     index: 1,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 }],
                 1,
             )
@@ -4775,7 +4777,7 @@ mod tests {
         assert_eq!(r.next_index, next_before);
         let preserved = r.entries.iter().find(|entry| entry.index == 1).unwrap();
         assert_eq!(preserved.term, 3);
-        assert_eq!(preserved.payload, vec![1]);
+        assert_eq!(&preserved.payload[..], &vec![1][..]);
     }
 
     #[test]
@@ -4790,7 +4792,7 @@ mod tests {
             vec![LogEntry {
                 term: 2,
                 index: 1,
-                payload: vec![1],
+                payload: vec![1].into(),
             }],
             99,
         )
@@ -4818,7 +4820,7 @@ mod tests {
                 vec![LogEntry {
                     term: 5,
                     index: 11,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 }],
                 11,
             )
@@ -4845,7 +4847,7 @@ mod tests {
                 vec![LogEntry {
                     term: 6,
                     index: 11,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 }],
                 11,
             )
@@ -4864,9 +4866,9 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(4);
 
-        let committed = r.propose(vec![1]).unwrap();
+        let committed = r.propose(vec![1].into()).unwrap();
         r.register_follower_ack(committed.index, 1);
-        let speculative = r.propose(vec![2]).unwrap();
+        let speculative = r.propose(vec![2].into()).unwrap();
         let speculative_status = r.status_snapshot();
         assert!(speculative_status.has_speculative_tail());
         assert_eq!(speculative_status.live.next_index, speculative.index + 1);
@@ -4881,7 +4883,7 @@ mod tests {
                 vec![LogEntry {
                     term: 6,
                     index: committed.index + 10,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 }],
                 committed.index + 10,
             )
@@ -4918,7 +4920,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             5,
         )
@@ -4937,7 +4939,7 @@ mod tests {
                 vec![LogEntry {
                     term: 5,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -4974,7 +4976,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             5,
         )
@@ -4996,12 +4998,12 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![60],
+                    payload: vec![60].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![70],
+                    payload: vec![70].into(),
                 },
             ],
             6,
@@ -5037,10 +5039,10 @@ mod tests {
         assert_eq!(r.entries.len(), 2);
         assert_eq!(r.entries[0].index, 6);
         assert_eq!(r.entries[0].term, 5);
-        assert_eq!(r.entries[0].payload, vec![60]);
+        assert_eq!(&r.entries[0].payload[..], &[60u8][..]);
         assert_eq!(r.entries[1].index, 7);
         assert_eq!(r.entries[1].term, 5);
-        assert_eq!(r.entries[1].payload, vec![70]);
+        assert_eq!(&r.entries[1].payload[..], &[70u8][..]);
     }
 
     #[test]
@@ -5059,7 +5061,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             5,
         )
@@ -5072,12 +5074,12 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![60],
+                    payload: vec![60].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![70],
+                    payload: vec![70].into(),
                 },
             ],
             6,
@@ -5139,7 +5141,7 @@ mod tests {
             vec![LogEntry {
                 term: 3,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             6,
         )
@@ -5153,7 +5155,7 @@ mod tests {
             vec![LogEntry {
                 term: 3,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             6,
         )
@@ -5187,7 +5189,7 @@ mod tests {
             vec![LogEntry {
                 term: 3,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             6,
         )
@@ -5215,7 +5217,7 @@ mod tests {
             vec![LogEntry {
                 term: 3,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             6,
         )
@@ -5244,7 +5246,7 @@ mod tests {
                 vec![LogEntry {
                     term: 4,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 }],
                 6,
             )
@@ -5278,7 +5280,7 @@ mod tests {
                 vec![LogEntry {
                     term: 4,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 }],
                 6,
             )
@@ -5307,7 +5309,7 @@ mod tests {
                 vec![LogEntry {
                     term: 4,
                     index: 1,
-                    payload: vec![1],
+                    payload: vec![1].into(),
                 }],
                 1,
             )
@@ -5341,7 +5343,7 @@ mod tests {
                 vec![LogEntry {
                     term: 4,
                     index: 1,
-                    payload: vec![1],
+                    payload: vec![1].into(),
                 }],
                 1,
             )
@@ -5379,7 +5381,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![9],
+                payload: vec![9].into(),
             }],
             6,
         )
@@ -5428,7 +5430,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![9],
+                payload: vec![9].into(),
             }],
             5,
         )
@@ -5476,7 +5478,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![9],
+                payload: vec![9].into(),
             }],
             5,
         )
@@ -5548,9 +5550,9 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         r.become_leader(5);
 
-        let t1 = r.propose(vec![1]).unwrap();
-        let t2 = r.propose(vec![2]).unwrap();
-        let t3 = r.propose(vec![3]).unwrap();
+        let t1 = r.propose(vec![1].into()).unwrap();
+        let t2 = r.propose(vec![2].into()).unwrap();
+        let t3 = r.propose(vec![3].into()).unwrap();
 
         r.register_follower_ack(t1.index, 1);
         r.register_follower_ack(t2.index, 1);
@@ -5601,7 +5603,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![9],
+                payload: vec![9].into(),
             }],
             5,
         )
@@ -5666,7 +5668,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![9],
+                payload: vec![9].into(),
             }],
             5,
         )
@@ -5729,7 +5731,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             5,
         )
@@ -5753,7 +5755,7 @@ mod tests {
                 vec![LogEntry {
                     term: 5,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -5777,12 +5779,12 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![60],
+                    payload: vec![60].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![70],
+                    payload: vec![70].into(),
                 },
             ],
             6,
@@ -5838,7 +5840,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             5,
         )
@@ -5857,7 +5859,7 @@ mod tests {
                 vec![LogEntry {
                     term: 5,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -5872,12 +5874,12 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![60],
+                    payload: vec![60].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![70],
+                    payload: vec![70].into(),
                 },
             ],
             6,
@@ -5926,7 +5928,7 @@ mod tests {
             vec![LogEntry {
                 term: 4,
                 index: 6,
-                payload: vec![6],
+                payload: vec![6].into(),
             }],
             5,
         )
@@ -5955,7 +5957,7 @@ mod tests {
                 vec![LogEntry {
                     term: 5,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -5971,12 +5973,12 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![60],
+                    payload: vec![60].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![70],
+                    payload: vec![70].into(),
                 },
             ],
             6,
@@ -6018,22 +6020,22 @@ mod tests {
                 LogEntry {
                     term: 4,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 4,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 4,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
                 LogEntry {
                     term: 4,
                     index: 9,
-                    payload: vec![9],
+                    payload: vec![9].into(),
                 },
             ],
             5,
@@ -6066,7 +6068,7 @@ mod tests {
                 vec![LogEntry {
                     term: 6,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -6090,12 +6092,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             9,
@@ -6151,17 +6153,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6183,7 +6185,7 @@ mod tests {
                 vec![LogEntry {
                     term: 6,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -6218,17 +6220,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6272,12 +6274,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -6330,17 +6332,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6410,17 +6412,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6480,12 +6482,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -6589,17 +6591,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6663,17 +6665,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6700,7 +6702,7 @@ mod tests {
                 vec![LogEntry {
                     term: 6,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -6738,17 +6740,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6773,12 +6775,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -6903,17 +6905,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -6938,12 +6940,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -6975,7 +6977,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -7031,17 +7033,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -7066,12 +7068,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -7208,17 +7210,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -7243,12 +7245,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -7397,17 +7399,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -7432,12 +7434,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -7505,17 +7507,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -7535,12 +7537,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -7639,17 +7641,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -7668,12 +7670,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -7794,17 +7796,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -7823,12 +7825,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -7905,17 +7907,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -7934,12 +7936,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -7975,7 +7977,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -8034,17 +8036,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -8063,12 +8065,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -8109,7 +8111,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -8167,17 +8169,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -8196,12 +8198,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -8273,17 +8275,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -8302,12 +8304,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -8420,17 +8422,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -8449,17 +8451,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -8572,17 +8574,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -8601,17 +8603,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -8705,17 +8707,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -8734,17 +8736,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -8889,17 +8891,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -8918,17 +8920,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -9021,17 +9023,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -9050,17 +9052,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -9184,17 +9186,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -9213,17 +9215,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -9314,17 +9316,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -9343,17 +9345,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -9400,7 +9402,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -9431,12 +9433,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -9530,17 +9532,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -9559,17 +9561,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -9609,7 +9611,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -9624,12 +9626,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -9782,17 +9784,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -9811,17 +9813,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -9861,7 +9863,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -9876,12 +9878,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -9955,17 +9957,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -9984,17 +9986,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -10034,7 +10036,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -10049,12 +10051,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -10084,7 +10086,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -10138,17 +10140,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -10167,17 +10169,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -10217,7 +10219,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -10232,12 +10234,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -10257,7 +10259,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -10288,12 +10290,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -10388,17 +10390,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -10417,17 +10419,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -10467,7 +10469,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -10482,12 +10484,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -10507,7 +10509,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -10522,12 +10524,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -10606,17 +10608,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -10635,17 +10637,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -10685,7 +10687,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -10700,12 +10702,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -10725,7 +10727,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -10740,12 +10742,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -10849,17 +10851,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -10878,17 +10880,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -10928,7 +10930,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -10943,12 +10945,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -10968,7 +10970,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -10983,12 +10985,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -11101,17 +11103,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -11130,17 +11132,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -11180,7 +11182,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -11195,12 +11197,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -11220,7 +11222,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -11235,12 +11237,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -11344,17 +11346,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -11373,17 +11375,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -11423,7 +11425,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -11438,12 +11440,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -11463,7 +11465,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -11478,12 +11480,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -11567,17 +11569,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -11596,17 +11598,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -11646,7 +11648,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -11661,12 +11663,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -11686,7 +11688,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -11701,12 +11703,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -11731,7 +11733,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -11787,17 +11789,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -11816,17 +11818,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -11866,7 +11868,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -11881,12 +11883,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -11906,7 +11908,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -11921,12 +11923,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -11946,7 +11948,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -11971,12 +11973,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -12035,17 +12037,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -12064,17 +12066,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -12114,7 +12116,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -12129,12 +12131,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -12154,7 +12156,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -12169,12 +12171,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -12194,7 +12196,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -12209,12 +12211,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -12229,7 +12231,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -12244,12 +12246,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -12332,17 +12334,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -12361,17 +12363,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -12411,7 +12413,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -12426,12 +12428,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -12451,7 +12453,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -12466,12 +12468,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -12491,7 +12493,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -12506,12 +12508,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -12531,7 +12533,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -12556,12 +12558,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -12677,17 +12679,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -12706,17 +12708,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -12756,7 +12758,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -12771,12 +12773,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -12796,7 +12798,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -12811,12 +12813,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -12836,7 +12838,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -12851,12 +12853,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -12876,7 +12878,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -12891,12 +12893,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -12979,17 +12981,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -13008,17 +13010,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -13058,7 +13060,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -13073,12 +13075,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -13098,7 +13100,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -13113,12 +13115,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -13138,7 +13140,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -13153,12 +13155,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -13178,7 +13180,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -13193,12 +13195,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -13315,17 +13317,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -13344,17 +13346,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -13394,7 +13396,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -13409,12 +13411,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -13434,7 +13436,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -13449,12 +13451,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -13474,7 +13476,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -13489,12 +13491,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -13514,7 +13516,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -13529,12 +13531,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -13664,17 +13666,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -13693,17 +13695,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -13743,7 +13745,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -13758,12 +13760,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -13783,7 +13785,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -13798,12 +13800,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -13823,7 +13825,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -13838,12 +13840,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -13863,7 +13865,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -13878,12 +13880,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -13971,17 +13973,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -14000,17 +14002,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -14050,7 +14052,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -14065,12 +14067,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -14090,7 +14092,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -14105,12 +14107,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -14130,7 +14132,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -14145,12 +14147,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -14170,7 +14172,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -14185,12 +14187,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -14215,7 +14217,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -14271,17 +14273,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -14300,17 +14302,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -14350,7 +14352,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -14365,12 +14367,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -14390,7 +14392,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -14405,12 +14407,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -14430,7 +14432,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -14445,12 +14447,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -14470,7 +14472,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -14485,12 +14487,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -14618,17 +14620,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -14647,17 +14649,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -14697,7 +14699,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -14712,12 +14714,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -14737,7 +14739,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -14752,12 +14754,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -14777,7 +14779,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -14792,12 +14794,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -14817,7 +14819,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -14832,12 +14834,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -14857,7 +14859,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -14879,12 +14881,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -14945,17 +14947,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -14974,17 +14976,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -15024,7 +15026,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -15039,12 +15041,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -15064,7 +15066,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -15079,12 +15081,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -15104,7 +15106,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -15119,12 +15121,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -15144,7 +15146,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -15159,12 +15161,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -15184,7 +15186,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -15199,12 +15201,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -15287,17 +15289,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -15316,17 +15318,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -15366,7 +15368,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -15381,12 +15383,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -15406,7 +15408,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -15421,12 +15423,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -15446,7 +15448,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -15461,12 +15463,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -15486,7 +15488,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -15501,12 +15503,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -15526,7 +15528,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -15541,12 +15543,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -15621,17 +15623,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -15650,17 +15652,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -15700,7 +15702,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -15715,12 +15717,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -15740,7 +15742,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -15755,12 +15757,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -15780,7 +15782,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -15795,12 +15797,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -15820,7 +15822,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -15835,12 +15837,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -15860,7 +15862,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -15875,12 +15877,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -15999,17 +16001,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -16028,17 +16030,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -16078,7 +16080,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -16093,12 +16095,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -16118,7 +16120,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -16133,12 +16135,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -16158,7 +16160,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -16173,12 +16175,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -16198,7 +16200,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -16213,12 +16215,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -16238,7 +16240,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -16253,12 +16255,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -16388,17 +16390,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -16417,17 +16419,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -16467,7 +16469,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -16482,12 +16484,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -16507,7 +16509,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -16522,12 +16524,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -16547,7 +16549,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -16562,12 +16564,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -16587,7 +16589,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -16602,12 +16604,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -16627,7 +16629,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -16642,12 +16644,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -16735,17 +16737,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -16764,17 +16766,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -16814,7 +16816,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -16829,12 +16831,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -16854,7 +16856,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -16869,12 +16871,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -16894,7 +16896,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -16909,12 +16911,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -16934,7 +16936,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -16949,12 +16951,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -16974,7 +16976,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -16989,12 +16991,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -17074,17 +17076,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -17103,17 +17105,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -17153,7 +17155,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -17168,12 +17170,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -17193,7 +17195,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -17208,12 +17210,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -17233,7 +17235,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -17248,12 +17250,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -17273,7 +17275,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -17288,12 +17290,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -17313,7 +17315,7 @@ mod tests {
                 vec![LogEntry {
                     term: 11,
                     index: 100,
-                    payload: vec![150],
+                    payload: vec![150].into(),
                 }],
                 100,
             )
@@ -17328,12 +17330,12 @@ mod tests {
                 LogEntry {
                     term: 11,
                     index: 14,
-                    payload: vec![151],
+                    payload: vec![151].into(),
                 },
                 LogEntry {
                     term: 11,
                     index: 15,
-                    payload: vec![152],
+                    payload: vec![152].into(),
                 },
             ],
             14,
@@ -17457,17 +17459,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -17486,17 +17488,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -17536,7 +17538,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -17551,12 +17553,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -17576,7 +17578,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -17591,12 +17593,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -17616,7 +17618,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -17631,12 +17633,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -17656,7 +17658,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -17671,12 +17673,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -17806,17 +17808,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -17835,17 +17837,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -17885,7 +17887,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -17900,12 +17902,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -17925,7 +17927,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -17940,12 +17942,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -17965,7 +17967,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -17980,12 +17982,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -18005,7 +18007,7 @@ mod tests {
                 vec![LogEntry {
                     term: 10,
                     index: 100,
-                    payload: vec![140],
+                    payload: vec![140].into(),
                 }],
                 100,
             )
@@ -18020,12 +18022,12 @@ mod tests {
                 LogEntry {
                     term: 10,
                     index: 13,
-                    payload: vec![141],
+                    payload: vec![141].into(),
                 },
                 LogEntry {
                     term: 10,
                     index: 14,
-                    payload: vec![142],
+                    payload: vec![142].into(),
                 },
             ],
             13,
@@ -18155,17 +18157,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -18184,17 +18186,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -18234,7 +18236,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -18249,12 +18251,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -18274,7 +18276,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -18289,12 +18291,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -18314,7 +18316,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -18329,12 +18331,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -18436,17 +18438,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -18465,17 +18467,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -18515,7 +18517,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -18530,12 +18532,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -18555,7 +18557,7 @@ mod tests {
                 vec![LogEntry {
                     term: 8,
                     index: 100,
-                    payload: vec![120],
+                    payload: vec![120].into(),
                 }],
                 100,
             )
@@ -18570,12 +18572,12 @@ mod tests {
                 LogEntry {
                     term: 8,
                     index: 11,
-                    payload: vec![121],
+                    payload: vec![121].into(),
                 },
                 LogEntry {
                     term: 8,
                     index: 12,
-                    payload: vec![122],
+                    payload: vec![122].into(),
                 },
             ],
             11,
@@ -18595,7 +18597,7 @@ mod tests {
                 vec![LogEntry {
                     term: 9,
                     index: 100,
-                    payload: vec![130],
+                    payload: vec![130].into(),
                 }],
                 100,
             )
@@ -18610,12 +18612,12 @@ mod tests {
                 LogEntry {
                     term: 9,
                     index: 12,
-                    payload: vec![131],
+                    payload: vec![131].into(),
                 },
                 LogEntry {
                     term: 9,
                     index: 13,
-                    payload: vec![132],
+                    payload: vec![132].into(),
                 },
             ],
             12,
@@ -18745,17 +18747,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -18774,17 +18776,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -18824,7 +18826,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -18839,12 +18841,12 @@ mod tests {
                 LogEntry {
                     term: 7,
                     index: 10,
-                    payload: vec![110],
+                    payload: vec![110].into(),
                 },
                 LogEntry {
                     term: 7,
                     index: 11,
-                    payload: vec![111],
+                    payload: vec![111].into(),
                 },
             ],
             10,
@@ -18958,17 +18960,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -18987,17 +18989,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -19103,17 +19105,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -19132,17 +19134,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -19192,7 +19194,7 @@ mod tests {
                 vec![LogEntry {
                     term: 7,
                     index: 100,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 }],
                 100,
             )
@@ -19251,17 +19253,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -19280,17 +19282,17 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 10,
-                    payload: vec![100],
+                    payload: vec![100].into(),
                 },
             ],
             8,
@@ -19453,17 +19455,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -19482,12 +19484,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -19644,17 +19646,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -19673,12 +19675,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -19761,17 +19763,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -19790,12 +19792,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,
@@ -19947,17 +19949,17 @@ mod tests {
                 LogEntry {
                     term: 5,
                     index: 6,
-                    payload: vec![6],
+                    payload: vec![6].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 7,
-                    payload: vec![7],
+                    payload: vec![7].into(),
                 },
                 LogEntry {
                     term: 5,
                     index: 8,
-                    payload: vec![8],
+                    payload: vec![8].into(),
                 },
             ],
             7,
@@ -19976,12 +19978,12 @@ mod tests {
                 LogEntry {
                     term: 6,
                     index: 8,
-                    payload: vec![80],
+                    payload: vec![80].into(),
                 },
                 LogEntry {
                     term: 6,
                     index: 9,
-                    payload: vec![90],
+                    payload: vec![90].into(),
                 },
             ],
             8,

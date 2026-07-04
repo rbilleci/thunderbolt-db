@@ -107,23 +107,23 @@ fn main() -> Result<(), EngineError> {
     leader.become_leader(1);
     assert_eq!(leader.role(), Role::Leader);
     assert!(matches!(
-        follower_a.propose(b"blocked follower write".to_vec()),
+        follower_a.propose(b"blocked follower write".to_vec().into()),
         Err(EngineError::NotLeader)
     ));
 
-    let first = leader.propose(b"create table t(id int)".to_vec())?;
-    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let first = leader.propose(b"create table t(id int)".to_vec().into())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec().into())?;
     let term_one = leader.current_term();
     let first_batch = vec![
         LogEntry {
             term: term_one,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term: term_one,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
     ];
 
@@ -182,17 +182,17 @@ fn main() -> Result<(), EngineError> {
     }
     assert!(election_passed);
     let old_leader_rejected_after_failover = matches!(
-        leader.propose(b"blocked after failover".to_vec()),
+        leader.propose(b"blocked after failover".to_vec().into()),
         Err(EngineError::NotLeader)
     );
     assert!(old_leader_rejected_after_failover);
 
-    let third = follower_a.propose(b"insert into t values (2)".to_vec())?;
+    let third = follower_a.propose(b"insert into t values (2)".to_vec().into())?;
     let term_two = follower_a.current_term();
     let failover_entry = vec![LogEntry {
         term: term_two,
         index: third.index,
-        payload: b"insert into t values (2)".to_vec(),
+        payload: b"insert into t values (2)".to_vec().into(),
     }];
 
     append_batches_sent += 1;

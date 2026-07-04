@@ -1441,7 +1441,7 @@ fn publish_telemetry_emits_snapshot_to_sink() {
 #[test]
 fn installing_older_snapshot_is_a_status_no_op() {
     let mut e = Engine::new_local();
-    let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    let committed = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     let baseline = e.status_snapshot();
 
     e.install_snapshot(SnapshotMeta {
@@ -1463,7 +1463,7 @@ fn installing_older_snapshot_is_a_status_no_op() {
 #[test]
 fn installing_higher_index_lower_term_snapshot_is_a_status_no_op() {
     let mut e = Engine::new_local();
-    let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    let committed = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
 
     e.install_snapshot(SnapshotMeta {
         last_included_index: committed.index + 2,
@@ -1489,7 +1489,7 @@ fn installing_higher_index_lower_term_snapshot_is_a_status_no_op() {
 #[test]
 fn installing_advanced_snapshot_replaces_snapshot_identity_exactly() {
     let mut e = Engine::new_local();
-    let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    let committed = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
 
     e.install_snapshot(SnapshotMeta {
         last_included_index: committed.index,

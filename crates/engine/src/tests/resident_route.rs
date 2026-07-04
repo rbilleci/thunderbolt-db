@@ -3116,7 +3116,7 @@ fn telemetry_snapshot_reflects_replication_lag_and_runtime_metrics() {
 #[test]
 fn status_snapshot_answers_snapshot_and_replication_health_questions() {
     let mut e = Engine::new_local();
-    let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    let token = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     let exported = e.export_snapshot_meta();
 
     let status = e.status_snapshot();

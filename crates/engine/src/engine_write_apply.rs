@@ -292,8 +292,12 @@ impl Engine {
         // the version stamp exactly as before. The snapshot is taken immediately before prepare, so
         // `next_row_id` and the read visibility match what the in-line apply used.
         let snapshot = self.dml_read_snapshot(txn_id);
-        let delta =
-            self.prepare_insert(&insert, snapshot, profile.as_deref_mut(), InsertPrepareValidation::Full)?;
+        let delta = self.prepare_insert(
+            &insert,
+            snapshot,
+            profile.as_deref_mut(),
+            InsertPrepareValidation::Full,
+        )?;
         // Slice 1b-ii-c: surface the APPLIED rows (post-coercion / post-default, catalog order — the
         // actual stored images) for the commit path's in-place open-shard append, plus the delta's
         // write-set for SI ledger recording (C2). Captured BEFORE apply_delta_serialized consumes
@@ -1858,7 +1862,7 @@ impl Engine {
                 self.preflight_unique_index_constraints(&cmd, txn_id)?;
                 if self.command_requires_immediate_unique_index_commit(&cmd) {
                     self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
-                    self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                    self.commit_mutation(txn_id, std::sync::Arc::from(text.as_bytes()))?;
                     return Ok(());
                 }
 
@@ -1879,7 +1883,7 @@ impl Engine {
                         let maybe_batch = self.batcher().enqueue(
                             PendingMutation {
                                 txn_id,
-                                payload: text.as_bytes().to_vec(),
+                                payload: std::sync::Arc::from(text.as_bytes()),
                             },
                             now,
                         );
@@ -1892,10 +1896,10 @@ impl Engine {
                     }
                     RouteDecision::CpuFallback { reason, .. } => {
                         self.metrics.inc_gpu_fallback(reason);
-                        self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                        self.commit_mutation(txn_id, std::sync::Arc::from(text.as_bytes()))?;
                     }
                     RouteDecision::Cpu => {
-                        self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                        self.commit_mutation(txn_id, std::sync::Arc::from(text.as_bytes()))?;
                     }
                 }
             }
@@ -2008,7 +2012,7 @@ impl Engine {
         // appends + ONE fsync, not k fsyncs. On a clean pre-durable failure the whole batch is
         // requeued for retry (nothing committed); a post-durable failure must NOT be requeued —
         // the records are already in the durable log and a retry would duplicate them.
-        let batch: Vec<(TxnId, Vec<u8>)> = items
+        let batch: Vec<(TxnId, std::sync::Arc<[u8]>)> = items
             .iter()
             .map(|p| (p.item.txn_id, p.item.payload.clone()))
             .collect();

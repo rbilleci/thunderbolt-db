@@ -49,19 +49,19 @@ fn run_parent() -> Result<(), Box<dyn Error>> {
     let mut leader = RaftReplicator::new(3);
     leader.become_leader(1);
 
-    let first = leader.propose(b"create table t(id int)".to_vec())?;
-    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let first = leader.propose(b"create table t(id int)".to_vec().into())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec().into())?;
     let term_one = leader.current_term();
     let first_batch = vec![
         LogEntry {
             term: term_one,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term: term_one,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
     ];
 

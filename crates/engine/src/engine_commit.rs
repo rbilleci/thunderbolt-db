@@ -49,7 +49,7 @@ impl Engine {
     pub fn commit_mutation(
         &self,
         txn_id: u64,
-        payload: Vec<u8>,
+        payload: std::sync::Arc<[u8]>,
     ) -> Result<CommitToken, EngineError> {
         let timestamp_micros = self.next_commit_timestamp_micros();
         self.commit_mutation_at(txn_id, payload, timestamp_micros)
@@ -69,7 +69,7 @@ impl Engine {
     pub fn commit_mutation_at(
         &self,
         txn_id: u64,
-        payload: Vec<u8>,
+        payload: std::sync::Arc<[u8]>,
         timestamp_micros: u64,
     ) -> Result<CommitToken, EngineError> {
         if self.repl_role() != Role::Leader {
@@ -136,7 +136,7 @@ impl Engine {
     ///   restart replays the durable log as the source of truth).
     pub(crate) fn commit_mutation_batch(
         &self,
-        items: &[(TxnId, Vec<u8>)],
+        items: &[(TxnId, std::sync::Arc<[u8]>)],
     ) -> Result<(), BatchCommitFailure> {
         let Some((last_txn_id, _)) = items.last() else {
             return Ok(());
@@ -519,7 +519,7 @@ impl Engine {
     pub(crate) fn commit_mutation_at_with_current_apply<F>(
         &self,
         txn_id: u64,
-        payload: Vec<u8>,
+        payload: std::sync::Arc<[u8]>,
         timestamp_micros: u64,
         mut apply_current: F,
     ) -> Result<(CommitToken, u128), EngineError>

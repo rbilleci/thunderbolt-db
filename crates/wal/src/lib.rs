@@ -17,7 +17,9 @@ const WAL_RECORD_HEADER_LEN: usize = 24;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
     pub txn_id: TxnId,
-    pub payload: Vec<u8>,
+    /// W1a: shared with the replication log entry + the commit-wave item (one allocation per
+    /// statement, refcounted; was a fresh `Vec` copy per record on the commit hot path).
+    pub payload: std::sync::Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1025,7 +1027,10 @@ pub fn read_wal_segment(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, Engine
                         txn_id
                     )));
                 }
-                records.push(WalRecord { txn_id, payload });
+                records.push(WalRecord {
+                    txn_id,
+                    payload: payload.into(),
+                });
             }
             Ok(_) => unreachable!("one-byte read returned more than one byte"),
             Err(err) => {
@@ -1202,7 +1207,7 @@ pub fn recover_wal_segment(path: impl AsRef<Path>) -> Result<WalSegmentRecovery,
         }
         records.push(WalRecord {
             txn_id,
-            payload: payload.to_vec(),
+            payload: payload.to_vec().into(),
         });
         offset = payload_end;
     }
@@ -4003,11 +4008,11 @@ mod tests {
         let mut wal = WalBuffer::default();
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
         wal.append(WalRecord {
             txn_id: 2,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         });
 
         wal.flush_all().unwrap();
@@ -4020,7 +4025,7 @@ mod tests {
         let mut wal = WalBuffer::default();
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
 
         wal.fail_next_flush();
@@ -4037,11 +4042,11 @@ mod tests {
         let mut wal = WalBuffer::default();
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
         wal.append(WalRecord {
             txn_id: 2,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         });
 
         wal.flush_all().unwrap();
@@ -4057,11 +4062,11 @@ mod tests {
         let mut wal = WalBuffer::default();
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
         wal.append(WalRecord {
             txn_id: 2,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         });
 
         assert_eq!(wal.unflushed_count(), 2);
@@ -4071,7 +4076,7 @@ mod tests {
 
         wal.append(WalRecord {
             txn_id: 3,
-            payload: b"SET c=3".to_vec(),
+            payload: b"SET c=3".to_vec().into(),
         });
         assert_eq!(wal.unflushed_count(), 1);
     }
@@ -4081,11 +4086,11 @@ mod tests {
         let mut wal = WalBuffer::default();
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
         wal.append(WalRecord {
             txn_id: 2,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         });
 
         assert!(wal.flushed_records().is_empty());
@@ -4093,7 +4098,7 @@ mod tests {
         wal.flush_all().unwrap();
         wal.append(WalRecord {
             txn_id: 3,
-            payload: b"SET c=3".to_vec(),
+            payload: b"SET c=3".to_vec().into(),
         });
 
         let durable = wal.flushed_records();
@@ -4107,7 +4112,7 @@ mod tests {
         let mut wal = WalBuffer::default();
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
 
         wal.fail_next_flush();
@@ -4130,11 +4135,11 @@ mod tests {
 
         wal.append(WalRecord {
             txn_id: 7,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
         wal.append(WalRecord {
             txn_id: 8,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         });
 
         assert_eq!(
@@ -4156,7 +4161,7 @@ mod tests {
 
         wal.append(WalRecord {
             txn_id: 9,
-            payload: b"SET c=3".to_vec(),
+            payload: b"SET c=3".to_vec().into(),
         });
         assert_eq!(
             wal.checkpoint_meta(),
@@ -4172,13 +4177,13 @@ mod tests {
         let mut wal = WalBuffer::default();
         wal.append(WalRecord {
             txn_id: 11,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         });
         wal.flush_all().unwrap();
 
         wal.append(WalRecord {
             txn_id: 12,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         });
         wal.fail_next_flush();
         assert!(wal.flush_all().is_err());
@@ -4201,11 +4206,11 @@ mod tests {
 
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"CREATE TABLE t (id INT)".to_vec(),
+            payload: b"CREATE TABLE t (id INT)".to_vec().into(),
         });
         wal.append(WalRecord {
             txn_id: 2,
-            payload: b"INSERT INTO t (id) VALUES (1)".to_vec(),
+            payload: b"INSERT INTO t (id) VALUES (1)".to_vec().into(),
         });
         // Nothing on disk until the flush.
         assert!(!path.exists());
@@ -4219,8 +4224,8 @@ mod tests {
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].txn_id, 1);
         assert_eq!(
-            recovered[1].payload,
-            b"INSERT INTO t (id) VALUES (1)".to_vec()
+            &recovered[1].payload[..],
+            &b"INSERT INTO t (id) VALUES (1)"[..]
         );
     }
 
@@ -4231,12 +4236,12 @@ mod tests {
 
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"one".to_vec(),
+            payload: b"one".to_vec().into(),
         });
         wal.flush_all().unwrap();
         wal.append(WalRecord {
             txn_id: 2,
-            payload: b"two".to_vec(),
+            payload: b"two".to_vec().into(),
         });
         wal.flush_all().unwrap();
 
@@ -4263,7 +4268,7 @@ mod tests {
 
         let first = WalRecord {
             txn_id: 1,
-            payload: b"a large first record payload".to_vec(),
+            payload: b"a large first record payload".to_vec().into(),
         };
         wal.append(first.clone());
         wal.flush_all().unwrap();
@@ -4275,7 +4280,7 @@ mod tests {
 
         let second = WalRecord {
             txn_id: 2,
-            payload: b"b".to_vec(),
+            payload: b"b".to_vec().into(),
         };
         wal.append(second.clone());
         wal.flush_all().unwrap();
@@ -4300,7 +4305,7 @@ mod tests {
             for txn_id in 1..=2 {
                 wal.append(WalRecord {
                     txn_id,
-                    payload: format!("record {txn_id}").into_bytes(),
+                    payload: format!("record {txn_id}").into_bytes().into(),
                 });
                 wal.flush_all().unwrap();
             }
@@ -4323,7 +4328,7 @@ mod tests {
         assert_eq!(wal.flushed_count(), 2);
         wal.append(WalRecord {
             txn_id: 3,
-            payload: b"post-recovery".to_vec(),
+            payload: b"post-recovery".to_vec().into(),
         });
         wal.flush_all().unwrap();
         drop(wal);
@@ -4347,7 +4352,7 @@ mod tests {
             for txn_id in 1..=2 {
                 wal.append(WalRecord {
                     txn_id,
-                    payload: format!("record {txn_id}").into_bytes(),
+                    payload: format!("record {txn_id}").into_bytes().into(),
                 });
                 wal.flush_all().unwrap();
             }
@@ -4374,7 +4379,7 @@ mod tests {
             let mut wal = WalBuffer::with_durable_segment(&path);
             wal.append(WalRecord {
                 txn_id: 1,
-                payload: b"acknowledged".to_vec(),
+                payload: b"acknowledged".to_vec().into(),
             });
             wal.flush_all().unwrap();
         }
@@ -4396,7 +4401,7 @@ mod tests {
             let mut wal = WalBuffer::with_durable_segment(&path);
             wal.append(WalRecord {
                 txn_id: 1,
-                payload: b"kept".to_vec(),
+                payload: b"kept".to_vec().into(),
             });
             wal.flush_all().unwrap();
         }
@@ -4422,7 +4427,7 @@ mod tests {
         for txn_id in 1..=3 {
             wal.append(WalRecord {
                 txn_id,
-                payload: format!("record {txn_id}").into_bytes(),
+                payload: format!("record {txn_id}").into_bytes().into(),
             });
             wal.flush_all().unwrap();
         }
@@ -4439,7 +4444,7 @@ mod tests {
 
         wal.append(WalRecord {
             txn_id: 4,
-            payload: b"post-checkpoint".to_vec(),
+            payload: b"post-checkpoint".to_vec().into(),
         });
         wal.flush_all().unwrap();
         drop(wal);
@@ -4461,17 +4466,17 @@ mod tests {
         // Two records, then ONE flush => a single group of size 2.
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"a".to_vec(),
+            payload: b"a".to_vec().into(),
         });
         wal.append(WalRecord {
             txn_id: 2,
-            payload: b"b".to_vec(),
+            payload: b"b".to_vec().into(),
         });
         wal.flush_all().unwrap();
         // One more record, separate flush => a second group of size 1.
         wal.append(WalRecord {
             txn_id: 3,
-            payload: b"c".to_vec(),
+            payload: b"c".to_vec().into(),
         });
         wal.flush_all().unwrap();
         // A flush with nothing new must NOT count as a group (no fsync performed).
@@ -4491,7 +4496,7 @@ mod tests {
         let mut wal = WalBuffer::with_durable_segment(&path);
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"a".to_vec(),
+            payload: b"a".to_vec().into(),
         });
 
         wal.fail_next_flush();
@@ -4517,7 +4522,7 @@ mod tests {
         assert!(!wal.is_durable());
         wal.append(WalRecord {
             txn_id: 1,
-            payload: b"a".to_vec(),
+            payload: b"a".to_vec().into(),
         });
         wal.flush_all().unwrap();
         assert_eq!(wal.flushed_count(), 1);
@@ -4530,11 +4535,11 @@ mod tests {
         wal.reinstate_durable_records(vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"a".to_vec(),
+                payload: b"a".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"b".to_vec(),
+                payload: b"b".to_vec().into(),
             },
         ]);
         assert_eq!(wal.len(), 2);
@@ -4548,11 +4553,13 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')"
+                    .to_vec()
+                    .into(),
             },
         ];
 
@@ -4572,7 +4579,7 @@ mod tests {
         let path = test_wal_path("checksum");
         let records = vec![WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
 
         write_wal_segment(&path, &records).unwrap();
@@ -4632,11 +4639,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
         ];
         let control = WalControlFile {
@@ -4654,7 +4661,7 @@ mod tests {
 
         assert_eq!(recovered_control, control);
         assert_eq!(recovered_records.len(), 2);
-        assert_eq!(recovered_records[1].payload, b"SET b=2");
+        assert_eq!(&recovered_records[1].payload[..], &b"SET b=2"[..]);
     }
 
     #[test]
@@ -4668,7 +4675,7 @@ mod tests {
         let segment_path = dir.join("segment-0001.wal");
         let records = vec![WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
         let control = WalControlFile {
             segment_path: PathBuf::from("segment-0001.wal"),
@@ -4698,15 +4705,15 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
         ];
 
@@ -4724,7 +4731,7 @@ mod tests {
             }
         );
         assert_eq!(recovered_records.len(), 3);
-        assert_eq!(recovered_records[2].payload, b"SET c=3");
+        assert_eq!(&recovered_records[2].payload[..], &b"SET c=3"[..]);
     }
 
     #[test]
@@ -4743,15 +4750,15 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -4815,7 +4822,7 @@ mod tests {
         let restored_segment_dir = dir.join("restored").join("segments");
         let records = vec![WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
 
         write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
@@ -4862,11 +4869,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
         ];
 
@@ -4927,11 +4934,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -4983,15 +4990,15 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
         ];
 
@@ -5009,7 +5016,7 @@ mod tests {
             }
         );
         assert_eq!(recovered_records.len(), 2);
-        assert_eq!(recovered_records[1].payload, b"SET b=2");
+        assert_eq!(&recovered_records[1].payload[..], &b"SET b=2"[..]);
     }
 
     #[test]
@@ -5023,7 +5030,7 @@ mod tests {
         let segment_dir = dir.join("segments");
         let records = vec![WalRecord {
             txn_id: 10,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
 
         write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
@@ -5046,7 +5053,7 @@ mod tests {
         let segment_dir = dir.join("segments");
         let records = vec![WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
 
         write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
@@ -5068,11 +5075,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
         ];
 
@@ -5097,15 +5104,15 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -5139,7 +5146,7 @@ mod tests {
             }
         );
         assert_eq!(recovered_records.len(), 2);
-        assert_eq!(recovered_records[1].payload, b"SET b=2");
+        assert_eq!(&recovered_records[1].payload[..], &b"SET b=2"[..]);
     }
 
     #[test]
@@ -5153,7 +5160,7 @@ mod tests {
         let segment_dir = dir.join("segments");
         let records = vec![WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
 
         write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
@@ -5175,11 +5182,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 10,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 20,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -5221,11 +5228,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -5260,11 +5267,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -5280,11 +5287,11 @@ mod tests {
         let ingest_records = vec![
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
             WalRecord {
                 txn_id: 4,
-                payload: b"SET d=4".to_vec(),
+                payload: b"SET d=4".to_vec().into(),
             },
         ];
         let ingest_timestamps = vec![
@@ -5317,7 +5324,7 @@ mod tests {
         assert_eq!(manifest.checkpoint.last_durable_txn_id, Some(4));
         assert_eq!(manifest.record_timestamps.len(), 4);
         assert_eq!(read_records.len(), 4);
-        assert_eq!(read_records[3].payload, b"SET d=4");
+        assert_eq!(&read_records[3].payload[..], &b"SET d=4"[..]);
         assert_eq!(target.target_txn_id, 4);
         assert_eq!(target_records.len(), 4);
     }
@@ -5334,11 +5341,11 @@ mod tests {
         let ingest_segment = segment_dir.join("segment-0002.wal");
         let records = vec![WalRecord {
             txn_id: 2,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         }];
         let ingest_records = vec![WalRecord {
             txn_id: 2,
-            payload: b"SET duplicate=2".to_vec(),
+            payload: b"SET duplicate=2".to_vec().into(),
         }];
 
         write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
@@ -5352,7 +5359,7 @@ mod tests {
         assert!(err.to_string().contains("not after durable transaction 2"));
         assert_eq!(after_manifest, before_manifest);
         assert_eq!(read_records.len(), 1);
-        assert_eq!(read_records[0].payload, b"SET b=2");
+        assert_eq!(&read_records[0].payload[..], &b"SET b=2"[..]);
     }
 
     #[test]
@@ -5367,7 +5374,7 @@ mod tests {
         let ingest_segment = segment_dir.join("segment-0002.wal");
         let records = vec![WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
         let timestamps = vec![WalArchiveRecordTimestamp {
             txn_id: 1,
@@ -5375,7 +5382,7 @@ mod tests {
         }];
         let ingest_records = vec![WalRecord {
             txn_id: 2,
-            payload: b"SET b=2".to_vec(),
+            payload: b"SET b=2".to_vec().into(),
         }];
 
         write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
@@ -5407,15 +5414,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')"
+                    .to_vec()
+                    .into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')"
+                    .to_vec()
+                    .into(),
             },
         ];
         write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
@@ -5463,15 +5474,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')"
+                    .to_vec()
+                    .into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')"
+                    .to_vec()
+                    .into(),
             },
         ];
         let timestamps = vec![
@@ -5553,15 +5568,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')"
+                    .to_vec()
+                    .into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')"
+                    .to_vec()
+                    .into(),
             },
         ];
         write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
@@ -5650,15 +5669,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')"
+                    .to_vec()
+                    .into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')"
+                    .to_vec()
+                    .into(),
             },
         ];
         write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
@@ -5736,15 +5759,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')"
+                    .to_vec()
+                    .into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')"
+                    .to_vec()
+                    .into(),
             },
         ];
         write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
@@ -5836,11 +5863,13 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')"
+                    .to_vec()
+                    .into(),
             },
         ];
         write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
@@ -5903,23 +5932,23 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
             WalRecord {
                 txn_id: 4,
-                payload: b"SET d=4".to_vec(),
+                payload: b"SET d=4".to_vec().into(),
             },
             WalRecord {
                 txn_id: 5,
-                payload: b"SET e=5".to_vec(),
+                payload: b"SET e=5".to_vec().into(),
             },
         ];
 
@@ -5958,23 +5987,23 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
             WalRecord {
                 txn_id: 4,
-                payload: b"SET d=4".to_vec(),
+                payload: b"SET d=4".to_vec().into(),
             },
             WalRecord {
                 txn_id: 5,
-                payload: b"SET e=5".to_vec(),
+                payload: b"SET e=5".to_vec().into(),
             },
         ];
 
@@ -5992,7 +6021,7 @@ mod tests {
         assert_eq!(retained_manifest.checkpoint.durable_record_count, 3);
         assert_eq!(retained_manifest.checkpoint.last_durable_txn_id, Some(3));
         assert_eq!(retained_records.len(), 3);
-        assert_eq!(retained_records[2].payload, b"SET c=3");
+        assert_eq!(&retained_records[2].payload[..], &b"SET c=3"[..]);
         assert!(target_err
             .to_string()
             .contains("beyond last durable transaction"));
@@ -6011,19 +6040,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
             WalRecord {
                 txn_id: 4,
-                payload: b"SET d=4".to_vec(),
+                payload: b"SET d=4".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -6078,7 +6107,7 @@ mod tests {
             ]
         );
         assert_eq!(retained_records.len(), 3);
-        assert_eq!(retained_records[2].payload, b"SET c=3");
+        assert_eq!(&retained_records[2].payload[..], &b"SET c=3"[..]);
         assert!(target_err
             .to_string()
             .contains("beyond last durable timestamp"));
@@ -6097,11 +6126,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 10,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 20,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -6141,19 +6170,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
             WalRecord {
                 txn_id: 4,
-                payload: b"SET d=4".to_vec(),
+                payload: b"SET d=4".to_vec().into(),
             },
         ];
         let timestamps = vec![
@@ -6208,19 +6237,19 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 3,
-                payload: b"SET c=3".to_vec(),
+                payload: b"SET c=3".to_vec().into(),
             },
             WalRecord {
                 txn_id: 4,
-                payload: b"SET d=4".to_vec(),
+                payload: b"SET d=4".to_vec().into(),
             },
         ];
 
@@ -6258,11 +6287,11 @@ mod tests {
         let records = vec![
             WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             },
             WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             },
         ];
 
@@ -6285,7 +6314,7 @@ mod tests {
         let segment_dir = dir.join("segments");
         let records = vec![WalRecord {
             txn_id: 1,
-            payload: b"SET a=1".to_vec(),
+            payload: b"SET a=1".to_vec().into(),
         }];
 
         let manifest = write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
@@ -6313,7 +6342,7 @@ mod tests {
             &segment_path,
             &[WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             }],
         )
         .unwrap();
@@ -6352,7 +6381,7 @@ mod tests {
             &segment_a,
             &[WalRecord {
                 txn_id: 2,
-                payload: b"SET b=2".to_vec(),
+                payload: b"SET b=2".to_vec().into(),
             }],
         )
         .unwrap();
@@ -6360,7 +6389,7 @@ mod tests {
             &segment_b,
             &[WalRecord {
                 txn_id: 1,
-                payload: b"SET a=1".to_vec(),
+                payload: b"SET a=1".to_vec().into(),
             }],
         )
         .unwrap();

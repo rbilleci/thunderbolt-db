@@ -37,7 +37,7 @@ fn replication_watermarks_track_commit_apply_visibility_and_durability() {
     assert!(before.quiescent_for_failover);
     assert!(!before.follower_promotion_ready);
 
-    let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    let token = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     let after = e.replication_watermarks();
 
     assert_eq!(after.role, Role::Leader);
@@ -79,7 +79,9 @@ fn replication_watermarks_do_not_advance_on_rejected_follower_commit() {
     let mut e = Engine::new_local();
     e.become_follower(2);
 
-    let err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+    let err = e
+        .commit_mutation(1, b"SET a=1".to_vec().into())
+        .unwrap_err();
     assert!(matches!(err, EngineError::NotLeader));
 
     let marks = e.replication_watermarks();
@@ -118,8 +120,8 @@ fn replication_watermarks_do_not_advance_on_rejected_follower_commit() {
 fn replication_watermarks_include_buffered_wal_records() {
     let e = Engine::new_local();
 
-    e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
-    e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
+    e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
+    e.commit_mutation(2, b"SET b=2".to_vec().into()).unwrap();
 
     let marks = e.replication_watermarks();
     assert_eq!(marks.wal_buffered_count, 2);

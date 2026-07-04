@@ -671,12 +671,7 @@ impl ResidencyReadState {
     /// a generation observed flagged here can only be replaced by a LATER lock-holder (e.g. a
     /// re-admission installing fresh descriptors), which would equally have overwritten a
     /// redundant re-flag.
-    pub(crate) fn flag_table_descriptors_invalidated(
-        &self,
-        table: &str,
-        txn_id: u64,
-        index: u64,
-    ) {
+    pub(crate) fn flag_table_descriptors_invalidated(&self, table: &str, txn_id: u64, index: u64) {
         let _publish = self
             .descriptor_publish_lock
             .lock()

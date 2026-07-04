@@ -281,7 +281,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!(
                     "    [host-phase us/item: validate {:.2} conflict {:.2} reresolve {:.2} \
                      sequence {:.2} ledger {:.2} apply {:.2} invalidate {:.2}]",
-                    per(hp[0]), per(hp[1]), per(hp[2]), per(hp[3]), per(hp[4]), per(hp[5]), per(hp[6]),
+                    per(hp[0]),
+                    per(hp[1]),
+                    per(hp[2]),
+                    per(hp[3]),
+                    per(hp[4]),
+                    per(hp[5]),
+                    per(hp[6]),
                 );
             }
             // Elision/validator engagement (constrained-elision A/B): steady state = elisions

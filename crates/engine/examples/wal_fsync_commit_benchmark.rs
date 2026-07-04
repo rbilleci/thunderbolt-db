@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for _ in 0..group {
             wal.append(WalRecord {
                 txn_id: next,
-                payload: b"INSERT INTO t (id) VALUES (0)".to_vec(),
+                payload: b"INSERT INTO t (id) VALUES (0)".to_vec().into(),
             });
             next += 1;
         }

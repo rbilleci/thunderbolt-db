@@ -86,7 +86,7 @@ impl Engine {
         let (_token, residency_invalidation_micros) = self
             .commit_mutation_at_with_current_apply(
                 txn_id,
-                sql.into_bytes(),
+                sql.into_bytes().into(),
                 timestamp_micros,
                 |engine, cat, commit_seq| {
                     let apply_started = Instant::now();

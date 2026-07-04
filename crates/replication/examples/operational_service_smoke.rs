@@ -58,19 +58,19 @@ fn run_parent(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut leader = RaftReplicator::new(3);
     leader.become_leader(1);
 
-    let first = leader.propose(b"create table t(id int)".to_vec())?;
-    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let first = leader.propose(b"create table t(id int)".to_vec().into())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec().into())?;
     let term = leader.current_term();
     let first_batch = vec![
         LogEntry {
             term,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
     ];
 
@@ -119,7 +119,7 @@ fn run_parent(args: &[String]) -> Result<(), Box<dyn Error>> {
         heartbeat_batches_sent += 1;
     }
 
-    let third = leader.propose(b"insert into t values (2)".to_vec())?;
+    let third = leader.propose(b"insert into t values (2)".to_vec().into())?;
     for follower in &followers {
         send_checked(
             follower,
@@ -130,7 +130,7 @@ fn run_parent(args: &[String]) -> Result<(), Box<dyn Error>> {
                 entries: vec![LogEntry {
                     term,
                     index: third.index,
-                    payload: b"insert into t values (2)".to_vec(),
+                    payload: b"insert into t values (2)".to_vec().into(),
                 }],
                 leader_commit: leader.commit_index(),
             },
@@ -204,19 +204,19 @@ fn run_supervised_restart_parent() -> Result<(), Box<dyn Error>> {
     let mut leader = RaftReplicator::new(3);
     leader.become_leader(1);
 
-    let first = leader.propose(b"create table t(id int)".to_vec())?;
-    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let first = leader.propose(b"create table t(id int)".to_vec().into())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec().into())?;
     let term = leader.current_term();
     let first_batch = vec![
         LogEntry {
             term,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
     ];
 
@@ -265,7 +265,7 @@ fn run_supervised_restart_parent() -> Result<(), Box<dyn Error>> {
         return Err("restarting follower did not report pre-restart catch-up".into());
     }
 
-    let third = leader.propose(b"insert into t values (2)".to_vec())?;
+    let third = leader.propose(b"insert into t values (2)".to_vec().into())?;
     send_checked(
         &stable_follower,
         AppendEntriesRequest {
@@ -275,7 +275,7 @@ fn run_supervised_restart_parent() -> Result<(), Box<dyn Error>> {
             entries: vec![LogEntry {
                 term,
                 index: third.index,
-                payload: b"insert into t values (2)".to_vec(),
+                payload: b"insert into t values (2)".to_vec().into(),
             }],
             leader_commit: leader.commit_index(),
         },
@@ -289,17 +289,17 @@ fn run_supervised_restart_parent() -> Result<(), Box<dyn Error>> {
         LogEntry {
             term,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
         LogEntry {
             term,
             index: third.index,
-            payload: b"insert into t values (2)".to_vec(),
+            payload: b"insert into t values (2)".to_vec().into(),
         },
     ];
     send_checked(
@@ -394,19 +394,19 @@ fn run_container_supervised_restart_parent(args: &[String]) -> Result<(), Box<dy
     let mut leader = RaftReplicator::new(3);
     leader.become_leader(1);
 
-    let first = leader.propose(b"create table t(id int)".to_vec())?;
-    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let first = leader.propose(b"create table t(id int)".to_vec().into())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec().into())?;
     let term = leader.current_term();
     let first_batch = vec![
         LogEntry {
             term,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
     ];
     let mut append_batches_sent = 0usize;
@@ -455,7 +455,7 @@ fn run_container_supervised_restart_parent(args: &[String]) -> Result<(), Box<dy
     }
     restarting_follower.addr = docker_published_addr(restart_container)?;
 
-    let third = leader.propose(b"insert into t values (2)".to_vec())?;
+    let third = leader.propose(b"insert into t values (2)".to_vec().into())?;
     send_checked(
         &stable_follower,
         AppendEntriesRequest {
@@ -465,7 +465,7 @@ fn run_container_supervised_restart_parent(args: &[String]) -> Result<(), Box<dy
             entries: vec![LogEntry {
                 term,
                 index: third.index,
-                payload: b"insert into t values (2)".to_vec(),
+                payload: b"insert into t values (2)".to_vec().into(),
             }],
             leader_commit: leader.commit_index(),
         },
@@ -478,17 +478,17 @@ fn run_container_supervised_restart_parent(args: &[String]) -> Result<(), Box<dy
         LogEntry {
             term,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
         LogEntry {
             term,
             index: third.index,
-            payload: b"insert into t values (2)".to_vec(),
+            payload: b"insert into t values (2)".to_vec().into(),
         },
     ];
     send_checked_with_retry(
@@ -577,19 +577,19 @@ fn run_compose_supervised_restart_parent(args: &[String]) -> Result<(), Box<dyn 
     let mut leader = RaftReplicator::new(3);
     leader.become_leader(1);
 
-    let first = leader.propose(b"create table t(id int)".to_vec())?;
-    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let first = leader.propose(b"create table t(id int)".to_vec().into())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec().into())?;
     let term = leader.current_term();
     let first_batch = vec![
         LogEntry {
             term,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
     ];
     let mut append_batches_sent = 0usize;
@@ -646,7 +646,7 @@ fn run_compose_supervised_restart_parent(args: &[String]) -> Result<(), Box<dyn 
     restarting_follower.addr =
         compose_published_addr(compose_file, compose_project, restart_service)?;
 
-    let third = leader.propose(b"insert into t values (2)".to_vec())?;
+    let third = leader.propose(b"insert into t values (2)".to_vec().into())?;
     send_checked(
         &stable_follower,
         AppendEntriesRequest {
@@ -656,7 +656,7 @@ fn run_compose_supervised_restart_parent(args: &[String]) -> Result<(), Box<dyn 
             entries: vec![LogEntry {
                 term,
                 index: third.index,
-                payload: b"insert into t values (2)".to_vec(),
+                payload: b"insert into t values (2)".to_vec().into(),
             }],
             leader_commit: leader.commit_index(),
         },
@@ -669,17 +669,17 @@ fn run_compose_supervised_restart_parent(args: &[String]) -> Result<(), Box<dyn 
         LogEntry {
             term,
             index: first.index,
-            payload: b"create table t(id int)".to_vec(),
+            payload: b"create table t(id int)".to_vec().into(),
         },
         LogEntry {
             term,
             index: second.index,
-            payload: b"insert into t values (1)".to_vec(),
+            payload: b"insert into t values (1)".to_vec().into(),
         },
         LogEntry {
             term,
             index: third.index,
-            payload: b"insert into t values (2)".to_vec(),
+            payload: b"insert into t values (2)".to_vec().into(),
         },
     ];
     send_checked_with_retry(

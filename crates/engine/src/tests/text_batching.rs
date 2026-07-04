@@ -30,7 +30,7 @@ fn planner_config_can_override_default_gpu_target() {
 #[test]
 fn wal_before_visibility_holds() {
     let e = Engine::new_local();
-    let t = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    let t = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     assert!(e.wal_flushed_count() >= 1);
     assert!(e.visible_up_to() >= t.index);
     assert!(e.applied_len() >= 1);
@@ -39,8 +39,8 @@ fn wal_before_visibility_holds() {
 #[test]
 fn commit_indices_monotonic() {
     let e = Engine::new_local();
-    let a = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
-    let b = e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
+    let a = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
+    let b = e.commit_mutation(2, b"SET b=2".to_vec().into()).unwrap();
     assert!(b.index > a.index);
     assert!(e.visible_up_to() >= b.index);
 }
@@ -457,7 +457,7 @@ fn flush_aliases_drain_pending_batch() {
 fn wal_flush_failure_prevents_visibility_advance() {
     let mut e = Engine::new_local();
     e.simulate_next_wal_flush_failure();
-    let res = e.commit_mutation(1, b"SET a=1".to_vec());
+    let res = e.commit_mutation(1, b"SET a=1".to_vec().into());
     assert!(matches!(res, Err(EngineError::Durability(_))));
     assert_eq!(e.visible_up_to(), 0);
 }
@@ -466,9 +466,9 @@ fn wal_flush_failure_prevents_visibility_advance() {
 fn wal_flush_failure_does_not_leak_into_later_successful_commit() {
     let mut e = Engine::new_local();
     e.simulate_next_wal_flush_failure();
-    let _ = e.commit_mutation(1, b"SET a=1".to_vec());
+    let _ = e.commit_mutation(1, b"SET a=1".to_vec().into());
 
-    e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
+    e.commit_mutation(2, b"SET b=2".to_vec().into()).unwrap();
 
     assert_eq!(e.get("a"), None);
     assert_eq!(e.get("b").as_deref(), Some("2"));
@@ -480,7 +480,9 @@ fn wal_flush_failure_discards_unflushed_record_from_buffer() {
     let mut e = Engine::new_local();
     e.simulate_next_wal_flush_failure();
 
-    let err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+    let err = e
+        .commit_mutation(1, b"SET a=1".to_vec().into())
+        .unwrap_err();
 
     assert!(matches!(err, EngineError::Durability(_)));
     assert_eq!(e.wal_flushed_count(), 0);
@@ -492,14 +494,14 @@ fn wal_flush_failure_discards_unflushed_record_from_buffer() {
 fn durable_wal_records_exclude_failed_commit_attempts() {
     let mut e = Engine::new_local();
 
-    e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
     e.simulate_next_wal_flush_failure();
-    let _ = e.commit_mutation(2, b"SET b=2".to_vec());
+    let _ = e.commit_mutation(2, b"SET b=2".to_vec().into());
 
     let durable = e.durable_wal_records();
     assert_eq!(durable.len(), 1);
     assert_eq!(durable[0].txn_id, 1);
-    assert_eq!(durable[0].payload, b"SET a=1".to_vec());
+    assert_eq!(&durable[0].payload[..], &b"SET a=1"[..]);
 }
 
 #[test]
@@ -507,7 +509,9 @@ fn follower_rejects_commit_without_visibility_or_wal_flush() {
     let mut e = Engine::new_local();
     e.become_follower(2);
 
-    let err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+    let err = e
+        .commit_mutation(1, b"SET a=1".to_vec().into())
+        .unwrap_err();
 
     assert!(matches!(err, EngineError::NotLeader));
     assert_eq!(e.visible_up_to(), 0);
@@ -648,7 +652,9 @@ fn candidate_rejects_commit_and_batched_enqueue() {
     let mut e = Engine::with_batching(2, Duration::from_secs(999));
     e.become_candidate(2);
 
-    let commit_err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+    let commit_err = e
+        .commit_mutation(1, b"SET a=1".to_vec().into())
+        .unwrap_err();
     assert!(matches!(commit_err, EngineError::NotLeader));
 
     let enqueue_err = e

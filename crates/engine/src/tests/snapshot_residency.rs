@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn snapshot_export_tracks_last_applied_index() {
     let mut e = Engine::new_local();
-    let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+    let token = e.commit_mutation(1, b"SET a=1".to_vec().into()).unwrap();
 
     let exported = e.export_snapshot_meta();
     let current = e.snapshot_meta();
@@ -35,7 +35,7 @@ fn install_snapshot_advances_visible_and_replication_watermarks() {
     assert_eq!(marks.apply_visible_gap, 0);
     assert_eq!(marks.snapshot_id, 11);
 
-    let next = e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
+    let next = e.commit_mutation(2, b"SET b=2".to_vec().into()).unwrap();
     assert_eq!(next.index, 8);
     assert_eq!(e.get("b").as_deref(), Some("2"));
 }
@@ -215,7 +215,7 @@ fn residency_invalidation_scope_narrows_dml_and_falls_back_on_unknown() {
         LogEntry {
             term: 1,
             index,
-            payload: sql.as_bytes().to_vec(),
+            payload: sql.as_bytes().to_vec().into(),
         }
     }
 

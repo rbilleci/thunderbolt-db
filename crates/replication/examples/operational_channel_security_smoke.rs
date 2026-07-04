@@ -79,7 +79,7 @@ fn run_mtls_append_probe(
             entries: vec![LogEntry {
                 term: 1,
                 index: 1,
-                payload: b"secure append".to_vec(),
+                payload: b"secure append".to_vec().into(),
             }],
             leader_commit: 0,
         },

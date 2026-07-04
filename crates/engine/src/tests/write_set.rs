@@ -242,7 +242,7 @@ fn prepare_insert_failing_preflight_advances_nothing() {
         &parse_insert("INSERT INTO p (code) VALUES (100)"),
         next_commit_snapshot(&e),
         None,
-            InsertPrepareValidation::Full,
+        InsertPrepareValidation::Full,
     );
     assert!(err.is_err(), "duplicate unique value must fail preflight");
     assert_eq!(

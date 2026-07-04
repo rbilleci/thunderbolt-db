@@ -3880,8 +3880,8 @@ mod capacity_payload_tests {
             let churn_ladder = [
                 "UPDATE t SET v = 999 WHERE id = 130", // SV5 append dups the open shard's id col
                 "INSERT INTO t (id, v) VALUES (130, 1)", // post-churn dup probe -> 23505 (rehydrates)
-                "UPDATE t SET id = 42 WHERE id = 131", // dup-by-UPDATE -> 23505
-                "UPDATE t SET id = 131 WHERE id = 131", // self-key UPDATE: excluded -> ok
+                "UPDATE t SET id = 42 WHERE id = 131",   // dup-by-UPDATE -> 23505
+                "UPDATE t SET id = 131 WHERE id = 131",  // self-key UPDATE: excluded -> ok
                 "DELETE FROM t WHERE id = 42",
                 "INSERT INTO t (id, v) VALUES (42, 77)", // deleted key is reusable -> ok
             ];
@@ -3985,9 +3985,7 @@ mod capacity_payload_tests {
             std::thread::spawn(move || {
                 for round in 0..40_u64 {
                     let t1 = txn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Err(err) =
-                        e.execute_text(t1, "CREATE UNIQUE INDEX t_id_uq ON t (id)")
-                    {
+                    if let Err(err) = e.execute_text(t1, "CREATE UNIQUE INDEX t_id_uq ON t (id)") {
                         let _ = done_tx.send(Err(format!("round {round} create: {err}")));
                         return;
                     }
@@ -4074,7 +4072,8 @@ mod capacity_payload_tests {
             e.table_install_elided("t"),
             "premise: the PK'd table is elided before the churn"
         );
-        e.execute_text(300, "UPDATE t SET v = 999 WHERE id = 130").unwrap();
+        e.execute_text(300, "UPDATE t SET v = 999 WHERE id = 130")
+            .unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let txn = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(20_000));
         let writers: Vec<_> = (0..6_u64)
@@ -4232,11 +4231,18 @@ mod capacity_payload_tests {
         for t in 0..30_u64 {
             on.execute_dml_concurrent(
                 650 + t,
-                &format!("INSERT INTO dp (d, v) VALUES ('2028-{:02}-{:02}', 1)", 1 + t / 28, 1 + t % 28),
+                &format!(
+                    "INSERT INTO dp (d, v) VALUES ('2028-{:02}-{:02}', 1)",
+                    1 + t / 28,
+                    1 + t % 28
+                ),
             )
             .unwrap();
         }
-        assert!(on.table_install_elided("dp"), "the DATE-PK table must elide");
+        assert!(
+            on.table_install_elided("dp"),
+            "the DATE-PK table must elide"
+        );
         // Elided-era dup DATE -> 23505 through the DEVICE Date-needle probe.
         let dup = on.execute_text(700, "INSERT INTO dp (d, v) VALUES ('2028-01-01', 9)");
         assert!(
@@ -4300,8 +4306,11 @@ mod capacity_payload_tests {
                     }
                 })
                 .collect();
-            e.execute_text(2, &format!("INSERT INTO t8 (id, v, t) VALUES {}", values.join(",")))
-                .unwrap();
+            e.execute_text(
+                2,
+                &format!("INSERT INTO t8 (id, v, t) VALUES {}", values.join(",")),
+            )
+            .unwrap();
             let sharded = e
                 .read_state
                 .residency
@@ -4326,7 +4335,10 @@ mod capacity_payload_tests {
         };
         let (sharded_on, on) = run(true);
         let (sharded_off, off) = run(false);
-        assert!(sharded_on, "non-vacuity: the flag must shard-admit the int8 table");
+        assert!(
+            sharded_on,
+            "non-vacuity: the flag must shard-admit the int8 table"
+        );
         assert!(!sharded_off, "flag OFF keeps the int8 table single-buffer");
         let mut ok_count = 0;
         for (i, (a, b)) in on.iter().zip(off.iter()).enumerate() {
@@ -4373,8 +4385,11 @@ mod capacity_payload_tests {
                     )
                 })
                 .collect();
-            e.execute_text(2, &format!("INSERT INTO t8 (id, v, ts) VALUES {}", seed.join(",")))
-                .unwrap();
+            e.execute_text(
+                2,
+                &format!("INSERT INTO t8 (id, v, ts) VALUES {}", seed.join(",")),
+            )
+            .unwrap();
             let hits_before = e.open_shard_append_hits();
             for t in 0..200_u64 {
                 e.execute_dml_concurrent(
@@ -4446,8 +4461,11 @@ mod capacity_payload_tests {
             e.set_shard_size_target(64);
             e.set_shard_int8_section_enabled(true);
             e.set_host_install_elision_enabled(elide);
-            e.execute_text(1, "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, ts TIMESTAMP)")
-                .unwrap();
+            e.execute_text(
+                1,
+                "CREATE TABLE t8 (id INT PRIMARY KEY, v BIGINT, ts TIMESTAMP)",
+            )
+            .unwrap();
             let mut seq = 2u64;
             for chunk in 0..2_i64 {
                 let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
@@ -4498,7 +4516,10 @@ mod capacity_payload_tests {
         };
         let (on, on_out, on_rows) = run(true);
         let (off, off_out, off_rows) = run(false);
-        assert_eq!(on_out, off_out, "i64-payload outcome ladder: elided == twin");
+        assert_eq!(
+            on_out, off_out,
+            "i64-payload outcome ladder: elided == twin"
+        );
         assert_eq!(on_rows, off_rows, "i64-payload reads: elided == twin");
         assert!(
             on.host_install_elisions() > 0,
@@ -4517,7 +4538,10 @@ mod capacity_payload_tests {
         for i in 0..30_u64 {
             on.execute_dml_concurrent(
                 710 + i,
-                &format!("INSERT INTO u8 (v, x) VALUES ({}, {i})", 8_100_000_000_i64 + i as i64),
+                &format!(
+                    "INSERT INTO u8 (v, x) VALUES ({}, {i})",
+                    8_100_000_000_i64 + i as i64
+                ),
             )
             .unwrap();
         }
@@ -4563,12 +4587,12 @@ mod capacity_payload_tests {
             }
             let ladder = [
                 "INSERT INTO t (id, v) VALUES (500, 5000)",
-                "INSERT INTO t (id, v) VALUES (42, 1)",   // dup PK -> 23505 (A3 via locate)
-                "UPDATE t SET v = 999 WHERE id = 130",    // A2 resolve + SV5 append (2-shard key)
-                "UPDATE t SET v = 7 WHERE id = 130",      // now id=130 is in 2 shards -> multi-hit
-                "DELETE FROM t WHERE id = 42",            // A2 resolve
-                "INSERT INTO t (id, v) VALUES (42, 77)",  // reuse the deleted key -> ok
-                "UPDATE t SET v = -1 WHERE id = 500",     // elided-era row
+                "INSERT INTO t (id, v) VALUES (42, 1)", // dup PK -> 23505 (A3 via locate)
+                "UPDATE t SET v = 999 WHERE id = 130",  // A2 resolve + SV5 append (2-shard key)
+                "UPDATE t SET v = 7 WHERE id = 130",    // now id=130 is in 2 shards -> multi-hit
+                "DELETE FROM t WHERE id = 42",          // A2 resolve
+                "INSERT INTO t (id, v) VALUES (42, 77)", // reuse the deleted key -> ok
+                "UPDATE t SET v = -1 WHERE id = 500",   // elided-era row
             ];
             let mut outcomes: Vec<Result<(), String>> = Vec::new();
             for sql in &ladder {
@@ -4589,8 +4613,14 @@ mod capacity_payload_tests {
         };
         let (on, on_out, on_rows) = run(true);
         let (off, off_out, off_rows) = run(false);
-        assert_eq!(on_out, off_out, "device locate outcome ladder == host-probe oracle");
-        assert_eq!(on_rows, off_rows, "device locate reads == host-probe oracle");
+        assert_eq!(
+            on_out, off_out,
+            "device locate outcome ladder == host-probe oracle"
+        );
+        assert_eq!(
+            on_rows, off_rows,
+            "device locate reads == host-probe oracle"
+        );
         assert!(
             on.device_write_locate_hits() > 0,
             "non-vacuity: the DEVICE write-locate kernel must have FIRED (got {})",
@@ -4626,23 +4656,28 @@ mod capacity_payload_tests {
                 let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
                     .map(|k| format!("({k},{})", k * 10))
                     .collect();
-                e.execute_text(seq, &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))
-                    .unwrap();
+                e.execute_text(
+                    seq,
+                    &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+                )
+                .unwrap();
                 seq += 1;
             }
             // A DDL mid-stream forces the catalog-drift full-validate path for a later insert.
             let ladder = [
-                "INSERT INTO t (id, v) VALUES (500, 5000)",   // new key -> pass (batched)
-                "INSERT INTO t (id, v) VALUES (42, 1)",       // dup seeded key -> 23505
-                "INSERT INTO t (id, v) VALUES (500, 9)",      // dup elided-era key -> 23505
-                "UPDATE t SET v = 7 WHERE id = 130",          // A2 resolve (not a wave-batch insert)
+                "INSERT INTO t (id, v) VALUES (500, 5000)", // new key -> pass (batched)
+                "INSERT INTO t (id, v) VALUES (42, 1)",     // dup seeded key -> 23505
+                "INSERT INTO t (id, v) VALUES (500, 9)",    // dup elided-era key -> 23505
+                "UPDATE t SET v = 7 WHERE id = 130",        // A2 resolve (not a wave-batch insert)
                 "DELETE FROM t WHERE id = 43",
-                "INSERT INTO t (id, v) VALUES (43, 2)",       // reuse deleted key -> pass
+                "INSERT INTO t (id, v) VALUES (43, 2)", // reuse deleted key -> pass
             ];
             let mut outcomes: Vec<Result<(), String>> = Vec::new();
             for sql in &ladder {
                 outcomes.push(
-                    e.execute_text(seq, sql).map(|_| ()).map_err(|err| err.to_string()),
+                    e.execute_text(seq, sql)
+                        .map(|_| ())
+                        .map_err(|err| err.to_string()),
                 );
                 seq += 1;
             }
@@ -4684,18 +4719,25 @@ mod capacity_payload_tests {
             let values: Vec<String> = (chunk * 100..(chunk + 1) * 100)
                 .map(|k| format!("({k},{})", k * 10))
                 .collect();
-            e.execute_text(seq, &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))
-                .unwrap();
+            e.execute_text(
+                seq,
+                &format!("INSERT INTO t (id, v) VALUES {}", values.join(",")),
+            )
+            .unwrap();
             seq += 1;
         }
         // Enter elision.
         for t in 0..20_u64 {
-            e.execute_dml_concurrent(100 + t, &format!("INSERT INTO t (id, v) VALUES ({}, 1)", 5_000 + t))
-                .unwrap();
+            e.execute_dml_concurrent(
+                100 + t,
+                &format!("INSERT INTO t (id, v) VALUES ({}, 1)", 5_000 + t),
+            )
+            .unwrap();
         }
         assert!(e.table_install_elided("t"), "premise: elided");
-        let wins: Vec<std::sync::atomic::AtomicU32> =
-            (0..200).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        let wins: Vec<std::sync::atomic::AtomicU32> = (0..200)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect();
         let txn = std::sync::atomic::AtomicU64::new(10_000);
         std::thread::scope(|scope| {
             for w in 0..8_u64 {
@@ -4735,8 +4777,15 @@ mod capacity_payload_tests {
                 "key {k}: exactly one winner"
             );
         }
-        let rows = e.execute_relational_select_text("SELECT id FROM t").unwrap().rows;
-        assert_eq!(rows.len(), 200 + 20 + 200, "seed + waved + one win per contended key");
+        let rows = e
+            .execute_relational_select_text("SELECT id FROM t")
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows.len(),
+            200 + 20 + 200,
+            "seed + waved + one win per contended key"
+        );
     }
 
     /// Ledger #18 — the DETERMINISTIC same-snapshot dup race: two writers INSERT the SAME PK
@@ -4812,7 +4861,11 @@ mod capacity_payload_tests {
             .execute_relational_select_text("SELECT id, v FROM t")
             .unwrap()
             .rows;
-        assert_eq!(rows.len(), 200 + 20 + 20, "seed + waved + one win per round");
+        assert_eq!(
+            rows.len(),
+            200 + 20 + 20,
+            "seed + waved + one win per round"
+        );
     }
 
     /// TYPE-COVERAGE track 1 — the CONCURRENT dup race on an ELIDED PK'd table: 8 writers all
@@ -4844,8 +4897,9 @@ mod capacity_payload_tests {
             .unwrap();
             seq += 1;
         }
-        let successes: Vec<std::sync::atomic::AtomicU32> =
-            (0..200).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        let successes: Vec<std::sync::atomic::AtomicU32> = (0..200)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect();
         let txn = std::sync::atomic::AtomicU64::new(1_000);
         std::thread::scope(|s| {
             for w in 0..8_u64 {
@@ -4904,7 +4958,11 @@ mod capacity_payload_tests {
             .execute_relational_select_text("SELECT id, v FROM t")
             .unwrap()
             .rows;
-        assert_eq!(rows.len(), 400, "200 seeded + 200 contended keys, each once");
+        assert_eq!(
+            rows.len(),
+            400,
+            "200 seeded + 200 contended keys, each once"
+        );
     }
 
     /// Wave-BATCHED appends (audit N-1): REAL multi-item waves — 8 writer threads pump
@@ -7516,43 +7574,38 @@ impl Engine {
             || (self.constrained_elision_enabled()
                 && self.dml_value_index_resolve_enabled()
                 && self.dml_device_validate_enabled());
-        table
-            .columns
-            .iter()
-            .all(|column| {
-                // TYPE-COVERAGE track 2 (stages 1 + iii): every FIXED-WIDTH-section type is
-                // device-authoritative-capable (A4a/A4c type from the catalog; appends ride the
-                // section-aware encoder). The gather requires the shard layout the flag admits,
-                // so i64 columns only ever appear here when `shard_int8_section_enabled` built
-                // them — eligibility composes with admission by construction.
-                matches!(
-                    column.ty,
-                    gpu_db_sql::SqlType::Int4
-                        | gpu_db_sql::SqlType::Date
-                        | gpu_db_sql::SqlType::Int2
-                        | gpu_db_sql::SqlType::Int8
-                        | gpu_db_sql::SqlType::Timestamp
-                )
-            })
-            && table.indexes.iter().all(|index| {
-                // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
-                // i64 column could not be validated device-side, so such a table must not
-                // elide (its probes would decline -> rehydrate thrash at best).
-                !index.unique
-                    || table
-                        .columns
-                        .iter()
-                        .find(|column| column.name == index.column)
-                        .is_some_and(|column| {
-                            matches!(
-                                column.ty,
-                                gpu_db_sql::SqlType::Int4
-                                    | gpu_db_sql::SqlType::Date
-                                    | gpu_db_sql::SqlType::Int2
-                            )
-                        })
-            })
-            && unique_ok
+        table.columns.iter().all(|column| {
+            // TYPE-COVERAGE track 2 (stages 1 + iii): every FIXED-WIDTH-section type is
+            // device-authoritative-capable (A4a/A4c type from the catalog; appends ride the
+            // section-aware encoder). The gather requires the shard layout the flag admits,
+            // so i64 columns only ever appear here when `shard_int8_section_enabled` built
+            // them — eligibility composes with admission by construction.
+            matches!(
+                column.ty,
+                gpu_db_sql::SqlType::Int4
+                    | gpu_db_sql::SqlType::Date
+                    | gpu_db_sql::SqlType::Int2
+                    | gpu_db_sql::SqlType::Int8
+                    | gpu_db_sql::SqlType::Timestamp
+            )
+        }) && table.indexes.iter().all(|index| {
+            // The A2/A3 device locate probes i32-SECTION keys only: a unique index on an
+            // i64 column could not be validated device-side, so such a table must not
+            // elide (its probes would decline -> rehydrate thrash at best).
+            !index.unique
+                || table
+                    .columns
+                    .iter()
+                    .find(|column| column.name == index.column)
+                    .is_some_and(|column| {
+                        matches!(
+                            column.ty,
+                            gpu_db_sql::SqlType::Int4
+                                | gpu_db_sql::SqlType::Date
+                                | gpu_db_sql::SqlType::Int2
+                        )
+                    })
+        }) && unique_ok
             && table.check_constraints.is_empty()
             && table.foreign_keys.is_empty()
             && !catalog.relational_catalog.values().any(|other| {
@@ -7936,9 +7989,8 @@ impl Engine {
             // `deleted_by` needs no write on append — the headroom was pre-filled with the live sentinel at
             // admission, so appended rows are born live. SV6: an UPDATE-appended NEW VERSION additionally
             // stamps `created_by = commit_seq` (below); a plain INSERT append stays unstamped (born-visible).
-            let append_started =
-                crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
-                    .then(std::time::Instant::now);
+            let append_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
+                .then(std::time::Instant::now);
             let append_result = shard_device_memory.append_owned_chunks(chunks);
             if let Some(started) = append_started {
                 crate::engine_dml_concurrent::WAVE_DEVICE_STATS[1].fetch_add(
@@ -7970,8 +8022,8 @@ impl Engine {
                     return false;
                 }
             }
-            let appended_bytes = (k
-                * (num_i32_cols * std::mem::size_of::<i32>()
+            let appended_bytes =
+                (k * (num_i32_cols * std::mem::size_of::<i32>()
                     + num_i64_cols * std::mem::size_of::<i64>())) as u64;
             // S-d3: extend the open shard's zone map (min/max per int4 column) to cover the appended
             // rows. The stats vector is INT4-ORDINAL-aligned, so iterate only the i32-section catalog
@@ -8002,7 +8054,12 @@ impl Engine {
             // entry can exist to extend). NULL-free by the guard above, so `sql_value_as_int4`
             // yields exactly the bytes the chunks wrote for the i32 columns.
             let column_values: Vec<Vec<i32>> = (0..column_count)
-                .map(|c| new_rows.iter().map(|row| sql_value_as_int4(&row[c])).collect())
+                .map(|c| {
+                    new_rows
+                        .iter()
+                        .map(|row| sql_value_as_int4(&row[c]))
+                        .collect()
+                })
                 .collect();
             self.extend_shard_pk_index_cache_on_append(
                 table,
@@ -8015,9 +8072,8 @@ impl Engine {
             // kernel), so the wave-batched device locate never triggers the O(rows) rebuild.
             // Only fires when a device index is cached (device_write_locate on); no-op otherwise.
             if self.device_write_locate_enabled() {
-                let idx_started =
-                    crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
-                        .then(std::time::Instant::now);
+                let idx_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
+                    .then(std::time::Instant::now);
                 self.extend_shard_pk_device_index_on_append(
                     table,
                     shard_id,
@@ -8126,9 +8182,10 @@ impl Engine {
             resident_device_int4_column_stats: int4_stats,
             // Audit NOTE adopted: count i64 columns at 8 bytes (was a telemetry undercount
             // vs the admit path; allocated_bytes was always correct).
-            resident_bytes: (8
-                + k * (num_i32_cols * std::mem::size_of::<i32>()
-                    + num_i64_cols * std::mem::size_of::<i64>())) as u64,
+            resident_bytes: (8 + k
+                * (num_i32_cols * std::mem::size_of::<i32>()
+                    + num_i64_cols * std::mem::size_of::<i64>()))
+                as u64,
             allocated_bytes: device_payload.len() as u64,
             count_header_byte_offset: 0,
             resident_device_int4_columns: shard_int4_names.clone(),
@@ -9342,7 +9399,9 @@ impl Engine {
                         )
                         .ok()?;
                         columns.push(GatheredColumn::I64(
-                            device_memory.read_resident_i32_column(base, rows * 2).ok()?,
+                            device_memory
+                                .read_resident_i32_column(base, rows * 2)
+                                .ok()?,
                         ));
                     }
                     _ => {

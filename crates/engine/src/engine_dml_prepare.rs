@@ -222,16 +222,17 @@ impl Engine {
             // semantics and errors are unchanged (`prepare_update` already shares its scan the
             // same way). Kept as the flag-off / self-referencing-FK oracle arm.
             let mut candidate_rows: Option<Vec<Vec<SqlValue>>> = None;
-            let materialize_candidates = |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
-                let mut rows = engine.visible_relational_rows(
-                    &table,
-                    StorageVisibility {
-                        read_txn_id: txn_id,
-                    },
-                )?;
-                rows.extend(new_rows.clone());
-                Ok(rows)
-            };
+            let materialize_candidates =
+                |engine: &Self| -> Result<Vec<Vec<SqlValue>>, EngineError> {
+                    let mut rows = engine.visible_relational_rows(
+                        &table,
+                        StorageVisibility {
+                            read_txn_id: txn_id,
+                        },
+                    )?;
+                    rows.extend(new_rows.clone());
+                    Ok(rows)
+                };
             if table.indexes.iter().any(|index| index.unique) {
                 let unique_preflight_started = Instant::now();
                 if candidate_rows.is_none() {
@@ -256,8 +257,7 @@ impl Engine {
                     candidate_rows.as_ref().expect("materialized above"),
                 )?;
                 if let Some(profile) = profile.as_mut() {
-                    profile.check_preflight_micros +=
-                        check_preflight_started.elapsed().as_micros();
+                    profile.check_preflight_micros += check_preflight_started.elapsed().as_micros();
                 }
             }
             if !table.foreign_keys.is_empty() {
@@ -568,11 +568,9 @@ impl Engine {
             if *op == SelectFilterOp::Eq {
                 // TYPE-COVERAGE track 2: any i32-section-typed Eq (Int4/Date/Int2, variant
                 // agreeing with the column) can drive the locate.
-                if let Some(needle) = table
-                    .columns
-                    .get(*idx)
-                    .and_then(|column| crate::engine_residency::i32_section_needle(column.ty, value))
-                {
+                if let Some(needle) = table.columns.get(*idx).and_then(|column| {
+                    crate::engine_residency::i32_section_needle(column.ty, value)
+                }) {
                     eq = Some((*idx, needle));
                     break;
                 }
@@ -800,10 +798,8 @@ impl Engine {
         }
         // TYPE-COVERAGE track 2: i32-section needles (Int4/Date/Int2) probe with the exact
         // section encoding; anything else declines to the host ladder.
-        let needle = crate::engine_residency::i32_section_needle(
-            table.columns.get(column_idx)?.ty,
-            value,
-        )?;
+        let needle =
+            crate::engine_residency::i32_section_needle(table.columns.get(column_idx)?.ty, value)?;
         let hits = self.locate_resident_pk_via_shard_index_detailed(table, column_idx, needle)?;
         let mut answer = false;
         for hit in &hits {
@@ -1077,13 +1073,7 @@ impl Engine {
                         continue;
                     }
                     // No provider left: any visible child row still referencing it = violation.
-                    if self.visible_row_with_value(
-                        child,
-                        visibility,
-                        child_idx,
-                        value,
-                        None,
-                    )? {
+                    if self.visible_row_with_value(child, visibility, child_idx, value, None)? {
                         return Err(EngineError::ApplyFailed(format!(
                             "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
                             child.name, foreign_key.name

@@ -64,7 +64,7 @@ pub(crate) fn wave_host_phase_timing_enabled() -> bool {
 pub(crate) struct CommitWaveItem {
     txn_id: u64,
     cmd: Command,
-    payload: Vec<u8>,
+    payload: std::sync::Arc<[u8]>,
     write_set: WriteSet,
     read_snapshot: Index,
     residency_tables: BTreeSet<String>,
@@ -475,7 +475,7 @@ impl Engine {
         queue.items.push_back(CommitWaveItem {
             txn_id,
             cmd,
-            payload: text.as_bytes().to_vec(),
+            payload: std::sync::Arc::from(text.as_bytes()),
             prepared_catalog_seq,
             offlock_delta,
             write_set,
@@ -762,10 +762,7 @@ impl Engine {
                                 .iter()
                                 .find(|idx| {
                                     idx.unique
-                                        && table
-                                            .columns
-                                            .iter()
-                                            .position(|c| c.name == idx.column)
+                                        && table.columns.iter().position(|c| c.name == idx.column)
                                             == Some(filter_idx)
                                 })
                                 .map(|idx| idx.name.as_str())
@@ -966,8 +963,10 @@ impl Engine {
             ($k:expr) => {
                 if let Some(ref mut t) = _hp {
                     let now = Instant::now();
-                    WAVE_HOST_STATS[$k]
-                        .fetch_add(now.duration_since(*t).as_nanos() as u64, AtomicOrdering::Relaxed);
+                    WAVE_HOST_STATS[$k].fetch_add(
+                        now.duration_since(*t).as_nanos() as u64,
+                        AtomicOrdering::Relaxed,
+                    );
                     *t = now;
                 }
             };
@@ -979,7 +978,9 @@ impl Engine {
             // M1 design B: a deferred INSERT whose PK value already exists (wave-batch verdict)
             // aborts here — the same 23505 the off-lock validation would have raised.
             if let Some(err) = wave_unique_violations.get(&position) {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(err.clone()))));
+                item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    err.clone(),
+                ))));
                 continue;
             }
             // Batched-append ORDER: a non-INSERT item's re-resolve (device locate) and its
@@ -1040,7 +1041,9 @@ impl Engine {
             // at the wave's `next_row_id` instead of re-coercing + rebuilding it. A generation
             // drift (Full) or a non-eligible item falls through to the authoritative re-prepare.
             let prepared = match &item.offlock_delta {
-                Some(delta) if insert_validation == InsertPrepareValidation::ReResolveLedgerCovered => {
+                Some(delta)
+                    if insert_validation == InsertPrepareValidation::ReResolveLedgerCovered =>
+                {
                     Ok(Self::rekey_offlock_insert_delta(delta, install_snapshot))
                 }
                 _ => self.prepare_dml(&item.cmd, install_snapshot, insert_validation),
@@ -1531,7 +1534,7 @@ impl Engine {
                     RouteDecision::Gpu(_) | RouteDecision::Cpu => {
                         self.commit_mutation_at(
                             txn_id,
-                            text.as_bytes().to_vec(),
+                            std::sync::Arc::from(text.as_bytes()),
                             timestamp_micros,
                         )?;
                     }
@@ -1539,7 +1542,7 @@ impl Engine {
                         self.metrics.inc_gpu_fallback(reason);
                         self.commit_mutation_at(
                             txn_id,
-                            text.as_bytes().to_vec(),
+                            std::sync::Arc::from(text.as_bytes()),
                             timestamp_micros,
                         )?;
                     }
@@ -1732,7 +1735,10 @@ fn insert_i32_unique_needle(
     table: &RelationalTable,
     unique_column: &str,
 ) -> Option<(usize, i32)> {
-    let filter_idx = table.columns.iter().position(|c| c.name == *unique_column)?;
+    let filter_idx = table
+        .columns
+        .iter()
+        .position(|c| c.name == *unique_column)?;
     insert_i32_unique_needle_at(insert, table, filter_idx)
 }
 

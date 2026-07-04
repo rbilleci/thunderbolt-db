@@ -112,7 +112,7 @@ pub struct KvStateMachine {
 
 impl ReplicatedStateMachine for KvStateMachine {
     fn apply(&mut self, entry: &LogEntry) -> Result<(), EngineError> {
-        self.applied.push(entry.payload.clone());
+        self.applied.push(entry.payload.to_vec());
         if let Ok(s) = std::str::from_utf8(&entry.payload) {
             if let Ok(cmd) = parse_command(s) {
                 match cmd {
@@ -275,7 +275,7 @@ const RESIDENT_SHARD_MEMORY_MISSING: &str = " has no retained device memory";
 #[derive(Debug, Clone)]
 struct PendingMutation {
     txn_id: u64,
-    payload: Vec<u8>,
+    payload: std::sync::Arc<[u8]>,
 }
 
 /// D3b (write-path assessment / scalability ledger #7) — group-commit flush coordination for the
@@ -623,4 +623,3 @@ pub fn engine_dml_concurrent_wave_device_stats() -> &'static [std::sync::atomic:
 pub fn engine_dml_concurrent_wave_host_stats() -> &'static [std::sync::atomic::AtomicU64; 7] {
     &engine_dml_concurrent::WAVE_HOST_STATS
 }
-
