@@ -2090,24 +2090,6 @@ impl Engine {
     }
 }
 
-/// M1 design B: bind an INSERT's value for a UNIQUE-index column to its i32-section needle +
-/// the column's catalog position. Handles the insert's own column list (explicit or catalog
-/// order) and coerces the raw literal (Text->Date, Int4->Int2) as the DML binder does, then
-/// encodes via `i32_section_needle` (strict variant agreement). `None` (odd shape / non-i32
-/// section / NULL / uncoercible) -> the caller full-validates that item instead of batching.
-/// SINGLE-ROW only (the caller gates on `insert.rows.len() == 1`).
-fn insert_i32_unique_needle(
-    insert: &Insert,
-    table: &RelationalTable,
-    unique_column: &str,
-) -> Option<(usize, i32)> {
-    let filter_idx = table
-        .columns
-        .iter()
-        .position(|c| c.name == *unique_column)?;
-    insert_i32_unique_needle_at(insert, table, filter_idx)
-}
-
 /// M1 design B (perf): bind the needle by catalog COLUMN INDEX (no column-name search — the
 /// caller cached the filter_idx). Same coercion + strict `i32_section_needle` encode.
 fn insert_i32_unique_needle_at(
