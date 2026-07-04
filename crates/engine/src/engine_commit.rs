@@ -716,32 +716,9 @@ impl Engine {
         txn_id: TxnId,
         index: Index,
     ) {
-        self.read_state.residency.with_snapshots_mut(|snapshots| {
-            if let Some(entry) = snapshots.get_mut(table) {
-                // make_mut COWs the shared descriptor into a fresh version (host_rows stays shared).
-                let snapshot = std::sync::Arc::make_mut(&mut entry.descriptor);
-                if snapshot.invalidated_by_txn_id.is_none() {
-                    snapshot.invalidated_by_txn_id = Some(txn_id);
-                    snapshot.invalidated_at_index = Some(index);
-                }
-                if let Some(proof) = snapshot.device_memory_proof.as_mut() {
-                    proof.retained = false;
-                }
-            }
-        });
-        self.read_state.residency.with_shards_mut(|shards| {
-            if let Some(shards) = shards.get_mut(table) {
-                for shard in shards.iter_mut() {
-                    if shard.invalidated_by_txn_id.is_none() {
-                        shard.invalidated_by_txn_id = Some(txn_id);
-                        shard.invalidated_at_index = Some(index);
-                    }
-                    if let Some(proof) = shard.device_memory_proof.as_mut() {
-                        proof.retained = false;
-                    }
-                }
-            }
-        });
+        self.read_state
+            .residency
+            .flag_table_descriptors_invalidated(table, txn_id, index);
     }
 
     /// Invalidate the GPU residency of the `tables` a CONCURRENT commit mutated, via `&self`

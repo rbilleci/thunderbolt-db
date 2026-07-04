@@ -662,6 +662,77 @@ impl ResidencyReadState {
             .retain(|(cached_table, _, _), _| cached_table != table);
     }
 
+    /// W0: flag `table`'s residency descriptors (snapshot + every shard) invalidated at
+    /// `(txn_id, index)` — ONE `descriptor_publish_lock` hold covering the already-flagged check
+    /// AND both map publishes. The check makes repeated invalidations of the same table (the
+    /// concurrent wave invalidates PER ITEM) O(load + compare) instead of two full COW clones —
+    /// measured −13% sustained on the default (invalidate-per-item) benchmark arm without it.
+    /// Skipping is safe ONLY because the check runs under the same lock every publisher takes:
+    /// a generation observed flagged here can only be replaced by a LATER lock-holder (e.g. a
+    /// re-admission installing fresh descriptors), which would equally have overwritten a
+    /// redundant re-flag.
+    pub(crate) fn flag_table_descriptors_invalidated(
+        &self,
+        table: &str,
+        txn_id: u64,
+        index: u64,
+    ) {
+        let _publish = self
+            .descriptor_publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot_flagged = self.snapshots.load().get(table).is_none_or(|entry| {
+            entry.descriptor.invalidated_by_txn_id.is_some()
+                && entry
+                    .descriptor
+                    .device_memory_proof
+                    .as_ref()
+                    .is_none_or(|proof| !proof.retained)
+        });
+        let shards_flagged = self.shards.load().get(table).is_none_or(|shards| {
+            shards.iter().all(|shard| {
+                shard.invalidated_by_txn_id.is_some()
+                    && shard
+                        .device_memory_proof
+                        .as_ref()
+                        .is_none_or(|proof| !proof.retained)
+            })
+        });
+        if snapshot_flagged && shards_flagged {
+            return;
+        }
+        if !snapshot_flagged {
+            let mut next = (**self.snapshots.load()).clone();
+            if let Some(entry) = next.get_mut(table) {
+                // make_mut COWs the shared descriptor into a fresh version (host_rows stays shared).
+                let snapshot = Arc::make_mut(&mut entry.descriptor);
+                if snapshot.invalidated_by_txn_id.is_none() {
+                    snapshot.invalidated_by_txn_id = Some(txn_id);
+                    snapshot.invalidated_at_index = Some(index);
+                }
+                if let Some(proof) = snapshot.device_memory_proof.as_mut() {
+                    proof.retained = false;
+                }
+            }
+            self.snapshots.store(Arc::new(next));
+        }
+        if !shards_flagged {
+            let mut next = (**self.shards.load()).clone();
+            if let Some(shards) = next.get_mut(table) {
+                for shard in shards.iter_mut() {
+                    if shard.invalidated_by_txn_id.is_none() {
+                        shard.invalidated_by_txn_id = Some(txn_id);
+                        shard.invalidated_at_index = Some(index);
+                    }
+                    if let Some(proof) = shard.device_memory_proof.as_mut() {
+                        proof.retained = false;
+                    }
+                }
+            }
+            self.shards.store(Arc::new(next));
+        }
+    }
+
     /// COW-mutate the resident snapshot map: clone the published map, apply `mutate`, then
     /// atomically store it. In-flight readers keep the generation they loaded. W0: publishers
     /// serialize on `descriptor_publish_lock` — the catalog-latch paths were the single publisher
