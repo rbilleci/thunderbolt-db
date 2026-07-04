@@ -24991,6 +24991,11 @@ mod tests {
                 ],
                 vec![
                     Some("pg_catalog".to_string()),
+                    Some("date".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
                     Some("integer".to_string()),
                     None
                 ],
@@ -25001,7 +25006,22 @@ mod tests {
                 ],
                 vec![
                     Some("pg_catalog".to_string()),
+                    Some("smallint".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
                     Some("text".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("timestamp without time zone".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("uuid".to_string()),
                     None
                 ],
             ]
@@ -25031,6 +25051,16 @@ mod tests {
                 ],
                 vec![
                     Some("pg_catalog".to_string()),
+                    Some("date".to_string()),
+                    Some("date".to_string()),
+                    Some("4".to_string()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
                     Some("integer".to_string()),
                     Some("int4".to_string()),
                     Some("4".to_string()),
@@ -25051,9 +25081,39 @@ mod tests {
                 ],
                 vec![
                     Some("pg_catalog".to_string()),
+                    Some("smallint".to_string()),
+                    Some("int2".to_string()),
+                    Some(String::new()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
                     Some("text".to_string()),
                     Some("text".to_string()),
                     Some("var".to_string()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("timestamp without time zone".to_string()),
+                    Some("timestamp".to_string()),
+                    Some(String::new()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("uuid".to_string()),
+                    Some("uuid".to_string()),
+                    Some(String::new()),
                     None,
                     Some("postgres".to_string()),
                     None,
@@ -25953,6 +26013,11 @@ mod tests {
                     Some("8".to_string()),
                 ],
                 vec![
+                    Some("21".to_string()),
+                    Some("int2".to_string()),
+                    Some("2".to_string()),
+                ],
+                vec![
                     Some("23".to_string()),
                     Some("int4".to_string()),
                     Some("4".to_string()),
@@ -25963,9 +26028,24 @@ mod tests {
                     Some("-1".to_string()),
                 ],
                 vec![
+                    Some("1082".to_string()),
+                    Some("date".to_string()),
+                    Some("4".to_string()),
+                ],
+                vec![
+                    Some("1114".to_string()),
+                    Some("timestamp".to_string()),
+                    Some("8".to_string()),
+                ],
+                vec![
                     Some("1700".to_string()),
                     Some("numeric".to_string()),
                     Some("-1".to_string()),
+                ],
+                vec![
+                    Some("2950".to_string()),
+                    Some("uuid".to_string()),
+                    Some("16".to_string()),
                 ],
             ]
         );
@@ -25976,6 +26056,16 @@ mod tests {
                     Some("bool".to_string()),
                     Some("16".to_string()),
                     Some("1".to_string()),
+                ],
+                vec![
+                    Some("date".to_string()),
+                    Some("1082".to_string()),
+                    Some("4".to_string()),
+                ],
+                vec![
+                    Some("int2".to_string()),
+                    Some("21".to_string()),
+                    Some("2".to_string()),
                 ],
                 vec![
                     Some("int4".to_string()),
@@ -25996,6 +26086,16 @@ mod tests {
                     Some("text".to_string()),
                     Some("25".to_string()),
                     Some("-1".to_string()),
+                ],
+                vec![
+                    Some("timestamp".to_string()),
+                    Some("1114".to_string()),
+                    Some("8".to_string()),
+                ],
+                vec![
+                    Some("uuid".to_string()),
+                    Some("2950".to_string()),
+                    Some("16".to_string()),
                 ],
             ]
         );
