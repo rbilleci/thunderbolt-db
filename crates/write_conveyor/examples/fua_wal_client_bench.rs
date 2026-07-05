@@ -343,12 +343,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     std::hint::spin_loop();
                 }
                 // ADAPTIVE FRAME SIZING: spread the backlog across the pool.
+                // Frame target absorbs the POPULATION into the pipeline:
+                // lanes*frame ~= clients keeps the standing queue out of the
+                // ring (a pending-based target self-defeats — it sizes frames
+                // from the ring leftover, so the leftover never drains).
+                // The pending term still grows frames past the population
+                // share when the ring backs up at saturation.
                 let pending_total = shared
                     .next_seq
                     .load(Ordering::Relaxed)
                     .min(shared.events)
                     .saturating_sub(next_append);
+                let population_share = clients.div_ceil(fence_qd);
                 let target_frame = ((pending_total as usize).div_ceil(fence_qd))
+                    .max(population_share)
                     .clamp(min_records.max(1), block_size);
                 // contiguous ready prefix, capped at the target frame
                 let mut avail = 0_usize;

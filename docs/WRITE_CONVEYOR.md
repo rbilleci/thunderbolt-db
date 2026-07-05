@@ -1009,6 +1009,25 @@ clients   qd  block   throughput   client->durable-ack
 before device-bound). The engine-side lesson is structural: SQL commit acks must be delivered by polling
 event loops (gate batches of commits on `durable_record_seq` sweeps), never by per-commit thread wakeups.
 
+**Sub-millisecond p90 regime (population-share frame targeting).** A pending-based frame target self-defeats
+below saturation: it sizes frames from the ring LEFTOVER, so a standing queue (~0.4-0.8ms) never drains and
+ack latency floors at ~1.15ms even at 256 clients. Targeting `frame >= clients/fence_qd` absorbs the whole
+population into the fence pipeline (ring ~= 0) and the ack collapses to the bare fence — the conveyor adds
+<10us around the device write:
+
+```text
+ 512  qd=32  62    0.59 M/s   p50=835us  p90=857us  p99=1.37ms
+1024  qd=32  62    1.16 M/s   p50=835us  p90=871us  p99=1.37ms
+2048  qd=48  62    2.09 M/s   p50=886us  p90=922us  p99=3.40ms
+2560  qd=48  62    2.65 M/s   p50=890us  p90=927us  p99=3.07ms   <- p90<1ms envelope edge
+3072  qd=48  62    3.07 M/s   p50=900us  p90=1.10ms             <- past the edge (frames hit cap, ring re-forms)
+```
+
+Rule of thumb for the engine: pick lanes ~= clients/frame with frame <= 62 and the durable ack p90 tracks the
+raw FUA fence p90 at that queue depth (~0.86-0.93ms on this drive). The p99 tail (~3ms) is device fence
+stragglers, within the <5ms SLO. Sub-0.8ms p90 on this consumer drive is not reachable (fence floor); PLP
+media collapses the same architecture to tens of microseconds.
+
 ### E1 foundation: `FuaFrameLog` — variable-payload frame log for the engine WAL (2026-07-05)
 
 The engine's `gpu_db_wal` records are variable-length (SQL text, binary row-ops, DDL) and its group flush is
