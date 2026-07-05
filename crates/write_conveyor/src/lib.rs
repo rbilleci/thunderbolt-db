@@ -1422,7 +1422,9 @@ mod fua_wal;
 #[cfg(unix)]
 mod wal_segment;
 #[cfg(unix)]
-pub use fua_wal::{FuaFencePool, FuaWalAppender, FuaWalSegment, FuaWalSegmentConfig};
+pub use fua_wal::{
+    FuaFencePool, FuaStageTimings, FuaWalAppender, FuaWalSegment, FuaWalSegmentConfig,
+};
 #[cfg(unix)]
 pub use wal_segment::{
     recover_wal_manager, recover_wal_manager_by_scan, WalDataSyncMode, WalManagerRecovery,

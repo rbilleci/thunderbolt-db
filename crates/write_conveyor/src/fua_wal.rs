@@ -125,6 +125,55 @@ impl Drop for AlignedStaging {
 #[repr(align(128))]
 struct PaddedAtomicU64(AtomicU64);
 
+/// Optional per-block pipeline timestamps (nanoseconds from an internal base
+/// `Instant`), for latency attribution: publish -> fence-start -> fence-done
+/// -> durable-cut. Enabled by [`FuaWalSegment::enable_stage_timings`]; when
+/// disabled the hot path pays one `Option` check per stage. Written by the
+/// single appender (publish) and fence lanes (rest); read after the run.
+pub struct FuaStageTimings {
+    base: std::time::Instant,
+    publish_ns: Vec<AtomicU64>,
+    fence_start_ns: Vec<AtomicU64>,
+    fence_done_ns: Vec<AtomicU64>,
+    cut_ns: Vec<AtomicU64>,
+}
+
+impl FuaStageTimings {
+    fn new(block_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            base: std::time::Instant::now(),
+            publish_ns: (0..block_capacity).map(|_| AtomicU64::new(0)).collect(),
+            fence_start_ns: (0..block_capacity).map(|_| AtomicU64::new(0)).collect(),
+            fence_done_ns: (0..block_capacity).map(|_| AtomicU64::new(0)).collect(),
+            cut_ns: (0..block_capacity).map(|_| AtomicU64::new(0)).collect(),
+        })
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.base.elapsed().as_nanos() as u64
+    }
+
+    /// (publish->fence_start, fence_start->fence_done, fence_done->cut) in
+    /// nanoseconds for every block with a complete timeline.
+    pub fn block_stages(&self, blocks: u64) -> Vec<(u64, u64, u64)> {
+        (0..blocks as usize)
+            .filter_map(|block| {
+                let publish = self.publish_ns[block].load(Ordering::Relaxed);
+                let start = self.fence_start_ns[block].load(Ordering::Relaxed);
+                let done = self.fence_done_ns[block].load(Ordering::Relaxed);
+                let cut = self.cut_ns[block].load(Ordering::Relaxed);
+                (publish != 0 && start != 0 && done != 0 && cut != 0).then(|| {
+                    (
+                        start.saturating_sub(publish),
+                        done.saturating_sub(start),
+                        cut.saturating_sub(done),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
 /// A recoverable WAL segment whose durability is a pipelined FUA fence pool.
 ///
 /// Exactly one appender publishes blocks (claim it with [`Self::appender`]);
@@ -148,12 +197,18 @@ pub struct FuaWalSegment {
     durable_frontier: Mutex<u64>,
     durable_blocks: PaddedAtomicU64,
     durable_record_seq: PaddedAtomicU64,
+    /// Total completed fences, ORDER-INDEPENDENT (unlike the contiguous
+    /// durable cut). This is the pacing denominator: a lane that finished an
+    /// out-of-order frame is free for new work even though the cut has not
+    /// reached its block yet.
+    fences_completed: PaddedAtomicU64,
     publishing_finished: AtomicBool,
     /// Set by a fence lane that hit an IO error. The durable cut can never
     /// advance past the failed frame, so producers/waiters spinning on the
     /// cut would otherwise hang; they must poll [`FuaWalSegment::fence_failed`]
     /// and abort. The underlying error is returned by [`FuaFencePool::join`].
     fence_failed: AtomicBool,
+    stage_timings: Mutex<Option<Arc<FuaStageTimings>>>,
 }
 
 impl FuaWalSegment {
@@ -242,8 +297,10 @@ impl FuaWalSegment {
             durable_frontier: Mutex::new(0),
             durable_blocks: PaddedAtomicU64(AtomicU64::new(0)),
             durable_record_seq: PaddedAtomicU64(AtomicU64::new(0)),
+            fences_completed: PaddedAtomicU64(AtomicU64::new(0)),
             publishing_finished: AtomicBool::new(false),
             fence_failed: AtomicBool::new(false),
+            stage_timings: Mutex::new(None),
         };
         segment.write_file_header(bytes)?;
         Ok(Arc::new(segment))
@@ -288,6 +345,7 @@ impl FuaWalSegment {
             "FUA WAL segment supports exactly one appender"
         );
         FuaWalAppender {
+            timings: self.stage_timings(),
             segment: Arc::clone(self),
             next_block: 0,
             next_record_seq: 0,
@@ -311,6 +369,8 @@ impl FuaWalSegment {
     }
 
     fn fence_lane_loop(&self) -> std::io::Result<u64> {
+        // capture once: the per-op Mutex read is contended at fence rates
+        let timings = self.stage_timings();
         let mut fenced = 0_u64;
         loop {
             let block = self.fence_cursor.0.fetch_add(1, Ordering::Relaxed);
@@ -325,7 +385,7 @@ impl FuaWalSegment {
                 }
                 std::thread::yield_now();
             }
-            if let Err(error) = self.fence_block(block) {
+            if let Err(error) = self.fence_block_timed(block, &timings) {
                 // Signal producers/waiters before surfacing the error via
                 // join(): the durable cut is now permanently stalled at or
                 // before this frame.
@@ -337,8 +397,21 @@ impl FuaWalSegment {
     }
 
     /// FUA-write one published frame and advance the contiguous durable cut.
+    #[cfg(test)]
     fn fence_block(&self, block_id: u64) -> std::io::Result<()> {
+        self.fence_block_timed(block_id, &None)
+    }
+
+    /// FUA-write one published frame and advance the contiguous durable cut.
+    fn fence_block_timed(
+        &self,
+        block_id: u64,
+        timings: &Option<Arc<FuaStageTimings>>,
+    ) -> std::io::Result<()> {
         debug_assert!(block_id < self.block_capacity);
+        if let Some(timings) = &timings {
+            timings.fence_start_ns[block_id as usize].store(timings.now_ns(), Ordering::Relaxed);
+        }
         let offset = block_id as usize * self.block_stride;
         let file_offset = WAL_SEGMENT_HEADER_BYTES as u64 + block_id * self.block_stride as u64;
         unsafe {
@@ -348,7 +421,11 @@ impl FuaWalSegment {
                 file_offset,
             )?;
         }
+        if let Some(timings) = &timings {
+            timings.fence_done_ns[block_id as usize].store(timings.now_ns(), Ordering::Relaxed);
+        }
         self.fence_completed[block_id as usize].store(true, Ordering::Release);
+        self.fences_completed.0.fetch_add(1, Ordering::AcqRel);
         let mut frontier = self
             .durable_frontier
             .lock()
@@ -360,6 +437,12 @@ impl FuaWalSegment {
             advanced += 1;
         }
         if advanced != *frontier {
+            if let Some(timings) = &timings {
+                let now = timings.now_ns();
+                for covered in *frontier..advanced {
+                    timings.cut_ns[covered as usize].store(now, Ordering::Relaxed);
+                }
+            }
             *frontier = advanced;
             self.durable_blocks.0.store(advanced, Ordering::Release);
             self.durable_record_seq.0.store(
@@ -376,6 +459,25 @@ impl FuaWalSegment {
     /// underlying error is returned by [`FuaFencePool::join`].
     pub fn fence_failed(&self) -> bool {
         self.fence_failed.load(Ordering::Acquire)
+    }
+
+    /// Enable per-block stage timestamps for latency attribution. Must be
+    /// called BEFORE [`Self::spawn_fence_pool`] and [`Self::appender`]: both
+    /// capture the handle once at construction to keep it off the hot path.
+    pub fn enable_stage_timings(&self) -> Arc<FuaStageTimings> {
+        let timings = FuaStageTimings::new(self.block_capacity as usize);
+        *self
+            .stage_timings
+            .lock()
+            .expect("stage timings lock poisoned") = Some(Arc::clone(&timings));
+        timings
+    }
+
+    fn stage_timings(&self) -> Option<Arc<FuaStageTimings>> {
+        self.stage_timings
+            .lock()
+            .expect("stage timings lock poisoned")
+            .clone()
     }
 
     /// Contiguous durable block prefix.
@@ -404,12 +506,17 @@ impl FuaWalSegment {
 
     /// Free capacity in a fence pool of `lanes`: the appender's pacing gate.
     /// Publish a frame only when this is non-zero; accumulate otherwise.
+    ///
+    /// In-flight is measured against TOTAL completions, not the contiguous
+    /// durable cut: fences complete out of order, and gating on the cut
+    /// would idle lanes behind a straggler (measured: effective device queue
+    /// depth sags below the lane count and fence latency rises).
     pub fn free_fence_slots(&self, lanes: usize) -> usize {
         let in_flight = self
             .published_blocks
             .0
             .load(Ordering::Relaxed)
-            .saturating_sub(self.durable_blocks.0.load(Ordering::Acquire));
+            .saturating_sub(self.fences_completed.0.load(Ordering::Acquire));
         (lanes as u64).saturating_sub(in_flight) as usize
     }
 
@@ -460,6 +567,7 @@ fn prewrite_extents(path: &Path, bytes: u64) -> std::io::Result<()> {
 /// The single publishing handle for a [`FuaWalSegment`].
 pub struct FuaWalAppender {
     segment: Arc<FuaWalSegment>,
+    timings: Option<Arc<FuaStageTimings>>,
     next_block: u64,
     next_record_seq: u64,
 }
@@ -538,6 +646,9 @@ impl FuaWalAppender {
         self.next_record_seq = first_client_seq + count as u64;
         segment.block_end_seq[block_id as usize].store(self.next_record_seq, Ordering::Relaxed);
         self.next_block = block_id + 1;
+        if let Some(timings) = &self.timings {
+            timings.publish_ns[block_id as usize].store(timings.now_ns(), Ordering::Relaxed);
+        }
         segment
             .published_blocks
             .0

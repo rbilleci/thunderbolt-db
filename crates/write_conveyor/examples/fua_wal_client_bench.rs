@@ -28,7 +28,7 @@ use std::error::Error;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use gpu_db_write_conveyor::{
@@ -125,7 +125,33 @@ struct Shared {
     // volatile store
     store: VolatileStore,
     applied_seq: AtomicU64,
+    // Chronicle-style wait strategy: clients PARK on ack instead of
+    // yielding. Thousands of yield_now waiters turn ack observation into a
+    // scheduler round-trip (measured to dominate tail latency and starve the
+    // ring). A/B result: per-seq park/unpark beat bucketed condvar cohorts
+    // decisively (condvars pay a thundering herd on every partial-bucket
+    // notify plus wake serialization through the bucket mutex). Registry
+    // slots are Mutex<Option<Thread>>; the park loop re-checks after
+    // registering, so a wake can never be missed; park_timeout bounds any
+    // residual race.
+    waiters: Vec<Mutex<Option<std::thread::Thread>>>,
+    // wake-delivery diagnostics: waker stamps before unpark, client samples
+    // stamp->resume (CONVEYOR_STAGE_TIMINGS=1)
+    wake_base: Instant,
+    unpark_ns: Vec<AtomicU64>,
     events: u64,
+}
+
+impl Shared {
+    fn acked(&self, seq: u64) -> bool {
+        self.segment.durable_record_seq() > seq && self.applied_seq.load(Ordering::Acquire) > seq
+    }
+
+    fn ack_frontier(&self) -> u64 {
+        self.segment
+            .durable_record_seq()
+            .min(self.applied_seq.load(Ordering::Acquire))
+    }
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -189,6 +215,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             .clamp(1, block_size)
             .min(clients);
     let append_group_us: u64 = parse_env("CONVEYOR_CLIENT_APPEND_GROUP_US", 25_u64);
+    let park_window =
+        Duration::from_micros(parse_env("CONVEYOR_PARK_TIMEOUT_US", 5000_u64).max(10));
+    // 0 = one OS thread per client (parked-waiter ack); N>0 = event-loop
+    // driver threads each multiplexing clients/N logical clients (no parks,
+    // no wakes: acks observed by sweeping two atomics per logical client).
+    // The per-request futex wake+park pair (~4-8us kernel time, serialized
+    // through the waker pool) is unpayable at millions of acks/s — measured
+    // as ~670us of waker scan lag at 2048 threads. Event-loop drivers are
+    // the Chronicle/production shape.
+    let driver_threads: usize = parse_env("CONVEYOR_CLIENT_DRIVER_THREADS", 64_usize).min(clients);
     let sample_stride: u64 = parse_env(
         "CONVEYOR_CLIENT_LATENCY_SAMPLE_STRIDE",
         (events / 2_000_000).max(1),
@@ -205,6 +241,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     if events == 0 {
         return Err("CONVEYOR_EVENTS must be greater than zero".into());
+    }
+    if clients as u64 >= 65_536 {
+        return Err("CONVEYOR_CLIENTS must be below the waiter-ring coverage (65536)".into());
     }
     // worst case: every block carries only the liveness floor of records
     let capacity_records = events
@@ -264,9 +303,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         segment: Arc::clone(&segment),
         store: VolatileStore::new(events as usize),
         applied_seq: AtomicU64::new(0),
+        waiters: (0..ring_capacity).map(|_| Mutex::new(None)).collect(),
+        wake_base: Instant::now(),
+        unpark_ns: (0..ring_capacity).map(|_| AtomicU64::new(0)).collect(),
         events,
     });
-    let start_barrier = Arc::new(Barrier::new(clients + 1));
+    let barrier_clients = if driver_threads > 0 {
+        driver_threads
+    } else {
+        clients
+    };
+    let start_barrier = Arc::new(Barrier::new(barrier_clients + 1));
+
+    let stage_timings = if parse_bool("CONVEYOR_STAGE_TIMINGS", false) {
+        Some(segment.enable_stage_timings())
+    } else {
+        None
+    };
 
     // --- fence lanes (library pool) ---
     let pool = segment.spawn_fence_pool(fence_qd);
@@ -368,56 +421,201 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
     };
 
-    // --- closed-loop clients ---
-    let client_handles: Vec<_> = (0..clients)
-        .map(|_| {
+    // --- waker threads: unpark the cohort covered by each frontier advance
+    // (thread-per-client mode only; drivers poll and never park — audit
+    // finding: idle wakers would spin at 100% and pollute measurements) ---
+    let waker_threads: usize = if driver_threads > 0 {
+        0
+    } else {
+        parse_env("CONVEYOR_WAKER_THREADS", 8_usize).max(1)
+    };
+    let waker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waker_handles: Vec<_> = (0..waker_threads)
+        .map(|lane| {
             let shared = Arc::clone(&shared);
-            let barrier = Arc::clone(&start_barrier);
+            let stop = Arc::clone(&waker_stop);
+            let wake_lag_sampling = stage_timings.is_some();
             std::thread::spawn(move || {
-                let mut latencies = Vec::new();
-                barrier.wait();
+                // each waker owns seqs where seq % waker_threads == lane
+                let mut woken: u64 = lane as u64;
                 loop {
-                    let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed);
-                    if seq >= shared.events {
-                        return latencies;
-                    }
-                    // slot reuse gate
-                    while seq - shared.consumed_seq.load(Ordering::Acquire) >= shared.ring_mask + 1
-                    {
-                        std::thread::yield_now();
-                    }
-                    let ingress = Instant::now();
-                    let slot = (seq & shared.ring_mask) as usize;
-                    unsafe {
-                        shared.slots[slot].0.get().write(intent_for(seq));
-                    }
-                    shared.ready[slot].store(seq + 1, Ordering::Release);
-                    // ack = durable WAL frame + volatile store applied
-                    while shared.segment.durable_record_seq() <= seq
-                        || shared.applied_seq.load(Ordering::Acquire) <= seq
-                    {
-                        if shared.segment.fence_failed() {
-                            // durability is wedged; abort so the appender's
-                            // error can surface through main
-                            return latencies;
+                    let frontier = shared.ack_frontier();
+                    while woken < frontier {
+                        let slot = (woken & shared.ring_mask) as usize;
+                        if let Some(thread) = shared.waiters[slot]
+                            .lock()
+                            .expect("waiter slot poisoned")
+                            .take()
+                        {
+                            if wake_lag_sampling {
+                                shared.unpark_ns[slot].store(
+                                    shared.wake_base.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            thread.unpark();
                         }
-                        std::thread::yield_now();
+                        woken += waker_threads as u64;
                     }
-                    if seq.is_multiple_of(sample_stride) {
-                        latencies.push(ingress.elapsed());
+                    if (frontier >= shared.events && woken >= shared.events)
+                        || stop.load(Ordering::Acquire)
+                        || shared.segment.fence_failed()
+                    {
+                        return;
                     }
+                    std::hint::spin_loop();
                 }
             })
         })
         .collect();
 
+    // --- closed-loop clients: event-loop drivers or thread-per-client ---
+    let driver_mode = driver_threads > 0;
+    let driver_handles: Vec<_> = if driver_mode {
+        let per_driver = clients.div_ceil(driver_threads);
+        (0..driver_threads)
+            .map(|driver| {
+                let shared = Arc::clone(&shared);
+                let barrier = Arc::clone(&start_barrier);
+                let logical = per_driver.min(clients - (driver * per_driver).min(clients));
+                std::thread::spawn(move || {
+                    enum Logical {
+                        Idle,
+                        Waiting { seq: u64, ingress: Instant },
+                        Done,
+                    }
+                    let mut states: Vec<Logical> = (0..logical).map(|_| Logical::Idle).collect();
+                    let mut latencies = Vec::new();
+                    let wake_lags = Vec::new();
+                    let mut done = 0_usize;
+                    barrier.wait();
+                    while done < logical {
+                        let mut progressed = false;
+                        for state in states.iter_mut() {
+                            // retire a completed wait
+                            if let Logical::Waiting { seq, ingress } = state {
+                                if shared.acked(*seq) {
+                                    if seq.is_multiple_of(sample_stride) {
+                                        latencies.push(ingress.elapsed());
+                                    }
+                                    *state = Logical::Idle;
+                                    progressed = true;
+                                } else if shared.segment.fence_failed() {
+                                    return (latencies, wake_lags);
+                                }
+                            }
+                            // issue the next request
+                            if matches!(state, Logical::Idle) {
+                                let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed);
+                                if seq >= shared.events {
+                                    *state = Logical::Done;
+                                    done += 1;
+                                    continue;
+                                }
+                                while seq - shared.consumed_seq.load(Ordering::Acquire)
+                                    >= shared.ring_mask + 1
+                                {
+                                    std::thread::yield_now();
+                                }
+                                let ingress = Instant::now();
+                                let ring_slot = (seq & shared.ring_mask) as usize;
+                                unsafe {
+                                    shared.slots[ring_slot].0.get().write(intent_for(seq));
+                                }
+                                shared.ready[ring_slot].store(seq + 1, Ordering::Release);
+                                *state = Logical::Waiting { seq, ingress };
+                                progressed = true;
+                            }
+                        }
+                        if !progressed {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    (latencies, wake_lags)
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // --- thread-per-client mode ---
+    let client_handles: Vec<_> = if driver_mode {
+        Vec::new()
+    } else {
+        (0..clients)
+            .map(|_| {
+                let shared = Arc::clone(&shared);
+                let barrier = Arc::clone(&start_barrier);
+                std::thread::spawn(move || {
+                    let mut latencies = Vec::new();
+                    let mut wake_lags = Vec::new();
+                    barrier.wait();
+                    loop {
+                        let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed);
+                        if seq >= shared.events {
+                            return (latencies, wake_lags);
+                        }
+                        // slot reuse gate
+                        while seq - shared.consumed_seq.load(Ordering::Acquire)
+                            >= shared.ring_mask + 1
+                        {
+                            std::thread::yield_now();
+                        }
+                        let ingress = Instant::now();
+                        let slot = (seq & shared.ring_mask) as usize;
+                        unsafe {
+                            shared.slots[slot].0.get().write(intent_for(seq));
+                        }
+                        shared.ready[slot].store(seq + 1, Ordering::Release);
+                        // ack = durable WAL frame + volatile store applied; park
+                        // until a waker covers this seq (missed-wake-safe:
+                        // register, re-check, then park with a bounded timeout)
+                        while !shared.acked(seq) {
+                            if shared.segment.fence_failed() {
+                                // durability is wedged; abort so the appender's
+                                // error can surface through main
+                                return (latencies, wake_lags);
+                            }
+                            let waiter = &shared.waiters[(seq & shared.ring_mask) as usize];
+                            *waiter.lock().expect("waiter slot poisoned") =
+                                Some(std::thread::current());
+                            if shared.acked(seq) || shared.segment.fence_failed() {
+                                waiter.lock().expect("waiter slot poisoned").take();
+                                continue;
+                            }
+                            std::thread::park_timeout(park_window);
+                            waiter.lock().expect("waiter slot poisoned").take();
+                        }
+                        if seq.is_multiple_of(sample_stride) {
+                            latencies.push(ingress.elapsed());
+                            let slot = (seq & shared.ring_mask) as usize;
+                            let stamped = shared.unpark_ns[slot].swap(0, Ordering::Relaxed);
+                            if stamped != 0 {
+                                let now = shared.wake_base.elapsed().as_nanos() as u64;
+                                wake_lags.push(Duration::from_nanos(now.saturating_sub(stamped)));
+                            }
+                        }
+                    }
+                })
+            })
+            .collect()
+    };
+
     start_barrier.wait();
     let run_start = Instant::now();
     let mut client_latencies = Vec::new();
-    for handle in client_handles {
-        client_latencies.extend(handle.join().expect("client thread panicked"));
+    let mut wake_lags = Vec::new();
+    for handle in client_handles.into_iter().chain(driver_handles) {
+        let (lat, lags) = handle.join().expect("client thread panicked");
+        client_latencies.extend(lat);
+        wake_lags.extend(lags);
     }
     let elapsed = run_start.elapsed();
+    waker_stop.store(true, Ordering::Release);
+    for handle in waker_handles {
+        handle.join().expect("waker thread panicked");
+    }
     let blocks = appender_thread.join().expect("appender panicked")?;
     let fences = pool.join()?;
     store_thread.join().expect("store worker panicked");
@@ -465,5 +663,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     );
     print_distribution("client->durable-ack", &mut client_latencies);
+    print_distribution("unpark->resume (wake lag)", &mut wake_lags);
+    if let Some(timings) = stage_timings {
+        let stages = timings.block_stages(blocks);
+        let mut queue: Vec<Duration> = stages.iter().map(|s| Duration::from_nanos(s.0)).collect();
+        let mut fence: Vec<Duration> = stages.iter().map(|s| Duration::from_nanos(s.1)).collect();
+        let mut cut: Vec<Duration> = stages.iter().map(|s| Duration::from_nanos(s.2)).collect();
+        print_distribution("publish->fence-start", &mut queue);
+        print_distribution("fence write (FUA)", &mut fence);
+        print_distribution("fence-done->durable-cut", &mut cut);
+    }
     Ok(())
 }

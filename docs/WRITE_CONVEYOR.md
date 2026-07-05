@@ -960,6 +960,55 @@ allocation (capacity assumes every frame at the liveness floor); production segm
 (recycle pool + background prep thread), replacing yield-waits with event-driven acks, and gating SQL commit
 visibility on `durable_record_seq`.
 
+### Optimization rounds (2026-07-05, post-commit `6c05f825`): 2.0 -> 6.3M durable writes/s
+
+Instrumentation-driven rounds over the committed lane. Per-block stage timings
+(`FuaWalSegment::enable_stage_timings`, `CONVEYOR_STAGE_TIMINGS=1`) attribute publish -> fence-start ->
+fence-done -> durable-cut; handles are captured once per thread (a per-op Mutex read measurably contended the
+fence lanes), so enable it BEFORE `spawn_fence_pool`/`appender`.
+
+What the measurements found, in order:
+
+1. **Pacing metric defect (library fix).** `free_fence_slots` gated on `published - durable`, but the durable
+   cut is CONTIGUOUS: out-of-order-completed fences still counted as in-flight, idling lanes behind any
+   straggler and sagging effective device queue depth below the lane count. Fixed with an order-independent
+   `fences_completed` counter. After the fix the pipeline runs at the device floor: publish->fence-start p50
+   901ns, FUA write p50 683us, fence-done->cut p50 330ns.
+2. **Wait-strategy A/B (thread-per-client).** yield_now ack-waiting costs a scheduler round-trip under
+   thousands of threads. Parked waiters (per-seq Mutex<Option<Thread>> registry + waker threads) beat
+   bucketed-condvar cohorts decisively — condvars pay a thundering herd on every partial-bucket notify plus
+   wake serialization through the bucket mutex. Short `park_timeout` polling is poison (100us: 0.63M/s,
+   p99 19ms). But even tuned parking plateaus: direct wake-lag sampling showed unpark->resume at p50 8.3us
+   while ~670us of ack latency remained — the waker pool itself saturates at ~5.8us per unpark syscall,
+   exactly 100% utilized at 1.4M acks/s. THE PER-REQUEST FUTEX WAKE+PARK PAIR IS UNPAYABLE AT MILLIONS OF
+   ACKS/S; no waker-pool width fixes it (32 wakers measured no better than 8).
+3. **Event-loop client multiplexing (the Chronicle shape).** `CONVEYOR_CLIENT_DRIVER_THREADS` (default 64)
+   drivers sweep logical-client state machines: no parks, no wakes, acks observed by polling two atomics per
+   logical client per sweep. This removes the wake wall entirely, moves the standing queue into the ring
+   (frames pack to capacity: avg-block 125.6/126), and unlocks population scaling far past OS-thread limits.
+4. **Fence-pool width at population.** With drivers, the lane is cleanly device-bound; raising fence lanes
+   follows the raw FUA curve (the drive coalesces more concurrent FUA writes).
+5. **Post-round audit (opus): no correctness defects** across fences_completed ordering, over-publish,
+   stage-timing lifecycle, driver ring-gate/termination/barrier accounting, and waiter aliasing. One MINOR
+   benchmark-integrity finding fixed: waker threads no longer spawn in driver mode (they spun at 100% CPU
+   scanning empty registries and polluted throughput).
+
+Client-contract frontier (per-request durable ack, scan-recovery + store validated, filesystem-backed
+`target/`):
+
+```text
+clients   qd  block   throughput   client->durable-ack
+ 2048     16   62      1.40 M/s    p50=1.35ms p99=2.25ms
+ 4096     24  126      2.49 M/s    p50=1.66ms p99=3.94ms
+ 8192     48  126      4.28 M/s    p50=1.91ms p99=3.51ms
+16384     48  126      5.87 M/s    p50=2.74ms p99=3.83ms
+32768     64  126      6.30 M/s    p50=5.09ms p99=7.31ms   <- 48x the pre-FUA lane's best-ever
+```
+
+254-record (16KiB) frames do not beat 126 at these populations (frames run underfull — population-bound
+before device-bound). The engine-side lesson is structural: SQL commit acks must be delivered by polling
+event loops (gate batches of commits on `durable_record_seq` sweeps), never by per-commit thread wakeups.
+
 ## Next Build-Up
 
 1. **Done locally:** add segment rolling, retention metadata, and a small external control file for the synced
