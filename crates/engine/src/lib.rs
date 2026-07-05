@@ -62,7 +62,7 @@ use gpu_db_wal::{
     WalArchiveManifest, WalArchiveObjectBackup, WalArchiveRecordTimestamp, WalArchiveRetentionPlan,
     WalArchiveTimeline, WalArchiveTimelineBranch, WalArchiveTimelinePrunePlan,
     WalArchiveTimelineRegistry, WalArchiveTimelineSelection, WalBuffer, WalCheckpointMeta,
-    WalControlFile, WalGroupCommitStats, WalRecord,
+    WalControlFile, WalDurability, WalGroupCommitStats, WalRecord,
 };
 
 mod rel_exec_helpers;
@@ -296,6 +296,19 @@ struct GroupFlushState {
     /// (low) value is safe: the waiter becomes a flusher and `flush_all` with nothing unflushed
     /// is a no-op that refreshes the mirror.
     durable_records: std::sync::atomic::AtomicUsize,
+    /// E1 step 2 — set once at construction when the WAL's durability backend supports MULTIPLE
+    /// concurrent group flushes in flight (the FUA fence pool). When true, `wait_group_durable`
+    /// takes the CONCURRENT path: it skips the single-flusher election (`flusher_active`) and lets
+    /// every committer run `begin_group_flush` + `job.commit()` at once — the WAL's ticket gate
+    /// keeps frames ordered and the fence pool pipelines durability. The serial backend leaves this
+    /// false and keeps electing one flusher (its `io_in_flight` slot admits at most one IO).
+    concurrent_durability: bool,
+    /// E1 step 2 — lock-free sticky mirror of `GroupFlushCoord::failed` for the concurrent path's
+    /// POLLING waiters (a committer whose records another thread already published spins on
+    /// `durable_records` with no per-commit wakeup). A flusher sets this before it wedges so a
+    /// polling waiter never spins forever behind a failed fence; the authoritative message stays in
+    /// `coord.failed`. Unused (always false) on the serial path.
+    wedged: std::sync::atomic::AtomicBool,
 }
 
 impl Default for GroupFlushState {
@@ -304,6 +317,8 @@ impl Default for GroupFlushState {
             coord: Mutex::new(GroupFlushCoord::default()),
             cv: std::sync::Condvar::new(),
             durable_records: std::sync::atomic::AtomicUsize::new(0),
+            concurrent_durability: false,
+            wedged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

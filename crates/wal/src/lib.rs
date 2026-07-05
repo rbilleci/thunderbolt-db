@@ -785,6 +785,21 @@ impl WalBuffer {
         self.durable.is_some()
     }
 
+    /// Whether this buffer's durability backend supports MULTIPLE concurrent group flushes in
+    /// flight (E1 step 2). True only for the FUA fence-pool backend, where `begin_group_flush`
+    /// snapshots and advances the `published` cursor under the caller's outer lock (so frames stay
+    /// totally ordered) while the returned job's fence-pool durable-cut wait runs off-lock and
+    /// overlaps every other FUA job. The serial `write_all` + `fdatasync` backend requires the
+    /// caller to elect a SINGLE flusher (its `io_in_flight` slot admits at most one IO), so it
+    /// returns false — the engine keeps the flusher-election on that path and skips it on this one.
+    pub fn durability_is_concurrent(&self) -> bool {
+        #[cfg(unix)]
+        if self.fua.is_some() {
+            return true;
+        }
+        false
+    }
+
     pub fn append(&mut self, rec: WalRecord) {
         self.records.push(rec);
     }

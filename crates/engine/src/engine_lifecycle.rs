@@ -379,7 +379,24 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Self {
         let mut engine = Self::with_planner_config(planner_cfg);
-        engine.commit_state_mut().wal = WalBuffer::with_durable_segment(segment_path);
+        // E1 step 2 — ONE authority for the durability backend: default SerialFdatasync, opt into
+        // the FUA fence pool via `GPU_DB_WAL_DURABILITY=fua` (+ `GPU_DB_WAL_FUA_LANES` /
+        // `GPU_DB_WAL_FUA_SEGMENT_BYTES`). The FUA backend admits MULTIPLE durable jobs in flight;
+        // the concurrent-flush seam in `wait_group_durable` keys off `durability_is_concurrent()`.
+        let segment_path = segment_path.into();
+        let wal = match WalDurability::from_env() {
+            #[cfg(unix)]
+            WalDurability::FuaFencePool {
+                lanes,
+                segment_bytes,
+            } => WalBuffer::with_fua_durable_segment(segment_path, lanes, segment_bytes)
+                .expect("failed to create FUA durable WAL segment (GPU_DB_WAL_DURABILITY=fua)"),
+            // Non-unix has no FUA backend; from_env can still name it, so fall back to serial.
+            #[allow(unreachable_patterns)]
+            _ => WalBuffer::with_durable_segment(segment_path),
+        };
+        engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
+        engine.commit_state_mut().wal = wal;
         engine
     }
 

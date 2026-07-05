@@ -1667,6 +1667,12 @@ impl Engine {
     /// writer's fail-closed poisoning of the segment backing on real I/O errors. The SERIALIZED
     /// commit path (`commit_mutation_at`) keeps its inline flush and clean per-statement abort.
     fn wait_group_durable(&self, wal_position: usize) -> Result<(), EngineError> {
+        // E1 step 2 — FUA fence-pool backend: no single-flusher election. Every committer whose
+        // record isn't yet covered runs its own `begin_group_flush` + `job.commit()` concurrently;
+        // the WAL's ticket gate keeps frames ordered and the fence pool pipelines durability.
+        if self.group_flush.concurrent_durability {
+            return self.wait_group_durable_concurrent(wal_position);
+        }
         loop {
             if self
                 .group_flush
@@ -1754,6 +1760,136 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// E1 step 2 — the CONCURRENT-durability variant of [`Engine::wait_group_durable`], taken when
+    /// the WAL's FUA fence-pool backend is active (`concurrent_durability`). There is NO
+    /// single-flusher election: every committer whose record isn't yet covered snapshots + publishes
+    /// its own group frame under a BRIEF commit_mutex hold (the WAL's ticket gate assigns frame
+    /// order there) and then waits for the fence pool's contiguous durable cut OFF-LOCK, so MANY
+    /// groups are durable in flight at once. A committer whose tail another thread already published
+    /// (so `begin_group_flush` reports `Clean`) does NOT re-snapshot in a tight loop — it POLLS the
+    /// shared `durable_records` mirror (spin-then-yield, no per-commit wakeup) until the owning
+    /// thread's fence completes and advances it. Visibility still gates on the durable frontier
+    /// exactly as the serial path; a fence/publish/roll failure wedges fail-closed identically.
+    fn wait_group_durable_concurrent(&self, wal_position: usize) -> Result<(), EngineError> {
+        // Spins before a `yield_now` while polling the durable mirror — mirrors the FUA backend's
+        // own durable-cut wait discipline (pure spin keeps the ack near one fence latency; the
+        // yield fallback avoids burning a core when the pool is genuinely backed up).
+        const SPIN_BEFORE_YIELD: u32 = 256;
+        // After this many `yield_now`s with no progress, fall back to re-`begin_group_flush` so a
+        // poisoned backend is surfaced (liveness backstop only — normal acks are sub-millisecond).
+        const POLL_YIELD_BUDGET: u32 = 1 << 16;
+        loop {
+            if self
+                .group_flush
+                .durable_records
+                .load(AtomicOrdering::Acquire)
+                >= wal_position
+            {
+                return Ok(());
+            }
+            if self.group_flush.wedged.load(AtomicOrdering::Acquire) {
+                return Err(self.group_flush_wedged_error());
+            }
+            // Snapshot + publish our unflushed tail under a BRIEF commit_mutex hold (frame order is
+            // assigned here), then make it durable OFF-LOCK. No `flusher_active` gate — concurrent
+            // begins are exactly what the FUA ticket gate is built to order.
+            let begun = {
+                let mut commit = self.commit_state();
+                commit.wal.begin_group_flush()
+            };
+            match begun {
+                Ok(gpu_db_wal::WalGroupFlushBegin::Clean { flushed_records }) => {
+                    // Another committer already published our tail and owns the in-flight frame that
+                    // covers us; it will advance `durable_records` when its fence completes. Refresh
+                    // the mirror with the snapshot's durable cut, then POLL (no wakeup) until either
+                    // the frontier covers us or the owner wedges.
+                    self.group_flush
+                        .durable_records
+                        .fetch_max(flushed_records, AtomicOrdering::AcqRel);
+                    // Bound the poll so a re-`begin_group_flush` eventually surfaces a poisoned
+                    // backend even if the owning thread died mid-flight without setting `wedged`
+                    // (far beyond one fence latency — the common case unblocks in the first spins).
+                    let mut yields: u32 = 0;
+                    let mut spins: u32 = 0;
+                    loop {
+                        if self
+                            .group_flush
+                            .durable_records
+                            .load(AtomicOrdering::Acquire)
+                            >= wal_position
+                        {
+                            return Ok(());
+                        }
+                        if self.group_flush.wedged.load(AtomicOrdering::Acquire) {
+                            return Err(self.group_flush_wedged_error());
+                        }
+                        if spins < SPIN_BEFORE_YIELD {
+                            spins += 1;
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                            yields += 1;
+                            if yields >= POLL_YIELD_BUDGET {
+                                break; // fall back to the outer loop (re-begin surfaces poison)
+                            }
+                        }
+                    }
+                }
+                Ok(gpu_db_wal::WalGroupFlushBegin::Job(job)) => match job.commit() {
+                    Ok(flushed_records) => {
+                        self.group_flush
+                            .durable_records
+                            .fetch_max(flushed_records, AtomicOrdering::AcqRel);
+                        // Loop: our own record was appended before this frame was published, so the
+                        // frontier now covers it.
+                    }
+                    Err(err) => return Err(self.wedge_group_flush(err)),
+                },
+                Err(err) => return Err(self.wedge_group_flush(err)),
+            }
+        }
+    }
+
+    /// E1 step 2 — wedge the concurrent group-flush path fail-closed after a fence/publish/roll
+    /// failure whose group's member deltas were already applied (they can never be published, and
+    /// nothing later may publish over them). Records the sticky failure under the coordination lock,
+    /// flips the lock-free `wedged` mirror so POLLING waiters bail, and PANICS while holding the
+    /// commit_mutex — poisoning it so the façade refuses further service (restart recovery replays
+    /// the durable WAL prefix; the un-fsynced records were never acknowledged nor visible). This is
+    /// the same wedge-don't-serve-torn-state policy the serial path's flusher applies.
+    fn wedge_group_flush(&self, err: EngineError) -> EngineError {
+        {
+            let mut coord = self
+                .group_flush
+                .coord
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if coord.failed.is_none() {
+                coord.failed = Some(err.to_string());
+            }
+        }
+        self.group_flush.wedged.store(true, AtomicOrdering::Release);
+        let _commit = self.commit_state();
+        panic!(
+            "group-commit FUA durability failed after member deltas were applied: {err} — \
+             wedging the commit path; restart recovery replays the durable WAL prefix"
+        );
+    }
+
+    /// The sticky-failure error a concurrent waiter returns once the path is wedged.
+    fn group_flush_wedged_error(&self) -> EngineError {
+        let coord = self
+            .group_flush
+            .coord
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let msg = coord.failed.clone().unwrap_or_else(|| "wedged".to_string());
+        EngineError::Durability(format!(
+            "group-commit durability failed; the commit path is wedged pending restart \
+             recovery: {msg}"
+        ))
     }
 
     pub fn execute_text(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
