@@ -1,0 +1,10 @@
+[package]
+name = "gpu_db_write_conveyor"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+crc32c = "0.6"
+libc = "0.2"
+tikv-jemallocator.workspace = true

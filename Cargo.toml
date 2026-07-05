@@ -12,6 +12,7 @@ members = [
   "crates/observability",
   "crates/protocol",
   "crates/storage",
+  "crates/write_conveyor",
   "crates/engine",
   "crates/facade",
   "crates/server",
