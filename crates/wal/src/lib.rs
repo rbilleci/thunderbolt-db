@@ -6,6 +6,14 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use gpu_db_types::{EngineError, TxnId};
 
+// E1 step 1: the optional FUA fence-pool durability backend (unix-only — it drives a
+// `gpu_db_write_conveyor::FuaFrameLog`, an `O_DIRECT|O_DSYNC` construct). Default is OFF; the
+// serial `WalDurableCore` path above is unchanged.
+#[cfg(unix)]
+mod fua;
+#[cfg(unix)]
+pub use fua::recover_fua_wal_records;
+
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
 const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";
@@ -403,12 +411,58 @@ pub enum WalGroupFlushBegin {
     Clean { flushed_records: usize },
 }
 
-/// A snapshotted group flush: the serialized unflushed tail plus the open segment handle. The
-/// expensive part — `write_all` + fsync — runs in [`WalGroupFlushJob::commit`] with NO lock
-/// held, so appenders keep working (and the next group keeps forming) while the disk syncs.
-/// While a job is outstanding the core's `io_in_flight` excludes every other writer of the file
-/// (inline flushes and admin ops wait on the condvar).
+/// A snapshotted group flush whose expensive durability step — one `write_all` + fsync for the
+/// serial backend, or a frame publish + fence-pool durable-cut wait for the FUA backend — runs in
+/// [`WalGroupFlushJob::commit`] with NO lock held, so appenders keep working (and the next group
+/// keeps forming) while the disk syncs. The public shape (`begin_group_flush` -> `Job(job)` ->
+/// `job.commit()`) is identical across backends; only the private [`WalGroupFlushJobKind`]
+/// differs. The `Option` is the consume-or-abandon latch: `commit` takes it, `Drop` abandons
+/// whatever is left (a caller that panicked between begin and commit), which fail-closes the
+/// backing so no later flush appends past a possibly-torn region / a never-published frame gap.
 pub struct WalGroupFlushJob {
+    kind: Option<WalGroupFlushJobKind>,
+}
+
+enum WalGroupFlushJobKind {
+    /// The serial-fdatasync backend: one positional `write_all` + `fdatasync` on the live segment.
+    Serial(SerialFlushJob),
+    /// The FUA fence-pool backend (E1 step 1): publish the group's frame and wait for the
+    /// contiguous durable cut to cover it, allowing MULTIPLE groups durable in flight.
+    #[cfg(unix)]
+    Fua(fua::FuaFlushJob),
+}
+
+impl WalGroupFlushJob {
+    /// Make the snapshotted group durable — call with NO locks held. For the serial backend this
+    /// is one `write_all` + `fdatasync`; for the FUA backend it publishes the frame and spins on
+    /// the fence pool's durable cut. Returns the new durable watermark (record count). On failure
+    /// the backing is POISONED fail-closed (the group's members may already have applied their
+    /// deltas; see the engine's group-commit wedge semantics).
+    pub fn commit(mut self) -> Result<usize, EngineError> {
+        match self.kind.take().expect("group flush job already consumed") {
+            WalGroupFlushJobKind::Serial(job) => job.commit(),
+            #[cfg(unix)]
+            WalGroupFlushJobKind::Fua(job) => job.commit(),
+        }
+    }
+}
+
+impl Drop for WalGroupFlushJob {
+    fn drop(&mut self) {
+        // `commit` took the kind out; anything left is an abandoned-mid-flight job.
+        match self.kind.take() {
+            None => {}
+            Some(WalGroupFlushJobKind::Serial(job)) => job.abandon(),
+            #[cfg(unix)]
+            Some(WalGroupFlushJobKind::Fua(job)) => job.abandon(),
+        }
+    }
+}
+
+/// The serial-fdatasync group flush: the serialized unflushed tail plus the open segment handle.
+/// While it is outstanding the core's `io_in_flight` excludes every other writer of the file
+/// (inline flushes and admin ops wait on the condvar).
+struct SerialFlushJob {
     core: Arc<WalDurableCore>,
     file: Arc<File>,
     /// W4a: the logical tail this group writes at (positional IO inside preallocated extents).
@@ -419,20 +473,14 @@ pub struct WalGroupFlushJob {
     bytes: Vec<u8>,
     target_records: usize,
     group_size: usize,
-    /// Disarmed by `commit`; a dropped-in-flight job (caller panicked between begin and commit)
-    /// poisons the backing so no later flush appends past a possibly-torn region.
-    completed: bool,
 }
 
-impl WalGroupFlushJob {
-    /// Perform the group's IO (one `write_all`, one `fdatasync`) — call with NO locks held —
-    /// then complete under the durable core's own lock: advance the watermark + stats and wake
-    /// waiters. Returns the new durable watermark (record count). On IO failure the backing is
-    /// POISONED fail-closed (the group's members may already have applied their deltas; see the
-    /// engine's group-commit wedge semantics) and waiters are still woken.
-    pub fn commit(mut self) -> Result<usize, EngineError> {
+impl SerialFlushJob {
+    /// Perform the group's IO (one `write_all`, one `fdatasync`) then complete under the durable
+    /// core's own lock: advance the watermark + stats and wake waiters. On IO failure the backing
+    /// is POISONED fail-closed and waiters are still woken.
+    fn commit(self) -> Result<usize, EngineError> {
         use std::os::unix::fs::FileExt;
-        self.completed = true;
         // W4a: extend the zero-filled frontier lock-free if this group crosses it (rare — once
         // per chunk; `io_in_flight` excludes every other writer), then write POSITIONALLY at
         // the snapshotted logical tail so `sync_data` never pays size-change journaling.
@@ -472,15 +520,10 @@ impl WalGroupFlushJob {
         self.core.cv.notify_all();
         outcome
     }
-}
 
-impl Drop for WalGroupFlushJob {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        // The flusher died between begin and commit: the file may hold a partial write. Fail
-        // closed and wake anyone waiting for the IO to drain.
+    /// The flusher died between begin and commit: the file may hold a partial write. Fail closed
+    /// and wake anyone waiting for the IO to drain.
+    fn abandon(self) {
         let mut state = self.core.lock_state();
         state.io_in_flight = false;
         state.poisoned = Some("group flush abandoned mid-IO".to_string());
@@ -552,6 +595,63 @@ pub struct WalBuffer {
     flushed_memory: usize,
     fail_next_flush: bool,
     durable: Option<Arc<WalDurableCore>>,
+    /// E1 step 1: the optional FUA fence-pool durability backend (default OFF). When present it
+    /// REPLACES `durable`: `flush_all` / `begin_group_flush` publish frames into a pipelined
+    /// fence pool whose contiguous durable cut is the record watermark, so MULTIPLE groups can
+    /// be durable in flight at once (unlike the serial single-slot `durable` core). Gated behind
+    /// `#[cfg(unix)]` because the underlying `FuaFrameLog` is a unix `O_DIRECT|O_DSYNC` construct.
+    #[cfg(unix)]
+    fua: Option<Arc<fua::FuaWalBackend>>,
+}
+
+/// Which durability backend a durable [`WalBuffer`] uses. Default is the existing single-slot
+/// serial `write_all` + `fdatasync` path; the FUA fence pool is opt-in (E1 step 1) and, once the
+/// engine is wired to it in step 2, env-gated via [`WalDurability::from_env`] (default OFF).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WalDurability {
+    /// The existing behavior: one `write_all` + `fdatasync` per group, at most one IO in flight.
+    #[default]
+    SerialFdatasync,
+    /// The FUA fence-pool backend: `lanes` concurrent FUA-write fence lanes over pre-written,
+    /// epoch-stamped frame-log segments of `segment_bytes` data capacity each; the contiguous
+    /// durable cut advances the record watermark, allowing multiple groups durable in flight.
+    FuaFencePool { lanes: usize, segment_bytes: usize },
+}
+
+impl WalDurability {
+    /// Suggested fence-pool depth when the env leaves it unset (measured fast-mode flip is
+    /// qd 16-48 on the reference NVMe; 32 is a safe midpoint — re-probe per device at bring-up).
+    pub const DEFAULT_FUA_LANES: usize = 32;
+    /// Suggested per-segment data capacity when the env leaves it unset (64MiB, matching the
+    /// serial preallocation chunk).
+    pub const DEFAULT_FUA_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Read the durability backend from the environment (the step-2 engine flag surface).
+    /// `GPU_DB_WAL_DURABILITY=fua` selects the FUA fence pool (with `GPU_DB_WAL_FUA_LANES` and
+    /// `GPU_DB_WAL_FUA_SEGMENT_BYTES` overrides); anything else — including unset — is the serial
+    /// default. Kept here so the engine's later wiring reads ONE authority for the gate.
+    pub fn from_env() -> Self {
+        let selected = std::env::var("GPU_DB_WAL_DURABILITY")
+            .map(|v| v.eq_ignore_ascii_case("fua"))
+            .unwrap_or(false);
+        if !selected {
+            return Self::SerialFdatasync;
+        }
+        let lanes = std::env::var("GPU_DB_WAL_FUA_LANES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(Self::DEFAULT_FUA_LANES);
+        let segment_bytes = std::env::var("GPU_DB_WAL_FUA_SEGMENT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(Self::DEFAULT_FUA_SEGMENT_BYTES);
+        Self::FuaFencePool {
+            lanes,
+            segment_bytes,
+        }
+    }
 }
 
 impl WalBuffer {
@@ -571,6 +671,33 @@ impl WalBuffer {
             durable: Some(Arc::new(WalDurableCore::fresh(segment_path.into()))),
             ..Self::default()
         }
+    }
+
+    /// A WAL buffer backed by the FUA fence-pool durability backend (E1 step 1) — a FRESH durable
+    /// database. `flush_all` / `begin_group_flush` publish each group's encoded record run as ONE
+    /// frame into a pipelined fence pool; the contiguous durable cut is the record watermark, so
+    /// multiple groups can be durable in flight at once. Segment files are created next to
+    /// `segment_path` (named `<segment_path>.fua.<segment_id>`); recovery reads them back with
+    /// [`recover_fua_wal_records`]. `lanes` is the fence-pool depth (see
+    /// [`WalDurability::DEFAULT_FUA_LANES`]); `segment_bytes` is the per-segment data capacity.
+    ///
+    /// The frame payload bytes are byte-identical to what the serial backend's group flush would
+    /// have written for the same records (the [`encode_record_into`] run), so the two backends
+    /// recover to the same logical `WalRecord`s.
+    #[cfg(unix)]
+    pub fn with_fua_durable_segment(
+        segment_path: impl Into<PathBuf>,
+        lanes: usize,
+        segment_bytes: usize,
+    ) -> Result<Self, EngineError> {
+        Ok(Self {
+            fua: Some(Arc::new(fua::FuaWalBackend::create(
+                segment_path.into(),
+                lanes,
+                segment_bytes,
+            )?)),
+            ..Self::default()
+        })
     }
 
     /// A WAL buffer installed over a segment just read back by [`recover_wal_segment`], seeded
@@ -632,11 +759,18 @@ impl WalBuffer {
             flushed_memory: 0,
             fail_next_flush: false,
             durable: Some(Arc::new(core)),
+            #[cfg(unix)]
+            fua: None,
         })
     }
 
-    /// The durable segment path, if this buffer is backed by one.
+    /// The durable segment path, if this buffer is backed by one. For the FUA backend this is the
+    /// base path the per-segment files (`<path>.fua.<segment_id>`) sit beside.
     pub fn durable_segment_path(&self) -> Option<&Path> {
+        #[cfg(unix)]
+        if let Some(fua) = self.fua.as_ref() {
+            return Some(fua.base_path());
+        }
         self.durable
             .as_ref()
             .map(|core| core.segment_path.as_path())
@@ -644,6 +778,10 @@ impl WalBuffer {
 
     /// Whether `flush_all` performs a real fsync (vs. in-memory watermark advance only).
     pub fn is_durable(&self) -> bool {
+        #[cfg(unix)]
+        if self.fua.is_some() {
+            return true;
+        }
         self.durable.is_some()
     }
 
@@ -686,6 +824,20 @@ impl WalBuffer {
         // being cut would have had to `begin` inside this holder's outer critical section — it
         // cannot have). If a future caller cuts below the flushed watermark, physically rewind
         // the segment too so the file never replays records the buffer disowned.
+        #[cfg(unix)]
+        if let Some(fua) = self.fua.as_ref() {
+            // The FUA backend advances its `published` cursor only inside `begin_group_flush`,
+            // which runs under this same outer lock; so a commit-path rollback cutting the tail
+            // it just appended is always ABOVE `published` and needs no frame rewind. A cut BELOW
+            // `published` would disown records already handed to (possibly already-durable) frames
+            // — the frame log cannot un-publish, so fail closed (defensive; never hit on the
+            // commit path) and still drop the logical tail so the buffer's history stays coherent.
+            if len < fua.published_records() {
+                fua.set_poison("WAL truncate below the published FUA frame watermark");
+            }
+            self.records.truncate(len);
+            return;
+        }
         match self.durable.as_ref() {
             None => {
                 self.records.truncate(len);
@@ -747,6 +899,25 @@ impl WalBuffer {
     /// leaves the on-disk tail state unknowable poisons the backing (fail-closed until restart
     /// recovery truncates the torn tail at [`recover_wal_segment`] time).
     pub fn flush_all(&mut self) -> Result<(), EngineError> {
+        // FUA backend: the inline serial-path flush is just a group flush that also WAITS for the
+        // durable cut. Delegating keeps one publish/wait path (and one `fail_next_flush`
+        // consumption, handled by `begin_group_flush`).
+        #[cfg(unix)]
+        if self.fua.is_some() {
+            let target = self.records.len();
+            match self.begin_group_flush()? {
+                WalGroupFlushBegin::Clean { .. } => {}
+                WalGroupFlushBegin::Job(job) => {
+                    job.commit()?;
+                }
+            }
+            // Ensure durability up to the full record count: a `Clean` return means nothing NEW to
+            // publish, but concurrently-published frames may not have reached the durable cut yet.
+            if let Some(fua) = self.fua.as_ref() {
+                fua.wait_durable(target)?;
+            }
+            return Ok(());
+        }
         if self.fail_next_flush {
             self.fail_next_flush = false;
             return Err(EngineError::Durability(
@@ -831,9 +1002,12 @@ impl WalBuffer {
     ///
     /// In-memory mode: advances the watermark (no IO exists to defer) and reports `Clean`.
     ///
-    /// The caller must serialize group flushes (at most one outstanding job — the engine's
-    /// flusher-election does this); the job's `io_in_flight` mark excludes the INLINE
-    /// [`WalBuffer::flush_all`] path in the meantime.
+    /// The serial backend requires the caller to serialize group flushes (at most one outstanding
+    /// job — the engine's flusher-election does this); the job's `io_in_flight` mark excludes the
+    /// INLINE [`WalBuffer::flush_all`] path in the meantime. The FUA backend has NO such single-slot
+    /// exclusion: it snapshots + advances its `published` cursor under this outer lock (so frames
+    /// stay totally ordered) and the returned job's fence-pool wait runs concurrently with any
+    /// other FUA job — multiple groups may be durable in flight at once.
     pub fn begin_group_flush(&mut self) -> Result<WalGroupFlushBegin, EngineError> {
         if self.fail_next_flush {
             self.fail_next_flush = false;
@@ -842,6 +1016,45 @@ impl WalBuffer {
             ));
         }
         let target = self.records.len();
+        // FUA backend: snapshot the not-yet-published tail as ONE frame payload (its bytes are the
+        // exact serial-encoded record run), advance the `published` cursor under this outer lock
+        // so frame order is total, and hand back a job that publishes + waits for the durable cut.
+        #[cfg(unix)]
+        if let Some(fua) = self.fua.as_ref() {
+            if let Some(reason) = fua.poison_reason() {
+                return Err(fua.poison_error(&reason));
+            }
+            let published = fua.published_records();
+            let group_size = target.saturating_sub(published);
+            if group_size == 0 {
+                return Ok(WalGroupFlushBegin::Clean {
+                    flushed_records: fua.durable_records(),
+                });
+            }
+            let seq_count = u32::try_from(group_size).map_err(|_| {
+                EngineError::Durability(
+                    "FUA WAL group exceeds u32 records; split the commit batch".to_string(),
+                )
+            })?;
+            let mut payload = Vec::new();
+            for record in &self.records[published..target] {
+                encode_record_into(&mut payload, record)?;
+            }
+            // Allocate the ticket and advance the published cursor together under this outer lock
+            // so tickets and `first_seq` ranges are assigned in one total order.
+            let ticket = fua.next_ticket();
+            fua.set_published(target);
+            return Ok(WalGroupFlushBegin::Job(WalGroupFlushJob {
+                kind: Some(WalGroupFlushJobKind::Fua(fua::FuaFlushJob::new(
+                    Arc::clone(fua),
+                    ticket,
+                    payload,
+                    published as u64,
+                    seq_count,
+                    target,
+                ))),
+            }));
+        }
         let Some(core) = self.durable.as_ref() else {
             self.flushed_memory = target;
             return Ok(WalGroupFlushBegin::Clean {
@@ -870,28 +1083,40 @@ impl WalBuffer {
         let file = state.file.clone().expect("write handle present");
         state.io_in_flight = true;
         Ok(WalGroupFlushBegin::Job(WalGroupFlushJob {
-            core: Arc::clone(core),
-            file,
-            offset: state.durable_bytes,
-            prealloc_end: state.prealloc_bytes,
-            bytes: tail,
-            target_records: target,
-            group_size,
-            completed: false,
+            kind: Some(WalGroupFlushJobKind::Serial(SerialFlushJob {
+                core: Arc::clone(core),
+                file,
+                offset: state.durable_bytes,
+                prealloc_end: state.prealloc_bytes,
+                bytes: tail,
+                target_records: target,
+                group_size,
+            })),
         }))
     }
 
     /// Valid, fsynced byte length of the live durable segment (0 for an in-memory buffer or
-    /// before the first durable flush). The size-bound input for checkpoint/rotation policy.
+    /// before the first durable flush). The size-bound input for checkpoint/rotation policy. The
+    /// FUA backend self-rolls its own segments, so it reports 0 (the outer rotation policy does not
+    /// drive it — step 2 exposes FUA-native size/retention introspection).
     pub fn durable_segment_bytes(&self) -> u64 {
+        #[cfg(unix)]
+        if self.fua.is_some() {
+            return 0;
+        }
         self.durable
             .as_ref()
             .map_or(0, |core| core.lock_state().durable_bytes)
     }
 
     /// How many of the buffer's records are durable in an external checkpoint segment rather than
-    /// the live segment file (see [`WalBuffer::truncate_durable_segment_prefix`]).
+    /// the live segment file (see [`WalBuffer::truncate_durable_segment_prefix`]). Always 0 for the
+    /// FUA backend (no external checkpoint segment in step 1).
     pub fn durable_segment_base_records(&self) -> usize {
+        #[cfg(unix)]
+        if self.fua.is_some() {
+            return 0;
+        }
         self.durable
             .as_ref()
             .map_or(0, |core| core.lock_state().segment_base_records)
@@ -906,6 +1131,16 @@ impl WalBuffer {
     /// logical counters are unchanged — only the FILE is trimmed, so a long-lived database's live
     /// segment stays bounded by the checkpoint cadence instead of growing forever.
     pub fn truncate_durable_segment_prefix(&mut self, base: usize) -> Result<(), EngineError> {
+        // The FUA backend's segment lifecycle (roll + recycle + retention) is step 2; it has no
+        // external checkpoint segment to trim against in step 1.
+        #[cfg(unix)]
+        if self.fua.is_some() {
+            let _ = base;
+            return Err(EngineError::Durability(
+                "prefix truncation is not supported by the FUA WAL backend in E1 step 1"
+                    .to_string(),
+            ));
+        }
         let core = self.durable.as_ref().ok_or_else(|| {
             EngineError::Durability(
                 "cannot truncate the segment prefix of an in-memory WAL buffer".to_string(),
@@ -981,6 +1216,11 @@ impl WalBuffer {
     }
 
     pub fn flushed_count(&self) -> usize {
+        // FUA backend: the durable watermark is the contiguous durable cut of the fence pool.
+        #[cfg(unix)]
+        if let Some(fua) = self.fua.as_ref() {
+            return fua.durable_records();
+        }
         match self.durable.as_ref() {
             Some(core) => core.lock_state().flushed_records,
             None => self.flushed_memory,
@@ -998,6 +1238,10 @@ impl WalBuffer {
     /// Group-commit accounting (fsync groups, durable records, largest group). See
     /// [`WalGroupCommitStats`].
     pub fn group_commit_stats(&self) -> WalGroupCommitStats {
+        #[cfg(unix)]
+        if let Some(fua) = self.fua.as_ref() {
+            return fua.group_commit_stats();
+        }
         self.durable
             .as_ref()
             .map_or(WalGroupCommitStats::default(), |core| {
@@ -4122,6 +4366,52 @@ fn encoded_record_len(record: &WalRecord) -> u64 {
     WAL_RECORD_HEADER_LEN as u64 + record.payload.len() as u64
 }
 
+/// Strictly decode a run of [`encode_record_into`]-encoded records that must consume EXACTLY
+/// `bytes` (no torn tail — the caller has already validated the container's integrity, e.g. a FUA
+/// frame's payload CRC). This is the FUA backend's replay decode: a frame payload is the byte-for-
+/// byte record run the serial group flush would have written, so it decodes to the identical
+/// `WalRecord`s. Each record's own checksum is re-verified as defense in depth, and any leftover
+/// or truncated bytes are a hard error (an intact frame can never contain a partial record).
+#[cfg(unix)]
+pub(crate) fn decode_wal_record_run(bytes: &[u8]) -> Result<Vec<WalRecord>, EngineError> {
+    let mut records = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if bytes.len() - offset < WAL_RECORD_HEADER_LEN {
+            return Err(EngineError::Durability(
+                "FUA WAL frame payload ends with a truncated record header".to_string(),
+            ));
+        }
+        let header = &bytes[offset..offset + WAL_RECORD_HEADER_LEN];
+        let txn_id = u64::from_le_bytes(header[0..8].try_into().expect("txn id bytes"));
+        let payload_len = u64::from_le_bytes(header[8..16].try_into().expect("payload len bytes"));
+        let expected_checksum =
+            u64::from_le_bytes(header[16..24].try_into().expect("checksum bytes"));
+        let payload_start = offset + WAL_RECORD_HEADER_LEN;
+        let payload_end = usize::try_from(payload_len)
+            .ok()
+            .and_then(|len| payload_start.checked_add(len))
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| {
+                EngineError::Durability(
+                    "FUA WAL frame payload record length overruns the frame".to_string(),
+                )
+            })?;
+        let payload = &bytes[payload_start..payload_end];
+        if wal_record_checksum(txn_id, payload_len, payload) != expected_checksum {
+            return Err(EngineError::Durability(format!(
+                "FUA WAL frame payload record checksum mismatch for txn {txn_id}"
+            )));
+        }
+        records.push(WalRecord {
+            txn_id,
+            payload: payload.to_vec().into(),
+        });
+        offset = payload_end;
+    }
+    Ok(records)
+}
+
 fn temporary_segment_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -6764,5 +7054,231 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
 
         assert!(err.to_string().contains("non-increasing transaction order"));
+    }
+
+    // ---- E1 step 1: FUA fence-pool durability backend -----------------------------------------
+
+    #[cfg(unix)]
+    fn fua_test_base(name: &str) -> PathBuf {
+        // A per-test DIRECTORY so the `<base>.fua.<id>` segment files don't collide, and cleanup
+        // can drop the whole dir.
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-fua-{name}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create fua test dir");
+        dir.join("wal.segment")
+    }
+
+    #[cfg(unix)]
+    fn rec(txn_id: TxnId, payload: &[u8]) -> WalRecord {
+        WalRecord {
+            txn_id,
+            payload: payload.to_vec().into(),
+        }
+    }
+
+    /// (a) Roundtrip + recovery parity: the same logical records recover BYTE-IDENTICALLY through
+    /// the FUA backend's frame log and through the serial segment reader.
+    #[cfg(unix)]
+    #[test]
+    fn fua_roundtrip_recovers_identically_to_serial_path() {
+        let base = fua_test_base("roundtrip");
+        let records = vec![
+            rec(1, b"CREATE TABLE t (id INT)"),
+            rec(2, b"INSERT INTO t (id) VALUES (1)"),
+            rec(3, &vec![0xABu8; 9000]), // multi-4KiB payload, exercises frame padding
+            rec(4, b"UPDATE t SET id = 2 WHERE id = 1"),
+        ];
+
+        // FUA path: append + group-flush all records as one group, then recover from disk.
+        {
+            let mut wal =
+                WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("fua create");
+            assert!(wal.is_durable());
+            assert_eq!(wal.durable_segment_path(), Some(base.as_path()));
+            for record in &records {
+                wal.append(record.clone());
+            }
+            wal.flush_all().expect("fua flush");
+            assert_eq!(wal.flushed_count(), records.len());
+            assert_eq!(wal.unflushed_count(), 0);
+        }
+        let fua_recovered = recover_fua_wal_records(&base).expect("fua recover");
+
+        // Serial path: the same records written to a plain segment and read back.
+        let serial_path = base.with_file_name("serial.segment");
+        write_wal_segment(&serial_path, &records).expect("serial write");
+        let serial_recovered = read_wal_segment(&serial_path).expect("serial read");
+
+        assert_eq!(fua_recovered, records, "fua recovery must match input");
+        assert_eq!(
+            fua_recovered, serial_recovered,
+            "fua and serial recovery must be identical"
+        );
+
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
+    /// (b) The durable watermark advances ONLY over the contiguous durable cut and is monotonic,
+    /// even with MULTIPLE flush jobs in flight completing out of order across the fence pool.
+    #[cfg(unix)]
+    #[test]
+    fn fua_watermark_is_monotonic_under_concurrent_in_flight_jobs() {
+        use std::sync::Arc as StdArc;
+        use std::sync::Mutex as StdMutex;
+
+        let base = fua_test_base("monotonic");
+        let wal = StdArc::new(StdMutex::new(
+            WalBuffer::with_fua_durable_segment(&base, 32, 4 << 20).expect("fua create"),
+        ));
+
+        // Producer: append records and start group flushes concurrently. Each begin snapshots a
+        // disjoint record range under the outer lock; commits run lock-free and may finish out of
+        // order, so a watching thread must never see the watermark go backwards or exceed the
+        // published count.
+        let groups = 40usize;
+        let per_group = 5usize;
+        let total = groups * per_group;
+        // A watcher samples the durable watermark under the outer lock throughout the run and
+        // asserts it NEVER decreases (advances only over the contiguous cut) and never overshoots
+        // the records appended so far. This is the time-domain monotonicity property; the
+        // per-commit return values below are the value-domain property.
+        let done = StdArc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let wal = StdArc::clone(&wal);
+            let done = StdArc::clone(&done);
+            std::thread::spawn(move || {
+                let mut last = 0usize;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    let watermark = wal.lock().unwrap().flushed_count();
+                    assert!(
+                        watermark >= last,
+                        "watermark regressed: {watermark} < {last}"
+                    );
+                    assert!(
+                        watermark <= total,
+                        "watermark {watermark} exceeds published {total}"
+                    );
+                    last = watermark;
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        // (job_target, join handle): each commit must return a watermark that already covers its
+        // own group (the durable cut reached at least its target) and never exceeds the total.
+        let mut handles = Vec::new();
+        let mut next_txn = 1u64;
+        for group in 0..groups {
+            let target = (group + 1) * per_group;
+            let begun = {
+                let mut guard = wal.lock().unwrap();
+                for _ in 0..per_group {
+                    guard.append(rec(next_txn, format!("op-{next_txn}").as_bytes()));
+                    next_txn += 1;
+                }
+                guard.begin_group_flush().expect("begin")
+            };
+            match begun {
+                WalGroupFlushBegin::Clean { .. } => {}
+                WalGroupFlushBegin::Job(job) => {
+                    handles.push((
+                        target,
+                        std::thread::spawn(move || job.commit().expect("commit")),
+                    ));
+                }
+            }
+        }
+
+        for (target, handle) in handles {
+            let watermark = handle.join().expect("join");
+            assert!(
+                watermark >= target,
+                "commit returned watermark {watermark} below its own group target {target}"
+            );
+            assert!(
+                watermark <= total,
+                "watermark {watermark} exceeds published {total}"
+            );
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        watcher.join().expect("watcher");
+
+        {
+            let mut guard = wal.lock().unwrap();
+            guard.flush_all().expect("final flush");
+            assert_eq!(guard.flushed_count(), total);
+        }
+        // Everything recovers, in order.
+        let recovered = recover_fua_wal_records(&base).expect("recover");
+        assert_eq!(recovered.len(), total);
+        for (index, record) in recovered.iter().enumerate() {
+            assert_eq!(record.txn_id, index as u64 + 1);
+        }
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
+    /// (c) Segment roll mid-stream: a small per-segment capacity forces several rolls; the
+    /// totally-ordered record history recovers contiguously ACROSS the rolled segment files.
+    #[cfg(unix)]
+    #[test]
+    fn fua_segment_roll_recovers_across_segments() {
+        let base = fua_test_base("roll");
+        let payload = vec![0x5Au8; 2000]; // ~3 frames fit a 12KiB-ish segment before StorageFull
+        let total = 60usize;
+        {
+            // 16KiB data capacity per segment: each ~2KB record pads to 4KiB, so ~4 frames/segment
+            // -> many rolls over 60 records.
+            let mut wal =
+                WalBuffer::with_fua_durable_segment(&base, 8, 16 * 1024).expect("fua create");
+            for txn in 1..=total as u64 {
+                wal.append(rec(txn, &payload));
+                // Flush each record individually so every group is its own frame — maximizes rolls.
+                wal.flush_all().expect("flush");
+                assert_eq!(wal.flushed_count(), txn as usize);
+            }
+        }
+        // More than one segment file must exist (a roll happened).
+        let dir = base.parent().unwrap();
+        let segment_count = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("wal.segment.fua."))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            segment_count > 1,
+            "expected multiple rolled segments, found {segment_count}"
+        );
+
+        let recovered = recover_fua_wal_records(&base).expect("recover across segments");
+        assert_eq!(recovered.len(), total);
+        for (index, record) in recovered.iter().enumerate() {
+            assert_eq!(record.txn_id, index as u64 + 1);
+            assert_eq!(&record.payload[..], &payload[..]);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The FUA backend surfaces its config errors and the step-1 unsupported ops fail-closed.
+    #[cfg(unix)]
+    #[test]
+    fn fua_config_and_unsupported_ops_error() {
+        let base = fua_test_base("config");
+        assert!(WalBuffer::with_fua_durable_segment(&base, 8, 0).is_err());
+
+        let mut wal = WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("create");
+        wal.append(rec(1, b"x"));
+        wal.flush_all().expect("flush");
+        // Prefix truncation is a step-2 capability; it must error rather than silently no-op.
+        assert!(wal.truncate_durable_segment_prefix(0).is_err());
+        assert_eq!(wal.durable_segment_base_records(), 0);
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 }

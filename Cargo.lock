@@ -760,6 +760,7 @@ name = "gpu_db_wal"
 version = "0.1.0"
 dependencies = [
  "gpu_db_types",
+ "gpu_db_write_conveyor",
 ]
 
 [[package]]
