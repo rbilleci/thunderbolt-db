@@ -1835,7 +1835,7 @@ fn write_all_at_dsync(_file: &File, _bytes: &[u8], _offset: u64) -> std::io::Res
     ))
 }
 
-fn read_struct_at<T: Copy>(file: &mut File, offset: u64) -> std::io::Result<T> {
+pub(crate) fn read_struct_at<T: Copy>(file: &mut File, offset: u64) -> std::io::Result<T> {
     file.seek(SeekFrom::Start(offset))?;
     let mut value = MaybeUninit::<T>::uninit();
     let bytes =

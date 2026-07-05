@@ -99,14 +99,18 @@ impl FuaWalSegmentConfig {
     }
 }
 
-struct AlignedStaging {
+pub(crate) struct AlignedStaging {
     ptr: *mut u8,
     layout: Layout,
 }
 unsafe impl Send for AlignedStaging {}
 unsafe impl Sync for AlignedStaging {}
 impl AlignedStaging {
-    fn zeroed(len: usize) -> std::io::Result<Self> {
+    pub(crate) fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub(crate) fn zeroed(len: usize) -> std::io::Result<Self> {
         let layout = Layout::from_size_align(len.max(1), 4096)
             .map_err(|_| invalid_data("FUA WAL staging layout"))?;
         let ptr = unsafe { alloc_zeroed(layout) };
@@ -123,7 +127,25 @@ impl Drop for AlignedStaging {
 }
 
 #[repr(align(128))]
-struct PaddedAtomicU64(AtomicU64);
+pub(crate) struct PaddedAtomicU64(AtomicU64);
+
+impl PaddedAtomicU64 {
+    pub(crate) fn zero() -> Self {
+        Self(AtomicU64::new(0))
+    }
+    pub(crate) fn load_acquire(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+    pub(crate) fn load_relaxed(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub(crate) fn store_release(&self, value: u64) {
+        self.0.store(value, Ordering::Release)
+    }
+    pub(crate) fn fetch_add(&self, value: u64) -> u64 {
+        self.0.fetch_add(value, Ordering::AcqRel)
+    }
+}
 
 /// Optional per-block pipeline timestamps (nanoseconds from an internal base
 /// `Instant`), for latency attribution: publish -> fence-start -> fence-done
@@ -273,11 +295,7 @@ impl FuaWalSegment {
         block_stride: usize,
         bytes: usize,
     ) -> std::io::Result<Arc<Self>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | O_DIRECT | O_DSYNC)
-            .open(&config.path)?;
+        let file = fua_open_direct(&config.path)?;
         let staging = AlignedStaging::zeroed(block_capacity * block_stride)?;
         let segment = Self {
             file,
@@ -548,7 +566,16 @@ impl FuaWalSegment {
     }
 }
 
-fn prewrite_extents(path: &Path, bytes: u64) -> std::io::Result<()> {
+/// Open the FUA descriptor: `O_DIRECT|O_DSYNC` write-through, symlink-safe.
+pub(crate) fn fua_open_direct(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | O_DIRECT | O_DSYNC)
+        .open(path)
+}
+
+pub(crate) fn prewrite_extents(path: &Path, bytes: u64) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = OpenOptions::new()
         .write(true)

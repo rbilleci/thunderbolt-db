@@ -1418,7 +1418,14 @@ pub fn stats_for_range(first_client_seq: u64, count: u64) -> DrainStats {
 }
 
 #[cfg(unix)]
+mod fua_frame_log;
+#[cfg(unix)]
 mod fua_wal;
+#[cfg(unix)]
+pub use fua_frame_log::{
+    recover_frame_log_by_scan, FrameHandle, FuaFrameLog, FuaFrameLogAppender, FuaFrameLogConfig,
+    FuaFrameLogFencePool, RecoveredFrame,
+};
 #[cfg(unix)]
 mod wal_segment;
 #[cfg(unix)]

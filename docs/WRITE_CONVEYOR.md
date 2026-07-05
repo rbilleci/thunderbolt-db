@@ -1009,6 +1009,29 @@ clients   qd  block   throughput   client->durable-ack
 before device-bound). The engine-side lesson is structural: SQL commit acks must be delivered by polling
 event loops (gate batches of commits on `durable_record_seq` sweeps), never by per-commit thread wakeups.
 
+### E1 foundation: `FuaFrameLog` — variable-payload frame log for the engine WAL (2026-07-05)
+
+The engine's `gpu_db_wal` records are variable-length (SQL text, binary row-ops, DDL) and its group flush is
+single-slot serial `write_all`+`fdatasync` (`io_in_flight` excludes every other writer — at most ONE durable
+IO in flight, ~0.86ms/job in the archived diagnostics). `FuaFrameLog` generalizes the FUA lane to opaque
+variable payloads so ONE totally ordered log carries every record shape: 4KiB-aligned frames (64B padding-free
+CRC'd header + payload + zero pad), bounded slot ring, fence pool + contiguous durable cut reporting
+`durable_seq` (the engine's commit-visibility gate), epoch-stamped recycle, chain-walking scan recovery.
+Two implementation landmines worth recording: (a) header CRCs must cover PADDING-FREE layouts — implicit
+`repr(C)` padding is nondeterministic across stack copies; (b) frame alignment must be the 4KiB FILESYSTEM
+block, not the 512B device block — XFS serializes sub-fs-block O_DIRECT writes on the exclusive inode lock
+(measured: 3.5K fences/s at qd=16 with 512B alignment vs 28.5K at 4KiB).
+
+Smoke bench (`fua_frame_log_bench`, engine-shaped payload mix, scan-recovery validated): 28.5K durable
+frames/s at qd=16, 55.0K at qd=48 — identical fence economics to the fixed-record lane, so an engine group
+frame of ~50 records has a ~2.75M commits/s durability budget.
+
+Charter framing for the engine integration: this log is host CONTROL-PLANE work (WAL/durability IO is an
+enumerated host duty). The stages behind the durable cut — validation, store apply, index maintenance,
+visibility — are DATA PLANE and belong on the GPU (E2: fused device apply kernel replacing host tuple-store /
+value-index publication by DELETION, per the retirement program). SQL commit acks gate on `durable_seq` via
+batch-polling event loops, never per-commit wakeups.
+
 ## Next Build-Up
 
 1. **Done locally:** add segment rolling, retention metadata, and a small external control file for the synced
