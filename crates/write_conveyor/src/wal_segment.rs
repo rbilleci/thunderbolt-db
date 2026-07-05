@@ -3,39 +3,49 @@ use std::hint::spin_loop;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, MaybeUninit};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use super::{intent_for, preallocate_file, sync_parent_dir, DrainStats, PublishError, WriteIntent};
+use super::{
+    intent_for, preallocate_file, sync_parent_dir, DrainStats, OpenShardAppendStore, PublishError,
+    WriteIntent,
+};
 
-const WAL_SEGMENT_MAGIC: u64 = 0x5743_4f4e_5659_5347;
+pub(crate) const WAL_SEGMENT_MAGIC: u64 = 0x5743_4f4e_5659_5347;
 const WAL_CONTROL_MAGIC: u64 = 0x5743_4f4e_4354_524c;
 const WAL_MANAGER_CONTROL_MAGIC: u64 = 0x5743_4f4e_4d43_5452;
-const WAL_BLOCK_HEADER_MAGIC: u64 = 0x5743_4f4e_4248_4452;
-const WAL_BLOCK_TRAILER_MAGIC: u64 = 0x5743_4f4e_4254_524c;
+pub(crate) const WAL_BLOCK_HEADER_MAGIC: u64 = 0x5743_4f4e_4248_4452;
+pub(crate) const WAL_BLOCK_TRAILER_MAGIC: u64 = 0x5743_4f4e_4254_524c;
 const WAL_CONTROL_COMMIT_MARKER: u64 = 0x4455_5241_424c_455f;
 const WAL_MANAGER_CONTROL_COMMIT_MARKER: u64 = 0x4d47_5244_5552_4142;
-const WAL_BLOCK_COMMIT_MARKER: u64 = 0x434f_4d4d_4954_4544;
-const WAL_SEGMENT_VERSION: u32 = 1;
-const WAL_SEGMENT_HEADER_BYTES: usize = 4096;
+pub(crate) const WAL_BLOCK_COMMIT_MARKER: u64 = 0x434f_4d4d_4954_4544;
+pub(crate) const WAL_SEGMENT_VERSION: u32 = 1;
+pub(crate) const WAL_SEGMENT_HEADER_BYTES: usize = 4096;
 const WAL_CONTROL_SLOTS: usize = 2;
+/// Segment flag: block headers stamp `reserved0` with the segment id's low 32
+/// bits (the recycle epoch). Scan recovery then rejects valid-looking blocks
+/// left over from a previous life of a RECYCLED segment file, which would
+/// otherwise be indistinguishable from the current segment's blocks beyond the
+/// new frontier.
+pub(crate) const WAL_SEGMENT_FLAG_EPOCH_STAMPED: u32 = 1;
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, Default)]
-struct WalSegmentFileHeader {
-    magic: u64,
-    version: u32,
-    header_bytes: u32,
-    segment_id: u64,
-    block_size: u32,
-    block_capacity: u32,
-    record_size: u32,
-    block_header_size: u32,
-    block_trailer_size: u32,
-    flags: u32,
-    reserved: [u64; 2],
+pub(crate) struct WalSegmentFileHeader {
+    pub(crate) magic: u64,
+    pub(crate) version: u32,
+    pub(crate) header_bytes: u32,
+    pub(crate) segment_id: u64,
+    pub(crate) block_size: u32,
+    pub(crate) block_capacity: u32,
+    pub(crate) record_size: u32,
+    pub(crate) block_header_size: u32,
+    pub(crate) block_trailer_size: u32,
+    pub(crate) flags: u32,
+    pub(crate) reserved: [u64; 2],
 }
 
 #[repr(C, align(64))]
@@ -73,28 +83,28 @@ struct WalManagerControlRecord {
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, Default)]
-struct WalBlockHeader {
-    magic: u64,
-    block_id: u64,
-    first_client_seq: u64,
-    count: u32,
-    block_size: u32,
-    payload_bytes: u32,
-    reserved0: u32,
-    reserved: [u64; 3],
+pub(crate) struct WalBlockHeader {
+    pub(crate) magic: u64,
+    pub(crate) block_id: u64,
+    pub(crate) first_client_seq: u64,
+    pub(crate) count: u32,
+    pub(crate) block_size: u32,
+    pub(crate) payload_bytes: u32,
+    pub(crate) reserved0: u32,
+    pub(crate) reserved: [u64; 3],
 }
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, Default)]
-struct WalBlockTrailer {
-    magic: u64,
-    block_id: u64,
-    first_client_seq: u64,
-    count: u32,
-    payload_bytes: u32,
-    checksum: u64,
-    reserved: [u64; 2],
-    commit_marker: u64,
+pub(crate) struct WalBlockTrailer {
+    pub(crate) magic: u64,
+    pub(crate) block_id: u64,
+    pub(crate) first_client_seq: u64,
+    pub(crate) count: u32,
+    pub(crate) payload_bytes: u32,
+    pub(crate) checksum: u64,
+    pub(crate) reserved: [u64; 2],
+    pub(crate) commit_marker: u64,
 }
 
 #[repr(align(128))]
@@ -140,9 +150,15 @@ pub struct MappedWalSegment {
     block_stride: usize,
     states: Box<[WalBlockState]>,
     tail_block: PaddedAtomicU64,
-    durable_blocks: u64,
-    control_generation: u64,
+    durable_blocks: AtomicU64,
+    data_frontier_blocks: AtomicU64,
+    prewrite_data_frontier_blocks: AtomicU64,
+    write_data_frontier_blocks: AtomicU64,
+    file_data_frontier_blocks: AtomicU64,
+    control_generation: AtomicU64,
+    sync_in_progress: AtomicBool,
     consumer_taken: AtomicBool,
+    write_scratch: Mutex<Vec<u8>>,
 }
 
 unsafe impl Send for MappedWalSegment {}
@@ -172,17 +188,34 @@ pub struct WalManagerRecovery {
     pub stats: DrainStats,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WalDataSyncMode {
+    #[default]
+    RangeAndFileData,
+    WriteAndFileData,
+    PrewriteAndFileData,
+    SyncWriteData,
+    FileDataOnly,
+}
+
 pub struct WalSegmentManager {
     config: WalSegmentManagerConfig,
     control: File,
-    current_segment: MappedWalSegment,
+    current_segment: Arc<MappedWalSegment>,
     current_segment_id: u64,
     current_blocks: u64,
-    sealed_segments: Vec<MappedWalSegment>,
+    sealed_segments: Vec<Arc<MappedWalSegment>>,
     first_segment_id: u64,
     durable_segment_id: u64,
     durable_blocks: u64,
     control_generation: u64,
+}
+
+#[derive(Clone)]
+pub struct WalPublishedBlock {
+    position: WalPosition,
+    global_block_id: u64,
+    segment: Arc<MappedWalSegment>,
 }
 
 impl WalSegmentManagerConfig {
@@ -214,6 +247,39 @@ impl WalSegmentManagerConfig {
     }
 }
 
+impl WalPublishedBlock {
+    pub fn position(&self) -> WalPosition {
+        self.position
+    }
+
+    pub fn global_block_id(&self) -> u64 {
+        self.global_block_id
+    }
+
+    pub fn read_published_block_into(&self, out: &mut Vec<WriteIntent>) -> Option<()> {
+        self.segment
+            .read_published_block_into(self.position.block_id, out)
+    }
+
+    pub fn sync_published_data_frontier(&self) -> std::io::Result<()> {
+        self.segment
+            .sync_published_data_frontier(self.position.block_id + 1)
+    }
+
+    pub fn sync_published_data_frontier_with_mode(
+        &self,
+        mode: WalDataSyncMode,
+    ) -> std::io::Result<()> {
+        self.segment
+            .sync_published_data_frontier_with_mode(self.position.block_id + 1, mode)
+    }
+
+    pub fn write_published_data_frontier(&self) -> std::io::Result<u64> {
+        self.segment
+            .write_published_data_frontier(self.position.block_id + 1)
+    }
+}
+
 impl WalSegmentManager {
     /// # Safety
     ///
@@ -234,14 +300,14 @@ impl WalSegmentManager {
         control.sync_data()?;
         sync_parent_dir(&control_path)?;
 
-        let current_segment = unsafe {
+        let current_segment = Arc::new(unsafe {
             MappedWalSegment::create(
                 config.segment_path(0),
                 0,
                 config.records_per_segment,
                 config.block_size,
             )?
-        };
+        });
         Ok(Self {
             config,
             control,
@@ -261,11 +327,28 @@ impl WalSegmentManager {
         first_client_seq: u64,
         count: usize,
     ) -> Result<WalPosition, Box<dyn std::error::Error>> {
+        Ok(self
+            .publish_block_handle(first_client_seq, count)?
+            .position())
+    }
+
+    pub fn publish_block_handle(
+        &mut self,
+        first_client_seq: u64,
+        count: usize,
+    ) -> Result<WalPublishedBlock, Box<dyn std::error::Error>> {
         if count == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "WAL manager publish count must be non-zero",
             )
+            .into());
+        }
+        if count > self.config.block_size {
+            return Err(PublishError::CountExceedsBlockSize {
+                count,
+                block_size: self.config.block_size,
+            }
             .into());
         }
         if self.current_blocks == self.current_segment.block_capacity() {
@@ -278,18 +361,40 @@ impl WalSegmentManager {
         self.current_segment
             .try_publish_block(first_client_seq, count)?;
         self.current_blocks += 1;
-        Ok(position)
+        Ok(WalPublishedBlock {
+            position,
+            global_block_id: OpenShardAppendStore::global_block_id(
+                position.segment_id,
+                self.config.blocks_per_segment(),
+                position.block_id,
+            ),
+            segment: Arc::clone(&self.current_segment),
+        })
     }
 
     pub fn publish_intents(
         &mut self,
         intents: &[WriteIntent],
     ) -> Result<WalPosition, Box<dyn std::error::Error>> {
+        Ok(self.publish_intents_handle(intents)?.position())
+    }
+
+    pub fn publish_intents_handle(
+        &mut self,
+        intents: &[WriteIntent],
+    ) -> Result<WalPublishedBlock, Box<dyn std::error::Error>> {
         if intents.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "WAL manager publish payload must be non-empty",
             )
+            .into());
+        }
+        if intents.len() > self.config.block_size {
+            return Err(PublishError::CountExceedsBlockSize {
+                count: intents.len(),
+                block_size: self.config.block_size,
+            }
             .into());
         }
         if self.current_blocks == self.current_segment.block_capacity() {
@@ -301,12 +406,20 @@ impl WalSegmentManager {
         };
         self.current_segment.try_publish_intents(intents)?;
         self.current_blocks += 1;
-        Ok(position)
+        Ok(WalPublishedBlock {
+            position,
+            global_block_id: OpenShardAppendStore::global_block_id(
+                position.segment_id,
+                self.config.blocks_per_segment(),
+                position.block_id,
+            ),
+            segment: Arc::clone(&self.current_segment),
+        })
     }
 
     pub fn sync_all_published(&mut self) -> std::io::Result<WalPosition> {
         for segment in self.sealed_segments.iter_mut() {
-            if segment.durable_blocks < segment.block_capacity() {
+            if segment.durable_blocks() < segment.block_capacity() {
                 segment.sync_published_prefix(segment.block_capacity())?;
             }
         }
@@ -365,14 +478,14 @@ impl WalSegmentManager {
 
     fn roll_segment(&mut self) -> std::io::Result<()> {
         let next_segment_id = self.current_segment_id + 1;
-        let next = unsafe {
+        let next = Arc::new(unsafe {
             MappedWalSegment::create(
                 self.config.segment_path(next_segment_id),
                 next_segment_id,
                 self.config.records_per_segment,
                 self.config.block_size,
             )?
-        };
+        });
         let previous = std::mem::replace(&mut self.current_segment, next);
         self.sealed_segments.push(previous);
         self.current_segment_id = next_segment_id;
@@ -449,10 +562,6 @@ impl MappedWalSegment {
         );
         assert!(block_size > 0, "WAL block size must be non-zero");
         assert!(
-            block_size.is_power_of_two(),
-            "WAL block size must be a power of two"
-        );
-        assert!(
             block_size <= u32::MAX as usize,
             "WAL block size must fit on disk"
         );
@@ -503,10 +612,6 @@ impl MappedWalSegment {
             return Err(std::io::Error::last_os_error());
         }
         let ptr = NonNull::new(raw.cast::<u8>()).expect("mmap returned null");
-        unsafe {
-            std::ptr::write_bytes(ptr.as_ptr(), 0, bytes);
-        }
-
         let states = (0..block_capacity)
             .map(|sequence| WalBlockState {
                 sequence: AtomicU64::new(sequence as u64),
@@ -523,9 +628,15 @@ impl MappedWalSegment {
             block_stride,
             states,
             tail_block: PaddedAtomicU64::new(0),
-            durable_blocks: 0,
-            control_generation: 0,
+            durable_blocks: AtomicU64::new(0),
+            data_frontier_blocks: AtomicU64::new(0),
+            prewrite_data_frontier_blocks: AtomicU64::new(0),
+            write_data_frontier_blocks: AtomicU64::new(0),
+            file_data_frontier_blocks: AtomicU64::new(0),
+            control_generation: AtomicU64::new(0),
+            sync_in_progress: AtomicBool::new(false),
             consumer_taken: AtomicBool::new(false),
+            write_scratch: Mutex::new(Vec::new()),
         };
         segment.write_file_header();
         Ok(segment)
@@ -632,36 +743,178 @@ impl MappedWalSegment {
         self.block_capacity
     }
 
-    pub fn sync_published_prefix(&mut self, blocks: u64) -> std::io::Result<()> {
+    pub fn durable_blocks(&self) -> u64 {
+        self.durable_blocks.load(Ordering::Acquire)
+    }
+
+    pub fn contiguous_published_prefix(
+        &self,
+        start_blocks: u64,
+        blocks: u64,
+    ) -> std::io::Result<u64> {
+        if start_blocks > blocks || blocks > self.block_capacity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL published-prefix scan exceeds segment",
+            ));
+        }
+        Ok(self.contiguous_published_prefix_unchecked(start_blocks, blocks))
+    }
+
+    pub fn sync_published_prefix(&self, blocks: u64) -> std::io::Result<()> {
         if blocks > self.block_capacity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "WAL sync prefix exceeds segment",
             ));
         }
-        if blocks == self.durable_blocks && self.control_generation != 0 {
-            return Ok(());
-        }
-        if blocks < self.durable_blocks {
+        self.acquire_sync_slot();
+        let result = self.sync_published_prefix_locked(blocks);
+        self.sync_in_progress.store(false, Ordering::Release);
+        result
+    }
+
+    pub fn sync_published_data_frontier(&self, blocks: u64) -> std::io::Result<()> {
+        self.sync_published_data_frontier_with_mode(blocks, WalDataSyncMode::RangeAndFileData)
+    }
+
+    pub fn sync_published_data_frontier_with_mode(
+        &self,
+        blocks: u64,
+        mode: WalDataSyncMode,
+    ) -> std::io::Result<()> {
+        if blocks > self.block_capacity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "WAL durable prefix cannot move backward",
+                "WAL data sync frontier exceeds segment",
             ));
         }
-        for block_id in self.durable_blocks..blocks {
-            let state = &self.states[block_id as usize];
-            while state.sequence.load(Ordering::Acquire) != block_id + 1 {
-                spin_loop();
-            }
+        self.acquire_sync_slot();
+        let result = self.sync_published_data_frontier_locked(blocks, mode);
+        self.sync_in_progress.store(false, Ordering::Release);
+        result
+    }
+
+    pub fn write_published_data_frontier(&self, blocks: u64) -> std::io::Result<u64> {
+        if blocks > self.block_capacity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL data write frontier exceeds segment",
+            ));
         }
+        self.write_published_data_frontier_locked(blocks)
+    }
+
+    fn sync_published_prefix_locked(&self, blocks: u64) -> std::io::Result<()> {
+        let durable_blocks = self.durable_blocks.load(Ordering::Acquire);
+        let control_generation = self.control_generation.load(Ordering::Acquire);
+        if blocks <= durable_blocks && control_generation != 0 {
+            return Ok(());
+        }
+        for block_id in durable_blocks..blocks {
+            self.wait_for_published_block(block_id);
+        }
+        let start = if durable_blocks == 0 && control_generation == 0 {
+            0
+        } else {
+            WAL_SEGMENT_HEADER_BYTES + durable_blocks as usize * self.block_stride
+        };
         let end = WAL_SEGMENT_HEADER_BYTES + blocks as usize * self.block_stride;
-        self.sync_range(0, end)?;
+        self.sync_range(start, end)?;
         self.file.sync_data()?;
-        self.write_control_record(blocks);
+        let next_generation = control_generation + 1;
+        self.write_control_record(blocks, next_generation);
         self.sync_range(control_offset(0), control_offset(WAL_CONTROL_SLOTS))?;
         self.file.sync_data()?;
-        self.durable_blocks = blocks;
-        self.control_generation += 1;
+        self.durable_blocks.store(blocks, Ordering::Release);
+        self.data_frontier_blocks
+            .fetch_max(blocks, Ordering::AcqRel);
+        self.prewrite_data_frontier_blocks
+            .fetch_max(blocks, Ordering::AcqRel);
+        self.write_data_frontier_blocks
+            .fetch_max(blocks, Ordering::AcqRel);
+        self.file_data_frontier_blocks
+            .fetch_max(blocks, Ordering::AcqRel);
+        self.control_generation
+            .store(next_generation, Ordering::Release);
+        Ok(())
+    }
+
+    fn sync_published_data_frontier_locked(
+        &self,
+        blocks: u64,
+        mode: WalDataSyncMode,
+    ) -> std::io::Result<()> {
+        let start_blocks = match mode {
+            WalDataSyncMode::RangeAndFileData => self.data_frontier_blocks.load(Ordering::Acquire),
+            WalDataSyncMode::WriteAndFileData | WalDataSyncMode::PrewriteAndFileData => {
+                self.write_data_frontier_blocks.load(Ordering::Acquire)
+            }
+            WalDataSyncMode::SyncWriteData => {
+                self.file_data_frontier_blocks.load(Ordering::Acquire)
+            }
+            WalDataSyncMode::FileDataOnly => self.file_data_frontier_blocks.load(Ordering::Acquire),
+        };
+        if blocks <= start_blocks {
+            return Ok(());
+        }
+        for block_id in start_blocks..blocks {
+            self.wait_for_published_block(block_id);
+        }
+        if mode == WalDataSyncMode::RangeAndFileData {
+            let start = if start_blocks == 0 {
+                0
+            } else {
+                WAL_SEGMENT_HEADER_BYTES + start_blocks as usize * self.block_stride
+            };
+            let end = WAL_SEGMENT_HEADER_BYTES + blocks as usize * self.block_stride;
+            self.sync_range(start, end)?;
+        } else if matches!(
+            mode,
+            WalDataSyncMode::WriteAndFileData | WalDataSyncMode::PrewriteAndFileData
+        ) {
+            self.write_published_data_frontier_locked(blocks)?;
+        } else if mode == WalDataSyncMode::SyncWriteData {
+            self.sync_write_published_data_frontier_locked(blocks)?;
+        }
+        if mode != WalDataSyncMode::SyncWriteData {
+            self.file.sync_data()?;
+        }
+        match mode {
+            WalDataSyncMode::RangeAndFileData => {
+                self.data_frontier_blocks.store(blocks, Ordering::Release);
+                self.prewrite_data_frontier_blocks
+                    .fetch_max(blocks, Ordering::AcqRel);
+                self.write_data_frontier_blocks
+                    .fetch_max(blocks, Ordering::AcqRel);
+                self.file_data_frontier_blocks
+                    .fetch_max(blocks, Ordering::AcqRel);
+            }
+            WalDataSyncMode::WriteAndFileData => {
+                self.write_data_frontier_blocks
+                    .store(blocks, Ordering::Release);
+                self.file_data_frontier_blocks
+                    .fetch_max(blocks, Ordering::AcqRel);
+            }
+            WalDataSyncMode::PrewriteAndFileData => {
+                self.write_data_frontier_blocks
+                    .store(blocks, Ordering::Release);
+                self.file_data_frontier_blocks
+                    .fetch_max(blocks, Ordering::AcqRel);
+            }
+            WalDataSyncMode::SyncWriteData => {
+                self.prewrite_data_frontier_blocks
+                    .fetch_max(blocks, Ordering::AcqRel);
+                self.write_data_frontier_blocks
+                    .fetch_max(blocks, Ordering::AcqRel);
+                self.file_data_frontier_blocks
+                    .store(blocks, Ordering::Release);
+            }
+            WalDataSyncMode::FileDataOnly => {
+                self.file_data_frontier_blocks
+                    .store(blocks, Ordering::Release);
+            }
+        }
         Ok(())
     }
 
@@ -687,8 +940,7 @@ impl MappedWalSegment {
         }
     }
 
-    fn write_control_record(&self, durable_blocks: u64) {
-        let generation = self.control_generation + 1;
+    fn write_control_record(&self, durable_blocks: u64, generation: u64) {
         let slot = generation as usize % WAL_CONTROL_SLOTS;
         let mut record = WalControlRecord {
             magic: WAL_CONTROL_MAGIC,
@@ -731,6 +983,47 @@ impl MappedWalSegment {
             spin_loop();
         }
         Ok(block_id)
+    }
+
+    fn acquire_sync_slot(&self) {
+        let mut spins = 0;
+        while self
+            .sync_in_progress
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            if spins < 64 {
+                spin_loop();
+                spins += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn wait_for_published_block(&self, block_id: u64) {
+        let state = &self.states[block_id as usize];
+        let mut spins = 0;
+        while state.sequence.load(Ordering::Acquire) != block_id + 1 {
+            if spins < 256 {
+                spin_loop();
+                spins += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn contiguous_published_prefix_unchecked(&self, start_blocks: u64, blocks: u64) -> u64 {
+        let mut prefix = start_blocks;
+        while prefix < blocks {
+            let state = &self.states[prefix as usize];
+            if state.sequence.load(Ordering::Acquire) != prefix + 1 {
+                break;
+            }
+            prefix += 1;
+        }
+        prefix
     }
 
     fn write_block_header(
@@ -818,6 +1111,77 @@ impl MappedWalSegment {
         Ok(())
     }
 
+    fn write_published_data_frontier_locked(&self, blocks: u64) -> std::io::Result<u64> {
+        let mut scratch = self
+            .write_scratch
+            .lock()
+            .map_err(|_| std::io::Error::other("WAL write scratch buffer poisoned"))?;
+        let start_blocks = self.prewrite_data_frontier_blocks.load(Ordering::Acquire);
+        if blocks <= start_blocks {
+            return Ok(0);
+        }
+        for block_id in start_blocks..blocks {
+            self.wait_for_published_block(block_id);
+        }
+        let start = if start_blocks == 0 {
+            0
+        } else {
+            WAL_SEGMENT_HEADER_BYTES + start_blocks as usize * self.block_stride
+        };
+        let end = WAL_SEGMENT_HEADER_BYTES + blocks as usize * self.block_stride;
+        if start > end || end > self.bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL write-through range exceeds segment",
+            ));
+        }
+        scratch.clear();
+        unsafe {
+            scratch.extend_from_slice(std::slice::from_raw_parts(
+                self.ptr.as_ptr().add(start),
+                end - start,
+            ));
+        }
+        write_all_at(&self.file, &scratch, start as u64)?;
+        self.prewrite_data_frontier_blocks
+            .fetch_max(blocks, Ordering::AcqRel);
+        Ok(blocks - start_blocks)
+    }
+
+    fn sync_write_published_data_frontier_locked(&self, blocks: u64) -> std::io::Result<()> {
+        let mut scratch = self
+            .write_scratch
+            .lock()
+            .map_err(|_| std::io::Error::other("WAL write scratch buffer poisoned"))?;
+        let start_blocks = self.file_data_frontier_blocks.load(Ordering::Acquire);
+        if blocks <= start_blocks {
+            return Ok(());
+        }
+        for block_id in start_blocks..blocks {
+            self.wait_for_published_block(block_id);
+        }
+        let start = if start_blocks == 0 {
+            0
+        } else {
+            WAL_SEGMENT_HEADER_BYTES + start_blocks as usize * self.block_stride
+        };
+        let end = WAL_SEGMENT_HEADER_BYTES + blocks as usize * self.block_stride;
+        if start > end || end > self.bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL sync-write range exceeds segment",
+            ));
+        }
+        scratch.clear();
+        unsafe {
+            scratch.extend_from_slice(std::slice::from_raw_parts(
+                self.ptr.as_ptr().add(start),
+                end - start,
+            ));
+        }
+        write_all_at_dsync(&self.file, &scratch, start as u64)
+    }
+
     unsafe fn block_header_ptr(&self, block_id: u64) -> *mut WalBlockHeader {
         self.ptr
             .as_ptr()
@@ -882,6 +1246,75 @@ pub fn recover_wal_segment(path: impl AsRef<Path>) -> std::io::Result<WalRecover
     recover_wal_segment_prefix(path, None)
 }
 
+pub fn recover_wal_segment_by_scan(path: impl AsRef<Path>) -> std::io::Result<WalRecovery> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let file_header: WalSegmentFileHeader = read_struct_at(&mut file, 0)?;
+    validate_file_header(file_header)?;
+
+    let block_size = file_header.block_size as usize;
+    let block_capacity = file_header.block_capacity as usize;
+    let stride = checked_block_stride(block_size)?;
+    let expected_len = checked_segment_bytes(block_capacity, stride)? as u64;
+    if file_len < expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "WAL segment shorter than declared layout",
+        ));
+    }
+
+    let mut recovery = WalRecovery {
+        segment_id: file_header.segment_id,
+        block_size: file_header.block_size,
+        block_capacity: file_header.block_capacity,
+        recovered_blocks: 0,
+        recovered_records: 0,
+        stats: DrainStats::default(),
+    };
+
+    let expected_epoch = expected_block_epoch(&file_header);
+    for block_id in 0..block_capacity as u64 {
+        let base = WAL_SEGMENT_HEADER_BYTES as u64 + block_id * stride as u64;
+        let header: WalBlockHeader = read_struct_at(&mut file, base)?;
+        if !valid_header(&header, block_id, block_size, expected_epoch) {
+            break;
+        }
+
+        let trailer_offset = base
+            + size_of::<WalBlockHeader>() as u64
+            + block_size as u64 * size_of::<WriteIntent>() as u64;
+        let trailer: WalBlockTrailer = read_struct_at(&mut file, trailer_offset)?;
+        if !valid_trailer(&header, &trailer) {
+            break;
+        }
+
+        let payload = read_payload_at(
+            &mut file,
+            base + size_of::<WalBlockHeader>() as u64,
+            header.count as usize,
+        )?;
+        let payload_bytes = unsafe {
+            std::slice::from_raw_parts(
+                payload.as_ptr().cast::<u8>(),
+                payload.len() * size_of::<WriteIntent>(),
+            )
+        };
+        if block_crc32c(&header, payload_bytes) as u64 != trailer.checksum {
+            break;
+        }
+
+        let mut stats = DrainStats::default();
+        for intent in payload.iter().copied() {
+            stats.observe(intent);
+        }
+        recovery.recovered_blocks += 1;
+        recovery.recovered_records += header.count as u64;
+        recovery.stats.add(stats);
+    }
+
+    Ok(recovery)
+}
+
 fn recover_wal_segment_prefix(
     path: impl AsRef<Path>,
     max_blocks: Option<u64>,
@@ -922,10 +1355,11 @@ fn recover_wal_segment_prefix(
         stats: DrainStats::default(),
     };
 
+    let expected_epoch = expected_block_epoch(&file_header);
     for block_id in 0..recover_blocks {
         let base = WAL_SEGMENT_HEADER_BYTES as u64 + block_id * stride as u64;
         let header: WalBlockHeader = read_struct_at(&mut file, base)?;
-        if !valid_header(&header, block_id, block_size) {
+        if !valid_header(&header, block_id, block_size, expected_epoch) {
             return Err(invalid_data(
                 "invalid WAL block header inside durable prefix",
             ));
@@ -1002,12 +1436,96 @@ pub fn recover_wal_manager(
                 "WAL manager segment recovery did not match durable control",
             ));
         }
+        validate_manager_segment_layout(config, &segment_recovery)?;
         recovered.recovered_segments += 1;
         recovered.recovered_records += segment_recovery.recovered_records;
         recovered.stats.add(segment_recovery.stats);
     }
 
     Ok(recovered)
+}
+
+pub fn recover_wal_manager_by_scan(
+    config: &WalSegmentManagerConfig,
+) -> std::io::Result<WalManagerRecovery> {
+    validate_manager_config(config)?;
+    let control_record = match File::open(config.control_path()) {
+        Ok(mut control) => recover_manager_control_record(&mut control, config)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+    let first_segment_id = control_record
+        .map(|record| record.first_segment_id)
+        .unwrap_or(0);
+    let mut recovered = WalManagerRecovery {
+        first_segment_id,
+        durable_segment_id: first_segment_id,
+        durable_blocks: 0,
+        recovered_segments: 0,
+        recovered_records: 0,
+        stats: DrainStats::default(),
+    };
+    let blocks_per_segment = config.blocks_per_segment();
+    let mut saw_segment = false;
+    let mut saw_partial = false;
+    let mut segment_id = first_segment_id;
+    loop {
+        let path = config.segment_path(segment_id);
+        if !path.try_exists()? {
+            break;
+        }
+        if saw_partial {
+            return Err(invalid_data(
+                "WAL manager scan recovery found segment after partial segment",
+            ));
+        }
+        let segment_recovery = recover_wal_segment_by_scan(&path)?;
+        if segment_recovery.segment_id != segment_id {
+            return Err(invalid_data(
+                "WAL manager scan recovery did not match segment id",
+            ));
+        }
+        validate_manager_segment_layout(config, &segment_recovery)?;
+        saw_segment = true;
+        recovered.recovered_segments += 1;
+        recovered.recovered_records += segment_recovery.recovered_records;
+        recovered.stats.add(segment_recovery.stats);
+        recovered.durable_segment_id = segment_id;
+        recovered.durable_blocks = segment_recovery.recovered_blocks;
+        if segment_recovery.recovered_blocks < blocks_per_segment {
+            saw_partial = true;
+        }
+        segment_id += 1;
+    }
+    if !saw_segment {
+        recovered.durable_segment_id = first_segment_id;
+        recovered.durable_blocks = 0;
+    }
+    if let Some(record) = control_record {
+        if recovered.durable_segment_id < record.durable_segment_id
+            || (recovered.durable_segment_id == record.durable_segment_id
+                && recovered.durable_blocks < record.durable_blocks)
+        {
+            return Err(invalid_data(
+                "WAL manager scan recovery is behind durable control",
+            ));
+        }
+    }
+    Ok(recovered)
+}
+
+fn validate_manager_segment_layout(
+    config: &WalSegmentManagerConfig,
+    recovery: &WalRecovery,
+) -> std::io::Result<()> {
+    if recovery.block_size as usize != config.block_size
+        || recovery.block_capacity as u64 != config.blocks_per_segment()
+    {
+        return Err(invalid_data(
+            "WAL manager segment layout did not match config",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_file_header(header: WalSegmentFileHeader) -> std::io::Result<()> {
@@ -1020,8 +1538,7 @@ fn validate_file_header(header: WalSegmentFileHeader) -> std::io::Result<()> {
         || header.block_size == 0
         || header.block_capacity == 0
         || header.block_size as usize > u32::MAX as usize / size_of::<WriteIntent>()
-        || !header.block_size.is_power_of_two()
-        || header.flags != 0
+        || header.flags & !WAL_SEGMENT_FLAG_EPOCH_STAMPED != 0
         || header.reserved != [0; 2]
     {
         return Err(std::io::Error::new(
@@ -1032,14 +1549,30 @@ fn validate_file_header(header: WalSegmentFileHeader) -> std::io::Result<()> {
     Ok(())
 }
 
-fn valid_header(header: &WalBlockHeader, block_id: u64, block_size: usize) -> bool {
+/// Block-header epoch a scan must require for this segment file. Legacy
+/// (non-epoch-stamped) segments wrote `reserved0 == 0`; epoch-stamped segments
+/// write the segment id's low 32 bits so recycled files reject stale blocks.
+fn expected_block_epoch(file_header: &WalSegmentFileHeader) -> u32 {
+    if file_header.flags & WAL_SEGMENT_FLAG_EPOCH_STAMPED != 0 {
+        file_header.segment_id as u32
+    } else {
+        0
+    }
+}
+
+fn valid_header(
+    header: &WalBlockHeader,
+    block_id: u64,
+    block_size: usize,
+    expected_epoch: u32,
+) -> bool {
     header.magic == WAL_BLOCK_HEADER_MAGIC
         && header.block_id == block_id
         && header.block_size as usize == block_size
         && header.count != 0
         && header.count as usize <= block_size
         && header.payload_bytes as usize == header.count as usize * size_of::<WriteIntent>()
-        && header.reserved0 == 0
+        && header.reserved0 == expected_epoch
         && header.reserved == [0; 3]
 }
 
@@ -1137,10 +1670,10 @@ fn validate_manager_config(config: &WalSegmentManagerConfig) -> std::io::Result<
             "WAL manager segment must contain records",
         ));
     }
-    if config.block_size == 0 || !config.block_size.is_power_of_two() {
+    if config.block_size == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "WAL manager block size must be a non-zero power of two",
+            "WAL manager block size must be non-zero",
         ));
     }
     if config.records_per_segment > u32::MAX as usize {
@@ -1164,7 +1697,7 @@ fn valid_manager_prefix(prefix: &str) -> bool {
         && components.next().is_none()
 }
 
-fn block_crc32c(header: &WalBlockHeader, payload: &[u8]) -> u32 {
+pub(crate) fn block_crc32c(header: &WalBlockHeader, payload: &[u8]) -> u32 {
     let crc = crc32c::crc32c_append(0, bytes_of(header));
     crc32c::crc32c_append(crc, payload)
 }
@@ -1183,7 +1716,7 @@ fn manager_control_crc32c(record: &WalManagerControlRecord) -> u32 {
     crc32c::crc32c(bytes_of(&copy))
 }
 
-fn checked_block_stride(block_size: usize) -> std::io::Result<usize> {
+pub(crate) fn checked_block_stride(block_size: usize) -> std::io::Result<usize> {
     size_of::<WalBlockHeader>()
         .checked_add(
             block_size
@@ -1194,7 +1727,10 @@ fn checked_block_stride(block_size: usize) -> std::io::Result<usize> {
         .ok_or_else(|| invalid_data("WAL block stride overflow"))
 }
 
-fn checked_segment_bytes(block_capacity: usize, block_stride: usize) -> std::io::Result<usize> {
+pub(crate) fn checked_segment_bytes(
+    block_capacity: usize,
+    block_stride: usize,
+) -> std::io::Result<usize> {
     WAL_SEGMENT_HEADER_BYTES
         .checked_add(
             block_capacity
@@ -1217,11 +1753,11 @@ fn manager_control_offset(slot: usize) -> usize {
     slot * size_of::<WalManagerControlRecord>()
 }
 
-fn invalid_data(message: &'static str) -> std::io::Error {
+pub(crate) fn invalid_data(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
-fn bytes_of<T>(value: &T) -> &[u8] {
+pub(crate) fn bytes_of<T>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
@@ -1232,6 +1768,71 @@ fn page_size() -> usize {
     } else {
         value as usize
     }
+}
+
+pub(crate) fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match file.write_at(bytes, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write WAL bytes",
+                ));
+            }
+            Ok(written) => {
+                bytes = &bytes[written..];
+                offset += written as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_at_dsync(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let written = unsafe {
+            libc::pwritev2(
+                file.as_raw_fd(),
+                &iov,
+                1,
+                offset as libc::off_t,
+                libc::RWF_DSYNC,
+            )
+        };
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to sync-write WAL bytes",
+            ));
+        }
+        if written > 0 {
+            let written = written as usize;
+            bytes = &bytes[written..];
+            offset += written as u64;
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_all_at_dsync(_file: &File, _bytes: &[u8], _offset: u64) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "WAL sync-write-data mode requires Linux pwritev2(RWF_DSYNC)",
+    ))
 }
 
 fn read_struct_at<T: Copy>(file: &mut File, offset: u64) -> std::io::Result<T> {
@@ -1265,6 +1866,7 @@ mod tests {
     use super::*;
     use crate::stats_for_range;
     use std::io::{Seek, SeekFrom, Write};
+    use std::sync::{Arc, Barrier};
 
     fn temp_wal_path(name: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -1323,7 +1925,7 @@ mod tests {
     fn wal_segment_recovers_synced_prefix() {
         let path = temp_wal_path("prefix");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 7, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 7, 16, 4).unwrap() };
             segment.try_publish_block(0, 4).unwrap();
             segment.try_publish_block(4, 3).unwrap();
             segment.sync_published_prefix(2).unwrap();
@@ -1345,7 +1947,7 @@ mod tests {
             .map(custom_intent)
             .collect();
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 13, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 13, 16, 4).unwrap() };
             segment.try_publish_intents(&intents).unwrap();
             segment.sync_published_prefix(1).unwrap();
         }
@@ -1359,10 +1961,30 @@ mod tests {
     }
 
     #[test]
+    fn wal_segment_supports_page_aligned_frame_record_count() {
+        let path = temp_wal_path("aligned-frame");
+        assert_eq!(block_stride(62), 4096);
+        {
+            let segment = unsafe { MappedWalSegment::create(&path, 22, 124, 62).unwrap() };
+            segment.try_publish_block(0, 62).unwrap();
+            segment.try_publish_block(62, 17).unwrap();
+            segment.sync_published_prefix(2).unwrap();
+        }
+
+        let recovered = recover_wal_segment(&path).unwrap();
+        assert_eq!(recovered.segment_id, 22);
+        assert_eq!(recovered.block_size, 62);
+        assert_eq!(recovered.recovered_blocks, 2);
+        assert_eq!(recovered.recovered_records, 79);
+        assert_eq!(recovered.stats, stats_for_range(0, 79));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn wal_recovery_ignores_valid_blocks_beyond_control_tail() {
         let path = temp_wal_path("control-tail");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 9, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 9, 16, 4).unwrap() };
             segment.try_publish_block(0, 4).unwrap();
             segment.try_publish_block(4, 4).unwrap();
             segment.sync_published_prefix(1).unwrap();
@@ -1379,13 +2001,235 @@ mod tests {
     fn wal_sync_prefix_is_monotonic() {
         let path = temp_wal_path("monotonic");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 10, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 10, 16, 4).unwrap() };
             segment.try_publish_block(0, 4).unwrap();
             segment.try_publish_block(4, 4).unwrap();
             segment.sync_published_prefix(2).unwrap();
-            let err = segment.sync_published_prefix(1).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            segment.sync_published_prefix(1).unwrap();
+            assert_eq!(segment.durable_blocks(), 2);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_sync_prefix_supports_single_shared_flusher() {
+        let path = temp_wal_path("shared-sync");
+        {
+            let segment = Arc::new(unsafe { MappedWalSegment::create(&path, 15, 16, 4).unwrap() });
+            for block in 0..4 {
+                segment.try_publish_block(block * 4, 4).unwrap();
+            }
+            let start = Arc::new(Barrier::new(5));
+            let mut handles = Vec::new();
+            for prefix in 1..=4 {
+                let segment = Arc::clone(&segment);
+                let start = Arc::clone(&start);
+                handles.push(std::thread::spawn(move || {
+                    start.wait();
+                    segment.sync_published_prefix(prefix).unwrap();
+                }));
+            }
+            start.wait();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert_eq!(segment.durable_blocks(), 4);
+        }
+
+        let recovered = recover_wal_segment(&path).unwrap();
+        assert_eq!(recovered.recovered_blocks, 4);
+        assert_eq!(recovered.recovered_records, 16);
+        assert_eq!(recovered.stats, stats_for_range(0, 16));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_scan_recovery_observes_data_synced_prefix_without_control_tail() {
+        let path = temp_wal_path("scan-data");
+        {
+            let segment = unsafe { MappedWalSegment::create(&path, 16, 16, 4).unwrap() };
+            segment.try_publish_block(0, 4).unwrap();
+            segment.try_publish_block(4, 4).unwrap();
+            segment.sync_published_data_frontier(2).unwrap();
+        }
+
+        let control_recovered = recover_wal_segment(&path).unwrap();
+        assert_eq!(control_recovered.recovered_blocks, 0);
+        let scan_recovered = recover_wal_segment_by_scan(&path).unwrap();
+        assert_eq!(scan_recovered.recovered_blocks, 2);
+        assert_eq!(scan_recovered.recovered_records, 8);
+        assert_eq!(scan_recovered.stats, stats_for_range(0, 8));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_scan_recovery_observes_write_data_synced_prefix() {
+        let path = temp_wal_path("scan-write-data");
+        {
+            let segment = unsafe { MappedWalSegment::create(&path, 18, 16, 4).unwrap() };
+            segment.try_publish_block(0, 4).unwrap();
+            segment.try_publish_block(4, 4).unwrap();
+            segment
+                .sync_published_data_frontier_with_mode(2, WalDataSyncMode::WriteAndFileData)
+                .unwrap();
+        }
+
+        let control_recovered = recover_wal_segment(&path).unwrap();
+        assert_eq!(control_recovered.recovered_blocks, 0);
+        let scan_recovered = recover_wal_segment_by_scan(&path).unwrap();
+        assert_eq!(scan_recovered.recovered_blocks, 2);
+        assert_eq!(scan_recovered.recovered_records, 8);
+        assert_eq!(scan_recovered.stats, stats_for_range(0, 8));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_data_sync_modes_track_upgradeable_frontiers() {
+        let path = temp_wal_path("sync-mode-frontiers");
+        {
+            let segment = unsafe { MappedWalSegment::create(&path, 17, 16, 4).unwrap() };
+            segment.try_publish_block(0, 4).unwrap();
+            segment.try_publish_block(4, 4).unwrap();
+            segment.try_publish_block(8, 4).unwrap();
+            segment
+                .sync_published_data_frontier_with_mode(1, WalDataSyncMode::FileDataOnly)
+                .unwrap();
+            assert_eq!(segment.data_frontier_blocks.load(Ordering::Acquire), 0);
+            assert_eq!(
+                segment
+                    .prewrite_data_frontier_blocks
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                segment.write_data_frontier_blocks.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(segment.file_data_frontier_blocks.load(Ordering::Acquire), 1);
+
+            segment
+                .sync_published_data_frontier_with_mode(2, WalDataSyncMode::WriteAndFileData)
+                .unwrap();
+            assert_eq!(segment.data_frontier_blocks.load(Ordering::Acquire), 0);
+            assert_eq!(
+                segment
+                    .prewrite_data_frontier_blocks
+                    .load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(
+                segment.write_data_frontier_blocks.load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(segment.file_data_frontier_blocks.load(Ordering::Acquire), 2);
+
+            segment.sync_published_data_frontier(3).unwrap();
+            assert_eq!(segment.data_frontier_blocks.load(Ordering::Acquire), 3);
+            assert_eq!(
+                segment
+                    .prewrite_data_frontier_blocks
+                    .load(Ordering::Acquire),
+                3
+            );
+            assert_eq!(
+                segment.write_data_frontier_blocks.load(Ordering::Acquire),
+                3
+            );
+            assert_eq!(segment.file_data_frontier_blocks.load(Ordering::Acquire), 3);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_prewrite_frontier_waits_for_final_sync() {
+        let path = temp_wal_path("prewrite-frontier");
+        {
+            let segment = unsafe { MappedWalSegment::create(&path, 19, 16, 4).unwrap() };
+            segment.try_publish_block(0, 4).unwrap();
+            segment.try_publish_block(4, 4).unwrap();
+            assert_eq!(segment.write_published_data_frontier(2).unwrap(), 2);
+            assert_eq!(
+                segment
+                    .prewrite_data_frontier_blocks
+                    .load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(
+                segment.write_data_frontier_blocks.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(segment.file_data_frontier_blocks.load(Ordering::Acquire), 0);
+
+            segment
+                .sync_published_data_frontier_with_mode(2, WalDataSyncMode::PrewriteAndFileData)
+                .unwrap();
+            assert_eq!(
+                segment
+                    .prewrite_data_frontier_blocks
+                    .load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(
+                segment.write_data_frontier_blocks.load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(segment.file_data_frontier_blocks.load(Ordering::Acquire), 2);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_scan_recovery_observes_prewrite_data_synced_prefix() {
+        let path = temp_wal_path("scan-prewrite-data");
+        {
+            let segment = unsafe { MappedWalSegment::create(&path, 20, 16, 4).unwrap() };
+            segment.try_publish_block(0, 4).unwrap();
+            segment.try_publish_block(4, 4).unwrap();
+            segment.write_published_data_frontier(2).unwrap();
+            segment
+                .sync_published_data_frontier_with_mode(2, WalDataSyncMode::PrewriteAndFileData)
+                .unwrap();
+        }
+
+        let control_recovered = recover_wal_segment(&path).unwrap();
+        assert_eq!(control_recovered.recovered_blocks, 0);
+        let scan_recovered = recover_wal_segment_by_scan(&path).unwrap();
+        assert_eq!(scan_recovered.recovered_blocks, 2);
+        assert_eq!(scan_recovered.recovered_records, 8);
+        assert_eq!(scan_recovered.stats, stats_for_range(0, 8));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_scan_recovery_observes_sync_write_data_prefix() {
+        let path = temp_wal_path("scan-sync-write-data");
+        {
+            let segment = unsafe { MappedWalSegment::create(&path, 21, 16, 4).unwrap() };
+            segment.try_publish_block(0, 4).unwrap();
+            segment.try_publish_block(4, 4).unwrap();
+            segment
+                .sync_published_data_frontier_with_mode(2, WalDataSyncMode::SyncWriteData)
+                .unwrap();
+            assert_eq!(segment.data_frontier_blocks.load(Ordering::Acquire), 0);
+            assert_eq!(
+                segment
+                    .prewrite_data_frontier_blocks
+                    .load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(
+                segment.write_data_frontier_blocks.load(Ordering::Acquire),
+                2
+            );
+            assert_eq!(segment.file_data_frontier_blocks.load(Ordering::Acquire), 2);
+        }
+
+        let control_recovered = recover_wal_segment(&path).unwrap();
+        assert_eq!(control_recovered.recovered_blocks, 0);
+        let scan_recovered = recover_wal_segment_by_scan(&path).unwrap();
+        assert_eq!(scan_recovered.recovered_blocks, 2);
+        assert_eq!(scan_recovered.recovered_records, 8);
+        assert_eq!(scan_recovered.stats, stats_for_range(0, 8));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1393,7 +2237,7 @@ mod tests {
     fn wal_sync_prefix_rejects_bounds_without_panicking() {
         let path = temp_wal_path("sync-bounds");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 10, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 10, 16, 4).unwrap() };
             let err = segment
                 .sync_published_prefix(segment.block_capacity() + 1)
                 .unwrap_err();
@@ -1406,7 +2250,7 @@ mod tests {
     fn wal_segment_empty_payload_publish_is_noop() {
         let path = temp_wal_path("empty-payload");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 14, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 14, 16, 4).unwrap() };
             segment.try_publish_intents(&[]).unwrap();
             segment.sync_published_prefix(0).unwrap();
         }
@@ -1423,7 +2267,7 @@ mod tests {
     fn wal_recovery_rejects_corrupt_durable_trailer() {
         let path = temp_wal_path("torn");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 8, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 8, 16, 4).unwrap() };
             segment.try_publish_block(0, 4).unwrap();
             segment.try_publish_block(4, 4).unwrap();
             segment.sync_published_prefix(2).unwrap();
@@ -1448,7 +2292,7 @@ mod tests {
     fn wal_recovery_rejects_unknown_file_header_flags() {
         let path = temp_wal_path("flags");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 11, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 11, 16, 4).unwrap() };
             segment.try_publish_block(0, 4).unwrap();
             segment.sync_published_prefix(1).unwrap();
         }
@@ -1472,7 +2316,7 @@ mod tests {
     fn wal_recovery_rejects_file_header_reserved_bits() {
         let path = temp_wal_path("reserved");
         {
-            let mut segment = unsafe { MappedWalSegment::create(&path, 12, 16, 4).unwrap() };
+            let segment = unsafe { MappedWalSegment::create(&path, 12, 16, 4).unwrap() };
             segment.try_publish_block(0, 4).unwrap();
             segment.sync_published_prefix(1).unwrap();
         }
@@ -1587,6 +2431,44 @@ mod tests {
     }
 
     #[test]
+    fn wal_manager_handles_read_and_scan_recover_data_fenced_blocks() {
+        let dir = temp_wal_dir("handle-scan-recover");
+        let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
+        let mut expected = DrainStats::default();
+        {
+            let mut manager = unsafe { WalSegmentManager::create(config.clone()).unwrap() };
+            for block in 0..5 {
+                let intents: Vec<_> = (0..4)
+                    .map(|offset| custom_intent(2_000 + block * 10 + offset))
+                    .collect();
+                expected.add(stats_for_intents(&intents));
+                let handle = manager.publish_intents_handle(&intents).unwrap();
+                assert_eq!(
+                    handle.position(),
+                    WalPosition {
+                        segment_id: block / 2,
+                        block_id: block % 2,
+                    }
+                );
+                let mut recovered_payload = Vec::new();
+                handle
+                    .read_published_block_into(&mut recovered_payload)
+                    .unwrap();
+                assert_eq!(recovered_payload, intents);
+                handle.sync_published_data_frontier().unwrap();
+            }
+        }
+
+        let control_recovered = recover_wal_manager(&config).unwrap();
+        assert_eq!(control_recovered.recovered_records, 0);
+        let scan_recovered = recover_wal_manager_by_scan(&config).unwrap();
+        assert_eq!(scan_recovered.recovered_segments, 3);
+        assert_eq!(scan_recovered.recovered_records, 20);
+        assert_eq!(scan_recovered.stats, expected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn wal_manager_retention_respects_durable_boundary() {
         let dir = temp_wal_dir("retention");
         let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
@@ -1611,6 +2493,154 @@ mod tests {
         assert_eq!(recovered.recovered_segments, 1);
         assert_eq!(recovered.recovered_records, 4);
         assert_eq!(recovered.stats, stats_for_range(8, 4));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_manager_scan_recovery_honors_retained_boundary() {
+        let dir = temp_wal_dir("scan-retention");
+        let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
+        {
+            let mut manager = unsafe { WalSegmentManager::create(config.clone()).unwrap() };
+            for block in 0..5 {
+                manager.publish_block(block * 4, 4).unwrap();
+            }
+            manager.sync_all_published().unwrap();
+            assert_eq!(manager.remove_segments_before(1).unwrap(), 1);
+        }
+
+        let recovered = recover_wal_manager_by_scan(&config).unwrap();
+        assert_eq!(recovered.first_segment_id, 1);
+        assert_eq!(recovered.durable_segment_id, 2);
+        assert_eq!(recovered.durable_blocks, 1);
+        assert_eq!(recovered.recovered_segments, 2);
+        assert_eq!(recovered.recovered_records, 12);
+        assert_eq!(recovered.stats, stats_for_range(8, 12));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_manager_scan_recovery_rejects_layout_mismatch() {
+        let dir = temp_wal_dir("scan-layout-mismatch");
+        let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
+        {
+            let mut manager = unsafe { WalSegmentManager::create(config.clone()).unwrap() };
+            manager.publish_block(0, 4).unwrap();
+            manager.sync_all_published().unwrap();
+        }
+
+        let wrong_config = WalSegmentManagerConfig::new(&dir, "events", 8, 8);
+        let err = recover_wal_manager_by_scan(&wrong_config).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_manager_scan_recovery_rejects_prefix_behind_control() {
+        let dir = temp_wal_dir("scan-behind-control");
+        let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
+        {
+            let mut manager = unsafe { WalSegmentManager::create(config.clone()).unwrap() };
+            for block in 0..3 {
+                manager.publish_block(block * 4, 4).unwrap();
+            }
+            manager.sync_all_published().unwrap();
+        }
+        std::fs::remove_file(config.segment_path(1)).unwrap();
+
+        let err = recover_wal_manager_by_scan(&config).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_manager_scan_recovery_rejects_segment_after_partial() {
+        let dir = temp_wal_dir("scan-gap-after-partial");
+        let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
+        {
+            let mut manager = unsafe { WalSegmentManager::create(config.clone()).unwrap() };
+            manager.publish_block(0, 4).unwrap();
+            manager
+                .current_segment
+                .sync_published_data_frontier(1)
+                .unwrap();
+        }
+        {
+            let _empty_segment =
+                unsafe { MappedWalSegment::create(config.segment_path(1), 1, 8, 4).unwrap() };
+        }
+
+        let err = recover_wal_manager_by_scan(&config).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_manager_recovery_rejects_segment_layout_mismatch() {
+        let dir = temp_wal_dir("control-layout-mismatch");
+        let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
+        let segment0 = config.segment_path(0);
+        {
+            let mut manager = unsafe { WalSegmentManager::create(config.clone()).unwrap() };
+            manager.publish_block(0, 4).unwrap();
+            manager.sync_all_published().unwrap();
+        }
+        std::fs::remove_file(&segment0).unwrap();
+        {
+            let segment = unsafe { MappedWalSegment::create(&segment0, 0, 8, 8).unwrap() };
+            segment.try_publish_block(0, 4).unwrap();
+            segment.sync_published_prefix(1).unwrap();
+        }
+
+        let err = recover_wal_manager(&config).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_manager_rejects_oversized_publish_before_rollover() {
+        let dir = temp_wal_dir("oversized-before-rollover");
+        let config = WalSegmentManagerConfig::new(&dir, "events", 8, 4);
+        let segment1 = config.segment_path(1);
+        {
+            let mut manager = unsafe { WalSegmentManager::create(config.clone()).unwrap() };
+            manager.publish_block(0, 4).unwrap();
+            manager.publish_block(4, 4).unwrap();
+            assert_eq!(manager.current_segment_id, 0);
+            assert_eq!(manager.current_blocks, 2);
+
+            let err = manager.publish_block(8, 5).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<PublishError>().copied(),
+                Some(PublishError::CountExceedsBlockSize {
+                    count: 5,
+                    block_size: 4,
+                })
+            );
+            assert_eq!(manager.current_segment_id, 0);
+            assert_eq!(manager.current_blocks, 2);
+            assert!(!segment1.exists());
+
+            let oversized: Vec<_> = (0..5).map(custom_intent).collect();
+            let err = manager.publish_intents(&oversized).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<PublishError>().copied(),
+                Some(PublishError::CountExceedsBlockSize {
+                    count: 5,
+                    block_size: 4,
+                })
+            );
+            assert_eq!(manager.current_segment_id, 0);
+            assert_eq!(manager.current_blocks, 2);
+            assert!(!segment1.exists());
+            manager.sync_all_published().unwrap();
+        }
+
+        let recovered = recover_wal_manager(&config).unwrap();
+        assert_eq!(recovered.durable_segment_id, 0);
+        assert_eq!(recovered.durable_blocks, 2);
+        assert_eq!(recovered.recovered_records, 8);
+        assert_eq!(recovered.stats, stats_for_range(0, 8));
         let _ = std::fs::remove_dir_all(dir);
     }
 

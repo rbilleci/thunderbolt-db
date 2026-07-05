@@ -8,3 +8,6 @@ version.workspace = true
 crc32c = "0.6"
 libc = "0.2"
 tikv-jemallocator.workspace = true
+
+[dev-dependencies]
+io-uring = "0.7"

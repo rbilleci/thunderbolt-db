@@ -194,6 +194,33 @@ impl ContiguousCompletionBarrier {
         Ok(())
     }
 
+    pub fn wait_for_with_yield(
+        &self,
+        target_prefix: u64,
+        spin_before_yield: u32,
+    ) -> Result<(), CompletionError> {
+        if target_prefix > self.capacity {
+            return Err(CompletionError::OutOfRange {
+                block_id: target_prefix,
+                capacity: self.capacity,
+            });
+        }
+        let mut spins = 0_u32;
+        while self.completed_prefix.load(Ordering::Acquire) < target_prefix {
+            if self.advance_contiguous() >= target_prefix {
+                break;
+            }
+            if spins < spin_before_yield {
+                spins += 1;
+                spin_loop();
+            } else {
+                spins = 0;
+                std::thread::yield_now();
+            }
+        }
+        Ok(())
+    }
+
     fn advance_contiguous(&self) -> u64 {
         loop {
             let prefix = self.completed_prefix.load(Ordering::Acquire);
@@ -1391,14 +1418,20 @@ pub fn stats_for_range(first_client_seq: u64, count: u64) -> DrainStats {
 }
 
 #[cfg(unix)]
+mod fua_wal;
+#[cfg(unix)]
 mod wal_segment;
 #[cfg(unix)]
+pub use fua_wal::{FuaFencePool, FuaWalAppender, FuaWalSegment, FuaWalSegmentConfig};
+#[cfg(unix)]
 pub use wal_segment::{
-    recover_wal_manager, WalManagerRecovery, WalPosition, WalSegmentManager,
-    WalSegmentManagerConfig,
+    recover_wal_manager, recover_wal_manager_by_scan, WalDataSyncMode, WalManagerRecovery,
+    WalPosition, WalPublishedBlock, WalSegmentManager, WalSegmentManagerConfig,
 };
 #[cfg(unix)]
-pub use wal_segment::{recover_wal_segment, MappedWalSegment, WalRecovery};
+pub use wal_segment::{
+    recover_wal_segment, recover_wal_segment_by_scan, MappedWalSegment, WalRecovery,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1579,6 +1612,27 @@ mod tests {
                 capacity: 2,
             }
         );
+        assert_eq!(
+            barrier.wait_for_with_yield(3, 0).unwrap_err(),
+            CompletionError::OutOfRange {
+                block_id: 3,
+                capacity: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn completion_barrier_yield_wait_observes_prefix() {
+        let barrier = Arc::new(ContiguousCompletionBarrier::with_capacity(4));
+        let waiter = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || barrier.wait_for_with_yield(4, 1).unwrap())
+        };
+        for block_id in 0..4 {
+            barrier.complete(block_id).unwrap();
+        }
+        waiter.join().unwrap();
+        assert_eq!(barrier.completed_prefix(), 4);
     }
 
     #[test]
