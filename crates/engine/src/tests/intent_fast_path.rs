@@ -189,6 +189,153 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     }
 }
 
+/// E2.2 — warm a PK'd int4 table into elision and return the prepared covered route (shared setup
+/// for the driver-multiplexed submit/poll semantics test). Returns `None` on a driverless box.
+fn warm_intent_route(engine: &mut Engine, txn_ids: &AtomicU64) -> Option<CoveredInsertRoute> {
+    engine
+        .execute_text(1, "CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine.set_auto_admit_on_commit(true);
+    engine.set_host_install_elision_enabled(true);
+    engine.set_binary_wal_records_enabled(true);
+    engine.set_device_write_locate_enabled(true);
+    engine.set_device_write_locate_wave_batch_enabled(true);
+    engine.set_constrained_elision_enabled(true);
+    engine
+        .execute_dml_concurrent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            "INSERT INTO t VALUES (1000000, 0)",
+        )
+        .unwrap();
+    let snapshot = engine
+        .populate_relational_residency_snapshot("t")
+        .expect("populate residency");
+    snapshot.device_memory_proof.as_ref()?;
+    for i in 0..10_000_i32 {
+        engine
+            .execute_dml_concurrent(
+                txn_ids.fetch_add(1, Ordering::Relaxed),
+                &format!("INSERT INTO t VALUES ({}, 0)", 1_000_001 + i),
+            )
+            .unwrap();
+        if engine.table_install_elided("t") {
+            return Some(engine.prepare_covered_insert_route("t").unwrap());
+        }
+    }
+    panic!("table never entered elision on a GPU box");
+}
+
+/// E2.2(c) + (a) — the driver-multiplexed submit/poll API and the integer-ledger conflict
+/// semantics. Submits a batch of distinct-PK intents WITHOUT per-commit blocking, drains them via
+/// the single-writer pump, and reaps every ticket. Then proves first-committer-wins on a SAME-WAVE
+/// duplicate PK (the integer conflict slot: exactly one commits, the other is a retryable conflict)
+/// and a committed-dup 23505 through the async surface.
+#[test]
+#[ignore = "requires a local NVIDIA driver and GPU"]
+fn gpu_intent_submit_poll_driver_and_conflict_semantics() {
+    let mut engine = Engine::new_local();
+    let txn_ids = AtomicU64::new(2);
+    let Some(route) = warm_intent_route(&mut engine, &txn_ids) else {
+        return; // driverless box
+    };
+
+    // Driver-multiplexed batch: submit 300 distinct-PK intents (non-blocking), then pump + reap.
+    let mut tickets: Vec<_> = (0..300_i32)
+        .map(|i| {
+            engine
+                .submit_covered_insert_intent(
+                    txn_ids.fetch_add(1, Ordering::Relaxed),
+                    &route,
+                    &[i, i + 1],
+                )
+                .expect("submit intent")
+        })
+        .collect();
+    let mut reaped = 0usize;
+    let mut spins = 0u32;
+    while reaped < tickets.len() {
+        engine.drive_commit_wave();
+        for ticket in tickets.iter_mut() {
+            if let Some(result) = engine.poll_intent(ticket) {
+                result.expect("distinct-PK intent commits");
+                reaped += 1;
+            }
+        }
+        spins += 1;
+        assert!(spins < 100_000, "driver failed to drain the intent batch");
+    }
+    let count = engine
+        .execute_relational_select_text("SELECT COUNT(*) FROM t WHERE id < 1000000")
+        .unwrap();
+    assert!(
+        format!("{:?}", count.rows.row(0).first()).contains("(300)"),
+        "all 300 distinct-PK intents visible: {:?}",
+        count.rows.row(0).first()
+    );
+
+    // SAME-WAVE duplicate PK: submit two intents on the same fresh PK before any pump. Exactly one
+    // wins; the other is a first-committer-wins conflict caught by the INTEGER unique-slot ledger.
+    let mut a = engine
+        .submit_covered_insert_intent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            &route,
+            &[500_000, 1],
+        )
+        .unwrap();
+    let mut b = engine
+        .submit_covered_insert_intent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            &route,
+            &[500_000, 2],
+        )
+        .unwrap();
+    let (mut ra, mut rb) = (None, None);
+    let mut spins = 0u32;
+    while ra.is_none() || rb.is_none() {
+        engine.drive_commit_wave();
+        if ra.is_none() {
+            ra = engine.poll_intent(&mut a);
+        }
+        if rb.is_none() {
+            rb = engine.poll_intent(&mut b);
+        }
+        spins += 1;
+        assert!(spins < 100_000, "same-PW duplicate never resolved");
+    }
+    let wins = [ra.as_ref().unwrap(), rb.as_ref().unwrap()]
+        .iter()
+        .filter(|r| r.is_ok())
+        .count();
+    assert_eq!(
+        wins, 1,
+        "exactly one of two same-PK intents commits (integer-ledger first-committer-wins): {ra:?} / {rb:?}"
+    );
+
+    // Committed-dup through the async surface: a fresh intent on the now-committed PK 500000 is
+    // rejected with 23505 (wave-batched device locate verdict) once the winner is durable.
+    let mut dup = engine
+        .submit_covered_insert_intent(
+            txn_ids.fetch_add(1, Ordering::Relaxed),
+            &route,
+            &[500_000, 3],
+        )
+        .unwrap();
+    let mut result = None;
+    let mut spins = 0u32;
+    while result.is_none() {
+        engine.drive_commit_wave();
+        result = engine.poll_intent(&mut dup);
+        spins += 1;
+        assert!(spins < 100_000, "committed-dup never resolved");
+    }
+    let err = result.unwrap().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("duplicate key value violates unique index"),
+        "committed-dup must raise 23505: {err}"
+    );
+}
+
 /// Rows the warm-up phase inserted (ids >= 1_000_000).
 fn warm_count(rows: &[Vec<SqlValue>]) -> usize {
     rows.iter()

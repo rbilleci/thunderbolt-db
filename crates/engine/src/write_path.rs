@@ -41,6 +41,31 @@ pub(crate) struct UniqueIndexSlotKey {
     pub(crate) value: String,
 }
 
+/// E2.2(a) — the INTEGER-keyed unique-slot conflict identity for the covered-INSERT INTENT fast
+/// path: `(slot_id, value)` where `slot_id` packs the stable `(table_oid, column_id)` catalog
+/// identity ([`pack_unique_slot_id`]) and `value` is the raw `i32` the row wrote into that
+/// unique i32 column. Two writes to the same i32 unique slot conflict exactly as the String-keyed
+/// [`UniqueIndexSlotKey`] would — but the hot path builds/records/checks them with ZERO
+/// allocations (no `table`/`column` clone, no decimal-string format of the value).
+///
+/// CROSS-PATH INTEROP is exact and automatic: [`WriteSet::add_unique_slots`] (the single chokepoint
+/// every path funnels through) emits the integer slot ALONGSIDE the String slot for every i32
+/// unique column, so a classic-path write and an intent-path write to the same slot record into
+/// the SAME integer map at the same `commit_seq` and see each other's conflicts. The intent path
+/// builds ONLY the integer slot (skipping the String allocation entirely); the classic path keeps
+/// both (the String slot stays authoritative for non-i32 columns and is a harmless redundancy for
+/// i32 ones).
+pub(crate) type IntUniqueSlotKey = (u64, i32);
+
+/// Pack the stable catalog identity of a unique i32 column into the [`IntUniqueSlotKey`] slot id:
+/// `(table_oid << 32) | column_id`. Both are catalog-assigned and monotonic, so a dropped+recreated
+/// table (fresh oid) never aliases the old — strictly MORE precise than the name-keyed String slot,
+/// and a hash-free exact identity every path can compute from the `RelationalTable`/`RelationalColumn`
+/// already in hand.
+pub(crate) fn pack_unique_slot_id(table_oid: u32, column_id: u32) -> u64 {
+    ((table_oid as u64) << 32) | (column_id as u64)
+}
+
 /// The complete, reusable write-set a `prepare_*` computes: every row slot and every
 /// unique-index slot the matching `apply_delta` will touch — no more, no less. Stage 4's
 /// conflict detector consumes exactly this shape to validate a prepared txn against commits since
@@ -50,12 +75,18 @@ pub(crate) struct UniqueIndexSlotKey {
 pub(crate) struct WriteSet {
     pub(crate) rows: Vec<RowWriteKey>,
     pub(crate) unique_slots: Vec<UniqueIndexSlotKey>,
+    /// E2.2(a) — the integer-keyed projection of the i32 unique slots (see [`IntUniqueSlotKey`]).
+    /// The classic path fills this ALONGSIDE `unique_slots` (for i32 columns); the intent fast
+    /// path fills ONLY this. Both feed the ledger's integer map, so cross-path conflicts are exact.
+    pub(crate) unique_slots_i32: Vec<IntUniqueSlotKey>,
 }
 
 impl WriteSet {
     /// Append the unique-index slots `values` occupies for `table`. Mirrors
     /// `validate_unique_indexes_for_rows`: for each unique index, resolve the column position
     /// (skip if the column is absent, as the validator does) and record `(table, column, value)`.
+    /// E2.2(a): for a unique i32 column also emit the allocation-free integer slot so classic-path
+    /// writes share the integer conflict map with the intent fast path.
     pub(crate) fn add_unique_slots(&mut self, table: &RelationalTable, values: &[SqlValue]) {
         for index in table.indexes.iter().filter(|index| index.unique) {
             let Some(column_idx) = table
@@ -70,6 +101,11 @@ impl WriteSet {
                 column: index.column.clone(),
                 value: relational_index_value(&values[column_idx]),
             });
+            if let SqlValue::Int4(v) = &values[column_idx] {
+                let column = &table.columns[column_idx];
+                self.unique_slots_i32
+                    .push((pack_unique_slot_id(table.oid, column.id), *v));
+            }
         }
     }
 }
@@ -186,6 +222,11 @@ pub(crate) struct WriteDelta {
 pub(crate) struct RecentCommitsLedger {
     pub(crate) rows: BTreeMap<RowWriteKey, Index>,
     pub(crate) unique_slots: BTreeMap<UniqueIndexSlotKey, Index>,
+    /// E2.2(a) — the integer-keyed unique-slot map (see [`IntUniqueSlotKey`]). A strict projection
+    /// of the i32 unique slots that BOTH paths maintain, so the intent fast path's allocation-free
+    /// conflict check/record sees classic-path writes and vice versa. `HashMap`, not `BTreeMap`:
+    /// this map is never range-scanned (prune walks it) and the O(1) probe is the hot-path win.
+    pub(crate) unique_slots_i32: std::collections::HashMap<IntUniqueSlotKey, Index>,
 }
 
 impl RecentCommitsLedger {
@@ -203,6 +244,11 @@ impl RecentCommitsLedger {
                     .get(key)
                     .is_some_and(|&seq| seq > read_snapshot)
             })
+            || write_set.unique_slots_i32.iter().any(|key| {
+                self.unique_slots_i32
+                    .get(key)
+                    .is_some_and(|&seq| seq > read_snapshot)
+            })
     }
 
     /// Record a committed write-set at `commit_seq` (the highest writer of each key wins — commits
@@ -215,6 +261,9 @@ impl RecentCommitsLedger {
         for key in &write_set.unique_slots {
             self.unique_slots.insert(key.clone(), commit_seq);
         }
+        for &key in &write_set.unique_slots_i32 {
+            self.unique_slots_i32.insert(key, commit_seq);
+        }
     }
 
     /// Drop entries written at or before `boundary` (no active snapshot reads before it, so they can
@@ -222,11 +271,12 @@ impl RecentCommitsLedger {
     pub(crate) fn prune_below(&mut self, boundary: Index) {
         self.rows.retain(|_, &mut seq| seq > boundary);
         self.unique_slots.retain(|_, &mut seq| seq > boundary);
+        self.unique_slots_i32.retain(|_, &mut seq| seq > boundary);
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.rows.len() + self.unique_slots.len()
+        self.rows.len() + self.unique_slots.len() + self.unique_slots_i32.len()
     }
 }
 

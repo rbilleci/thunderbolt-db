@@ -68,6 +68,62 @@ fn recent_commits_ledger_conflict_record_and_prune() {
     );
 }
 
+/// E2.2(a) — the integer-keyed unique-slot conflict dimension. The intent fast path claims a slot
+/// as `(packed_id, i32)` with NO String allocation; the ledger must detect first-committer-wins on
+/// it EXACTLY like the String slot, and — crucially — a classic-path write (which claims BOTH the
+/// String slot AND the same integer slot) must conflict with an intent-path write to that slot and
+/// vice versa (cross-path interop through the shared integer map).
+#[test]
+fn recent_commits_ledger_integer_slot_conflict_and_cross_path() {
+    let mut ledger = RecentCommitsLedger::default();
+    let slot_id = 0xdead_0000_0000_0007_u64; // (table_oid<<32)|column_id, opaque here
+
+    // An intent write: ONLY the integer slot (no String slot).
+    let mut intent = WriteSet::default();
+    intent.unique_slots_i32.push((slot_id, 42));
+    assert!(!ledger.conflicts(&intent, 5), "empty ledger: no conflict");
+    ledger.record(&intent, 6);
+    assert_eq!(ledger.len(), 1, "only the integer slot recorded");
+
+    // A second intent to the SAME pk value, snapshotted before the commit at 6, conflicts.
+    let mut same_pk = WriteSet::default();
+    same_pk.unique_slots_i32.push((slot_id, 42));
+    assert!(
+        ledger.conflicts(&same_pk, 5),
+        "same integer slot written after the snapshot must conflict"
+    );
+    assert!(
+        !ledger.conflicts(&same_pk, 6),
+        "equality on the snapshot is a commit already seen — no conflict"
+    );
+    // A different pk value on the same slot id never conflicts.
+    let mut other_pk = WriteSet::default();
+    other_pk.unique_slots_i32.push((slot_id, 43));
+    assert!(!ledger.conflicts(&other_pk, 0));
+
+    // CROSS-PATH: a classic-path write claims the String slot AND the mirror integer slot.
+    let mut classic = WriteSet::default();
+    classic.unique_slots.push(UniqueIndexSlotKey {
+        table: "t".to_string(),
+        column: "id".to_string(),
+        value: "42".to_string(),
+    });
+    classic.unique_slots_i32.push((slot_id, 42));
+    ledger.record(&classic, 8);
+    // An intent txn snapshotted at 7 now sees the classic write at 8 via the integer map.
+    assert!(
+        ledger.conflicts(&same_pk, 7),
+        "intent must see the classic write to the same slot (cross-path, integer map)"
+    );
+    // And a classic re-attempt sees prior writes via either dimension.
+    assert!(ledger.conflicts(&classic, 7));
+
+    // Prune drops the integer slots too (bounded by the active-snapshot window).
+    ledger.prune_below(8);
+    assert_eq!(ledger.len(), 0, "all slots at/below the floor pruned");
+    assert!(!ledger.conflicts(&same_pk, 0));
+}
+
 #[test]
 fn active_snapshots_track_oldest_boundary() {
     // The oldest-active read-snapshot boundary (the GC/ledger-prune floor) under registration +

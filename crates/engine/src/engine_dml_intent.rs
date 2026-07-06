@@ -48,6 +48,18 @@ pub struct CoveredInsertRoute {
     /// `"INSERT INTO <table> VALUES ("` — the synthesized-SQL prefix for the
     /// WAL-fallback payload and the classic-path fallback.
     sql_prefix: String,
+    /// E2.2(a) — the INTEGER conflict slots this route's inserts claim, precomputed once:
+    /// `(packed_slot_id, column_index)` for every unique i32 index (all of them, since the
+    /// route requires every column INT4). Execute reads `params[column_index]` to build the
+    /// allocation-free [`crate::write_path::IntUniqueSlotKey`]s — no per-item String format,
+    /// no `(table, column)` clone. The stable `(table_oid, column_id)` identity is shared with
+    /// the classic path (see [`crate::write_path::add_unique_slots`]), so cross-path SI conflicts
+    /// against the same slot are exact.
+    unique_i32_slots: Vec<(u64, usize)>,
+    /// E2.2(b) — the fixed byte offset of the single row's `u64` row id inside the pre-encoded
+    /// W5a binary WAL record for this route's table: `3 (tag/ver/op) + 2 (table_len) +
+    /// table_len + 4 (row_count)`. The sequencer patches 8 bytes here with the wave-assigned id.
+    binary_row_id_offset: u32,
 }
 
 impl CoveredInsertRoute {
@@ -129,11 +141,38 @@ impl Engine {
                  constraints present, or device write-locate flags disabled)",
             ));
         }
+        // E2.2(a): precompute the integer conflict slots — one per unique index, keyed by the
+        // stable (table_oid, column_id) identity + the row's i32 value at wave time. Every column
+        // is INT4 here, so every unique index qualifies for the allocation-free integer slot.
+        let unique_i32_slots: Vec<(u64, usize)> = table
+            .indexes
+            .iter()
+            .filter(|index| index.unique)
+            .filter_map(|index| {
+                table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == index.column)
+                    .map(|column_idx| {
+                        let column = &table.columns[column_idx];
+                        (
+                            crate::write_path::pack_unique_slot_id(table.oid, column.id),
+                            column_idx,
+                        )
+                    })
+            })
+            .collect();
+        // E2.2(b): the W5a single-row record lays out the row id at a fixed offset after the
+        // header (tag/ver/op) + table-len prefix + row-count. Encoding uses the bare `table.name`
+        // (the delta mutation's table string), matching the sequencer's binary-record input.
+        let binary_row_id_offset = (3 + 2 + table.name.len() + 4) as u32;
         Ok(CoveredInsertRoute {
             table: table.name.clone(),
             catalog_seq: catalog.commit_seq,
             column_count: table.columns.len(),
             sql_prefix: format!("INSERT INTO {} VALUES (", table.name),
+            unique_i32_slots,
+            binary_row_id_offset,
         })
     }
 
@@ -155,6 +194,89 @@ impl Engine {
         route: &CoveredInsertRoute,
         params: &[i32],
     ) -> Result<(), ExecuteError> {
+        self.check_intent_params(route, params)?;
+        // Pin + register the read snapshot exactly like the classic off-lock
+        // prepare (the guard holds the MVCC GC boundary; conflicts() validates
+        // against this snapshot).
+        let read_snapshot = self.committed_seq();
+        let snapshot_guard = self.register_active_snapshot(read_snapshot);
+        match self.build_covered_insert_intent(txn_id, route, params, read_snapshot) {
+            IntentBuild::Item(item) => self.commit_wave_item_blocking(item),
+            IntentBuild::Fallback(text) => {
+                drop(snapshot_guard);
+                self.execute_dml_concurrent(txn_id, &text)
+            }
+        }
+    }
+
+    /// E2.2(c) — SUBMIT a covered-INSERT intent WITHOUT blocking, returning an [`IntentTicket`].
+    /// A driver thread advances the pipeline via [`Engine::drive_commit_wave`] and reaps the
+    /// ticket with [`Engine::poll_intent`]; N drivers thereby carry M logical clients with no
+    /// per-commit thread park/wake. The read snapshot stays registered (GC/prune boundary) until
+    /// the ticket is polled to completion — a submitted-but-never-polled ticket pins the boundary
+    /// (documented cost of the async contract; the driver bench always polls to completion).
+    ///
+    /// On eligibility drift the classic text path is run INLINE (rare) and the ticket returns its
+    /// resolved outcome on the first poll — the async surface never silently skips a validation.
+    pub fn submit_covered_insert_intent(
+        &self,
+        txn_id: u64,
+        route: &CoveredInsertRoute,
+        params: &[i32],
+    ) -> Result<IntentTicket, ExecuteError> {
+        self.check_intent_params(route, params)?;
+        let read_snapshot = self.committed_seq();
+        // Register WITHOUT the RAII guard — the boundary is released by `poll_intent` on
+        // completion (the async lifecycle owns the snapshot past this call's return).
+        std::mem::forget(self.register_active_snapshot(read_snapshot));
+        match self.build_covered_insert_intent(txn_id, route, params, read_snapshot) {
+            IntentBuild::Item(item) => {
+                let outcome = match self.submit_commit_wave_item(item) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        // Enqueue refused (wedged): release the boundary and surface the error.
+                        self.deregister_active_snapshot(read_snapshot);
+                        return Err(err);
+                    }
+                };
+                Ok(IntentTicket {
+                    outcome: Some(outcome),
+                    read_snapshot,
+                    resolved: None,
+                })
+            }
+            IntentBuild::Fallback(text) => {
+                // Rare drift: run the classic path inline, release the boundary, return a
+                // pre-resolved ticket (poll yields the result once).
+                let resolved = self.execute_dml_concurrent(txn_id, &text);
+                self.deregister_active_snapshot(read_snapshot);
+                Ok(IntentTicket {
+                    outcome: None,
+                    read_snapshot,
+                    resolved: Some(resolved),
+                })
+            }
+        }
+    }
+
+    /// E2.2(c) — poll a submitted intent. Returns `None` while in flight, `Some(result)` exactly
+    /// once on completion (releasing the read-snapshot GC boundary), and `None` thereafter.
+    pub fn poll_intent(&self, ticket: &mut IntentTicket) -> Option<Result<(), ExecuteError>> {
+        if let Some(resolved) = ticket.resolved.take() {
+            return Some(resolved);
+        }
+        let outcome = ticket.outcome.as_ref()?;
+        let result = outcome.take_if_done()?;
+        ticket.outcome = None;
+        self.deregister_active_snapshot(ticket.read_snapshot);
+        Some(result)
+    }
+
+    fn check_intent_params(
+        &self,
+        route: &CoveredInsertRoute,
+        params: &[i32],
+    ) -> Result<(), ExecuteError> {
         if params.len() != route.column_count {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "covered-INSERT intent expects {} params for table \"{}\", got {}",
@@ -166,16 +288,24 @@ impl Engine {
         if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
-        // Pin + register the read snapshot exactly like the classic off-lock
-        // prepare (the guard holds the MVCC GC boundary; conflicts() validates
-        // against this snapshot).
-        let read_snapshot = self.committed_seq();
-        let snapshot_guard = self.register_active_snapshot(read_snapshot);
+        Ok(())
+    }
 
-        // Re-derive eligibility against the LIVE catalog generation. The gate
-        // must match what the wave sequencer will re-derive under the same
-        // generation stamp: a stale route (DDL) or a de-elided table falls
-        // back to the classic path — never a validation skip.
+    /// Build the wave item for a covered-INSERT intent (shared by the blocking + async arms), or
+    /// fall back to synthesized SQL text on eligibility drift. The pure-function equivalent of
+    /// parse + `prepare_insert` for this shape: identity coercion, PK not-null vacuous for i32
+    /// params, unique check wave-deferred + integer-slotted (a), value index elided-empty, and the
+    /// W5a binary record PRE-ENCODED with a placeholder row id (b).
+    fn build_covered_insert_intent(
+        &self,
+        txn_id: u64,
+        route: &CoveredInsertRoute,
+        params: &[i32],
+        read_snapshot: Index,
+    ) -> IntentBuild {
+        // Re-derive eligibility against the LIVE catalog generation. The gate must match what the
+        // wave sequencer will re-derive under the same generation stamp: a stale route (DDL) or a
+        // de-elided table falls back to the classic path — never a validation skip.
         let catalog = self.catalog_snapshot();
         let prepared_catalog_seq = catalog.commit_seq;
         let table = catalog.relational_catalog.get(&route.table);
@@ -186,21 +316,18 @@ impl Engine {
                     && self.insert_unique_wave_batchable(&catalog, table)
             });
         if !eligible {
-            drop(snapshot_guard);
-            let text = route.synthesize_text(params);
-            return self.execute_dml_concurrent(txn_id, &text);
+            return IntentBuild::Fallback(route.synthesize_text(params));
         }
-        let table = table.expect("eligibility checked table presence");
 
-        // Build the wave item directly — the pure-function equivalent of
-        // parse + `prepare_insert` for this shape (identity coercion, PK
-        // not-null vacuous for i32 params, unique check wave-deferred, value
-        // index elided-empty). The row key is snapshot-relative exactly like
-        // `prepare_insert`'s encode; the sequencer re-keys it at the wave's
-        // row-id cursor (`rekey_offlock_insert_delta`).
         let values: Vec<SqlValue> = params.iter().map(|&param| SqlValue::Int4(param)).collect();
+        // E2.2(a): build the ALLOCATION-FREE integer conflict slots from the route's precomputed
+        // (slot_id, column_index) list — no String format, no (table, column) clone.
         let mut write_set = WriteSet::default();
-        write_set.add_unique_slots(table, &values);
+        for &(slot_id, column_idx) in &route.unique_i32_slots {
+            write_set
+                .unique_slots_i32
+                .push((slot_id, params[column_idx]));
+        }
         let snapshot = self.dml_read_snapshot(read_snapshot);
         let row_key = relational_row_key(&route.table, snapshot.next_row_id);
         let delta = WriteDelta {
@@ -213,22 +340,32 @@ impl Engine {
                 seq_advances: BTreeMap::new(),
             },
         };
-        // The Insert AST is the wave's validation currency (batched device
-        // locate needles; the Full re-prepare on mid-wave catalog drift) —
-        // empty column list = catalog order, matching `params`.
+        // The Insert AST is the wave's validation currency (batched device locate needles; the
+        // Full re-prepare on mid-wave catalog drift) — empty column list = catalog order.
         let cmd = Command::Insert(Insert {
             table: route.table.clone(),
             columns: Vec::new(),
-            rows: vec![values],
+            rows: vec![values.clone()],
         });
-        // WAL fallback payload: the sequencer logs the W5a BINARY record for
-        // this reuse-eligible delta; the text payload is written verbatim only
-        // on its fallback arms (catalog drift mid-wave, binary encode decline),
-        // so it must stay valid replayable SQL.
+        // E2.2(b): pre-encode the W5a binary record with a PLACEHOLDER row id (0). The sequencer
+        // patches the real id at `binary_row_id_offset`. Encoding is a pure function of the row
+        // image, so this runs OFF the sequencer. `None` (width-exceeding; never for this shape)
+        // leaves the sequencer's per-item encode path in charge.
+        let binary_wal_template =
+            crate::wal_binary::try_encode_binary_insert(&route.table, &[(0u64, values.as_slice())])
+                .map(|bytes| {
+                    (
+                        std::sync::Arc::<[u8]>::from(bytes.as_slice()),
+                        route.binary_row_id_offset,
+                    )
+                });
+        // WAL fallback payload: the sequencer logs the W5a BINARY record for this reuse-eligible
+        // delta; the text payload is written verbatim only on its fallback arms (catalog drift
+        // mid-wave, binary encode decline), so it must stay valid replayable SQL.
         let text = route.synthesize_text(params);
         let mut residency_tables = BTreeSet::new();
         residency_tables.insert(route.table.clone());
-        self.commit_dml_concurrent(
+        IntentBuild::Item(self.make_covered_insert_wave_item(
             txn_id,
             cmd,
             &text,
@@ -237,6 +374,24 @@ impl Engine {
             residency_tables,
             prepared_catalog_seq,
             Some(delta),
-        )
+            binary_wal_template,
+        ))
     }
+}
+
+/// The outcome of [`Engine::build_covered_insert_intent`]: a ready-to-enqueue wave item, or a
+/// synthesized-SQL fallback for the classic path (eligibility drift).
+enum IntentBuild {
+    Item(crate::engine_dml_concurrent::CommitWaveItem),
+    Fallback(String),
+}
+
+/// E2.2(c) — a handle to a submitted covered-INSERT intent. Poll it with [`Engine::poll_intent`];
+/// the read-snapshot GC boundary it pins is released on the completing poll.
+pub struct IntentTicket {
+    /// The wave-item completion slot (async path); `None` once reaped or for the inline fallback.
+    outcome: Option<crate::engine_dml_concurrent::CommitWaveOutcome>,
+    read_snapshot: Index,
+    /// A pre-resolved result (the inline classic fallback arm), yielded on the first poll.
+    resolved: Option<Result<(), ExecuteError>>,
 }

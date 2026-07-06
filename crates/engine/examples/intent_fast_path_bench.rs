@@ -95,6 +95,11 @@ fn warm_up_elision(engine: &Engine, txn_ids: &AtomicU64) -> Result<usize, Box<dy
 enum Arm {
     Classic,
     Intent,
+    /// E2.2(c) — the driver-multiplexed arm: each thread is an EVENT-LOOP DRIVER carrying a WINDOW
+    /// of logical clients (in-flight tickets), submitting non-blocking, pumping the single-writer
+    /// commit wave via `drive_commit_wave`, and reaping tickets with `poll_intent`. No per-commit
+    /// thread park/wake — the thread-per-client wake storm the E2.1 bench measured is gone.
+    Driver,
 }
 
 fn run_arm(
@@ -107,7 +112,14 @@ fn run_arm(
     let name = match arm {
         Arm::Classic => "classic",
         Arm::Intent => "intent",
+        Arm::Driver => "driver",
     };
+    // E2.2(c): per-driver in-flight window = logical clients carried per driver thread.
+    let window: usize = std::env::var("GPU_DB_BENCH_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(64);
     let segment = wal_dir.join(format!("intent-{name}-c{writers}.wal"));
     remove_segment_files(&segment);
     let engine = build_engine(&segment)?;
@@ -137,6 +149,63 @@ fn run_arm(
                 // proportionally past that (a 3s closed-loop point stays far
                 // under the per-writer budget either way).
                 let stride = 4_000_000_i64.min(2_100_000_000 / writers as i64);
+                if arm == Arm::Driver {
+                    // E2.2(c): event-loop driver carrying `window` logical clients. Keep the window
+                    // full of in-flight tickets, pump the wave, reap completions, record per-client
+                    // end-to-end latency (submit -> durable+published poll), and refill.
+                    let mut inflight: Vec<Option<(gpu_db_engine::IntentTicket, Instant)>> =
+                        (0..window).map(|_| None).collect();
+                    while !stop.load(Ordering::Relaxed) {
+                        for slot in inflight.iter_mut() {
+                            if slot.is_none() {
+                                let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
+                                let id = (w as i64 * stride + i) as i32;
+                                i += 1;
+                                let submitted = Instant::now();
+                                match engine.submit_covered_insert_intent(txn_id, &route, &[id, 1])
+                                {
+                                    Ok(ticket) => *slot = Some((ticket, submitted)),
+                                    Err(err) => return Err(format!("driver {w} submit: {err}")),
+                                }
+                            }
+                        }
+                        engine.drive_commit_wave();
+                        for slot in inflight.iter_mut() {
+                            if let Some((ticket, submitted)) = slot {
+                                if let Some(result) = engine.poll_intent(ticket) {
+                                    result.map_err(|err| format!("driver {w}: {err}"))?;
+                                    latencies_nanos.push(submitted.elapsed().as_nanos() as u64);
+                                    completions_millis
+                                        .push(run_started.elapsed().as_millis() as u64);
+                                    *slot = None;
+                                }
+                            }
+                        }
+                    }
+                    // Drain the window so no ticket outlives the run (releases GC boundaries).
+                    // Record drained commits too so `total` matches the durable row count
+                    // (recovery-parity honesty).
+                    let mut pending = inflight.iter().filter(|s| s.is_some()).count();
+                    while pending > 0 {
+                        engine.drive_commit_wave();
+                        for slot in inflight.iter_mut() {
+                            if let Some((ticket, submitted)) = slot {
+                                if let Some(result) = engine.poll_intent(ticket) {
+                                    result.map_err(|err| format!("driver {w} drain: {err}"))?;
+                                    latencies_nanos.push(submitted.elapsed().as_nanos() as u64);
+                                    completions_millis
+                                        .push(run_started.elapsed().as_millis() as u64);
+                                    *slot = None;
+                                    pending -= 1;
+                                }
+                            }
+                        }
+                    }
+                    return Ok(WriterSample {
+                        latencies_nanos,
+                        completions_millis,
+                    });
+                }
                 while !stop.load(Ordering::Relaxed) {
                     let txn_id = txn_ids.fetch_add(1, Ordering::Relaxed);
                     let id = (w as i64 * stride + i) as i32;
@@ -149,6 +218,7 @@ fn run_arm(
                             txn_id,
                             &format!("INSERT INTO t VALUES ({id}, 1)"),
                         ),
+                        Arm::Driver => unreachable!("driver arm handled above"),
                     };
                     outcome.map_err(|err| format!("writer {w} id {id}: {err}"))?;
                     latencies_nanos.push(commit_started.elapsed().as_nanos() as u64);
@@ -328,6 +398,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if arm == "intent" || arm == "both" {
             run_arm(Arm::Intent, writers, seconds, &wal_dir, recover)?;
+        }
+        // E2.2(c): the driver-multiplexed arm (opt-in via ARM=driver|all; `writers` = driver
+        // threads, each carrying GPU_DB_BENCH_WINDOW logical clients).
+        if arm == "driver" || arm == "all" {
+            run_arm(Arm::Driver, writers, seconds, &wal_dir, recover)?;
         }
     }
     Ok(())

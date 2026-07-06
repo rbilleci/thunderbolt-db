@@ -9,7 +9,32 @@ use super::*;
 
 /// Upper bound on items per wave drain (keeps a single wave's worst-case commit latency bounded;
 /// under saturation the NEXT wave picks the rest up immediately).
-const COMMIT_WAVE_MAX: usize = 1024;
+const COMMIT_WAVE_MAX_DEFAULT: usize = 1024;
+
+/// E2.2(d) — the wave-size / pipeline-depth knobs are env-overridable for the latency-knee sweep
+/// (`GPU_DB_COMMIT_WAVE_MAX`, `GPU_DB_WAVE_TAIL_PIPELINE_DEPTH`), read once. The defaults are the
+/// production values; the sweep finds the throughput/latency knee once (a)-(c) reshape the loop.
+fn commit_wave_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_DB_COMMIT_WAVE_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(COMMIT_WAVE_MAX_DEFAULT)
+    })
+}
+
+fn wave_tail_pipeline_depth() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_DB_WAVE_TAIL_PIPELINE_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(WAVE_TAIL_PIPELINE_DEPTH_DEFAULT)
+    })
+}
 
 /// W2b — max sequenced-but-unpublished wave tails outstanding in the durability pipeline. Depth 1
 /// forced one fsync per wave (the sequencer stalled at the gate for ~the full fdatasync — a
@@ -20,7 +45,7 @@ const COMMIT_WAVE_MAX: usize = 1024;
 /// `publish_committed_seq` is a CAS-max, so concurrent claimers may finish tails out of order.
 /// The bound caps applied-but-unpublished state at N waves (restart recovery replays the durable
 /// prefix; nothing unpublished was ever acked).
-const WAVE_TAIL_PIPELINE_DEPTH: u64 = 8;
+const WAVE_TAIL_PIPELINE_DEPTH_DEFAULT: u64 = 8;
 
 /// Commit-wave telemetry (waves sequenced / items committed through waves / total sequencing
 /// nanos). W2 CHANGED [2]'s meaning: the timer now stops when `sequence_commit_wave` returns —
@@ -96,6 +121,13 @@ pub(crate) struct CommitWaveItem {
     /// (`prepared_catalog_seq`; a DDL bump forces the Full path, dropping the reuse). `None` = the
     /// item takes the normal `prepare_dml` re-resolve.
     offlock_delta: Option<crate::write_path::WriteDelta>,
+    /// E2.2(b) — the PRE-ENCODED W5a binary WAL record, built OFF the sequencer at intent-build
+    /// time as a pure function of `(route, params)` with a PLACEHOLDER row id, plus the fixed byte
+    /// offset of that row id. Present only for single-row covered-INSERT intents. The sequencer
+    /// patches the 8-byte row id at `offset` with the wave-assigned id (no String row-key parse, no
+    /// per-item `encode_relational_row` + `try_encode_binary_insert`) and uses the result verbatim
+    /// as the reuse-eligible delta's WAL payload. `None` = the classic per-item encode path.
+    binary_wal_template: Option<(std::sync::Arc<[u8]>, u32)>,
     outcome: CommitWaveOutcome,
 }
 
@@ -111,7 +143,7 @@ pub(crate) struct CommitWaveDone {
 }
 
 impl CommitWaveDone {
-    fn take_if_done(&self) -> Option<Result<(), ExecuteError>> {
+    pub(crate) fn take_if_done(&self) -> Option<Result<(), ExecuteError>> {
         if !self.done.load(AtomicOrdering::Acquire) {
             return None;
         }
@@ -540,34 +572,164 @@ impl Engine {
         prepared_catalog_seq: Index,
         offlock_delta: Option<crate::write_path::WriteDelta>,
     ) -> Result<(), ExecuteError> {
-        let outcome: CommitWaveOutcome = Arc::new(CommitWaveDone::default());
+        let item = CommitWaveItem {
+            txn_id,
+            cmd,
+            payload: std::sync::Arc::from(text.as_bytes()),
+            prepared_catalog_seq,
+            offlock_delta,
+            binary_wal_template: None,
+            write_set,
+            read_snapshot,
+            residency_tables,
+            outcome: Arc::new(CommitWaveDone::default()),
+        };
+        let outcome = self.enqueue_commit_wave_item(item)?;
+        // Blocking client: become the sequencer or spin/park on our own outcome, running the
+        // pipeline's pending tails as a fallback claimer (the classic per-statement blocking arm).
+        if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
+            return result;
+        }
+        self.await_commit_wave_outcome(&outcome)
+    }
+
+    /// E2.2(c) — build a covered-INSERT wave item (the intent fast path's per-statement item),
+    /// carrying the reuse delta, integer conflict slots (already in `write_set`), and the
+    /// pre-encoded W5a binary template. Kept in this module so [`CommitWaveItem`]'s fields stay
+    /// private; the intent module supplies the pure-function inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn make_covered_insert_wave_item(
+        &self,
+        txn_id: u64,
+        cmd: Command,
+        text: &str,
+        write_set: WriteSet,
+        read_snapshot: Index,
+        residency_tables: BTreeSet<String>,
+        prepared_catalog_seq: Index,
+        offlock_delta: Option<crate::write_path::WriteDelta>,
+        binary_wal_template: Option<(std::sync::Arc<[u8]>, u32)>,
+    ) -> CommitWaveItem {
+        CommitWaveItem {
+            txn_id,
+            cmd,
+            payload: std::sync::Arc::from(text.as_bytes()),
+            prepared_catalog_seq,
+            offlock_delta,
+            binary_wal_template,
+            write_set,
+            read_snapshot,
+            residency_tables,
+            outcome: Arc::new(CommitWaveDone::default()),
+        }
+    }
+
+    /// E2.2(c) — enqueue a built item and BLOCK until it commits (the intent path's blocking arm,
+    /// identical wait machinery to [`Engine::commit_dml_concurrent`]).
+    pub(crate) fn commit_wave_item_blocking(
+        &self,
+        item: CommitWaveItem,
+    ) -> Result<(), ExecuteError> {
+        let outcome = self.enqueue_commit_wave_item(item)?;
+        if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
+            return result;
+        }
+        self.await_commit_wave_outcome(&outcome)
+    }
+
+    /// E2.2(c) — enqueue a built item WITHOUT blocking, returning its completion slot (the
+    /// driver-multiplexed submit path). The caller advances the pipeline via
+    /// [`Engine::drive_commit_wave`] and observes completion via [`CommitWaveOutcome::take_if_done`].
+    pub(crate) fn submit_commit_wave_item(
+        &self,
+        item: CommitWaveItem,
+    ) -> Result<CommitWaveOutcome, ExecuteError> {
+        self.enqueue_commit_wave_item(item)
+    }
+
+    /// Enqueue one already-built wave item (non-blocking). Returns its completion slot, or the
+    /// wedge error if the concurrent path is wedged pending recovery. The single shared push point
+    /// for the blocking commit arm and the E2.2(c) async submit path.
+    fn enqueue_commit_wave_item(
+        &self,
+        item: CommitWaveItem,
+    ) -> Result<CommitWaveOutcome, ExecuteError> {
+        let outcome = Arc::clone(&item.outcome);
         let mut queue = self.lock_commit_wave_queue();
         if let Some(reason) = &queue.wedged {
             return Err(ExecuteError::Engine(EngineError::Durability(format!(
                 "the concurrent commit path is wedged pending restart recovery: {reason}"
             ))));
         }
-        queue.items.push_back(CommitWaveItem {
-            txn_id,
-            cmd,
-            payload: std::sync::Arc::from(text.as_bytes()),
-            prepared_catalog_seq,
-            offlock_delta,
-            write_set,
-            read_snapshot,
-            residency_tables,
-            outcome: Arc::clone(&outcome),
-        });
-        if !queue.sequencer_active {
-            queue.sequencer_active = true;
-            drop(queue);
-            self.run_commit_wave_sequencer(&outcome);
-            if let Some(result) = outcome.take_if_done() {
-                return result;
-            }
-        } else {
-            drop(queue);
+        queue.items.push_back(item);
+        Ok(outcome)
+    }
+
+    /// E2.2(c) — the driver-multiplexed pipeline pump: advance the commit wave by ONE unit of work
+    /// without blocking on any particular outcome. If no sequencer is active and work is queued,
+    /// promote this thread to sequence a drain; otherwise claim a pending durability tail. Returns
+    /// whether it did work. N event-loop drivers call this in their poll loops so M logical clients
+    /// share a few OS threads with no per-commit park/wake — the disruptor ingress the mandate
+    /// calls for. `take_if_done` on a submitted ticket observes the result.
+    pub fn drive_commit_wave(&self) -> bool {
+        // Prefer claiming a pending tail (cheap, unblocks acks) before taking sequencer duty.
+        if self.try_finish_pending_wave_tail() {
+            return true;
         }
+        let promote = {
+            let mut queue = match self.commit_wave.queue.try_lock() {
+                Ok(queue) => queue,
+                Err(_) => return false,
+            };
+            if !queue.sequencer_active && !queue.items.is_empty() && queue.wedged.is_none() {
+                queue.sequencer_active = true;
+                true
+            } else {
+                false
+            }
+        };
+        if promote {
+            // Drive one full drain cycle. `own_outcome` is a never-completing sentinel: the
+            // sequencer steps down on an empty queue (or when this dummy is "done", which it never
+            // is), so this returns after draining everything currently queued.
+            let sentinel: CommitWaveOutcome = Arc::new(CommitWaveDone::default());
+            self.run_commit_wave_sequencer(&sentinel);
+            return true;
+        }
+        false
+    }
+
+    /// If no sequencer is running, promote THIS thread to drain+sequence waves until `own_outcome`
+    /// completes, then return its result. Returns `None` if a sequencer is already active (the
+    /// caller should wait) or if the promotion ran but our outcome is not yet set (a pipelined
+    /// tail we did not claim — fall through to the waiter loop).
+    fn pump_as_sequencer_if_idle(
+        &self,
+        own_outcome: &CommitWaveOutcome,
+    ) -> Option<Result<(), ExecuteError>> {
+        let promote = {
+            let mut queue = self.lock_commit_wave_queue();
+            if !queue.sequencer_active {
+                queue.sequencer_active = true;
+                true
+            } else {
+                false
+            }
+        };
+        if promote {
+            self.run_commit_wave_sequencer(own_outcome);
+            return own_outcome.take_if_done();
+        }
+        None
+    }
+
+    /// Block until `own_outcome` completes: spin (claiming pending tails + promoting a leaderless
+    /// queue), then fall back to the condvar. The tail of the classic blocking commit path.
+    fn await_commit_wave_outcome(
+        &self,
+        own_outcome: &CommitWaveOutcome,
+    ) -> Result<(), ExecuteError> {
+        let outcome: &CommitWaveOutcome = own_outcome;
         loop {
             // Spin first: under load a wave completes within tens of µs, far cheaper to poll than
             // to pay a futex sleep + wake per commit. The periodic promotion probe keeps queued
@@ -588,7 +750,7 @@ impl Engine {
                         if !queue.sequencer_active && !queue.items.is_empty() {
                             queue.sequencer_active = true;
                             drop(queue);
-                            self.run_commit_wave_sequencer(&outcome);
+                            self.run_commit_wave_sequencer(outcome);
                         }
                     }
                 }
@@ -617,7 +779,7 @@ impl Engine {
                     }
                     queue.sequencer_active = true;
                     drop(queue);
-                    self.run_commit_wave_sequencer(&outcome);
+                    self.run_commit_wave_sequencer(outcome);
                     break;
                 }
                 queue = self
@@ -654,7 +816,7 @@ impl Engine {
         loop {
             let batch: Vec<CommitWaveItem> = {
                 let mut queue = self.lock_commit_wave_queue();
-                let n = queue.items.len().min(COMMIT_WAVE_MAX);
+                let n = queue.items.len().min(commit_wave_max());
                 if n == 0 {
                     queue.sequencer_active = false;
                     drop(queue);
@@ -694,7 +856,7 @@ impl Engine {
                 // applied-but-unpublished state. Claim tails ourselves when the pipe is full
                 // (under load the shared fsync already covered them and the finishes are
                 // instant).
-                self.wait_wave_tail_capacity(WAVE_TAIL_PIPELINE_DEPTH - 1);
+                self.wait_wave_tail_capacity(wave_tail_pipeline_depth() - 1);
                 {
                     let mut tails = self
                         .commit_wave
@@ -1318,35 +1480,60 @@ impl Engine {
             // SQL text: replay becomes decode+install (no parse, no re-resolve), the record
             // carries the ORIGINAL row ids, and checkpoints shrink. Everything else keeps the
             // SQL-text payload unchanged.
-            let wal_payload: std::sync::Arc<[u8]> =
-                if self.binary_wal_records_enabled() && Self::reresolve_reuse_eligible(&delta) {
-                    let crate::write_path::PreparedMutation::Insert {
-                        table,
-                        inserted_rows,
-                        ..
-                    } = &delta.mutation
-                    else {
-                        unreachable!("reuse-eligible is insert-shaped");
-                    };
-                    let prefix = relational_key_prefix(table);
-                    let id_rows: Vec<(u64, &[SqlValue])> = inserted_rows
-                        .iter()
-                        .map(|(key, values)| {
-                            (
-                                crate::engine_residency::parse_relational_row_id(key, &prefix)
-                                    .expect("re-keyed insert rows carry canonical row keys"),
-                                values.as_slice(),
-                            )
-                        })
-                        .collect();
-                    match try_encode_binary_insert(table, &id_rows) {
-                        Some(payload) => payload.into(),
-                        // Width-exceeding shape (unrealistic; audit 21eddaa7 C): keep the text.
-                        None => item.payload.clone(),
-                    }
-                } else {
-                    item.payload.clone()
+            let wal_payload: std::sync::Arc<[u8]> = if self.binary_wal_records_enabled()
+                && Self::reresolve_reuse_eligible(&delta)
+            {
+                let crate::write_path::PreparedMutation::Insert {
+                    table,
+                    inserted_rows,
+                    ..
+                } = &delta.mutation
+                else {
+                    unreachable!("reuse-eligible is insert-shaped");
                 };
+                // E2.2(b): a single-row covered-INSERT intent carries its W5a record PRE-ENCODED
+                // (built off the sequencer at intent-build time). The only wave-time-dependent
+                // field is the row id, at a fixed offset — patch it in place instead of parsing the
+                // row key + re-encoding the row image. The reuse re-key assigns the single row's id
+                // as `next_row_id + 0`, i.e. this item's `install_snapshot.next_row_id`.
+                match &item.binary_wal_template {
+                    Some((template, offset)) if inserted_rows.len() == 1 => {
+                        let row_id = install_snapshot.next_row_id;
+                        debug_assert_eq!(
+                            crate::engine_residency::parse_relational_row_id(
+                                &inserted_rows[0].0,
+                                &relational_key_prefix(table),
+                            ),
+                            Some(row_id),
+                            "pre-encoded intent row id must equal the re-keyed delta's row id"
+                        );
+                        let mut bytes = template.to_vec();
+                        let off = *offset as usize;
+                        bytes[off..off + 8].copy_from_slice(&row_id.to_le_bytes());
+                        bytes.into()
+                    }
+                    _ => {
+                        let prefix = relational_key_prefix(table);
+                        let id_rows: Vec<(u64, &[SqlValue])> = inserted_rows
+                            .iter()
+                            .map(|(key, values)| {
+                                (
+                                    crate::engine_residency::parse_relational_row_id(key, &prefix)
+                                        .expect("re-keyed insert rows carry canonical row keys"),
+                                    values.as_slice(),
+                                )
+                            })
+                            .collect();
+                        match try_encode_binary_insert(table, &id_rows) {
+                            Some(payload) => payload.into(),
+                            // Width-exceeding shape (unrealistic; audit 21eddaa7 C): keep the text.
+                            None => item.payload.clone(),
+                        }
+                    }
+                }
+            } else {
+                item.payload.clone()
+            };
             let wal_len_before = commit.wal.len();
             commit.wal.append(WalRecord {
                 txn_id: item.txn_id,
@@ -1389,6 +1576,7 @@ impl Engine {
             let fast_table = matches!(item.cmd, Command::Insert(_))
                 && !auto_admit
                 && delta.write_set.unique_slots.is_empty()
+                && delta.write_set.unique_slots_i32.is_empty()
                 && match &delta.mutation {
                     crate::write_path::PreparedMutation::Insert { table, .. } => {
                         *fast_table_cache.entry(table.clone()).or_insert_with(|| {
