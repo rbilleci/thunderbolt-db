@@ -139,6 +139,7 @@ impl Engine {
             }),
             active_snapshots: std::sync::Arc::new(Mutex::new(ActiveSnapshots::default())),
             group_flush: GroupFlushState::default(),
+            intent_lanes: None,
             // Mirrors LocalReplicator::leader() below.
             repl_role_mirror: std::sync::atomic::AtomicU8::new(0),
             commit_wave: engine_dml_concurrent::CommitWaveState::default(),
@@ -384,6 +385,8 @@ impl Engine {
         // `GPU_DB_WAL_FUA_SEGMENT_BYTES`). The FUA backend admits MULTIPLE durable jobs in flight;
         // the concurrent-flush seam in `wait_group_durable` keys off `durability_is_concurrent()`.
         let segment_path = segment_path.into();
+        #[cfg(unix)]
+        let lane_base_path = segment_path.clone();
         let wal = match WalDurability::from_env() {
             #[cfg(unix)]
             WalDurability::FuaFencePool {
@@ -397,6 +400,43 @@ impl Engine {
         };
         engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
         engine.commit_state_mut().wal = wal;
+        // E2.5b-2 stage 2 — construct the N-lane intent pipeline when opted in. The lane set is
+        // its own on-disk log (`<base>.lane-<L>.fua.<id>`), independent of the serial WalBuffer
+        // above: pre-activation writes (DDL, warm-up) land in the serial log; once the first lane
+        // seq block is claimed the engine is intent-only (fail-loud guard). Recovery replays the
+        // serial log, then the lane merge over the disjoint higher seq range.
+        #[cfg(unix)]
+        {
+            let lane_count = engine_intent_lanes::intent_lane_count();
+            if lane_count >= 2 {
+                let fence_lanes: usize = std::env::var("GPU_DB_INTENT_LANE_FENCES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n| n >= 1)
+                    .unwrap_or(16);
+                let lane_segment_bytes: usize = std::env::var("GPU_DB_INTENT_LANE_SEGMENT_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(64 << 20);
+                let wal_lanes = gpu_db_wal::FuaWalLaneSet::create(
+                    &lane_base_path,
+                    lane_count,
+                    fence_lanes,
+                    lane_segment_bytes,
+                )
+                .expect("failed to create intent WAL lanes (GPU_DB_INTENT_LANES)");
+                engine.intent_lanes =
+                    Some(std::sync::Arc::new(engine_intent_lanes::IntentLaneState {
+                        lane_count,
+                        wal_lanes,
+                        applied: std::sync::Mutex::new(engine_intent_lanes::SeqCut::default()),
+                        applied_mirror: std::sync::atomic::AtomicU64::new(0),
+                        activated: std::sync::atomic::AtomicBool::new(false),
+                        base_seq: std::sync::atomic::AtomicU64::new(0),
+                    }));
+            }
+        }
         engine
     }
 

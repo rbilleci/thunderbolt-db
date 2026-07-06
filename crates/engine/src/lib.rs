@@ -364,6 +364,9 @@ pub struct Engine {
     /// `group_flush.coord` may be taken only when the commit_mutex is NOT held; a flusher takes
     /// the commit_mutex briefly INSIDE (coord → commit), never the reverse.
     group_flush: GroupFlushState,
+    /// E2.5b-2 — N-lane intent commit pipeline state (`GPU_DB_INTENT_LANES>=2` on a durable
+    /// engine); `None` keeps every existing path byte-identical. Arc: lane pumps hold clones.
+    intent_lanes: Option<std::sync::Arc<engine_intent_lanes::IntentLaneState>>,
     /// The lock-free read-path state, shared by value-`Arc` with the concurrent-dispatch façade so
     /// reads and the concurrent-DML path reach `mvcc` / `committed_seq` / resident device-memory /
     /// route telemetry WITHOUT the engine `RwLock` (lock-free read path, write-half MVCC). A holder

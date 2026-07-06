@@ -21,9 +21,9 @@
 //! in the same lane by construction (hash routing), preserving single-winner
 //! 23505 without cross-lane coordination.
 
-// Stage 1 of the lane wiring (see module docs): the types land with their unit
-// tests; construction + lane pumps arrive in the next staged commit. The allow
-// is removed the moment `engine_lifecycle` constructs `IntentLaneState`.
+// Stage 2: constructed by `engine_lifecycle` behind GPU_DB_INTENT_LANES; the
+// pump-facing methods (visible_cut/record_applied/lane_for_pk) go live with the
+// stage-3 lane pump loop.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
