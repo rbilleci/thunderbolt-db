@@ -1330,6 +1330,14 @@ impl Engine {
             WAVE_HOST_STATS[0]
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
         }
+        // E2.3 — the catalog generation is CONSTANT for the whole wave: DDL is the only publisher
+        // and it commits under the very commit_mutex this sequencer holds, so no generation bump can
+        // interleave a wave's items. Load the snapshot ONCE here instead of per item (the old
+        // per-item `catalog_snapshot()` was an ArcSwap load + Arc clone on every commit — the
+        // generation gate at re-resolve, the fast-run eligibility probe, and the intent fast-lane
+        // gate all read it). `wave_catalog_seq` is the ledger-#18 stamp every item compares against.
+        let wave_catalog = self.catalog_snapshot();
+        let wave_catalog_seq = wave_catalog.commit_seq;
         // HOST-phase probe: `_hp` timestamps the running phase boundary; `hp!(k)` charges the elapsed
         // time since the last boundary to WAVE_HOST_STATS[k] and resets. Reset at each item's top.
         let mut _hp = hostphase.then(Instant::now);
@@ -1345,34 +1353,152 @@ impl Engine {
                 }
             };
         }
-        for (position, item) in batch.iter().enumerate() {
+        // Index-based (not `iter().enumerate()`): the intent fast lane and the general path both
+        // reach `batch[position]` while the `flush_*` closures also borrow `batch` — an index keeps
+        // those borrows disjoint per statement without threading an iterator through the closures.
+        #[allow(clippy::needless_range_loop)]
+        for position in 0..batch.len() {
             if let Some(ref mut t) = _hp {
                 *t = Instant::now();
             }
             // M1 design B: a deferred INSERT whose PK value already exists (wave-batch verdict)
             // aborts here — the same 23505 the off-lock validation would have raised.
             if let Some(err) = wave_unique_violations.get(&position) {
-                item.set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                batch[position].set_outcome(Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     err.clone(),
                 ))));
                 continue;
             }
             // Batched-append ORDER: a non-INSERT item's re-resolve (device locate) and its
             // tombstone paths must observe every prior row of this wave — flush first.
-            if !matches!(item.cmd, Command::Insert(_)) {
+            if !matches!(batch[position].cmd, Command::Insert(_)) {
                 flush_appends(&mut pending_appends, &mut committed);
             }
             // (3a) SI first-committer-wins: any key in the write-set committed after this item's
             // read snapshot aborts it (retryable). Earlier items in THIS wave recorded into the
             // ledger below, so intra-wave conflicts are caught here exactly like cross-wave ones.
-            if commit.ledger.conflicts(&item.write_set, item.read_snapshot) {
-                item.set_outcome(Err(ExecuteError::Serialization(format!(
-                    "write-write conflict on a key committed after read snapshot {}",
-                    item.read_snapshot
+            if commit
+                .ledger
+                .conflicts(&batch[position].write_set, batch[position].read_snapshot)
+            {
+                let read_snapshot = batch[position].read_snapshot;
+                batch[position].set_outcome(Err(ExecuteError::Serialization(format!(
+                    "write-write conflict on a key committed after read snapshot {read_snapshot}"
                 ))));
                 continue;
             }
             hp!(1);
+
+            // E2.3 — INTENT INTEGER FAST LANE. A single-row covered-INSERT intent (pre-encoded
+            // binary WAL template + reuse-eligible off-lock delta + catalog generation unchanged
+            // since prepare + table still elided + auto-admit on) owes NO String row key: its row id
+            // is the wave's integer `next_row_id`, its W5a record is patched in place, and its values
+            // flow straight into the batched device append. This collapses the general path's
+            // `rekey_offlock_insert_delta` (row-key `format!` + write-set/value clones) AND the
+            // `insert_append` value-clone + String→u64 parse — the two top host buckets (reresolve,
+            // apply) for the flagship shape — into one value clone + one WAL patch. Any drift (gen
+            // bump, de-elision, auto-admit off, non-intent item) falls through to the always-correct
+            // general path below, byte-identical to before.
+            let intent_fast = auto_admit
+                && wave_catalog_seq == batch[position].prepared_catalog_seq
+                && batch[position].binary_wal_template.is_some()
+                && matches!(&batch[position].offlock_delta, Some(d)
+                    if Self::reresolve_reuse_eligible(d)
+                        && matches!(&d.mutation,
+                            crate::write_path::PreparedMutation::Insert { inserted_rows, .. }
+                                if inserted_rows.len() == 1))
+                && match &batch[position].cmd {
+                    Command::Insert(insert) => self.table_install_elided(&insert.table),
+                    _ => false,
+                };
+            if intent_fast {
+                // Land any earlier deferred fast-run installs first so seq order == apply order
+                // (intents are never themselves fast-run — they hold a unique slot — but a mixed
+                // wave may have buffered plain inserts ahead of this one).
+                flush_fast_run(&mut commit, &mut fast_run, &mut committed);
+                let commit_seq = commit.repl.peek_next_index();
+                // The row id is the wave's integer cursor — IDENTICAL to what the general path's
+                // `rekey` would `format!` into `rel/{table}/{row_id:020}` and then parse back out.
+                let row_id = next_row_id;
+                // WAL: patch the pre-encoded W5a record's 8-byte row id at its fixed offset (no
+                // key parse, no `encode_relational_row`, no `try_encode_binary_insert`).
+                let wal_bytes = {
+                    let (template, offset) = batch[position]
+                        .binary_wal_template
+                        .as_ref()
+                        .expect("intent_fast requires a binary WAL template");
+                    let off = *offset as usize;
+                    let mut bytes = template.to_vec();
+                    bytes[off..off + 8].copy_from_slice(&row_id.to_le_bytes());
+                    bytes
+                };
+                let wal_payload: std::sync::Arc<[u8]> = std::sync::Arc::from(wal_bytes);
+                let wal_len_before = commit.wal.len();
+                commit.wal.append(WalRecord {
+                    txn_id: batch[position].txn_id,
+                    payload: wal_payload.clone(),
+                });
+                let wal_position = commit.wal.len();
+                let token = match commit.repl.propose(wal_payload) {
+                    Ok(token) => token,
+                    Err(err) => {
+                        commit.wal.truncate(wal_len_before);
+                        batch[position].set_outcome(Err(ExecuteError::Engine(err)));
+                        continue;
+                    }
+                };
+                debug_assert_eq!(
+                    token.index, commit_seq,
+                    "the sequencer is the single proposer: the proposed index must equal the peek"
+                );
+                if let Err(err) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
+                    commit.repl.rollback_unapplied_from(commit_seq);
+                    commit.wal.truncate(wal_len_before);
+                    batch[position].set_outcome(Err(ExecuteError::Engine(err)));
+                    continue;
+                }
+                let timestamp_micros =
+                    wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
+                commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
+                hp!(3);
+                commit.ledger.record(&batch[position].write_set, commit_seq);
+                hp!(4);
+                // Elided apply == advance the row-id allocator (host store skipped) + the elision
+                // counter, exactly `apply_delta`'s elided-insert branch for one row. Clone the row
+                // image + table out of the carried delta straight into the batched append (one value
+                // clone total, vs the general path's two + the String round-trip).
+                let (table, values) = {
+                    let delta = batch[position]
+                        .offlock_delta
+                        .as_ref()
+                        .expect("intent_fast requires an off-lock delta");
+                    let crate::write_path::PreparedMutation::Insert {
+                        table,
+                        inserted_rows,
+                        ..
+                    } = &delta.mutation
+                    else {
+                        unreachable!("intent_fast gates to single-row inserts");
+                    };
+                    (table.clone(), inserted_rows[0].1.clone())
+                };
+                self.read_state.mvcc.advance_row_id(1);
+                self.read_state
+                    .residency
+                    .host_install_elisions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                commit.repl.mark_applied(commit_seq);
+                next_row_id = self.read_state.mvcc.current_row_id();
+                let entry = pending_appends.entry(table).or_default();
+                entry.3.push(commit_seq);
+                entry.0.push(values);
+                entry.1.push(row_id);
+                entry.2.push((position, commit_seq));
+                wave_tail = Some((commit_seq, wal_position));
+                hp!(5);
+                continue;
+            }
+            let item = &batch[position];
 
             // (3b) Re-resolve at the peeked commit seq — sees every PRIOR wave item's applied
             // delta (they are installed already), so wave order is the only order there is. A
@@ -1404,12 +1530,11 @@ impl Engine {
             // records nothing in the ledger and the item's write_set lacks slots for the new
             // index, so the skip would silently bypass it. Any DDL bumps the stamp -> Full
             // (always correct; DDL is rare so the hot path keeps the skip).
-            let insert_validation =
-                if self.catalog_snapshot().commit_seq == item.prepared_catalog_seq {
-                    InsertPrepareValidation::ReResolveLedgerCovered
-                } else {
-                    InsertPrepareValidation::Full
-                };
+            let insert_validation = if wave_catalog_seq == item.prepared_catalog_seq {
+                InsertPrepareValidation::ReResolveLedgerCovered
+            } else {
+                InsertPrepareValidation::Full
+            };
             // DELTA-REUSE (B): a reuse-eligible elided insert whose catalog generation still
             // matches (ReResolveLedgerCovered) owes no re-validation — RE-KEY the off-lock delta
             // at the wave's `next_row_id` instead of re-coercing + rebuilding it. A generation
@@ -1580,14 +1705,11 @@ impl Engine {
                 && match &delta.mutation {
                     crate::write_path::PreparedMutation::Insert { table, .. } => {
                         *fast_table_cache.entry(table.clone()).or_insert_with(|| {
-                            self.catalog_snapshot()
-                                .relational_catalog
-                                .get(table)
-                                .is_some_and(|t| {
-                                    !t.indexes.iter().any(|index| index.unique)
-                                        && t.check_constraints.is_empty()
-                                        && t.foreign_keys.is_empty()
-                                })
+                            wave_catalog.relational_catalog.get(table).is_some_and(|t| {
+                                !t.indexes.iter().any(|index| index.unique)
+                                    && t.check_constraints.is_empty()
+                                    && t.foreign_keys.is_empty()
+                            })
                         })
                     }
                     _ => false,

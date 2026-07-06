@@ -120,6 +120,17 @@ fn run_arm(
         .and_then(|v| v.parse().ok())
         .filter(|&w| w > 0)
         .unwrap_or(64);
+    // E2.3 — DEDICATED-PUMP mode (disruptor staging validation): with `GPU_DB_BENCH_PUMPS=N>0`
+    // (Driver arm only), N threads do NOTHING but pump the commit wave (`drive_commit_wave`:
+    // sequence + finish durability tails) while the `writers` driver threads ONLY submit + poll.
+    // This decouples the single-writer sequencer from ingress/ack so the sequencer stays hot on
+    // one core instead of the role bouncing across every driver (the measured per-item inflation
+    // 0.89 -> 2.7us). `0` (default) keeps the self-pumping driver loop unchanged.
+    let pumps: usize = std::env::var("GPU_DB_BENCH_PUMPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let self_pump = !(arm == Arm::Driver && pumps > 0);
     let segment = wal_dir.join(format!("intent-{name}-c{writers}.wal"));
     remove_segment_files(&segment);
     let engine = build_engine(&segment)?;
@@ -129,7 +140,26 @@ fn run_arm(
     let engine = Arc::new(engine);
 
     let stop = Arc::new(AtomicBool::new(false));
-    let barrier = Arc::new(Barrier::new(writers + 1));
+    let pump_count = if self_pump { 0 } else { pumps };
+    let barrier = Arc::new(Barrier::new(writers + pump_count + 1));
+    // E2.3 — dedicated pump threads (see `pumps`): pure sequencer/tail-finisher cores.
+    let pump_handles: Vec<_> = (0..pump_count)
+        .map(|_| {
+            let engine = Arc::clone(&engine);
+            let stop = Arc::clone(&stop);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    if !engine.drive_commit_wave() {
+                        std::hint::spin_loop();
+                    }
+                }
+                // Drain: keep pumping until the queue + tails are empty so no ticket is stranded.
+                while engine.drive_commit_wave() {}
+            })
+        })
+        .collect();
     let handles: Vec<_> = (0..writers)
         .map(|w| {
             let engine = Arc::clone(&engine);
@@ -169,7 +199,11 @@ fn run_arm(
                                 }
                             }
                         }
-                        engine.drive_commit_wave();
+                        // With dedicated pumps the drivers ONLY submit + poll (the pump threads
+                        // own sequencing + tail-finishing); otherwise self-pump as before.
+                        if self_pump {
+                            engine.drive_commit_wave();
+                        }
                         for slot in inflight.iter_mut() {
                             if let Some((ticket, submitted)) = slot {
                                 if let Some(result) = engine.poll_intent(ticket) {
@@ -241,6 +275,9 @@ fn run_arm(
         .into_iter()
         .map(|h| h.join().expect("writer panicked"))
         .collect::<Result<_, _>>()?;
+    for pump in pump_handles {
+        pump.join().expect("pump panicked");
+    }
     let elapsed = started.elapsed();
 
     let mut latencies: Vec<u64> = samples
