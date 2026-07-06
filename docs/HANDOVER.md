@@ -406,6 +406,22 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**NO-REAP PIPELINE + THE VALIDATE WALL (2026-07-06, `782213d9`): the pump is now fully non-blocking on
+apply; the remaining wall is the INLINE DEVICE VALIDATE.** No-reap: LaneSettle carries the ApplySlot,
+settlement queues at apply-push time, `drive_apply_queue_once` opportunistic leader passes, apply-failure
+poisons the lanes (fixes a LATENT livelock: a failed merged apply permanently holes the applied cut and
+previously hung all later waves silently). Inline apply wait 730→~150µs/wave. TIMELINE instrumentation
+(`GPU_DB_BENCH_TIMELINE=1`, per-second completions): NO stalls — a smooth plateau with a ~6s warm-up ramp
+(1.0→1.45M), steady ~1.45-1.55M/s; the reported "burst" is a 100ms-window×10 metric (ack clustering), not
+a sustainable rate. Deadline sweep on the non-blocking pipeline: GROUP_US {500,1000,1500} all BELOW the
+2000 baseline — smaller waves multiply per-launch fixed costs; validate stays ~500µs/wave at ANY wave
+size (launch-count-bound through the validate coalescer, the pump's last inline device wait; ~1.7ms/cycle
+total measured of a ~3ms lane cycle). VERDICT: config space EXHAUSTED at ~1.5M steady sustained
+(1.66M record run = favorable variance). The 2M+ path is structural: (1) THE MEGA-FUSE — one device
+launch for validate+apply over the merged cross-lane batch (memory: simple fuses dead, only the mega-fuse
+works); (2) validate-overlap restructure (kick validate async, run ledger/dedup behind it, filter before
+claim — hides ~130-230µs); (3) bench honesty: exclude the warm-up ramp from the sustained metric.
+
 **SETTLE-CONVOY FIX (2026-07-06): the hidden host pass was `durable_cut()` mutex-walking from every
 pump.** New pump host-pass instrumentation (drain/conflict/patch/settle ns, `[pump host us/wave]` bench
 line) attributed the un-measured ~3.5ms/lane-cycle: settle = 1362µs/wave — every pump iteration's
