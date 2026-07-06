@@ -2639,24 +2639,74 @@ impl Engine {
             AtomicOrdering::Relaxed,
         );
 
-        // device apply (v1: serialized across lanes — shared per-table device offsets)
+        // device apply via the APPLY COALESCER: push this wave's prepared rows;
+        // whoever wins the device lock becomes the leader and applies EVERY
+        // pending request in ONE merged per-table append pass (fixed-per-pass
+        // device cost amortizes across lanes; the leader lock preserves the
+        // PK-index extension chain exactly like the old exclusive section).
         let stat_start = Instant::now();
-        let mut pending: WavePendingAppends = BTreeMap::new();
-        let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(winners.len());
-        for (offset, (table, values)) in winner_rows.into_iter().enumerate() {
-            let commit_seq = first_seq + offset as u64;
-            let entry = pending.entry(table).or_default();
-            entry.3.push(commit_seq);
-            entry.0.push(values);
-            entry.1.push(row_id_base + offset as u64);
-            entry.2.push((offset, commit_seq));
-        }
+        let apply_slot = std::sync::Arc::new(crate::engine_intent_lanes::ApplySlot {
+            done: std::sync::atomic::AtomicBool::new(false),
+        });
         {
-            let _device_guard = lanes
-                .device_apply_lock
+            let mut rows = Vec::with_capacity(winners.len());
+            let mut stamps = Vec::with_capacity(winners.len());
+            let mut txn_ids = Vec::with_capacity(winners.len());
+            let mut row_ids = Vec::with_capacity(winners.len());
+            let mut table_name = String::new();
+            for (offset, (table, values)) in winner_rows.into_iter().enumerate() {
+                if offset == 0 {
+                    table_name = table;
+                }
+                rows.push(values);
+                stamps.push(first_seq + offset as u64);
+                txn_ids.push(winners[offset].txn_id);
+                row_ids.push(row_id_base + offset as u64);
+            }
+            lanes
+                .apply_queue
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.flush_wave_pending_appends(&mut pending, &mut committed, &winners);
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(crate::engine_intent_lanes::ApplyRequest {
+                    table: table_name,
+                    rows,
+                    row_ids,
+                    stamps,
+                    txn_ids,
+                    slot: std::sync::Arc::clone(&apply_slot),
+                });
+        }
+        loop {
+            if apply_slot.done.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let Ok(_leader) = lanes.device_apply_lock.try_lock() else {
+                std::hint::spin_loop();
+                continue;
+            };
+            let batch: Vec<crate::engine_intent_lanes::ApplyRequest> = {
+                let mut queue = lanes
+                    .apply_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *queue)
+            };
+            if batch.is_empty() {
+                continue; // another leader served us; re-check done
+            }
+            lanes
+                .stat_apply_launches
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            lanes
+                .stat_apply_requests
+                .fetch_add(batch.len() as u64, AtomicOrdering::Relaxed);
+            self.lane_apply_merged(&batch);
+            for request in batch {
+                request
+                    .slot
+                    .done
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         lanes.stat_apply_ns.fetch_add(
             stat_start.elapsed().as_nanos() as u64,
@@ -2678,6 +2728,85 @@ impl Engine {
             });
         self.settle_intent_lane(&lanes, lane);
         true
+    }
+
+    /// APPLY LEADER body: merge every pending lane request per table and run
+    /// ONE open-shard append pass (rows + per-row created_by stamps + row ids).
+    /// The leader lock serializes appends, so the PK-index extension chain
+    /// (entry.row_count == base) is preserved exactly as under the old
+    /// exclusive section — just batched across lanes. The non-appended
+    /// fallback mirrors flush_wave_pending_appends' rehydrate/invalidate arm
+    /// using only request-carried data (no CommitWaveItem).
+    fn lane_apply_merged(&self, batch: &[crate::engine_intent_lanes::ApplyRequest]) {
+        use std::collections::BTreeMap;
+        // group request indexes per table (usually exactly one table)
+        let mut tables: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (index, request) in batch.iter().enumerate() {
+            tables.entry(&request.table).or_default().push(index);
+        }
+        for (table, requests) in tables {
+            let total: usize = requests.iter().map(|&i| batch[i].rows.len()).sum();
+            let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(total);
+            let mut row_ids: Vec<u64> = Vec::with_capacity(total);
+            let mut stamps: Vec<Index> = Vec::with_capacity(total);
+            for &i in &requests {
+                rows.extend(batch[i].rows.iter().cloned());
+                row_ids.extend_from_slice(&batch[i].row_ids);
+                stamps.extend_from_slice(&batch[i].stamps);
+            }
+            let appended = self.auto_admit_on_commit_enabled()
+                && self.try_append_resident_int4_open_shard(
+                    table,
+                    &rows,
+                    crate::engine_residency::AppendCreatedBy::InsertPerRow(&stamps),
+                    Some(&row_ids),
+                );
+            if appended {
+                if self.host_install_elision_enabled() && !self.table_install_elided(table) {
+                    let snapshot = self.catalog_snapshot();
+                    if self.table_elision_eligible(&snapshot, table) {
+                        self.set_table_install_elided(table, true);
+                    }
+                }
+                continue;
+            }
+            // Fallback (rare on the lanes path — intents gate on elided,
+            // auto-admit tables): rehydrate the merged batch as upserts and
+            // invalidate per txn, mirroring flush_wave_pending_appends.
+            if self.table_install_elided(table) {
+                let first_seq = stamps.first().copied().unwrap_or_default();
+                let last_seq = stamps.last().copied().unwrap_or_default();
+                let upserts: BTreeMap<u64, Vec<SqlValue>> =
+                    row_ids.iter().copied().zip(rows.iter().cloned()).collect();
+                let catalog_table = self
+                    .relational_catalog_table(table)
+                    .expect("an elided table is in the catalog");
+                self.rehydrate_elided_table(
+                    &catalog_table,
+                    first_seq.saturating_sub(1),
+                    &upserts,
+                    &Default::default(),
+                    last_seq,
+                )
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "commit-path invariant violation: elided rehydration for the \
+                         merged lane append on {table} failed: {err}"
+                    )
+                });
+            }
+            let residency: std::collections::BTreeSet<String> =
+                std::iter::once(table.to_string()).collect();
+            for &i in &requests {
+                for (offset, txn_id) in batch[i].txn_ids.iter().enumerate() {
+                    self.invalidate_relational_residency_tables_concurrent(
+                        &residency,
+                        *txn_id,
+                        batch[i].stamps[offset],
+                    );
+                }
+            }
+        }
     }
 
     /// Settle every lane wave whose end seq the visible cut covers (durable AND

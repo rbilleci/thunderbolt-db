@@ -168,6 +168,10 @@ pub(crate) struct IntentLaneState {
     /// integration is an E2.5c+ concern, documented). The measured win: the
     /// per-wave commit-lock claim was 77% lock-wait at 8 lanes (2.2ms/wave).
     pub(crate) seq_oracle: AtomicU64,
+    /// Apply-side coalescing queue (leader = whoever wins `device_apply_lock`).
+    pub(crate) apply_queue: Mutex<Vec<ApplyRequest>>,
+    pub(crate) stat_apply_launches: AtomicU64,
+    pub(crate) stat_apply_requests: AtomicU64,
 }
 
 /// One lane's pending locate request (see `IntentLaneState::validate_queue`).
@@ -183,6 +187,24 @@ pub(crate) struct ValidateRequest {
 pub(crate) struct ValidateSlot {
     pub(crate) done: AtomicBool,
     pub(crate) result: Mutex<Option<Option<Vec<u32>>>>,
+}
+
+/// One lane's prepared device-apply request (the apply-side coalescer; same
+/// leader pattern as validate). Everything the merged append needs travels in
+/// the request — no `CommitWaveItem` re-walk on the apply path.
+pub(crate) struct ApplyRequest {
+    pub(crate) table: String,
+    pub(crate) rows: Vec<Vec<crate::SqlValue>>,
+    pub(crate) row_ids: Vec<u64>,
+    pub(crate) stamps: Vec<u64>,
+    pub(crate) txn_ids: Vec<u64>,
+    pub(crate) slot: std::sync::Arc<ApplySlot>,
+}
+
+/// Apply completion: `done` flips after the merged append (or its fallback)
+/// covered this request's rows.
+pub(crate) struct ApplySlot {
+    pub(crate) done: AtomicBool,
 }
 
 impl IntentLaneState {
