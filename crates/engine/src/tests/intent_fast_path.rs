@@ -138,10 +138,9 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
     // The covered route + concurrent intents through the fast path. In LANES mode the
     // submit/poll surface is the write entry (the blocking classic-shaped path is refused
     // once the lanes activate); serial mode keeps the blocking path.
-    let lanes_mode = std::env::var("GPU_DB_INTENT_LANES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .is_some_and(|n| n >= 2);
+    // Effective mode (env OR the E2.5c-3 default): lanes >= 2 routes intents through the
+    // lane pipeline, so this test must pick the matching write surface.
+    let lanes_mode = crate::engine_intent_lanes::intent_lane_count() >= 2;
     let route = engine.prepare_covered_insert_route("t").unwrap();
     assert_eq!(route.table(), "t");
     assert_eq!(route.column_count(), 2);

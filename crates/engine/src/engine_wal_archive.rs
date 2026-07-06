@@ -254,8 +254,9 @@ impl Engine {
         let _flight = lanes.checkpoint_lock.try_lock().map_err(|_| {
             EngineError::Durability("a lanes checkpoint is already in progress".to_string())
         })?;
-        let base = lanes.wal_lanes.base_path().to_path_buf();
-        let cut = lanes.wal_lanes.durable_cut();
+        let wal_lanes = lanes.wal()?;
+        let base = wal_lanes.base_path().to_path_buf();
+        let cut = wal_lanes.durable_cut();
         // The serial prefix froze at activation (classic writes are refused), so the live
         // WalBuffer holds exactly the pre-activation history.
         let serial_records = {
@@ -289,7 +290,7 @@ impl Engine {
             // Nothing new to checkpoint — but still sweep (audit nit): a prior run that
             // committed its checkpoint and then failed the prune leaves below-baseline
             // segments lingering; the retry lands here and must reclaim the space.
-            lanes.wal_lanes.truncate_segments_below(cut)?;
+            wal_lanes.truncate_segments_below(cut)?;
             return Ok(cut);
         }
         let mut checkpoint_records = serial_records;
@@ -310,7 +311,7 @@ impl Engine {
         gpu_db_wal::write_lanes_checkpoint(&base, serial_count, cut, &checkpoint_records)?;
         // Prune: retire rolled-away lane segments fully below the new baseline (recycle one per
         // lane, delete the rest).
-        lanes.wal_lanes.truncate_segments_below(cut)?;
+        wal_lanes.truncate_segments_below(cut)?;
         Ok(cut)
     }
 

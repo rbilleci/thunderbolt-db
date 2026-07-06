@@ -193,6 +193,13 @@ impl Engine {
         // header (tag/ver/op) + table-len prefix + row-count. Encoding uses the bare `table.name`
         // (the delta mutation's table string), matching the sequencer's binary-record input.
         let binary_row_id_offset = (3 + 2 + table.name.len() + 4) as u32;
+        // E2.5c-3: route preparation is the explicit intent-path opt-in, so materialize the
+        // LAZY lane WAL backing here — off the hot path — instead of on the first wave (the
+        // N x 2 segment prewrite is seconds at production segment sizes; a first-wave stall
+        // that long would poison the latency profile). Fails loudly like any other route error.
+        if let Some(lanes) = &self.intent_lanes {
+            lanes.wal().map_err(ExecuteError::Engine)?;
+        }
         Ok(CoveredInsertRoute {
             table: table.name.clone(),
             catalog_seq: catalog.commit_seq,

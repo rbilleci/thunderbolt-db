@@ -1996,7 +1996,11 @@ fn w1b_auto_open_repairs_the_checkpoint_truncation_crash_window() {
     let control = gpu_db_wal::wal_checkpoint_control_path(&path);
     let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
     {
-        let e = Engine::with_durable_wal_segment(&path);
+        // Pinned SERIAL (audit E2.5c-3 F1): this test fabricates a SERIAL checkpoint pair and
+        // exercises the serial live/checkpoint overlap dedup; under the flipped FUA default the
+        // live log would be `<path>.fua.*`, the serial recovery would see an empty live file,
+        // and the dedup branch would never run — a vacuous pass.
+        let e = serial_durable_engine(&path);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         for i in 0..6 {
             e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, {i})"))
@@ -2091,7 +2095,8 @@ fn w1b_auto_open_repairs_a_second_rotation_crash_window() {
     let control = gpu_db_wal::wal_checkpoint_control_path(&path);
     let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
     {
-        let e = Engine::with_durable_wal_segment(&path);
+        // Pinned SERIAL (audit E2.5c-3 F1; see the first crash-window test).
+        let e = serial_durable_engine(&path);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         for i in 0..4 {
             e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, 1)"))

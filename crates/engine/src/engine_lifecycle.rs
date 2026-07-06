@@ -407,36 +407,53 @@ impl Engine {
         // serial log, then the lane merge over the disjoint higher seq range.
         #[cfg(unix)]
         engine
-            .attach_fresh_intent_lanes(&lane_base_path)
+            .attach_fresh_intent_lanes(&lane_base_path, true)
             .expect("failed to create intent WAL lanes (GPU_DB_INTENT_LANES)");
         engine
     }
 
-    /// Construct a FRESH N-lane intent pipeline at `lane_base_path` when `GPU_DB_INTENT_LANES`
-    /// opts in (>= 2). Used by the durable constructor AND the non-lanes reopen paths (a
-    /// reopened database accepts lane intents exactly like a fresh one; activation then seeds
-    /// `base_seq` from the recovered commit index). Errors propagate (audit finding: an
-    /// ENOSPC/EDQUOT during the per-lane segment prewrite must not panic a reopen of an
-    /// otherwise-valid database); the infallible constructor `expect`s at its call site.
+    /// Construct a FRESH N-lane intent pipeline at `lane_base_path` when lanes are enabled
+    /// (`GPU_DB_INTENT_LANES`, default ON — E2.5c-3). Used by the durable constructor AND the
+    /// non-lanes reopen paths (a reopened database accepts lane intents exactly like a fresh
+    /// one; activation then seeds `base_seq` from the recovered commit index). The WAL backing
+    /// is LAZY (created on the first lane wave), so a default-ON engine that never takes the
+    /// intent path pays nothing.
+    ///
+    /// `fresh` = fresh-database semantics: STALE lane files from a previous database life at
+    /// this path are clobbered NOW (leaving them would make the next reopen misread this
+    /// database as a lanes DB holding the prior life's records). On a REOPEN (`fresh=false`,
+    /// reached only when no lane segment files exist) a LANES CHECKPOINT sidecar with no lane
+    /// files is corruption — it embeds committed lane records — so refuse loudly instead of
+    /// silently deleting it (audit E2.5c-3 F3).
     #[cfg(unix)]
     fn attach_fresh_intent_lanes(
         &mut self,
         lane_base_path: &std::path::Path,
+        fresh: bool,
     ) -> Result<(), EngineError> {
+        if fresh {
+            gpu_db_wal::remove_stale_lane_files(lane_base_path)?;
+        } else if gpu_db_wal::lanes_checkpoint_sidecar_path(lane_base_path).exists() {
+            return Err(EngineError::Durability(format!(
+                "a lanes checkpoint exists beside {} but no lane segment files do; the \
+                 checkpoint embeds committed lane records and the lane logs appear to have been \
+                 removed — refusing to reopen over possible data loss",
+                lane_base_path.display()
+            )));
+        }
         let lane_count = engine_intent_lanes::intent_lane_count();
         if lane_count < 2 {
             return Ok(());
         }
         let fence_lanes = engine_intent_lanes::intent_lane_fences();
         let lane_segment_bytes = engine_intent_lanes::intent_lane_segment_bytes();
-        let wal_lanes = gpu_db_wal::FuaWalLaneSet::create(
-            lane_base_path,
-            lane_count,
-            fence_lanes,
-            lane_segment_bytes,
-        )?;
         self.intent_lanes = Some(std::sync::Arc::new(
-            engine_intent_lanes::IntentLaneState::fresh(lane_count, fence_lanes, wal_lanes),
+            engine_intent_lanes::IntentLaneState::fresh(
+                lane_count,
+                fence_lanes,
+                lane_base_path.to_path_buf(),
+                lane_segment_bytes,
+            ),
         ));
         Ok(())
     }
@@ -549,7 +566,7 @@ impl Engine {
                 // E2.5c-1: a reopened database accepts lane intents like a fresh one (no lane
                 // files existed here, so the set is created fresh; activation seeds base_seq
                 // from the recovered commit index).
-                engine.attach_fresh_intent_lanes(segment_path)?;
+                engine.attach_fresh_intent_lanes(segment_path, false)?;
                 return Ok(engine);
             }
         }
@@ -565,7 +582,7 @@ impl Engine {
         engine.commit_state_mut().wal =
             WalBuffer::with_recovered_durable_segment(segment_path, records, &recovery)?;
         #[cfg(unix)]
-        engine.attach_fresh_intent_lanes(segment_path)?;
+        engine.attach_fresh_intent_lanes(segment_path, false)?;
         Ok(engine)
     }
 
@@ -760,7 +777,12 @@ impl Engine {
             lane_segment_bytes,
             baseline,
         )?;
-        let state = engine_intent_lanes::IntentLaneState::fresh(lane_count, fence_lanes, wal_lanes);
+        let state = engine_intent_lanes::IntentLaneState::with_backing(
+            lane_count,
+            fence_lanes,
+            wal_lanes,
+            lane_segment_bytes,
+        );
         if lane_record_count > 0 {
             use std::sync::atomic::Ordering;
             state.base_seq.store(base_seq, Ordering::Release);

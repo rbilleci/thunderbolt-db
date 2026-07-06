@@ -124,8 +124,17 @@ pub(crate) struct IntentLaneState {
     /// (high-load) regimes. Arc'd so each LaneIntent can carry the decrement
     /// handle.
     pub(crate) outstanding: std::sync::Arc<AtomicU64>,
-    /// The multi-lane durable WAL (per-lane fence pools + cross-lane durable cut).
-    pub(crate) wal_lanes: gpu_db_wal::FuaWalLaneSet,
+    /// The multi-lane durable WAL (per-lane fence pools + cross-lane durable cut). LAZY for a
+    /// fresh engine (E2.5c-3 default flip: lanes-ON-by-default must not prewrite N x 2 lane
+    /// segments for every durable engine that never takes the intent path — the backing is
+    /// created on the first lane wave via [`Self::wal`]); PRE-POPULATED by the reopen path
+    /// (a lanes database's files already exist and the recovered cuts must install).
+    wal_lanes: std::sync::OnceLock<gpu_db_wal::FuaWalLaneSet>,
+    /// Serializes the one-time lazy creation (OnceLock has no fallible get_or_init on stable).
+    wal_lanes_init: Mutex<()>,
+    /// Lane WAL base path + per-lane segment capacity for the lazy create.
+    lane_base: std::path::PathBuf,
+    lane_segment_bytes: usize,
     /// Cross-lane applied cut (device apply completion), advanced under the mutex;
     /// mirrored lock-free for pollers.
     pub(crate) applied: Mutex<SeqCut>,
@@ -312,12 +321,14 @@ pub(crate) fn intent_lane_ship_div() -> usize {
         .unwrap_or(2)
 }
 
-/// Age deadline for an under-min wave (`GPU_DB_INTENT_LANE_GROUP_US`, default 200).
+/// Age deadline CAP for an under-min wave (`GPU_DB_INTENT_LANE_GROUP_US`, default 2000 — the
+/// measured champion; the live deadline scales with population and only reaches this cap in
+/// the high-load regime, so the default does not tax low-load latency).
 pub(crate) fn intent_lane_group_us() -> u64 {
     std::env::var("GPU_DB_INTENT_LANE_GROUP_US")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(300)
+        .unwrap_or(2000)
 }
 
 /// One lane wave awaiting the visible cut: `[first_seq, end_seq)` plus the
@@ -337,14 +348,14 @@ pub(crate) struct LaneSettle {
 }
 
 impl IntentLaneState {
-    /// A fresh (never-activated) lane state over `wal_lanes`. Shared by the durable
-    /// constructor and the reopen path (which then pre-seeds the activation latch,
-    /// `base_seq`, the seq oracle, and the applied cut from the recovered history
-    /// before the state is installed — single-threaded, so plain stores suffice).
+    /// A fresh (never-activated) lane state with LAZY WAL backing at `lane_base` (created on
+    /// the first lane wave — the E2.5c-3 default flip makes lanes-ON the durable default, and
+    /// an engine that never takes the intent path must not pay N x 2 segment prewrites).
     pub(crate) fn fresh(
         lane_count: usize,
         fence_lanes: usize,
-        wal_lanes: gpu_db_wal::FuaWalLaneSet,
+        lane_base: std::path::PathBuf,
+        lane_segment_bytes: usize,
     ) -> Self {
         Self {
             lane_count,
@@ -361,7 +372,10 @@ impl IntentLaneState {
             stat_resizes: AtomicU64::new(0),
             stat_resize_ns: AtomicU64::new(0),
             outstanding: std::sync::Arc::new(AtomicU64::new(0)),
-            wal_lanes,
+            wal_lanes: std::sync::OnceLock::new(),
+            wal_lanes_init: Mutex::new(()),
+            lane_base,
+            lane_segment_bytes,
             applied: Mutex::new(SeqCut::default()),
             applied_mirror: AtomicU64::new(0),
             activated: AtomicBool::new(false),
@@ -403,14 +417,63 @@ impl IntentLaneState {
         }
     }
 
+    /// A lane state over an ALREADY-OPEN WAL backing (the reopen path: the lane files exist
+    /// and the recovered cuts must install; the caller then pre-seeds the activation latch,
+    /// `base_seq`, the seq oracle, and the applied cut — single-threaded, plain stores).
+    pub(crate) fn with_backing(
+        lane_count: usize,
+        fence_lanes: usize,
+        wal_lanes: gpu_db_wal::FuaWalLaneSet,
+        lane_segment_bytes: usize,
+    ) -> Self {
+        let lane_base = wal_lanes.base_path().to_path_buf();
+        let state = Self::fresh(lane_count, fence_lanes, lane_base, lane_segment_bytes);
+        let _ = state.wal_lanes.set(wal_lanes);
+        state
+    }
+
+    /// The lane WAL, creating the on-disk backing on FIRST use (see the field docs). Failure
+    /// (ENOSPC/EDQUOT during the per-lane prewrite) surfaces to the caller — the wave that
+    /// triggered creation fails loudly; the engine itself stays up.
+    pub(crate) fn wal(&self) -> Result<&gpu_db_wal::FuaWalLaneSet, crate::EngineError> {
+        if let Some(set) = self.wal_lanes.get() {
+            return Ok(set);
+        }
+        let _init = self
+            .wal_lanes_init
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(set) = self.wal_lanes.get() {
+            return Ok(set);
+        }
+        let set = gpu_db_wal::FuaWalLaneSet::create(
+            &self.lane_base,
+            self.lane_count,
+            self.fence_lanes,
+            self.lane_segment_bytes,
+        )?;
+        let _ = self.wal_lanes.set(set);
+        Ok(self
+            .wal_lanes
+            .get()
+            .expect("just installed under the init lock"))
+    }
+
+    /// Non-creating peek for pollers (stats, settle, visibility): `None` means the intent
+    /// path has never run — nothing durable, nothing poisoned, cut 0.
+    pub(crate) fn wal_peek(&self) -> Option<&gpu_db_wal::FuaWalLaneSet> {
+        self.wal_lanes.get()
+    }
+
     /// The lanes' visibility frontier in LANE-LOCAL seq space (local seq =
     /// global seq - base_seq; the lane logs tile [0, N) exactly, per the
     /// FuaWalLaneSet contract — the pre-activation range lives in the serial
     /// log and never touches the lanes). Every local seq below this is durable
     /// in its WAL lane AND device-applied.
     pub(crate) fn visible_local_cut(&self) -> u64 {
-        self.wal_lanes
-            .durable_cut()
+        self.wal_peek()
+            .map(|wal| wal.durable_cut())
+            .unwrap_or(0)
             .min(self.applied_mirror.load(Ordering::Acquire))
     }
 
@@ -463,7 +526,7 @@ impl crate::Engine {
             lanes.stat_encode_ns.load(Ordering::Relaxed),
             lanes.stat_publish_ns.load(Ordering::Relaxed),
             lanes.stat_apply_ns.load(Ordering::Relaxed),
-            lanes.wal_lanes.durable_cut(),
+            lanes.wal_peek().map(|wal| wal.durable_cut()).unwrap_or(0),
             lanes.applied_mirror.load(Ordering::Acquire),
             self.read_state
                 .residency
@@ -499,7 +562,12 @@ impl crate::Engine {
     /// WAL fence latency (publish->fence-done): (total ns, fenced frames).
     pub fn intent_lane_fence_stats(&self) -> Option<(u64, u64)> {
         let lanes = self.intent_lanes.as_ref()?;
-        Some(lanes.wal_lanes.fence_latency_stats())
+        Some(
+            lanes
+                .wal_peek()
+                .map(|wal| wal.fence_latency_stats())
+                .unwrap_or((0, 0)),
+        )
     }
 
     /// Publish->settle lag: (total ns, settled waves). The fence+cut+settle
@@ -560,12 +628,15 @@ pub(crate) fn intent_lane_wave_max() -> usize {
         .unwrap_or(1024)
 }
 
+/// Intent lane count (`GPU_DB_INTENT_LANES`). E2.5c-3 DEFAULT FLIP: lanes mode is ON by
+/// default on unix (10 lanes — the measured champion on the reference box; the WAL backing is
+/// LAZY, so engines that never take the intent path pay nothing). Explicit `0`/`1` disables.
 pub(crate) fn intent_lane_count() -> usize {
     std::env::var("GPU_DB_INTENT_LANES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 2)
-        .unwrap_or(1)
+        .map(|n| if n >= 2 { n } else { 1 })
+        .unwrap_or(if cfg!(unix) { 10 } else { 1 })
 }
 
 /// Fence lanes per WAL lane (`GPU_DB_INTENT_LANE_FENCES`, default 16) — the per-lane FUA

@@ -2606,6 +2606,23 @@ impl Engine {
             return true;
         }
 
+        // LAZY WAL BACKING (E2.5c-3 default flip): resolve/create the lane set BEFORE any seq
+        // is claimed — a creation failure (ENOSPC/EDQUOT during the per-lane prewrite) here
+        // fails the wave cleanly; after the claim it would HOLE the cross-lane cut (claimed
+        // seqs that can never become durable stall every later ack).
+        let wal_lanes = match lanes.wal() {
+            Ok(wal) => wal,
+            Err(err) => {
+                let message = format!("intent lane WAL unavailable: {err}");
+                for item in winners {
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
+                        message.clone(),
+                    ))));
+                }
+                return true;
+            }
+        };
+
         // row-id block (atomic claim — safe under concurrent lanes) + W5a patches
         let patch_started = Instant::now();
         let row_id_base = self.read_state.mvcc.claim_row_id_block(k);
@@ -2705,7 +2722,7 @@ impl Engine {
             // pool means the drive is out of its bimodal fast mode and two
             // pipelined frames beat one slow one. A busy pool (high load)
             // publishes single frames.
-            let free = lanes.wal_lanes.free_fence_slots(lane).unwrap_or(0);
+            let free = wal_lanes.free_fence_slots(lane).unwrap_or(0);
             if free * 4 >= lanes.fence_lanes * 3 {
                 2
             } else {
@@ -2718,7 +2735,7 @@ impl Engine {
         .max(1);
         let mut append_error: Option<String> = None;
         if subframes == 1 {
-            if let Err(err) = lanes.wal_lanes.append_encoded(
+            if let Err(err) = wal_lanes.append_encoded(
                 lane,
                 local_first,
                 local_first + k,
@@ -2740,7 +2757,7 @@ impl Engine {
                 }
                 let rec_end = rec_start + take;
                 let byte_end = record_ends[rec_end - 1];
-                if let Err(err) = lanes.wal_lanes.append_encoded(
+                if let Err(err) = wal_lanes.append_encoded(
                     lane,
                     seq,
                     seq + take as u64,
@@ -3264,7 +3281,7 @@ impl Engine {
         // would hang their clients forever instead of wedging loudly like the
         // classic path. The probes are lock-free flags; the mutex-walking
         // reason fetch (N poison locks) is paid only on an actual wedge.
-        let wal_poisoned = lanes.wal_lanes.is_poisoned();
+        let wal_poisoned = lanes.wal_peek().is_some_and(|wal| wal.is_poisoned());
         if wal_poisoned
             || lanes
                 .apply_poisoned
@@ -3272,8 +3289,8 @@ impl Engine {
         {
             let reason = if wal_poisoned {
                 let inner = lanes
-                    .wal_lanes
-                    .poison_reason()
+                    .wal_peek()
+                    .and_then(|wal| wal.poison_reason())
                     .unwrap_or_else(|| "lane wedged (reason pending)".to_string());
                 format!("intent lane WAL poisoned: {inner}")
             } else {

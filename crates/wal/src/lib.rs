@@ -22,7 +22,8 @@ mod fua_lanes;
 #[cfg(unix)]
 pub use fua_lanes::{
     discover_lane_count, encode_lane_frame_payload, lane_segment_capacity_bytes, recover_lanes,
-    recover_lanes_from, repair_lane_orphans, repair_lane_orphans_from, FuaWalLaneSet,
+    recover_lanes_from, remove_stale_lane_files, repair_lane_orphans, repair_lane_orphans_from,
+    FuaWalLaneSet,
 };
 
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
@@ -642,9 +643,12 @@ impl WalDurability {
     /// `GPU_DB_WAL_FUA_SEGMENT_BYTES` overrides); anything else — including unset — is the serial
     /// default. Kept here so the engine's later wiring reads ONE authority for the gate.
     pub fn from_env() -> Self {
+        // E2.5c-3 DEFAULT FLIP: the FUA fence-pool backend is the durable default on unix
+        // (pre-written extents + pipelined FUA write-through; the serial fdatasync path was
+        // measured ~20x slower on the reference NVMe). Opt out with GPU_DB_WAL_DURABILITY=serial.
         let selected = std::env::var("GPU_DB_WAL_DURABILITY")
             .map(|v| v.eq_ignore_ascii_case("fua"))
-            .unwrap_or(false);
+            .unwrap_or(cfg!(unix));
         if !selected {
             return Self::SerialFdatasync;
         }

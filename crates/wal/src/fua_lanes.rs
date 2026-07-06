@@ -691,6 +691,59 @@ pub fn repair_lane_orphans_from(
     Ok(orphans)
 }
 
+/// Remove every lane artifact from a PREVIOUS database life beside `base_path` — the lane
+/// segment files (`<stem>.lane-<L>.fua.*`), the lanes checkpoint sidecar, and its generation
+/// segments. The fresh-database constructors call this (E2.5c-3 lazy backing: the lane set is
+/// no longer eagerly created — which used to clobber per-lane — so stale files would otherwise
+/// survive and make the NEXT reopen misread a fresh database as a lanes DB holding the prior
+/// life's records).
+pub fn remove_stale_lane_files(base_path: impl AsRef<Path>) -> Result<(), EngineError> {
+    let base = base_path.as_ref();
+    let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let Some(stem) = base.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    let checkpoint_name = format!("{stem}.lanes-checkpoint");
+    let checkpoint_seg_prefix = format!("{stem}.lanes-checkpoint.seg.");
+    let checkpoint_tmp = format!("{stem}.lanes-checkpoint.tmp");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(EngineError::Durability(format!(
+                "failed to enumerate stale lane files in {}: {err}",
+                parent.display()
+            )));
+        }
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|n| n.to_string()) else {
+            continue;
+        };
+        // STRUCTURED matching (audit F2): only exact lane-segment names
+        // (`<stem>.lane-<L>.fua.<id>`, via the same parser recovery uses) and the exact
+        // checkpoint artifacts are ours to delete — a bare prefix match could reach into a
+        // neighboring database whose stem merely starts with ours.
+        let is_lane_segment = parse_lane_id(&name, stem).is_some();
+        let is_checkpoint_artifact = name == checkpoint_name
+            || name == checkpoint_tmp
+            || name
+                .strip_prefix(&checkpoint_seg_prefix)
+                .is_some_and(|gen| gen.parse::<u64>().is_ok());
+        if is_lane_segment || is_checkpoint_artifact {
+            std::fs::remove_file(entry.path()).map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to remove stale lane file {}: {err}",
+                    entry.path().display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Data capacity (bytes) of an existing lane segment beside `base_path` — the geometry a REOPEN
 /// continues with (disk-authoritative: env defaults in the reopening process must not silently
 /// change an existing database's segment size). `None` when no lane segment exists.
