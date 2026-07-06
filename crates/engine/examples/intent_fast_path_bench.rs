@@ -369,6 +369,9 @@ fn run_arm(
                     publ as f64 / lw as f64 / 1e3,
                     apply as f64 / lw as f64 / 1e3,
                 );
+                if let Some((active, outstanding)) = engine.intent_lane_adaptive_stats() {
+                    eprintln!("    [adaptive: active_lanes {active}  outstanding {outstanding}]");
+                }
                 if let Some((lag_ns, lag_waves)) = engine.intent_lane_acklag_stats() {
                     if lag_waves > 0 {
                         eprintln!(

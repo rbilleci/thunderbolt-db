@@ -436,6 +436,14 @@ impl Engine {
                 engine.intent_lanes =
                     Some(std::sync::Arc::new(engine_intent_lanes::IntentLaneState {
                         lane_count,
+                        fence_lanes,
+                        // Start with the low-load subset; the first heavy wave
+                        // of population resizes up through the drain barrier.
+                        active_lanes: std::sync::atomic::AtomicUsize::new(lane_count.min(4)),
+                        resize_holding: std::sync::atomic::AtomicBool::new(false),
+                        resize_hold: std::sync::Mutex::new(Vec::new()),
+                        resize_leader: std::sync::Mutex::new(None),
+                        outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         wal_lanes,
                         applied: std::sync::Mutex::new(engine_intent_lanes::SeqCut::default()),
                         applied_mirror: std::sync::atomic::AtomicU64::new(0),

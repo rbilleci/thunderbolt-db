@@ -228,6 +228,9 @@ pub(crate) struct LaneIntent {
     pub(crate) template: std::sync::Arc<[u8]>,
     pub(crate) values: Vec<SqlValue>,
     pub(crate) outcome: CommitWaveOutcome,
+    /// Live-population decrement handle (see `IntentLaneState::outstanding`);
+    /// None outside lanes mode.
+    pub(crate) outstanding: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl LaneIntent {
@@ -238,6 +241,11 @@ impl LaneIntent {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
         self.outcome.done.store(true, AtomicOrdering::Release);
+        // Population bookkeeping: set_outcome is the single completion choke
+        // point, so submit/settle pairing is exact by construction.
+        if let Some(outstanding) = &self.outstanding {
+            outstanding.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
     }
 }
 
@@ -788,6 +796,8 @@ impl Engine {
         // E2.5b-2: in lanes mode a pump call advances one lane's pipeline (round-robin);
         // the classic wave machinery below still services pre-activation traffic.
         if let Some(lanes) = &self.intent_lanes {
+            let lanes = std::sync::Arc::clone(lanes);
+            self.maybe_resize_lanes(&lanes);
             let lane = (lanes
                 .pump_cursor
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2471,12 +2481,22 @@ impl Engine {
             AtomicOrdering::Relaxed,
         );
 
-        // Wave-formation pacing (the conveyor laws): accumulate to min_wave or
-        // the age deadline; tiny waves pay the fixed per-wave costs per item.
+        // WORKLOAD-ADAPTIVE wave formation (the conveyor laws, population-
+        // scaled): the ship target and the age deadline follow the LIVE
+        // population, with the configured MIN_WAVE/GROUP_US acting as the
+        // high-load CAPS. At 512 outstanding the target is ~a lane's arrival
+        // share and the deadline tens of microseconds (latency regime); at
+        // 60k+ outstanding both clamp to the configured batching values
+        // (throughput regime). One configuration serves both ends.
         let wave_max = crate::engine_intent_lanes::intent_lane_wave_max();
         let min_wave = crate::engine_intent_lanes::intent_lane_min_wave();
-        let group_window =
-            std::time::Duration::from_micros(crate::engine_intent_lanes::intent_lane_group_us());
+        let outstanding =
+            lanes.outstanding.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let ship_target = (outstanding / (lanes.lane_count * 2)).clamp(1, min_wave);
+        let group_window = std::time::Duration::from_micros(
+            ((outstanding / lanes.lane_count) as u64)
+                .min(crate::engine_intent_lanes::intent_lane_group_us()),
+        );
         let drain_started = Instant::now();
         let batch: Vec<LaneIntent> = {
             let mut queue = lanes.queues[lane]
@@ -2485,7 +2505,7 @@ impl Engine {
             if queue.is_empty() {
                 Vec::new()
             } else {
-                let ship = if queue.len() < min_wave {
+                let ship = if queue.len() < ship_target {
                     let mut since = lanes.pending_since[lane]
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2678,9 +2698,23 @@ impl Engine {
         // ack waits on the contiguous cut over all N (pipelined), and recovery
         // semantics are unchanged (per-frame intervals, same merge math).
         let stat_start = Instant::now();
-        let subframes = crate::engine_intent_lanes::intent_lane_subframes()
-            .min(k as usize)
-            .max(1);
+        let configured_subframes = crate::engine_intent_lanes::intent_lane_subframes();
+        let subframes = if configured_subframes == 0 {
+            // AUTO: split only in the low-depth regime — a mostly-idle fence
+            // pool means the drive is out of its bimodal fast mode and two
+            // pipelined frames beat one slow one. A busy pool (high load)
+            // publishes single frames.
+            let free = lanes.wal_lanes.free_fence_slots(lane).unwrap_or(0);
+            if free * 4 >= lanes.fence_lanes * 3 {
+                2
+            } else {
+                1
+            }
+        } else {
+            configured_subframes
+        }
+        .min(k as usize)
+        .max(1);
         let mut append_error: Option<String> = None;
         if subframes == 1 {
             if let Err(err) = lanes.wal_lanes.append_encoded(
@@ -2792,6 +2826,100 @@ impl Engine {
         self.drive_apply_queue_once(&lanes);
         self.settle_intent_lane(&lanes, lane);
         true
+    }
+
+    /// WORKLOAD-ADAPTIVE ACTIVE-LANE RESIZE (slice 3): pick the routing-subset
+    /// size from the live population and, when it changes, pass through the
+    /// DRAIN BARRIER — divert new submits to the hold queue, pump every lane
+    /// until nothing is in flight, flip `active_lanes`, then re-route the held
+    /// intents through the new epoch. Safety: at the barrier every prior
+    /// commit precedes every post-flip snapshot, so the device validate alone
+    /// catches old duplicates (lane-ledger continuity across epochs is not
+    /// required). Fail-open: a drain that cannot complete (wedge) aborts the
+    /// resize and keeps the old epoch.
+    fn maybe_resize_lanes(
+        &self,
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+    ) {
+        const UP_AT: u64 = 4096;
+        const DOWN_AT: u64 = 1024;
+        const DWELL: std::time::Duration = std::time::Duration::from_millis(200);
+        const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+        let low = lanes.lane_count.min(4);
+        if lanes.lane_count <= low {
+            return; // nothing to adapt between
+        }
+        let active = lanes
+            .active_lanes
+            .load(std::sync::atomic::Ordering::Acquire);
+        let outstanding = lanes.outstanding.load(std::sync::atomic::Ordering::Relaxed);
+        let target = if outstanding >= UP_AT {
+            lanes.lane_count
+        } else if outstanding <= DOWN_AT {
+            low
+        } else {
+            active // hysteresis band: hold
+        };
+        if target == active {
+            return;
+        }
+        let Ok(mut leader) = lanes.resize_leader.try_lock() else {
+            return; // a resize is already in progress
+        };
+        if leader.is_some_and(|last| last.elapsed() < DWELL) {
+            return; // dwell: no flapping
+        }
+        // BARRIER: divert new submits, drain everything in flight.
+        lanes
+            .resize_holding
+            .store(true, std::sync::atomic::Ordering::Release);
+        let drain_started = Instant::now();
+        let mut drained = true;
+        while lanes.outstanding.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            for lane in 0..lanes.lane_count {
+                self.drive_intent_lane(lane);
+            }
+            if drain_started.elapsed() > DRAIN_LIMIT {
+                drained = false; // wedge: fail-open, keep the old epoch
+                break;
+            }
+        }
+        if drained {
+            lanes
+                .active_lanes
+                .store(target, std::sync::atomic::Ordering::Release);
+        }
+        lanes
+            .resize_holding
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Re-route the held intents through the (possibly new) epoch.
+        let held: Vec<LaneIntent> = std::mem::take(
+            &mut *lanes
+                .resize_hold
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for intent in held {
+            Self::enqueue_lane_intent(lanes, intent);
+        }
+        *leader = Some(Instant::now());
+    }
+
+    /// Route one intent to its PK lane, counting it into the live population.
+    /// The single lane-ingress point (submit fast path + hold-queue release).
+    pub(crate) fn enqueue_lane_intent(
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+        mut intent: LaneIntent,
+    ) {
+        lanes
+            .outstanding
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        intent.outstanding = Some(std::sync::Arc::clone(&lanes.outstanding));
+        let lane = lanes.lane_for_pk(intent.slot.1);
+        lanes.queues[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(intent);
     }
 
     /// ONE opportunistic apply-leader pass: if the device lock is free and the

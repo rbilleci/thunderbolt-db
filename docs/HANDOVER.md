@@ -406,7 +406,34 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
-**LOW-LOAD LATENCY PROFILE (2026-07-06, user SLO: p90 < 1ms client ack at ~512 concurrent clients).**
+**WORKLOAD ADAPTIVITY + THE FENCE-SPIN ARTIFACT (2026-07-06, user mandate: one system that adapts —
+minimal latency at low load, full throughput at high load).** TWO shipped mechanisms:
+(1) **FENCE-LANE PARK (write_conveyor/fua_frame_log.rs) — the decisive fix.** Idle fence lanes
+yield-SPUN waiting for frames; at 10 lanes × 16 fences = 160 spinning threads starving the host at low
+load. THIS — not validate-coalescer churn — was the real reason few-lane configs won at 512 clients
+(CORRECTION: every pre-park low-load lane-count conclusion below is contaminated by this artifact).
+Fix: spin a 2000-yield window then park on a condvar; frames are CAS-claimed only when work exists (no
+pre-assigned frames → `notify_one` per publish suffices — no thundering herd, no missed-wake hang); the
+hot path never touches the mutex; finish/failure notify_all.
+(2) **WORKLOAD-ADAPTIVE LANES (engine):** live population counter (`outstanding`: inc at lane enqueue,
+dec in `set_outcome`, the single completion choke point); wave-formation ship-target and age deadline
+scale with population (configured MIN_WAVE/GROUP_US act as high-load caps); `SUBFRAMES=0` default = AUTO
+(split when the lane's fence pool is ≥3/4 idle — the low-depth bimodal-FUA regime); DYNAMIC ACTIVE-LANE
+SUBSET (`active_lanes`, starts min(4,N)): routing = hash % active; a resize (thresholds: up ≥4096
+outstanding, down ≤1024, 200ms dwell) passes a DRAIN BARRIER — submits divert to a hold queue, the
+resize leader pumps everything in flight to settlement, flips, re-routes the held intents. Safety: at
+the barrier every prior commit precedes every post-flip snapshot, so the device validate alone catches
+old duplicates (lane-ledger continuity across epochs is not required); fail-open on a 5s drain limit.
+**RESULT — ONE CONFIG (the champion env), both regimes:** 512 clients → **p50 1.09ms p90 1.40ms p99
+1.73ms @ 420k TPS** (best low-load ever measured, beats the hand-tuned 4-lane profile); 61k clients →
+**{1.31, 1.35, 1.54}M sustained with p90 ~28ms p99 41-53ms** (tail 2-4x better than the pre-park
+champion's 67-190ms; mean within the variance band). Known cost: the resize barrier shows as rare
+~0.6-1.2s max-latency spikes at load transitions (bounded by the drain). Gates: engine 488/488 both
+modes + GPU intent suites (serial + lanes=2 + lanes=6).
+
+**LOW-LOAD LATENCY PROFILE (2026-07-06, user SLO: p90 < 1ms client ack at ~512 concurrent clients —
+NOTE: the lane-count numbers below predate the fence-park fix above and are contaminated by the
+fence-spin artifact; the post-fix one-config numbers supersede them).**
 The high-load champion config is WRONG for small workloads: at 512 clients, 10 lanes = p50 6.9ms (8-item
 waves, validate-coalescer churn). The tuned profile — **GPU_DB_INTENT_LANES=3-4, GPU_DB_INTENT_LANE_SUBFRAMES=2,
 MIN_WAVE=1, GROUP_US=0 → p50 1.17-1.20ms p90 1.46-1.50ms p99 1.77ms at ~400k TPS** (4.7x better than the

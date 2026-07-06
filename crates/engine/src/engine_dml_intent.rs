@@ -263,6 +263,7 @@ impl Engine {
             template,
             values,
             outcome: crate::engine_dml_concurrent::new_pending_outcome(),
+            outstanding: None,
         })
     }
 
@@ -282,11 +283,21 @@ impl Engine {
                 Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
             if let Some(intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
                 let outcome = std::sync::Arc::clone(&intent.outcome);
-                let lane = lanes.lane_for_pk(intent.slot.1);
-                lanes.queues[lane]
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push_back(intent);
+                // ACTIVE-LANE RESIZE barrier: while a resize leader drains the
+                // in-flight population, new intents divert to the hold queue
+                // (not counted as outstanding) and re-route after the flip.
+                if lanes
+                    .resize_holding
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    lanes
+                        .resize_hold
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(intent);
+                } else {
+                    crate::Engine::enqueue_lane_intent(lanes, intent);
+                }
                 return Ok(IntentTicket {
                     outcome: Some(outcome),
                     snapshot_hold,
