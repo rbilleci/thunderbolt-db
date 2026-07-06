@@ -14,6 +14,14 @@ mod fua;
 #[cfg(unix)]
 pub use fua::{fua_wal_segments_exist, recover_fua_wal_records};
 
+// E2.5a (Variant 2): N independent ordered WAL lanes whose records carry EXPLICIT global commit
+// seqs, with a cross-lane contiguous durable cut and merge recovery. Self-contained here; the
+// engine consumer is a later slice. Unix-only (drives the FUA fence-pool lanes).
+#[cfg(unix)]
+mod fua_lanes;
+#[cfg(unix)]
+pub use fua_lanes::{recover_lanes, FuaWalLaneSet};
+
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
 const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";

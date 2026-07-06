@@ -446,6 +446,32 @@ impl FuaWalBackend {
         Ok(self.durable_records())
     }
 
+    /// Append ONE frame carrying an EXPLICIT global-seq range and return WITHOUT waiting for
+    /// durability (the fence pool pipelines it). `first_seq` is the GLOBAL commit sequence of the
+    /// frame's first record and `seq_count` the record count (== the number of contiguous global
+    /// seqs the frame covers); the durable cut (`durable_records`) reports the largest global end
+    /// of this lane's contiguous-durable frame prefix. This is the per-lane primitive behind
+    /// [`crate::FuaWalLaneSet`] — unlike [`Self::commit_group`] it does not block on the cut, so a
+    /// caller drives N lanes independently and polls the cross-lane merged cut. Single-writer per
+    /// lane is assumed (tickets serialize the staging memcpy; the fence pool then pipelines).
+    pub(crate) fn append_frame(
+        &self,
+        payload: &[u8],
+        first_seq: u64,
+        seq_count: u32,
+    ) -> Result<(), EngineError> {
+        if let Some(reason) = self.poison_reason() {
+            return Err(self.poison_error(&reason));
+        }
+        let ticket = self.next_ticket();
+        self.publish(ticket, payload, first_seq, seq_count)?;
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
+        stats.flush_groups += 1;
+        stats.durable_records += seq_count as u64;
+        stats.max_group_size = stats.max_group_size.max(seq_count as usize);
+        Ok(())
+    }
+
     /// Wait (spin-then-yield) until every record up to `target` is durable — the inline
     /// `flush_all` completion for the FUA backend after its own group (if any) committed.
     pub(crate) fn wait_durable(&self, target: usize) -> Result<(), EngineError> {
@@ -585,6 +611,39 @@ fn highest_existing_segment_id(base: &Path) -> u64 {
 /// starting a fresh database that shadows the durable FUA data.
 pub fn fua_wal_segments_exist(base: impl AsRef<Path>) -> bool {
     highest_existing_segment_id(base.as_ref()) > 0
+}
+
+/// Every `<base>.fua.<id>` segment file beside `base`, ascending by id (empty when none exist).
+/// Shared by [`recover_fua_wal_records`] and the lane-set merge recovery so both walk segments in
+/// the same total order.
+pub(crate) fn fua_segment_paths_sorted(base: &Path) -> Result<Vec<PathBuf>, EngineError> {
+    let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let Some(stem) = base.file_name().and_then(|n| n.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+    match std::fs::read_dir(parent) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(id) = parse_segment_id(name, stem) {
+                        segments.push((id, entry.path()));
+                    }
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(EngineError::Durability(format!(
+                "failed to enumerate FUA WAL segments in {}: {err}",
+                parent.display()
+            )));
+        }
+    }
+    segments.sort_by_key(|(id, _)| *id);
+    Ok(segments.into_iter().map(|(_, path)| path).collect())
 }
 
 fn open_segment(
