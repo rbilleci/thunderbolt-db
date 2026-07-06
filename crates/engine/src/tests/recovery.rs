@@ -1,5 +1,20 @@
 use super::*;
 
+/// A SERIAL-durable engine, PINNED to the serial backend regardless of the process
+/// `GPU_DB_WAL_DURABILITY` env. The tests that use it exercise serial-backend on-disk mechanics —
+/// torn-record CRC rejection, torn-append truncation, and checkpoint / segment ROTATION (prefix
+/// truncation) — which the FUA fence-pool backend either stores in a DIFFERENT frame-log format
+/// (so raw serial-byte corruption is meaningless against it) or DEFERS to a later step (checkpoint
+/// prefix truncation is unsupported by the FUA backend today). Pinning serial keeps these tests
+/// meaningful (and green) under BOTH modes; in the default (serial) mode this is byte-identical to
+/// `Engine::with_durable_wal_segment`. The FUA backend has its own crash-safety coverage in the
+/// `gpu_db_wal` crate (roundtrip / segment-roll / reopen-across-lives).
+fn serial_durable_engine(path: impl AsRef<std::path::Path>) -> Engine {
+    let mut engine = Engine::new_local();
+    engine.commit_state_mut().wal = WalBuffer::with_durable_segment(path.as_ref());
+    engine
+}
+
 #[test]
 fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
     let path = test_wal_path("restart");
@@ -150,7 +165,7 @@ fn durable_recovery_rejects_a_torn_trailing_record() {
     // or silently truncating, so there is never torn state.
     let path = test_wal_path("durable-torn");
     {
-        let e = Engine::with_durable_wal_segment(&path);
+        let e = serial_durable_engine(&path);
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -189,7 +204,7 @@ fn durable_recovery_truncates_a_torn_append_tail_and_continues() {
     // ACKNOWLEDGED record (below the recorded tail) and recovery must fail loudly.
     let path = test_wal_path("durable-torn-append");
     {
-        let e = Engine::with_durable_wal_segment(&path);
+        let e = serial_durable_engine(&path);
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -239,7 +254,7 @@ fn checkpoint_and_truncate_bounds_the_live_segment_and_recovers_with_checkpoint(
     let control_path = dir.join("CONTROL");
     let checkpoint_segment_path = dir.join("checkpoint-0001.wal");
 
-    let e = Engine::with_durable_wal_segment(&segment_path);
+    let e = serial_durable_engine(&segment_path);
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -302,7 +317,7 @@ fn checkpoint_truncation_prunes_the_commit_timestamp_map() {
     let control_path = dir.join("CONTROL");
     let checkpoint_segment_path = dir.join("checkpoint-0001.wal");
 
-    let e = Engine::with_durable_wal_segment(&segment_path);
+    let e = serial_durable_engine(&segment_path);
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -360,7 +375,7 @@ fn checkpoint_size_bound_policy_rotates_only_beyond_the_bound() {
     let control_path = dir.join("CONTROL");
     let checkpoint_segment_path = dir.join("checkpoint-0001.wal");
 
-    let e = Engine::with_durable_wal_segment(&segment_path);
+    let e = serial_durable_engine(&segment_path);
     e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
         .unwrap();
     e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -1938,7 +1953,7 @@ fn w1b_auto_open_recovers_full_history_after_rotation() {
     let control = gpu_db_wal::wal_checkpoint_control_path(&path);
     let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
     {
-        let e = Engine::with_durable_wal_segment(&path);
+        let e = serial_durable_engine(&path);
         e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
         for i in 0..8 {
             e.execute_text(2 + i, &format!("INSERT INTO t (id, v) VALUES ({i}, {i})"))
@@ -2036,7 +2051,7 @@ fn w1b_rotation_prunes_timestamps_and_replication_log() {
     let path = test_wal_path("w1b-prune-trio");
     let control = gpu_db_wal::wal_checkpoint_control_path(&path);
     let checkpoint = gpu_db_wal::wal_checkpoint_segment_path(&path);
-    let e = Engine::with_durable_wal_segment(&path);
+    let e = serial_durable_engine(&path);
     e.execute_text(1, "CREATE TABLE t (id INT)").unwrap();
     for i in 0..8 {
         e.execute_text(2 + i, &format!("INSERT INTO t (id) VALUES ({i})"))

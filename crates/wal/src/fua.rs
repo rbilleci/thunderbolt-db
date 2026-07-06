@@ -146,8 +146,78 @@ impl FuaWalBackend {
         })
     }
 
+    /// REOPEN an existing FUA-durable database at `base_path` and continue appending ABOVE the
+    /// recovered history. `recovered_records` is the count of records
+    /// [`recover_fua_wal_records`] read back from the retained `<base>.fua.*` segments (the caller
+    /// replayed them). We do NOT append into any recovered segment — a fresh segment is opened
+    /// above the highest existing id, which keeps torn-tail recovery semantics trivial (a crash can
+    /// only ever tear the tail of the newest segment; older segments stay byte-frozen). The old
+    /// segments are RETAINED for recovery until prefix-truncation lands (E1 step 3); a future
+    /// reopen re-recovers them in ascending id order and the new segment chains on top (its first
+    /// frame's `first_seq` == `recovered_records`, exactly the contiguous cut the old segments end
+    /// at). The published/durable watermarks start at `recovered_records` so `flushed_count()` and
+    /// the record→frame `first_seq` mapping are continuous with the recovered log.
+    ///
+    /// Torn-tail caveat (documented, untested — reopen is only exercised after a CLEAN drain): if a
+    /// prior crash left a GAP inside a retained old segment, recovery stops at that gap and this
+    /// new segment's higher-id frames are never reached on the next recovery. Truncation (step 3)
+    /// will retire fully-drained old segments and remove this window.
+    pub(crate) fn reopen(
+        base_path: PathBuf,
+        lanes: usize,
+        segment_bytes: usize,
+        recovered_records: usize,
+    ) -> Result<Self, EngineError> {
+        let lanes = lanes.max(1);
+        if segment_bytes == 0 {
+            return Err(EngineError::Durability(
+                "FUA WAL segment_bytes must be non-zero".to_string(),
+            ));
+        }
+        if let Some(parent) = base_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                EngineError::Durability(format!(
+                    "failed to create FUA WAL directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        // Open a FRESH segment ABOVE every existing id (never recycle a recovered file's epoch).
+        let segment_id = highest_existing_segment_id(&base_path) + 1;
+        let log = open_segment(&base_path, segment_id, segment_bytes)?;
+        let pool = log.spawn_fence_pool(lanes);
+        let appender = log.appender();
+        let recovered = recovered_records as u64;
+        Ok(Self {
+            base_path,
+            lanes,
+            segment_bytes,
+            active: Mutex::new(ActiveSegment {
+                log,
+                appender: Some(appender),
+                pool: Some(pool),
+                segment_id,
+            }),
+            published: AtomicUsize::new(recovered_records),
+            next_ticket: AtomicU64::new(0),
+            publish_cursor: AtomicU64::new(0),
+            rolled_baseline: AtomicU64::new(recovered),
+            next_segment_id: AtomicU64::new(segment_id + 1),
+            poison: Mutex::new(None),
+            stats: Mutex::new(WalGroupCommitStats::default()),
+        })
+    }
+
     pub(crate) fn base_path(&self) -> &Path {
         &self.base_path
+    }
+
+    /// Free fence lanes in the active segment's pool (the engine-seam PACING signal — a committer
+    /// may begin its own group flush only while a lane is free; see the engine's concurrent
+    /// durability wait).
+    pub(crate) fn free_fence_slots(&self) -> usize {
+        let active = self.lock_active();
+        active.log.free_fence_slots(self.lanes)
     }
 
     /// Records already handed to frames (the `begin_group_flush` cursor; buffer outer lock held).
@@ -468,6 +538,35 @@ fn segment_file_path(base: &Path, segment_id: u64) -> PathBuf {
 fn parse_segment_id(name: &str, stem: &str) -> Option<u64> {
     let prefix = format!("{stem}.fua.");
     name.strip_prefix(&prefix).and_then(|id| id.parse().ok())
+}
+
+/// The highest `<stem>.fua.<id>` segment id present beside `base` (0 when none exist). A reopen
+/// opens `highest + 1` so a fresh segment never collides with (or appends into) a recovered file.
+fn highest_existing_segment_id(base: &Path) -> u64 {
+    let mut highest = 0u64;
+    let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return highest;
+    };
+    let Some(stem) = base.file_name().and_then(|n| n.to_str()) else {
+        return highest;
+    };
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(id) = parse_segment_id(name, stem) {
+                    highest = highest.max(id);
+                }
+            }
+        }
+    }
+    highest
+}
+
+/// Whether ANY `<stem>.fua.<id>` segment exists beside `base` — the guard the engine uses to
+/// refuse a SERIAL reopen of what is physically a FUA log (and vice-versa), rather than silently
+/// starting a fresh database that shadows the durable FUA data.
+pub fn fua_wal_segments_exist(base: impl AsRef<Path>) -> bool {
+    highest_existing_segment_id(base.as_ref()) > 0
 }
 
 fn open_segment(

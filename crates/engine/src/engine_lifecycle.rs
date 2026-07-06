@@ -424,6 +424,60 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref();
+        // E1 step 3 — reopen is DISK-AUTHORITATIVE (not env-authoritative): a FUA log lives in
+        // `<segment_path>.fua.*` frame-log segments (NO plain serial segment file), a serial log in
+        // the plain `<segment_path>` file, so the on-disk shape identifies the backend
+        // unambiguously. Recover whichever is present; refuse a genuine MIXED log (both present —
+        // ambiguous ordering), which the pure-fua / pure-serial test suite never produces. This is
+        // the task's "recover the non-empty one, refuse a real mix" rule, made robust to a caller
+        // whose env disagrees with what a prior run wrote.
+        #[cfg(unix)]
+        {
+            let fua_present = gpu_db_wal::fua_wal_segments_exist(segment_path);
+            let serial_present = segment_path.exists();
+            if fua_present && serial_present {
+                return Err(EngineError::Durability(format!(
+                    "both serial and FUA WAL segments exist beside {}; refusing an ambiguous \
+                     mixed-backend reopen (remove one backend's segments to disambiguate)",
+                    segment_path.display()
+                )));
+            }
+            let env_is_fua = matches!(
+                WalDurability::from_env(),
+                WalDurability::FuaFencePool { .. }
+            );
+            // FUA reopen when a FUA log is on disk (honor it regardless of env — a serial-env
+            // reopen must NOT shadow it), or when the env selects FUA for a fresh db. A serial log
+            // on disk always recovers serially below (the on-disk format wins over the env).
+            if fua_present || (!serial_present && env_is_fua) {
+                let (lanes, segment_bytes) = match WalDurability::from_env() {
+                    WalDurability::FuaFencePool {
+                        lanes,
+                        segment_bytes,
+                    } => (lanes, segment_bytes),
+                    _ => (
+                        WalDurability::DEFAULT_FUA_LANES,
+                        WalDurability::DEFAULT_FUA_SEGMENT_BYTES,
+                    ),
+                };
+                let records = gpu_db_wal::recover_fua_wal_records(segment_path)?;
+                let mut engine = Self::with_planner_config(planner_cfg);
+                // Replay the durable prefix WITHOUT a durable backing (no segment I/O), then install
+                // a reopened FUA backend that appends above the recovered history in a fresh segment.
+                for record in &records {
+                    engine.commit_mutation(record.txn_id, record.payload.clone())?;
+                }
+                let wal = WalBuffer::with_recovered_fua_durable_segment(
+                    segment_path,
+                    records,
+                    lanes,
+                    segment_bytes,
+                )?;
+                engine.group_flush.concurrent_durability = wal.durability_is_concurrent();
+                engine.commit_state_mut().wal = wal;
+                return Ok(engine);
+            }
+        }
         let recovery = recover_wal_segment(segment_path)?;
         let mut engine = Self::with_planner_config(planner_cfg);
         // Replay the durable prefix WITHOUT a durable backing so the replay does no segment I/O;

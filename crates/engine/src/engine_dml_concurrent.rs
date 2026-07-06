@@ -1773,13 +1773,6 @@ impl Engine {
     /// thread's fence completes and advances it. Visibility still gates on the durable frontier
     /// exactly as the serial path; a fence/publish/roll failure wedges fail-closed identically.
     fn wait_group_durable_concurrent(&self, wal_position: usize) -> Result<(), EngineError> {
-        // Spins before a `yield_now` while polling the durable mirror — mirrors the FUA backend's
-        // own durable-cut wait discipline (pure spin keeps the ack near one fence latency; the
-        // yield fallback avoids burning a core when the pool is genuinely backed up).
-        const SPIN_BEFORE_YIELD: u32 = 256;
-        // After this many `yield_now`s with no progress, fall back to re-`begin_group_flush` so a
-        // poisoned backend is surfaced (liveness backstop only — normal acks are sub-millisecond).
-        const POLL_YIELD_BUDGET: u32 = 1 << 16;
         loop {
             if self
                 .group_flush
@@ -1792,15 +1785,33 @@ impl Engine {
             if self.group_flush.wedged.load(AtomicOrdering::Acquire) {
                 return Err(self.group_flush_wedged_error());
             }
-            // Snapshot + publish our unflushed tail under a BRIEF commit_mutex hold (frame order is
-            // assigned here), then make it durable OFF-LOCK. No `flusher_active` gate — concurrent
-            // begins are exactly what the FUA ticket gate is built to order.
+            // FENCE-POOL PACING (E1 step 3 — the engine-seam anti-convoy law): snapshot + publish
+            // our unflushed tail under a BRIEF commit_mutex hold (frame order is assigned there),
+            // but ONLY if the fence pool has a free lane. While every lane is busy we do NOT begin
+            // — a fresh begin here would frame the FEW records accumulated since the last publish
+            // (the E1.2 negative: 61-record serial-election groups collapse to ~28), doubling the
+            // durable-op count and starving the pool. Instead we release the lock and POLL the
+            // durable mirror: whoever begins when a lane frees sweeps the WHOLE accumulated tail
+            // (ours included) into ONE larger frame. This recreates serial-election batching but
+            // with up to `lanes` groups pipelined instead of one. `fua_free_fence_slots` is `None`
+            // on the serial backend (never reached here) → treat as "a lane is free".
             let begun = {
                 let mut commit = self.commit_state();
-                commit.wal.begin_group_flush()
+                if commit.wal.fua_free_fence_slots().unwrap_or(1) == 0 {
+                    None // all lanes busy → accumulate + poll (do not ship a tiny frame)
+                } else {
+                    Some(commit.wal.begin_group_flush())
+                }
             };
             match begun {
-                Ok(gpu_db_wal::WalGroupFlushBegin::Clean { flushed_records }) => {
+                None => {
+                    // Pacing back-off: another begin will cover us once a lane frees. Poll the
+                    // durable mirror off-lock; on budget-elapse re-loop to re-check the pacing gate.
+                    if self.poll_concurrent_durable_mirror(wal_position)? {
+                        return Ok(());
+                    }
+                }
+                Some(Ok(gpu_db_wal::WalGroupFlushBegin::Clean { flushed_records })) => {
                     // Another committer already published our tail and owns the in-flight frame that
                     // covers us; it will advance `durable_records` when its fence completes. Refresh
                     // the mirror with the snapshot's durable cut, then POLL (no wakeup) until either
@@ -1808,36 +1819,11 @@ impl Engine {
                     self.group_flush
                         .durable_records
                         .fetch_max(flushed_records, AtomicOrdering::AcqRel);
-                    // Bound the poll so a re-`begin_group_flush` eventually surfaces a poisoned
-                    // backend even if the owning thread died mid-flight without setting `wedged`
-                    // (far beyond one fence latency — the common case unblocks in the first spins).
-                    let mut yields: u32 = 0;
-                    let mut spins: u32 = 0;
-                    loop {
-                        if self
-                            .group_flush
-                            .durable_records
-                            .load(AtomicOrdering::Acquire)
-                            >= wal_position
-                        {
-                            return Ok(());
-                        }
-                        if self.group_flush.wedged.load(AtomicOrdering::Acquire) {
-                            return Err(self.group_flush_wedged_error());
-                        }
-                        if spins < SPIN_BEFORE_YIELD {
-                            spins += 1;
-                            std::hint::spin_loop();
-                        } else {
-                            std::thread::yield_now();
-                            yields += 1;
-                            if yields >= POLL_YIELD_BUDGET {
-                                break; // fall back to the outer loop (re-begin surfaces poison)
-                            }
-                        }
+                    if self.poll_concurrent_durable_mirror(wal_position)? {
+                        return Ok(());
                     }
                 }
-                Ok(gpu_db_wal::WalGroupFlushBegin::Job(job)) => match job.commit() {
+                Some(Ok(gpu_db_wal::WalGroupFlushBegin::Job(job))) => match job.commit() {
                     Ok(flushed_records) => {
                         self.group_flush
                             .durable_records
@@ -1847,7 +1833,44 @@ impl Engine {
                     }
                     Err(err) => return Err(self.wedge_group_flush(err)),
                 },
-                Err(err) => return Err(self.wedge_group_flush(err)),
+                Some(Err(err)) => return Err(self.wedge_group_flush(err)),
+            }
+        }
+    }
+
+    /// Spin-then-yield poll of the concurrent durable mirror (no per-commit wakeup), bounded by a
+    /// yield budget. Returns `Ok(true)` when the frontier covers `wal_position`, `Ok(false)` when
+    /// the budget elapses (the caller re-loops to re-check the pacing gate / a freed fence lane —
+    /// this also surfaces a poisoned backend that died mid-flight without setting `wedged`, far
+    /// beyond one fence latency), and `Err` when the path is wedged. Pure spin at low contention
+    /// keeps the ack near one fence latency; the yield fallback avoids burning a core when the pool
+    /// is genuinely backed up.
+    fn poll_concurrent_durable_mirror(&self, wal_position: usize) -> Result<bool, EngineError> {
+        const SPIN_BEFORE_YIELD: u32 = 256;
+        const POLL_YIELD_BUDGET: u32 = 1 << 16;
+        let mut spins: u32 = 0;
+        let mut yields: u32 = 0;
+        loop {
+            if self
+                .group_flush
+                .durable_records
+                .load(AtomicOrdering::Acquire)
+                >= wal_position
+            {
+                return Ok(true);
+            }
+            if self.group_flush.wedged.load(AtomicOrdering::Acquire) {
+                return Err(self.group_flush_wedged_error());
+            }
+            if spins < SPIN_BEFORE_YIELD {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+                yields += 1;
+                if yields >= POLL_YIELD_BUDGET {
+                    return Ok(false);
+                }
             }
         }
     }

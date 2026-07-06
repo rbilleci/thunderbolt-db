@@ -12,7 +12,7 @@ use gpu_db_types::{EngineError, TxnId};
 #[cfg(unix)]
 mod fua;
 #[cfg(unix)]
-pub use fua::recover_fua_wal_records;
+pub use fua::{fua_wal_segments_exist, recover_fua_wal_records};
 
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
@@ -762,6 +762,45 @@ impl WalBuffer {
             #[cfg(unix)]
             fua: None,
         })
+    }
+
+    /// REOPEN a FUA-durable database (E1 step 3) whose retained `<segment_path>.fua.*` segments were
+    /// already scan-recovered into `records` by [`recover_fua_wal_records`] (the caller replayed
+    /// them). The buffer is seeded with the full recovered history and positioned to keep APPENDING
+    /// in a FRESH segment above the highest existing id — the old segments are retained, never
+    /// appended into, so a crash can only tear the newest segment's tail. `records.len()` is the
+    /// durable/published watermark: `flushed_count()` reports it immediately and the first new
+    /// frame's `first_seq` continues the contiguous log (see [`fua::FuaWalBackend::reopen`]).
+    #[cfg(unix)]
+    pub fn with_recovered_fua_durable_segment(
+        segment_path: impl Into<PathBuf>,
+        records: Vec<WalRecord>,
+        lanes: usize,
+        segment_bytes: usize,
+    ) -> Result<Self, EngineError> {
+        let recovered = records.len();
+        let backend =
+            fua::FuaWalBackend::reopen(segment_path.into(), lanes, segment_bytes, recovered)?;
+        Ok(Self {
+            records,
+            flushed_memory: 0,
+            fail_next_flush: false,
+            durable: None,
+            fua: Some(Arc::new(backend)),
+        })
+    }
+
+    /// FUA-backend PACING signal (E1 step 3): free fence lanes in the active segment's pool, or
+    /// `None` for any non-FUA backend. The engine's concurrent-durability wait uses this at the
+    /// engine seam — a committer begins its own group flush ONLY while a lane is free, so backlog
+    /// forms a LARGER next group behind the busy lanes instead of collapsing the pool to tiny
+    /// per-arrival frames (the population-share anti-convoy law, applied above the WAL).
+    pub fn fua_free_fence_slots(&self) -> Option<usize> {
+        #[cfg(unix)]
+        if let Some(fua) = self.fua.as_ref() {
+            return Some(fua.free_fence_slots());
+        }
+        None
     }
 
     /// The durable segment path, if this buffer is backed by one. For the FUA backend this is the
@@ -7294,6 +7333,73 @@ mod tests {
         // Prefix truncation is a step-2 capability; it must error rather than silently no-op.
         assert!(wal.truncate_durable_segment_prefix(0).is_err());
         assert_eq!(wal.durable_segment_base_records(), 0);
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
+    /// E1 step 3: REOPEN an existing FUA log — write + drop, reopen and verify the recovered
+    /// history + that appends CONTINUE the contiguous log (new segment above the old id), then
+    /// drop + recover a THIRD time to prove both segments chain end-to-end.
+    #[cfg(unix)]
+    #[test]
+    fn fua_reopen_continues_the_log_and_recovers_across_lives() {
+        let base = fua_test_base("reopen");
+        let first = vec![
+            rec(1, b"CREATE TABLE t (id INT)"),
+            rec(2, b"INSERT INTO t (id) VALUES (1)"),
+            rec(3, b"INSERT INTO t (id) VALUES (2)"),
+        ];
+        // Life 1: write + flush + clean drop (drain).
+        {
+            let mut wal = WalBuffer::with_fua_durable_segment(&base, 8, 1 << 20).expect("create");
+            for record in &first {
+                wal.append(record.clone());
+            }
+            wal.flush_all().expect("flush life 1");
+        }
+        let recovered_1 = recover_fua_wal_records(&base).expect("recover life 1");
+        assert_eq!(recovered_1, first, "life-1 recovery matches input");
+
+        // Life 2: reopen seeded with the recovered history, verify watermark, then APPEND more.
+        let second = vec![
+            rec(4, b"UPDATE t SET id = 3 WHERE id = 1"),
+            rec(5, b"DELETE FROM t WHERE id = 2"),
+        ];
+        {
+            let mut wal = WalBuffer::with_recovered_fua_durable_segment(
+                &base,
+                recovered_1.clone(),
+                8,
+                1 << 20,
+            )
+            .expect("reopen");
+            assert!(wal.is_durable());
+            assert_eq!(
+                wal.flushed_count(),
+                first.len(),
+                "reopen reports the recovered records as already durable"
+            );
+            assert_eq!(wal.unflushed_count(), 0, "nothing unflushed on reopen");
+            assert_eq!(wal.durable_segment_path(), Some(base.as_path()));
+            for record in &second {
+                wal.append(record.clone());
+            }
+            assert_eq!(wal.unflushed_count(), second.len());
+            wal.flush_all().expect("flush life 2");
+            assert_eq!(wal.flushed_count(), first.len() + second.len());
+        }
+
+        // Life 3: recover across BOTH segments — the chain must be first ++ second, in order.
+        let mut expected = first.clone();
+        expected.extend(second.clone());
+        let recovered_2 = recover_fua_wal_records(&base).expect("recover life 2");
+        assert_eq!(
+            recovered_2, expected,
+            "recovery chains the old and new segments contiguously"
+        );
+        assert!(
+            fua_wal_segments_exist(&base),
+            "segments are retained for recovery"
+        );
         let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 }
