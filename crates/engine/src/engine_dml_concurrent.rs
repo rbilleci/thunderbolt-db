@@ -2700,7 +2700,8 @@ impl Engine {
             lanes
                 .stat_apply_requests
                 .fetch_add(batch.len() as u64, AtomicOrdering::Relaxed);
-            self.lane_apply_merged(&batch);
+            let mut batch = batch;
+            self.lane_apply_merged(&mut batch);
             for request in batch {
                 request
                     .slot
@@ -2737,20 +2738,23 @@ impl Engine {
     /// exclusive section — just batched across lanes. The non-appended
     /// fallback mirrors flush_wave_pending_appends' rehydrate/invalidate arm
     /// using only request-carried data (no CommitWaveItem).
-    fn lane_apply_merged(&self, batch: &[crate::engine_intent_lanes::ApplyRequest]) {
+    fn lane_apply_merged(&self, batch: &mut [crate::engine_intent_lanes::ApplyRequest]) {
         use std::collections::BTreeMap;
         // group request indexes per table (usually exactly one table)
-        let mut tables: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        let mut tables: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, request) in batch.iter().enumerate() {
-            tables.entry(&request.table).or_default().push(index);
+            tables.entry(request.table.clone()).or_default().push(index);
         }
         for (table, requests) in tables {
+            let table = table.as_str();
             let total: usize = requests.iter().map(|&i| batch[i].rows.len()).sum();
             let mut rows: Vec<Vec<SqlValue>> = Vec::with_capacity(total);
             let mut row_ids: Vec<u64> = Vec::with_capacity(total);
             let mut stamps: Vec<Index> = Vec::with_capacity(total);
             for &i in &requests {
-                rows.extend(batch[i].rows.iter().cloned());
+                // MOVE the row vectors (pointer moves) — the leader was cloning
+                // every merged row's SqlValues, ~1900 heap allocs per wave.
+                rows.append(&mut batch[i].rows);
                 row_ids.extend_from_slice(&batch[i].row_ids);
                 stamps.extend_from_slice(&batch[i].stamps);
             }
