@@ -72,6 +72,7 @@ impl Engine {
         payload: std::sync::Arc<[u8]>,
         timestamp_micros: u64,
     ) -> Result<CommitToken, EngineError> {
+        self.intent_lanes_write_guard()?;
         if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }

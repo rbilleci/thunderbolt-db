@@ -421,6 +421,8 @@ impl Engine {
     /// `&self`: the whole path runs without an engine write lock, so writers overlap on prepare and
     /// serialize only briefly on the commit_mutex, and a writer never blocks a reader.
     pub fn execute_dml_concurrent(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
+        self.intent_lanes_write_guard()
+            .map_err(ExecuteError::Engine)?;
         self.execute_dml_concurrent_instrumented(txn_id, text, || {})
     }
 
@@ -2426,7 +2428,7 @@ impl Engine {
             return false; // another pump owns this lane right now
         };
         // settle matured waves first: acks lead each iteration
-        let mut progressed = self.settle_intent_lane(&lanes, lane);
+        let progressed = self.settle_intent_lane(&lanes, lane);
 
         let wave_max = crate::engine_intent_lanes::intent_lane_wave_max();
         let batch: Vec<CommitWaveItem> = {
@@ -2439,7 +2441,6 @@ impl Engine {
         if batch.is_empty() {
             return progressed;
         }
-        progressed = true;
 
         // device validate (committed-dup 23505 verdicts), off-lock
         let violations = self.wave_batch_validate_unique(&batch);

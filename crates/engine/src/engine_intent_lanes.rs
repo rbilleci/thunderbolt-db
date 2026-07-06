@@ -172,6 +172,26 @@ impl IntentLaneState {
 
 /// `GPU_DB_INTENT_LANES` (default 1 = lanes mode OFF; >= 2 enables). Read once
 /// at engine construction, like the other write-path knobs.
+impl crate::Engine {
+    /// V1 intent-only contract: once the first lane seq block is claimed, classic
+    /// DML/DDL writes are refused fail-loud — a classic record appended to the
+    /// serial WAL AFTER lane activation would interleave two ordered logs with
+    /// no merge rule (full serial+lanes merge replay is the E2.5c slice).
+    /// Pre-activation traffic (schema DDL, elision warm-up) is unaffected.
+    pub(crate) fn intent_lanes_write_guard(&self) -> Result<(), crate::EngineError> {
+        if let Some(lanes) = &self.intent_lanes {
+            if lanes.activated.load(Ordering::Acquire) {
+                return Err(crate::EngineError::Durability(
+                    "intent lanes are ACTIVE: the engine is intent-only (v1 lanes contract); \
+                     classic DML/DDL writes are refused after the first lane commit"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Max items drained per lane wave (`GPU_DB_INTENT_LANE_WAVE_MAX`, default 1024).
 pub(crate) fn intent_lane_wave_max() -> usize {
     std::env::var("GPU_DB_INTENT_LANE_WAVE_MAX")

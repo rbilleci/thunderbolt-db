@@ -459,6 +459,28 @@ impl Engine {
     /// acknowledged-durable records — still fails loudly rather than silently dropping data. If
     /// the segment does not exist yet, this behaves like [`Engine::with_durable_wal_segment`] (a
     /// fresh durable database).
+    /// True if `<base>.lane-<L>.fua.*` intent-lane files exist beside the serial segment.
+    #[cfg(unix)]
+    fn intent_lane_files_exist(segment_path: &std::path::Path) -> bool {
+        let Some(parent) = segment_path.parent() else {
+            return false;
+        };
+        let Some(stem) = segment_path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let prefix = format!("{stem}.lane-");
+        std::fs::read_dir(parent)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&prefix))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     pub fn open_durable_wal_segment(
         segment_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, EngineError> {
@@ -470,6 +492,19 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Result<Self, EngineError> {
         let segment_path = segment_path.as_ref();
+        // E2.5b-2 stage 4 (v1): REFUSE reopen when intent-lane files exist. The lane logs hold
+        // seqs ABOVE the serial log's range; replaying them requires the serial-then-lanes merge
+        // (recover_lanes ordered by global seq), which is the E2.5c slice. Failing loudly here is
+        // strictly safer than replaying a prefix and silently dropping acknowledged lane commits.
+        #[cfg(unix)]
+        if Self::intent_lane_files_exist(segment_path) {
+            return Err(EngineError::Durability(format!(
+                "intent-lane WAL files exist beside {} (<base>.lane-<L>.fua.*): lanes-mode reopen \
+                 is not wired yet (E2.5c); recover offline via gpu_db_wal::recover_lanes or start \
+                 a fresh database path",
+                segment_path.display()
+            )));
+        }
         // E1 step 3 — reopen is DISK-AUTHORITATIVE (not env-authoritative): a FUA log lives in
         // `<segment_path>.fua.*` frame-log segments (NO plain serial segment file), a serial log in
         // the plain `<segment_path>` file, so the on-disk shape identifies the backend
