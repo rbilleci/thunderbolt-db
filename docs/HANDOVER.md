@@ -388,6 +388,19 @@ submit may run sequencer/tail work when it becomes the leader). A post-W4h diagn
 51us/commit in that run, queue residence ~1.26ms/item, and durable tail ~0.86ms/tail. The remaining latency gap is therefore
 not explained by SQL parse alone; it is dominated by closed-loop queueing plus the final durability/visibility barrier.
 
+**E2 PROGRAM (2026-07-06, commits 907d6b88..a88cf690, ALL PUSHED; user mandate: multi-million engine TPS,
+disruptor staging, main agent implements / opus audits only):** classic 32k -> intent fast path (E2.1) ->
+disruptor submit/poll + integer ledger (E2.2, 414k) -> fast lane (E2.3, 597k peak) -> sharded-dispatch
+negative (E2.4a, documented) -> FuaWalLaneSet in crates/wal (E2.5a: N ordered lanes, global seqs, cross-lane
+cut, merge recovery, property-tested) -> batched thin cut + HashMap timestamps (E2.5b-1) -> audit clean, two
+LOW fixes (unique wave timestamps for PITR, self-releasing IntentTicket) -> single-copy WAL payload
+(E2.5b-3): **511k sustained / 666k burst durable, sequencer 1.70us/item, recovery parity to 1.94M commits.**
+Bench: GPU_DB_BENCH_ARM=driver WRITERS=32 PUMPS=4 WINDOW=256 + GPU_DB_WAL_DURABILITY=fua.
+**NEXT (E2.5b-2, the structural 2x):** wire FuaWalLaneSet into the intent path — N lane-sequencers claiming
+global-seq blocks (exact tiling contract), single writer per lane, visibility = cross-lane contiguous cut ∧
+applied; then GPU wave scaling (device ~1us/item, FUA budget 2.75M/s both idle). The ordered serial cut
+(~1.5-1.7us/item ~= 625k ceiling) is the LAST wall before the multi-million band.
+
 **LOCAL FUA-WAL (same branch, NOT merged; new lane owner 2026-07-05, opus audit in flight):** the write-conveyor
 durable wall was DIAGNOSED AS A MEASUREMENT ARTIFACT and fixed. All prior durable fences ran over
 `posix_fallocate` UNWRITTEN extents (per-fence XFS extent-conversion journal force, ~2.45ms) and were issued
