@@ -575,6 +575,8 @@ pub(crate) struct ResidencyReadState {
     /// (append and re-admit are byte-identical), and device-ptr stability can't either (a same-size
     /// re-admit reuses the just-freed address). `Relaxed` monotonic counter.
     pub(crate) open_shard_append_hits: std::sync::atomic::AtomicU64,
+    /// E2.5c 2M+ push (b): merged applies served by the FUSED device pass.
+    pub(crate) fused_apply_hits: std::sync::atomic::AtomicU64,
     /// S-d3: count of shards actually GATHERED (recompacted) by the sharded read after zone-map pruning.
     /// The non-vacuity signal that pruning fired — output equality can't prove a shard was skipped
     /// (a pruned shard holds no matching rows, so the result is identical either way). `Relaxed` monotonic.

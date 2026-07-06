@@ -196,6 +196,15 @@ fn gpu_intent_fast_path_recovers_fua_log_with_row_parity() {
 
     let before = select_all_rows(&engine);
     assert_eq!(before.len(), 400 + warm_count(&before));
+    // E2.5c 2M+ push (b) non-vacuity: with the fused apply flag on, the merged applies must
+    // have run through the FUSED device pass (row parity alone cannot prove which kernel
+    // produced the state).
+    if std::env::var("GPU_DB_FUSED_APPLY").as_deref() != Ok("0") {
+        assert!(
+            engine.fused_apply_hits() > 0,
+            "fused apply is enabled (default ON) but no fused pass ever ran"
+        );
+    }
     assert!(engine.wal_unflushed_count() == 0);
     drop(engine); // crash
 

@@ -2347,12 +2347,14 @@ mod capacity_payload_tests {
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn sv6_created_by_gate_reader_at_prior_snapshot_never_sees_updated_key_twice() {
         // Run the torn-window differential over BOTH stamp branches: 200 rows -> the open shard has
-        // headroom, the append stamps IN PLACE; 258 rows (= 2 + 64*4: the 1-row admit builds a capacity-2
-        // shard 0, then target-64 rollovers) -> the open shard is FULL, the append ROLLS OVER a new stamped
-        // shard (whose created_by region must install before the shard publishes). The branch actually
-        // taken is PROVEN structurally below (shard-count delta), so neither variant can go vacuous if the
-        // admit shape changes.
-        for total_rows in [200_i64, 258_i64] {
+        // headroom, the append stamps IN PLACE; 256 rows (= 64*4 under the E2.5b-2 first-capacity
+        // FLOOR clamped by the target: EVERY shard is born at the 64-row target, so 4 exactly-full
+        // shards) -> the open shard is FULL, the append ROLLS OVER a new stamped shard (whose
+        // created_by region must install before the shard publishes). The branch actually taken is
+        // PROVEN structurally below (shard-count delta), so neither variant can go vacuous if the
+        // admit shape changes. (Recalibrated from 258: the pre-floor 1-row admit built a capacity-2
+        // shard 0; the floor commit 6c3fe683 made shard 0 birth at the target too.)
+        for total_rows in [200_i64, 256_i64] {
             let e = Engine::new_local();
             e.set_shard_residency_enabled(true);
             e.set_auto_admit_on_commit(true);
@@ -2413,7 +2415,7 @@ mod capacity_payload_tests {
                 "the UPDATE append must have stamped a created_by region at {total_rows} rows"
             );
             // NON-VACUITY (branch proof): 200 rows must exercise the IN-PLACE stamp (same shard set);
-            // 258 rows must exercise the ROLLOVER stamp (a new shard appeared). If the admit shape ever
+            // 256 rows must exercise the ROLLOVER stamp (a new shard appeared). If the admit shape ever
             // changes these row counts, this assert flags the variant instead of silently going vacuous.
             if total_rows == 200 {
                 assert_eq!(
@@ -7522,6 +7524,26 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// E2.5c 2M+ push (b): enable/disable the FUSED merged-apply device pass.
+    pub fn set_fused_apply_enabled(&self, on: bool) {
+        self.fused_apply_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn fused_apply_enabled(&self) -> bool {
+        self.fused_apply_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fused merged-apply passes that actually ran (non-vacuity telemetry — output equality
+    /// cannot prove the fused kernel produced the state).
+    pub fn fused_apply_hits(&self) -> u64 {
+        self.read_state
+            .residency
+            .fused_apply_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// M1 design B: enable/disable WAVE-TIME batched PK-unique validation.
     pub fn set_device_write_locate_wave_batch_enabled(&self, on: bool) {
         self.device_write_locate_wave_batch_enabled
@@ -8028,40 +8050,100 @@ impl Engine {
                 Ok(chunks) => chunks,
                 Err(_) => return false,
             };
-            // `deleted_by` needs no write on append — the headroom was pre-filled with the live sentinel at
-            // admission, so appended rows are born live. SV6: an UPDATE-appended NEW VERSION additionally
-            // stamps `created_by = commit_seq` (below); a plain INSERT append stays unstamped (born-visible).
-            let append_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
-                .then(std::time::Instant::now);
-            let append_result = shard_device_memory.append_owned_chunks(chunks);
-            if let Some(started) = append_started {
-                crate::engine_dml_concurrent::WAVE_DEVICE_STATS[1].fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
+            // Column values in catalog order (used by the fused pass, the host PK-index cache
+            // extension, and the device index maintenance below). NULL-free by the appendable
+            // guard, so `sql_value_as_int4` yields exactly the bytes the chunks encode for the
+            // i32 columns.
+            let column_values: Vec<Vec<i32>> = (0..column_count)
+                .map(|c| {
+                    new_rows
+                        .iter()
+                        .map(|row| sql_value_as_int4(&row[c]))
+                        .collect()
+                })
+                .collect();
+            // E2.5c 2M+ push (b): the FUSED merged-apply device pass — column scatter +
+            // created_by/row-id stamps + PK index insert in ONE staging HtoD + ONE launch
+            // (replacing the ~8 driver calls of the unfused chain below). Int4-only shards
+            // (the covered-INSERT shape); ineligible falls through to the unfused sequence,
+            // byte-identical to before the flag.
+            let fused = if self.fused_apply_enabled() && num_i64_cols == 0 {
+                let append_started =
+                    crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
+                        .then(std::time::Instant::now);
+                // Per-COLUMN offsets only: the encoder's FINAL chunk is the device
+                // row-count header (offset 0), which the fused kernel publishes itself.
+                let chunk_offsets: Vec<u64> = chunks
+                    .iter()
+                    .take(column_count)
+                    .map(|chunk| chunk.byte_offset)
+                    .collect();
+                let outcome = self.try_fused_apply_in_place(
+                    table,
+                    shard_id,
+                    &shard_device_memory,
+                    &chunk_offsets,
+                    &column_values,
+                    row_count,
+                    capacity,
+                    gpu_id,
+                    &stamps,
+                    row_ids,
                 );
-            }
-            if append_result.is_err() {
-                // Partial/failed append leaves bytes only in invisible headroom beyond row_count;
-                // returning false makes the caller invalidate + re-admit, discarding them.
-                return false;
-            }
-            // SV6 ORDER (load-bearing): stamp created_by BEFORE the `row_count` bump below publishes the
-            // appended slots. The slots are still invisible headroom here, so a torn state (values + stamps
-            // written, count not bumped) is unreadable; stamping AFTER the bump would let a reader bound to
-            // an older snapshot observe the new version born-visible (created_by = fill 0) — exactly the
-            // SV5 P2 double-read window this gate closes. A stamp failure -> false -> the caller re-admits
-            // (the re-admit purge releases any partial region; rebuild-all-live is always correct).
-            if !self.stamp_created_by_resident_shard_slots(
-                table, shard_id, row_count, capacity, gpu_id, &stamps,
-            ) {
-                return false;
-            }
-            // RETIREMENT A1: stamp the appended slots' host identities (get-or-skip: a region-less
-            // benchmark lineage skips; an identity-bearing shard gets exact stamps). Same
-            // before-the-bump ordering as the version stamps.
-            if let Some(ids) = row_ids {
-                if !self.stamp_row_id_resident_shard_slots(table, shard_id, row_count, ids) {
+                if let Some(started) = append_started {
+                    crate::engine_dml_concurrent::WAVE_DEVICE_STATS[1].fetch_add(
+                        started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                match outcome {
+                    Some(true) => true,
+                    // Device failure mid-pass: bytes live only in invisible headroom beyond
+                    // row_count; the caller invalidates + re-admits (same contract as the
+                    // unfused arm's partial-failure rule).
+                    Some(false) => return false,
+                    None => false, // not eligible -> unfused sequence
+                }
+            } else {
+                false
+            };
+            if !fused {
+                // `deleted_by` needs no write on append — the headroom was pre-filled with the live sentinel at
+                // admission, so appended rows are born live. SV6: an UPDATE-appended NEW VERSION additionally
+                // stamps `created_by = commit_seq` (below); a plain INSERT append stays unstamped (born-visible).
+                let append_started =
+                    crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
+                        .then(std::time::Instant::now);
+                let append_result = shard_device_memory.append_owned_chunks(chunks);
+                if let Some(started) = append_started {
+                    crate::engine_dml_concurrent::WAVE_DEVICE_STATS[1].fetch_add(
+                        started.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                if append_result.is_err() {
+                    // Partial/failed append leaves bytes only in invisible headroom beyond row_count;
+                    // returning false makes the caller invalidate + re-admit, discarding them.
                     return false;
+                }
+                // SV6 ORDER (load-bearing): stamp created_by BEFORE the `row_count` bump below publishes the
+                // appended slots. The slots are still invisible headroom here, so a torn state (values + stamps
+                // written, count not bumped) is unreadable; stamping AFTER the bump would let a reader bound to
+                // an older snapshot observe the new version born-visible (created_by = fill 0) — exactly the
+                // SV5 P2 double-read window this gate closes. A stamp failure -> false -> the caller re-admits
+                // (the re-admit purge releases any partial region; rebuild-all-live is always correct).
+                if !self.stamp_created_by_resident_shard_slots(
+                    table, shard_id, row_count, capacity, gpu_id, &stamps,
+                ) {
+                    return false;
+                }
+                // RETIREMENT A1: stamp the appended slots' host identities (get-or-skip: a region-less
+                // benchmark lineage skips; an identity-bearing shard gets exact stamps). Same
+                // before-the-bump ordering as the version stamps.
+                if let Some(ids) = row_ids {
+                    if !self.stamp_row_id_resident_shard_slots(table, shard_id, row_count, ids) {
+                        return false;
+                    }
                 }
             }
             let appended_bytes =
@@ -8095,14 +8177,6 @@ impl Engine {
             // i64 columns produce inert placeholder vecs (their probes decline pre-cache, so no
             // entry can exist to extend). NULL-free by the guard above, so `sql_value_as_int4`
             // yields exactly the bytes the chunks wrote for the i32 columns.
-            let column_values: Vec<Vec<i32>> = (0..column_count)
-                .map(|c| {
-                    new_rows
-                        .iter()
-                        .map(|row| sql_value_as_int4(&row[c]))
-                        .collect()
-                })
-                .collect();
             self.extend_shard_pk_index_cache_on_append(
                 table,
                 shard_id,
@@ -8113,7 +8187,7 @@ impl Engine {
             // M1 (ledger #24): incrementally maintain the DEVICE PK index too (the index_insert
             // kernel), so the wave-batched device locate never triggers the O(rows) rebuild.
             // Only fires when a device index is cached (device_write_locate on); no-op otherwise.
-            if self.device_write_locate_enabled() {
+            if !fused && self.device_write_locate_enabled() {
                 let idx_started = crate::engine_dml_concurrent::wave_device_phase_timing_enabled()
                     .then(std::time::Instant::now);
                 self.extend_shard_pk_device_index_on_append(
@@ -8404,6 +8478,227 @@ impl Engine {
     /// silently, keeping the absent-region = identity-unknown contract; a shard WITH one (admission
     /// or rollover created it, sentinel-filled headroom) gets exact stamps. Runs BEFORE the
     /// row_count bump (the slots are invisible headroom), same ordering as the version stamps.
+    /// Get-or-allocate a shard's ON-DEMAND `created_by` region (factored from the stamp path
+    /// so the FUSED apply pass shares the exact allocate + descriptor-republish semantics; see
+    /// `stamp_created_by_resident_shard_slots` for the SV6/D4 contract).
+    fn get_or_alloc_created_by_region(
+        &self,
+        table: &str,
+        shard_id: u32,
+        capacity: usize,
+        gpu_id: u16,
+    ) -> Option<Arc<CudaResidentDeviceMemory>> {
+        if let Some(region) = self
+            .read_state
+            .residency
+            .shard_created_by_memory
+            .get(&(table.to_string(), shard_id))
+        {
+            return Some(region);
+        }
+        let payload = vec![CREATED_BY_VISIBLE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
+        let region = Arc::new(self.relational_residency_device_memory(gpu_id, &payload)?);
+        self.read_state
+            .residency
+            .shard_created_by_memory
+            .insert_shard(table, shard_id, Arc::clone(&region));
+        // D4 (ADR-013 pre2): REPUBLISH the descriptor with the new region (see the
+        // deleted_by twin above). Born all-visible (fill 0), so a reader observing the
+        // republished descriptor mid-commit is unchanged until the stamps + row_count land.
+        self.read_state.residency.with_shards_mut(|shards| {
+            if let Some(table_shards) = shards.get_mut(table) {
+                if let Some(shard) = table_shards.iter_mut().find(|s| s.shard_id == shard_id) {
+                    shard.created_by_region = Some(Arc::clone(&region));
+                }
+            }
+        });
+        Some(region)
+    }
+
+    /// E2.5c 2M+ push (b): the FUSED merged-apply device pass — column scatter + created_by /
+    /// row-id stamps + PK hash-index insert in ONE staging HtoD + ONE launch + ONE decline DtoH
+    /// (which also completes the launch, so the caller's row_count publish keeps the SV6
+    /// stamp-before-publish order). Returns:
+    /// - `None`  -> not eligible; the caller runs the unfused sequence (byte-identical);
+    /// - `Some(true)`  -> the pass covered append + stamps + index maintenance;
+    /// - `Some(false)` -> device failure mid-pass; bytes live only in invisible headroom, the
+    ///   caller must NOT publish and must invalidate + re-admit (the unfused contract).
+    #[allow(clippy::too_many_arguments)]
+    fn try_fused_apply_in_place(
+        &self,
+        table: &str,
+        shard_id: u32,
+        shard_device_memory: &Arc<CudaResidentDeviceMemory>,
+        chunk_offsets: &[u64],
+        column_values: &[Vec<i32>],
+        row_count: usize,
+        capacity: usize,
+        gpu_id: u16,
+        stamps: &[Index],
+        row_ids: Option<&[u64]>,
+    ) -> Option<bool> {
+        let k = stamps.len();
+        if k == 0
+            || chunk_offsets.len() != column_values.len()
+            || column_values.iter().any(|col| col.len() != k)
+            || row_count.saturating_add(k) > capacity
+        {
+            return None;
+        }
+        let base_row_u32 = u32::try_from(row_count).ok()?;
+        // created_by region (get-or-allocate — same semantics as the unfused stamp path).
+        let created_by_region =
+            self.get_or_alloc_created_by_region(table, shard_id, capacity, gpu_id)?;
+        let created_by_dest =
+            created_by_region.device_ptr() + (row_count as u64) * std::mem::size_of::<u64>() as u64;
+        // Row-id region: get-or-skip, exactly like `stamp_row_id_resident_shard_slots` (a
+        // region-less lineage stamps nothing).
+        let row_ids_arg = row_ids.and_then(|ids| {
+            if ids.len() != k {
+                return None;
+            }
+            self.read_state
+                .residency
+                .shard_row_id_memory
+                .get(&(table.to_string(), shard_id))
+                .map(|region| {
+                    (
+                        ids,
+                        region.device_ptr()
+                            + (row_count as u64) * std::mem::size_of::<u64>() as u64,
+                    )
+                })
+        });
+        if row_ids.is_some() && row_ids_arg.is_none() {
+            // ids provided but no region (or arity drift): only the no-region case is a
+            // legitimate skip; arity drift declines to the unfused path's own guards.
+            if row_ids.is_some_and(|ids| ids.len() != k) {
+                return None;
+            }
+        }
+        // PK device-index snapshot: mirror `extend_shard_pk_device_index_on_append`'s basis
+        // validation + load rule for the (at most one) column with a LIVE cached device index.
+        // More than one live entry -> not eligible (the fused kernel inserts into one index).
+        let mut index_arg: Option<(u64, u32, u32, u32, u32)> = None;
+        let mut index_col: Option<usize> = None;
+        let mut index_guard: Option<Arc<CudaResidentDeviceMemory>> = None;
+        if self.device_write_locate_enabled() {
+            let new_count = row_count + k;
+            let device_ptr = shard_device_memory.device_ptr();
+            let mut live: Vec<(usize, Arc<CudaResidentDeviceMemory>, u32, u32)> = Vec::new();
+            {
+                let cache = self
+                    .read_state
+                    .residency
+                    .shard_pk_device_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for col_idx in 0..column_values.len() {
+                    let key = (table.to_string(), shard_id, col_idx);
+                    let Some(entry) = cache.get(&key) else {
+                        continue;
+                    };
+                    if entry.resident_device_ptr != device_ptr || entry.row_count != row_count {
+                        continue; // stale basis -> the prober path converges it (unfused rule)
+                    }
+                    let Some(index) = entry.device_index.clone() else {
+                        continue; // DECLINED is monotone under appends
+                    };
+                    live.push((col_idx, index, entry.table_mask, entry.hash_shift));
+                }
+            }
+            match live.len() {
+                0 => {}
+                1 => {
+                    let (col_idx, index, table_mask, hash_shift) = live.pop().expect("len 1");
+                    let table_size = (table_mask as u64) + 1;
+                    if (new_count as u64).saturating_mul(2) > table_size {
+                        // Past the builder's load rule -> drop so the next probe rebuilds at
+                        // the grown size (unfused rule), then run WITHOUT index maintenance.
+                        self.read_state
+                            .residency
+                            .shard_pk_device_index
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&(table.to_string(), shard_id, col_idx));
+                    } else {
+                        index_arg = Some((
+                            index.device_ptr(),
+                            table_mask,
+                            hash_shift,
+                            col_idx as u32,
+                            base_row_u32,
+                        ));
+                        index_col = Some(col_idx);
+                        index_guard = Some(index);
+                    }
+                }
+                _ => return None, // multi-index shard: the unfused per-column loop handles it
+            }
+        }
+        let _hold_index_alive = index_guard; // the launch reads the index buffer
+
+        // Flatten col-major values + absolute per-column dest addresses.
+        let values: Vec<i32> = column_values.iter().flatten().copied().collect();
+        let col_dests: Vec<u64> = chunk_offsets
+            .iter()
+            .map(|offset| shard_device_memory.device_ptr() + offset)
+            .collect();
+        let request = gpu_db_execution::FusedApplyRequest {
+            col_dests: &col_dests,
+            values: &values,
+            stamps,
+            created_by_dest,
+            row_ids: row_ids_arg,
+            index: index_arg,
+            // The device row-count header word (the unfused path's FINAL append chunk).
+            header_dest: shard_device_memory.device_ptr(),
+            header_value: (row_count + k) as u64,
+        };
+        match shard_device_memory.submit_i32_fused_apply(&request) {
+            Ok(dup) => {
+                if let Some(col_idx) = index_col {
+                    // Post-launch entry update, mirroring the unfused path: advance the basis,
+                    // or DECLINE monotonically on a dup/overflow verdict.
+                    let mut cache = self
+                        .read_state
+                        .residency
+                        .shard_pk_device_index
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(entry) = cache.get_mut(&(table.to_string(), shard_id, col_idx)) {
+                        if entry.resident_device_ptr == shard_device_memory.device_ptr()
+                            && entry.row_count == row_count
+                        {
+                            if dup {
+                                entry.device_index = None;
+                            }
+                            entry.row_count = row_count + k;
+                        }
+                    }
+                }
+                self.read_state
+                    .residency
+                    .fused_apply_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(true)
+            }
+            Err(_) => {
+                if let Some(col_idx) = index_col {
+                    // A failed launch may have partially mutated the index -> drop the entry
+                    // (rebuild on next probe); never a wrong index. Same as the unfused path.
+                    self.read_state
+                        .residency
+                        .shard_pk_device_index
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&(table.to_string(), shard_id, col_idx));
+                }
+                Some(false)
+            }
+        }
+    }
+
     fn stamp_row_id_resident_shard_slots(
         &self,
         table: &str,
@@ -8465,38 +8760,9 @@ impl Engine {
         if first_slot.saturating_add(k) > capacity {
             return false;
         }
-        let region = match self
-            .read_state
-            .residency
-            .shard_created_by_memory
-            .get(&(table.to_string(), shard_id))
-        {
-            Some(region) => region,
-            None => {
-                let payload =
-                    vec![CREATED_BY_VISIBLE_FILL_BYTE; capacity * std::mem::size_of::<u64>()];
-                let Some(region) = self.relational_residency_device_memory(gpu_id, &payload) else {
-                    return false;
-                };
-                let region = Arc::new(region);
-                self.read_state
-                    .residency
-                    .shard_created_by_memory
-                    .insert_shard(table, shard_id, Arc::clone(&region));
-                // D4 (ADR-013 pre2): REPUBLISH the descriptor with the new region (see the
-                // deleted_by twin above). Born all-visible (fill 0), so a reader observing the
-                // republished descriptor mid-commit is unchanged until the stamps + row_count land.
-                self.read_state.residency.with_shards_mut(|shards| {
-                    if let Some(table_shards) = shards.get_mut(table) {
-                        if let Some(shard) =
-                            table_shards.iter_mut().find(|s| s.shard_id == shard_id)
-                        {
-                            shard.created_by_region = Some(Arc::clone(&region));
-                        }
-                    }
-                });
-                region
-            }
+        let Some(region) = self.get_or_alloc_created_by_region(table, shard_id, capacity, gpu_id)
+        else {
+            return false;
         };
         let mut bytes = Vec::with_capacity(k * std::mem::size_of::<u64>());
         for stamp in stamps {

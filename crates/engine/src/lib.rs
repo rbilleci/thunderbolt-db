@@ -472,6 +472,11 @@ pub struct Engine {
     /// hash cache — key->slot ADDRESSING is device work. Default OFF until the SLO gate + audit;
     /// the host cache stays as the flag-off oracle until M3 deletes it. Kill switch -> host probe.
     device_write_locate_enabled: std::sync::atomic::AtomicBool,
+    /// E2.5c 2M+ push (b): FUSED merged-apply device pass (one staging HtoD + one launch for
+    /// column scatter + created_by/row-id stamps + PK index insert). Default ON (measured
+    /// best-of-3 sustained 1.65M vs 1.41M unfused); opt out with `GPU_DB_FUSED_APPLY=0`,
+    /// settable per engine.
+    fused_apply_enabled: std::sync::atomic::AtomicBool,
     /// M1 design B (wave-time batched validation): eligible INSERTs' PK-unique check is DEFERRED
     /// from the off-lock prepare to the wave sequencer, which batches the whole wave's PK needles
     /// into ONE device locate (the amortization win: launch cost is flat vs batch size). Default

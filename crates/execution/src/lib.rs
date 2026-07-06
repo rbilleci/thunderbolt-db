@@ -1224,8 +1224,17 @@ impl CudaResidentDeviceMemory {
         nulls_first_mask: u64,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_bitonic_sort_hetero(
-            self, indices, int_keys, num_int, text_cols, b128_cols, key_plan, desc_mask, null_offs,
-            nulls_first_mask, None,
+            self,
+            indices,
+            int_keys,
+            num_int,
+            text_cols,
+            b128_cols,
+            key_plan,
+            desc_mask,
+            null_offs,
+            nulls_first_mask,
+            None,
         )
     }
 
@@ -1428,7 +1437,13 @@ impl CudaResidentDeviceMemory {
         build_validity: Option<&[u32]>,
         probe_validity: Option<&[u32]>,
     ) -> Result<HashJoinOutcome, CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_i64(self, build_keys, probe_keys, build_validity, probe_validity)
+        launch_cuda_hash_join_inner_i64(
+            self,
+            build_keys,
+            probe_keys,
+            build_validity,
+            probe_validity,
+        )
     }
 
     /// GPU inner equi-join (M5 J4b) on a TEXT key with a UNIQUE build-side key. `build_texts`/`probe_texts`
@@ -1450,7 +1465,13 @@ impl CudaResidentDeviceMemory {
         build_validity: Option<&[u32]>,
         probe_validity: Option<&[u32]>,
     ) -> Result<HashJoinOutcome, CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_text(self, build_texts, probe_texts, build_validity, probe_validity)
+        launch_cuda_hash_join_inner_text(
+            self,
+            build_texts,
+            probe_texts,
+            build_validity,
+            probe_validity,
+        )
     }
 
     /// GPU inner equi-join (M5 N:N) on an int key where BOTH sides may have DUPLICATE keys -- the general
@@ -1471,7 +1492,13 @@ impl CudaResidentDeviceMemory {
         build_validity: Option<&[u32]>,
         probe_validity: Option<&[u32]>,
     ) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_i64_nn(self, build_keys, probe_keys, build_validity, probe_validity)
+        launch_cuda_hash_join_inner_i64_nn(
+            self,
+            build_keys,
+            probe_keys,
+            build_validity,
+            probe_validity,
+        )
     }
 
     /// GPU inner equi-join (M5 N:N) on a TEXT (or 16-byte numeric/uuid) key where BOTH sides may have
@@ -1491,7 +1518,13 @@ impl CudaResidentDeviceMemory {
         build_validity: Option<&[u32]>,
         probe_validity: Option<&[u32]>,
     ) -> Result<(Vec<u32>, Vec<u32>), CudaRuntimeProbeError> {
-        launch_cuda_hash_join_inner_text_nn(self, build_texts, probe_texts, build_validity, probe_validity)
+        launch_cuda_hash_join_inner_text_nn(
+            self,
+            build_texts,
+            probe_texts,
+            build_validity,
+            probe_validity,
+        )
     }
 
     /// COUNT(DISTINCT v) mark pass: `keys` is the (key0, key1, ..) i64 tuple matrix (row-major, `k`
@@ -1543,7 +1576,13 @@ impl CudaResidentDeviceMemory {
         // has no NULLs (all rows valid). NULL rows never match the needle (three-valued logic).
         null_bitmap_offset: Option<u64>,
     ) -> Result<u64, CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_equal_count(self, byte_offset, row_count, needle, null_bitmap_offset)
+        launch_cuda_resident_i32_equal_count(
+            self,
+            byte_offset,
+            row_count,
+            needle,
+            null_bitmap_offset,
+        )
     }
 
     pub fn count_i32_in_from_payload(
@@ -1661,7 +1700,13 @@ impl CudaResidentDeviceMemory {
         row_count: u64,
         null_bitmap_offset: Option<u64>,
     ) -> Result<(u64, i64, i32, i32), CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_scalar_stats(self, byte_offset, row_count, None, null_bitmap_offset)
+        launch_cuda_resident_i32_scalar_stats(
+            self,
+            byte_offset,
+            row_count,
+            None,
+            null_bitmap_offset,
+        )
     }
 
     /// FILTERED (+ optionally NULL-aware) DIRECT scalar (count, sum, min, max) — the filtered analogue of
@@ -1926,13 +1971,13 @@ impl CudaResidentDeviceMemory {
             false, // ...not a text value
             0,
             0,
-            0, // key_base_override (bench uses column keys)
-            0, // value_base_override
-            0, // comp_w (not a wide-key composite)
-            0, // n_text (no text members)
-            0, // text_desc_ptr
-            None, // value_null_off (bench: non-nullable)
-            None, // key_null_off (bench: non-nullable)
+            0,                     // key_base_override (bench uses column keys)
+            0,                     // value_base_override
+            0,                     // comp_w (not a wide-key composite)
+            0,                     // n_text (no text members)
+            0,                     // text_desc_ptr
+            None,                  // value_null_off (bench: non-nullable)
+            None,                  // key_null_off (bench: non-nullable)
             grouped_agg_mask::ALL, // bench computes every field
         )
     }
@@ -2565,7 +2610,11 @@ impl CudaResidentDeviceMemory {
         comparison: u32,
     ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_compare_indices_ordered(
-            self, byte_offset, row_count, needle, comparison,
+            self,
+            byte_offset,
+            row_count,
+            needle,
+            comparison,
         )
     }
 }
@@ -2650,7 +2699,9 @@ impl CudaI32BatchProjectionColumns {
         // misreshape (and `into_rows` would silently drop rows at width 0). Every live shape is uniform and
         // >=1 wide; assert it so a future zero/ragged-projection producer trips here in tests (audit P3).
         debug_assert!(
-            rows.is_empty() || (projection_count > 0 && rows.iter().all(|r| r.values.len() == projection_count)),
+            rows.is_empty()
+                || (projection_count > 0
+                    && rows.iter().all(|r| r.values.len() == projection_count)),
             "from_rows requires uniform, non-zero-width rows (got width {projection_count})"
         );
         let mut values = Vec::with_capacity(rows.len() * projection_count);
@@ -2705,7 +2756,11 @@ impl CudaI32BatchProjectionColumns {
             .enumerate()
             .map(|(i, (row, needle_index))| CudaI32BatchProjectionRow {
                 needle_index: needle_index as usize,
-                row_index: if has_row_indices { self.row_indices[i] } else { 0 },
+                row_index: if has_row_indices {
+                    self.row_indices[i]
+                } else {
+                    0
+                },
                 values: row.to_vec(),
             })
             .collect()
@@ -2966,7 +3021,9 @@ impl CudaI32EqualAnyProjectSubmission {
         // `row_index < row_count`. The columnar arrays are returned as-is for the engine to scatter flat.
         for &needle_index in &needle_indices {
             if needle_index as usize >= self.needles_len {
-                return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index as usize));
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    needle_index as usize,
+                ));
             }
         }
         for &row_index in &row_indices {
@@ -4090,8 +4147,14 @@ fn launch_cuda_bitonic_sort_i64(
         if rc != 0 {
             return rc;
         }
-        let rc =
-            unsafe { htod_async(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes, stream) };
+        let rc = unsafe {
+            htod_async(
+                keys_dev.ptr,
+                keys.as_ptr().cast::<c_void>(),
+                keys_bytes,
+                stream,
+            )
+        };
         if rc != 0 {
             return rc;
         }
@@ -4187,8 +4250,11 @@ fn launch_cuda_order_by_sort_i64_radix(
             .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    check_cuda(unsafe { cu_memcpy_htod(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes) })?;
-    let result = launch_cuda_resident_i64_argsort_radix(resident, keys_dev.ptr, n as u64, descending);
+    check_cuda(unsafe {
+        cu_memcpy_htod(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes)
+    })?;
+    let result =
+        launch_cuda_resident_i64_argsort_radix(resident, keys_dev.ptr, n as u64, descending);
     drop(keys_dev);
     result
 }
@@ -4449,8 +4515,14 @@ fn launch_cuda_bitonic_sort_multikey(
         if rc != 0 {
             return rc;
         }
-        let rc =
-            unsafe { htod_async(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes, stream) };
+        let rc = unsafe {
+            htod_async(
+                keys_dev.ptr,
+                keys.as_ptr().cast::<c_void>(),
+                keys_bytes,
+                stream,
+            )
+        };
         if rc != 0 {
             return rc;
         }
@@ -5321,7 +5393,8 @@ block_done:
     let function = resident
         .primary()
         .cached_function(c"gpu_db_resident_i32_equal_count_parallel", &ptx)?;
-    let null_bitmap_kernel_arg = validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
+    let null_bitmap_kernel_arg =
+        validity_bitmap_kernel_arg(null_bitmap_offset, row_count, resident)?;
 
     // SATURATING grid (not one-thread-per-row): clamp to a moderate constant that fills the GPU.
     // The grid-stride loop covers any row_count regardless of grid size, so clamping is
@@ -6201,11 +6274,20 @@ fn gather_resident_fixed_rows(
             .and_then(|offset| offset.checked_add(elem_size))
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         if value_end > allocated {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(value_end as usize));
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                value_end as usize,
+            ));
         }
     }
 
-    gather_resident_kernel(resident, byte_offset, row_indices, kernel_name, out_host, out_bytes)
+    gather_resident_kernel(
+        resident,
+        byte_offset,
+        row_indices,
+        kernel_name,
+        out_host,
+        out_bytes,
+    )
 }
 
 /// Gather a resident int4 column at `row_indices` into host `i32` values: one
@@ -6746,8 +6828,17 @@ fn compact_mask_with_validity(
             ];
             let rc = unsafe {
                 cu_launch_kernel(
-                    bool_mask_fn, grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                    bargs.as_mut_ptr(), std::ptr::null_mut(),
+                    bool_mask_fn,
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    bargs.as_mut_ptr(),
+                    std::ptr::null_mut(),
                 )
             };
             if rc != 0 {
@@ -6768,8 +6859,17 @@ fn compact_mask_with_validity(
             ];
             let rc = unsafe {
                 cu_launch_kernel(
-                    mask_binary_fn, grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                    margs.as_mut_ptr(), std::ptr::null_mut(),
+                    mask_binary_fn,
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    margs.as_mut_ptr(),
+                    std::ptr::null_mut(),
                 )
             };
             if rc != 0 {
@@ -7610,7 +7710,9 @@ fn launch_cuda_resident_i128_minmax_partials_at_indices(
     // Bounded grid: cap the partials count (and the host combine) at 64 * 256 = 16384.
     const BLOCK: u32 = 256;
     const MAX_GRID: u32 = 64;
-    let grid = (count_u64.div_ceil(u64::from(BLOCK)).clamp(1, u64::from(MAX_GRID))) as u32;
+    let grid = (count_u64
+        .div_ceil(u64::from(BLOCK))
+        .clamp(1, u64::from(MAX_GRID))) as u32;
     let num_threads = (grid * BLOCK) as usize;
     let partials_bytes = num_threads
         .checked_mul(std::mem::size_of::<i128>())
@@ -7751,7 +7853,9 @@ fn launch_cuda_resident_i128_sum_partials_at_indices(
 
     const BLOCK: u32 = 256;
     const MAX_GRID: u32 = 64;
-    let grid = (count_u64.div_ceil(u64::from(BLOCK)).clamp(1, u64::from(MAX_GRID))) as u32;
+    let grid = (count_u64
+        .div_ceil(u64::from(BLOCK))
+        .clamp(1, u64::from(MAX_GRID))) as u32;
     let num_threads = (grid * BLOCK) as usize;
     let partials_bytes = num_threads
         .checked_mul(std::mem::size_of::<i128>())
@@ -8360,9 +8464,8 @@ fn launch_cuda_group_by_i32_count_sum(
         if rc != 0 {
             return rc;
         }
-        let rc = unsafe {
-            cu_memset_d8_async(overflow_flag.ptr, 0, std::mem::size_of::<u64>(), stream)
-        };
+        let rc =
+            unsafe { cu_memset_d8_async(overflow_flag.ptr, 0, std::mem::size_of::<u64>(), stream) };
         if rc != 0 {
             return rc;
         }
@@ -8385,8 +8488,17 @@ fn launch_cuda_group_by_i32_count_sum(
         if let Some(f) = fill_i128_fn {
             let rc = unsafe {
                 cu_launch_kernel(
-                    f, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                    fill128_args.as_mut_ptr(), std::ptr::null_mut(),
+                    f,
+                    fill_grid,
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    fill128_args.as_mut_ptr(),
+                    std::ptr::null_mut(),
                 )
             };
             if rc != 0 {
@@ -8398,8 +8510,17 @@ fn launch_cuda_group_by_i32_count_sum(
         // fill slot_keys = EMPTY
         let rc = unsafe {
             cu_launch_kernel(
-                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fill_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         };
         if rc != 0 {
@@ -8410,8 +8531,17 @@ fn launch_cuda_group_by_i32_count_sum(
         f2 = min_lo_id;
         let rc = unsafe {
             cu_launch_kernel(
-                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fill_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         };
         if rc != 0 {
@@ -8422,8 +8552,17 @@ fn launch_cuda_group_by_i32_count_sum(
         f2 = max_lo_id;
         let rc = unsafe {
             cu_launch_kernel(
-                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fill_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         };
         if rc != 0 {
@@ -8434,8 +8573,17 @@ fn launch_cuda_group_by_i32_count_sum(
         f2 = min_hi_id;
         let rc = unsafe {
             cu_launch_kernel(
-                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fill_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         };
         if rc != 0 {
@@ -8445,8 +8593,17 @@ fn launch_cuda_group_by_i32_count_sum(
         f2 = max_hi_id;
         let rc = unsafe {
             cu_launch_kernel(
-                fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                fill_args.as_mut_ptr(), std::ptr::null_mut(),
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fill_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         };
         if rc != 0 {
@@ -8454,8 +8611,17 @@ fn launch_cuda_group_by_i32_count_sum(
         }
         let rc = unsafe {
             cu_launch_kernel(
-                group_fn, group_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                group_args.as_mut_ptr(), std::ptr::null_mut(),
+                group_fn,
+                group_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                group_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         };
         if rc != 0 {
@@ -8465,8 +8631,17 @@ fn launch_cuda_group_by_i32_count_sum(
         if let Some(f) = pass2_fn {
             let rc = unsafe {
                 cu_launch_kernel(
-                    f, group_grid, 1, 1, BLOCK, 1, 1, 0, stream,
-                    pass2_args.as_mut_ptr(), std::ptr::null_mut(),
+                    f,
+                    group_grid,
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    pass2_args.as_mut_ptr(),
+                    std::ptr::null_mut(),
                 )
             };
             if rc != 0 {
@@ -8478,8 +8653,17 @@ fn launch_cuda_group_by_i32_count_sum(
         // the same stream, after every aggregate pass has finalized the slots.
         unsafe {
             cu_launch_kernel(
-                compact_fn, 1, 1, 1, BLOCK, 1, 1, 0, stream,
-                compact_args.as_mut_ptr(), std::ptr::null_mut(),
+                compact_fn,
+                1,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                compact_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         }
     })?;
@@ -8528,40 +8712,88 @@ fn launch_cuda_group_by_i32_count_sum(
         let mut key_i128s = vec![0i128; groups_len];
         let mut is_nulls = vec![0u32; groups_len];
         check_cuda(unsafe {
-            cu_memcpy_dtoh(keys.as_mut_ptr().cast::<c_void>(), out_key.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                keys.as_mut_ptr().cast::<c_void>(),
+                out_key.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(counts.as_mut_ptr().cast::<c_void>(), out_count_arr.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                counts.as_mut_ptr().cast::<c_void>(),
+                out_count_arr.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(sums.as_mut_ptr().cast::<c_void>(), out_sum.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                sums.as_mut_ptr().cast::<c_void>(),
+                out_sum.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(sum_his.as_mut_ptr().cast::<c_void>(), out_sum_hi.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                sum_his.as_mut_ptr().cast::<c_void>(),
+                out_sum_hi.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(mins.as_mut_ptr().cast::<c_void>(), out_min.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                mins.as_mut_ptr().cast::<c_void>(),
+                out_min.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(maxs.as_mut_ptr().cast::<c_void>(), out_max.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                maxs.as_mut_ptr().cast::<c_void>(),
+                out_max.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(min_his.as_mut_ptr().cast::<c_void>(), out_min_hi.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                min_his.as_mut_ptr().cast::<c_void>(),
+                out_min_hi.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(max_his.as_mut_ptr().cast::<c_void>(), out_max_hi.ptr, dense_i64_bytes)
+            cu_memcpy_dtoh(
+                max_his.as_mut_ptr().cast::<c_void>(),
+                out_max_hi.ptr,
+                dense_i64_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(min_uuid_bytes.as_mut_ptr().cast::<c_void>(), out_min_uuid.ptr, dense_b128_bytes)
+            cu_memcpy_dtoh(
+                min_uuid_bytes.as_mut_ptr().cast::<c_void>(),
+                out_min_uuid.ptr,
+                dense_b128_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(max_uuid_bytes.as_mut_ptr().cast::<c_void>(), out_max_uuid.ptr, dense_b128_bytes)
+            cu_memcpy_dtoh(
+                max_uuid_bytes.as_mut_ptr().cast::<c_void>(),
+                out_max_uuid.ptr,
+                dense_b128_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(key_i128s.as_mut_ptr().cast::<c_void>(), out_keyi128.ptr, dense_b128_bytes)
+            cu_memcpy_dtoh(
+                key_i128s.as_mut_ptr().cast::<c_void>(),
+                out_keyi128.ptr,
+                dense_b128_bytes,
+            )
         })?;
         check_cuda(unsafe {
-            cu_memcpy_dtoh(is_nulls.as_mut_ptr().cast::<c_void>(), out_isnull.ptr, dense_u32_bytes)
+            cu_memcpy_dtoh(
+                is_nulls.as_mut_ptr().cast::<c_void>(),
+                out_isnull.ptr,
+                dense_u32_bytes,
+            )
         })?;
         // Rebuild a canonical-order uuid from a dense row's 16 device bytes -- the SAME byte-reversal the
         // old host loop applied (the kernel stored the b128 as `(uhi << 64) | ulo` with uhi = uuid bytes
@@ -8629,7 +8861,17 @@ fn launch_cuda_group_by_kernel_timed(
     agg_mask: u32,
 ) -> Result<(Vec<GroupByI32Row>, f32), CudaRuntimeProbeError> {
     type CuLaunchKernel = unsafe extern "C" fn(
-        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void, *mut *mut c_void, *mut *mut c_void,
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
     ) -> i32;
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
@@ -8652,7 +8894,10 @@ fn launch_cuda_group_by_kernel_timed(
     let primary = resident.primary();
     primary.set_current()?;
     let cu_launch = unsafe {
-        *resident.lib().get::<CuLaunchKernel>(b"cuLaunchKernel\0").map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        *resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memset = unsafe {
         *resident
@@ -8676,7 +8921,10 @@ fn launch_cuda_group_by_kernel_timed(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_stream_sync = unsafe {
-        *resident.lib().get::<CuStreamSync>(b"cuStreamSynchronize\0").map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        *resident
+            .lib()
+            .get::<CuStreamSync>(b"cuStreamSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
@@ -8707,7 +8955,13 @@ fn launch_cuda_group_by_kernel_timed(
     // The int4 bench never takes the i128/text-key branch (key_is_i128 = key_is_text = 0), so it is
     // never dereferenced.
     let slot_keys_i128 = primary.lease_device_buffer(nslots * 16)?;
-    check_cuda(unsafe { cu_htod(indices_dev.ptr, indices.as_ptr().cast::<c_void>(), idx_bytes) })?;
+    check_cuda(unsafe {
+        cu_htod(
+            indices_dev.ptr,
+            indices.as_ptr().cast::<c_void>(),
+            idx_bytes,
+        )
+    })?;
 
     let null = std::ptr::null_mut::<c_void>();
     let mut start = std::ptr::null_mut::<c_void>();
@@ -8727,8 +8981,17 @@ fn launch_cuda_group_by_kernel_timed(
         (&mut f2 as *mut u64).cast::<c_void>(),
     ];
     let mut a = [
-        resident.device_ptr(), key_byte_offset, sum_byte_offset, indices_dev.ptr, count_u64, mask,
-        slot_keys.ptr, slot_count.ptr, slot_sum.ptr, slot_min.ptr, slot_max.ptr,
+        resident.device_ptr(),
+        key_byte_offset,
+        sum_byte_offset,
+        indices_dev.ptr,
+        count_u64,
+        mask,
+        slot_keys.ptr,
+        slot_count.ptr,
+        slot_sum.ptr,
+        slot_min.ptr,
+        slot_max.ptr,
         0, // value_is_int8 = false: the timed bench always aggregates an int4 value column
         slot_sum_hi.ptr,
         0, // key_is_int8 = false: the timed bench always groups by an int4 key
@@ -8742,12 +9005,12 @@ fn launch_cuda_group_by_kernel_timed(
         slot_max_uuid.ptr,
         0, // key_is_i128 = false: the timed bench always groups by an int4 key
         slot_keys_i128.ptr,
-        0, // key_is_text = false: the timed bench always groups by an int4 key
-        0, // key_offsets_off (unused)
-        0, // key_bytes_off (unused)
-        0, // value_is_text = false: the timed bench always aggregates an int4 value
-        0, // value_offsets_off (unused)
-        0, // value_bytes_off (unused)
+        0,                   // key_is_text = false: the timed bench always groups by an int4 key
+        0,                   // key_offsets_off (unused)
+        0,                   // key_bytes_off (unused)
+        0,        // value_is_text = false: the timed bench always aggregates an int4 value
+        0,        // value_offsets_off (unused)
+        0,        // value_bytes_off (unused)
         0, // key_base_override = 0: the timed bench uses column keys (no derived-buffer override)
         0, // value_base_override = 0: the timed bench uses column values
         0, // comp_w = 0: the timed bench is not a wide-key composite
@@ -8757,8 +9020,10 @@ fn launch_cuda_group_by_kernel_timed(
         u64::MAX, // M3 key_null_off = sentinel (the timed bench is non-nullable -> no NULL-key group)
         u64::from(agg_mask), // query-aware aggregate-selection mask (a37, LAST kernel arg)
     ];
-    let mut group_args: Vec<*mut c_void> =
-        a.iter_mut().map(|x| (x as *mut u64).cast::<c_void>()).collect();
+    let mut group_args: Vec<*mut c_void> = a
+        .iter_mut()
+        .map(|x| (x as *mut u64).cast::<c_void>())
+        .collect();
 
     let mut best = f32::MAX;
     for _ in 0..runs {
@@ -8768,21 +9033,69 @@ fn launch_cuda_group_by_kernel_timed(
         f0 = slot_keys.ptr;
         f2 = EMPTY as u64;
         check_cuda(unsafe {
-            cu_launch(fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, null, fill_args.as_mut_ptr(), null.cast())
+            cu_launch(
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                null,
+                fill_args.as_mut_ptr(),
+                null.cast(),
+            )
         })?;
         f0 = slot_min.ptr;
         f2 = i64::MAX as u64;
         check_cuda(unsafe {
-            cu_launch(fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, null, fill_args.as_mut_ptr(), null.cast())
+            cu_launch(
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                null,
+                fill_args.as_mut_ptr(),
+                null.cast(),
+            )
         })?;
         f0 = slot_max.ptr;
         f2 = i64::MIN as u64;
         check_cuda(unsafe {
-            cu_launch(fill_fn, fill_grid, 1, 1, BLOCK, 1, 1, 0, null, fill_args.as_mut_ptr(), null.cast())
+            cu_launch(
+                fill_fn,
+                fill_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                null,
+                fill_args.as_mut_ptr(),
+                null.cast(),
+            )
         })?;
         check_cuda(unsafe { (primary.cu_event_record)(start, null) })?;
         check_cuda(unsafe {
-            cu_launch(group_fn, group_grid, 1, 1, BLOCK, 1, 1, 0, null, group_args.as_mut_ptr(), null.cast())
+            cu_launch(
+                group_fn,
+                group_grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                null,
+                group_args.as_mut_ptr(),
+                null.cast(),
+            )
         })?;
         check_cuda(unsafe { (primary.cu_event_record)(stop, null) })?;
         check_cuda(unsafe { cu_stream_sync(null) })?;
@@ -8794,8 +9107,20 @@ fn launch_cuda_group_by_kernel_timed(
     let mut keys = vec![0i64; nslots];
     let mut counts = vec![0u64; nslots];
     let mut sums = vec![0i64; nslots];
-    check_cuda(unsafe { cu_dtoh(keys.as_mut_ptr().cast::<c_void>(), slot_keys.ptr, slot_bytes) })?;
-    check_cuda(unsafe { cu_dtoh(counts.as_mut_ptr().cast::<c_void>(), slot_count.ptr, slot_bytes) })?;
+    check_cuda(unsafe {
+        cu_dtoh(
+            keys.as_mut_ptr().cast::<c_void>(),
+            slot_keys.ptr,
+            slot_bytes,
+        )
+    })?;
+    check_cuda(unsafe {
+        cu_dtoh(
+            counts.as_mut_ptr().cast::<c_void>(),
+            slot_count.ptr,
+            slot_bytes,
+        )
+    })?;
     check_cuda(unsafe { cu_dtoh(sums.as_mut_ptr().cast::<c_void>(), slot_sum.ptr, slot_bytes) })?;
     unsafe {
         (primary.cu_event_destroy)(start);
@@ -8806,12 +9131,24 @@ fn launch_cuda_group_by_kernel_timed(
         if keys[i] != EMPTY {
             // min/max are placeholders here -- the timed bench only validates COUNT/SUM (the two
             // kernels intentionally differ on min/max: single-level computes them, two-level doesn't).
-            groups.push(GroupByI32Row { key: keys[i], count: counts[i], sum: sums[i], sum_hi: 0, min: 0, max: 0, min_hi: 0, max_hi: 0, min_uuid: [0u8; 16], max_uuid: [0u8; 16], key_i128: 0, key_is_null: false });
+            groups.push(GroupByI32Row {
+                key: keys[i],
+                count: counts[i],
+                sum: sums[i],
+                sum_hi: 0,
+                min: 0,
+                max: 0,
+                min_hi: 0,
+                max_hi: 0,
+                min_uuid: [0u8; 16],
+                max_uuid: [0u8; 16],
+                key_i128: 0,
+                key_is_null: false,
+            });
         }
     }
     Ok((groups, best))
 }
-
 
 /// Evaluate `text[i] LIKE pattern` over a resident TEXT column to surviving row indices (the type
 /// matrix, doc 19): copy the compiled u32 token array H2D into a leased buffer, run
@@ -10648,7 +10985,8 @@ DONE:
             )
         })
         .map_err(drain_err)?;
-        check_cuda(unsafe { cu_memset_d8(status_guard.ptr, 0, status_bytes) }).map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(status_guard.ptr, 0, status_bytes) })
+            .map_err(drain_err)?;
     }
 
     if timed {
@@ -10744,10 +11082,10 @@ fn submit_cuda_resident_i32_multi_shard_index_probe_dense(
 
     const MAX_PROJECTIONS: usize = 4;
     const DESC_U64_PER_SHARD: usize = 8; // resident_ptr, index_ptr, mask|shift, proj0..3, reserved
-    // PTX: outer SHARD loop over a device descriptor array (64 B/shard) wrapping the single-shard probe +
-    // gather. Each thread probes shard 0, 1, ... until a FOUND (emit slot + status=1) or all miss (status=2).
-    // The hash/probe/gather is byte-identical to `gpu_db_resident_i32_index_probe_dense`; only the shard loop +
-    // per-shard descriptor reads are new. ASCII-only.
+                                         // PTX: outer SHARD loop over a device descriptor array (64 B/shard) wrapping the single-shard probe +
+                                         // gather. Each thread probes shard 0, 1, ... until a FOUND (emit slot + status=1) or all miss (status=2).
+                                         // The hash/probe/gather is byte-identical to `gpu_db_resident_i32_index_probe_dense`; only the shard loop +
+                                         // per-shard descriptor reads are new. ASCII-only.
     const PTX: &[u8] = br#"
 .version 6.0
 .target sm_30
@@ -10996,8 +11334,7 @@ DONE:
     }
     // Build the descriptor array + per-shard bounds check; all shards share projection_count.
     let mut desc: Vec<u64> = Vec::with_capacity(shards.len() * DESC_U64_PER_SHARD);
-    let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> =
-        Vec::with_capacity(shards.len() * 2);
+    let mut index_guards: Vec<Arc<CudaResidentDeviceMemory>> = Vec::with_capacity(shards.len() * 2);
     for shard in shards {
         if shard.projection_offsets.len() != projection_count {
             return Err(CudaRuntimeProbeError::InvalidInputLength(
@@ -11180,7 +11517,8 @@ DONE:
             cu_memcpy_htod(desc_guard.ptr, desc.as_ptr().cast::<c_void>(), desc_bytes)
         })
         .map_err(drain_err)?;
-        check_cuda(unsafe { cu_memset_d8(status_guard.ptr, 0, status_bytes) }).map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(status_guard.ptr, 0, status_bytes) })
+            .map_err(drain_err)?;
     }
 
     if timed {
@@ -11466,6 +11804,169 @@ DONE:
 }
 "#;
 
+/// E2.5c FUSED APPLY (2M+ push (b)): ONE kernel for the whole merged-apply device pass —
+/// column scatter (each appended row's i32 values into every column section's headroom slots)
+/// + created_by stamps + row-id stamps + the incremental PK hash-index CAS insert — replacing
+/// the ~8 driver calls of the unfused chain (C column HtoDs + 2 stamp HtoDs + the 4-call index
+/// insert) with 1 staging HtoD + 1 launch + 1 decline DtoH (which also serializes the stamps
+/// ahead of the host's row_count publish, preserving the SV6 stamp-before-publish order).
+///
+/// Everything travels in ONE staging buffer read by the kernel (fixed 80B header + a per-column
+/// dest-pointer table + col-major values + stamps + optional row ids); the decline flag lives
+/// INSIDE the header (zeroed by the same HtoD that uploads it — no separate memset). Hash/pack
+/// math is byte-identical to `gpu_db_resident_i32_index_insert` above. `pk_col == 0xFFFFFFFF`
+/// skips the index insert (no cached device index); `has_row_ids == 0` skips row-id stamps.
+/// ASCII-only.
+///
+/// Header layout (u64-aligned; offsets are load-bearing — `submit_i32_fused_apply` mirrors them):
+///   0: u32 k             4: u32 num_cols     8: u32 pk_col      12: u32 base_row
+///  16: u32 index_mask   20: u32 index_shift 24: u32 has_row_ids 28: u32 decline (kernel-set)
+///  32: u64 index_ptr    40: u64 created_by_dest                48: u64 row_id_dest
+///  56: u64 header_dest (the shard's device row-count word)     64: u64 header_value
+///  72: u64 reserved
+///  80: u64 col_dest[num_cols]
+///  80 + num_cols*8:                     i32 values[num_cols][k] (col-major)
+///  ^ + round8(num_cols*k*4):            u64 stamps[k]
+///  ^ + k*8:                             u64 row_ids[k]   (present iff has_row_ids)
+const FUSED_APPLY_PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_fused_apply(
+    .param .u64 staging_ptr
+)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<28>;
+
+    ld.param.u64 %rd1, [staging_ptr];
+    ld.global.u32 %r1, [%rd1+0];      // k
+    ld.global.u32 %r2, [%rd1+4];      // num_cols
+
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mad.lo.u32 %r8, %r6, %r7, %r5;    // j
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra DONE;
+
+    // thread 0 publishes the shard's DEVICE row-count header (the unfused path's final
+    // append_owned_chunks chunk) -- same launch, completed before the caller's sync DtoH.
+    setp.ne.u32 %p2, %r8, 0;
+    @%p2 bra HDRDONE;
+    ld.global.u64 %rd6, [%rd1+56];
+    ld.global.u64 %rd7, [%rd1+64];
+    st.global.u64 [%rd6], %rd7;
+HDRDONE:
+
+    // values base = staging + 80 + num_cols*8
+    cvt.u64.u32 %rd2, %r2;
+    shl.b64 %rd3, %rd2, 3;
+    add.u64 %rd4, %rd1, 80;           // col_dest table base
+    add.u64 %rd5, %rd4, %rd3;         // values base
+
+    // COLUMN SCATTER: for c in 0..num_cols: col_dest[c][j] = values[c*k + j]
+    mov.u32 %r9, 0;                   // c
+COLLOOP:
+    setp.ge.u32 %p2, %r9, %r2;
+    @%p2 bra COLDONE;
+    // src = values_base + (c*k + j)*4
+    mad.lo.u32 %r10, %r9, %r1, %r8;
+    mul.wide.u32 %rd6, %r10, 4;
+    add.u64 %rd7, %rd5, %rd6;
+    ld.global.s32 %r11, [%rd7];
+    // dst = col_dest[c] + j*4
+    mul.wide.u32 %rd8, %r9, 8;
+    add.u64 %rd9, %rd4, %rd8;
+    ld.global.u64 %rd10, [%rd9];
+    mul.wide.u32 %rd11, %r8, 4;
+    add.u64 %rd12, %rd10, %rd11;
+    st.global.s32 [%rd12], %r11;
+    add.u32 %r9, %r9, 1;
+    bra COLLOOP;
+COLDONE:
+
+    // stamps base = values_base + round8(num_cols*k*4)
+    mul.lo.u32 %r12, %r2, %r1;
+    mul.wide.u32 %rd13, %r12, 4;
+    add.u64 %rd13, %rd13, 7;
+    and.b64 %rd13, %rd13, 0xfffffffffffffff8;
+    add.u64 %rd14, %rd5, %rd13;       // stamps base
+    // created_by_dest[j] = stamps[j]
+    mul.wide.u32 %rd15, %r8, 8;
+    add.u64 %rd16, %rd14, %rd15;
+    ld.global.u64 %rd17, [%rd16];
+    ld.global.u64 %rd18, [%rd1+40];
+    add.u64 %rd19, %rd18, %rd15;
+    st.global.u64 [%rd19], %rd17;
+
+    // row ids (optional): row_id_dest[j] = row_ids[j]
+    ld.global.u32 %r13, [%rd1+24];
+    setp.eq.u32 %p3, %r13, 0;
+    @%p3 bra RIDONE;
+    cvt.u64.u32 %rd20, %r1;
+    shl.b64 %rd20, %rd20, 3;
+    add.u64 %rd21, %rd14, %rd20;      // row_ids base = stamps base + k*8
+    add.u64 %rd21, %rd21, %rd15;
+    ld.global.u64 %rd22, [%rd21];
+    ld.global.u64 %rd23, [%rd1+48];
+    add.u64 %rd24, %rd23, %rd15;
+    st.global.u64 [%rd24], %rd22;
+RIDONE:
+
+    // PK INDEX INSERT (optional): identical math to gpu_db_resident_i32_index_insert.
+    ld.global.u32 %r14, [%rd1+8];     // pk_col
+    setp.eq.u32 %p4, %r14, 4294967295;
+    @%p4 bra DONE;
+    // key = values[pk_col*k + j]
+    mad.lo.u32 %r15, %r14, %r1, %r8;
+    mul.wide.u32 %rd25, %r15, 4;
+    add.u64 %rd26, %rd5, %rd25;
+    ld.global.s32 %r16, [%rd26];
+    // packed = (key << 32) | (base_row + j + 1)
+    ld.global.u32 %r17, [%rd1+12];    // base_row
+    add.u32 %r17, %r17, %r8;
+    add.u32 %r17, %r17, 1;
+    cvt.u64.u32 %rd6, %r17;
+    cvt.u64.u32 %rd7, %r16;
+    shl.b64 %rd8, %rd7, 32;
+    or.b64 %rd9, %rd8, %rd6;
+    // slot = (key * 0x9E3779B1) >> shift & mask
+    ld.global.u32 %r18, [%rd1+16];    // mask
+    ld.global.u32 %r19, [%rd1+20];    // shift
+    ld.global.u64 %rd10, [%rd1+32];   // index_ptr
+    mul.lo.u32 %r20, %r16, 2654435761;
+    shr.u32 %r21, %r20, %r19;
+    and.b32 %r21, %r21, %r18;
+    mov.u32 %r22, 0;
+INSLOOP:
+    mul.wide.u32 %rd11, %r21, 8;
+    add.u64 %rd12, %rd10, %rd11;
+    mov.u64 %rd13, 0;
+    atom.global.cas.b64 %rd27, [%rd12], %rd13, %rd9;
+    setp.eq.u64 %p5, %rd27, 0;
+    @%p5 bra DONE;
+    shr.u64 %rd14, %rd27, 32;
+    cvt.u32.u64 %r23, %rd14;
+    setp.eq.s32 %p5, %r23, %r16;
+    @%p5 bra DUP;
+    add.u32 %r21, %r21, 1;
+    and.b32 %r21, %r21, %r18;
+    add.u32 %r22, %r22, 1;
+    setp.ge.u32 %p5, %r22, 256;
+    @%p5 bra DUP;
+    bra INSLOOP;
+DUP:
+    mov.u32 %r23, 1;
+    st.global.u32 [%rd1+28], %r23;    // decline flag lives in the header
+
+DONE:
+    ret;
+}
+"#;
+
 /// M1 (charter-pure, ledger #24): the INCREMENTAL device-index INSERT kernel — lock-free
 /// open-addressing insert of the k APPENDED keys into an existing device hash, so the device
 /// index is APPEND-MAINTAINED (O(k)) instead of REBUILT O(rows) every wave (the measured
@@ -11557,7 +12058,189 @@ DONE:
 }
 "#;
 
+/// One fused merged-apply pass (see [`FUSED_APPLY_PTX`]): everything the kernel needs, staged
+/// into one buffer by [`CudaResidentDeviceMemory::submit_i32_fused_apply`].
+pub struct FusedApplyRequest<'a> {
+    /// Absolute device address of each column's FIRST new slot (shard base + section offset +
+    /// row_count * 4), catalog order. `values` is col-major over exactly these columns.
+    pub col_dests: &'a [u64],
+    /// Col-major i32 values: `values[c * k + j]` = row j's value for column c.
+    pub values: &'a [i32],
+    /// One created_by birth stamp per appended row (k of them).
+    pub stamps: &'a [u64],
+    /// Absolute device address of `created_by[first_slot]`.
+    pub created_by_dest: u64,
+    /// Optional row-id stamps + the absolute device address of `row_id[first_slot]`.
+    pub row_ids: Option<(&'a [u64], u64)>,
+    /// Optional PK hash-index insert: (index_ptr, table_mask, hash_shift, pk_col, base_row).
+    pub index: Option<(u64, u32, u32, u32, u32)>,
+    /// The shard's device row-count header word (absolute address) and the value to publish
+    /// there (`row_count + k`) — the unfused path's final append chunk, written by thread 0.
+    pub header_dest: u64,
+    pub header_value: u64,
+}
+
 impl CudaResidentDeviceMemory {
+    /// E2.5c FUSED APPLY (2M+ push (b)): run the WHOLE merged-apply device pass in one staging
+    /// HtoD + one launch + one decline DtoH (which also completes the launch, so the caller's
+    /// row_count publish happens strictly after the stamps land — the SV6 order). Returns
+    /// `true` when the index insert hit a DUP/overflow (caller declines the index entry, same
+    /// contract as [`Self::submit_i32_index_insert`]). Any error leaves the shard partially
+    /// mutated in INVISIBLE headroom only — the caller must not publish and must re-admit,
+    /// exactly the `append_owned_chunks` partial-failure contract.
+    pub fn submit_i32_fused_apply(
+        &self,
+        request: &FusedApplyRequest<'_>,
+    ) -> Result<bool, CudaRuntimeProbeError> {
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        #[allow(clippy::type_complexity)]
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        let num_cols = request.col_dests.len();
+        let k = request.stamps.len();
+        if k == 0 || num_cols == 0 {
+            return Ok(false);
+        }
+        if request.values.len() != num_cols * k {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                request.values.len(),
+            ));
+        }
+        if let Some((row_ids, _)) = request.row_ids {
+            if row_ids.len() != k {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(row_ids.len()));
+            }
+        }
+        let k_u32 = u32::try_from(k).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(k))?;
+        let cols_u32 = u32::try_from(num_cols)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(num_cols))?;
+
+        // Assemble the staging image (header layout documented at FUSED_APPLY_PTX).
+        let values_bytes = num_cols * k * 4;
+        let values_padded = values_bytes.div_ceil(8) * 8;
+        let header_bytes = 80 + num_cols * 8;
+        let total = header_bytes
+            + values_padded
+            + k * 8
+            + if request.row_ids.is_some() { k * 8 } else { 0 };
+        let mut staging = vec![0_u8; total];
+        let (pk_col, base_row, index_ptr, index_mask, index_shift) = match request.index {
+            Some((ptr, mask, shift, pk_col, base_row)) => (pk_col, base_row, ptr, mask, shift),
+            None => (u32::MAX, 0, 0, 0, 0),
+        };
+        staging[0..4].copy_from_slice(&k_u32.to_le_bytes());
+        staging[4..8].copy_from_slice(&cols_u32.to_le_bytes());
+        staging[8..12].copy_from_slice(&pk_col.to_le_bytes());
+        staging[12..16].copy_from_slice(&base_row.to_le_bytes());
+        staging[16..20].copy_from_slice(&index_mask.to_le_bytes());
+        staging[20..24].copy_from_slice(&index_shift.to_le_bytes());
+        staging[24..28].copy_from_slice(&u32::from(request.row_ids.is_some()).to_le_bytes());
+        // 28..32 = decline flag, zeroed by this very upload (no separate memset).
+        staging[32..40].copy_from_slice(&index_ptr.to_le_bytes());
+        staging[40..48].copy_from_slice(&request.created_by_dest.to_le_bytes());
+        let row_id_dest = request.row_ids.map(|(_, dest)| dest).unwrap_or(0);
+        staging[48..56].copy_from_slice(&row_id_dest.to_le_bytes());
+        staging[56..64].copy_from_slice(&request.header_dest.to_le_bytes());
+        staging[64..72].copy_from_slice(&request.header_value.to_le_bytes());
+        // 72..80 reserved (zero).
+        for (c, dest) in request.col_dests.iter().enumerate() {
+            staging[80 + c * 8..80 + c * 8 + 8].copy_from_slice(&dest.to_le_bytes());
+        }
+        let values_off = header_bytes;
+        for (i, value) in request.values.iter().enumerate() {
+            staging[values_off + i * 4..values_off + i * 4 + 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        let stamps_off = values_off + values_padded;
+        for (i, stamp) in request.stamps.iter().enumerate() {
+            staging[stamps_off + i * 8..stamps_off + i * 8 + 8]
+                .copy_from_slice(&stamp.to_le_bytes());
+        }
+        if let Some((row_ids, _)) = request.row_ids {
+            let row_ids_off = stamps_off + k * 8;
+            for (i, row_id) in row_ids.iter().enumerate() {
+                staging[row_ids_off + i * 8..row_ids_off + i * 8 + 8]
+                    .copy_from_slice(&row_id.to_le_bytes());
+            }
+        }
+
+        let primary = self.primary_arc();
+        primary.set_current()?;
+        let cu_memcpy_htod = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_memcpy_dtoh = unsafe {
+            primary
+                .lib()
+                .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+                .or_else(|_| primary.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        let cu_launch_kernel = unsafe {
+            primary
+                .lib()
+                .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+
+        let staging_guard = primary.lease_device_buffer_owned(total)?;
+        let mut ptx = Vec::with_capacity(FUSED_APPLY_PTX.len() + 1);
+        ptx.extend_from_slice(FUSED_APPLY_PTX);
+        ptx.push(0);
+        let function = primary.cached_function(c"gpu_db_resident_i32_fused_apply", &ptx)?;
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(staging_guard.ptr, staging.as_ptr().cast::<c_void>(), total)
+        })?;
+        let mut staging_arg = staging_guard.ptr;
+        let mut args = [(&mut staging_arg as *mut u64).cast::<c_void>()];
+        let threads_per_block: u32 = 128;
+        let blocks = k_u32.div_ceil(threads_per_block);
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        // The decline read completes the launch (default stream), which is what lets the caller
+        // publish row_count AFTER the stamps are device-visible.
+        let mut decline = 0_u32;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                (&mut decline as *mut u32).cast::<c_void>(),
+                staging_guard.ptr + 28,
+                std::mem::size_of::<u32>(),
+            )
+        })?;
+        Ok(decline != 0)
+    }
+
     /// M1 (ledger #24): insert `keys` (the APPENDED tail, at device rows `base_row..`) INTO this
     /// device hash index IN PLACE via the lock-free `index_insert` kernel. Returns `true` if a DUP
     /// (or 256-probe overflow) was hit — the caller then transitions the cache to the DECLINED
@@ -15238,30 +15921,30 @@ fn run_resident_arith_program<'r>(
     ptx.extend_from_slice(PTX);
     ptx.push(0);
     // Per-element-type kernels (the type matrix, doc 19); the mask-binary stage is type-agnostic.
-    let (load_name, binary_name, scalar_name, compare_scalar_name, compare_buffers_name) = match elem
-    {
-        ResidentElemType::I32 => (
-            c"gpu_db_resident_i32_load_column",
-            c"gpu_db_buffer_i32_binary",
-            c"gpu_db_buffer_i32_binary_scalar",
-            c"gpu_db_buffer_i32_compare_scalar_to_mask",
-            c"gpu_db_buffer_i32_compare_buffers_to_mask",
-        ),
-        ResidentElemType::I64 => (
-            c"gpu_db_resident_i64_load_column",
-            c"gpu_db_buffer_i64_binary",
-            c"gpu_db_buffer_i64_binary_scalar",
-            c"gpu_db_buffer_i64_compare_scalar_to_mask",
-            c"gpu_db_buffer_i64_compare_buffers_to_mask",
-        ),
-        ResidentElemType::I128 => (
-            c"gpu_db_resident_i128_load_column",
-            c"gpu_db_buffer_i128_binary",
-            c"gpu_db_buffer_i128_binary_scalar",
-            c"gpu_db_buffer_i128_compare_scalar_to_mask",
-            c"gpu_db_buffer_i128_compare_buffers_to_mask",
-        ),
-    };
+    let (load_name, binary_name, scalar_name, compare_scalar_name, compare_buffers_name) =
+        match elem {
+            ResidentElemType::I32 => (
+                c"gpu_db_resident_i32_load_column",
+                c"gpu_db_buffer_i32_binary",
+                c"gpu_db_buffer_i32_binary_scalar",
+                c"gpu_db_buffer_i32_compare_scalar_to_mask",
+                c"gpu_db_buffer_i32_compare_buffers_to_mask",
+            ),
+            ResidentElemType::I64 => (
+                c"gpu_db_resident_i64_load_column",
+                c"gpu_db_buffer_i64_binary",
+                c"gpu_db_buffer_i64_binary_scalar",
+                c"gpu_db_buffer_i64_compare_scalar_to_mask",
+                c"gpu_db_buffer_i64_compare_buffers_to_mask",
+            ),
+            ResidentElemType::I128 => (
+                c"gpu_db_resident_i128_load_column",
+                c"gpu_db_buffer_i128_binary",
+                c"gpu_db_buffer_i128_binary_scalar",
+                c"gpu_db_buffer_i128_compare_scalar_to_mask",
+                c"gpu_db_buffer_i128_compare_buffers_to_mask",
+            ),
+        };
     let load_fn = primary.cached_function(load_name, &ptx)?;
     let buffer_binary_fn = primary.cached_function(binary_name, &ptx)?;
     let scalar_binary_fn = primary.cached_function(scalar_name, &ptx)?;
@@ -15351,23 +16034,24 @@ fn run_resident_arith_program<'r>(
     const BLOCK: u32 = 256;
     let grid = n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
     let resident_base = resident.device_ptr();
-    let launch = |function: *mut c_void, args: &mut [*mut c_void]| -> Result<(), CudaRuntimeProbeError> {
-        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
-            cu_launch_kernel(
-                function,
-                grid,
-                1,
-                1,
-                BLOCK,
-                1,
-                1,
-                0,
-                stream,
-                args.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        })
-    };
+    let launch =
+        |function: *mut c_void, args: &mut [*mut c_void]| -> Result<(), CudaRuntimeProbeError> {
+            launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+                cu_launch_kernel(
+                    function,
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            })
+        };
 
     // Stack of leased intermediate buffers. Popped operands drop (return to the pool) after their
     // consuming step's stream has synced, so the pool churns at most ~tree-depth live buffers.
@@ -15500,7 +16184,8 @@ fn run_resident_arith_program<'r>(
                         ];
                         // op 2 (multiply) uses the dedicated i128 mul kernel; add/sub the binary kernel.
                         let function = if op == 2 {
-                            i128_mul_scalar_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?
+                            i128_mul_scalar_fn
+                                .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?
                         } else {
                             scalar_binary_fn
                         };
@@ -15693,9 +16378,9 @@ fn run_resident_arith_program<'r>(
                 // textcol[i] == needle (XOR negate) -> i32 mask pushed on the stack; the VM combines it
                 // with AND/OR like any other mask. The needle is uploaded H2D into a fresh lease (>=1
                 // byte so the pointer is valid for the empty string, which the kernel never reads).
-                let needle = text_needles
-                    .get(needle_idx as usize)
-                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(needle_idx as usize))?;
+                let needle = text_needles.get(needle_idx as usize).ok_or(
+                    CudaRuntimeProbeError::InvalidInputLength(needle_idx as usize),
+                )?;
                 let function =
                     text_eq_mask_fn.ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
                 let needle_lease = primary.lease_device_buffer(needle.len().max(1))?;
@@ -15739,9 +16424,9 @@ fn run_resident_arith_program<'r>(
                 // (and a following validity MaskBinary for NULL 3VL) like any other mask. The pattern is the
                 // LE-serialized u32 token array `text_needles[pattern_idx]` (`ntok = len/4`), uploaded H2D
                 // into a fresh lease (>=1 byte so the pointer is valid for the empty pattern, never read).
-                let pattern = text_needles
-                    .get(pattern_idx as usize)
-                    .ok_or(CudaRuntimeProbeError::InvalidInputLength(pattern_idx as usize))?;
+                let pattern = text_needles.get(pattern_idx as usize).ok_or(
+                    CudaRuntimeProbeError::InvalidInputLength(pattern_idx as usize),
+                )?;
                 if pattern.len() % std::mem::size_of::<u32>() != 0 {
                     return Err(CudaRuntimeProbeError::InvalidInputLength(pattern.len()));
                 }
@@ -16560,8 +17245,16 @@ fn launch_cuda_hash_join_inner_i64(
     // Phase 1: upload keys + validity bitmaps, zero dup_flag/cursor, fill the slot table to EMPTY128, BUILD.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
-            (build_dev.ptr, build_keys.as_ptr().cast::<c_void>(), build_bytes),
-            (probe_dev.ptr, probe_keys.as_ptr().cast::<c_void>(), probe_bytes),
+            (
+                build_dev.ptr,
+                build_keys.as_ptr().cast::<c_void>(),
+                build_bytes,
+            ),
+            (
+                probe_dev.ptr,
+                probe_keys.as_ptr().cast::<c_void>(),
+                probe_bytes,
+            ),
             (dup_flag.ptr, zero8.as_ptr().cast::<c_void>(), 8usize),
             (cursor.ptr, zero8.as_ptr().cast::<c_void>(), 8usize),
         ] {
@@ -16575,7 +17268,8 @@ fn launch_cuda_hash_join_inner_i64(
             (&probe_valid_dev, probe_valid_words),
         ] {
             if let (Some(d), Some(w)) = (dev, words) {
-                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                let rc =
+                    unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
                 if rc != 0 {
                     return rc;
                 }
@@ -16594,7 +17288,16 @@ fn launch_cuda_hash_join_inner_i64(
         ];
         let rc = unsafe {
             cu_launch_kernel(
-                fill_fn, grid(npot), 1, 1, BLOCK, 1, 1, 0, stream, fargs.as_mut_ptr(),
+                fill_fn,
+                grid(npot),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
@@ -16619,7 +17322,16 @@ fn launch_cuda_hash_join_inner_i64(
         ];
         unsafe {
             cu_launch_kernel(
-                build_fn, grid(build_n), 1, 1, BLOCK, 1, 1, 0, stream, bargs.as_mut_ptr(),
+                build_fn,
+                grid(build_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                bargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         }
@@ -16627,9 +17339,7 @@ fn launch_cuda_hash_join_inner_i64(
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     // Reject a non-unique build key (N:N is a follow-up).
     let mut dup_host = [0u64];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(dup_host.as_mut_ptr().cast::<c_void>(), dup_flag.ptr, 8)
-    })?;
+    check_cuda(unsafe { cu_memcpy_dtoh(dup_host.as_mut_ptr().cast::<c_void>(), dup_flag.ptr, 8) })?;
     if dup_host[0] != 0 {
         return Ok(HashJoinOutcome::DuplicateBuildKey);
     }
@@ -16655,18 +17365,25 @@ fn launch_cuda_hash_join_inner_i64(
         ];
         unsafe {
             cu_launch_kernel(
-                probe_fn, grid(probe_n), 1, 1, BLOCK, 1, 1, 0, stream, pargs.as_mut_ptr(),
+                probe_fn,
+                grid(probe_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                pargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         }
     })?;
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     let mut cur_host = [0u64];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8)
-    })?;
-    let n_pairs = usize::try_from(cur_host[0])
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    check_cuda(unsafe { cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8) })?;
+    let n_pairs =
+        usize::try_from(cur_host[0]).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     if n_pairs > probe_n {
         // The unique-build-key invariant bounds matches by probe_n; more means a kernel bug.
         return Err(CudaRuntimeProbeError::InvalidInputLength(n_pairs));
@@ -16674,11 +17391,7 @@ fn launch_cuda_hash_join_inner_i64(
     let mut flat = vec![0u32; n_pairs * 2];
     if n_pairs > 0 {
         check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                flat.as_mut_ptr().cast::<c_void>(),
-                pairs.ptr,
-                n_pairs * 8,
-            )
+            cu_memcpy_dtoh(flat.as_mut_ptr().cast::<c_void>(), pairs.ptr, n_pairs * 8)
         })?;
     }
     let mut build_idxs = Vec::with_capacity(n_pairs);
@@ -16834,7 +17547,11 @@ fn launch_cuda_hash_join_inner_text(
     // Phase 1: upload the dense buffer + validity bitmaps, zero dup_flag/cursor, fill EMPTY128, run BUILD.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
-            (payload_dev.ptr, payload.as_ptr().cast::<c_void>(), payload.len()),
+            (
+                payload_dev.ptr,
+                payload.as_ptr().cast::<c_void>(),
+                payload.len(),
+            ),
             (dup_flag.ptr, zero8.as_ptr().cast::<c_void>(), 8usize),
             (cursor.ptr, zero8.as_ptr().cast::<c_void>(), 8usize),
         ] {
@@ -16848,7 +17565,8 @@ fn launch_cuda_hash_join_inner_text(
             (&probe_valid_dev, probe_valid_words),
         ] {
             if let (Some(d), Some(w)) = (dev, words) {
-                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                let rc =
+                    unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
                 if rc != 0 {
                     return rc;
                 }
@@ -16866,7 +17584,16 @@ fn launch_cuda_hash_join_inner_text(
         ];
         let rc = unsafe {
             cu_launch_kernel(
-                fill_fn, grid(npot), 1, 1, BLOCK, 1, 1, 0, stream, fargs.as_mut_ptr(),
+                fill_fn,
+                grid(npot),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
@@ -16895,16 +17622,23 @@ fn launch_cuda_hash_join_inner_text(
         ];
         unsafe {
             cu_launch_kernel(
-                build_fn, grid(build_n), 1, 1, BLOCK, 1, 1, 0, stream, bargs.as_mut_ptr(),
+                build_fn,
+                grid(build_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                bargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         }
     })?;
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     let mut dup_host = [0u64];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(dup_host.as_mut_ptr().cast::<c_void>(), dup_flag.ptr, 8)
-    })?;
+    check_cuda(unsafe { cu_memcpy_dtoh(dup_host.as_mut_ptr().cast::<c_void>(), dup_flag.ptr, 8) })?;
     if dup_host[0] != 0 {
         return Ok(HashJoinOutcome::DuplicateBuildKey);
     }
@@ -16938,18 +17672,25 @@ fn launch_cuda_hash_join_inner_text(
         ];
         unsafe {
             cu_launch_kernel(
-                probe_fn, grid(probe_n), 1, 1, BLOCK, 1, 1, 0, stream, pargs.as_mut_ptr(),
+                probe_fn,
+                grid(probe_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                pargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         }
     })?;
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     let mut cur_host = [0u64];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8)
-    })?;
-    let n_pairs = usize::try_from(cur_host[0])
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    check_cuda(unsafe { cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8) })?;
+    let n_pairs =
+        usize::try_from(cur_host[0]).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     if n_pairs > probe_n {
         return Err(CudaRuntimeProbeError::InvalidInputLength(n_pairs));
     }
@@ -17086,8 +17827,16 @@ fn launch_cuda_hash_join_inner_i64_nn(
     // (u64::MAX), BUILD the chains, then a COUNT emit (cap=0) so the cursor holds the exact output size.
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
-            (build_dev.ptr, build_keys.as_ptr().cast::<c_void>(), build_bytes),
-            (probe_dev.ptr, probe_keys.as_ptr().cast::<c_void>(), probe_bytes),
+            (
+                build_dev.ptr,
+                build_keys.as_ptr().cast::<c_void>(),
+                build_bytes,
+            ),
+            (
+                probe_dev.ptr,
+                probe_keys.as_ptr().cast::<c_void>(),
+                probe_bytes,
+            ),
             (cursor.ptr, zero8.as_ptr().cast::<c_void>(), 8usize),
         ] {
             let rc = unsafe { htod_async(dst, src, bytes, stream) };
@@ -17100,7 +17849,8 @@ fn launch_cuda_hash_join_inner_i64_nn(
             (&probe_valid_dev, probe_valid_words),
         ] {
             if let (Some(d), Some(w)) = (dev, words) {
-                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                let rc =
+                    unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
                 if rc != 0 {
                     return rc;
                 }
@@ -17117,7 +17867,16 @@ fn launch_cuda_hash_join_inner_i64_nn(
             ];
             let rc = unsafe {
                 cu_launch_kernel(
-                    fill_fn, grid(npot), 1, 1, BLOCK, 1, 1, 0, stream, fargs.as_mut_ptr(),
+                    fill_fn,
+                    grid(npot),
+                    1,
+                    1,
+                    BLOCK,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    fargs.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )
             };
@@ -17145,7 +17904,16 @@ fn launch_cuda_hash_join_inner_i64_nn(
         ];
         let rc = unsafe {
             cu_launch_kernel(
-                build_fn, grid(build_n), 1, 1, BLOCK, 1, 1, 0, stream, bargs.as_mut_ptr(),
+                build_fn,
+                grid(build_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                bargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
@@ -17178,18 +17946,25 @@ fn launch_cuda_hash_join_inner_i64_nn(
         ];
         unsafe {
             cu_launch_kernel(
-                emit_fn, grid(probe_n), 1, 1, BLOCK, 1, 1, 0, stream, eargs.as_mut_ptr(),
+                emit_fn,
+                grid(probe_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                eargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         }
     })?;
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     let mut cur_host = [0u64];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8)
-    })?;
-    let total = usize::try_from(cur_host[0])
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    check_cuda(unsafe { cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8) })?;
+    let total =
+        usize::try_from(cur_host[0]).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     if total == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -17230,7 +18005,16 @@ fn launch_cuda_hash_join_inner_i64_nn(
         ];
         unsafe {
             cu_launch_kernel(
-                emit_fn, grid(probe_n), 1, 1, BLOCK, 1, 1, 0, stream, eargs.as_mut_ptr(),
+                emit_fn,
+                grid(probe_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                eargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         }
@@ -17422,7 +18206,16 @@ fn launch_cuda_hash_join_inner_text_nn(
         ];
         unsafe {
             cu_launch_kernel(
-                emit_fn, grid(probe_n), 1, 1, BLOCK, 1, 1, 0, stream, eargs.as_mut_ptr(),
+                emit_fn,
+                grid(probe_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                eargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         }
@@ -17431,7 +18224,11 @@ fn launch_cuda_hash_join_inner_text_nn(
     // COUNT (cap=0).
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
         for (dst, src, bytes) in [
-            (payload_dev.ptr, payload.as_ptr().cast::<c_void>(), payload.len()),
+            (
+                payload_dev.ptr,
+                payload.as_ptr().cast::<c_void>(),
+                payload.len(),
+            ),
             (cursor.ptr, zero8.as_ptr().cast::<c_void>(), 8usize),
         ] {
             let rc = unsafe { htod_async(dst, src, bytes, stream) };
@@ -17444,7 +18241,8 @@ fn launch_cuda_hash_join_inner_text_nn(
             (&probe_valid_dev, probe_valid_words),
         ] {
             if let (Some(d), Some(w)) = (dev, words) {
-                let rc = unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
+                let rc =
+                    unsafe { htod_async(d.ptr, w.as_ptr().cast::<c_void>(), w.len() * 4, stream) };
                 if rc != 0 {
                     return rc;
                 }
@@ -17462,7 +18260,16 @@ fn launch_cuda_hash_join_inner_text_nn(
         ];
         let rc = unsafe {
             cu_launch_kernel(
-                fill128_fn, grid(npot), 1, 1, BLOCK, 1, 1, 0, stream, fargs.as_mut_ptr(),
+                fill128_fn,
+                grid(npot),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                fargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
@@ -17479,7 +18286,16 @@ fn launch_cuda_hash_join_inner_text_nn(
         ];
         let rc = unsafe {
             cu_launch_kernel(
-                fill64_fn, grid(npot), 1, 1, BLOCK, 1, 1, 0, stream, gargs.as_mut_ptr(),
+                fill64_fn,
+                grid(npot),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                gargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
@@ -17510,7 +18326,16 @@ fn launch_cuda_hash_join_inner_text_nn(
         ];
         let rc = unsafe {
             cu_launch_kernel(
-                build_fn, grid(build_n), 1, 1, BLOCK, 1, 1, 0, stream, bargs.as_mut_ptr(),
+                build_fn,
+                grid(build_n),
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                bargs.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
@@ -17521,11 +18346,9 @@ fn launch_cuda_hash_join_inner_text_nn(
     })?;
     check_cuda(unsafe { cu_ctx_synchronize() })?;
     let mut cur_host = [0u64];
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8)
-    })?;
-    let total = usize::try_from(cur_host[0])
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
+    check_cuda(unsafe { cu_memcpy_dtoh(cur_host.as_mut_ptr().cast::<c_void>(), cursor.ptr, 8) })?;
+    let total =
+        usize::try_from(cur_host[0]).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(0))?;
     if total == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -17639,13 +18462,25 @@ fn launch_cuda_mark_new_distinct_device<'r>(
     const BLOCK: u32 = 256;
     let grid = (n_usize.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
-        let rc =
-            unsafe { htod_async(keys_dev.ptr, keys.as_ptr().cast::<c_void>(), keys_bytes, stream) };
+        let rc = unsafe {
+            htod_async(
+                keys_dev.ptr,
+                keys.as_ptr().cast::<c_void>(),
+                keys_bytes,
+                stream,
+            )
+        };
         if rc != 0 {
             return rc;
         }
-        let rc =
-            unsafe { htod_async(perm_dev.ptr, perm.as_ptr().cast::<c_void>(), perm_bytes, stream) };
+        let rc = unsafe {
+            htod_async(
+                perm_dev.ptr,
+                perm.as_ptr().cast::<c_void>(),
+                perm_bytes,
+                stream,
+            )
+        };
         if rc != 0 {
             return rc;
         }
@@ -17778,8 +18613,14 @@ fn launch_cuda_mark_new_distinct_text_device<'r>(
     const BLOCK: u32 = 256;
     let grid = (n_usize.div_ceil(BLOCK as usize) as u32).clamp(1, 65_535);
     launch_on_pooled_stream(resident, None, |stream, _scratch| {
-        let rc =
-            unsafe { htod_async(perm_dev.ptr, perm.as_ptr().cast::<c_void>(), perm_bytes, stream) };
+        let rc = unsafe {
+            htod_async(
+                perm_dev.ptr,
+                perm.as_ptr().cast::<c_void>(),
+                perm_bytes,
+                stream,
+            )
+        };
         if rc != 0 {
             return rc;
         }
@@ -17984,16 +18825,28 @@ fn launch_cuda_arith_value_column_at_indices_nullable(
     };
     // The arith VALUE (I32) and the VALIDITY mask (I32, 0/1) -- two independent VM runs over all rows; each
     // top-of-stack buffer is the single result and must stay alive through the blend.
-    let mut value_stack = run_resident_arith_program(resident, program, &[], n_rows, ResidentElemType::I32)?;
-    let value = value_stack.pop().ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mut value_stack =
+        run_resident_arith_program(resident, program, &[], n_rows, ResidentElemType::I32)?;
+    let value = value_stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
     if !value_stack.is_empty() {
         return Err(CudaRuntimeProbeError::InvalidInputLength(program.len()));
     }
-    let mut mask_stack =
-        run_resident_arith_program(resident, validity_program, &[], n_rows, ResidentElemType::I32)?;
-    let mask = mask_stack.pop().ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
+    let mut mask_stack = run_resident_arith_program(
+        resident,
+        validity_program,
+        &[],
+        n_rows,
+        ResidentElemType::I32,
+    )?;
+    let mask = mask_stack
+        .pop()
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(0))?;
     if !mask_stack.is_empty() {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(validity_program.len()));
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            validity_program.len(),
+        ));
     }
     // Blend ON-DEVICE: out_i64[i] = mask[i] ? sign_extend(value[i]) : i64::MAX.
     let out_bytes = n
@@ -18101,15 +18954,8 @@ fn compact_mask_i32_to_indices(
     // `mask_device_ptr`). The caller leases the mask buffer and holds that lease across this whole call
     // (it is borrowed for the duration), so the input outlives both reads — unchanged from the legacy
     // single-launch path, which also read the same mask buffer.
-    let slots = launch_cuda_resident_i32_compare_ordered_core(
-        resident,
-        mask_device_ptr,
-        0,
-        n,
-        0,
-        5,
-        1,
-    )?;
+    let slots =
+        launch_cuda_resident_i32_compare_ordered_core(resident, mask_device_ptr, 0, n, 0, 5, 1)?;
     Ok(slots.into_iter().map(|slot| slot as u32).collect())
 }
 
@@ -24607,7 +25453,10 @@ mod tests {
             .submit_multi_shard_i32_write_locate(&shards, &all, 2)
             .expect("locate");
         for (i, &key) in all.iter().enumerate() {
-            assert_eq!(result.count[i], 1, "key {key}: exactly one hit after extend");
+            assert_eq!(
+                result.count[i], 1,
+                "key {key}: exactly one hit after extend"
+            );
             let slot = result.slot[i * result.max_hits as usize];
             assert_eq!(slot as usize, i, "key {key}: row {i} preserved");
         }
@@ -24639,9 +25488,7 @@ mod tests {
         let mut all_keys: Vec<i32> = Vec::new();
         let mut shards = Vec::new();
         for s in 0..SHARDS {
-            let keys: Vec<i32> = (0..PER_SHARD)
-                .map(|i| (s * PER_SHARD + i) as i32)
-                .collect();
+            let keys: Vec<i32> = (0..PER_SHARD).map(|i| (s * PER_SHARD + i) as i32).collect();
             all_keys.extend_from_slice(&keys);
             let (index_words, table_mask, hash_shift) = build_pk_hash(&keys);
             let bytes: Vec<u8> = index_words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -24733,12 +25580,12 @@ mod tests {
                 }
             }
             let count = result.count[ni];
-            assert_ne!(count, u32::MAX, "needle {needle}: no overflow at max_hits=2");
-            assert_eq!(
-                count as usize,
-                expected.len(),
-                "needle {needle}: hit count"
+            assert_ne!(
+                count,
+                u32::MAX,
+                "needle {needle}: no overflow at max_hits=2"
             );
+            assert_eq!(count as usize, expected.len(), "needle {needle}: hit count");
             let mut got: Vec<(u32, u32)> = (0..count as usize)
                 .map(|h| {
                     let idx = ni * result.max_hits as usize + h;
@@ -25045,13 +25892,20 @@ mod tests {
         // The 12 i32 read back must equal a fresh full upload of 0..12 (non-vacuous: seed=0..8,
         // appended=8..12, so a wrong offset/contents would corrupt the join).
         let read = mem.read_resident_i32_column(0, 12).expect("read back");
-        assert_eq!(read, (0..12).collect::<Vec<i32>>(), "append must equal a fresh upload");
+        assert_eq!(
+            read,
+            (0..12).collect::<Vec<i32>>(),
+            "append must equal a fresh upload"
+        );
         // A chunk that would overrun the allocation is REJECTED (caller must roll over to a new shard).
         let overrun = mem.append_owned_chunks(std::iter::once(CudaOwnedDeviceMemoryChunk {
             byte_offset: 60,
             bytes: vec![0_u8; 8],
         }));
-        assert!(overrun.is_err(), "a chunk overrunning allocated_bytes must be rejected");
+        assert!(
+            overrun.is_err(),
+            "a chunk overrunning allocated_bytes must be rejected"
+        );
     }
 
     #[test]
@@ -25072,7 +25926,8 @@ mod tests {
         let mut init = vec![0_u8; header + 2 * col];
         init[0..8].copy_from_slice(&(r as u64).to_le_bytes());
         for row in 0..r {
-            init[header + row * 4..header + row * 4 + 4].copy_from_slice(&(row as i32).to_le_bytes());
+            init[header + row * 4..header + row * 4 + 4]
+                .copy_from_slice(&(row as i32).to_le_bytes());
             init[header + col + row * 4..header + col + row * 4 + 4]
                 .copy_from_slice(&((row as i32) * 10).to_le_bytes());
         }
@@ -25087,8 +25942,12 @@ mod tests {
             )
             .expect("retain padded open shard");
         // Append K rows (ids R..R+K, balances *10) into both section tails + bump the live-row header.
-        let new_ids: Vec<u8> = (r..r + k).flat_map(|row| (row as i32).to_le_bytes()).collect();
-        let new_bals: Vec<u8> = (r..r + k).flat_map(|row| ((row as i32) * 10).to_le_bytes()).collect();
+        let new_ids: Vec<u8> = (r..r + k)
+            .flat_map(|row| (row as i32).to_le_bytes())
+            .collect();
+        let new_bals: Vec<u8> = (r..r + k)
+            .flat_map(|row| ((row as i32) * 10).to_le_bytes())
+            .collect();
         mem.append_owned_chunks(vec![
             CudaOwnedDeviceMemoryChunk {
                 byte_offset: 0,
@@ -25105,7 +25964,9 @@ mod tests {
         ])
         .expect("append rows into open shard");
         // Read each column back at its capacity-based offset — must equal a fresh full build of R+K rows.
-        let col0 = mem.read_resident_i32_column(header as u64, r + k).expect("read col0");
+        let col0 = mem
+            .read_resident_i32_column(header as u64, r + k)
+            .expect("read col0");
         let col1 = mem
             .read_resident_i32_column((header + col) as u64, r + k)
             .expect("read col1");
@@ -25117,7 +25978,11 @@ mod tests {
         );
         // The 8-byte header now records R+K live rows.
         let header_i32 = mem.read_resident_i32_column(0, 2).expect("read header");
-        assert_eq!(header_i32[0], (r + k) as i32, "header tracks the live row count");
+        assert_eq!(
+            header_i32[0],
+            (r + k) as i32,
+            "header tracks the live row count"
+        );
     }
 
     #[test]
@@ -25167,13 +26032,23 @@ mod tests {
         let needles = vec![keys[5], keys[100], keys[999], -12345, keys[0]];
 
         let scan = resident
-            .submit_match_project_i32_equal_any_from_payload(key_offset, &needles, &projections, rows)
+            .submit_match_project_i32_equal_any_from_payload(
+                key_offset,
+                &needles,
+                &projections,
+                rows,
+            )
             .expect("scan submit");
         let mut scan_rows = scan.complete(&resident).expect("scan complete");
 
         let probe = resident
             .submit_match_project_i32_index_probe_from_payload(
-                &index_resident, table_mask, hash_shift, &needles, &projections, rows,
+                &index_resident,
+                table_mask,
+                hash_shift,
+                &needles,
+                &projections,
+                rows,
             )
             .expect("index submit");
         let mut probe_rows = probe.complete(&resident).expect("index complete");
@@ -25187,9 +26062,16 @@ mod tests {
         );
         assert_eq!(probe_rows.len(), 4, "4 present needles, 1 absent");
         let first = &probe_rows[0];
-        assert_eq!(first.needle_index, 0, "first sorted row is needle 0 (keys[5])");
+        assert_eq!(
+            first.needle_index, 0,
+            "first sorted row is needle 0 (keys[5])"
+        );
         assert_eq!(first.row_index, 5);
-        assert_eq!(first.values, vec![keys[5], payload[5]], "gather: (key, payload) at row 5");
+        assert_eq!(
+            first.values,
+            vec![keys[5], payload[5]],
+            "gather: (key, payload) at row 5"
+        );
     }
 
     #[test]
@@ -25247,7 +26129,10 @@ mod tests {
         check(&big, false);
         check(&big, true);
         // n<=1 is the already-sorted fast path.
-        assert_eq!(resident.bitonic_sort_i64(&[], false).unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            resident.bitonic_sort_i64(&[], false).unwrap(),
+            Vec::<u32>::new()
+        );
         assert_eq!(resident.bitonic_sort_i64(&[7], true).unwrap(), vec![0]);
     }
 
@@ -25268,7 +26153,10 @@ mod tests {
             assert_eq!(perm.len(), n, "{label}: perm length");
             let mut bij = perm.to_vec();
             bij.sort_unstable();
-            assert!(bij.iter().copied().eq(0..n as u32), "{label}: valid permutation 0..n");
+            assert!(
+                bij.iter().copied().eq(0..n as u32),
+                "{label}: valid permutation 0..n"
+            );
             for w in perm.windows(2) {
                 let (a, b) = (keys[w[0] as usize], keys[w[1] as usize]);
                 if descending {
@@ -25282,7 +26170,9 @@ mod tests {
             // Dense duplicates (value range << n at large n) + planted extremes stress the signed
             // transform + tie handling.
             let mut dup: Vec<i64> = (0..n)
-                .map(|i| ((((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 8_000) as i64) - 4_000)
+                .map(|i| {
+                    ((((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 8_000) as i64) - 4_000
+                })
                 .collect();
             if n >= 4 {
                 dup[0] = i64::MIN;
@@ -25291,7 +26181,9 @@ mod tests {
                 dup[3] = 0;
             }
             for &desc in &[false, true] {
-                let perm = resident.order_by_sort_i64(&dup, desc).expect("order_by_sort dup");
+                let perm = resident
+                    .order_by_sort_i64(&dup, desc)
+                    .expect("order_by_sort dup");
                 assert_sorted(&dup, &perm, desc, &format!("dup n={n} desc={desc}"));
             }
             // UNIQUE keys (distinct, signed, shuffled): the radix/bitonic dispatch must equal bitonic.
@@ -25301,8 +26193,12 @@ mod tests {
                 uniq.swap(i, j);
             }
             for &desc in &[false, true] {
-                let dispatched = resident.order_by_sort_i64(&uniq, desc).expect("order_by_sort uniq");
-                let bitonic = resident.bitonic_sort_i64(&uniq, desc).expect("bitonic uniq");
+                let dispatched = resident
+                    .order_by_sort_i64(&uniq, desc)
+                    .expect("order_by_sort uniq");
+                let bitonic = resident
+                    .bitonic_sort_i64(&uniq, desc)
+                    .expect("bitonic uniq");
                 assert_eq!(
                     dispatched, bitonic,
                     "unique-key n={n} desc={desc}: order_by_sort_i64 (radix>=10k) must equal bitonic"
@@ -25367,7 +26263,11 @@ mod tests {
                 let kb = keys[b * k + kk];
                 if ka != kb {
                     let asc = ka.cmp(&kb);
-                    return if (mask >> kk) & 1 == 1 { asc.reverse() } else { asc };
+                    return if (mask >> kk) & 1 == 1 {
+                        asc.reverse()
+                    } else {
+                        asc
+                    };
                 }
             }
             std::cmp::Ordering::Equal
@@ -25459,8 +26359,7 @@ mod tests {
                     build_idxs,
                     probe_idxs,
                 } => {
-                    let mut v: Vec<(u32, u32)> =
-                        build_idxs.into_iter().zip(probe_idxs).collect();
+                    let mut v: Vec<(u32, u32)> = build_idxs.into_iter().zip(probe_idxs).collect();
                     v.sort_unstable();
                     v
                 }
@@ -25480,13 +26379,21 @@ mod tests {
         );
         // (b) 1:N fan-out: one build row, three matching probe rows.
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[5], &[5, 5, 5], None, None).unwrap()),
+            sorted(
+                resident
+                    .hash_join_inner_i64(&[5], &[5, 5, 5], None, None)
+                    .unwrap()
+            ),
             vec![(0, 0), (0, 1), (0, 2)],
             "1:N fan-out (unique build, repeated probe)"
         );
         // (c) no matches at all.
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[1, 2], &[3, 4], None, None).unwrap()),
+            sorted(
+                resident
+                    .hash_join_inner_i64(&[1, 2], &[3, 4], None, None)
+                    .unwrap()
+            ),
             Vec::<(u32, u32)>::new(),
             "disjoint key sets -> no pairs"
         );
@@ -25503,18 +26410,28 @@ mod tests {
         );
         // (e) duplicate build key -> reject (N:N is a follow-up).
         assert_eq!(
-            resident.hash_join_inner_i64(&[10, 10], &[10], None, None).unwrap(),
+            resident
+                .hash_join_inner_i64(&[10, 10], &[10], None, None)
+                .unwrap(),
             HashJoinOutcome::DuplicateBuildKey,
             "a repeated build key is rejected"
         );
         // (f) empty sides -> no matches.
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[], &[1, 2], None, None).unwrap()),
+            sorted(
+                resident
+                    .hash_join_inner_i64(&[], &[1, 2], None, None)
+                    .unwrap()
+            ),
             Vec::<(u32, u32)>::new(),
             "empty build -> no pairs"
         );
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&[1, 2], &[], None, None).unwrap()),
+            sorted(
+                resident
+                    .hash_join_inner_i64(&[1, 2], &[], None, None)
+                    .unwrap()
+            ),
             Vec::<(u32, u32)>::new(),
             "empty probe -> no pairs"
         );
@@ -25532,7 +26449,11 @@ mod tests {
         }
         expected.sort_unstable();
         assert_eq!(
-            sorted(resident.hash_join_inner_i64(&build, &probe, None, None).unwrap()),
+            sorted(
+                resident
+                    .hash_join_inner_i64(&build, &probe, None, None)
+                    .unwrap()
+            ),
             expected,
             "200 unique build keys probed by all 200 (forces collision walks) + 2 misses"
         );
@@ -25566,18 +26487,33 @@ mod tests {
         }
         let join = |build: &[&str], probe: &[&str]| -> Vec<(u32, u32)> {
             let (b, p) = (bytes(build), bytes(probe));
-            sorted(resident.hash_join_inner_text(&refs(&b), &refs(&p), None, None).unwrap())
+            sorted(
+                resident
+                    .hash_join_inner_text(&refs(&b), &refs(&p), None, None)
+                    .unwrap(),
+            )
         };
         // (a) unique build texts, matches + a non-matching probe.
         assert_eq!(
-            join(&["apple", "banana", "cherry"], &["banana", "apple", "banana", "date"]),
+            join(
+                &["apple", "banana", "cherry"],
+                &["banana", "apple", "banana", "date"]
+            ),
             vec![(0, 1), (1, 0), (1, 2)],
             "unique build text, 1:1 + a repeated probe key + a miss"
         );
         // (b) 1:N fan-out.
-        assert_eq!(join(&["x"], &["x", "x", "x"]), vec![(0, 0), (0, 1), (0, 2)], "1:N text fan-out");
+        assert_eq!(
+            join(&["x"], &["x", "x", "x"]),
+            vec![(0, 0), (0, 1), (0, 2)],
+            "1:N text fan-out"
+        );
         // (c) no matches.
-        assert_eq!(join(&["a", "b"], &["c", "d"]), Vec::<(u32, u32)>::new(), "disjoint text sets");
+        assert_eq!(
+            join(&["a", "b"], &["c", "d"]),
+            Vec::<(u32, u32)>::new(),
+            "disjoint text sets"
+        );
         // (d) prefix / length sensitivity: "ab" must NOT match "abc"/"abcd" (the byte-verify checks
         // length + bytes, not just the hash). build0=ab, build1=abc; probe abc->1, ab->0, abcd->none.
         assert_eq!(
@@ -25586,19 +26522,33 @@ mod tests {
             "a prefix text does not match a longer one (verify is exact)"
         );
         // (e) empty-string key (len 0 -> the FNV basis hash; a valid, matchable key).
-        assert_eq!(join(&[""], &["", ""]), vec![(0, 0), (0, 1)], "empty-string text key matches");
+        assert_eq!(
+            join(&[""], &["", ""]),
+            vec![(0, 0), (0, 1)],
+            "empty-string text key matches"
+        );
         // (f) duplicate build text -> reject (N:N is a follow-up).
         assert_eq!(
             {
                 let (b, p) = (bytes(&["k", "k"]), bytes(&["k"]));
-                resident.hash_join_inner_text(&refs(&b), &refs(&p), None, None).unwrap()
+                resident
+                    .hash_join_inner_text(&refs(&b), &refs(&p), None, None)
+                    .unwrap()
             },
             HashJoinOutcome::DuplicateBuildKey,
             "a repeated build text is rejected"
         );
         // (g) empty sides.
-        assert_eq!(join(&[], &["a"]), Vec::<(u32, u32)>::new(), "empty build -> no pairs");
-        assert_eq!(join(&["a"], &[]), Vec::<(u32, u32)>::new(), "empty probe -> no pairs");
+        assert_eq!(
+            join(&[], &["a"]),
+            Vec::<(u32, u32)>::new(),
+            "empty build -> no pairs"
+        );
+        assert_eq!(
+            join(&["a"], &[]),
+            Vec::<(u32, u32)>::new(),
+            "empty probe -> no pairs"
+        );
         // (h) 200 unique build texts probed by all 200 (forces collision walks) + 2 misses -- a broken
         // probe linear-probe step or a verify that mishandles a collision walk is caught here.
         let build_strs: Vec<String> = (0..200).map(|i| format!("key-{i}")).collect();
@@ -25610,7 +26560,11 @@ mod tests {
         let mut expected: Vec<(u32, u32)> = (0..200).map(|i| (i, i)).collect();
         expected.sort_unstable();
         assert_eq!(
-            sorted(resident.hash_join_inner_text(&refs(&build_b), &refs(&probe_b), None, None).unwrap()),
+            sorted(
+                resident
+                    .hash_join_inner_text(&refs(&build_b), &refs(&probe_b), None, None)
+                    .unwrap()
+            ),
             expected,
             "200 unique build texts probed by all 200 + 2 misses"
         );
@@ -25624,7 +26578,9 @@ mod tests {
             .retain_device_memory_copy(0, &0_u64.to_le_bytes())
             .expect("resident device memory");
         let join = |build: &[i64], probe: &[i64]| -> Vec<(u32, u32)> {
-            let (b, p) = resident.hash_join_inner_i64_nn(build, probe, None, None).unwrap();
+            let (b, p) = resident
+                .hash_join_inner_i64_nn(build, probe, None, None)
+                .unwrap();
             let mut v: Vec<(u32, u32)> = b.into_iter().zip(p).collect();
             v.sort_unstable();
             v
@@ -25639,7 +26595,11 @@ mod tests {
         assert_eq!(join(&[10, 20], &[20, 10]), vec![(0, 1), (1, 0)], "1:1");
         // (c) 1:N (unique build) and (d) N:1 (unique probe).
         assert_eq!(join(&[5], &[5, 5, 5]), vec![(0, 0), (0, 1), (0, 2)], "1:N");
-        assert_eq!(join(&[5, 5], &[5]), vec![(0, 0), (1, 0)], "N:1 (both build rows match)");
+        assert_eq!(
+            join(&[5, 5], &[5]),
+            vec![(0, 0), (1, 0)],
+            "N:1 (both build rows match)"
+        );
         // (e) a heavier 3x2 cross product on one key.
         assert_eq!(
             join(&[7, 7, 7], &[7, 7]),
@@ -25663,10 +26623,17 @@ mod tests {
         }
         probe.extend_from_slice(&[1000, 1001, 1002, 1003, 1004]);
         let got = join(&build, &probe);
-        assert_eq!(got.len(), 300, "50 keys x (3 build x 2 probe) = 300 pairs (misses dropped)");
+        assert_eq!(
+            got.len(),
+            300,
+            "50 keys x (3 build x 2 probe) = 300 pairs (misses dropped)"
+        );
         // every emitted pair must share the same key on both sides.
         for &(b, p) in &got {
-            assert_eq!(build[b as usize], probe[p as usize], "a pair must match on the key");
+            assert_eq!(
+                build[b as usize], probe[p as usize],
+                "a pair must match on the key"
+            );
         }
     }
 
@@ -25680,10 +26647,13 @@ mod tests {
         fn refs(v: &[Vec<u8>]) -> Vec<&[u8]> {
             v.iter().map(|b| b.as_slice()).collect()
         }
-        let bytes = |t: &[&str]| -> Vec<Vec<u8>> { t.iter().map(|s| s.as_bytes().to_vec()).collect() };
+        let bytes =
+            |t: &[&str]| -> Vec<Vec<u8>> { t.iter().map(|s| s.as_bytes().to_vec()).collect() };
         let join = |build: &[&str], probe: &[&str]| -> Vec<(u32, u32)> {
             let (b, p) = (bytes(build), bytes(probe));
-            let (bi, pi) = resident.hash_join_inner_text_nn(&refs(&b), &refs(&p), None, None).unwrap();
+            let (bi, pi) = resident
+                .hash_join_inner_text_nn(&refs(&b), &refs(&p), None, None)
+                .unwrap();
             let mut v: Vec<(u32, u32)> = bi.into_iter().zip(pi).collect();
             v.sort_unstable();
             v
@@ -25696,7 +26666,11 @@ mod tests {
         );
         // (b) 1:1 / (c) 1:N / (d) N:1.
         assert_eq!(join(&["x", "y"], &["y", "x"]), vec![(0, 1), (1, 0)], "1:1");
-        assert_eq!(join(&["z"], &["z", "z", "z"]), vec![(0, 0), (0, 1), (0, 2)], "1:N");
+        assert_eq!(
+            join(&["z"], &["z", "z", "z"]),
+            vec![(0, 0), (0, 1), (0, 2)],
+            "1:N"
+        );
         assert_eq!(join(&["z", "z"], &["z"]), vec![(0, 0), (1, 0)], "N:1");
         // (e) prefix/length sensitivity (the byte-verify): "ab" must NOT match "abc". build "ab","ab","abc"
         // probe "ab","abc" -> "ab":2x1=2, "abc":1x1=1.
@@ -25710,16 +26684,24 @@ mod tests {
         assert_eq!(join(&[], &["a"]), Vec::<(u32, u32)>::new(), "empty build");
         assert_eq!(join(&["a"], &[]), Vec::<(u32, u32)>::new(), "empty probe");
         // (g) 50 distinct keys, each 3 build x 2 probe = 6 -> 300; + misses; verify each pair shares the key.
-        let build_strs: Vec<String> = (0..50).flat_map(|k| (0..3).map(move |_| format!("k-{k}"))).collect();
-        let mut probe_strs: Vec<String> =
-            (0..50).flat_map(|k| (0..2).map(move |_| format!("k-{k}"))).collect();
+        let build_strs: Vec<String> = (0..50)
+            .flat_map(|k| (0..3).map(move |_| format!("k-{k}")))
+            .collect();
+        let mut probe_strs: Vec<String> = (0..50)
+            .flat_map(|k| (0..2).map(move |_| format!("k-{k}")))
+            .collect();
         probe_strs.extend(["miss-1".to_string(), "miss-2".to_string()]);
         let bb: Vec<Vec<u8>> = build_strs.iter().map(|s| s.as_bytes().to_vec()).collect();
         let pb: Vec<Vec<u8>> = probe_strs.iter().map(|s| s.as_bytes().to_vec()).collect();
-        let (bi, pi) = resident.hash_join_inner_text_nn(&refs(&bb), &refs(&pb), None, None).unwrap();
+        let (bi, pi) = resident
+            .hash_join_inner_text_nn(&refs(&bb), &refs(&pb), None, None)
+            .unwrap();
         assert_eq!(bi.len(), 300, "50 keys x (3 build x 2 probe) = 300 pairs");
         for (b, p) in bi.iter().zip(&pi) {
-            assert_eq!(build_strs[*b as usize], probe_strs[*p as usize], "a pair must match on the text");
+            assert_eq!(
+                build_strs[*b as usize], probe_strs[*p as usize],
+                "a pair must match on the text"
+            );
         }
     }
 
@@ -26787,7 +27769,10 @@ mod tests {
         let longer = resident
             .expr_text_eq_scalar_filter(offsets_off, bytes_off, b"apples", false, N)
             .expect("text = apples");
-        assert!(longer.is_empty(), "text = 'apples' (longer) matches nothing");
+        assert!(
+            longer.is_empty(),
+            "text = 'apples' (longer) matches nothing"
+        );
     }
 
     #[test]
@@ -26872,8 +27857,8 @@ mod tests {
             .expect("retain resident device memory");
 
         for pattern in [
-            "app%", "%e", "a_p%", "%an%", "_____", "%", "", "apple", "xyz%", "ap_le", "%a%a%",
-            "_", "%%", "apple%", "%apple",
+            "app%", "%e", "a_p%", "%an%", "_____", "%", "", "apple", "xyz%", "ap_le", "%a%a%", "_",
+            "%%", "apple%", "%apple",
         ] {
             let tokens = like_tokens(pattern);
             let got = resident
@@ -27031,7 +28016,10 @@ mod tests {
             .expect("a<100 OR a>500");
         let mut or_expected: Vec<u32> = (0..100).collect();
         or_expected.extend(501..N as u32);
-        assert_eq!(got_or, or_expected, "a<100 OR a>500 <=> [0,100) U [501,600)");
+        assert_eq!(
+            got_or, or_expected,
+            "a<100 OR a>500 <=> [0,100) U [501,600)"
+        );
 
         // a != 300  ->  everything except index 300.
         let p_ne = [load, cmp_scalar(5, 300)];
@@ -27075,20 +28063,41 @@ mod tests {
                 0,
                 db_off + db_bytes.len() as u64,
                 &[
-                    CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-                    CudaDeviceMemoryChunk { byte_offset: id_off, bytes: &id_bytes },
-                    CudaDeviceMemoryChunk { byte_offset: db_off, bytes: &db_bytes },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: id_off,
+                        bytes: &id_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: db_off,
+                        bytes: &db_bytes,
+                    },
                 ],
             )
             .expect("retain resident device memory");
 
         // MIXED program at elem=I32: `id == 5` (i32) AND `deleted_by > 6` (i64).
         let mixed = [
-            ExprStep::LoadColumn { byte_offset: id_off },
-            ExprStep::CompareScalar { cmp: 0, scalar: 5, scalar_on_left: false }, // 0 = `=`
-            ExprStep::LoadColumnI64 { byte_offset: db_off },
-            ExprStep::CompareScalarI64 { cmp: 3, scalar: 6, scalar_on_left: false }, // 3 = `>`
-            ExprStep::MaskBinary { op: 0 },                                          // 0 = AND
+            ExprStep::LoadColumn {
+                byte_offset: id_off,
+            },
+            ExprStep::CompareScalar {
+                cmp: 0,
+                scalar: 5,
+                scalar_on_left: false,
+            }, // 0 = `=`
+            ExprStep::LoadColumnI64 {
+                byte_offset: db_off,
+            },
+            ExprStep::CompareScalarI64 {
+                cmp: 3,
+                scalar: 6,
+                scalar_on_left: false,
+            }, // 3 = `>`
+            ExprStep::MaskBinary { op: 0 }, // 0 = AND
         ];
         // row0 (id5, MAX>6) yes; row1 (id5, 10>6) yes; row2 (id7) no; row3 (id5, 3>6) no.
         assert_eq!(
@@ -27102,8 +28111,14 @@ mod tests {
         // NON-VACUITY: id==5 ALONE (no visibility) keeps the deleted row3 -> [0,1,3]; the i64 visibility
         // compare is what removes it. A no-op mixed-width path would leave row3 in.
         let where_only = [
-            ExprStep::LoadColumn { byte_offset: id_off },
-            ExprStep::CompareScalar { cmp: 0, scalar: 5, scalar_on_left: false },
+            ExprStep::LoadColumn {
+                byte_offset: id_off,
+            },
+            ExprStep::CompareScalar {
+                cmp: 0,
+                scalar: 5,
+                scalar_on_left: false,
+            },
         ];
         assert_eq!(
             resident
@@ -27115,8 +28130,14 @@ mod tests {
 
         // The i64 visibility compare ALONE (the no-WHERE scan/COUNT case) at elem=I64: deleted_by>6 -> [0,1,2].
         let vis_only = [
-            ExprStep::LoadColumnI64 { byte_offset: db_off },
-            ExprStep::CompareScalarI64 { cmp: 3, scalar: 6, scalar_on_left: false },
+            ExprStep::LoadColumnI64 {
+                byte_offset: db_off,
+            },
+            ExprStep::CompareScalarI64 {
+                cmp: 3,
+                scalar: 6,
+                scalar_on_left: false,
+            },
         ];
         assert_eq!(
             resident
@@ -27233,16 +28254,24 @@ mod tests {
         // Buffer-vs-buffer mask, self-compare: a<=a all, a<a none, a!=a none.
         let cb = |cmp: u32| [load, load, ExprStep::CompareBuffers { cmp }];
         assert_eq!(
-            resident.run_expr_predicate_filter(&cb(2), N, ResidentElemType::I32).unwrap(),
+            resident
+                .run_expr_predicate_filter(&cb(2), N, ResidentElemType::I32)
+                .unwrap(),
             range(0, N as u32),
             "a <= a is all rows"
         );
         assert!(
-            resident.run_expr_predicate_filter(&cb(1), N, ResidentElemType::I32).unwrap().is_empty(),
+            resident
+                .run_expr_predicate_filter(&cb(1), N, ResidentElemType::I32)
+                .unwrap()
+                .is_empty(),
             "a < a is empty"
         );
         assert!(
-            resident.run_expr_predicate_filter(&cb(5), N, ResidentElemType::I32).unwrap().is_empty(),
+            resident
+                .run_expr_predicate_filter(&cb(5), N, ResidentElemType::I32)
+                .unwrap()
+                .is_empty(),
             "a != a is empty"
         );
     }
@@ -28590,7 +29619,17 @@ mod tests {
         // reduction's zero-iteration threads + partial last block -- exactly the path the count-skeleton
         // fix's first (shfl) attempt UNDERCOUNTED. The serial (1,1,1) oracle validates the exact count
         // there. The large multiples-of-256 sizes (last) keep the speedup hypothesis.
-        let sizes: [u64; 9] = [255, 257, 513, 1_000, 4_096, 65_536, 1 << 20, 1 << 22, 1 << 24];
+        let sizes: [u64; 9] = [
+            255,
+            257,
+            513,
+            1_000,
+            4_096,
+            65_536,
+            1 << 20,
+            1 << 22,
+            1 << 24,
+        ];
         println!("p2_m2_parallel_scan_spike: needle={needle} (value[i] = i % 7)");
         println!("| rows | expected | serial ms | parallel ms | speedup |");
         println!("|---:|---:|---:|---:|---:|");
@@ -28628,8 +29667,9 @@ mod tests {
             // Correctness (also warms each kernel's module load): the parallel kernel must EQUAL
             // the previously-shipped serial (1,1,1) scan ON THE GPU — the serial scan is the
             // GPU-native oracle (no CPU re-implementation of the count operator as the expected).
-            let serial = launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle, None)
-                .expect("serial count");
+            let serial =
+                launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle, None)
+                    .expect("serial count");
             let parallel = launch_cuda_resident_i32_equal_count(&resident, offset, n, needle, None)
                 .expect("parallel count");
             assert_eq!(
@@ -28642,7 +29682,8 @@ mod tests {
             let mut parallel_ms = f64::MAX;
             for _ in 0..3 {
                 let t = Instant::now();
-                launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle, None).unwrap();
+                launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle, None)
+                    .unwrap();
                 serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
                 let t = Instant::now();
                 launch_cuda_resident_i32_equal_count(&resident, offset, n, needle, None).unwrap();
@@ -28706,9 +29747,18 @@ mod tests {
                 0,
                 allocated,
                 &[
-                    CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-                    CudaDeviceMemoryChunk { byte_offset: header_len, bytes: column_bytes },
-                    CudaDeviceMemoryChunk { byte_offset: null_offset, bytes: bitmap_bytes },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: header_len,
+                        bytes: column_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: null_offset,
+                        bytes: bitmap_bytes,
+                    },
                 ],
             )
             .expect("retain resident column + validity bitmap");
@@ -28724,8 +29774,14 @@ mod tests {
         let parallel0 =
             launch_cuda_resident_i32_equal_count(&resident, offset, n, 0, Some(null_offset))
                 .expect("parallel count with bitmap");
-        assert_eq!(serial0, parallel0, "serial == parallel (GPU oracle) at needle=0");
-        assert_eq!(serial0, 0, "NULL rows (placeholder 0) must NOT match WHERE col = 0");
+        assert_eq!(
+            serial0, parallel0,
+            "serial == parallel (GPU oracle) at needle=0"
+        );
+        assert_eq!(
+            serial0, 0,
+            "NULL rows (placeholder 0) must NOT match WHERE col = 0"
+        );
 
         // Control: WITHOUT the bitmap (None), the 0 placeholders DO leak as matches — proving the
         // setup is real and the bitmap is precisely what excludes the NULL rows.
@@ -28746,7 +29802,10 @@ mod tests {
         let parallel3 =
             launch_cuda_resident_i32_equal_count(&resident, offset, n, 3, Some(null_offset))
                 .expect("parallel count needle=3");
-        assert_eq!(serial3, parallel3, "serial == parallel (GPU oracle) at needle=3");
+        assert_eq!(
+            serial3, parallel3,
+            "serial == parallel (GPU oracle) at needle=3"
+        );
         assert_eq!(serial3, expected3, "construction count excludes NULL rows");
     }
 
@@ -28785,9 +29844,18 @@ mod tests {
                 0,
                 allocated,
                 &[
-                    CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-                    CudaDeviceMemoryChunk { byte_offset: header_len, bytes: column_bytes },
-                    CudaDeviceMemoryChunk { byte_offset: null_off, bytes: bitmap_bytes },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: header_len,
+                        bytes: column_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: null_off,
+                        bytes: bitmap_bytes,
+                    },
                 ],
             )
             .expect("retain resident column + validity bitmap");
@@ -28795,7 +29863,8 @@ mod tests {
 
         // Range [0,4] INCLUDES the placeholder 0. WITH the bitmap, only non-null values in [0,4] count
         // (i.e. {1,2,3,4}; value 5 excluded). Hand-computed construction over the non-null rows.
-        let (mut exp_count, mut exp_sum, mut exp_min, mut exp_max) = (0u64, 0i64, i32::MAX, i32::MIN);
+        let (mut exp_count, mut exp_sum, mut exp_min, mut exp_max) =
+            (0u64, 0i64, i32::MAX, i32::MIN);
         for i in 0..n {
             if !is_null(i) {
                 let v = (i % 5) as i32 + 1;
@@ -28812,7 +29881,11 @@ mod tests {
             .expect("nullable between stats");
         assert_eq!(stats.count, exp_count, "between count excludes NULL");
         assert_eq!(stats.sum, exp_sum, "between sum excludes NULL");
-        assert_eq!(stats.min, Some(exp_min), "between min excludes NULL (not the 0 placeholder)");
+        assert_eq!(
+            stats.min,
+            Some(exp_min),
+            "between min excludes NULL (not the 0 placeholder)"
+        );
         assert_eq!(stats.max, Some(exp_max), "between max excludes NULL");
 
         // Control: WITHOUT the bitmap, the NULL placeholder 0s satisfy [0,4] and leak — count rises by
@@ -28822,8 +29895,16 @@ mod tests {
         let leaked = resident
             .stats_i32_between_from_payload(off, n, 0, 4)
             .expect("between stats without bitmap");
-        assert_eq!(leaked.count, exp_count + n_null, "without bitmap the 0 placeholders leak in");
-        assert_eq!(leaked.min, Some(0), "without bitmap min collapses to the 0 placeholder");
+        assert_eq!(
+            leaked.count,
+            exp_count + n_null,
+            "without bitmap the 0 placeholders leak in"
+        );
+        assert_eq!(
+            leaked.min,
+            Some(0),
+            "without bitmap min collapses to the 0 placeholder"
+        );
     }
 
     #[test]
@@ -29169,7 +30250,8 @@ mod tests {
             let expected = host_wrapping_sum(values);
             let gpu = run(values);
             assert_eq!(
-                gpu, expected,
+                gpu,
+                expected,
                 "GPU sum != host wrapping oracle for case '{label}' (n={})",
                 values.len()
             );
@@ -29183,14 +30265,25 @@ mod tests {
         // `mov.s64 %sum,0` init, not garbage). Mixed sign so the zero contributors are distinguishable
         // from a hypothetical garbage add. ---
         check(&[5], "single row");
-        check(&[i32::MIN], "single i32::MIN (negative -> high-bit-set u64 partial)");
+        check(
+            &[i32::MIN],
+            "single i32::MIN (negative -> high-bit-set u64 partial)",
+        );
         check(&[i32::MAX, i32::MIN, -1, 1, 7], "5 rows mixed sign");
-        check(&[-7; 100], "100 negative rows (< one warp-block tail of 256)");
-        check(&[i32::MIN; 255], "255 negative rows (one short of a full block)");
+        check(
+            &[-7; 100],
+            "100 negative rows (< one warp-block tail of 256)",
+        );
+        check(
+            &[i32::MIN; 255],
+            "255 negative rows (one short of a full block)",
+        );
 
         // --- EDGE: partial last block (not a multiple of 256) + odd counts. ---
         check(
-            &(0..257).map(|i| if i % 2 == 0 { i32::MAX } else { i32::MIN }).collect::<Vec<_>>(),
+            &(0..257)
+                .map(|i| if i % 2 == 0 { i32::MAX } else { i32::MIN })
+                .collect::<Vec<_>>(),
             "257 alternating MAX/MIN (partial block, odd)",
         );
         check(
@@ -29202,9 +30295,18 @@ mod tests {
         // rows into a large i64 partial. 4M+1 is NOT a multiple of the grid width nor of 256 (partial
         // tail), with large-magnitude alternating values so partials are big and sign-mixed. ---
         let big: Vec<i32> = (0..4_000_001_u64)
-            .map(|i| if i % 2 == 0 { i32::MAX - (i % 17) as i32 } else { i32::MIN + (i % 13) as i32 })
+            .map(|i| {
+                if i % 2 == 0 {
+                    i32::MAX - (i % 17) as i32
+                } else {
+                    i32::MIN + (i % 13) as i32
+                }
+            })
             .collect();
-        check(&big, "4_000_001 large alternating (grid-stride wrap, partial tail)");
+        check(
+            &big,
+            "4_000_001 large alternating (grid-stride wrap, partial tail)",
+        );
 
         // --- THE CORE CLAIM: genuine mod-2^64 OVERFLOW in the u64 tree adds. A pure i32 sum cannot
         // overflow i64 at feasible row counts (would need ~2^32 rows of i32::MAX, ~17GB), so a true i64
@@ -29247,7 +30349,9 @@ mod tests {
         // but at a partial-tail odd size), to confirm the wrapping path also stays correct when no high
         // bit is set. ---
         check(
-            &(0..3_000_007_u64).map(|i| (i % 7) as i32).collect::<Vec<_>>(),
+            &(0..3_000_007_u64)
+                .map(|i| (i % 7) as i32)
+                .collect::<Vec<_>>(),
             "3_000_007 non-negative i%7 (grid-stride wrap, partial tail, control)",
         );
     }
@@ -29273,7 +30377,9 @@ mod tests {
         // the associativity/commutativity claim for u64 sum and the assoc/comm claim for min/max.s32).
         let host_oracle = |values: &[i32]| -> (u64, i64, i32, i32) {
             let count = values.len() as u64;
-            let sum = values.iter().fold(0_i64, |acc, &v| acc.wrapping_add(i64::from(v)));
+            let sum = values
+                .iter()
+                .fold(0_i64, |acc, &v| acc.wrapping_add(i64::from(v)));
             let min = values.iter().copied().min().unwrap_or(i32::MAX);
             let max = values.iter().copied().max().unwrap_or(i32::MIN);
             (count, sum, min, max)
@@ -29293,7 +30399,10 @@ mod tests {
                     0,
                     allocated.max(std::mem::size_of::<u64>() as u64),
                     &[
-                        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
                         CudaDeviceMemoryChunk {
                             byte_offset: std::mem::size_of::<u64>() as u64,
                             bytes: column_bytes,
@@ -29313,7 +30422,8 @@ mod tests {
             let oracle = host_oracle(values);
             let direct = run(values);
             assert_eq!(
-                direct, oracle,
+                direct,
+                oracle,
                 "DIRECT scalar_stats != host oracle for '{label}' (n={})",
                 values.len()
             );
@@ -29331,52 +30441,87 @@ mod tests {
         // --- all-negative: a leaked INT_MAX min-sentinel or mis-init min=0 would surface (max must be
         // negative; min must be the most-negative real value). ---
         check(&[-1, -5, -100, -7, -3], "all-negative small");
-        check(&(1..=1000_i32).map(|i| -i).collect::<Vec<_>>(), "all-negative 1000 (-1..-1000)");
+        check(
+            &(1..=1000_i32).map(|i| -i).collect::<Vec<_>>(),
+            "all-negative 1000 (-1..-1000)",
+        );
         check(&[-42; 257], "all-equal negative, 257 (partial block, odd)");
 
         // --- all-positive: a leaked INT_MIN max-sentinel or mis-init min=0 (would wrongly win the min
         // of an all-positive column) would surface. ---
         check(&[1, 5, 100, 7, 3], "all-positive small");
-        check(&(1..=1000_i32).collect::<Vec<_>>(), "all-positive 1000 (1..1000)");
+        check(
+            &(1..=1000_i32).collect::<Vec<_>>(),
+            "all-positive 1000 (1..1000)",
+        );
         check(&[42; 257], "all-equal positive, 257 (partial block, odd)");
 
         // --- mixed-sign, duplicates, monotonic, single, all-equal. ---
         check(&[7], "single positive");
         check(&[-7], "single negative");
         check(&[3, 3, 3, 3, 3], "all-equal");
-        check(&(-500..=500_i32).collect::<Vec<_>>(), "monotonic -500..500 (1001, odd)");
-        check(&(0..1024_i32).rev().collect::<Vec<_>>(), "monotonic decreasing 1023..0");
         check(
-            &(0..777_u32).map(|i| i.wrapping_mul(2_654_435_761) as i32).collect::<Vec<_>>(),
+            &(-500..=500_i32).collect::<Vec<_>>(),
+            "monotonic -500..500 (1001, odd)",
+        );
+        check(
+            &(0..1024_i32).rev().collect::<Vec<_>>(),
+            "monotonic decreasing 1023..0",
+        );
+        check(
+            &(0..777_u32)
+                .map(|i| i.wrapping_mul(2_654_435_761) as i32)
+                .collect::<Vec<_>>(),
             "scrambled 777 (random-ish, odd, partial block)",
         );
 
         // --- sizes: < one block, exactly one block, partial last block, ODD, rows >> grid*block. ---
         check(&(0..255_i32).collect::<Vec<_>>(), "255 (< one block)");
         check(&(0..256_i32).collect::<Vec<_>>(), "256 (exactly one block)");
-        check(&(0..257_i32).collect::<Vec<_>>(), "257 (one over a block, partial)");
-        check(&(0..513_i32).collect::<Vec<_>>(), "513 (odd, two-block tail)");
+        check(
+            &(0..257_i32).collect::<Vec<_>>(),
+            "257 (one over a block, partial)",
+        );
+        check(
+            &(0..513_i32).collect::<Vec<_>>(),
+            "513 (odd, two-block tail)",
+        );
 
         // --- i64 SUM wrap: large negative partials forcing u64 wrap in the tree/atomics across
         // hundreds of thousands of threads; == linear host wrapping_add oracle. Also exercises
         // grid-stride wrap (> 1024*256 = 262144 threads). The min here is i32::MIN (a REAL extreme) and
         // max is i32::MIN too (all equal), so a sentinel leak would surface alongside the wrap. ---
         let neg_n = 2_000_003_usize; // > grid width, odd, partial tail
-        check(&vec![i32::MIN; neg_n], "2_000_003x i32::MIN (i64-wrap + grid-stride + sentinel min/max)");
+        check(
+            &vec![i32::MIN; neg_n],
+            "2_000_003x i32::MIN (i64-wrap + grid-stride + sentinel min/max)",
+        );
 
         // --- grid-stride wrap with large-magnitude alternating extremes (partial tail, odd). min must
         // be i32::MIN and max i32::MAX -- both REAL extremes, scattered across many grid-stride iters. ---
         let big: Vec<i32> = (0..4_000_001_u64)
-            .map(|i| if i % 2 == 0 { i32::MAX - (i % 17) as i32 } else { i32::MIN + (i % 13) as i32 })
+            .map(|i| {
+                if i % 2 == 0 {
+                    i32::MAX - (i % 17) as i32
+                } else {
+                    i32::MIN + (i % 13) as i32
+                }
+            })
             .collect();
-        check(&big, "4_000_001 alternating near-extremes (grid-stride wrap, partial tail)");
+        check(
+            &big,
+            "4_000_001 alternating near-extremes (grid-stride wrap, partial tail)",
+        );
 
         // --- mixed positive grid-stride-wrap control (no high bit) with a single embedded extreme so
         // min/max are determined by ONE row reached deep in a grid-stride iteration. ---
         let mut spread: Vec<i32> = (0..3_000_007_u64).map(|i| (i % 100) as i32).collect();
         spread[2_500_000] = i32::MAX; // a single real max buried mid-stream
         spread[1_999_999] = i32::MIN; // a single real min buried mid-stream
-        check(&spread, "3M spread with single buried i32::MIN/MAX (grid-stride, partial tail)");
+        check(
+            &spread,
+            "3M spread with single buried i32::MIN/MAX (grid-stride, partial tail)",
+        );
     }
 
     #[test]
@@ -29403,8 +30548,9 @@ mod tests {
             let column_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
             };
-            let bitmap_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(bitmap.as_ptr().cast::<u8>(), bitmap.len() * 4) };
+            let bitmap_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(bitmap.as_ptr().cast::<u8>(), bitmap.len() * 4)
+            };
             let header = n.to_le_bytes();
             let header_len = std::mem::size_of::<u64>() as u64;
             let null_offset = header_len + column_bytes.len() as u64;
@@ -29415,9 +30561,18 @@ mod tests {
                     0,
                     allocated,
                     &[
-                        CudaDeviceMemoryChunk { byte_offset: 0, bytes: &header },
-                        CudaDeviceMemoryChunk { byte_offset: header_len, bytes: column_bytes },
-                        CudaDeviceMemoryChunk { byte_offset: null_offset, bytes: bitmap_bytes },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: header_len,
+                            bytes: column_bytes,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: null_offset,
+                            bytes: bitmap_bytes,
+                        },
                     ],
                 )
                 .expect("retain resident column + validity bitmap");
@@ -29425,20 +30580,24 @@ mod tests {
         };
 
         // HOST oracle over the rows surviving the filter AND the validity predicate.
-        let host_oracle =
-            |values: &[i32], valid: &dyn Fn(usize) -> bool, keep: &dyn Fn(i32) -> bool| -> (u64, i64, i32, i32) {
-                let survivors: Vec<i32> = values
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, &v)| valid(*i) && keep(v))
-                    .map(|(_, &v)| v)
-                    .collect();
-                let count = survivors.len() as u64;
-                let sum = survivors.iter().fold(0_i64, |acc, &v| acc.wrapping_add(i64::from(v)));
-                let min = survivors.iter().copied().min().unwrap_or(i32::MAX);
-                let max = survivors.iter().copied().max().unwrap_or(i32::MIN);
-                (count, sum, min, max)
-            };
+        let host_oracle = |values: &[i32],
+                           valid: &dyn Fn(usize) -> bool,
+                           keep: &dyn Fn(i32) -> bool|
+         -> (u64, i64, i32, i32) {
+            let survivors: Vec<i32> = values
+                .iter()
+                .enumerate()
+                .filter(|(i, &v)| valid(*i) && keep(v))
+                .map(|(_, &v)| v)
+                .collect();
+            let count = survivors.len() as u64;
+            let sum = survivors
+                .iter()
+                .fold(0_i64, |acc, &v| acc.wrapping_add(i64::from(v)));
+            let min = survivors.iter().copied().min().unwrap_or(i32::MAX);
+            let max = survivors.iter().copied().max().unwrap_or(i32::MIN);
+            (count, sum, min, max)
+        };
 
         let cmp_keep = |cmp: CudaI32Comparison, needle: i32| -> Box<dyn Fn(i32) -> bool> {
             match cmp {
@@ -29524,9 +30683,18 @@ mod tests {
         // all-survivors-NULL: a needle that ALL non-null rows fail (here `< i32::MIN` is unsatisfiable) =>
         // zero survivors even ignoring NULLs; AND an all-NULL column => zero survivors via the bitmap.
         let unsat = resident
-            .filtered_scalar_stats_i32_from_payload(off, rows, i32::MIN, CudaI32Comparison::Lt, Some(null_off))
+            .filtered_scalar_stats_i32_from_payload(
+                off,
+                rows,
+                i32::MIN,
+                CudaI32Comparison::Lt,
+                Some(null_off),
+            )
             .expect("unsatisfiable filter");
-        assert_eq!(unsat.0, 0, "v < i32::MIN matches nothing => count 0 => SQL NULL");
+        assert_eq!(
+            unsat.0, 0,
+            "v < i32::MIN matches nothing => count 0 => SQL NULL"
+        );
 
         // ---------- (B) FILTERED NON-NULLABLE (no bitmap, `None`): A/B vs the NON-null self-grouped path
         // and host oracle. This is the path that REPLACES the gather-to-host project+CPU reduce.
@@ -29567,7 +30735,10 @@ mod tests {
             .nullable_scalar_stats_i32_from_payload(off, rows, Some(null_off))
             .expect("direct unfiltered nullable scalar stats");
         let oracle_all = host_oracle(&raw, &valid, &|_| true);
-        assert_eq!(direct_all, oracle_all, "DIRECT unfiltered nullable != host oracle");
+        assert_eq!(
+            direct_all, oracle_all,
+            "DIRECT unfiltered nullable != host oracle"
+        );
 
         // all-NULL column => zero survivors => count 0 (=> SQL NULL).
         let all_null: Vec<i32> = vec![0; 333];
@@ -30378,7 +31549,10 @@ mod tests {
             .expr_i64_compare_scalar_filter(big_off, needle, false, 3, ROW_COUNT)
             .expect("big > needle");
         let gt_expected: Vec<u32> = (4001..ROW_COUNT).map(|i| i as u32).collect();
-        assert_eq!(gt, gt_expected, "big > BASE+4000 => [4001, 5000) (64-bit needle)");
+        assert_eq!(
+            gt, gt_expected,
+            "big > BASE+4000 => [4001, 5000) (64-bit needle)"
+        );
 
         // scalar_on_left: needle < big (lt=1) is the SAME set, exercising the left/right flag.
         let flipped = resident
@@ -30485,7 +31659,10 @@ mod tests {
             .expr_i128_compare_scalar_filter(hi_off, hi_needle, false, 4, ROW_COUNT)
             .expect("hi >= 2500<<64");
         let ge_expected: Vec<u32> = (2500..ROW_COUNT).map(|i| i as u32).collect();
-        assert_eq!(ge, ge_expected, "hi >= 2500<<64 => [2500, 5000) (high-limb compare)");
+        assert_eq!(
+            ge, ge_expected,
+            "hi >= 2500<<64 => [2500, 5000) (high-limb compare)"
+        );
 
         // col-vs-col: big < big2 (lt=1) => 2i < n-1 => [0, 2500).
         let lt_cols = resident
@@ -30507,7 +31684,10 @@ mod tests {
             .project_i128_rows_from_payload(big_off, &gt_indices)
             .expect("project big");
         let projected_expected: Vec<i128> = (4001..N).map(|i| base + i as i128).collect();
-        assert_eq!(projected, projected_expected, "projected big == base + i (128-bit)");
+        assert_eq!(
+            projected, projected_expected,
+            "projected big == base + i (128-bit)"
+        );
 
         // Projection of NEGATIVE i128 round-trips: neg at [0, 3) => -base - i.
         let neg_proj = resident
@@ -30535,8 +31715,16 @@ mod tests {
         let i4_off = std::mem::size_of::<u64>() as u64; // 8
         let i8_off = i4_off + ROWS * 4; // 28 == 4 (mod 8): 4-byte-aligned int8 section
         let i128_off = i8_off + ROWS * 8; // 68 == 4 (mod 8): 4-byte-aligned i128 section
-        assert_eq!(i8_off % 8, 4, "int8 section must be 4-byte aligned to exercise the fix");
-        assert_eq!(i128_off % 8, 4, "i128 section must be 4-byte aligned to exercise the fix");
+        assert_eq!(
+            i8_off % 8,
+            4,
+            "int8 section must be 4-byte aligned to exercise the fix"
+        );
+        assert_eq!(
+            i128_off % 8,
+            4,
+            "i128 section must be 4-byte aligned to exercise the fix"
+        );
 
         let mut header = Vec::new();
         header.extend_from_slice(&ROWS.to_le_bytes());
@@ -30579,13 +31767,17 @@ mod tests {
         // int8 at a 4-byte-aligned offset: big > base+1 (gt=3) => r > 1 => [2, 5). Must NOT fault.
         let i8_gt = resident
             .expr_i64_compare_scalar_filter(i8_off, i8_base + 1, false, 3, ROWS)
-            .expect("int8 compare at a 4-byte-aligned offset must not fault (misalignment regression)");
+            .expect(
+                "int8 compare at a 4-byte-aligned offset must not fault (misalignment regression)",
+            );
         assert_eq!(i8_gt, vec![2u32, 3, 4], "int8 big > base+1 => [2, 5)");
 
         // i128 at a 4-byte-aligned offset: num > base+1 (gt=3) => r > 1 => [2, 5). Must NOT fault.
         let i128_gt = resident
             .expr_i128_compare_scalar_filter(i128_off, i128_base + 1, false, 3, ROWS)
-            .expect("i128 compare at a 4-byte-aligned offset must not fault (misalignment regression)");
+            .expect(
+                "i128 compare at a 4-byte-aligned offset must not fault (misalignment regression)",
+            );
         assert_eq!(i128_gt, vec![2u32, 3, 4], "i128 num > base+1 => [2, 5)");
     }
 
@@ -30824,7 +32016,10 @@ mod tests {
             .run_expr_predicate_filter(&neg_prog, N, ResidentElemType::I128)
             .expect("a*(-3)==negc on GPU");
         let all_expected: Vec<u32> = (0..N as u32).collect();
-        assert_eq!(eq, all_expected, "a*(-3) == negc => all rows (exact negative product)");
+        assert_eq!(
+            eq, all_expected,
+            "a*(-3) == negc => all rows (exact negative product)"
+        );
 
         // big * 2 with big = i128::MAX overflows i128 -> numeric field overflow (never wraps).
         let ovf_prog = [

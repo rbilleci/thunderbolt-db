@@ -150,7 +150,11 @@ fn run_arm(
 
     let stop = Arc::new(AtomicBool::new(false));
     let pump_count = if self_pump { 0 } else { pumps };
-    let barrier = Arc::new(Barrier::new(writers + pump_count + 1));
+    // +1 = the main thread; +1 more when the 1Hz stage-attribution sampler runs (TIMELINE=1).
+    let timeline_enabled = std::env::var("GPU_DB_BENCH_TIMELINE").as_deref() == Ok("1");
+    let barrier = Arc::new(Barrier::new(
+        writers + pump_count + 1 + usize::from(timeline_enabled),
+    ));
     // E2.3 — dedicated pump threads (see `pumps`): pure sequencer/tail-finisher cores.
     let pump_handles: Vec<_> = (0..pump_count)
         .map(|_| {
@@ -277,6 +281,24 @@ fn run_arm(
         })
         .collect();
 
+    // Per-second STAGE ATTRIBUTION sampler (2M+ push (a)): the timeline shows WHERE the
+    // sustained/burst gap lives; this shows WHY — cumulative stage counters sampled at 1Hz,
+    // printed as per-second deltas so a TPS dip lines up with the stage that inflated
+    // (validate/publish/apply/host passes/fence latency) in the same second.
+    let sampler = timeline_enabled.then(|| {
+        let engine = Arc::clone(&engine);
+        let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut rows: Vec<StageSnap> = vec![stage_snap(&engine)];
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1000));
+                rows.push(stage_snap(&engine));
+            }
+            rows
+        })
+    });
     barrier.wait();
     let started = Instant::now();
     std::thread::sleep(Duration::from_secs(seconds));
@@ -314,7 +336,7 @@ fn run_arm(
         * 10;
     // Per-second completion timeline (GPU_DB_BENCH_TIMELINE=1): the
     // sustained/burst gap lives in STALL seconds — this shows where.
-    if std::env::var("GPU_DB_BENCH_TIMELINE").as_deref() == Ok("1") {
+    if timeline_enabled {
         let secs: Vec<u64> = per_ms
             .chunks(1000)
             .map(|chunk| chunk.iter().sum::<u64>())
@@ -326,6 +348,38 @@ fn run_arm(
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Per-second STAGE deltas (see the sampler above): one row per second, per-wave
+        // microseconds for each pipeline stage + fence latency — the dip in tps/s above lines
+        // up with the stage column that inflated in the same row.
+        if let Some(sampler) = sampler {
+            let rows = sampler.join().expect("stage sampler panicked");
+            eprintln!(
+                "    [stages/s:  sec |  waves |  items | us/wave: validate publish apply | \
+                 drain conflict patch settle | fence us/frame | acklag us/wave]"
+            );
+            for (sec, pair) in rows.windows(2).enumerate() {
+                let d = pair[1].delta(&pair[0]);
+                let per_wave = |ns: u64| ns as f64 / 1000.0 / d.waves.max(1) as f64;
+                eprintln!(
+                    "    [stages/s: {:>4} | {:>6} | {:>6} | {:>8.0} {:>7.0} {:>5.0} | {:>5.0} \
+                     {:>8.0} {:>5.0} {:>6.0} | {:>14.0} | {:>14.0}]",
+                    sec,
+                    d.waves,
+                    d.items,
+                    per_wave(d.validate_ns),
+                    per_wave(d.publish_ns),
+                    per_wave(d.apply_ns),
+                    per_wave(d.drain_ns),
+                    per_wave(d.conflict_ns),
+                    per_wave(d.patch_ns),
+                    per_wave(d.settle_ns),
+                    d.fence_ns as f64 / 1000.0 / d.fence_frames.max(1) as f64,
+                    d.acklag_ns as f64 / 1000.0 / d.settled_waves.max(1) as f64,
+                );
+            }
+        }
+    } else if let Some(sampler) = sampler {
+        let _ = sampler.join();
     }
 
     let stats = engine.wal_group_commit_stats();
@@ -524,4 +578,71 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+/// Cumulative stage counters at one sampling instant (per-second STAGE ATTRIBUTION — see the
+/// TIMELINE sampler). Deltas between consecutive snapshots give the per-second view.
+#[derive(Clone, Copy, Default)]
+struct StageSnap {
+    waves: u64,
+    items: u64,
+    validate_ns: u64,
+    publish_ns: u64,
+    apply_ns: u64,
+    drain_ns: u64,
+    conflict_ns: u64,
+    patch_ns: u64,
+    settle_ns: u64,
+    fence_ns: u64,
+    fence_frames: u64,
+    acklag_ns: u64,
+    settled_waves: u64,
+}
+
+impl StageSnap {
+    /// Per-second delta (saturating: the fence counters live in the ACTIVE segment and reset
+    /// on a roll — a negative delta clamps to 0 for that second instead of wrapping).
+    fn delta(&self, prev: &Self) -> Self {
+        Self {
+            waves: self.waves.saturating_sub(prev.waves),
+            items: self.items.saturating_sub(prev.items),
+            validate_ns: self.validate_ns.saturating_sub(prev.validate_ns),
+            publish_ns: self.publish_ns.saturating_sub(prev.publish_ns),
+            apply_ns: self.apply_ns.saturating_sub(prev.apply_ns),
+            drain_ns: self.drain_ns.saturating_sub(prev.drain_ns),
+            conflict_ns: self.conflict_ns.saturating_sub(prev.conflict_ns),
+            patch_ns: self.patch_ns.saturating_sub(prev.patch_ns),
+            settle_ns: self.settle_ns.saturating_sub(prev.settle_ns),
+            fence_ns: self.fence_ns.saturating_sub(prev.fence_ns),
+            fence_frames: self.fence_frames.saturating_sub(prev.fence_frames),
+            acklag_ns: self.acklag_ns.saturating_sub(prev.acklag_ns),
+            settled_waves: self.settled_waves.saturating_sub(prev.settled_waves),
+        }
+    }
+}
+
+fn stage_snap(engine: &gpu_db_engine::Engine) -> StageSnap {
+    let mut snap = StageSnap::default();
+    if let Some(stats) = engine.intent_lane_stats() {
+        snap.waves = stats.0;
+        snap.items = stats.1;
+        snap.validate_ns = stats.2;
+        snap.publish_ns = stats.5;
+        snap.apply_ns = stats.6;
+    }
+    if let Some((drain, conflict, patch, settle)) = engine.intent_lane_hostpass_stats() {
+        snap.drain_ns = drain;
+        snap.conflict_ns = conflict;
+        snap.patch_ns = patch;
+        snap.settle_ns = settle;
+    }
+    if let Some((ns, frames)) = engine.intent_lane_fence_stats() {
+        snap.fence_ns = ns;
+        snap.fence_frames = frames;
+    }
+    if let Some((ns, settled)) = engine.intent_lane_acklag_stats() {
+        snap.acklag_ns = ns;
+        snap.settled_waves = settled;
+    }
+    snap
 }
