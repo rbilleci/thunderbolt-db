@@ -2054,15 +2054,20 @@ impl Engine {
                         "the sequencer is the single proposer: the batch must start at the peek"
                     );
                     let last_seq = first_seq + k - 1;
-                    // One wave timestamp: monotonic vs prior commits by the same max-guard the
-                    // per-item path used; items within a wave legitimately share wall micros.
-                    let timestamp_micros =
+                    // Per-winner UNIQUE timestamps (audit F1): base + offset reproduces the serial
+                    // path's strictly-increasing per-txn stamps (the max-guard chain), keeping
+                    // PITR-to-timestamp unambiguous at wave boundaries. `record_commit_timestamp`
+                    // bumps the running max per call, so later waves stay monotonic.
+                    let base_timestamp_micros =
                         wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
                     for (offset, (position, table, values, _record, _off)) in
                         winners.into_iter().enumerate()
                     {
                         let commit_seq = first_seq + offset as u64;
-                        commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
+                        commit.record_commit_timestamp(
+                            batch[position].txn_id,
+                            base_timestamp_micros + offset as u64,
+                        );
                         // Classic-path interop: record the write-set into the SHARED ledger (in
                         // wave order). Same-slot dups were already resolved by the workers
                         // (single-winner), so recording every winner is conflict-free.

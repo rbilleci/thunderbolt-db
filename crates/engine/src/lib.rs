@@ -348,7 +348,7 @@ pub struct Engine {
     /// In-flight transactions' read snapshots (write-half MVCC, Stage 4), for the oldest-active GC
     /// boundary. Separate from `commit` so a transaction can register its snapshot at prepare-begin
     /// WITHOUT serializing on the commit_mutex (prepare is off-lock).
-    active_snapshots: Mutex<ActiveSnapshots>,
+    active_snapshots: std::sync::Arc<Mutex<ActiveSnapshots>>,
     /// Lock-free mirror of the replicator role (0=Leader, 1=Follower, 2=Candidate), updated only
     /// by the rare `become_*` transitions. The per-statement leader check (`repl_role`) used to
     /// lock the commit_mutex for this one field read — measured to CONVOY every "off-lock"

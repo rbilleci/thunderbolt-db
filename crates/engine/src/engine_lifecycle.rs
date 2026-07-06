@@ -137,7 +137,7 @@ impl Engine {
                 sm: KvStateMachine::default(),
                 txn_manager: TxnManager::default(),
             }),
-            active_snapshots: Mutex::new(ActiveSnapshots::default()),
+            active_snapshots: std::sync::Arc::new(Mutex::new(ActiveSnapshots::default())),
             group_flush: GroupFlushState::default(),
             // Mirrors LocalReplicator::leader() below.
             repl_role_mirror: std::sync::atomic::AtomicU8::new(0),

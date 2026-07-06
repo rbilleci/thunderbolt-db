@@ -213,8 +213,8 @@ impl Engine {
     /// A driver thread advances the pipeline via [`Engine::drive_commit_wave`] and reaps the
     /// ticket with [`Engine::poll_intent`]; N drivers thereby carry M logical clients with no
     /// per-commit thread park/wake. The read snapshot stays registered (GC/prune boundary) until
-    /// the ticket is polled to completion — a submitted-but-never-polled ticket pins the boundary
-    /// (documented cost of the async contract; the driver bench always polls to completion).
+    /// the ticket is polled to completion or dropped (the ticket owns the release: Drop is the
+    /// audit-F2 safety net, so an abandoned ticket cannot pin the GC/prune boundary forever).
     ///
     /// On eligibility drift the classic text path is run INLINE (rare) and the ticket returns its
     /// resolved outcome on the first poll — the async surface never silently skips a validation.
@@ -226,9 +226,11 @@ impl Engine {
     ) -> Result<IntentTicket, ExecuteError> {
         self.check_intent_params(route, params)?;
         let read_snapshot = self.committed_seq();
-        // Register WITHOUT the RAII guard — the boundary is released by `poll_intent` on
-        // completion (the async lifecycle owns the snapshot past this call's return).
+        // Register WITHOUT the RAII guard — the ticket takes an OWNED hold on the registry, so
+        // the boundary is released by the completing poll or the ticket's Drop (audit F2), never
+        // leaked by a dropped-unpolled ticket.
         std::mem::forget(self.register_active_snapshot(read_snapshot));
+        let snapshot_hold = Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
         match self.build_covered_insert_intent(txn_id, route, params, read_snapshot) {
             IntentBuild::Item(item) => {
                 let outcome = match self.submit_commit_wave_item(item) {
@@ -241,7 +243,7 @@ impl Engine {
                 };
                 Ok(IntentTicket {
                     outcome: Some(outcome),
-                    read_snapshot,
+                    snapshot_hold,
                     resolved: None,
                 })
             }
@@ -252,7 +254,7 @@ impl Engine {
                 self.deregister_active_snapshot(read_snapshot);
                 Ok(IntentTicket {
                     outcome: None,
-                    read_snapshot,
+                    snapshot_hold: None,
                     resolved: Some(resolved),
                 })
             }
@@ -268,7 +270,7 @@ impl Engine {
         let outcome = ticket.outcome.as_ref()?;
         let result = outcome.take_if_done()?;
         ticket.outcome = None;
-        self.deregister_active_snapshot(ticket.read_snapshot);
+        ticket.release_snapshot();
         Some(result)
     }
 
@@ -391,7 +393,32 @@ enum IntentBuild {
 pub struct IntentTicket {
     /// The wave-item completion slot (async path); `None` once reaped or for the inline fallback.
     outcome: Option<crate::engine_dml_concurrent::CommitWaveOutcome>,
-    read_snapshot: Index,
+    /// The read-snapshot GC boundary this ticket still holds: an OWNED handle to the engine's
+    /// active-snapshot registry plus the pinned snapshot. Released exactly once — by the
+    /// completing poll, or by `Drop` (audit F2: a submitted-but-never-polled ticket must not pin
+    /// `ledger.prune_below`/MVCC GC forever).
+    snapshot_hold: Option<(
+        std::sync::Arc<std::sync::Mutex<crate::ActiveSnapshots>>,
+        Index,
+    )>,
     /// A pre-resolved result (the inline classic fallback arm), yielded on the first poll.
     resolved: Option<Result<(), ExecuteError>>,
+}
+
+impl IntentTicket {
+    /// Release the read-snapshot GC boundary (idempotent; `take` makes double-release a no-op).
+    fn release_snapshot(&mut self) {
+        if let Some((registry, snapshot)) = self.snapshot_hold.take() {
+            registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .deregister(snapshot);
+        }
+    }
+}
+
+impl Drop for IntentTicket {
+    fn drop(&mut self) {
+        self.release_snapshot();
+    }
 }
