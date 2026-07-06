@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -527,8 +527,11 @@ struct CommitState {
     wal: WalBuffer,
     /// Per-txn commit timestamps (durable transaction identity → wall-clock micros), for
     /// PITR-by-timestamp lookups. Keyed by the façade txn_id (the durable identity), distinct from
-    /// the MVCC `commit_seq`.
-    wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
+    /// the MVCC `commit_seq`. A HashMap: every consumer is a point lookup or a retain (archive
+    /// timestamp export, checkpoint pruning) — nothing reads key order — and the per-commit insert
+    /// sits on the wave sequencer's serial cut, where an unbounded BTreeMap's O(log n) insert was
+    /// measured as a top per-item cost at millions of retained commits.
+    wal_commit_timestamps_micros: HashMap<TxnId, u64>,
     /// O(1) running max of every value ever put into `wal_commit_timestamps_micros`. Commit
     /// timestamps are assigned monotonically (`next_commit_timestamp_micros`), so this is exactly
     /// `wal_commit_timestamps_micros.values().max()` — tracked incrementally to keep the per-commit

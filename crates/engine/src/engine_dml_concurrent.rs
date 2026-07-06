@@ -1996,12 +1996,21 @@ impl Engine {
                 .fetch_add(started.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
         }
 
-        // Stage 3 — the thin serial cut: ordered WAL append + global commit-seq + device buffer.
+        // Stage 3 — the thin serial cut, E2.5b BATCHED: one commit-seq block claim, one
+        // repl propose_batch, one row-id block, one applied mark, one timestamp for the whole
+        // wave. The per-item body is reduced to the WAL push, the shared-ledger record, and the
+        // device-buffer push — the E2.4a measurement showed the per-item repl round-trips,
+        // BTreeMap timestamp insert, and allocator atomics WERE the ordered cut (~1.3us/item).
+        // Aborts never consume a commit seq (same as the serial path's peek-before-propose), and
+        // a propose_batch failure aborts the WHOLE wave — identical semantics to a first-item
+        // propose failure, since the single-node leader either accepts all or is not leader.
         let mut wave_tail: Option<(Index, usize)> = None;
         let mut committed: Vec<(usize, Index, bool)> = Vec::with_capacity(n);
         let mut pending_appends: WavePendingAppends = BTreeMap::new();
-        let mut next_row_id = self.read_state.mvcc.current_row_id();
         let cut_started = hostphase.then(Instant::now);
+        // Pass 1 — settle aborts, collect winners (position + payload parts) in wave order.
+        let mut winners: Vec<(usize, String, Vec<SqlValue>, Vec<u8>, usize)> =
+            Vec::with_capacity(n);
         for position in 0..n {
             match verdicts[position]
                 .take()
@@ -2013,61 +2022,76 @@ impl Engine {
                 ShardVerdict::Commit {
                     table,
                     values,
-                    mut wal_record,
+                    wal_record,
                     wal_offset,
-                } => {
-                    let commit_seq = commit.repl.peek_next_index();
-                    let row_id = next_row_id;
-                    // Patch the pre-encoded W5a record's 8-byte row id (the only wave-time field).
-                    wal_record[wal_offset..wal_offset + 8].copy_from_slice(&row_id.to_le_bytes());
-                    let wal_payload: std::sync::Arc<[u8]> = std::sync::Arc::from(wal_record);
-                    let wal_len_before = commit.wal.len();
-                    commit.wal.append(WalRecord {
-                        txn_id: batch[position].txn_id,
-                        payload: wal_payload.clone(),
-                    });
-                    let wal_position = commit.wal.len();
-                    let token = match commit.repl.propose(wal_payload) {
-                        Ok(token) => token,
-                        Err(err) => {
-                            commit.wal.truncate(wal_len_before);
-                            batch[position].set_outcome(Err(ExecuteError::Engine(err)));
-                            continue;
-                        }
-                    };
+                } => winners.push((position, table, values, wal_record, wal_offset)),
+            }
+        }
+        if !winners.is_empty() {
+            let k = winners.len() as u64;
+            let first_seq = commit.repl.peek_next_index();
+            let row_id_base = self.read_state.mvcc.current_row_id();
+            let wal_len_before = commit.wal.len();
+            let mut payloads: Vec<std::sync::Arc<[u8]>> = Vec::with_capacity(winners.len());
+            for (offset, (position, _table, _values, wal_record, wal_offset)) in
+                winners.iter_mut().enumerate()
+            {
+                // Patch the pre-encoded W5a record's 8-byte row id (the only wave-time field).
+                let row_id = row_id_base + offset as u64;
+                wal_record[*wal_offset..*wal_offset + 8].copy_from_slice(&row_id.to_le_bytes());
+                let wal_payload: std::sync::Arc<[u8]> =
+                    std::sync::Arc::from(std::mem::take(wal_record));
+                commit.wal.append(WalRecord {
+                    txn_id: batch[*position].txn_id,
+                    payload: wal_payload.clone(),
+                });
+                payloads.push(wal_payload);
+            }
+            match commit.repl.propose_batch(payloads) {
+                Ok(proposed_first) => {
                     debug_assert_eq!(
-                        token.index, commit_seq,
-                        "the sequencer is the single proposer: the proposed index must equal the peek"
+                        proposed_first, first_seq,
+                        "the sequencer is the single proposer: the batch must start at the peek"
                     );
-                    if let Err(err) = commit.repl.wait_committed(token, Duration::from_millis(0)) {
-                        commit.repl.rollback_unapplied_from(commit_seq);
-                        commit.wal.truncate(wal_len_before);
-                        batch[position].set_outcome(Err(ExecuteError::Engine(err)));
-                        continue;
-                    }
+                    let last_seq = first_seq + k - 1;
+                    // One wave timestamp: monotonic vs prior commits by the same max-guard the
+                    // per-item path used; items within a wave legitimately share wall micros.
                     let timestamp_micros =
                         wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
-                    commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
-                    // Classic-path interop: record the write-set into the SHARED ledger (in wave
-                    // order) so later waves and the classic path see this commit. Same-slot dups
-                    // were already resolved by the workers (single-winner), so no two committed
-                    // items share a slot here — recording every winner is conflict-free.
-                    commit.ledger.record(&batch[position].write_set, commit_seq);
-                    // Elided apply == advance the row-id allocator + the elision counter (host store
-                    // skipped), exactly `apply_delta`'s elided-insert branch for one row.
-                    self.read_state.mvcc.advance_row_id(1);
+                    for (offset, (position, table, values, _record, _off)) in
+                        winners.into_iter().enumerate()
+                    {
+                        let commit_seq = first_seq + offset as u64;
+                        commit.record_commit_timestamp(batch[position].txn_id, timestamp_micros);
+                        // Classic-path interop: record the write-set into the SHARED ledger (in
+                        // wave order). Same-slot dups were already resolved by the workers
+                        // (single-winner), so recording every winner is conflict-free.
+                        commit.ledger.record(&batch[position].write_set, commit_seq);
+                        let entry = pending_appends.entry(table).or_default();
+                        entry.3.push(commit_seq);
+                        entry.0.push(values);
+                        entry.1.push(row_id_base + offset as u64);
+                        entry.2.push((position, commit_seq));
+                    }
+                    // Elided apply, batched: advance the row-id allocator + elision counter by the
+                    // whole wave (host store skipped) and mark the block applied once.
+                    self.read_state.mvcc.advance_row_id(k);
                     self.read_state
                         .residency
                         .host_install_elisions
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    commit.repl.mark_applied(commit_seq);
-                    next_row_id = self.read_state.mvcc.current_row_id();
-                    let entry = pending_appends.entry(table).or_default();
-                    entry.3.push(commit_seq);
-                    entry.0.push(values);
-                    entry.1.push(row_id);
-                    entry.2.push((position, commit_seq));
-                    wave_tail = Some((commit_seq, wal_position));
+                        .fetch_add(k, std::sync::atomic::Ordering::Relaxed);
+                    commit.repl.mark_applied(last_seq);
+                    wave_tail = Some((last_seq, commit.wal.len()));
+                }
+                Err(err) => {
+                    // Whole-wave abort: nothing proposed, nothing durable, no seq consumed.
+                    commit.wal.truncate(wal_len_before);
+                    let message = format!("wave propose failed: {err}");
+                    for (position, _table, _values, _record, _offset) in winners.into_iter() {
+                        batch[position].set_outcome(Err(ExecuteError::Engine(
+                            EngineError::ProposalFailed(message.clone()),
+                        )));
+                    }
                 }
             }
         }

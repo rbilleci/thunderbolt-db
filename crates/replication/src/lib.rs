@@ -1229,6 +1229,36 @@ impl LocalReplicator {
         self.entries.retain(|e| e.index > applied);
     }
 
+    /// E2.5b — batch propose for the wave sequencer: append `payloads` as consecutive leader
+    /// entries and advance the commit index ONCE. Returns the FIRST assigned index; the batch
+    /// covers `[first, first + n)`. Semantically identical to `propose` called in a loop (the
+    /// single-node leader commits immediately; all-or-nothing on the leadership check, and the
+    /// caller aborts the whole wave on error exactly as a first-item `propose` failure would).
+    /// Exists because the wave commit cut is the write path's serial section and per-item
+    /// propose/wait/mark round-trips were measured as pure bookkeeping overhead there.
+    pub fn propose_batch<I>(&mut self, payloads: I) -> Result<Index, EngineError>
+    where
+        I: IntoIterator<Item = std::sync::Arc<[u8]>>,
+    {
+        if self.role != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+        let first = self.next_index;
+        for payload in payloads {
+            let idx = self.next_index;
+            self.next_index += 1;
+            self.entries.push(LogEntry {
+                term: self.term,
+                index: idx,
+                payload,
+            });
+        }
+        if self.next_index > first {
+            self.commit_index = self.next_index - 1;
+        }
+        Ok(first)
+    }
+
     pub fn rollback_unapplied_from(&mut self, index_inclusive: Index) {
         if index_inclusive <= self.applied_index {
             return;

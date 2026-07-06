@@ -131,7 +131,7 @@ impl Engine {
             commit: Mutex::new(CommitState {
                 repl: LocalReplicator::leader(),
                 wal: WalBuffer::default(),
-                wal_commit_timestamps_micros: BTreeMap::new(),
+                wal_commit_timestamps_micros: HashMap::new(),
                 max_commit_timestamp_micros: 0,
                 ledger: RecentCommitsLedger::default(),
                 sm: KvStateMachine::default(),

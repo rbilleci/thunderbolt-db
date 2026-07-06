@@ -1289,16 +1289,20 @@ mod commit_timestamp_tests {
     }
 
     /// The assignment property the O(n) scan guaranteed is preserved: commit timestamps are strictly
-    /// increasing. (txn_ids are assigned monotonically here, so `values()` is in commit order.)
+    /// increasing in COMMIT ORDER. txn_ids are assigned monotonically here, so sorting by txn_id
+    /// recovers commit order explicitly (the map is a HashMap; `values()` order is arbitrary —
+    /// the old BTreeMap iteration only happened to coincide with commit order).
     #[test]
     fn assigned_timestamps_are_strictly_monotonic() {
         let engine = engine_with_commits(32);
         let commit = engine.commit_state();
-        let stamps: Vec<u64> = commit
+        let mut by_txn: Vec<(gpu_db_types::TxnId, u64)> = commit
             .wal_commit_timestamps_micros
-            .values()
-            .copied()
+            .iter()
+            .map(|(txn_id, stamp)| (*txn_id, *stamp))
             .collect();
+        by_txn.sort_unstable_by_key(|(txn_id, _)| *txn_id);
+        let stamps: Vec<u64> = by_txn.into_iter().map(|(_, stamp)| stamp).collect();
         assert!(stamps.len() >= 32, "expected commits to be recorded");
         for pair in stamps.windows(2) {
             assert!(
