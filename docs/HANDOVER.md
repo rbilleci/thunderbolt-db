@@ -388,6 +388,19 @@ submit may run sequencer/tail work when it becomes the leader). A post-W4h diagn
 51us/commit in that run, queue residence ~1.26ms/item, and durable tail ~0.86ms/tail. The remaining latency gap is therefore
 not explained by SQL parse alone; it is dominated by closed-loop queueing plus the final durability/visibility barrier.
 
+**E2.5b-2 MILESTONE (2026-07-06): SUSTAINED SEVEN FIGURES — 1,323,628 durable TPS / 2,547,760 burst**
+(closed-loop per-request durable acks, 15s, p50 18.5ms p90 31ms p99 84ms, recovery cut clean, pk-rebuilds 1).
+Config: GPU_DB_WAL_DURABILITY=fua GPU_DB_INTENT_LANES=6 GPU_DB_INTENT_LANE_MIN_WAVE=1024
+GPU_DB_INTENT_LANE_GROUP_US=4000 GPU_DB_OPEN_SHARD_FLOOR_ROWS=48000000 + bench: ARM=driver WRITERS=8
+PUMPS=6 WINDOW=6144 SHARD_TARGET=48000000. Driver knee: 8 drivers optimal (16→1.16M, 12→1.20M, 8→1.32M,
+6→1.25M, 20→0.97M; the record was unlocked by NOT letting bench client threads strangle the pumps).
+8L/8P variant: 1.29M/2.55M burst. Engine trajectory this program: 32k → 73k → 414k → 597k → 894k → 1.32M
+sustained. The architecture that did it (all committed, gates green): N-lane pumps + lock-free seq oracle +
+cross-lane validate/apply coalescers + lean LaneIntent + capacity floor/capacity-sized PK index + FUA lane
+WAL + cut-gated settlement. KNOWN ISSUE: 4-driver x >=12288-window bench runs exit silently (uninvestigated;
+not the record path). NEXT toward 2M+: whole-system profile of the flat residual, wider lanes with freed
+cores, and the E2.5c program (lanes reopen/replay, truncation, Raft-compatible seq oracle, default flips).
+
 **E2 PROGRAM (2026-07-06, commits 907d6b88..a88cf690, ALL PUSHED; user mandate: multi-million engine TPS,
 disruptor staging, main agent implements / opus audits only):** classic 32k -> intent fast path (E2.1) ->
 disruptor submit/poll + integer ledger (E2.2, 414k) -> fast lane (E2.3, 597k peak) -> sharded-dispatch
