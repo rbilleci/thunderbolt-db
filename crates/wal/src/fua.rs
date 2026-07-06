@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use gpu_db_types::EngineError;
 use gpu_db_write_conveyor::{
@@ -53,6 +53,23 @@ struct ActiveSegment {
     appender: Option<FuaFrameLogAppender>,
     pool: Option<FuaFrameLogFencePool>,
     segment_id: u64,
+}
+
+/// The pre-staged NEXT segment (Chronicle's pre-toucher). A background thread prewrites the
+/// next segment file at a temp path while the active segment fills, so a roll only drains,
+/// renames and swaps. Prewriting inline under the active lock (~100ms for a 64MiB segment)
+/// was a visibility stall: a rolling lane blocks the CROSS-LANE contiguous cut, so every
+/// lane's acks stall behind one lane's extent prewrite.
+enum PrestageSlot {
+    /// Nothing staged (transient: between a take and the follow-up kick, and before the
+    /// constructor's first kick).
+    Empty,
+    /// The background thread is prewriting segment `id` at the temp path.
+    Pending(u64),
+    /// Segment `id` is prewritten at the temp path, ready to rename + swap in.
+    Ready(u64, Arc<FuaFrameLog>),
+    /// Pre-create failed; the next roll surfaces this and wedges the backend.
+    Failed(String),
 }
 
 /// The FUA fence-pool durability backend behind an optional field of [`WalBuffer`].
@@ -82,6 +99,8 @@ pub(crate) struct FuaWalBackend {
     /// Fail-closed wedge reason; once set, every flush errors until restart recovery.
     poison: Mutex<Option<String>>,
     stats: Mutex<WalGroupCommitStats>,
+    /// See [`PrestageSlot`]: the next segment, prewritten off the roll path.
+    prestaged: Arc<(Mutex<PrestageSlot>, Condvar)>,
 }
 
 impl std::fmt::Debug for FuaWalBackend {
@@ -136,7 +155,7 @@ impl FuaWalBackend {
         let log = open_segment(&base_path, segment_id, segment_bytes)?;
         let pool = log.spawn_fence_pool(lanes);
         let appender = log.appender();
-        Ok(Self {
+        let backend = Self {
             base_path,
             lanes,
             segment_bytes,
@@ -153,7 +172,10 @@ impl FuaWalBackend {
             next_segment_id: AtomicU64::new(segment_id + 1),
             poison: Mutex::new(None),
             stats: Mutex::new(WalGroupCommitStats::default()),
-        })
+            prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
+        };
+        backend.kick_prestage();
+        Ok(backend)
     }
 
     /// REOPEN an existing FUA-durable database at `base_path` and continue appending ABOVE the
@@ -198,7 +220,7 @@ impl FuaWalBackend {
         let pool = log.spawn_fence_pool(lanes);
         let appender = log.appender();
         let recovered = recovered_records as u64;
-        Ok(Self {
+        let backend = Self {
             base_path,
             lanes,
             segment_bytes,
@@ -215,7 +237,10 @@ impl FuaWalBackend {
             next_segment_id: AtomicU64::new(segment_id + 1),
             poison: Mutex::new(None),
             stats: Mutex::new(WalGroupCommitStats::default()),
-        })
+            prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
+        };
+        backend.kick_prestage();
+        Ok(backend)
     }
 
     pub(crate) fn base_path(&self) -> &Path {
@@ -363,6 +388,88 @@ impl FuaWalBackend {
         }
     }
 
+    /// Kick the background pre-create of the NEXT segment: claim its id now (ids must ascend in
+    /// roll order for recovery) and prewrite the file at the TEMP path off-thread. The temp name
+    /// keeps half-prewritten files invisible to recovery/`highest_existing_segment_id` (both parse
+    /// only `<base>.fua.<id>` names); the roll renames it into place.
+    fn kick_prestage(&self) {
+        let id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
+        {
+            let (lock, _) = &*self.prestaged;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = PrestageSlot::Pending(id);
+        }
+        let slot = Arc::clone(&self.prestaged);
+        let temp = prestage_file_path(&self.base_path);
+        let segment_bytes = self.segment_bytes;
+        std::thread::spawn(move || {
+            // A stale temp from a crashed prior life (or an unrolled leftover) is ours to clobber.
+            let _ = std::fs::remove_file(&temp);
+            let config = FuaFrameLogConfig {
+                path: temp,
+                segment_id: id,
+                capacity_bytes: segment_bytes,
+            };
+            // Safety: the temp path is owned exclusively by this backend (one prestage in flight;
+            // the file is renamed to its final segment name before any other opener exists).
+            let result = unsafe { FuaFrameLog::create(config) };
+            let (lock, cvar) = &*slot;
+            let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = match result {
+                Ok(log) => PrestageSlot::Ready(id, log),
+                Err(err) => PrestageSlot::Failed(format!("{err}")),
+            };
+            cvar.notify_all();
+        });
+    }
+
+    /// Take the pre-staged next segment, waiting if the prewrite is still in flight (a roll
+    /// arriving before ~100ms of prewrite finishes — only under tiny test segments), and rename
+    /// it to its final `<base>.fua.<id>` name. The rename (+ parent dir fsync) must be durable
+    /// BEFORE any frame lands in the segment: acked commits would otherwise sit in a file
+    /// recovery ignores.
+    fn take_prestaged(&self) -> Result<(u64, Arc<FuaFrameLog>), EngineError> {
+        let (lock, cvar) = &*self.prestaged;
+        let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (id, log) = loop {
+            match std::mem::replace(&mut *guard, PrestageSlot::Empty) {
+                PrestageSlot::Ready(id, log) => break (id, log),
+                PrestageSlot::Failed(reason) => {
+                    return Err(EngineError::Durability(format!(
+                        "FUA segment pre-create failed: {reason}"
+                    )));
+                }
+                PrestageSlot::Pending(id) => {
+                    *guard = PrestageSlot::Pending(id);
+                    guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
+                }
+                PrestageSlot::Empty => {
+                    // No prestage in flight (constructor always kicks one; defensive): create
+                    // inline exactly like the pre-prestager roll did.
+                    drop(guard);
+                    let id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
+                    let log = open_segment(&self.base_path, id, self.segment_bytes)?;
+                    return Ok((id, log));
+                }
+            }
+        };
+        drop(guard);
+        let temp = prestage_file_path(&self.base_path);
+        let final_path = segment_file_path(&self.base_path, id);
+        std::fs::rename(&temp, &final_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to rename pre-staged FUA segment {} -> {}: {err}",
+                temp.display(),
+                final_path.display()
+            ))
+        })?;
+        sync_parent_dir(&final_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to fsync FUA WAL directory after segment rename: {err}"
+            ))
+        })?;
+        Ok((id, log))
+    }
+
     /// Roll the full active segment to a fresh one. The current segment is DRAINED (appender
     /// finished + pool joined) so it is 100% durable BEFORE any record lands in the next segment —
     /// otherwise a crash with the new segment partly durable and the old segment's tail not durable
@@ -392,9 +499,12 @@ impl FuaWalBackend {
                 Err(observed) => current = observed,
             }
         }
-        let new_id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
-        let new_log = open_segment(&self.base_path, new_id, self.segment_bytes)
-            .inspect_err(|_| self.set_poison("FUA segment roll (create) failed"))?;
+        let (new_id, new_log) = self
+            .take_prestaged()
+            .inspect_err(|err| self.set_poison(&format!("FUA segment roll failed: {err}")))?;
+        // Start prewriting the FOLLOWING segment while this one fills (the whole point: the
+        // ~100ms extent prewrite runs concurrent with normal appends, never under this lock).
+        self.kick_prestage();
         let new_pool = new_log.spawn_fence_pool(self.lanes);
         let new_appender = new_log.appender();
         active.log = new_log;
@@ -518,6 +628,15 @@ impl Drop for FuaWalBackend {
         if let Some(pool) = active.pool.take() {
             let _ = pool.join();
         }
+        // Drain the pre-stager: a Pending thread still owns the temp path, and letting it outlive
+        // this backend could race a same-path successor's kick (its remove_file) in a rapid
+        // drop+reopen. The thread's slot fill is its last temp-path-relevant action, so waiting
+        // for Pending to clear is a full ownership handoff.
+        let (lock, cvar) = &*self.prestaged;
+        let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while matches!(*guard, PrestageSlot::Pending(_)) {
+            guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
+        }
     }
 }
 
@@ -576,6 +695,25 @@ fn segment_file_path(base: &Path, segment_id: u64) -> PathBuf {
         .and_then(|n| n.to_str())
         .unwrap_or("wal.segment");
     base.with_file_name(format!("{name}.fua.{segment_id}"))
+}
+
+/// `<base>.fua.prestage` — the temp path pre-created segments are prewritten at. The non-numeric
+/// suffix keeps the file invisible to [`parse_segment_id`] (recovery, reopen id scan, stale-file
+/// clobber) until the roll renames it to its final `<base>.fua.<id>` name.
+fn prestage_file_path(base: &Path) -> PathBuf {
+    let name = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("wal.segment");
+    base.with_file_name(format!("{name}.fua.prestage"))
+}
+
+/// fsync the parent directory so a just-renamed segment file's directory entry is durable.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
 }
 
 /// Parse the `segment_id` out of a `<stem>.fua.<id>` file name.

@@ -404,7 +404,21 @@ GROUP_US=4000, FLOOR/SHARD_TARGET=48000000, GPU_DB_WAL_DURABILITY=fua. Driver sw
 durable, durable cut == applied cut, pk-rebuilds 1, clean exit** (93% of the 15s record held for 2x the
 duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — apply is the next wall).
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
-at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers. Deferred to E2.5c (documented, unblocked): lanes reopen/replay merge, lane-log
+at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
+
+**SEGMENT-ROLL TAIL FIX (2026-07-06): pre-stager + 512MiB lane segments — p99 191ms→90.5ms at record
+throughput (1,622,823 / 2,612,240 burst, p50 20.1ms p90 38.5ms).** Diagnosis: `FuaWalBackend::roll()`
+prewrote the next segment (64MiB of zeros + fsync, ~100ms) INLINE under the active lock; a rolling lane
+blocks the CROSS-LANE contiguous cut, so one lane's roll stalls every lane's acks — at ~59MB/lane/15s the
+64MiB segments rolled right at the bench horizon and produced the p99/max tail. Fix 1 (crates/wal/src/fua.rs):
+Chronicle-style PRE-STAGER — a background thread prewrites the next segment at `<base>.fua.prestage` (the
+non-numeric suffix is invisible to recovery/reopen scans); roll = drain + rename + parent-dir fsync + swap;
+`Drop` drains a Pending prestage (temp-path ownership handoff). Measured alone it halves the tail but costs
+~10% mean (the prewrite's fsync is a device-wide NVMe FLUSH now landing during live FUA fencing). Fix 2:
+lanes-mode default segment size 64MiB→512MiB (`GPU_DB_INTENT_LANE_SEGMENT_BYTES`) — same total log bytes,
+8x fewer rolls/FLUSHes/drains; rolls leave the bench horizon entirely and production rolls (~75s/lane at
+1.6M TPS) stay off the hot path via the pre-stager. Gates: engine 488/488 default AND fua, GPU intent
+suites green (serial + lanes=2), wal crate 78/78, clippy clean. Deferred to E2.5c (documented, unblocked): lanes reopen/replay merge, lane-log
 truncation/archive, Raft-compatible seq oracle, default flips, engine-side FuaWalSegment recycle.
 
 **E2.5b-2 FIRST MILESTONE (2026-07-06): SUSTAINED SEVEN FIGURES — 1,323,628 durable TPS / 2,547,760 burst**

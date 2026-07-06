@@ -414,11 +414,15 @@ impl Engine {
                     .and_then(|v| v.parse().ok())
                     .filter(|&n| n >= 1)
                     .unwrap_or(16);
+                // 512MiB default: rolls (drain + segment swap + a device-wide FLUSH from the
+                // pre-stager's prewrite fsync) are the lane tail's dominant stall; at M-TPS
+                // rates 64MiB rolled every ~15s/lane and the roll tail showed as p99. Same
+                // total log bytes either way — only the roll cadence changes.
                 let lane_segment_bytes: usize = std::env::var("GPU_DB_INTENT_LANE_SEGMENT_BYTES")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .filter(|&n| n > 0)
-                    .unwrap_or(64 << 20);
+                    .unwrap_or(512 << 20);
                 let wal_lanes = gpu_db_wal::FuaWalLaneSet::create(
                     &lane_base_path,
                     lane_count,
