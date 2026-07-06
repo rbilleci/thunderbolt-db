@@ -388,7 +388,26 @@ submit may run sequencer/tail work when it becomes the leader). A post-W4h diagn
 51us/commit in that run, queue residence ~1.26ms/item, and durable tail ~0.86ms/tail. The remaining latency gap is therefore
 not explained by SQL parse alone; it is dominated by closed-loop queueing plus the final durability/visibility barrier.
 
-**E2.5b-2 MILESTONE (2026-07-06): SUSTAINED SEVEN FIGURES — 1,323,628 durable TPS / 2,547,760 burst**
+**E2.5b-2 RECORD + FULL-ARC AUDIT ADOPTED (2026-07-06, `9073c816`): 1,662,843 sustained / 2,683,310 burst
+durable TPS** (closed-loop per-request durable acks, 15s, p50 20.3ms p90 44.9ms p99 191ms), measured AFTER
+adopting all five findings from the adversarial opus audit of the whole lanes arc (b3e4922c..d3c77701):
+F1 CRITICAL — oracle activation double-seed (two lanes racing the cold-start check-then-act could seed
+duplicate global seq spaces → acked-commit loss at recovery); fixed with double-checked seeding under the
+commit lock, activation latch stored LAST. F2 — apply-leader panic stranded waiters (livelock); fixed with
+catch_unwind + ApplySlot.failed + resume_unwind. F3 — async WAL poison never reached settle (clients hung
+instead of erroring); fixed with poison_reason() drain in settle_intent_lane. F4 — commit_mutation_batch
+missing the lanes guard. F5 — archive/PITR would silently drop lane commits; now refuses in lanes mode +
+dead ts_side/reserve_timestamps removed. Gates: 486/486 default AND fua modes, GPU intent suites green
+(serial + lanes=2). Champion config: 10 lanes / 10 pumps / 10 bench drivers, WINDOW=6144, MIN_WAVE=1024,
+GROUP_US=4000, FLOOR/SHARD_TARGET=48000000, GPU_DB_WAL_DURABILITY=fua. Driver sweep at 10L: 8→1.58M,
+10→1.66M, 12→1.51M. 30s STABILITY (floor/target 64M): **1,552,410 sustained / 2,625,190 burst — 46.6M rows
+durable, durable cut == applied cut, pk-rebuilds 1, clean exit** (93% of the 15s record held for 2x the
+duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — apply is the next wall).
+Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
+at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers. Deferred to E2.5c (documented, unblocked): lanes reopen/replay merge, lane-log
+truncation/archive, Raft-compatible seq oracle, default flips, engine-side FuaWalSegment recycle.
+
+**E2.5b-2 FIRST MILESTONE (2026-07-06): SUSTAINED SEVEN FIGURES — 1,323,628 durable TPS / 2,547,760 burst**
 (closed-loop per-request durable acks, 15s, p50 18.5ms p90 31ms p99 84ms, recovery cut clean, pk-rebuilds 1).
 Config: GPU_DB_WAL_DURABILITY=fua GPU_DB_INTENT_LANES=6 GPU_DB_INTENT_LANE_MIN_WAVE=1024
 GPU_DB_INTENT_LANE_GROUP_US=4000 GPU_DB_OPEN_SHARD_FLOOR_ROWS=48000000 + bench: ARM=driver WRITERS=8

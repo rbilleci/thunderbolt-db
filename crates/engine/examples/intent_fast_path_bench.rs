@@ -184,10 +184,11 @@ fn run_arm(
                 let run_started = Instant::now();
                 let mut i = 0_i64;
                 // Disjoint per-writer ranges, all below the warm-up base (2.1e9)
-                // at any population; 4M ids/writer up to 512 writers, shrinking
-                // proportionally past that (a 3s closed-loop point stays far
-                // under the per-writer budget either way).
-                let stride = 4_000_000_i64.min(2_100_000_000 / writers as i64);
+                // at any population: split the whole sub-warm-up id space evenly.
+                // (A fixed 4M/writer cap overflowed into the neighbor's range on
+                // long runs — 30s at 1.66M TPS is ~5M ids/driver — and the engine
+                // correctly rejected the wraparound as duplicate keys.)
+                let stride = 2_100_000_000 / writers as i64;
                 if arm == Arm::Driver {
                     // E2.2(c): event-loop driver carrying `window` logical clients. Keep the window
                     // full of in-flight tickets, pump the wave, reap completions, record per-client

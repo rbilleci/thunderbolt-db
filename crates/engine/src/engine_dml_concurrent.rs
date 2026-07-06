@@ -2583,7 +2583,6 @@ impl Engine {
         // repl log intentionally does not carry lane payloads (single-node;
         // recovery reads the lane logs' explicit seqs — Raft integration is
         // an E2.5c+ concern).
-        let wall_clock = current_timestamp_micros();
         let stat_start = Instant::now();
         let first_seq = if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
             lanes
