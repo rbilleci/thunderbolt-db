@@ -213,6 +213,42 @@ impl CommitWaveDone {
     }
 }
 
+/// E2.5b-2 LEAN LANE ITEM: everything the lane pump needs, ~112B + the value
+/// row — vs the ~500B CommitWaveItem plus its AST/delta/text attachments. The
+/// pump's host passes were the measured final wall (~6.5ms/lane cycle of cold
+/// cache traffic at ~925-item waves); this struct is the fix.
+pub(crate) struct LaneIntent {
+    pub(crate) txn_id: u64,
+    pub(crate) slot: crate::write_path::IntUniqueSlotKey,
+    pub(crate) read_snapshot: Index,
+    pub(crate) prepared_catalog_seq: Index,
+    pub(crate) filter_idx: u32,
+    pub(crate) row_id_offset: u32,
+    pub(crate) table: std::sync::Arc<str>,
+    pub(crate) template: std::sync::Arc<[u8]>,
+    pub(crate) values: Vec<SqlValue>,
+    pub(crate) outcome: CommitWaveOutcome,
+}
+
+impl LaneIntent {
+    pub(crate) fn set_outcome(&self, result: Result<(), ExecuteError>) {
+        *self
+            .outcome
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+        self.outcome.done.store(true, AtomicOrdering::Release);
+    }
+}
+
+/// A fresh, pending completion slot (shared by the lean lane path).
+pub(crate) fn new_pending_outcome() -> CommitWaveOutcome {
+    Arc::new(CommitWaveDone {
+        done: std::sync::atomic::AtomicBool::new(false),
+        result: Mutex::new(None),
+    })
+}
+
 impl CommitWaveItem {
     fn set_outcome(&self, result: Result<(), ExecuteError>) {
         *self
@@ -691,6 +727,19 @@ impl Engine {
         &self,
         item: CommitWaveItem,
     ) -> Result<(), ExecuteError> {
+        // Lanes-mode seq-collision guard: the classic sequencer must not run
+        // concurrently with activated lanes (oracle vs repl seqs). Blocking
+        // classic-shaped items are refused post-activation like all classic
+        // writes; the lean submit path is the lanes-mode entry.
+        if let Some(lanes) = &self.intent_lanes {
+            if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ExecuteError::Engine(EngineError::Durability(
+                    "intent lanes are ACTIVE: blocking classic-path commits are refused \
+                     (submit_covered_insert_intent is the lanes-mode write entry)"
+                        .to_string(),
+                )));
+            }
+        }
         let outcome = self.enqueue_commit_wave_item(item)?;
         if let Some(result) = self.pump_as_sequencer_if_idle(&outcome) {
             return result;
@@ -705,22 +754,9 @@ impl Engine {
         &self,
         item: CommitWaveItem,
     ) -> Result<CommitWaveOutcome, ExecuteError> {
-        // E2.5b-2: lanes mode routes single-slot intents to their PK lane (same
-        // PK -> same lane = single-winner without cross-lane coordination).
-        // Multi/zero-slot items (classic shapes) stay on the classic queue —
-        // they are pre-activation-only under the intent-only contract.
-        if let Some(lanes) = &self.intent_lanes {
-            if item.write_set.unique_slots_i32.len() == 1 && item.binary_wal_template.is_some() {
-                let outcome = Arc::clone(&item.outcome);
-                let pk = item.write_set.unique_slots_i32[0].1;
-                let lane = lanes.lane_for_pk(pk);
-                lanes.queues[lane]
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push_back(item);
-                return Ok(outcome);
-            }
-        }
+        // E2.5b-2 lean path: lanes-mode intents enter via build_lane_intent in
+        // submit_covered_insert_intent (LaneIntent queues); classic-shaped
+        // items always take the classic queue (pre-activation only).
         self.enqueue_commit_wave_item(item)
     }
 
@@ -2436,7 +2472,7 @@ impl Engine {
         let min_wave = crate::engine_intent_lanes::intent_lane_min_wave();
         let group_window =
             std::time::Duration::from_micros(crate::engine_intent_lanes::intent_lane_group_us());
-        let batch: Vec<CommitWaveItem> = {
+        let batch: Vec<LaneIntent> = {
             let mut queue = lanes.queues[lane]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2464,12 +2500,12 @@ impl Engine {
             return progressed;
         }
 
-        // device validate (committed-dup 23505 verdicts), off-lock: the PK-index
-        // cache tolerates newer-than-snapshot entries (see
-        // ensure_shard_pk_device_index), so concurrent lane applies no longer
-        // force rebuilds and the probe needs no device-section serialization.
+        // device validate (committed-dup 23505 verdicts), off-lock and LEAN:
+        // needles come straight from the intents' integer slots (no AST walk);
+        // the locate goes through the cross-lane coalescer; count>0 hits get
+        // the same authoritative visibility recheck as the classic path.
         let stat_start = Instant::now();
-        let violations = self.wave_batch_validate_unique(&batch);
+        let violations = self.lane_validate_unique(&batch);
         lanes.stat_validate_ns.fetch_add(
             stat_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
@@ -2482,7 +2518,7 @@ impl Engine {
         // private-ledger conflicts + intra-wave same-slot dedup (lowest position wins).
         // PASS-FUSION: integer slots are extracted here once (winner_slots) so the
         // post-claim ledger record never re-walks the fat items.
-        let mut winners: Vec<CommitWaveItem> = Vec::with_capacity(batch.len());
+        let mut winners: Vec<LaneIntent> = Vec::with_capacity(batch.len());
         let mut winner_slots: Vec<crate::write_path::IntUniqueSlotKey> =
             Vec::with_capacity(batch.len());
         {
@@ -2498,29 +2534,25 @@ impl Engine {
                     ))));
                     continue;
                 }
-                if ledger.conflicts(&item.write_set, item.read_snapshot) {
+                if ledger.conflicts_int_slot(item.slot, item.read_snapshot) {
                     let read_snapshot = item.read_snapshot;
                     item.set_outcome(Err(ExecuteError::Serialization(format!(
                         "write-write conflict on a key committed after read snapshot {read_snapshot}"
                     ))));
                     continue;
                 }
-                if item
-                    .write_set
-                    .unique_slots_i32
-                    .iter()
-                    .any(|slot| !wave_slots.insert(*slot))
-                {
+                if !wave_slots.insert(item.slot) {
                     item.set_outcome(Err(ExecuteError::Serialization(
                         "intra-wave duplicate key: an earlier same-wave insert holds this unique slot"
                             .to_string(),
                     )));
                     continue;
                 }
-                winner_slots.push(item.write_set.unique_slots_i32[0]);
+                winner_slots.push(item.slot);
                 winners.push(item);
             }
         }
+        let mut winners = winners;
         let k = winners.len() as u64;
         if k == 0 {
             return true;
@@ -2533,33 +2565,14 @@ impl Engine {
         // separate encode_record_into pass that was measured at ~1.4us/record
         // of cold Arc re-walks (1.4ms of a 1000-record wave).
         let mut frame_payload: Vec<u8> = Vec::with_capacity(winners.len() * 24 + 4096);
-        let mut winner_rows: Vec<(String, Vec<SqlValue>)> = Vec::with_capacity(winners.len());
         for (offset, item) in winners.iter().enumerate() {
-            let (template, wal_offset) = item
-                .binary_wal_template
-                .as_ref()
-                .expect("lane intents carry a binary WAL template");
-            let off = *wal_offset as usize;
+            let off = item.row_id_offset as usize;
             let row_id = row_id_base + offset as u64;
-            let mut payload: std::sync::Arc<[u8]> = std::sync::Arc::from(&template[..]);
+            let mut payload: std::sync::Arc<[u8]> = std::sync::Arc::from(&item.template[..]);
             std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
                 [off..off + 8]
                 .copy_from_slice(&row_id.to_le_bytes());
             gpu_db_wal::encode_wal_record_parts_into(&mut frame_payload, item.txn_id, &payload);
-            // fused (table, values) extraction: same item walk, warm cache
-            let delta = item
-                .offlock_delta
-                .as_ref()
-                .expect("lane intents carry an off-lock delta");
-            let crate::write_path::PreparedMutation::Insert {
-                table,
-                inserted_rows,
-                ..
-            } = &delta.mutation
-            else {
-                unreachable!("lane intents gate to single-row inserts");
-            };
-            winner_rows.push((table.clone(), inserted_rows[0].1.clone()));
         }
 
         // THE CLAIM, LOCK-FREE: after activation, a seq block is one fetch_add
@@ -2653,14 +2666,14 @@ impl Engine {
             let mut stamps = Vec::with_capacity(winners.len());
             let mut txn_ids = Vec::with_capacity(winners.len());
             let mut row_ids = Vec::with_capacity(winners.len());
-            let mut table_name = String::new();
-            for (offset, (table, values)) in winner_rows.into_iter().enumerate() {
-                if offset == 0 {
-                    table_name = table;
-                }
-                rows.push(values);
+            let table_name = winners
+                .first()
+                .map(|item| item.table.to_string())
+                .unwrap_or_default();
+            for (offset, item) in winners.iter_mut().enumerate() {
+                rows.push(std::mem::take(&mut item.values));
                 stamps.push(first_seq + offset as u64);
-                txn_ids.push(winners[offset].txn_id);
+                txn_ids.push(item.txn_id);
                 row_ids.push(row_id_base + offset as u64);
             }
             lanes
@@ -2734,6 +2747,128 @@ impl Engine {
             });
         self.settle_intent_lane(&lanes, lane);
         true
+    }
+
+    /// LEAN device validate for lane intents: needles straight from the
+    /// integer slots, locate through the cross-lane coalescer, count>0 hits
+    /// re-checked authoritatively at the item's read snapshot (same semantics
+    /// as wave_batch_validate_unique's covered-insert arm). Returns 23505
+    /// messages by batch position. Catalog drift (DDL between build and pump,
+    /// pre-activation-window only) aborts the item retryably.
+    fn lane_validate_unique(
+        &self,
+        batch: &[LaneIntent],
+    ) -> std::collections::BTreeMap<usize, String> {
+        let mut violations = std::collections::BTreeMap::new();
+        if batch.is_empty() {
+            return violations;
+        }
+        let catalog = self.catalog_snapshot();
+        // group needles per (table, filter_idx); usually exactly one group
+        let mut group_keys: Vec<(&str, u32)> = Vec::new();
+        let mut group_needles: Vec<Vec<i32>> = Vec::new();
+        let mut group_positions: Vec<Vec<usize>> = Vec::new();
+        for (position, item) in batch.iter().enumerate() {
+            if catalog.commit_seq != item.prepared_catalog_seq {
+                violations.insert(
+                    position,
+                    "catalog drift between intent build and lane wave (retry)".to_string(),
+                );
+                continue;
+            }
+            let key = (&*item.table, item.filter_idx);
+            let group = match group_keys.iter().position(|k| *k == key) {
+                Some(index) => index,
+                None => {
+                    group_keys.push(key);
+                    group_needles.push(Vec::new());
+                    group_positions.push(Vec::new());
+                    group_keys.len() - 1
+                }
+            };
+            group_needles[group].push(item.slot.1);
+            group_positions[group].push(position);
+        }
+        for (group, &(table_name, filter_idx)) in group_keys.iter().enumerate() {
+            let Some(table) = catalog.relational_catalog.get(table_name) else {
+                for &position in &group_positions[group] {
+                    violations.insert(position, "table dropped".to_string());
+                }
+                continue;
+            };
+            let locate = self.wave_batch_locate_hit_counts(
+                table,
+                filter_idx as usize,
+                &group_needles[group],
+            );
+            let Some(counts) = locate else {
+                // decline -> authoritative per-needle recheck (rare)
+                for (&position, &needle) in group_positions[group]
+                    .iter()
+                    .zip(group_needles[group].iter())
+                {
+                    self.lane_authoritative_dup_check(
+                        table,
+                        filter_idx as usize,
+                        needle,
+                        batch[position].read_snapshot,
+                        position,
+                        &mut violations,
+                    );
+                }
+                continue;
+            };
+            for ((&position, &needle), &count) in group_positions[group]
+                .iter()
+                .zip(group_needles[group].iter())
+                .zip(counts.iter())
+            {
+                if count == 0 {
+                    continue;
+                }
+                self.lane_authoritative_dup_check(
+                    table,
+                    filter_idx as usize,
+                    needle,
+                    batch[position].read_snapshot,
+                    position,
+                    &mut violations,
+                );
+            }
+        }
+        violations
+    }
+
+    fn lane_authoritative_dup_check(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        needle: i32,
+        read_snapshot: Index,
+        position: usize,
+        violations: &mut std::collections::BTreeMap<usize, String>,
+    ) {
+        let visibility = crate::StorageVisibility {
+            read_txn_id: read_snapshot,
+        };
+        let value = SqlValue::Int4(needle);
+        match self.visible_row_with_value(table, visibility, filter_idx, &value, None) {
+            Ok(true) => {
+                let index_name = table
+                    .columns
+                    .get(filter_idx)
+                    .map(|column| format!("{}_{}_key", table.name, column.name))
+                    .unwrap_or_else(|| format!("{}_key", table.name));
+                violations.insert(
+                    position,
+                    format!("duplicate key value violates unique index \"{index_name}\""),
+                );
+            }
+            Ok(false) => {}
+            Err(err) => {
+                violations.insert(position, format!("unique validation failed: {err}"));
+            }
+        }
     }
 
     /// APPLY LEADER body: merge every pending lane request per table and run

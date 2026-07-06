@@ -41,6 +41,8 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct CoveredInsertRoute {
     table: String,
+    /// Shared table name for lean lane intents (cheap Arc clone per submit).
+    table_arc: std::sync::Arc<str>,
     /// Catalog generation at prepare. Execute compares the LIVE generation:
     /// a mismatch means a DDL committed since — the shape proof is stale.
     catalog_seq: Index,
@@ -171,6 +173,7 @@ impl Engine {
             catalog_seq: catalog.commit_seq,
             column_count: table.columns.len(),
             sql_prefix: format!("INSERT INTO {} VALUES (", table.name),
+            table_arc: std::sync::Arc::from(table_name),
             unique_i32_slots,
             binary_row_id_offset,
         })
@@ -218,6 +221,51 @@ impl Engine {
     ///
     /// On eligibility drift the classic text path is run INLINE (rare) and the ticket returns its
     /// resolved outcome on the first poll — the async surface never silently skips a validation.
+    /// E2.5b-2 lean build: everything the lane pump needs, nothing more — no
+    /// SQL text, no row-key String, no delta/AST clones, no residency set.
+    /// `None` = eligibility drift (caller falls back to the classic path).
+    fn build_lane_intent(
+        &self,
+        txn_id: u64,
+        route: &CoveredInsertRoute,
+        params: &[i32],
+        read_snapshot: Index,
+    ) -> Option<crate::engine_dml_concurrent::LaneIntent> {
+        let catalog = self.catalog_snapshot();
+        let prepared_catalog_seq = catalog.commit_seq;
+        let table = catalog.relational_catalog.get(&route.table)?;
+        let eligible = prepared_catalog_seq == route.catalog_seq
+            && self.binary_wal_records_enabled()
+            && route.unique_i32_slots.len() == 1
+            && table.columns.len() == route.column_count
+            && self.insert_unique_wave_batchable(&catalog, table);
+        if !eligible {
+            return None;
+        }
+        let values: Vec<SqlValue> = params.iter().map(|&param| SqlValue::Int4(param)).collect();
+        let (slot_id, column_idx) = route.unique_i32_slots[0];
+        let (template, row_id_offset) =
+            crate::wal_binary::try_encode_binary_insert(&route.table, &[(0u64, values.as_slice())])
+                .map(|bytes| {
+                    (
+                        std::sync::Arc::<[u8]>::from(bytes.as_slice()),
+                        route.binary_row_id_offset,
+                    )
+                })?;
+        Some(crate::engine_dml_concurrent::LaneIntent {
+            txn_id,
+            slot: (slot_id, params[column_idx]),
+            read_snapshot,
+            prepared_catalog_seq,
+            filter_idx: column_idx as u32,
+            row_id_offset,
+            table: std::sync::Arc::clone(&route.table_arc),
+            template,
+            values,
+            outcome: crate::engine_dml_concurrent::new_pending_outcome(),
+        })
+    }
+
     pub fn submit_covered_insert_intent(
         &self,
         txn_id: u64,
@@ -225,6 +273,35 @@ impl Engine {
         params: &[i32],
     ) -> Result<IntentTicket, ExecuteError> {
         self.check_intent_params(route, params)?;
+        // LEAN LANE PATH: in lanes mode, build the compact LaneIntent and push
+        // straight to its PK lane — CommitWaveItem is never constructed here.
+        if let Some(lanes) = &self.intent_lanes {
+            let read_snapshot = self.committed_seq();
+            std::mem::forget(self.register_active_snapshot(read_snapshot));
+            let snapshot_hold =
+                Some((std::sync::Arc::clone(&self.active_snapshots), read_snapshot));
+            if let Some(intent) = self.build_lane_intent(txn_id, route, params, read_snapshot) {
+                let outcome = std::sync::Arc::clone(&intent.outcome);
+                let lane = lanes.lane_for_pk(intent.slot.1);
+                lanes.queues[lane]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_back(intent);
+                return Ok(IntentTicket {
+                    outcome: Some(outcome),
+                    snapshot_hold,
+                    resolved: None,
+                });
+            }
+            // eligibility drift: classic inline fallback (rare)
+            let resolved = self.execute_dml_concurrent(txn_id, &route.synthesize_text(params));
+            self.deregister_active_snapshot(read_snapshot);
+            return Ok(IntentTicket {
+                outcome: None,
+                snapshot_hold: None,
+                resolved: Some(resolved),
+            });
+        }
         let read_snapshot = self.committed_seq();
         // Register WITHOUT the RAII guard — the ticket takes an OWNED hold on the registry, so
         // the boundary is released by the completing poll or the ticket's Drop (audit F2), never

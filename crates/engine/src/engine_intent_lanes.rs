@@ -102,7 +102,7 @@ pub(crate) struct IntentLaneState {
     /// Per-lane ingress queues (single-consumer: the lane's pump; multi-producer
     /// submitters). Items route by PK hash, so same-PK contention stays in-lane.
     pub(crate) queues:
-        Vec<Mutex<std::collections::VecDeque<crate::engine_dml_concurrent::CommitWaveItem>>>,
+        Vec<Mutex<std::collections::VecDeque<crate::engine_dml_concurrent::LaneIntent>>>,
     /// Per-lane PRIVATE conflict ledgers (integer slots only in lanes mode; the
     /// intent-only contract means no classic write can race them).
     pub(crate) ledgers: Vec<Mutex<crate::write_path::RecentCommitsLedger>>,
@@ -252,7 +252,7 @@ pub(crate) fn intent_lane_group_us() -> u64 {
 /// winner items whose outcome slots settle (Ok) when the cut covers end_seq.
 pub(crate) struct LaneSettle {
     pub(crate) end_seq: u64,
-    pub(crate) winners: Vec<crate::engine_dml_concurrent::CommitWaveItem>,
+    pub(crate) winners: Vec<crate::engine_dml_concurrent::LaneIntent>,
 }
 
 impl IntentLaneState {

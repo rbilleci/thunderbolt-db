@@ -254,6 +254,13 @@ impl RecentCommitsLedger {
     /// Record a committed write-set at `commit_seq` (the highest writer of each key wins — commits
     /// are assigned monotonically increasing `commit_seq` under the commit_mutex, so a later commit
     /// always overwrites with a larger value).
+    /// E2.5b-2 — conflict check for ONE integer slot (the lean lane form).
+    pub(crate) fn conflicts_int_slot(&self, slot: IntUniqueSlotKey, read_snapshot: Index) -> bool {
+        self.unique_slots_i32
+            .get(&slot)
+            .is_some_and(|&seq| seq > read_snapshot)
+    }
+
     /// E2.5b-2 — record ONE integer unique slot (the lane pump's fused-pass
     /// form; equivalent to `record` for a write-set holding exactly this slot).
     pub(crate) fn record_int_slot(&mut self, slot: IntUniqueSlotKey, commit_seq: Index) {
