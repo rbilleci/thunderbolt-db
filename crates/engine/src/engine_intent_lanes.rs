@@ -297,6 +297,19 @@ pub(crate) fn intent_lane_subframes() -> usize {
         .unwrap_or(0)
 }
 
+/// Adaptive ship-target divisor (`GPU_DB_INTENT_LANE_SHIP_DIV`, default 2):
+/// a lane ships when its queue reaches outstanding/(div * lanes). Larger
+/// divisors ship SMALLER waves sooner — lower formation wait (the oldest
+/// item pays the full fill time) and more WAL frames in flight (deeper FUA
+/// pipeline), at more per-wave fixed cost.
+pub(crate) fn intent_lane_ship_div() -> usize {
+    std::env::var("GPU_DB_INTENT_LANE_SHIP_DIV")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(2)
+}
+
 /// Age deadline for an under-min wave (`GPU_DB_INTENT_LANE_GROUP_US`, default 200).
 pub(crate) fn intent_lane_group_us() -> u64 {
     std::env::var("GPU_DB_INTENT_LANE_GROUP_US")
@@ -413,6 +426,12 @@ impl crate::Engine {
             lanes.stat_resizes.load(Ordering::Relaxed),
             lanes.stat_resize_ns.load(Ordering::Relaxed),
         ))
+    }
+
+    /// WAL fence latency (publish->fence-done): (total ns, fenced frames).
+    pub fn intent_lane_fence_stats(&self) -> Option<(u64, u64)> {
+        let lanes = self.intent_lanes.as_ref()?;
+        Some(lanes.wal_lanes.fence_latency_stats())
     }
 
     /// Publish->settle lag: (total ns, settled waves). The fence+cut+settle

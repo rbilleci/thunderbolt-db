@@ -349,6 +349,19 @@ impl FuaWalLaneSet {
         advanced
     }
 
+    /// Aggregate publish->fence-done latency across all lanes' ACTIVE
+    /// segments: (total ns, fenced frames).
+    pub fn fence_latency_stats(&self) -> (u64, u64) {
+        let mut ns = 0u64;
+        let mut frames = 0u64;
+        for lane in &self.lanes {
+            let (lane_ns, lane_frames) = lane.backend.fence_latency_stats();
+            ns += lane_ns;
+            frames += lane_frames;
+        }
+        (ns, frames)
+    }
+
     /// Lock-free poison probe: true if ANY lane has wedged. Pump settle passes poll this at
     /// iteration rate — the mutex-taking [`Self::poison_reason`] (N poison locks per call) is
     /// only worth paying once this flags true.

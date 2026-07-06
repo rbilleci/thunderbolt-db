@@ -285,6 +285,12 @@ impl FuaWalBackend {
             .max(self.rolled_baseline.load(Ordering::Acquire)) as usize
     }
 
+    /// Aggregate publish->fence-done latency of the ACTIVE segment: (ns, frames).
+    pub(crate) fn fence_latency_stats(&self) -> (u64, u64) {
+        let active = self.lock_active();
+        active.log.fence_latency_stats()
+    }
+
     pub(crate) fn group_commit_stats(&self) -> WalGroupCommitStats {
         *self.stats.lock().unwrap_or_else(|p| p.into_inner())
     }

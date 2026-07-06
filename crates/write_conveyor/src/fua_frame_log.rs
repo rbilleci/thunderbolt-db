@@ -157,6 +157,15 @@ pub struct FuaFrameLog {
     /// (frames arriving within the spin window) never touches the mutex.
     park: Mutex<usize>,
     park_wake: std::sync::Condvar,
+    /// Latency attribution (cheap always-on aggregates): per-frame
+    /// publish->fence-done nanos summed + frame count, and the same for
+    /// fence-done->frontier-advance. Splits the ack path's WAL share into
+    /// DRIVE latency vs pipeline discovery.
+    stat_fence_ns: AtomicU64,
+    stat_fenced_frames: AtomicU64,
+    /// Publish instants ring (nanos from `stat_base`), indexed like `slots`.
+    publish_ns: Vec<AtomicU64>,
+    stat_base: std::time::Instant,
 }
 
 const FRAME_SLOTS: usize = 4096; // bounds in-flight frames; pacing keeps use << this
@@ -225,6 +234,10 @@ impl FuaFrameLog {
             published_frames: PaddedAtomicU64::zero(),
             park: Mutex::new(0),
             park_wake: std::sync::Condvar::new(),
+            stat_fence_ns: AtomicU64::new(0),
+            stat_fenced_frames: AtomicU64::new(0),
+            publish_ns: (0..FRAME_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            stat_base: std::time::Instant::now(),
             appender_taken: AtomicBool::new(false),
             fence_cursor: PaddedAtomicU64::zero(),
             durable_frontier: Mutex::new(0),
@@ -379,6 +392,11 @@ impl FuaFrameLog {
             )?;
         }
         slot.fenced.store(true, Ordering::Release);
+        let published = self.publish_ns[(frame_id as usize) % FRAME_SLOTS].load(Ordering::Relaxed);
+        let now = self.stat_base.elapsed().as_nanos() as u64;
+        self.stat_fence_ns
+            .fetch_add(now.saturating_sub(published), Ordering::Relaxed);
+        self.stat_fenced_frames.fetch_add(1, Ordering::Relaxed);
         self.fences_completed.fetch_add(1);
         let mut frontier = self
             .durable_frontier
@@ -417,6 +435,14 @@ impl FuaFrameLog {
     /// durable) — the engine's commit-visibility gate.
     pub fn durable_seq(&self) -> u64 {
         self.durable_seq.load_acquire()
+    }
+
+    /// Aggregate publish->fence-done latency: (total ns, fenced frames).
+    pub fn fence_latency_stats(&self) -> (u64, u64) {
+        (
+            self.stat_fence_ns.load(Ordering::Relaxed),
+            self.stat_fenced_frames.load(Ordering::Relaxed),
+        )
     }
 
     pub fn published_frames(&self) -> u64 {
@@ -504,6 +530,10 @@ impl FuaFrameLogAppender {
             }
         }
         let slot = &log.slots[(frame_id as usize) % FRAME_SLOTS];
+        log.publish_ns[(frame_id as usize) % FRAME_SLOTS].store(
+            log.stat_base.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         slot.fenced.store(false, Ordering::Relaxed);
         slot.offset
             .store(self.next_offset as u64, Ordering::Relaxed);

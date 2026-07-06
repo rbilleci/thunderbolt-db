@@ -2492,7 +2492,9 @@ impl Engine {
         let min_wave = crate::engine_intent_lanes::intent_lane_min_wave();
         let outstanding =
             lanes.outstanding.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        let ship_target = (outstanding / (lanes.lane_count * 2)).clamp(1, min_wave);
+        let ship_target = (outstanding
+            / (lanes.lane_count * crate::engine_intent_lanes::intent_lane_ship_div()))
+        .clamp(1, min_wave);
         let group_window = std::time::Duration::from_micros(
             ((outstanding / lanes.lane_count) as u64)
                 .min(crate::engine_intent_lanes::intent_lane_group_us()),

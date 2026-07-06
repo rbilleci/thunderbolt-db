@@ -385,6 +385,14 @@ fn run_arm(
                         );
                     }
                 }
+                if let Some((fence_ns, frames)) = engine.intent_lane_fence_stats() {
+                    if frames > 0 {
+                        eprintln!(
+                            "    [fence: {:.1} us/frame over {frames} frames]",
+                            fence_ns as f64 / frames as f64 / 1e3,
+                        );
+                    }
+                }
                 if let Some((drain, conflict, patch, settle)) =
                     engine.intent_lane_hostpass_stats()
                 {
