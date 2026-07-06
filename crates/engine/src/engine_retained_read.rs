@@ -982,6 +982,115 @@ impl Engine {
         filter_idx: usize,
         needles: &[i32],
     ) -> Option<Vec<u32>> {
+        // E2.5b-2 device-stage aggregation (v1): under lanes, funnel locate
+        // calls through the cross-lane coalescer — one kernel launch covers
+        // every lane's concurrently-pending wave (fixed-per-launch device cost
+        // was the measured scaling bound past 4 lanes).
+        if self.intent_lanes.is_some() {
+            return self.wave_batch_locate_coalesced(table, filter_idx, needles);
+        }
+        self.wave_batch_locate_hit_counts_direct(table, filter_idx, needles)
+    }
+
+    /// The cross-lane coalescing front of the device locate (see
+    /// `IntentLaneState::validate_queue`). Push the request, then either lead
+    /// (drain every same-target request, ONE launch, scatter counts) or spin
+    /// until a leader completes ours.
+    fn wave_batch_locate_coalesced(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        needles: &[i32],
+    ) -> Option<Vec<u32>> {
+        use std::sync::atomic::Ordering as AOrd;
+        let lanes = self
+            .intent_lanes
+            .as_ref()
+            .expect("coalesced locate requires lanes");
+        let slot = std::sync::Arc::new(crate::engine_intent_lanes::ValidateSlot {
+            done: std::sync::atomic::AtomicBool::new(false),
+            result: std::sync::Mutex::new(None),
+        });
+        lanes
+            .validate_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(crate::engine_intent_lanes::ValidateRequest {
+                table: table.name.clone(),
+                filter_idx,
+                needles: needles.to_vec(),
+                slot: std::sync::Arc::clone(&slot),
+            });
+        loop {
+            if slot.done.load(AOrd::Acquire) {
+                return slot
+                    .result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                    .expect("done implies result written");
+            }
+            let Ok(_leader) = lanes.validate_leader.try_lock() else {
+                std::hint::spin_loop();
+                continue;
+            };
+            // LEADER: drain every request for THIS (table, filter) target —
+            // including our own — into one concatenated launch.
+            let batch: Vec<crate::engine_intent_lanes::ValidateRequest> = {
+                let mut queue = lanes
+                    .validate_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut matched = Vec::new();
+                let mut rest = Vec::with_capacity(queue.len());
+                for request in queue.drain(..) {
+                    if request.table == table.name && request.filter_idx == filter_idx {
+                        matched.push(request);
+                    } else {
+                        rest.push(request);
+                    }
+                }
+                *queue = rest;
+                matched
+            };
+            if batch.is_empty() {
+                // someone else's leader round already served us; loop re-checks
+                continue;
+            }
+            let mut all_needles: Vec<i32> =
+                Vec::with_capacity(batch.iter().map(|r| r.needles.len()).sum());
+            for request in &batch {
+                all_needles.extend_from_slice(&request.needles);
+            }
+            lanes.stat_coalesced_launches.fetch_add(1, AOrd::Relaxed);
+            lanes
+                .stat_coalesced_requests
+                .fetch_add(batch.len() as u64, AOrd::Relaxed);
+            let counts = self.wave_batch_locate_hit_counts_direct(table, filter_idx, &all_needles);
+            let mut offset = 0usize;
+            for request in batch {
+                let take = request.needles.len();
+                let piece = counts
+                    .as_ref()
+                    .map(|all| all[offset..offset + take].to_vec());
+                offset += take;
+                *request
+                    .slot
+                    .result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(piece);
+                request.slot.done.store(true, AOrd::Release);
+            }
+            // our own slot was in the batch; the loop's next pass returns it
+        }
+    }
+
+    pub(crate) fn wave_batch_locate_hit_counts_direct(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        needles: &[i32],
+    ) -> Option<Vec<u32>> {
         // COUNT-ONLY (max_hits=0): the kernel emits per-needle counts only (0 = no dup, else
         // u32::MAX), skipping the shard/slot buffers + 2 DtoH reads this fn never consumes.
         const MAX_HITS: u32 = 0;

@@ -451,6 +451,10 @@ impl Engine {
                         stat_publish_ns: std::sync::atomic::AtomicU64::new(0),
                         ts_reservation: std::sync::atomic::AtomicU64::new(0),
                         ts_side: (0..lane_count).map(|_| Default::default()).collect(),
+                        validate_queue: std::sync::Mutex::new(Vec::new()),
+                        validate_leader: std::sync::Mutex::new(()),
+                        stat_coalesced_launches: std::sync::atomic::AtomicU64::new(0),
+                        stat_coalesced_requests: std::sync::atomic::AtomicU64::new(0),
                     }));
             }
         }

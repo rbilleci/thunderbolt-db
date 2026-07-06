@@ -150,6 +150,30 @@ pub(crate) struct IntentLaneState {
     /// wal_commit_timestamps_micros never look these txns up — the side maps
     /// retain the stamps for the E2.5c lane-archive slice.
     pub(crate) ts_side: Vec<Mutex<std::collections::HashMap<u64, u64>>>,
+    /// Cross-lane device-validate coalescing (v1 of the device-stage
+    /// aggregator): lanes push locate requests; one leader drains matching
+    /// requests, launches ONE kernel over the concatenated needles, and
+    /// scatters counts back. Device cost is fixed-per-launch, so coalescing
+    /// K lanes' waves cuts the shared section ~K-fold.
+    pub(crate) validate_queue: Mutex<Vec<ValidateRequest>>,
+    pub(crate) validate_leader: Mutex<()>,
+    pub(crate) stat_coalesced_launches: AtomicU64,
+    pub(crate) stat_coalesced_requests: AtomicU64,
+}
+
+/// One lane's pending locate request (see `IntentLaneState::validate_queue`).
+pub(crate) struct ValidateRequest {
+    pub(crate) table: String,
+    pub(crate) filter_idx: usize,
+    pub(crate) needles: Vec<i32>,
+    pub(crate) slot: std::sync::Arc<ValidateSlot>,
+}
+
+/// Completion slot: `done` flips after `result` is written (None = declined,
+/// callers fall back exactly like a direct-call decline).
+pub(crate) struct ValidateSlot {
+    pub(crate) done: AtomicBool,
+    pub(crate) result: Mutex<Option<Option<Vec<u32>>>>,
 }
 
 impl IntentLaneState {
