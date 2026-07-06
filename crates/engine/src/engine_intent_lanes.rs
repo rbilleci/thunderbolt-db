@@ -165,6 +165,17 @@ pub(crate) struct IntentLaneState {
     pub(crate) seq_oracle: AtomicU64,
     /// Apply-side coalescing queue (leader = whoever wins `device_apply_lock`).
     pub(crate) apply_queue: Mutex<Vec<ApplyRequest>>,
+    /// DEPTH-2 APPLY PIPELINE (disruptor staging): each lane's ONE in-flight
+    /// apply handoff. The pump pushes its wave to the apply coalescer and
+    /// returns to drain/validate the next wave; it reaps this slot (drive to
+    /// done, record the applied cut, queue settlement) before stashing the
+    /// next handoff — the device apply overlaps the next wave's host stages
+    /// instead of serializing the pump (~1.2ms/wave inline wait measured).
+    /// Same-slot safety does not depend on apply completion: the lane LEDGER
+    /// records winners at claim time and PK-hash routing pins a PK to one
+    /// lane, so the next wave's conflict pass sees the previous wave's slots
+    /// regardless of device-index freshness.
+    pub(crate) pending_apply: Vec<Mutex<Option<PendingApply>>>,
     pub(crate) stat_apply_launches: AtomicU64,
     pub(crate) stat_apply_requests: AtomicU64,
     /// Leader BUSY time (drain+merge+launch+scatter, excluding waiter spin) —
@@ -207,6 +218,16 @@ pub(crate) struct ApplySlot {
     /// AUDIT F2: set when the apply leader panicked/poisoned before covering
     /// this request — the waiter must fail its winners, not settle them.
     pub(crate) failed: AtomicBool,
+}
+
+/// One wave handed to the apply coalescer and not yet reaped (see
+/// `IntentLaneState::pending_apply`): its completion slot, its lane-local seq
+/// interval, and the winner items whose settlement waits on the reap.
+pub(crate) struct PendingApply {
+    pub(crate) slot: std::sync::Arc<ApplySlot>,
+    pub(crate) local_first: u64,
+    pub(crate) k: u64,
+    pub(crate) winners: Vec<crate::engine_dml_concurrent::LaneIntent>,
 }
 
 /// Min items before a lane wave ships (`GPU_DB_INTENT_LANE_MIN_WAVE`, default 192).

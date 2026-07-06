@@ -2477,27 +2477,40 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if queue.is_empty() {
-                return progressed;
-            }
-            if queue.len() < min_wave {
-                let mut since = lanes.pending_since[lane]
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let started = since.get_or_insert_with(std::time::Instant::now);
-                if started.elapsed() < group_window {
-                    return progressed; // let the wave fill
-                }
-                *since = None;
+                Vec::new()
             } else {
-                *lanes.pending_since[lane]
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                let ship = if queue.len() < min_wave {
+                    let mut since = lanes.pending_since[lane]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let started = since.get_or_insert_with(std::time::Instant::now);
+                    let expired = started.elapsed() >= group_window;
+                    if expired {
+                        *since = None;
+                    }
+                    expired // else: let the wave fill
+                } else {
+                    *lanes.pending_since[lane]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                    true
+                };
+                if ship {
+                    let n = queue.len().min(wave_max);
+                    queue.drain(..n).collect()
+                } else {
+                    Vec::new()
+                }
             }
-            let n = queue.len().min(wave_max);
-            queue.drain(..n).collect()
         };
         if batch.is_empty() {
-            return progressed;
+            // Idle or wave still forming: reap any in-flight apply handoff so
+            // its winners settle promptly and the coalescer keeps draining.
+            let reaped = self.reap_lane_apply(&lanes, lane);
+            if reaped {
+                self.settle_intent_lane(&lanes, lane);
+            }
+            return progressed || reaped;
         }
 
         // device validate (committed-dup 23505 verdicts), off-lock and LEAN:
@@ -2662,7 +2675,6 @@ impl Engine {
         // pending request in ONE merged per-table append pass (fixed-per-pass
         // device cost amortizes across lanes; the leader lock preserves the
         // PK-index extension chain exactly like the old exclusive section).
-        let stat_start = Instant::now();
         let apply_slot = std::sync::Arc::new(crate::engine_intent_lanes::ApplySlot {
             done: std::sync::atomic::AtomicBool::new(false),
             failed: std::sync::atomic::AtomicBool::new(false),
@@ -2695,6 +2707,50 @@ impl Engine {
                     slot: std::sync::Arc::clone(&apply_slot),
                 });
         }
+        // DEPTH-2 PIPELINE (disruptor staging): this wave's apply request is
+        // already queued; reap the PREVIOUS wave's handoff now (pushing ours
+        // first lets one leader pass merge both), stash this wave as the
+        // lane's in-flight handoff, and go drain the next wave. The pump no
+        // longer serializes on its own wave's device apply (~1.2ms/wave
+        // measured inline). Same-slot safety holds without the device index
+        // seeing this wave: the lane ledger recorded the winners at claim and
+        // PK-hash routing pins a PK to one lane.
+        self.reap_lane_apply(&lanes, lane);
+        *lanes.pending_apply[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(crate::engine_intent_lanes::PendingApply {
+                slot: apply_slot,
+                local_first,
+                k,
+                winners,
+            });
+        self.settle_intent_lane(&lanes, lane);
+        true
+    }
+
+    /// Reap a lane's in-flight apply handoff (see `IntentLaneState::pending_apply`):
+    /// drive the apply coalescer until the pending wave's slot completes, then record
+    /// its applied cut and queue its settlement. Returns whether a handoff was reaped.
+    fn reap_lane_apply(
+        &self,
+        lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
+        lane: usize,
+    ) -> bool {
+        let pending = lanes.pending_apply[lane]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(crate::engine_intent_lanes::PendingApply {
+            slot: apply_slot,
+            local_first,
+            k,
+            winners,
+        }) = pending
+        else {
+            return false;
+        };
+        let stat_start = Instant::now();
         loop {
             if apply_slot.done.load(std::sync::atomic::Ordering::Acquire) {
                 if apply_slot.failed.load(std::sync::atomic::Ordering::Acquire) {
@@ -2745,12 +2801,22 @@ impl Engine {
                 AtomicOrdering::Relaxed,
             );
             let failed = outcome.is_err();
+            let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
             for request in &batch {
                 if failed {
                     request
                         .slot
                         .failed
                         .store(true, std::sync::atomic::Ordering::Release);
+                } else if let (Some(first), len) = (request.stamps.first(), request.stamps.len()) {
+                    // Advance the applied cut HERE, at apply completion — not at
+                    // the owning pump's reap. The applied cut is GLOBAL-gating
+                    // (every lane's acks wait on the contiguous cut), and the
+                    // reap trails by a full wave-formation cycle; deferring the
+                    // cut to it measurably inflated every ack (depth-2 v1:
+                    // p50 21ms -> 28ms, sustained -10%).
+                    let local = first - base;
+                    lanes.record_applied(local, local + len as u64);
                 }
                 request
                     .slot
@@ -2770,8 +2836,8 @@ impl Engine {
             .host_install_elisions
             .fetch_add(k, std::sync::atomic::Ordering::Relaxed);
 
-        // applied cut + settlement queue; outcomes wait for the visible cut
-        lanes.record_applied(local_first, local_first + k);
+        // settlement queue only — the applied cut was already advanced by the
+        // apply LEADER at completion; outcomes wait for the visible cut.
         lanes.settle[lane]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2779,7 +2845,6 @@ impl Engine {
                 end_seq: local_first + k,
                 winners,
             });
-        self.settle_intent_lane(&lanes, lane);
         true
     }
 

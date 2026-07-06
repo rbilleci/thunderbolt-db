@@ -414,15 +414,18 @@ impl Engine {
                     .and_then(|v| v.parse().ok())
                     .filter(|&n| n >= 1)
                     .unwrap_or(16);
-                // 512MiB default: rolls (drain + segment swap + a device-wide FLUSH from the
-                // pre-stager's prewrite fsync) are the lane tail's dominant stall; at M-TPS
-                // rates 64MiB rolled every ~15s/lane and the roll tail showed as p99. Same
-                // total log bytes either way — only the roll cadence changes.
+                // Default stays SMALL (64MiB): every lanes engine prewrites segment_bytes x2
+                // (active + pre-staged) PER LANE at open — a big default quota-bombs test
+                // tempdirs. M-TPS deployments should set GPU_DB_INTENT_LANE_SEGMENT_BYTES
+                // to 512MiB+: rolls (drain + swap + the pre-stager's prewrite-fsync FLUSH)
+                // are the lane tail's dominant stall, and 64MiB rolls every ~15s/lane at
+                // 1.6M TPS (same total log bytes either way — only roll cadence changes;
+                // measured p99 191ms -> 90.5ms at 512MiB).
                 let lane_segment_bytes: usize = std::env::var("GPU_DB_INTENT_LANE_SEGMENT_BYTES")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .filter(|&n| n > 0)
-                    .unwrap_or(512 << 20);
+                    .unwrap_or(64 << 20);
                 let wal_lanes = gpu_db_wal::FuaWalLaneSet::create(
                     &lane_base_path,
                     lane_count,
@@ -460,6 +463,7 @@ impl Engine {
                         stat_coalesced_requests: std::sync::atomic::AtomicU64::new(0),
                         seq_oracle: std::sync::atomic::AtomicU64::new(0),
                         apply_queue: std::sync::Mutex::new(Vec::new()),
+                        pending_apply: (0..lane_count).map(|_| Default::default()).collect(),
                         stat_apply_launches: std::sync::atomic::AtomicU64::new(0),
                         stat_apply_requests: std::sync::atomic::AtomicU64::new(0),
                         stat_validate_leader_ns: std::sync::atomic::AtomicU64::new(0),

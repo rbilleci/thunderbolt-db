@@ -406,6 +406,31 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**DEPTH-2 APPLY PIPELINE (2026-07-06): pump never blocks on its own wave's device apply.** The window
+sweep proved the pipeline SATURATED (window 6144→12288: TPS flat ~1.5M, p50 27→43ms — population only
+queues), so per the disruptor mandate the apply stage was pipelined: the pump pushes its ApplyRequest,
+reaps only the PREVIOUS wave's handoff (`IntentLaneState::pending_apply`, one in-flight per lane), and
+returns to drain the next wave — device apply overlaps the next wave's host stages and the cross-lane
+apply coalescer merges ~3 waves/launch (was ~1.3). Correctness: same-slot safety never depended on apply
+completion (lane LEDGER records winners at claim; PK-hash routing pins a PK to its lane); F2/F3 fidelity
+preserved in the reap; settle order preserved (reap N precedes stash N+1). HONEST v1 NEGATIVE, fixed in
+v2: deferring `record_applied` to the reap delayed the GLOBAL applied cut a full formation cycle → every
+ack +7ms p50, sustained −10%; v2 moves the cut advance INTO the apply leader at completion (per-request
+`stamps[0]-base_seq`), reap keeps only settlement. v2 best-of-3 {1.45, 1.52, 1.59}M sustained — parity
+with the pre-pipeline baseline at equal latency, **burst record 2,730,170**, and the pump's inline apply
+wait is structurally gone (next lever: instrument the remaining ~3.5ms/lane-cycle of un-attributed host
+passes: drain/conflict/patch/settle). Gates: 488/488 both modes + GPU intent suites (serial + lanes=2).
+
+**/tmp QUOTA INCIDENT (2026-07-06): engine tests EDQUOT-wedged the box.** Test WAL files go to
+`std::env::temp_dir()` (`tests/common.rs::test_wal_path`); accumulated `gpu-db-engine-*.segment[.fua.*]`
+files from repeated suite runs exhausted the /tmp quota, killing a fua gate run mid-suite (cascading
+unrelated failures) and then EVERY shell command on the box (the agent harness stages output under /tmp).
+Fixes: `.cargo/config.toml` now sets `TMPDIR = target/tmp` (relative; dir must exist) so cargo-run tests
+put temp files on the project fs; the lanes segment-size default stays 64MiB (a 512MiB default made every
+lanes test prewrite 512MiB×2/lane — quota bomb; big segments are a BENCH/PROD env setting:
+`GPU_DB_INTENT_LANE_SEGMENT_BYTES=536870912 ` is part of the champion config). Also `target/wal-intent-bench`
+accumulates ~10GB/championrun of lane segments — periodically rm (24G removed this session).
+
 **SEGMENT-ROLL TAIL FIX (2026-07-06): pre-stager + 512MiB lane segments — p99 191ms→90.5ms at record
 throughput (1,622,823 / 2,612,240 burst, p50 20.1ms p90 38.5ms).** Diagnosis: `FuaWalBackend::roll()`
 prewrote the next segment (64MiB of zeros + fsync, ~100ms) INLINE under the active lock; a rolling lane
