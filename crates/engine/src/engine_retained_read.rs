@@ -1057,6 +1057,7 @@ impl Engine {
                 // someone else's leader round already served us; loop re-checks
                 continue;
             }
+            let leader_started = std::time::Instant::now();
             let mut all_needles: Vec<i32> =
                 Vec::with_capacity(batch.iter().map(|r| r.needles.len()).sum());
             for request in &batch {
@@ -1081,6 +1082,9 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(piece);
                 request.slot.done.store(true, AOrd::Release);
             }
+            lanes
+                .stat_validate_leader_ns
+                .fetch_add(leader_started.elapsed().as_nanos() as u64, AOrd::Relaxed);
             // our own slot was in the batch; the loop's next pass returns it
         }
     }

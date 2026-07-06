@@ -2700,8 +2700,13 @@ impl Engine {
             lanes
                 .stat_apply_requests
                 .fetch_add(batch.len() as u64, AtomicOrdering::Relaxed);
+            let leader_started = Instant::now();
             let mut batch = batch;
             self.lane_apply_merged(&mut batch);
+            lanes.stat_apply_leader_ns.fetch_add(
+                leader_started.elapsed().as_nanos() as u64,
+                AtomicOrdering::Relaxed,
+            );
             for request in batch {
                 request
                     .slot

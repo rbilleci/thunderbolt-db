@@ -353,6 +353,13 @@ fn run_arm(
                     publ as f64 / lw as f64 / 1e3,
                     apply as f64 / lw as f64 / 1e3,
                 );
+                if let Some((vbusy, vlaunch, abusy, alaunch)) = engine.intent_lane_leader_stats() {
+                    eprintln!(
+                        "    [leaders: validate busy {:.2}s over {vlaunch} launches  apply busy {:.2}s over {alaunch} launches]",
+                        vbusy as f64 / 1e9,
+                        abusy as f64 / 1e9,
+                    );
+                }
             }
         }
         let d = &gpu_db_engine::engine_dml_concurrent_wave_device_stats();

@@ -459,6 +459,8 @@ impl Engine {
                         apply_queue: std::sync::Mutex::new(Vec::new()),
                         stat_apply_launches: std::sync::atomic::AtomicU64::new(0),
                         stat_apply_requests: std::sync::atomic::AtomicU64::new(0),
+                        stat_validate_leader_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_apply_leader_ns: std::sync::atomic::AtomicU64::new(0),
                     }));
             }
         }

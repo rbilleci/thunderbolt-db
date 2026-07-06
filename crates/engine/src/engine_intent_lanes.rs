@@ -172,6 +172,10 @@ pub(crate) struct IntentLaneState {
     pub(crate) apply_queue: Mutex<Vec<ApplyRequest>>,
     pub(crate) stat_apply_launches: AtomicU64,
     pub(crate) stat_apply_requests: AtomicU64,
+    /// Leader BUSY time (drain+merge+launch+scatter, excluding waiter spin) —
+    /// the serial-resource test for the coalesced device stages.
+    pub(crate) stat_validate_leader_ns: AtomicU64,
+    pub(crate) stat_apply_leader_ns: AtomicU64,
 }
 
 /// One lane's pending locate request (see `IntentLaneState::validate_queue`).
@@ -314,6 +318,18 @@ impl crate::Engine {
                 .residency
                 .lane_diag_rebuilds
                 .load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Leader-busy diagnostics: (validate_leader_ns, validate_launches,
+    /// apply_leader_ns, apply_launches).
+    pub fn intent_lane_leader_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        let lanes = self.intent_lanes.as_ref()?;
+        Some((
+            lanes.stat_validate_leader_ns.load(Ordering::Relaxed),
+            lanes.stat_coalesced_launches.load(Ordering::Relaxed),
+            lanes.stat_apply_leader_ns.load(Ordering::Relaxed),
+            lanes.stat_apply_launches.load(Ordering::Relaxed),
         ))
     }
 
