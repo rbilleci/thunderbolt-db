@@ -369,6 +369,14 @@ fn run_arm(
                     publ as f64 / lw as f64 / 1e3,
                     apply as f64 / lw as f64 / 1e3,
                 );
+                if let Some((lag_ns, lag_waves)) = engine.intent_lane_acklag_stats() {
+                    if lag_waves > 0 {
+                        eprintln!(
+                            "    [publish->settle: {:.1} us/wave over {lag_waves} settled waves]",
+                            lag_ns as f64 / lag_waves as f64 / 1e3,
+                        );
+                    }
+                }
                 if let Some((drain, conflict, patch, settle)) =
                     engine.intent_lane_hostpass_stats()
                 {

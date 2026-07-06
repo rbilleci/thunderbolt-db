@@ -2593,6 +2593,9 @@ impl Engine {
         // separate encode_record_into pass that was measured at ~1.4us/record
         // of cold Arc re-walks (1.4ms of a 1000-record wave).
         let mut frame_payload: Vec<u8> = Vec::with_capacity(winners.len() * 24 + 4096);
+        // Per-record end offsets: sub-frame publishing splits the payload on
+        // record boundaries (see `intent_lane_subframes`).
+        let mut record_ends: Vec<usize> = Vec::with_capacity(winners.len());
         for (offset, item) in winners.iter().enumerate() {
             let off = item.row_id_offset as usize;
             let row_id = row_id_base + offset as u64;
@@ -2601,6 +2604,7 @@ impl Engine {
                 [off..off + 8]
                 .copy_from_slice(&row_id.to_le_bytes());
             gpu_db_wal::encode_wal_record_parts_into(&mut frame_payload, item.txn_id, &payload);
+            record_ends.push(frame_payload.len());
         }
         lanes.stat_patch_ns.fetch_add(
             patch_started.elapsed().as_nanos() as u64,
@@ -2667,16 +2671,56 @@ impl Engine {
         }
 
         // OFF-LOCK: durable lane append (envelope already fused into the patch
-        // pass above; stat_encode retired into the claim-adjacent patch time)
+        // pass above; stat_encode retired into the claim-adjacent patch time).
+        // SUB-FRAME SPLITTING (see `intent_lane_subframes`): the wave publishes
+        // as N contiguous-seq frames so the same traffic generates N in-flight
+        // FUA fences — pushing the drive into its fast mode at low load. The
+        // ack waits on the contiguous cut over all N (pipelined), and recovery
+        // semantics are unchanged (per-frame intervals, same merge math).
         let stat_start = Instant::now();
-        if let Err(err) = lanes.wal_lanes.append_encoded(
-            lane,
-            local_first,
-            local_first + k,
-            k as u32,
-            &frame_payload,
-        ) {
-            let message = format!("lane WAL append failed: {err}");
+        let subframes = crate::engine_intent_lanes::intent_lane_subframes()
+            .min(k as usize)
+            .max(1);
+        let mut append_error: Option<String> = None;
+        if subframes == 1 {
+            if let Err(err) = lanes.wal_lanes.append_encoded(
+                lane,
+                local_first,
+                local_first + k,
+                k as u32,
+                &frame_payload,
+            ) {
+                append_error = Some(format!("lane WAL append failed: {err}"));
+            }
+        } else {
+            let per = k as usize / subframes;
+            let rem = k as usize % subframes;
+            let mut rec_start = 0usize;
+            let mut byte_start = 0usize;
+            let mut seq = local_first;
+            for chunk_idx in 0..subframes {
+                let take = per + usize::from(chunk_idx < rem);
+                if take == 0 {
+                    continue;
+                }
+                let rec_end = rec_start + take;
+                let byte_end = record_ends[rec_end - 1];
+                if let Err(err) = lanes.wal_lanes.append_encoded(
+                    lane,
+                    seq,
+                    seq + take as u64,
+                    take as u32,
+                    &frame_payload[byte_start..byte_end],
+                ) {
+                    append_error = Some(format!("lane WAL append failed: {err}"));
+                    break;
+                }
+                seq += take as u64;
+                rec_start = rec_end;
+                byte_start = byte_end;
+            }
+        }
+        if let Some(message) = append_error {
             for item in winners {
                 item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
                     message.clone(),
@@ -2741,6 +2785,7 @@ impl Engine {
                 end_seq: local_first + k,
                 winners,
                 apply_slot,
+                published_at: std::time::Instant::now(),
             });
         // Opportunistic non-blocking leader pass keeps the apply queue moving
         // (nobody blocks on it anymore).
@@ -3107,6 +3152,13 @@ impl Engine {
                     .load(std::sync::atomic::Ordering::Acquire),
                 "cut covered a wave whose apply slot is not done"
             );
+            lanes.stat_acklag_ns.fetch_add(
+                entry.published_at.elapsed().as_nanos() as u64,
+                AtomicOrdering::Relaxed,
+            );
+            lanes
+                .stat_settled_waves
+                .fetch_add(1, AtomicOrdering::Relaxed);
             for item in entry.winners {
                 item.set_outcome(Ok(()));
             }

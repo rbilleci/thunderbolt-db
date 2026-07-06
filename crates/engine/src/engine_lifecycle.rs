@@ -454,6 +454,8 @@ impl Engine {
                         stat_conflict_ns: std::sync::atomic::AtomicU64::new(0),
                         stat_patch_ns: std::sync::atomic::AtomicU64::new(0),
                         stat_settle_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_acklag_ns: std::sync::atomic::AtomicU64::new(0),
+                        stat_settled_waves: std::sync::atomic::AtomicU64::new(0),
                         stat_validate_ns: std::sync::atomic::AtomicU64::new(0),
                         stat_claim_ns: std::sync::atomic::AtomicU64::new(0),
                         stat_append_ns: std::sync::atomic::AtomicU64::new(0),

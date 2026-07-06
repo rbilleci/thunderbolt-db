@@ -406,6 +406,24 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**LOW-LOAD LATENCY PROFILE (2026-07-06, user SLO: p90 < 1ms client ack at ~512 concurrent clients).**
+The high-load champion config is WRONG for small workloads: at 512 clients, 10 lanes = p50 6.9ms (8-item
+waves, validate-coalescer churn). The tuned profile — **GPU_DB_INTENT_LANES=3-4, GPU_DB_INTENT_LANE_SUBFRAMES=2,
+MIN_WAVE=1, GROUP_US=0 → p50 1.17-1.20ms p90 1.46-1.50ms p99 1.77ms at ~400k TPS** (4.7x better than the
+10L default). Two laws: (1) LANE COUNT SCALES WITH LOAD — more lanes = more service points (lower queueing)
+until coalescer churn dominates; 3-4 lanes is the 512-client knee. (2) SUB-FRAME SPLITTING
+(`GPU_DB_INTENT_LANE_SUBFRAMES`, default 1): this drive's FUA fence latency is BIMODAL (~1.6ms below ~qd8,
+0.68ms at qd16+ — the conveyor's fast-mode flip); at low load real traffic only sustains qd 2-4, so each
+wave publishes as N contiguous-seq frames to multiply depth from the SAME traffic (cut/recovery math
+unchanged; a foreign-traffic drive warmer was tried and is NEGATIVE — it queues ahead of real fences).
+sf=2 is the knee; sf>=4 regresses on publish (ticketed staging) serialization. ATTRIBUTION (new
+publish→settle stat, `LaneSettle::published_at`): the ack floor is **publish→settle 962µs/wave** — drive
+FUA p50 ~0.68ms + ~0.28ms cut-absorb/settle-discovery; pre-publish host work is trivial at low load
+(drain 0.9 conflict 3.7 patch 3.6 µs/wave). VERDICT: p90 < 1ms on THIS consumer drive is at/below the
+drive's FUA physics (zero host overhead would still give ~p90 1.1-1.2ms); on PLP/enterprise media
+(fence 10-20µs) the current code meets the SLO with ~4x margin (host total ~0.5ms). Remaining shavable:
+the ~0.28ms post-fence discovery (fence-path stage timings would locate it precisely).
+
 **MEGA-FUSE RECON (2026-07-06): fused validate+apply sized; full probe-insert fusion blocked by host
 ordering, a bounded apply-fuse slice is available.** Validate chain = `wave_batch_locate_hit_counts_direct`
 (engine_retained_read.rs:1092) → `submit_multi_shard_i32_write_locate` (execution/src/lib.rs:11706, the
