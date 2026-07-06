@@ -1426,17 +1426,21 @@ impl Engine {
                 let row_id = next_row_id;
                 // WAL: patch the pre-encoded W5a record's 8-byte row id at its fixed offset (no
                 // key parse, no `encode_relational_row`, no `try_encode_binary_insert`).
-                let wal_bytes = {
+                let wal_payload: std::sync::Arc<[u8]> = {
                     let (template, offset) = batch[position]
                         .binary_wal_template
                         .as_ref()
                         .expect("intent_fast requires a binary WAL template");
                     let off = *offset as usize;
-                    let mut bytes = template.to_vec();
-                    bytes[off..off + 8].copy_from_slice(&row_id.to_le_bytes());
-                    bytes
+                    // ONE copy: clone the template straight into the Arc allocation and patch the
+                    // row id in place (the fresh Arc is unique). `to_vec()` + `Arc::from(vec)`
+                    // was two full copies of every WAL record on the serial cut.
+                    let mut payload: std::sync::Arc<[u8]> = std::sync::Arc::from(&template[..]);
+                    std::sync::Arc::get_mut(&mut payload).expect("freshly created Arc is unique")
+                        [off..off + 8]
+                        .copy_from_slice(&row_id.to_le_bytes());
+                    payload
                 };
-                let wal_payload: std::sync::Arc<[u8]> = std::sync::Arc::from(wal_bytes);
                 let wal_len_before = commit.wal.len();
                 commit.wal.append(WalRecord {
                     txn_id: batch[position].txn_id,
