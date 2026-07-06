@@ -467,7 +467,7 @@ impl Engine {
                         stat_coalesced_requests: std::sync::atomic::AtomicU64::new(0),
                         seq_oracle: std::sync::atomic::AtomicU64::new(0),
                         apply_queue: std::sync::Mutex::new(Vec::new()),
-                        pending_apply: (0..lane_count).map(|_| Default::default()).collect(),
+                        apply_poisoned: std::sync::atomic::AtomicBool::new(false),
                         stat_apply_launches: std::sync::atomic::AtomicU64::new(0),
                         stat_apply_requests: std::sync::atomic::AtomicU64::new(0),
                         stat_validate_leader_ns: std::sync::atomic::AtomicU64::new(0),

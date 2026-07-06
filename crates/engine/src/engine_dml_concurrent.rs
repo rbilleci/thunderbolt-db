@@ -2510,13 +2510,13 @@ impl Engine {
             }
         };
         if batch.is_empty() {
-            // Idle or wave still forming: reap any in-flight apply handoff so
-            // its winners settle promptly and the coalescer keeps draining.
-            let reaped = self.reap_lane_apply(&lanes, lane);
-            if reaped {
+            // Idle or wave still forming: keep the apply coalescer moving so
+            // queued waves complete and their cuts advance.
+            let applied = self.drive_apply_queue_once(&lanes);
+            if applied {
                 self.settle_intent_lane(&lanes, lane);
             }
-            return progressed || reaped;
+            return progressed || applied;
         }
         lanes.stat_drain_ns.fetch_add(
             drain_started.elapsed().as_nanos() as u64,
@@ -2726,67 +2726,41 @@ impl Engine {
                     slot: std::sync::Arc::clone(&apply_slot),
                 });
         }
-        // DEPTH-2 PIPELINE (disruptor staging): this wave's apply request is
-        // already queued; reap the PREVIOUS wave's handoff now (pushing ours
-        // first lets one leader pass merge both), stash this wave as the
-        // lane's in-flight handoff, and go drain the next wave. The pump no
-        // longer serializes on its own wave's device apply (~1.2ms/wave
-        // measured inline). Same-slot safety holds without the device index
-        // seeing this wave: the lane ledger recorded the winners at claim and
-        // PK-hash routing pins a PK to one lane.
-        self.reap_lane_apply(&lanes, lane);
-        *lanes.pending_apply[lane]
+        // NO-REAP PIPELINE (disruptor staging): the wave's apply request is
+        // queued and its settlement entry goes straight into the settle queue
+        // — the pump NEVER waits on device apply. Settlement is gated on the
+        // visible cut, which only the apply LEADER advances (at completion),
+        // so a settled-Ok still implies durable AND applied; the failed flag
+        // covers the failure path. Same-slot safety holds without the device
+        // index seeing this wave: the lane ledger recorded the winners at
+        // claim and PK-hash routing pins a PK to one lane.
+        lanes.settle[lane]
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(crate::engine_intent_lanes::PendingApply {
-                slot: apply_slot,
-                local_first,
-                k,
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(crate::engine_intent_lanes::LaneSettle {
+                end_seq: local_first + k,
                 winners,
+                apply_slot,
             });
+        // Opportunistic non-blocking leader pass keeps the apply queue moving
+        // (nobody blocks on it anymore).
+        self.drive_apply_queue_once(&lanes);
         self.settle_intent_lane(&lanes, lane);
         true
     }
 
-    /// Reap a lane's in-flight apply handoff (see `IntentLaneState::pending_apply`):
-    /// drive the apply coalescer until the pending wave's slot completes, then record
-    /// its applied cut and queue its settlement. Returns whether a handoff was reaped.
-    fn reap_lane_apply(
+    /// ONE opportunistic apply-leader pass: if the device lock is free and the
+    /// apply coalescing queue is non-empty, drain it and run the merged apply.
+    /// Non-blocking — a busy lock or an empty queue returns immediately.
+    /// Returns whether a merged apply ran.
+    fn drive_apply_queue_once(
         &self,
         lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
-        lane: usize,
     ) -> bool {
-        let pending = lanes.pending_apply[lane]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let Some(crate::engine_intent_lanes::PendingApply {
-            slot: apply_slot,
-            local_first,
-            k,
-            winners,
-        }) = pending
-        else {
-            return false;
-        };
         let stat_start = Instant::now();
-        loop {
-            if apply_slot.done.load(std::sync::atomic::Ordering::Acquire) {
-                if apply_slot.failed.load(std::sync::atomic::Ordering::Acquire) {
-                    // AUDIT F2: the merged apply failed — these rows were NOT
-                    // applied; fail the winners loudly instead of settling.
-                    for item in winners {
-                        item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
-                            "lane apply leader failed; wave not applied".to_string(),
-                        ))));
-                    }
-                    return true;
-                }
-                break;
-            }
+        {
             let Ok(_leader) = lanes.device_apply_lock.try_lock() else {
-                std::hint::spin_loop();
-                continue;
+                return false;
             };
             let batch: Vec<crate::engine_intent_lanes::ApplyRequest> = {
                 let mut queue = lanes
@@ -2796,7 +2770,7 @@ impl Engine {
                 std::mem::take(&mut *queue)
             };
             if batch.is_empty() {
-                continue; // another leader served us; re-check done
+                return false;
             }
             lanes
                 .stat_apply_launches
@@ -2820,7 +2794,16 @@ impl Engine {
                 AtomicOrdering::Relaxed,
             );
             let failed = outcome.is_err();
+            if failed {
+                // A failed merged apply permanently HOLES the applied cut (its
+                // seqs never apply), so later waves would wait forever behind
+                // it — poison the lanes so settle drains everything loudly.
+                lanes
+                    .apply_poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             let base = lanes.base_seq.load(std::sync::atomic::Ordering::Acquire);
+            let mut applied_rows = 0u64;
             for request in &batch {
                 if failed {
                     request
@@ -2828,20 +2811,23 @@ impl Engine {
                         .failed
                         .store(true, std::sync::atomic::Ordering::Release);
                 } else if let (Some(first), len) = (request.stamps.first(), request.stamps.len()) {
-                    // Advance the applied cut HERE, at apply completion — not at
-                    // the owning pump's reap. The applied cut is GLOBAL-gating
-                    // (every lane's acks wait on the contiguous cut), and the
-                    // reap trails by a full wave-formation cycle; deferring the
-                    // cut to it measurably inflated every ack (depth-2 v1:
-                    // p50 21ms -> 28ms, sustained -10%).
+                    // Advance the applied cut HERE, at apply completion — the
+                    // cut is GLOBAL-gating (every lane's acks wait on it);
+                    // deferring it to the owning pump measurably inflated
+                    // every ack (depth-2 v1: p50 21ms -> 28ms, sustained -10%).
                     let local = first - base;
                     lanes.record_applied(local, local + len as u64);
+                    applied_rows += len as u64;
                 }
                 request
                     .slot
                     .done
                     .store(true, std::sync::atomic::Ordering::Release);
             }
+            self.read_state
+                .residency
+                .host_install_elisions
+                .fetch_add(applied_rows, std::sync::atomic::Ordering::Relaxed);
             if let Err(panic) = outcome {
                 std::panic::resume_unwind(panic);
             }
@@ -2850,20 +2836,6 @@ impl Engine {
             stat_start.elapsed().as_nanos() as u64,
             AtomicOrdering::Relaxed,
         );
-        self.read_state
-            .residency
-            .host_install_elisions
-            .fetch_add(k, std::sync::atomic::Ordering::Relaxed);
-
-        // settlement queue only — the applied cut was already advanced by the
-        // apply LEADER at completion; outcomes wait for the visible cut.
-        lanes.settle[lane]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_back(crate::engine_intent_lanes::LaneSettle {
-                end_seq: local_first + k,
-                winners,
-            });
         true
     }
 
@@ -3079,26 +3051,36 @@ impl Engine {
         lanes: &std::sync::Arc<crate::engine_intent_lanes::IntentLaneState>,
         lane: usize,
     ) -> bool {
-        // AUDIT F3: an ASYNC durability failure (fence pool poison after the
-        // append returned Ok) permanently stalls the durable cut; without this
-        // check the applied-but-undurable waves would hang their clients
-        // forever instead of wedging loudly like the classic path. The probe
-        // is the lock-free flag; the mutex-walking reason fetch (N poison
-        // locks) is paid only on an actual wedge.
-        if lanes.wal_lanes.is_poisoned() {
-            let reason = lanes
-                .wal_lanes
-                .poison_reason()
-                .unwrap_or_else(|| "lane wedged (reason pending)".to_string());
+        // AUDIT F3 (+ apply poison): an ASYNC durability failure (fence pool
+        // poison after the append returned Ok) OR a failed merged apply
+        // permanently stalls the cut; without this check the stalled waves
+        // would hang their clients forever instead of wedging loudly like the
+        // classic path. The probes are lock-free flags; the mutex-walking
+        // reason fetch (N poison locks) is paid only on an actual wedge.
+        let wal_poisoned = lanes.wal_lanes.is_poisoned();
+        if wal_poisoned
+            || lanes
+                .apply_poisoned
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let reason = if wal_poisoned {
+                let inner = lanes
+                    .wal_lanes
+                    .poison_reason()
+                    .unwrap_or_else(|| "lane wedged (reason pending)".to_string());
+                format!("intent lane WAL poisoned: {inner}")
+            } else {
+                "intent lane apply leader failed; cut permanently holed".to_string()
+            };
             let mut queue = lanes.settle[lane]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut settled = false;
             while let Some(entry) = queue.pop_front() {
                 for item in entry.winners {
-                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(format!(
-                        "intent lane WAL poisoned: {reason}"
-                    )))));
+                    item.set_outcome(Err(ExecuteError::Engine(EngineError::Durability(
+                        reason.clone(),
+                    ))));
                 }
                 settled = true;
             }
@@ -3118,6 +3100,13 @@ impl Engine {
             .is_some_and(|entry| entry.end_seq <= local_cut)
         {
             let entry = queue.pop_front().expect("front checked");
+            debug_assert!(
+                entry
+                    .apply_slot
+                    .done
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "cut covered a wave whose apply slot is not done"
+            );
             for item in entry.winners {
                 item.set_outcome(Ok(()));
             }

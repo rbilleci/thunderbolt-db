@@ -312,6 +312,21 @@ fn run_arm(
         .max()
         .unwrap_or(0)
         * 10;
+    // Per-second completion timeline (GPU_DB_BENCH_TIMELINE=1): the
+    // sustained/burst gap lives in STALL seconds — this shows where.
+    if std::env::var("GPU_DB_BENCH_TIMELINE").as_deref() == Ok("1") {
+        let secs: Vec<u64> = per_ms
+            .chunks(1000)
+            .map(|chunk| chunk.iter().sum::<u64>())
+            .collect();
+        eprintln!(
+            "    [timeline tps/s: {}]",
+            secs.iter()
+                .map(|s| format!("{:.2}M", *s as f64 / 1e6))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 
     let stats = engine.wal_group_commit_stats();
     println!(
