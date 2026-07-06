@@ -423,6 +423,13 @@ impl MvccData {
         self.next_row_id.fetch_add(n, AtomicOrdering::Relaxed);
     }
 
+    /// E2.5b-2 — atomically CLAIM a block of `n` row ids, returning the first. Unlike
+    /// `advance_row_id` (single-writer read-then-advance), this is safe under concurrent
+    /// lane pumps: the fetch_add is the claim.
+    pub(crate) fn claim_row_id_block(&self, n: u64) -> u64 {
+        self.next_row_id.fetch_add(n, AtomicOrdering::Relaxed)
+    }
+
     /// Load the KV partition's currently-published generation (a refcount bump; the read body runs
     /// lock-free afterward and pins the generation until the handle drops).
     pub(crate) fn load_kv(&self) -> SnapshotHandle<Arc<InMemoryTupleStore>> {

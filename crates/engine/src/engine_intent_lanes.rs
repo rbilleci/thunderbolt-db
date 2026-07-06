@@ -99,6 +99,30 @@ pub(crate) struct IntentLaneState {
     /// serial WAL from the pre-activation warm-up; recovery replays serial
     /// then lanes over disjoint ranges).
     pub(crate) base_seq: AtomicU64,
+    /// Per-lane ingress queues (single-consumer: the lane's pump; multi-producer
+    /// submitters). Items route by PK hash, so same-PK contention stays in-lane.
+    pub(crate) queues:
+        Vec<Mutex<std::collections::VecDeque<crate::engine_dml_concurrent::CommitWaveItem>>>,
+    /// Per-lane PRIVATE conflict ledgers (integer slots only in lanes mode; the
+    /// intent-only contract means no classic write can race them).
+    pub(crate) ledgers: Vec<Mutex<crate::write_path::RecentCommitsLedger>>,
+    /// Per-lane settlement queues: waves whose outcomes are set once the
+    /// visible cut covers their end seq (ack = durable ∧ applied ∧ published).
+    pub(crate) settle: Vec<Mutex<std::collections::VecDeque<LaneSettle>>>,
+    /// Device open-shard appends are not yet safe under concurrent lane pumps
+    /// (shared per-table device offsets): v1 serializes the apply stage.
+    /// ~20-30us per wave, so contention stays low at wave granularity.
+    pub(crate) device_apply_lock: Mutex<()>,
+    /// Round-robin pump cursor: each `drive_commit_wave` call in lanes mode
+    /// advances one lane's pipeline.
+    pub(crate) pump_cursor: AtomicU64,
+}
+
+/// One lane wave awaiting the visible cut: `[first_seq, end_seq)` plus the
+/// winner items whose outcome slots settle (Ok) when the cut covers end_seq.
+pub(crate) struct LaneSettle {
+    pub(crate) end_seq: u64,
+    pub(crate) winners: Vec<crate::engine_dml_concurrent::CommitWaveItem>,
 }
 
 impl IntentLaneState {
