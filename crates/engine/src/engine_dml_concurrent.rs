@@ -2528,7 +2528,6 @@ impl Engine {
 
         // row-id block (atomic claim — safe under concurrent lanes) + W5a patches
         let row_id_base = self.read_state.mvcc.claim_row_id_block(k);
-        let mut payloads: Vec<std::sync::Arc<[u8]>> = Vec::with_capacity(winners.len());
         // FUSED patch+envelope pass: the frame payload is assembled in the same
         // loop that patches each record (bytes are cache-warm), replacing the
         // separate encode_record_into pass that was measured at ~1.4us/record
@@ -2547,7 +2546,6 @@ impl Engine {
                 [off..off + 8]
                 .copy_from_slice(&row_id.to_le_bytes());
             gpu_db_wal::encode_wal_record_parts_into(&mut frame_payload, item.txn_id, &payload);
-            payloads.push(payload);
             // fused (table, values) extraction: same item walk, warm cache
             let delta = item
                 .offlock_delta
@@ -2564,28 +2562,30 @@ impl Engine {
             winner_rows.push((table.clone(), inserted_rows[0].1.clone()));
         }
 
-        // THE shared touch: one brief commit lock — seq block claim + timestamps
+        // THE CLAIM, LOCK-FREE: after activation, a seq block is one fetch_add
+        // on the lanes oracle (the per-wave commit-lock claim measured 77%
+        // lock-wait at 8 lanes). The FIRST wave seeds the oracle + timestamp
+        // reservation under the commit lock, then flips the activation latch;
+        // v1 contract: classic writes are refused after activation and the
+        // repl log intentionally does not carry lane payloads (single-node;
+        // recovery reads the lane logs' explicit seqs — Raft integration is
+        // an E2.5c+ concern).
         let wall_clock = current_timestamp_micros();
         let stat_start = Instant::now();
-        let first_seq = {
-            let mut commit = self.commit_state();
-            let first = match commit.repl.propose_batch(payloads) {
-                Ok(first) => first,
-                Err(err) => {
-                    let message = format!("lane wave propose failed: {err}");
-                    for item in winners {
-                        item.set_outcome(Err(ExecuteError::Engine(EngineError::ProposalFailed(
-                            message.clone(),
-                        ))));
-                    }
-                    return true;
-                }
-            };
-            let base_ts = wall_clock.max(commit.max_commit_timestamp_micros.saturating_add(1));
-            for (offset, item) in winners.iter().enumerate() {
-                commit.record_commit_timestamp(item.txn_id, base_ts + offset as u64);
-            }
-            commit.repl.mark_applied(first + k - 1);
+        let first_seq = if lanes.activated.load(std::sync::atomic::Ordering::Acquire) {
+            lanes
+                .seq_oracle
+                .fetch_add(k, std::sync::atomic::Ordering::AcqRel)
+        } else {
+            let commit = self.commit_state();
+            lanes.ts_reservation.fetch_max(
+                commit.max_commit_timestamp_micros,
+                std::sync::atomic::Ordering::AcqRel,
+            );
+            let first = commit.repl.peek_next_index();
+            lanes
+                .seq_oracle
+                .store(first + k, std::sync::atomic::Ordering::Release);
             first
         };
         lanes.stat_claim_ns.fetch_add(

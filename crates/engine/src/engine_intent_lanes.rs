@@ -159,6 +159,15 @@ pub(crate) struct IntentLaneState {
     pub(crate) validate_leader: Mutex<()>,
     pub(crate) stat_coalesced_launches: AtomicU64,
     pub(crate) stat_coalesced_requests: AtomicU64,
+    /// LANES-MODE SEQ ORACLE: after activation, waves claim commit-seq blocks
+    /// with a plain fetch_add — no commit lock on the pump at all. Seeded ONCE
+    /// (under the commit lock) from repl.peek_next_index at activation; safe
+    /// because the v1 contract guards classic writes off after activation and
+    /// refuses lanes reopen (single-node: the repl log intentionally does not
+    /// carry lane payloads — recovery reads the lane logs' explicit seqs; Raft
+    /// integration is an E2.5c+ concern, documented). The measured win: the
+    /// per-wave commit-lock claim was 77% lock-wait at 8 lanes (2.2ms/wave).
+    pub(crate) seq_oracle: AtomicU64,
 }
 
 /// One lane's pending locate request (see `IntentLaneState::validate_queue`).

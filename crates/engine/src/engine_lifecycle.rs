@@ -455,6 +455,7 @@ impl Engine {
                         validate_leader: std::sync::Mutex::new(()),
                         stat_coalesced_launches: std::sync::atomic::AtomicU64::new(0),
                         stat_coalesced_requests: std::sync::atomic::AtomicU64::new(0),
+                        seq_oracle: std::sync::atomic::AtomicU64::new(0),
                     }));
             }
         }
