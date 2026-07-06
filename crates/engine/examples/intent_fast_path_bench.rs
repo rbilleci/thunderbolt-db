@@ -369,8 +369,13 @@ fn run_arm(
                     publ as f64 / lw as f64 / 1e3,
                     apply as f64 / lw as f64 / 1e3,
                 );
-                if let Some((active, outstanding)) = engine.intent_lane_adaptive_stats() {
-                    eprintln!("    [adaptive: active_lanes {active}  outstanding {outstanding}]");
+                if let Some((active, outstanding, resizes, resize_ns)) =
+                    engine.intent_lane_adaptive_stats()
+                {
+                    eprintln!(
+                        "    [adaptive: active_lanes {active}  outstanding {outstanding}  resizes {resizes} ({:.1}ms total barrier)]",
+                        resize_ns as f64 / 1e6,
+                    );
                 }
                 if let Some((lag_ns, lag_waves)) = engine.intent_lane_acklag_stats() {
                     if lag_waves > 0 {

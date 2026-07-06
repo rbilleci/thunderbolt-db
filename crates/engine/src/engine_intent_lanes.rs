@@ -106,6 +106,16 @@ pub(crate) struct IntentLaneState {
     pub(crate) resize_hold: Mutex<Vec<crate::engine_dml_concurrent::LaneIntent>>,
     /// Single resize leader at a time + last-flip instant (dwell/hysteresis).
     pub(crate) resize_leader: Mutex<Option<std::time::Instant>>,
+    /// Down-flips require a SUSTAINED low population (this tracks since when
+    /// `outstanding` has been continuously <= DOWN_AT): a momentary dip at
+    /// high load must not trigger a barrier that drains 60k+ in-flight items
+    /// (the measured 0.6-1.2s spike). Up-flips stay instant — staying too
+    /// narrow under load is a throughput emergency, staying too wide at low
+    /// load costs little (fence lanes park).
+    pub(crate) resize_low_since: Mutex<Option<std::time::Instant>>,
+    /// Diagnostics: completed resizes + total barrier nanos.
+    pub(crate) stat_resizes: AtomicU64,
+    pub(crate) stat_resize_ns: AtomicU64,
     /// Live population: intents submitted but not yet outcome-settled, across
     /// all lanes. Incremented at submit; decremented in `set_outcome` (the
     /// single completion choke point). Drives WORKLOAD-ADAPTIVE wave
@@ -394,12 +404,14 @@ impl crate::Engine {
         ))
     }
 
-    /// Adaptivity diagnostics: (active_lanes, outstanding).
-    pub fn intent_lane_adaptive_stats(&self) -> Option<(usize, u64)> {
+    /// Adaptivity diagnostics: (active_lanes, outstanding, resizes, resize_ns).
+    pub fn intent_lane_adaptive_stats(&self) -> Option<(usize, u64, u64, u64)> {
         let lanes = self.intent_lanes.as_ref()?;
         Some((
             lanes.active_lanes.load(Ordering::Acquire),
             lanes.outstanding.load(Ordering::Relaxed),
+            lanes.stat_resizes.load(Ordering::Relaxed),
+            lanes.stat_resize_ns.load(Ordering::Relaxed),
         ))
     }
 

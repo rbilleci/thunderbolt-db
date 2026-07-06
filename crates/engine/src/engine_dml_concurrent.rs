@@ -2844,6 +2844,10 @@ impl Engine {
         const UP_AT: u64 = 4096;
         const DOWN_AT: u64 = 1024;
         const DWELL: std::time::Duration = std::time::Duration::from_millis(200);
+        /// A down-flip drains everything in flight, so a momentary dip at
+        /// high load must not trigger one: the population has to stay low
+        /// for this long, continuously, first.
+        const DOWN_STREAK: std::time::Duration = std::time::Duration::from_millis(500);
         const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
         let low = lanes.lane_count.min(4);
         if lanes.lane_count <= low {
@@ -2860,8 +2864,30 @@ impl Engine {
         } else {
             active // hysteresis band: hold
         };
-        if target == active {
-            return;
+        if target >= active {
+            // Not shrinking: clear any low streak (population recovered).
+            if outstanding > DOWN_AT {
+                if let Ok(mut since) = lanes.resize_low_since.try_lock() {
+                    *since = None;
+                }
+            }
+            if target == active {
+                return;
+            }
+            // Up-flips proceed immediately (throughput emergency).
+        } else {
+            // Down-flip: require a SUSTAINED low population first.
+            let Ok(mut since) = lanes.resize_low_since.try_lock() else {
+                return;
+            };
+            match *since {
+                None => {
+                    *since = Some(std::time::Instant::now());
+                    return;
+                }
+                Some(started) if started.elapsed() < DOWN_STREAK => return,
+                Some(_) => {}
+            }
         }
         let Ok(mut leader) = lanes.resize_leader.try_lock() else {
             return; // a resize is already in progress
@@ -2888,6 +2914,13 @@ impl Engine {
             lanes
                 .active_lanes
                 .store(target, std::sync::atomic::Ordering::Release);
+            lanes
+                .stat_resizes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            lanes.stat_resize_ns.fetch_add(
+                drain_started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         lanes
             .resize_holding

@@ -406,6 +406,17 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**RESIZE-BARRIER SOFTENED (2026-07-06, user-directed): the 0.6-1.5s transition spike is gone.** Causes:
+(1) `active_lanes` started at 4, so every high-load cold start paid an UP-flip barrier during the initial
+flood (tens of thousands of submits held over a cold drain); (2) a momentary population dip below DOWN_AT
+at high load could trigger a spurious down-flip draining 60k+ in-flight items. Fixes: start FULL-WIDTH
+(cheap because parked fence lanes make idle width nearly free — a low-load workload pays one down-flip
+draining ≤1024 items instead); down-flips require a SUSTAINED low streak (500ms continuous, tracked in
+`resize_low_since`) while up-flips stay instant (too-narrow under load is a throughput emergency);
+resize count + total barrier time now instrumented (`[adaptive: ... resizes N (X ms)]`). MEASURED:
+61k @12dr max 259ms (was 946-1560ms), ZERO resizes at steady high load; 512cl exactly ONE down-flip
+costing 1.7ms total, profile intact (p50 1.13 p90 1.38 @407k).
+
 **POST-PARK RECORD (2026-07-06): 1,677,904 sustained @ 12 drivers — the driver knee moved up once the
 fence threads stopped spinning.** With parked fence lanes the old 10-driver knee no longer binds:
 12 drivers / 10 pumps / window 6144 (73.7k population) = best-of-3 {1.23, 1.60, 1.68}M — the 1,677,904

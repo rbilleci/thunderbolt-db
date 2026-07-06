@@ -437,12 +437,17 @@ impl Engine {
                     Some(std::sync::Arc::new(engine_intent_lanes::IntentLaneState {
                         lane_count,
                         fence_lanes,
-                        // Start with the low-load subset; the first heavy wave
-                        // of population resizes up through the drain barrier.
-                        active_lanes: std::sync::atomic::AtomicUsize::new(lane_count.min(4)),
+                        // Start FULL-WIDTH: a high-load flood then never pays
+                        // an up-flip barrier at cold start (the measured
+                        // 0.6-1.2s spike); a low-load workload instead pays
+                        // one cheap down-flip (draining <= DOWN_AT items).
+                        active_lanes: std::sync::atomic::AtomicUsize::new(lane_count),
                         resize_holding: std::sync::atomic::AtomicBool::new(false),
                         resize_hold: std::sync::Mutex::new(Vec::new()),
                         resize_leader: std::sync::Mutex::new(None),
+                        resize_low_since: std::sync::Mutex::new(None),
+                        stat_resizes: std::sync::atomic::AtomicU64::new(0),
+                        stat_resize_ns: std::sync::atomic::AtomicU64::new(0),
                         outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         wal_lanes,
                         applied: std::sync::Mutex::new(engine_intent_lanes::SeqCut::default()),
