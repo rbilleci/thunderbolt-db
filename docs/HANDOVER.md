@@ -406,6 +406,16 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**LOW-CLIENT LATENCY FLOOR PINNED (2026-07-06, user-directed, `aec549b1`): the ≤512-client ack is
+DRIVE-BOUND.** New per-frame publish→fence-done attribution (`[fence: us/frame]` bench line): fence mean
+869-894µs/frame ≈ 90% of publish→settle at 128, 256, AND 512 clients (the curve is FLAT — p50 1.10-1.28
+p90 1.36-1.38 across the range). Knob probes: SHIP_DIV 4/8 (ship smaller waves sooner) trades p50 −30µs
+for p90 +100µs — not adopted; SUBFRAMES=3 REGRESSES (fence 1057µs — past the drive's depth sweet spot;
+AUTO's sf2 is the knee). VERDICT: p50 1.10-1.13 / p90 1.36-1.40 is this consumer drive's floor (its mean
+FUA write-through latency IS the ack); the non-fence share is ~0.25ms total. Sub-ms p90 requires
+PLP-class media (fence 10-20µs → p90 ~0.3-0.4ms with the code as-is). `GPU_DB_INTENT_LANE_SHIP_DIV`
+documented (default 2).
+
 **RESIZE-BARRIER SOFTENED (2026-07-06, user-directed): the 0.6-1.5s transition spike is gone.** Causes:
 (1) `active_lanes` started at 4, so every high-load cold start paid an UP-flip barrier during the initial
 flood (tens of thousands of submits held over a cold drain); (2) a momentary population dip below DOWN_AT
