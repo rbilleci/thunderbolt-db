@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpu_db_types::EngineError;
@@ -142,6 +143,11 @@ pub struct FuaWalLaneSet {
     /// The cross-lane merger. Touched only by cut READERS ([`Self::durable_cut`]) — NEVER on the
     /// append path — so appends to different lanes do not contend on it.
     cut: Mutex<CutState>,
+    /// Lock-free mirror of the last advanced cut. `durable_cut()` is called from EVERY lane
+    /// pump's settle pass; with N pumps the naive path (cut mutex + per-lane active/interval
+    /// locks) convoyed — measured 1.36ms/wave of settle time at 10 lanes. One caller advances
+    /// (try_lock), everyone else reads this mirror.
+    cut_mirror: AtomicU64,
 }
 
 impl std::fmt::Debug for FuaWalLaneSet {
@@ -182,6 +188,7 @@ impl FuaWalLaneSet {
             base,
             lanes,
             cut: Mutex::new(CutState::new(0)),
+            cut_mirror: AtomicU64::new(0),
         })
     }
 
@@ -226,6 +233,7 @@ impl FuaWalLaneSet {
             base,
             lanes,
             cut: Mutex::new(CutState::new(recovery.next_seq)),
+            cut_mirror: AtomicU64::new(recovery.next_seq),
         })
     }
 
@@ -317,7 +325,13 @@ impl FuaWalLaneSet {
     /// absorbs any newly-durable intervals, and advances the merged watermark. Holds at the first
     /// gap (a lagging lane).
     pub fn durable_cut(&self) -> u64 {
-        let mut cut = self.cut.lock().unwrap_or_else(|p| p.into_inner());
+        // SINGLE-ADVANCER: with N lane pumps polling this from every settle pass, queuing on
+        // the cut mutex (plus each lane's active/interval locks inside) convoys the pumps and
+        // contends with the append path. Exactly one caller advances at a time; the rest read
+        // the mirror (monotonic, at most one advance stale).
+        let Ok(mut cut) = self.cut.try_lock() else {
+            return self.cut_mirror.load(Ordering::Acquire);
+        };
         for lane in &self.lanes {
             let durable_end = lane.backend.durable_records() as u64;
             let mut queue = lane.intervals.lock().unwrap_or_else(|p| p.into_inner());
@@ -330,7 +344,16 @@ impl FuaWalLaneSet {
                 }
             }
         }
-        cut.advance()
+        let advanced = cut.advance();
+        self.cut_mirror.fetch_max(advanced, Ordering::AcqRel);
+        advanced
+    }
+
+    /// Lock-free poison probe: true if ANY lane has wedged. Pump settle passes poll this at
+    /// iteration rate — the mutex-taking [`Self::poison_reason`] (N poison locks per call) is
+    /// only worth paying once this flags true.
+    pub fn is_poisoned(&self) -> bool {
+        self.lanes.iter().any(|lane| lane.backend.is_poisoned())
     }
 
     /// First lane durability failure, if any (surfaces the wedge to cut waiters / the engine seam).

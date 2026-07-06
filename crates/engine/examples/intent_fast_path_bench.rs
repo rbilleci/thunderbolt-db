@@ -354,6 +354,17 @@ fn run_arm(
                     publ as f64 / lw as f64 / 1e3,
                     apply as f64 / lw as f64 / 1e3,
                 );
+                if let Some((drain, conflict, patch, settle)) =
+                    engine.intent_lane_hostpass_stats()
+                {
+                    eprintln!(
+                        "    [pump host us/wave: drain {:.1} conflict {:.1} patch {:.1} settle {:.1}]",
+                        drain as f64 / lw as f64 / 1e3,
+                        conflict as f64 / lw as f64 / 1e3,
+                        patch as f64 / lw as f64 / 1e3,
+                        settle as f64 / lw as f64 / 1e3,
+                    );
+                }
                 if let Some((vbusy, vlaunch, abusy, alaunch)) = engine.intent_lane_leader_stats() {
                     eprintln!(
                         "    [leaders: validate busy {:.2}s over {vlaunch} launches  apply busy {:.2}s over {alaunch} launches]",

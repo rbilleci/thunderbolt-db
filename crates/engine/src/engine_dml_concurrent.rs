@@ -2464,7 +2464,12 @@ impl Engine {
             return false; // another pump owns this lane right now
         };
         // settle matured waves first: acks lead each iteration
+        let settle_started = Instant::now();
         let progressed = self.settle_intent_lane(&lanes, lane);
+        lanes.stat_settle_ns.fetch_add(
+            settle_started.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
 
         // Wave-formation pacing (the conveyor laws): accumulate to min_wave or
         // the age deadline; tiny waves pay the fixed per-wave costs per item.
@@ -2472,6 +2477,7 @@ impl Engine {
         let min_wave = crate::engine_intent_lanes::intent_lane_min_wave();
         let group_window =
             std::time::Duration::from_micros(crate::engine_intent_lanes::intent_lane_group_us());
+        let drain_started = Instant::now();
         let batch: Vec<LaneIntent> = {
             let mut queue = lanes.queues[lane]
                 .lock()
@@ -2512,6 +2518,10 @@ impl Engine {
             }
             return progressed || reaped;
         }
+        lanes.stat_drain_ns.fetch_add(
+            drain_started.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
 
         // device validate (committed-dup 23505 verdicts), off-lock and LEAN:
         // needles come straight from the intents' integer slots (no AST walk);
@@ -2531,6 +2541,7 @@ impl Engine {
         // private-ledger conflicts + intra-wave same-slot dedup (lowest position wins).
         // PASS-FUSION: integer slots are extracted here once (winner_slots) so the
         // post-claim ledger record never re-walks the fat items.
+        let conflict_started = Instant::now();
         let mut winners: Vec<LaneIntent> = Vec::with_capacity(batch.len());
         let mut winner_slots: Vec<crate::write_path::IntUniqueSlotKey> =
             Vec::with_capacity(batch.len());
@@ -2565,13 +2576,17 @@ impl Engine {
                 winners.push(item);
             }
         }
-        let mut winners = winners;
+        lanes.stat_conflict_ns.fetch_add(
+            conflict_started.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
         let k = winners.len() as u64;
         if k == 0 {
             return true;
         }
 
         // row-id block (atomic claim — safe under concurrent lanes) + W5a patches
+        let patch_started = Instant::now();
         let row_id_base = self.read_state.mvcc.claim_row_id_block(k);
         // FUSED patch+envelope pass: the frame payload is assembled in the same
         // loop that patches each record (bytes are cache-warm), replacing the
@@ -2587,6 +2602,10 @@ impl Engine {
                 .copy_from_slice(&row_id.to_le_bytes());
             gpu_db_wal::encode_wal_record_parts_into(&mut frame_payload, item.txn_id, &payload);
         }
+        lanes.stat_patch_ns.fetch_add(
+            patch_started.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
 
         // THE CLAIM, LOCK-FREE: after activation, a seq block is one fetch_add
         // on the lanes oracle (the per-wave commit-lock claim measured 77%
@@ -3063,8 +3082,14 @@ impl Engine {
         // AUDIT F3: an ASYNC durability failure (fence pool poison after the
         // append returned Ok) permanently stalls the durable cut; without this
         // check the applied-but-undurable waves would hang their clients
-        // forever instead of wedging loudly like the classic path.
-        if let Some(reason) = lanes.wal_lanes.poison_reason() {
+        // forever instead of wedging loudly like the classic path. The probe
+        // is the lock-free flag; the mutex-walking reason fetch (N poison
+        // locks) is paid only on an actual wedge.
+        if lanes.wal_lanes.is_poisoned() {
+            let reason = lanes
+                .wal_lanes
+                .poison_reason()
+                .unwrap_or_else(|| "lane wedged (reason pending)".to_string());
             let mut queue = lanes.settle[lane]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());

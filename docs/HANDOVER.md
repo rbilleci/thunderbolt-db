@@ -406,6 +406,24 @@ duration; per-wave: validate 400us, publish 158us, device-apply 1101us wait — 
 Bench fix that run surfaced: the old fixed 4M-ids/writer stride overflowed into the neighbor's key range
 at 1.66M TPS x 30s and VALIDATION CORRECTLY REJECTED the duplicates — stride now 2.1e9/writers.
 
+**SETTLE-CONVOY FIX (2026-07-06): the hidden host pass was `durable_cut()` mutex-walking from every
+pump.** New pump host-pass instrumentation (drain/conflict/patch/settle ns, `[pump host us/wave]` bench
+line) attributed the un-measured ~3.5ms/lane-cycle: settle = 1362µs/wave — every pump iteration's
+`settle_intent_lane` called `FuaWalLaneSet::durable_cut()` (1 global cut mutex + N lane ACTIVE locks +
+N interval locks, contending the WAL publish path) plus `poison_reason()` (N poison mutex locks). Fixes:
+(1) `cut_mirror: AtomicU64` + SINGLE-ADVANCER `try_lock` in `durable_cut()` — one caller advances, the
+rest read the mirror (monotonic, ≤1 advance stale); (2) `FuaWalBackend.poisoned: AtomicBool` (stored
+AFTER the reason, under the lock) + lock-free `is_poisoned()` probes; settle pays the mutex-walking
+reason fetch only on an actual wedge. RESULT: settle 1362→~420µs/wave, pump cycle ~2x faster (waves/15s
+31k→45-48k), **LATENCY CHAMPION p50 18.39ms p90 32.75ms p99 67.59ms at 1.59M sustained** and **BURST
+RECORD 2,782,540**; sustained mean stays ~1.5M (waves shrink to arrival×cycle — the closed loop is
+self-consistent). Config-space EXHAUSTED at this architecture (all negatives, post-fix: min_wave
+{768,1024,1536} — not binding; windows {8192,10240} — latency inflates, TPS flat; 12 lanes/12 pumps —
+validate/apply inflate on core saturation; fences {24,32}, drivers {9,11,12} — earlier negatives).
+Remaining 2M+ levers are structural: fused validate+apply device pass (the "mega-fuse"), no-reap settle
+(LaneSettle carries the ApplySlot, opportunistic leader passes), per-item host-cost cuts (conflict
+~140µs/wave ledger lock, patch ~100µs/wave Arc alloc per record).
+
 **DEPTH-2 APPLY PIPELINE (2026-07-06): pump never blocks on its own wave's device apply.** The window
 sweep proved the pipeline SATURATED (window 6144→12288: TPS flat ~1.5M, p50 27→43ms — population only
 queues), so per the disruptor mandate the apply stage was pipelined: the pump pushes its ApplyRequest,

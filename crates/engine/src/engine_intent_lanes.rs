@@ -132,6 +132,13 @@ pub(crate) struct IntentLaneState {
     /// attribution of the pump pipeline.
     pub(crate) stat_waves: AtomicU64,
     pub(crate) stat_items: AtomicU64,
+    /// Host-pass attribution (E2.5b-2 round 2): batch formation drain, ledger
+    /// conflict/dedup, fused patch+envelope, and settle-pass time — the
+    /// previously invisible ~3.5ms/lane-cycle between the measured stages.
+    pub(crate) stat_drain_ns: AtomicU64,
+    pub(crate) stat_conflict_ns: AtomicU64,
+    pub(crate) stat_patch_ns: AtomicU64,
+    pub(crate) stat_settle_ns: AtomicU64,
     pub(crate) stat_validate_ns: AtomicU64,
     pub(crate) stat_claim_ns: AtomicU64,
     pub(crate) stat_append_ns: AtomicU64,
@@ -317,6 +324,19 @@ impl crate::Engine {
                 .residency
                 .lane_diag_rebuilds
                 .load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Pump host-pass diagnostics: (drain_ns, conflict_ns, patch_ns, settle_ns)
+    /// — the formation/ledger/patch+envelope/settle passes between the staged
+    /// stats above. None when lanes are off.
+    pub fn intent_lane_hostpass_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        let lanes = self.intent_lanes.as_ref()?;
+        Some((
+            lanes.stat_drain_ns.load(Ordering::Relaxed),
+            lanes.stat_conflict_ns.load(Ordering::Relaxed),
+            lanes.stat_patch_ns.load(Ordering::Relaxed),
+            lanes.stat_settle_ns.load(Ordering::Relaxed),
         ))
     }
 

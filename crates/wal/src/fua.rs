@@ -98,6 +98,8 @@ pub(crate) struct FuaWalBackend {
     next_segment_id: AtomicU64,
     /// Fail-closed wedge reason; once set, every flush errors until restart recovery.
     poison: Mutex<Option<String>>,
+    /// Lock-free mirror of `poison.is_some()` — pumps poll poison state at iteration rate.
+    poisoned: std::sync::atomic::AtomicBool,
     stats: Mutex<WalGroupCommitStats>,
     /// See [`PrestageSlot`]: the next segment, prewritten off the roll path.
     prestaged: Arc<(Mutex<PrestageSlot>, Condvar)>,
@@ -171,6 +173,7 @@ impl FuaWalBackend {
             rolled_baseline: AtomicU64::new(0),
             next_segment_id: AtomicU64::new(segment_id + 1),
             poison: Mutex::new(None),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
             stats: Mutex::new(WalGroupCommitStats::default()),
             prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
         };
@@ -236,6 +239,7 @@ impl FuaWalBackend {
             rolled_baseline: AtomicU64::new(recovered),
             next_segment_id: AtomicU64::new(segment_id + 1),
             poison: Mutex::new(None),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
             stats: Mutex::new(WalGroupCommitStats::default()),
             prestaged: Arc::new((Mutex::new(PrestageSlot::Empty), Condvar::new())),
         };
@@ -297,6 +301,15 @@ impl FuaWalBackend {
         if guard.is_none() {
             *guard = Some(reason.to_string());
         }
+        // Flag AFTER the reason is stored (under the lock) so a reader that
+        // observes the flag always finds a reason.
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Lock-free poison probe (see the lane-set settle path).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn poison_error(&self, reason: &str) -> EngineError {
